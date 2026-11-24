@@ -10,6 +10,9 @@ vpcmpistrm) zeroes bits 128..255 of the corresponding YMM register.
 Supported AVX instructions (docs/coverage/x64_zen2.tsv group AVX):
   - Packed string compares (VEX.128, W=0, xmm or flat m128 src2):
     vpcmpestri, vpcmpestrm, vpcmpistri, vpcmpistrm
+  - 64-bit explicit-length packed string compares (VEX.128, W=1, xmm or flat
+    m128 src2): vpcmpestri64, vpcmpestrm64. The lengths are the full signed
+    64-bit RAX and RDX; W=0 forms use only the signed low 32 bits.
 
 Transport and ABI glue:
   - vmovdqu (128/256-bit flat load, store and register copy)
@@ -18,8 +21,7 @@ Transport and ABI glue:
   - reg-reg / imm8 or/xor, reg imm8 shl, setcc (setb/sete/sets/seto/setp),
     movzx r32, r8, and terminal ret.
 
-VEX.W=1 64-bit string compares (vpcmpestri64/vpcmpestrm64), VEX.256 (L=1),
-EVEX encodings, legacy SSE4.2 pcmp*str*, nonvolatile registers
+VEX.256 (L=1), EVEX encodings, legacy SSE4.2 pcmp*str*, nonvolatile registers
 (XMM6..15 / YMM6..15, RBX/RBP/RSI/RDI/R12..R15/RSP), writes to r8,
 unsupported addressing modes, prefixes, branches, and all other instructions
 are rejected.
@@ -91,17 +93,14 @@ NONVOLATILE_GPR = {
     R.R15, R.R15D, R.R15L,
 }
 
-# (is_explicit, is_mask)
+# (is_explicit, is_mask, is_len64)
 PCMP_SPECS = {
-    Code.VEX_VPCMPESTRI_XMM_XMMM128_IMM8: (True, False),
-    Code.VEX_VPCMPESTRM_XMM_XMMM128_IMM8: (True, True),
-    Code.VEX_VPCMPISTRI_XMM_XMMM128_IMM8: (False, False),
-    Code.VEX_VPCMPISTRM_XMM_XMMM128_IMM8: (False, True),
-}
-
-PCMP_W1_CODES = {
-    Code.VEX_VPCMPESTRI64_XMM_XMMM128_IMM8,
-    Code.VEX_VPCMPESTRM64_XMM_XMMM128_IMM8,
+    Code.VEX_VPCMPESTRI_XMM_XMMM128_IMM8: (True, False, False),
+    Code.VEX_VPCMPESTRM_XMM_XMMM128_IMM8: (True, True, False),
+    Code.VEX_VPCMPISTRI_XMM_XMMM128_IMM8: (False, False, False),
+    Code.VEX_VPCMPISTRM_XMM_XMMM128_IMM8: (False, True, False),
+    Code.VEX_VPCMPESTRI64_XMM_XMMM128_IMM8: (True, False, True),
+    Code.VEX_VPCMPESTRM64_XMM_XMMM128_IMM8: (True, True, True),
 }
 
 LEGACY_PCMP_CODES = {
@@ -241,9 +240,9 @@ static Flags logic_flags(std::uint64_t result, bool is64) {
     return {false, masked == 0ull, sign_bit != 0ull, false, even_parity8(static_cast<std::uint8_t>(masked & 0xffull)), false};
 }
 
-static std::uint32_t pcmp_explicit_len(std::int32_t raw, std::uint32_t limit) {
-    const std::uint32_t mag = raw < 0 ? (0u - static_cast<std::uint32_t>(raw)) : static_cast<std::uint32_t>(raw);
-    return mag < limit ? mag : limit;
+static std::uint32_t pcmp_explicit_len(std::int64_t raw, std::uint32_t limit) {
+    const std::uint64_t mag = raw < 0 ? (0ull - static_cast<std::uint64_t>(raw)) : static_cast<std::uint64_t>(raw);
+    return mag < static_cast<std::uint64_t>(limit) ? static_cast<std::uint32_t>(mag) : limit;
 }
 
 static std::int32_t pcmp_elem(const std::uint8_t p[16], std::uint32_t idx, bool is_word, bool is_signed) {
@@ -256,7 +255,7 @@ static std::int32_t pcmp_elem(const std::uint8_t p[16], std::uint32_t idx, bool 
 }
 
 static PcmpResult pcmp_str(const Vec256& a_vec, const Vec256& b_vec,
-                           std::uint8_t imm, bool is_explicit, std::int32_t raw_la, std::int32_t raw_lb) {
+                           std::uint8_t imm, bool is_explicit, std::int64_t raw_la, std::int64_t raw_lb) {
     std::uint8_t a[16]{};
     std::uint8_t b[16]{};
     std::memcpy(a, a_vec.q, 16);
@@ -465,7 +464,7 @@ def lift_code(name, start, raw):
             or ins.is_broadcast
         ):
             raise ValueError(f"unsupported EVEX instruction at RVA {ins.ip:#x}: {ins}")
-        if ins.code in PCMP_W1_CODES or (
+        if ins.code not in PCMP_SPECS and (
             op_code.encoding == EncodingKind.VEX and op_code.w == 1 and ins.mnemonic in (
                 M.VPCMPESTRI, M.VPCMPESTRM, M.VPCMPISTRI, M.VPCMPISTRM
             )
@@ -505,7 +504,7 @@ def lift_code(name, start, raw):
             else:
                 raise ValueError(f"unsupported vmovdqu operands at RVA {ins.ip:#x}: {ins}")
         elif ins.code in PCMP_SPECS:
-            is_explicit, is_mask = PCMP_SPECS[ins.code]
+            is_explicit, is_mask, is_len64 = PCMP_SPECS[ins.code]
             src1, _ = read_vec(0, ins)
             if ins.op1_kind == OpKind.REGISTER:
                 src2, _ = read_vec(1, ins)
@@ -519,8 +518,12 @@ def lift_code(name, start, raw):
             if is_explicit:
                 if "rax" not in defined_gpr or "rdx" not in defined_gpr:
                     raise ValueError(f"undefined explicit length register at RVA {ins.ip:#x}: {ins}")
-                la_expr = "static_cast<std::int32_t>(static_cast<std::uint32_t>(rax))"
-                lb_expr = "static_cast<std::int32_t>(static_cast<std::uint32_t>(rdx))"
+                if is_len64:
+                    la_expr = "static_cast<std::int64_t>(rax)"
+                    lb_expr = "static_cast<std::int64_t>(rdx)"
+                else:
+                    la_expr = "static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<std::uint32_t>(rax)))"
+                    lb_expr = "static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<std::uint32_t>(rdx)))"
             else:
                 la_expr, lb_expr = "0", "0"
             if is_mask:

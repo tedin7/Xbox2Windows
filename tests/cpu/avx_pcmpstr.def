@@ -22,4 +22,9 @@ EXPORTS
     vpcmpistrm_uw_ranges_mpos_bit
     vpcmpistrm_sb_eqord_neg_bit
     vpcmpistrm_mem_ub_eqord_exp
+    vpcmpestri64_ub_eqany_pos_lsb
+    vpcmpestri64_sb_eqeach_mpos_msb
+    vpcmpestri64_mem_sw_ranges_neg_msb
+    vpcmpestrm64_ub_eqany_pos_bit
+    vpcmpestrm64_uw_eqeach_mpos_exp
     vpcmpistrm_discarded_read

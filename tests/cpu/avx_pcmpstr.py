@@ -42,9 +42,21 @@ SPECS = (
     ("vpcmpistrm_uw_ranges_mpos_bit", 0x25, None, False, True, True, False, False, False),
     ("vpcmpistrm_sb_eqord_neg_bit", 0x1E, None, False, True, False, False, False, False),
     ("vpcmpistrm_mem_ub_eqord_exp", 0x4C, None, False, True, False, False, False, True),
+    ("vpcmpestri64_ub_eqany_pos_lsb", 0x00, 0x01, True, False, False, False, False, False),
+    ("vpcmpestri64_sb_eqeach_mpos_msb", 0x6A, None, True, False, False, False, False, False),
+    ("vpcmpestri64_mem_sw_ranges_neg_msb", 0x57, None, True, False, True, False, False, False),
+    ("vpcmpestrm64_ub_eqany_pos_bit", 0x00, None, True, True, False, False, True, False),
+    ("vpcmpestrm64_uw_eqeach_mpos_exp", 0x69, 0x29, True, True, True, False, True, False),
 )
 
 ALL_EXPORTS = tuple(row[0] for row in SPECS) + ("vpcmpistrm_discarded_read",)
+
+
+def is_len64(name: str) -> bool:
+    """VEX.W=1 exports read full signed 64-bit RAX/RDX lengths."""
+    return "64_" in name
+
+
 
 BYTE_PAIRS = (
     (b"aeiou\x00xxxxxxxxxx", b"hello world!\x00xyz"),
@@ -97,9 +109,29 @@ EXPLICIT_LEN_PAIRS = (
     (-0x80000000, 6),
 )
 
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
 
-def sdm_pcmp(a_bytes: bytes, b_bytes: bytes, imm: int, is_explicit: bool, raw_la: int = 0, raw_lb: int = 0):
-    """Independent Intel SDM reference model for VPCMPESTRI/M and VPCMPISTRI/M."""
+# Lengths whose low 32 bits differ from the full signed 64-bit value, so a 32-bit
+# truncation of RAX/RDX gives a different clamped length than the real W=1 semantics.
+EXPLICIT_LEN64_PAIRS = EXPLICIT_LEN_PAIRS + (
+    (0x1_0000_0003, 5),
+    (5, 0x1_0000_0003),
+    (0x1_0000_0000, 0x1_0000_0000),
+    (0xFFFFFFFF, 6),
+    (7, 0xFFFFFFFF),
+    (-0xFFFFFFFB, 6),
+    (4, -0x1_0000_0004),
+    (INT64_MIN, 4),
+    (4, INT64_MIN),
+    (INT64_MAX, INT64_MAX),
+    (-1, INT64_MIN),
+)
+
+
+def sdm_pcmp(a_bytes: bytes, b_bytes: bytes, imm: int, is_explicit: bool, raw_la: int = 0, raw_lb: int = 0,
+             len64: bool = False):
+    """Independent Intel SDM reference model for VPCMPESTRI/M (W=0 or W=1) and VPCMPISTRI/M."""
     is_word = bool(imm & 1)
     is_signed = bool(imm & 2)
     limit = 8 if is_word else 16
@@ -113,7 +145,10 @@ def sdm_pcmp(a_bytes: bytes, b_bytes: bytes, imm: int, is_explicit: bool, raw_la
 
     if is_explicit:
         def clamp_len(raw: int) -> int:
-            signed = struct.unpack("<i", struct.pack("<I", raw & 0xffffffff))[0]
+            if len64:
+                signed = struct.unpack("<q", struct.pack("<Q", raw & 0xffffffffffffffff))[0]
+            else:
+                signed = struct.unpack("<i", struct.pack("<I", raw & 0xffffffff))[0]
             return min(abs(signed), limit)
 
         len1 = clamp_len(raw_la)
@@ -186,10 +221,14 @@ def bind_exports(dll_path: Path, prefix: str = ""):
     return lib, funcs
 
 
-def invoke_case(fn, a_bytes: bytes, b_bytes: bytes, is_exp: bool, la: int, lb: int, b_align: int = 0):
+def invoke_case(fn, a_bytes: bytes, b_bytes: bytes, is_exp: bool, la: int, lb: int, b_align: int = 0,
+                len64: bool = False):
     a_buf = ctypes.create_string_buffer(a_bytes + SENTINEL_HI, 32)
     b_raw = ctypes.create_string_buffer(b"\xCC" * b_align + b_bytes + b"\xCC" * 8, 32)
-    header = struct.pack("<ii", la, lb) + b"\x5A" * 8 + SENTINEL_HI + b"\xAA" * 32
+    if len64:
+        header = b"\x5A" * 16 + SENTINEL_HI + b"\xAA" * 16 + struct.pack("<qq", la, lb)
+    else:
+        header = struct.pack("<ii", la, lb) + b"\x5A" * 8 + SENTINEL_HI + b"\xAA" * 32
     guarded = ctypes.create_string_buffer(GUARD_PRE + header + GUARD_POST, 96)
     io_ptr = ctypes.addressof(guarded) + len(GUARD_PRE)
     flags = fn(ctypes.addressof(a_buf), ctypes.addressof(b_raw) + b_align, io_ptr)
@@ -203,7 +242,7 @@ def verify_output(label: str, name: str, is_mask: bool, check_xmm1: bool,
                   a_bytes: bytes, b_bytes: bytes, imm: int, is_exp: bool, la: int, lb: int,
                   got_flags: int, io_bytes: bytes):
     b_eff = a_bytes if "alias_xmm0" in name else b_bytes
-    exp_idx, exp_mask, exp_flags = sdm_pcmp(a_bytes, b_eff, imm, is_exp, la, lb)
+    exp_idx, exp_mask, exp_flags = sdm_pcmp(a_bytes, b_eff, imm, is_exp, la, lb, is_len64(name))
     if got_flags != exp_flags:
         raise AssertionError(
             f"{label} {name} imm={imm:#x} la={la} lb={lb}: flags={got_flags:#x} != exp={exp_flags:#x}"
@@ -254,12 +293,12 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
     total = 0
     for name, imm, _, is_exp, is_mask, is_word, is_alias, check_xmm1, check_unaligned in SPECS:
         vec_pairs = WORD_PAIRS if is_word else BYTE_PAIRS
-        len_pairs = EXPLICIT_LEN_PAIRS if is_exp else ((0, 0),)
+        len_pairs = (EXPLICIT_LEN64_PAIRS if is_len64(name) else EXPLICIT_LEN_PAIRS) if is_exp else ((0, 0),)
         for a_bytes, b_bytes in vec_pairs:
             for la, lb in len_pairs:
                 fn_n, fn_l = native[name], lifted[name]
-                flags_n, io_n = invoke_case(fn_n, a_bytes, b_bytes, is_exp, la, lb)
-                flags_l, io_l = invoke_case(fn_l, a_bytes, b_bytes, is_exp, la, lb)
+                flags_n, io_n = invoke_case(fn_n, a_bytes, b_bytes, is_exp, la, lb, len64=is_len64(name))
+                flags_l, io_l = invoke_case(fn_l, a_bytes, b_bytes, is_exp, la, lb, len64=is_len64(name))
                 verify_output("native", name, is_mask, check_xmm1, a_bytes, b_bytes, imm, is_exp, la, lb, flags_n, io_n)
                 verify_output("lifted", name, is_mask, check_xmm1, a_bytes, b_bytes, imm, is_exp, la, lb, flags_l, io_l)
                 total += 1
@@ -278,13 +317,13 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         if alt_imm is None:
             continue
         vec_pairs = WORD_PAIRS if is_word else BYTE_PAIRS
-        len_pairs = EXPLICIT_LEN_PAIRS if is_exp else ((0, 0),)
+        len_pairs = (EXPLICIT_LEN64_PAIRS if is_len64(name) else EXPLICIT_LEN_PAIRS) if is_exp else ((0, 0),)
         diffs = 0
         for a_bytes, b_bytes in vec_pairs:
             for la, lb in len_pairs:
-                flags_a, io_a = invoke_case(altered[name], a_bytes, b_bytes, is_exp, la, lb)
+                flags_a, io_a = invoke_case(altered[name], a_bytes, b_bytes, is_exp, la, lb, len64=is_len64(name))
                 verify_output("altered", name, is_mask, False, a_bytes, b_bytes, alt_imm, is_exp, la, lb, flags_a, io_a)
-                orig_idx, orig_mask, orig_flags = sdm_pcmp(a_bytes, b_bytes, orig_imm, is_exp, la, lb)
+                orig_idx, orig_mask, orig_flags = sdm_pcmp(a_bytes, b_bytes, orig_imm, is_exp, la, lb, is_len64(name))
                 alt_out = io_a[:16] if is_mask else struct.unpack("<Q", io_a[:8])[0]
                 orig_out = orig_mask if is_mask else orig_idx
                 if flags_a != orig_flags or alt_out != orig_out:
@@ -305,9 +344,42 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
     else:
         raise AssertionError("mutated output was not caught by comparator")
 
+    # W=1 negative control: a reference that truncates RAX/RDX to 32 bits must disagree with
+    # the native and lifted W=1 exports on the lengths above 32 bits, or the cases prove nothing.
+    truncated = {}
+    for name, imm, _, _, is_mask, is_word, _, _, _ in SPECS:
+        if not is_len64(name):
+            continue
+        vec_pairs = WORD_PAIRS if is_word else BYTE_PAIRS
+        differing = 0
+        for a_bytes, b_bytes in vec_pairs:
+            for la, lb in EXPLICIT_LEN64_PAIRS:
+                for functions in (native, lifted):
+                    flags, io = invoke_case(functions[name], a_bytes, b_bytes, True, la, lb, len64=True)
+                    b_eff = b_bytes
+                    idx, mask, exp_flags = sdm_pcmp(a_bytes, b_eff, imm, True, la, lb, False)
+                    got = io[:16] if is_mask else struct.unpack("<Q", io[:8])[0]
+                    if flags != exp_flags or got != (mask if is_mask else idx):
+                        differing += 1
+        if not differing:
+            raise AssertionError(f"{name}: 32-bit length truncation control never diverged")
+        truncated[name] = differing
+
+    w1_name = "vpcmpestrm64_ub_eqany_pos_bit"
+    flags_w, io_w = invoke_case(native[w1_name], sample_a, sample_b, True, 5, 12, len64=True)
+    mutated = bytearray(io_w)
+    mutated[0] ^= 0x01
+    try:
+        verify_output("mutation-w1", w1_name, True, False, sample_a, sample_b, 0x00, True, 5, 12, flags_w, bytes(mutated))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("mutated W=1 output was not caught by comparator")
+
     print(
         f"{total} VEX.128 AVX packed string compare cases across {len(SPECS)} exports matched native and reference; "
-        f"ALTER_IMM diverged on {diverged}; output mutation control caught"
+        f"ALTER_IMM diverged on {diverged}; "
+        f"32-bit length truncation of the W=1 reference diverged on {truncated}; output mutation controls caught"
     )
 
 
@@ -346,13 +418,15 @@ def check_rejections(original_path: Path) -> None:
         # Valid VEX.256 instruction out of scope
         ("vex256_vpaddq", encode_seq(ld_ymm1, ld_ymm2, Instruction.create_reg_reg_reg(
             Code.VEX_VPADDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret_ins), "unsupported VEX.256 (L=1)"),
-        # VEX.W=1 64-bit forms
-        ("vex_w1_vpcmpestri64", encode_seq(ld_xmm1, ld_xmm2, ld_eax, ld_edx, Instruction.create_reg_reg_u32(
+        # VEX.W=1 64-bit forms: supported, but only with a defined RAX length and L=0
+        ("vex_w1_vpcmpestri64_undefined_rax", encode_seq(ld_xmm1, ld_xmm2, Instruction.create_reg_reg_u32(
             Code.VEX_VPCMPESTRI64_XMM_XMMM128_IMM8, R.XMM1, R.XMM2, 0), ret_ins),
-         "unsupported VEX.W=1 64-bit packed string compare"),
-        ("vex_w1_vpcmpestrm64", encode_seq(ld_xmm1, ld_xmm2, ld_eax, ld_edx, Instruction.create_reg_reg_u32(
+         "undefined explicit length register"),
+        ("vex_w1_vpcmpestrm64_undefined_rax", encode_seq(ld_xmm1, ld_xmm2, Instruction.create_reg_reg_u32(
             Code.VEX_VPCMPESTRM64_XMM_XMMM128_IMM8, R.XMM1, R.XMM2, 0), ret_ins),
-         "unsupported VEX.W=1 64-bit packed string compare"),
+         "undefined explicit length register"),
+        ("vex256_w1_vpcmpestri64", ld_preamble + bytes.fromhex("c4e3fd61ca00") + ret_bytes, "invalid instruction"),
+        ("vex256_w1_vpcmpestrm64", ld_preamble + bytes.fromhex("c4e3fd60ca00") + ret_bytes, "invalid instruction"),
         # Legacy SSE4.2 forms
         ("legacy_pcmpestri", encode_seq(ld_xmm1, ld_xmm2, ld_eax, ld_edx, Instruction.create_reg_reg_u32(
             Code.PCMPESTRI_XMM_XMMM128_IMM8, R.XMM1, R.XMM2, 0), ret_ins),
@@ -441,9 +515,9 @@ def check_rejections(original_path: Path) -> None:
         max_len = orig_end - entry
 
     pe_patches = [
-        ("pe_vex_w1_vpcmpestri64", encode_seq(ld_xmm1, ld_xmm2, ld_eax, ld_edx, Instruction.create_reg_reg_u32(
+        ("pe_vex_w1_vpcmpestri64_undefined_rax", encode_seq(ld_xmm1, ld_xmm2, Instruction.create_reg_reg_u32(
             Code.VEX_VPCMPESTRI64_XMM_XMMM128_IMM8, R.XMM1, R.XMM2, 0), ret_ins),
-         "unsupported VEX.W=1 64-bit packed string compare"),
+         "undefined explicit length register"),
         ("pe_legacy_pcmpistrm", encode_seq(ld_xmm1, ld_xmm2, Instruction.create_reg_reg_u32(
             Code.PCMPISTRM_XMM_XMMM128_IMM8, R.XMM1, R.XMM2, 0), ret_ins),
          "unsupported legacy SSE4.2 packed string compare"),

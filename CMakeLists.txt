@@ -1483,7 +1483,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "vpcmpistri_ub_eqord_pos_lsb,vpcmpistri_sb_ranges_mneg_msb,vpcmpistri_uw_eqany_neg_msb,"
         "vpcmpistri_sw_eqeach_mpos_lsb,vpcmpistri_mem_ub_eqany_pos_lsb,"
         "vpcmpistrm_ub_eqeach_pos_exp,vpcmpistrm_sw_eqany_mneg_exp,vpcmpistrm_uw_ranges_mpos_bit,"
-        "vpcmpistrm_sb_eqord_neg_bit,vpcmpistrm_mem_ub_eqord_exp,vpcmpistrm_discarded_read")
+        "vpcmpistrm_sb_eqord_neg_bit,vpcmpistrm_mem_ub_eqord_exp,"
+        "vpcmpestri64_ub_eqany_pos_lsb,vpcmpestri64_sb_eqeach_mpos_msb,vpcmpestri64_mem_sw_ranges_neg_msb,"
+        "vpcmpestrm64_ub_eqany_pos_bit,vpcmpestrm64_uw_eqeach_mpos_exp,vpcmpistrm_discarded_read")
     string(CONCAT cpu_avx_pcmpstr_exports ${cpu_avx_pcmpstr_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_pcmpstr_${variant} avx_pcmpstr)

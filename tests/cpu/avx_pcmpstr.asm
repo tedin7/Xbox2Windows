@@ -7,7 +7,21 @@
 ;   R8  = void*       io      (64 bytes; [0..3] la / [4..7] lb on input for est*;
 ;                              on output [0..7] RCX index for *stri, [0..31] YMM0 for *strm,
 ;                              [32..47] staged m128 or preserved XMM1)
+; The VEX.W=1 (64-bit length) exports read signed int64 la / lb from [R8+48] / [R8+56] instead.
 ; Return value in RAX: (CF << 0) | (ZF << 1) | (SF << 2) | (OF << 3) | (PF << 4)
+
+; VEX.128 W=1 64-bit explicit-length compares, emitted as raw bytes.
+VPCMPESTRI64_XMM1_XMM2 MACRO imm
+    DB 0C4h, 0E3h, 0F9h, 61h, 0CAh, imm
+ENDM
+
+VPCMPESTRI64_XMM1_R8_32 MACRO imm
+    DB 0C4h, 0C3h, 0F9h, 61h, 48h, 20h, imm
+ENDM
+
+VPCMPESTRM64_XMM1_XMM2 MACRO imm
+    DB 0C4h, 0E3h, 0F9h, 60h, 0CAh, imm
+ENDM
 
 PACK_FLAGS MACRO
     setb al
@@ -342,6 +356,84 @@ vpcmpistrm_mem_ub_eqord_exp PROC FRAME
     vzeroupper
     PACK_FLAGS
 vpcmpistrm_mem_ub_eqord_exp ENDP
+
+; --- VPCMPESTRI64 / VPCMPESTRM64 (VEX.W=1, full signed 64-bit RAX/RDX lengths) ---
+
+vpcmpestri64_ub_eqany_pos_lsb PROC FRAME
+    .endprolog
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    mov rax, QWORD PTR [r8+48]
+    mov rdx, QWORD PTR [r8+56]
+    mov rcx, -1
+IFDEF ALTER_IMM
+    VPCMPESTRI64_XMM1_XMM2 01h
+ELSE
+    VPCMPESTRI64_XMM1_XMM2 00h
+ENDIF
+    mov QWORD PTR [r8], rcx
+    vzeroupper
+    PACK_FLAGS
+vpcmpestri64_ub_eqany_pos_lsb ENDP
+
+vpcmpestri64_sb_eqeach_mpos_msb PROC FRAME
+    .endprolog
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    mov rax, QWORD PTR [r8+48]
+    mov rdx, QWORD PTR [r8+56]
+    mov rcx, -1
+    VPCMPESTRI64_XMM1_XMM2 6Ah
+    mov QWORD PTR [r8], rcx
+    vzeroupper
+    PACK_FLAGS
+vpcmpestri64_sb_eqeach_mpos_msb ENDP
+
+vpcmpestri64_mem_sw_ranges_neg_msb PROC FRAME
+    .endprolog
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    vmovdqu XMMWORD PTR [r8+32], xmm2
+    mov rax, QWORD PTR [r8+48]
+    mov rdx, QWORD PTR [r8+56]
+    mov rcx, -1
+    VPCMPESTRI64_XMM1_R8_32 57h
+    mov QWORD PTR [r8], rcx
+    vzeroupper
+    PACK_FLAGS
+vpcmpestri64_mem_sw_ranges_neg_msb ENDP
+
+vpcmpestrm64_ub_eqany_pos_bit PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [r8]
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    mov rax, QWORD PTR [r8+48]
+    mov rdx, QWORD PTR [r8+56]
+    VPCMPESTRM64_XMM1_XMM2 00h
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu XMMWORD PTR [r8+32], xmm1
+    vzeroupper
+    PACK_FLAGS
+vpcmpestrm64_ub_eqany_pos_bit ENDP
+
+vpcmpestrm64_uw_eqeach_mpos_exp PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [r8]
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    mov rax, QWORD PTR [r8+48]
+    mov rdx, QWORD PTR [r8+56]
+IFDEF ALTER_IMM
+    VPCMPESTRM64_XMM1_XMM2 29h
+ELSE
+    VPCMPESTRM64_XMM1_XMM2 69h
+ENDIF
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu XMMWORD PTR [r8+32], xmm1
+    vzeroupper
+    PACK_FLAGS
+vpcmpestrm64_uw_eqeach_mpos_exp ENDP
 
 vpcmpistrm_discarded_read PROC FRAME
     .endprolog
