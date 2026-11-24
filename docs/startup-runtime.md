@@ -328,6 +328,39 @@ inside the range, an empty view alone) and reads the counters through the `x2w_d
 then copies a view into an empty slot, clears the copy red and reads the target back. It does not draw. The export reads
 the same counters the totals line prints.
 
+## Depth stencil clears
+
+Command-list slot 51 is `ClearDepthStencilView(view, flags, depth, stencil, rect count, rects)`. The slot is DERIVED, not
+seen in a title log: it is desktop slot 47 plus four, between slots 50 (`OMSetRenderTargets`) and 52
+(`ClearRenderTargetView`), which are both observed at desktop plus four. Before this change slot 51 fell through to the
+`x2w-noop` stand-in, so a depth buffer that the title cleared was never cleared on the desktop list and a depth test
+ran against whatever the new texture held.
+
+The depth value is the fourth argument, so a real call passes it in `xmm3`. The generic noop entry takes integer
+registers only and would lose it, so with `X2W_D3D12_LIST_NOOP=1` and render mode the list table points slot 51 at the
+handler itself. The handler keeps the per-slot call counts the generic entry would have kept, but a frame trace
+and a capture do not see it.
+
+The handler reads the view through its shadow record as slot 50 does, moves the resource to `DEPTH_WRITE` and calls the
+desktop `ClearDepthStencilView`. The decision is in `src/startup_stubs/list_clear_depth.h`: unknown flag bits and
+the stencil bit of a format without a stencil plane are dropped; no flag left means nothing to clear (not counted); a
+cleared depth that is not a number in [0, 1], a cleared plane that the view marks read-only, or rectangles that cannot be
+read are refused, because the desktop list would report an error for them. A view that holds nothing adds to the
+unresolved count of `x2w_d3d12_render_target_stats`; the other refusals add to the second counter of
+`x2w_d3d12_depth_clear_stats(forwarded, refused)`. Each refusal logs one line (the first six); the first four calls log
+their arguments. A forwarded clear also adds to `clears` in the `x2w-render totals` line. A closed list ignores the call.
+
+One limit: a resource that an earlier bind in the same recording holds as `DEPTH_READ` (a read-only view) is moved to
+`DEPTH_WRITE` by a clear through another view of it, and a later draw with the read-only view still bound would then
+find the wrong state. No title call shows that pattern yet.
+
+`list_clear_depth_check` runs the decision without a device; its two mutated runs (a stencil clear kept for a format
+without stencil, a read-only plane cleared) must fail. `startup_depth_clear_{warp,hardware}` clears a 4x4
+`D32_FLOAT_S8X24_UINT` texture through the stand-in and reads both planes back: both planes, depth only (the stencil
+argument ignored), stencil only (the depth argument ignored), one rectangle, then the refusals and the closed list. It
+does not draw. Before the first clear the planes are read once, and the check fails if they already hold what the first
+clear writes.
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was

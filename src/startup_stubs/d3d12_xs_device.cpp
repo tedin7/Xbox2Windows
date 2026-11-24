@@ -33,6 +33,7 @@
 #include <d3d12.h>
 #include "command_list_slot_names.h"
 #include "console_plane_size.h"
+#include "list_clear_depth.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -1081,6 +1082,8 @@ x2w_startup::DrawReadbacks& draw_dumps()
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
+// ClearDepthStencilView calls forwarded to the desktop list, and calls refused by rule (not counting an unresolved view).
+LONG render_depth_clears, render_depth_clears_refused;
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
@@ -1217,6 +1220,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_render_target_stats(unsigned* bi
 {
     if (binds) *binds = static_cast<unsigned>(InterlockedCompareExchange(&render_target_binds, 0, 0));
     if (unresolved) *unresolved = static_cast<unsigned>(InterlockedCompareExchange(&render_target_unresolved, 0, 0));
+}
+
+// Fixtures: ClearDepthStencilView calls forwarded, and calls refused for a read-only plane, a depth outside [0, 1] or
+// unreadable rectangles. A view that holds nothing is counted by x2w_d3d12_render_target_stats instead.
+extern "C" __declspec(dllexport) void x2w_d3d12_depth_clear_stats(unsigned* forwarded, unsigned* refused)
+{
+    if (forwarded) *forwarded = static_cast<unsigned>(InterlockedCompareExchange(&render_depth_clears, 0, 0));
+    if (refused) *refused = static_cast<unsigned>(InterlockedCompareExchange(&render_depth_clears_refused, 0, 0));
 }
 
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
@@ -2136,6 +2147,64 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     use_as_target(self, target);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
+    InterlockedIncrement(&render_clears);
+}
+static_assert(x2w_clear_depth::clear_depth == D3D12_CLEAR_FLAG_DEPTH && x2w_clear_depth::clear_stencil == D3D12_CLEAR_FLAG_STENCIL,
+              "the clear flag bits of list_clear_depth.h are the SDK values");
+// List slot 51 (desktop 47 + 4), ClearDepthStencilView(view, flags, depth, stencil, rect count, rects). DERIVED, not
+// seen in a title log: slots 50 and 52 around it are observed at desktop + 4. The depth value is the fourth argument,
+// so it arrives in xmm3 and the generic noop_slot entry would lose it; the table points at this function directly
+// (see where the list table is filled) and it keeps the per-slot counts noop_slot would have kept.
+// The view is read from its shadow record, as OMSetRenderTargets does. Desktop resources rest in COMMON, so the
+// resource is moved to DEPTH_WRITE first. A view that holds nothing is counted with the unresolved handles of
+// OMSetRenderTargets; a clear the desktop list would reject (read-only plane, depth outside [0, 1], unreadable
+// rectangles) is refused and counted in x2w_d3d12_depth_clear_stats. See startup_stubs/list_clear_depth.h.
+void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float depth, UINT stencil, UINT rect_count,
+                                const D3D12_RECT* rects)
+{
+    InterlockedIncrement64(&list_slot_calls[51]);
+    InterlockedIncrement64(&list_slot_census[51]);
+    InterlockedIncrement(&draw_calls_seen);
+    auto* list = recording(self);
+    if (!list) return;
+    const u64 desktop = desktop_cpu_handle(handle);
+    const ResolvedView view = desktop ? resolve_view(desktop, 21) : ResolvedView{};
+    ID3D12Resource* target = view.resource;
+    static LONG logged;
+    if (first_calls(logged, 4))
+        log("x2w-render ClearDepthStencilView view=0x%llx target=%p flags=0x%x depth=%.3f stencil=0x%x rects=%u", handle,
+            static_cast<void*>(target), flags, depth, stencil & 0xffu, rect_count);
+    if (!target) {
+        InterlockedIncrement(&render_target_unresolved);
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: view 0x%llx is %s", handle,
+                view.wrong_kind ? "not a depth stencil view"
+                                : view.skipped ? "a skipped depth stencil view" : "not a known depth stencil view");
+        return;
+    }
+    x2w_clear_depth::Request request;
+    request.flags = flags;
+    request.depth = depth;
+    request.format_has_stencil = format_has_stencil(view_format_of(desktop, target));
+    request.depth_read_only = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
+    request.stencil_read_only = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
+    request.rect_count = rect_count;
+    request.rects_readable = !rect_count || (rects && x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT)));
+    const x2w_clear_depth::Plan plan = x2w_clear_depth::plan(request);
+    if (plan.verdict == x2w_clear_depth::Verdict::nothing_to_clear) return;
+    if (plan.verdict != x2w_clear_depth::Verdict::forward) {
+        InterlockedIncrement(&render_depth_clears_refused);
+        static LONG refused_by_rule;
+        if (first_calls(refused_by_rule, 6))
+            log("x2w-d3d12 ClearDepthStencilView refused: %s (flags 0x%x, depth %.3f)", x2w_clear_depth::reason(plan.verdict), flags, depth);
+        return;
+    }
+    require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)},
+                                static_cast<D3D12_CLEAR_FLAGS>(plan.flags), depth, static_cast<UINT8>(stencil), plan.rect_count,
+                                plan.rect_count ? rects : nullptr);
+    InterlockedIncrement(&render_depth_clears);
     InterlockedIncrement(&render_clears);
 }
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
@@ -3707,6 +3776,8 @@ void build_tables()
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
     }
+    // Slot 51 takes a float (xmm3), which the generic entry cannot pass on: the table calls the handler itself.
+    if (render_mode() && list_noop()) tables[list_kind][51] = reinterpret_cast<void*>(&list_clear_depth);
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
     // Queue: not the desktop order (slot 18 is GetTimestampFrequency, desktop 16). Slots are

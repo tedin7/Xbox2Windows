@@ -11457,6 +11457,18 @@ The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 9 translated 
 
 Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
 
+## Depth stencil clears (command-list slot 51)
+
+`ClearDepthStencilView` had no handler; the title's call reached the `x2w-noop` stand-in and the depth buffer was never
+cleared on the desktop list. Slot 51 is derived from the desktop order plus the console shift (47 + 4), not seen in a
+title log. The stand-in forwards a clear whose depth is in [0, 1], whose planes the view can write and whose rectangles
+can be read, and counts the refusals. See [Depth stencil clears](startup-runtime.md#depth-stencil-clears).
+
+```powershell
+cmake --build --preset dev --target startup_depth_clear list_clear_depth_check
+ctest --preset dev --no-tests=error -R "^(startup_depth_clear_(warp|hardware)|list_clear_depth.*)$" -V
+```
+
 ## Render target binds with a single descriptor range
 
 `OMSetRenderTargets` (command-list slot 50) with `RTsSingleHandleToDescriptorRange` true used to be dropped without a
