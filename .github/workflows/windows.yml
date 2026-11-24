@@ -190,7 +190,7 @@ jobs:
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 40
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
