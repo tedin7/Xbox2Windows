@@ -106,4 +106,58 @@ byte_pack_reload PROC FRAME
     vmovdqu xmmword ptr [r8], xmm0
     ret
 byte_pack_reload ENDP
+
+; Saturating add and subtract, signed and unsigned, with memory sources, folded into one result.
+sat_words PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vpaddsw xmm1, xmm0, xmmword ptr [rdx]
+    vpaddusw xmm2, xmm0, xmmword ptr [rdx]
+    vpsubsw xmm3, xmm0, xmmword ptr [rdx]
+    vpsubusw xmm4, xmm0, xmmword ptr [rdx]
+    vpaddw xmm2, xmm2, xmm3
+    vpxor xmm1, xmm1, xmm2
+    vpxor xmm1, xmm1, xmm4
+    vmovdqu xmmword ptr [r8], xmm1
+    ret
+sat_words ENDP
+
+; Low and high word products and unsigned word extremes. In the altered build the unsigned
+; high product becomes the signed one, so lanes with bit 15 set in either input change.
+mul_minmax_words PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vmovdqu xmm5, xmmword ptr [rdx]
+    vpmullw xmm1, xmm0, xmm5
+IFDEF LOGICAL_SHIFT
+    vpmulhw xmm2, xmm0, xmm5
+ELSE
+    vpmulhuw xmm2, xmm0, xmm5
+ENDIF
+    vpmaxuw xmm3, xmm0, xmm5
+    vpminuw xmm4, xmm0, xmmword ptr [rdx]
+    vpaddw xmm1, xmm1, xmm2
+    vpxor xmm1, xmm1, xmm3
+    vpsubw xmm1, xmm1, xmm4
+    vmovdqu xmmword ptr [r8], xmm1
+    ret
+mul_minmax_words ENDP
+
+; Word compares. Each lane ends as exactly one code: equal 1, A above B 3, A below B 7, with the
+; signed order. The compares are all ones or all zeros before the shifts.
+cmp_words PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vmovdqu xmm5, xmmword ptr [rdx]
+    vpcmpeqw xmm1, xmm0, xmm5
+    vpcmpgtw xmm2, xmm0, xmmword ptr [rdx]
+    vpcmpgtw xmm3, xmm5, xmm0
+    vpsrlw xmm1, xmm1, 15
+    vpsrlw xmm2, xmm2, 14
+    vpsrlw xmm3, xmm3, 13
+    vpor xmm1, xmm1, xmm2
+    vpor xmm1, xmm1, xmm3
+    vmovdqu xmmword ptr [r8], xmm1
+    ret
+cmp_words ENDP
 END

@@ -40,6 +40,9 @@ BINARY = {
     M.VPMULHW: "pmulhw", M.VPAVGW: "pavgw", M.VPXOR: "pxor", M.VPAND: "pand", M.VPOR: "por",
     M.VPUNPCKLBW: "punpcklbw", M.VPUNPCKHBW: "punpckhbw", M.VPUNPCKLWD: "punpcklwd",
     M.VPUNPCKHWD: "punpckhwd", M.VPACKUSWB: "packuswb",
+    M.VPADDSW: "paddsw", M.VPADDUSW: "paddusw", M.VPSUBSW: "psubsw", M.VPSUBUSW: "psubusw",
+    M.VPMULLW: "pmullw", M.VPMULHUW: "pmulhuw", M.VPMAXUW: "pmaxuw", M.VPMINUW: "pminuw",
+    M.VPCMPEQW: "pcmpeqw", M.VPCMPGTW: "pcmpgtw",
 }
 SHIFTS = {M.VPSRAW: "psraw", M.VPSLLW: "psllw", M.VPSRLW: "psrlw"}
 MOVES = {M.VMOVDQU, M.VMOVDQA}
@@ -70,6 +73,23 @@ WORDWISE(pminsw, word(a, i) < word(b, i) ? word(a, i) : word(b, i))
 WORDWISE(pmulhw, (static_cast<std::int32_t>(word(a, i)) * word(b, i)) >> 16)
 // Unsigned average, rounded up: (a + b + 1) >> 1 without overflow.
 WORDWISE(pavgw, (static_cast<std::uint32_t>(uword(a, i)) + uword(b, i) + 1) >> 1)
+// Saturating add and subtract: clamp the exact result to the signed or unsigned word range.
+std::int32_t sat_s16(std::int32_t x) { return x < -32768 ? -32768 : x > 32767 ? 32767 : x; }
+std::int32_t sat_u16(std::int32_t x) { return x < 0 ? 0 : x > 65535 ? 65535 : x; }
+WORDWISE(paddsw, sat_s16(word(a, i) + word(b, i)))
+WORDWISE(psubsw, sat_s16(word(a, i) - word(b, i)))
+WORDWISE(paddusw, sat_u16(static_cast<std::int32_t>(uword(a, i)) + uword(b, i)))
+WORDWISE(psubusw, sat_u16(static_cast<std::int32_t>(uword(a, i)) - uword(b, i)))
+// The low 16 bits of the product are the same for signed and unsigned inputs; the high 16 bits
+// of the unsigned 32-bit product need an unsigned multiply.
+WORDWISE(pmullw, static_cast<std::int32_t>(word(a, i)) * word(b, i))
+WORDWISE(pmulhuw, (static_cast<std::uint32_t>(uword(a, i)) * uword(b, i)) >> 16)
+// Unsigned word maximum and minimum.
+WORDWISE(pmaxuw, uword(a, i) > uword(b, i) ? uword(a, i) : uword(b, i))
+WORDWISE(pminuw, uword(a, i) < uword(b, i) ? uword(a, i) : uword(b, i))
+// Compares set a lane to all ones or all zeros; pcmpgtw compares as signed words.
+WORDWISE(pcmpeqw, word(a, i) == word(b, i) ? -1 : 0)
+WORDWISE(pcmpgtw, word(a, i) > word(b, i) ? -1 : 0)
 #undef WORDWISE
 
 V pxor(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] ^ b.b[i]; return r; }

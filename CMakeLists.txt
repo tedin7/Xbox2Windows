@@ -1901,7 +1901,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${vex_lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_vex_aot.py"
                 "$<TARGET_FILE:cpu_vex_words_${variant}>" "${vex_lifted}" widen_mix word_ops shift_edges
-                store_reload aligned_ops byte_pack_reload
+                store_reload aligned_ops byte_pack_reload sat_words mul_minmax_words cmp_words
             DEPENDS cpu_vex_words_${variant} tools/cpu_vex_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
             VERBATIM)
         add_library(cpu_vex_words_${variant}_lifted SHARED "${vex_lifted}")

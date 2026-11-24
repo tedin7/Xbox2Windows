@@ -5,3 +5,6 @@ EXPORTS
     store_reload
     aligned_ops
     byte_pack_reload
+    sat_words
+    mul_minmax_words
+    cmp_words

@@ -16,9 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva  # noqa: E402
 from cpu_vex_aot import lift, translate  # noqa: E402
 
-FUNCTIONS = ("widen_mix", "word_ops", "shift_edges", "store_reload", "aligned_ops", "byte_pack_reload")
-UNALIGNED = ("widen_mix", "word_ops", "shift_edges", "store_reload",
-             "byte_pack_reload")  # vmovdqu-only functions
+FUNCTIONS = ("widen_mix", "word_ops", "shift_edges", "store_reload", "aligned_ops", "byte_pack_reload",
+             "sat_words", "mul_minmax_words", "cmp_words")
+UNALIGNED = ("widen_mix", "word_ops", "shift_edges", "store_reload", "byte_pack_reload",
+             "sat_words", "mul_minmax_words", "cmp_words")  # vmovdqu-only functions
 # Arena: guard | A | guard | B | guard | OUT | guard, each 16 bytes, starting 16-byte aligned.
 ZONES = {"a": 16, "b": 48, "out": 80}
 ARENA = 112
@@ -66,6 +67,34 @@ def outside_output(arena, output="out"):
     """The arena bytes that the function must not change: everything except the output zone."""
     start = ZONES[output]
     return arena[:start] + arena[start + 16:]
+
+
+def reference(name, a, b, altered=False):
+    """Expected output of the saturating, multiply, min/max and compare functions, from the
+    instruction definitions alone: exact integer arithmetic per lane, no code shared with the
+    translator. With altered=True, the high product is the signed one, as in the altered build."""
+    signed_a, signed_b = struct.unpack("<8h", a), struct.unpack("<8h", b)
+    unsigned_a, unsigned_b = struct.unpack("<8H", a), struct.unpack("<8H", b)
+    lanes = []
+    for sa, sb, ua, ub in zip(signed_a, signed_b, unsigned_a, unsigned_b):
+        if name == "sat_words":
+            adds = max(-32768, min(32767, sa + sb))
+            subs = max(-32768, min(32767, sa - sb))
+            lane = (adds ^ (min(65535, ua + ub) + subs) ^ max(0, ua - ub)) & 0xFFFF
+        elif name == "mul_minmax_words":
+            high = (sa * sb) >> 16 if altered else (ua * ub) >> 16
+            lane = (((sa * sb + high) & 0xFFFF) ^ max(ua, ub)) - min(ua, ub)
+            lane &= 0xFFFF
+        elif name == "cmp_words":
+            lane = 1 if sa == sb else 3 if sa > sb else 7
+        else:
+            raise ValueError(name)
+        lanes.append(lane)
+    return struct.pack("<8H", *lanes)
+
+
+REFERENCED = ("sat_words", "mul_minmax_words", "cmp_words")
+OUT = slice(ZONES["out"], ZONES["out"] + 16)
 
 
 def bind(path):
@@ -181,6 +210,17 @@ def main():
                                      f"!= native {expected[out].hex()} for {a.hex()} {b.hex()}")
         print(f"{name}: {len(pairs)} input pairs match bit for bit, guards intact")
 
+    # The new word forms against an independent per-lane reference, in the native and lifted DLLs.
+    for name in REFERENCED:
+        for index, (a, b) in enumerate(pairs):
+            expected = reference(name, a, b)
+            for variant, exports in (("native", native), ("lifted", lifted)):
+                observed = call(exports[name], a, b)[OUT]
+                if observed != expected:
+                    raise AssertionError(f"{name} pair {index}: {variant} {observed.hex()} != "
+                                         f"reference {expected.hex()} for {a.hex()} {b.hex()}")
+        print(f"{name}: native and lifted match the reference on {len(pairs)} pairs")
+
     # Exact aliases: the output is input A or input B. The whole arena must match, so a lifted
     # function that read an input after the native one wrote it (or before) would differ.
     reordered = 0
@@ -223,11 +263,27 @@ def main():
         differing += reference != call(native["shift_edges"], a, b)
     if not differing:
         raise AssertionError("replacing vpsraw with vpsrlw changed no output")
-    for name in ("widen_mix", "word_ops", "store_reload", "aligned_ops", "byte_pack_reload"):
+    for name in ("widen_mix", "word_ops", "store_reload", "aligned_ops", "byte_pack_reload",
+                 "sat_words", "cmp_words"):
         for a, b in pairs[:256]:
             if call(altered[name], a, b) != call(native[name], a, b):
                 raise AssertionError(f"altered fixture changed {name}")
     print(f"vpsraw replaced by vpsrlw: {differing} of {len(pairs)} shift_edges outputs differ")
+
+    # The altered build also swaps vpmulhuw for vpmulhw in mul_minmax_words. Its lifted DLL must
+    # follow the altered native build and the altered reference, and both must differ from the
+    # original, so the check fails if the unsigned high product is lowered as the signed one.
+    changed = 0
+    for a, b in pairs:
+        reference_altered = reference("mul_minmax_words", a, b, altered=True)
+        if call(altered["mul_minmax_words"], a, b)[OUT] != reference_altered:
+            raise AssertionError("altered mul_minmax_words: native differs from the altered reference")
+        if call(altered_lifted["mul_minmax_words"], a, b)[OUT] != reference_altered:
+            raise AssertionError("altered mul_minmax_words: lifted differs from the altered reference")
+        changed += reference_altered != reference("mul_minmax_words", a, b)
+    if not changed:
+        raise AssertionError("replacing vpmulhuw with vpmulhw changed no output")
+    print(f"vpmulhuw replaced by vpmulhw: {changed} of {len(pairs)} mul_minmax_words outputs differ")
 
     check_byte_pack_reload((
         ("original", native), ("original lifted", lifted),
