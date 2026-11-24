@@ -68,7 +68,7 @@ int main()
         s.set_signature(true, &root_a);
         const auto closed_table = s.set_table(false, 0, 0x7000);
         check(closed_table == ComputeRootState::Result::ignored_closed && s.table(0) == 0, "a closed list ignores the table");
-        check(s.closed_ignored_count() >= 1, "ignored calls are counted");
+        check(s.closed_ignored_count() == 2, "each ignored signature and table call is counted");
     }
     std::printf("startup_compute_root: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
