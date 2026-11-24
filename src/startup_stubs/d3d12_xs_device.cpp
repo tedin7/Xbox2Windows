@@ -15,6 +15,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
@@ -1823,6 +1824,7 @@ struct Pass {
     Wrapper* pipeline = nullptr;
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
+    x2w_startup::ComputeRootState compute_root;  // slots 33 and 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
@@ -2051,6 +2053,21 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (deferred <= 3)
         log("x2w-render root signature %p with heap flags 0x%x not set on the desktop list (title heaps are not forwarded)",
             static_cast<void*>(w), pass.root_heap_flags);
+}
+// List slot 33 (desktop 29 + 4), SetComputeRootSignature. Recorded only; nothing is forwarded to the desktop list yet.
+void __stdcall list_compute_root_signature(Wrapper* self, void* root)
+{
+    Wrapper* w = as_wrapper(root);
+    pass_of(self).compute_root.set_signature(self->own().list_open, w ? root_info(w) : nullptr);
+}
+// List slot 35 (desktop 31 + 4), SetComputeRootDescriptorTable(parameter, gpu_handle). Recorded only.
+void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    static LONG dropped;
+    if (pass_of(self).compute_root.set_table(self->own().list_open, parameter, gpu_handle) == x2w_startup::ComputeRootState::Result::out_of_range &&
+        first_calls(dropped, 4))
+        log("x2w-render compute descriptor table dropped: parameter %u (%u parameters are kept)", parameter,
+            x2w_startup::ComputeRootState::max_parameters);
 }
 DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 {
@@ -3697,6 +3714,8 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root_signature);
+        list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);

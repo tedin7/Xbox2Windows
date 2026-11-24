@@ -1229,6 +1229,12 @@ target_sources(offscreen_check PRIVATE tests/startup_cb_blend.cpp "${startup_cb_
 # The same decoder without a device (#1149): each factor value in each of the four factor slots,
 # colour and alpha combine functions apart, refusal reasons, MIN / MAX per slot, the write mask and
 # control_word. The mutated run (destination alpha left in its colour form) is the negative control.
+# Compute root state (command-list slots 33 and 35): signature, descriptor tables, clear on a different signature,
+# range limit, closed list. Checked against real mutations of list_compute_root.h before submission.
+add_executable(startup_compute_root tests/startup_compute_root.cpp)
+target_include_directories(startup_compute_root PRIVATE src)
+target_compile_features(startup_compute_root PRIVATE cxx_std_17)
+add_test(NAME startup_compute_root COMMAND startup_compute_root)
 add_executable(startup_cb_blend_check tests/startup_cb_blend_check.cpp)
 target_include_directories(startup_cb_blend_check PRIVATE src)
 target_compile_features(startup_cb_blend_check PRIVATE cxx_std_17)
