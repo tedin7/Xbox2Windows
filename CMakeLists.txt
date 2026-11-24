@@ -1619,7 +1619,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
-        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
+        "op_vmaskmovdqu,op_vaddsubps_xmm_reg,op_vaddsubps_xmm_mem,op_vaddsubps_ymm_reg,op_vaddsubps_ymm_mem,"
+        "op_vaddsubpd_xmm_reg,op_vaddsubpd_xmm_mem,op_vaddsubpd_ymm_reg,op_vaddsubpd_ymm_mem,"
+        "op_pipeline,op_discarded_read,op_discarded_read64")
     string(CONCAT cpu_avx_fp_move_exports ${cpu_avx_fp_move_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_fp_move_${variant} avx_fp_move)

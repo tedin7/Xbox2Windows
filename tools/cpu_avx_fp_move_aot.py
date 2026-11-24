@@ -24,8 +24,17 @@ Transport/ABI glue: vmovups, vmovaps, vmovdqu, vmovdqa (128/256-bit load, store
 and register copy), vzeroupper, 64-bit mov (volatile GPR <-> [base + disp],
 volatile GPR reg-reg, and rdi save/set-to-r8/restore), and terminal ret.
 
-Legacy SSE forms (movq, maskmovdqu), EVEX encodings, FP arithmetic
-(vaddsubps/vaddsubpd), nonvolatile registers (XMM6..15, YMM6..15,
+Alternating FP add/subtract: vaddsubps and vaddsubpd (VEX.128 and VEX.256; register or
+flat m128/m256 second source). Even-indexed elements compute src1 - src2 and odd-indexed
+elements compute src1 + src2 in every 128-bit lane (vaddsubpd: element 0 subtracts,
+element 1 adds). The arithmetic is performed at run time by the matching host intrinsic
+(_mm_addsub_ps, _mm256_addsub_ps, _mm_addsub_pd, _mm256_addsub_pd), so NaN propagation,
+signed zeros, exceptions-as-masked and the MXCSR rounding, DAZ and FTZ bits are those of the
+host instruction; nothing is folded at translation time. VEX.128 forms zero [255:128] of the
+destination. Other FP arithmetic is not supported.
+
+Legacy SSE forms (movq, maskmovdqu, addsubps, addsubpd), EVEX encodings, other FP arithmetic
+(for example vaddps), nonvolatile registers (XMM6..15, YMM6..15,
 RBX/RBP/RSI/R12..R15/RSP and unrestored, non-r8, or leaked RDI), non-argument
 memory bases, stores outside r8, unaligned vmovaps/vmovdqa memory operands,
 prefixes, RIP-relative addressing, branches, and trailing bytes after ret are
@@ -111,6 +120,14 @@ LEGACY_SSE_REJECT_CODES = {
     Code.MASKMOVDQU_RDI_XMM_XMM,
 }
 
+# Code -> (256-bit form, lifted helper name).
+VADDSUB_CODES = {
+    Code.VEX_VADDSUBPS_XMM_XMM_XMMM128: (False, "op_vaddsubps128"),
+    Code.VEX_VADDSUBPS_YMM_YMM_YMMM256: (True, "op_vaddsubps256"),
+    Code.VEX_VADDSUBPD_XMM_XMM_XMMM128: (False, "op_vaddsubpd128"),
+    Code.VEX_VADDSUBPD_YMM_YMM_YMMM256: (True, "op_vaddsubpd256"),
+}
+
 ALLOWED_CODES = {
     Code.RETNQ,
     Code.VEX_VZEROUPPER,
@@ -120,6 +137,7 @@ ALLOWED_CODES = {
     *VMOVQ_CODES,
     *FULL_VEC_LOAD_CODES,
     *FULL_VEC_STORE_CODES,
+    *VADDSUB_CODES,
 }
 
 
@@ -127,6 +145,13 @@ PRELUDE = """#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
+#include <immintrin.h>
+
+extern "C" __declspec(dllexport) std::uint32_t host_exchange_mxcsr(std::uint32_t next) {
+    const std::uint32_t current = _mm_getcsr();
+    _mm_setcsr(next);
+    return current;
+}
 
 extern "C" __declspec(dllexport) std::uint32_t host_has_avx() {
     int info[4]{};
@@ -185,6 +210,41 @@ static inline void store256(word address, const Vec256& v) {
 
 static inline Vec256 copy128(const Vec256& v) {
     return {{v.q[0], v.q[1], 0ull, 0ull}};
+}
+
+// VEX alternating add/subtract: even elements src1 - src2, odd elements src1 + src2.
+// Executed by the host instruction at run time so MXCSR (rounding, DAZ, FTZ), NaN
+// propagation and signed zeros are the hardware's. The 128-bit forms zero [255:128].
+static inline Vec256 op_vaddsubps128(const Vec256& a, const Vec256& b) {
+    Vec256 r{};
+    const __m128 x = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a.q)));
+    const __m128 y = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b.q)));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(r.q), _mm_castps_si128(_mm_addsub_ps(x, y)));
+    return r;
+}
+
+static inline Vec256 op_vaddsubpd128(const Vec256& a, const Vec256& b) {
+    Vec256 r{};
+    const __m128d x = _mm_castsi128_pd(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a.q)));
+    const __m128d y = _mm_castsi128_pd(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b.q)));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(r.q), _mm_castpd_si128(_mm_addsub_pd(x, y)));
+    return r;
+}
+
+static inline Vec256 op_vaddsubps256(const Vec256& a, const Vec256& b) {
+    Vec256 r{};
+    const __m256 x = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.q)));
+    const __m256 y = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b.q)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r.q), _mm256_castps_si256(_mm256_addsub_ps(x, y)));
+    return r;
+}
+
+static inline Vec256 op_vaddsubpd256(const Vec256& a, const Vec256& b) {
+    Vec256 r{};
+    const __m256d x = _mm256_castsi256_pd(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.q)));
+    const __m256d y = _mm256_castsi256_pd(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b.q)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r.q), _mm256_castpd_si256(_mm256_addsub_pd(x, y)));
+    return r;
 }
 
 static inline void op_vmaskmovdqu(word address, const Vec256& src, const Vec256& mask) {
@@ -386,6 +446,19 @@ def lift_code(name, start, raw):
             src, _ = read_vec(1, ins, require_xmm=True)
             mask, _ = read_vec(2, ins, require_xmm=True)
             statements.append(f"op_vmaskmovdqu({rdi_expr}, {src}, {mask});")
+
+        elif ins.code in VADDSUB_CODES:
+            wide, helper = VADDSUB_CODES[ins.code]
+            src1, _ = read_vec(1, ins, require_xmm=not wide)
+            if ins.op2_kind == OpKind.MEMORY:
+                expected = 32 if wide else 16
+                addr = flat_address(ins, clobbered_ptrs, expected_bytes=expected)
+                src2 = f"{'load256' if wide else 'load128'}({addr})"
+            else:
+                src2, _ = read_vec(2, ins, require_xmm=not wide)
+            dst_idx, dst, _ = write_vec(0, ins, require_xmm=not wide)
+            statements.append(f"{dst} = {helper}({src1}, {src2});")
+            defined_vec.add(dst_idx)
 
         elif ins.code in FULL_VEC_LOAD_CODES:
             wide, aligned = FULL_VEC_LOAD_CODES[ins.code]
