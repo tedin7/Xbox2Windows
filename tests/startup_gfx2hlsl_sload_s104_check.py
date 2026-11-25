@@ -150,6 +150,10 @@ def main():
         raise AssertionError('branch skipped the only descriptor load')
     s = run(TABLE, 's_load_dwordx4', 's[100:103], s[4:5], 0x20')
     assert s.u('vcc_lo') == 'vcc'
+    # A second translation pass starts with vcc intact: the load at the end of the first pass must not leak into it.
+    again = translate(read, load, 's_endpgm')
+    again.translate()
+    assert again.lines == translate(read, load, 's_endpgm').lines
     print('ok')
 
 

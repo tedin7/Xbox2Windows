@@ -2435,6 +2435,8 @@ class Stage:
             uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
+            self.vcc_lost = False
+            self.vcc_descriptor_overwritten = False
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
