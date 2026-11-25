@@ -2202,6 +2202,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # SDWA forms of the float-result conversions (#1727).
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
+    # v_frexp_mant_f32, v_frexp_exp_i32_f32, v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32 and v_ldexp_f32 (#1723).
+    add_test(NAME startup_gfx2hlsl_frexp_cvt COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_frexp_cvt_check.py")
+    set_tests_properties(startup_gfx2hlsl_frexp_cvt PROPERTIES TIMEOUT 60)
     # VOPC SDWA compares (#1906): every integer compare, select and sext() evaluated against an integer
     # reference; floating-point SDWA forms and unsupported modifiers are refused. The draws are registered below.
     add_test(NAME startup_gfx2hlsl_vopc_sdwa COMMAND "${INTAKE_PYTHON}" -B

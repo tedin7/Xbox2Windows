@@ -1441,6 +1441,61 @@ class Stage:
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
 
+    def float_bits(self, tok):
+        """uint bits of a float source, with the inline neg/abs operand modifiers applied."""
+        return 'U(%s)' % self.f(tok)
+
+    def op_v_frexp_mant_f32(self, ops, mods):
+        # Sign and mantissa in [0.5, 1) of a normal input; zero and denormals read as a signed zero;
+        # infinity and NaN pass through unchanged (RDNA 2 ISA, V_FREXP_MANT_F32).
+        if len(ops) != 2:
+            raise Unsupported('v_frexp_mant_f32 with %d operands, expected 2' % len(ops))
+        b = self.float_bits(ops[1])
+        e = '((%s >> 23) & 255u)' % b
+        expr = 'F(%s == 255u ? %s : %s == 0u ? (%s & 0x80000000u) : ((%s & 0x807fffffu) | 0x3f000000u))' % (
+            e, b, e, b, b)
+        self.set_vf(reg_range(ops[0])[1], expr, mods)
+
+    def op_v_frexp_exp_i32_f32(self, ops, mods):
+        # Exponent e with input = mantissa * 2^e and mantissa in [0.5, 1). Zero, denormal, infinity and NaN give 0.
+        if mods:
+            raise Unsupported('v_frexp_exp_i32_f32 with modifiers')
+        if len(ops) != 2:
+            raise Unsupported('v_frexp_exp_i32_f32 with %d operands, expected 2' % len(ops))
+        e = '((%s >> 23) & 255u)' % self.float_bits(ops[1])
+        self.set_v(reg_range(ops[0])[1], '(%s == 0u || %s == 255u) ? 0u : (%s - 126u)' % (e, e, e))
+
+    def float_to_int(self, base, ops, mods, rounded):
+        # Saturating conversion of the rounded float; NaN reads 0. v_cvt_flr rounds toward -inf, v_cvt_rpi
+        # rounds floor(x + 0.5). A value at or above 2^31 reads INT_MAX; one below -2^31 reads INT_MIN.
+        if mods:
+            raise Unsupported('%s with modifiers' % base)
+        if len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
+        x = self.f(ops[1])
+        r = 'floor(%s)' % (rounded % x)
+        self.set_v(reg_range(ops[0])[1], '(%s != %s) ? 0u : (%s >= 2147483648.0) ? 0x7fffffffu : uint(int(max(%s, -2147483648.0)))' % (
+            x, x, r, r))
+
+    def op_v_cvt_flr_i32_f32(self, ops, mods):
+        self.float_to_int('v_cvt_flr_i32_f32', ops, mods, '%s')
+
+    def op_v_cvt_rpi_i32_f32(self, ops, mods):
+        self.float_to_int('v_cvt_rpi_i32_f32', ops, mods, '%s + 0.5')
+
+    def op_v_ldexp_f32(self, ops, mods):
+        # D = S0 * 2^S1 with S1 a signed integer, clamped to +-300 (the result is 0 or inf past that anyway).
+        # The scale is applied in three parts of at most 2^100 each, so that no factor overflows binary32
+        # when the product is finite.
+        if len(ops) != 3:
+            raise Unsupported('v_ldexp_f32 with %d operands, expected 3' % len(ops))
+        n = 'clamp(int(%s), -300, 300)' % self.u(ops[2])
+        a = '(%s / 3)' % n
+        b = '((%s - %s) / 2)' % (n, a)
+        c = '(%s - %s - %s)' % (n, a, b)
+        expr = '((%s * exp2(float(%s))) * exp2(float(%s))) * exp2(float(%s))' % (self.f(ops[1]), a, b, c)
+        self.set_vf(reg_range(ops[0])[1], expr, mods)
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
