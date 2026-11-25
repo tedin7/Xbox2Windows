@@ -12,6 +12,7 @@ The expected colours come from the fixture formula red = (1 + x + 4y + 16s + 32m
 exact fractions. Mutants: a sampler capped to MAX_LOD 0 and SampleGrad replaced by an implicit Sample must both
 return mip 0 on every probe, which the same draw must report as different from the expected colours.
 """
+import re
 import struct
 import subprocess
 import sys
@@ -147,45 +148,17 @@ def run_draw(renderer, adapter, vs, ps, expected, sampler):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def drop_gradients(hlsl):
-    """SampleGrad(smp, uv, ddx, ddy) -> Sample(smp, uv): split the arguments at top-level commas."""
-    out, pos = [], 0
-    while True:
-        at = hlsl.find('.SampleGrad(', pos)
-        if at < 0:
-            out.append(hlsl[pos:])
-            return ''.join(out)
-        out.append(hlsl[pos:at])
-        i = at + len('.SampleGrad(')
-        depth, args, cur = 0, [], ''
-        while True:
-            ch = hlsl[i]
-            if ch == '(':
-                depth += 1
-            elif ch == ')':
-                if depth == 0:
-                    break
-                depth -= 1
-            if ch == ',' and depth == 0:
-                args.append(cur.strip())
-                cur = ''
-            else:
-                cur += ch
-            i += 1
-        args.append(cur.strip())
-        assert len(args) == 4, args
-        out.append('.Sample(%s, %s' % (args[0], args[1]))
-        pos = i
-
-
 def check_draw(dxc, renderer, adapter, fxc=None):
     _src, code = build_program(SAMPLER_WORDS)
     pipe = pipeline(code)
     sampler = manifest_sampler(pipe)
     capped = manifest_sampler(pipeline(build_program(CAPPED_WORDS)[1]))
     hlsl = pipe.hlsl_ps()
-    implicit = drop_gradients(hlsl)
-    assert implicit != hlsl and '.SampleGrad(' not in implicit and implicit.count('.Sample(') == len(PROBES)
+    # Sample takes (sampler, uv) only: drop the two gradient arguments of each call.
+    gradient = r'float2\(F\(v\d+\), F\(v\d+\)\)'
+    implicit, changed = re.subn(rf', {gradient}, {gradient}(?=\);)', '', hlsl)
+    assert changed == hlsl.count('.SampleGrad(') == 4
+    implicit = implicit.replace('.SampleGrad(', '.Sample(')
     want = ','.join(f32_hex(float(r)) for r in reference())
     mip0 = ','.join(f32_hex(float(r)) for r in reference(0))
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
