@@ -21,15 +21,15 @@ from startup_sampler_heap_check import VS_WORDS, assemble, root_blob  # noqa: E4
 
 TAIL = 's[16:23], s[24:27] dmask:0xf dim:'
 IMAGE = {
-    'd2': 'image_sample_d v[4:7], v[0:5], ' + TAIL + 'SQ_RSRC_IMG_2D',
+    'd2': 'image_sample_d v[4:7], v[0:7], ' + TAIL + 'SQ_RSRC_IMG_2D',
     'd2nsa': 'image_sample_d v[4:7], [v0, v1, v2, v3, v1, v0], ' + TAIL + 'SQ_RSRC_IMG_2D',
-    'd3': 'image_sample_d v[4:7], v[0:8], ' + TAIL + 'SQ_RSRC_IMG_3D',
-    'd2a': 'image_sample_d v[4:7], v[0:6], ' + TAIL + 'SQ_RSRC_IMG_2D_ARRAY',
+    'd3': 'image_sample_d v[4:7], v[0:15], ' + TAIL + 'SQ_RSRC_IMG_3D',
+    'd2a': 'image_sample_d v[4:7], v[0:7], ' + TAIL + 'SQ_RSRC_IMG_2D_ARRAY',
     'd1': 'image_sample_d v[4:7], [v0, v1, v2], ' + TAIL + 'SQ_RSRC_IMG_1D',
-    'cd': 'image_sample_c_d v[4:7], v[0:6], ' + TAIL + 'SQ_RSRC_IMG_2D',
-    'do': 'image_sample_d_o v[4:7], v[0:6], ' + TAIL + 'SQ_RSRC_IMG_2D',
-    'dtfe': 'image_sample_d v[4:5], v[0:5], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
-    'dglc': 'image_sample_d v[4:7], v[0:5], ' + TAIL + 'SQ_RSRC_IMG_2D glc',
+    'cd': 'image_sample_c_d v[4:7], v[0:7], ' + TAIL + 'SQ_RSRC_IMG_2D',
+    'do': 'image_sample_d_o v[4:7], v[0:7], ' + TAIL + 'SQ_RSRC_IMG_2D',
+    'dtfe': 'image_sample_d v[4:5], v[0:7], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
+    'dglc': 'image_sample_d v[4:7], v[0:7], ' + TAIL + 'SQ_RSRC_IMG_2D glc',
 }
 WORDS = {
     'd2': bytes.fromhex('04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e0000803ef202047ef402067e7fc08cbf080f88f00004c400703f8cbf0f1800f804050607000081bf'),
@@ -117,6 +117,7 @@ def controls():
 
 
 def check_binary(llvm_mc):
+    # The assembler takes the wide tuple spelling (8 VGPRs, 16 for a volume); the decoder lists the active ones.
     for name, line in IMAGE.items():
         built = assemble(llvm_mc, PRE + line + '\n' + POST)
         if built != WORDS[name]:
