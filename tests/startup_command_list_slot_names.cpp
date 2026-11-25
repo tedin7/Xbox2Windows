@@ -41,6 +41,7 @@ int main()
         {22, "RSSetScissorRects"},
         {23, "OMSetBlendFactor"},
         {25, "SetPipelineState"},
+        {26, "ResourceBarrier"},
         {32, "SetDescriptorHeaps"},
         {34, "SetGraphicsRootSignature"},
         {36, "SetGraphicsRootDescriptorTable"},
@@ -82,9 +83,9 @@ int main()
     expect(is(59, "SetPredication"), "slot 59 is the desktop slot 55 plus four");
 
     // Slots that are not known stay unnamed: a name there would be a guess.
-    // 10 and 11: this console list resets through 139. 26 to 31: four console methods sit in this range.
+    // 10 and 11: this console list resets through 139. 27 to 31: the remaining unconfirmed methods before the shift.
     // Other slots from 60 up have unconfirmed meanings. -1 and 4096: outside the table.
-    std::vector<int> unknown = {10, 11, 26, 27, 28, 29, 30, 31, 60, 62, 63, 64, 66, 68, 70, 71, 72, 74, 75, 100, 126,
+    std::vector<int> unknown = {10, 11, 27, 28, 29, 30, 31, 60, 62, 63, 64, 66, 68, 70, 71, 72, 74, 75, 100, 126,
                                 131, 132, 138, 140, 142, 146, 255, 256, 999, 4096, -1, -100};
     for (const int slot : unknown) expect(x2w_list_slots::name(slot) == nullptr, "slot " + std::to_string(slot) + " has no name");
 
@@ -97,7 +98,7 @@ int main()
         for (const std::string& earlier : seen) expect(earlier != got, std::string("the name ") + got + " is used once");
         seen.push_back(got);
     }
-    expect(seen.size() == 10 + 14 + 28 + 2, "the named slots are 0 to 9, 12 to 25, 32 to 59, 61 and 139");
+    expect(seen.size() == 10 + 15 + 28 + 2, "the named slots are 0 to 9, 12 to 26, 32 to 59, 61 and 139");
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

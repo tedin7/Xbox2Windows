@@ -34,6 +34,29 @@ struct StreamTarget {
 int read_stream_target(ID3D12Device* desktop, StreamTarget& state, const char* pixels);
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
                        DXGI_FORMAT format, UINT scissor_width, StreamTarget& state);
+// Typed render-target formats the translated colour export covers (#1999 F). Integer targets are created
+// typeless and drawn with a second RGBA8 target; float targets are drawn alone.
+struct StreamMrtFormat {
+    bool integer;
+    bool single;
+    UINT bytes;
+    DXGI_FORMAT typeless;
+};
+inline bool stream_mrt_format(DXGI_FORMAT format, StreamMrtFormat& out)
+{
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+        out = {true, true, 4, DXGI_FORMAT_R8G8B8A8_TYPELESS}; return true;
+    case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: out = {true, true, 4, DXGI_FORMAT_R32_TYPELESS}; return true;
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: out = {true, true, 8, DXGI_FORMAT_R32G32_TYPELESS}; return true;
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+        out = {true, true, 16, DXGI_FORMAT_R32G32B32A32_TYPELESS}; return true;
+    case DXGI_FORMAT_R32_FLOAT: out = {false, true, 4, format}; return true;
+    case DXGI_FORMAT_R32G32_FLOAT: out = {false, true, 8, format}; return true;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: out = {false, true, 16, format}; return true;
+    default: return false;
+    }
+}
 using StreamWord = std::uint64_t;
 StreamWord invoke(void*, unsigned, StreamWord = 0, StreamWord = 0, StreamWord = 0, StreamWord = 0,
                   StreamWord = 0, StreamWord = 0, StreamWord = 0, StreamWord = 0);

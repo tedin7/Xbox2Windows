@@ -62,6 +62,13 @@ using EnqueueSignalFn = void(__stdcall*)(void*, void*, std::uint64_t);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
+
+// The status of a refused request: a too-small destination reports its own code, the others E_FAIL.
+long failed_hresult(const char* why)
+{
+    return why && std::strcmp(why, "destination capacity exceeded") == 0 ? HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+                                                                          : E_FAIL;
+}
 using AllocatePhysicalFn = BOOL(WINAPI*)(ULONG_PTR, PULONG_PTR, PULONG_PTR);
 using FreePhysicalFn = BOOL(WINAPI*)(ULONG_PTR, PULONG_PTR);
 
@@ -272,7 +279,7 @@ int main(int argc, char** argv)
     auto valid = [&](unsigned i) { return plan[i].outcome == completed || (plan[i].outcome == not_counted && i + 1 < request_count); };
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     // Room for every entry, so the queue does not submit itself before the page array is made unreadable.
     *reinterpret_cast<std::uint16_t*>(description + 8) = 4 * request_count;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "PageEnds", nullptr, &status_ptr) != 0 ||
@@ -316,9 +323,9 @@ int main(int argc, char** argv)
         char what[128];
         const bool done = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i);
         const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-        std::snprintf(what, sizeof what, "request %u status is %s (complete %d), got 0x%08lx", i, valid(i) ? "S_OK" : "E_FAIL",
+        std::snprintf(what, sizeof what, "request %u status is %s (complete %d), got 0x%08lx", i, valid(i) ? "S_OK" : "the failure's HRESULT",
                       done ? 1 : 0, static_cast<unsigned long>(hr));
-        ok = expect(done && hr == (valid(i) ? S_OK : E_FAIL), what) && ok;
+        ok = expect(done && hr == (valid(i) ? S_OK : failed_hresult(plan[i].why)), what) && ok;
         if (plan[i].outcome == not_counted) continue;
         ++expected[static_cast<unsigned>(plan[i].end)][plan[i].outcome == failed ? 1 : 0];
         ++(plan[i].outcome == failed ? page_failed : page_completed);

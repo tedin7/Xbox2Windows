@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -365,6 +366,7 @@ public:
     // not at all. All or nothing; a blob missing from the container is not_found.
     Status read_blobs(std::string_view container, const std::vector<std::string>& blobs, std::vector<std::vector<unsigned char>>& out) const
     {
+        // x2w-seam: store-read
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         for (const std::string& blob : blobs)
@@ -376,8 +378,10 @@ public:
         FileLock publication;
         if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
         std::vector<std::vector<unsigned char>> all(blobs.size());
-        for (std::size_t i = 0; i < blobs.size(); ++i)
+        for (std::size_t i = 0; i < blobs.size(); ++i) {
             if (const Status status = read_file(dir / blobs[i], all[i]); status != Status::ok) return status;
+            // x2w-seam: blob-read
+        }
         out = std::move(all);
         return Status::ok;
     }
@@ -419,9 +423,15 @@ public:
     // a commit from any process is listed whole or not at all. Regular files only, by name (byte
     // order), with their sizes; links, directories and names valid_name refuses are not listed.
     // not_found: no such container. busy: the publication point stayed locked for the whole lock
-    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok.
-    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out) const
+    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok. With
+    // `payloads`, the listed blobs are also read under the same lock (one generation for names,
+    // sizes and bytes); it is replaced only on ok, in the order of `out`. `read_if`, when given, sees
+    // the listing first: when it returns false nothing is read and `payloads` is left empty.
+    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out,
+                      std::vector<std::vector<unsigned char>>* payloads = nullptr,
+                      const std::function<bool(const std::vector<BlobEntry>&)>& read_if = {}) const
     {
+        // x2w-seam: store-read
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         std::error_code ec;
@@ -456,6 +466,18 @@ public:
         }
         if (ec) return Status::io_error;
         std::sort(found.begin(), found.end(), [](const BlobEntry& a, const BlobEntry& b) { return a.name < b.name; });
+        if (payloads) {
+            std::vector<std::vector<unsigned char>> all;
+            if (!read_if || read_if(found)) {
+                all.resize(found.size());
+                for (std::size_t i = 0; i < found.size(); ++i) {
+                    if (const Status status = read_file(dir / found[i].name, all[i]); status != Status::ok) return status;
+                    found[i].bytes = all[i].size();
+                    // x2w-seam: blob-read
+                }
+            }
+            *payloads = std::move(all);
+        }
         out = std::move(found);
         return Status::ok;
     }

@@ -9,6 +9,14 @@
 namespace x2w_startup::bc64 {
 constexpr UINT first_tail = 3, tile_bytes = 65536, tile_side = 256;
 
+inline UINT guest_layout_word(const D3D12_RESOURCE_DESC& d)
+{
+    UINT word;
+    static_assert(sizeof(word) == sizeof(d.Layout));
+    std::memcpy(&word, &d.Layout, sizeof(word));
+    return word;
+}
+
 inline bool supports(const D3D12_RESOURCE_DESC& d)
 {
     const bool six = d.MipLevels == 6 && d.Height == 1024 && d.DepthOrArraySize == 1;
@@ -16,7 +24,7 @@ inline bool supports(const D3D12_RESOURCE_DESC& d)
                       (d.DepthOrArraySize == 1 || d.DepthOrArraySize == 2);
     return (six || nine) && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Alignment == 0 &&
            d.Width == 1024 && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 &&
-           static_cast<UINT>(d.Layout) == 0x109 && d.Flags == D3D12_RESOURCE_FLAG_NONE &&
+           guest_layout_word(d) == 0x109 && d.Flags == D3D12_RESOURCE_FLAG_NONE &&
            (d.Format == DXGI_FORMAT_BC5_UNORM || d.Format == DXGI_FORMAT_BC7_UNORM);
 }
 

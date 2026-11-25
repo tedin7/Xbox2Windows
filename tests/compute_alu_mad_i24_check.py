@@ -7,6 +7,7 @@ tests/compute_store_check.py with its ALU lines replaced by three v_mad_i32_i24,
     controls                              translator only
     draw <dxc> <renderer> <adapter>       translate, dispatch and compare the UAV readback
 """
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -205,6 +206,11 @@ def draw(directory, compiler, renderer, backend):
         mutant.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mutant_cso, mutant], check=True)
         run_rejected([*cmd[:3], mutant_cso, case], f"mutation '{label}'", "Compute readback differs")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in lines if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

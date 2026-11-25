@@ -13,9 +13,11 @@
 // write the whole array and validate the process heap.
 //
 // The log, one line on standard output:
-//   <thread><reason>=<s><t>   a TLS callback: thread m (initial), a or b; reason 1 process attach,
+//   <thread><reason>=<s><t>[<p>]  a TLS callback: thread m (initial), a or b; reason 1 process attach,
 //                             2 thread attach, 3 thread detach; s = y/n slot 0 is the image's block;
-//                             t = y/n the block holds the template, - when not checked
+//                             t = y/n the block holds the template, - when not checked; p, process
+//                             attach only: y/n GetModuleHandleW(nullptr) is this image's base, as it is
+//                             for the process image under a Windows launch
 //   <thread>:<s><t><w><h>     a thread's own check: slot 0, template, whole-array write read back,
 //                             HeapValidate after the write (- when not checked)
 //   X=<exit code>             the number of n results
@@ -41,6 +43,8 @@
 #include <cstdint>
 
 #pragma runtime_checks("", off)
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;  // this image's base, wherever it is mapped
 
 // The TLS support the C runtime's tlssup provides, for an EXE linked without it.
 extern "C" {
@@ -136,7 +140,11 @@ void NTAPI callback(PVOID, DWORD reason, PVOID) {
     const bool slot = in_slot0();
     // On thread detach the thread has already written its copy, so only slot 0 is checked.
     const char intact = slot && reason != DLL_THREAD_DETACH ? yes_no(template_intact()) : '-';
-    record(static_cast<char>('0' + reason), yes_no(slot), intact, 0, 0);
+    // Process identity before the entry point runs: the PEB's image base, read through GetModuleHandle(NULL).
+    const char process = reason == DLL_PROCESS_ATTACH
+                             ? yes_no(GetModuleHandleW(nullptr) == reinterpret_cast<HMODULE>(&__ImageBase))
+                             : 0;
+    record(static_cast<char>('0' + reason), yes_no(slot), intact, process, 0);
 }
 
 // A thread's own check: slot 0, its template copy, a whole-array write and the process heap.

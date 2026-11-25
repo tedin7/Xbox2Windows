@@ -9,11 +9,16 @@
 //   the slots between them (0 to 6, 8, 14 to 19, 24) take the desktop names.
 // - Slots 10 and 11 are not named. The desktop order puts Reset and ClearState there, but this
 //   console list resets through slot 139, so the desktop order is not known to hold at 10 and 11.
-// - Slots 26 to 31 are not named. The slots that follow are the desktop ones moved up by four
-//   (32 is SetDescriptorHeaps, desktop 28), so four console methods sit somewhere in 26 to 31 and
-//   which desktop slot is which is not known.
-// - Slots 32 to 59 are the desktop slots 28 to 55 plus four. Implemented and checked against the
-//   desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52.
+// - Slot 26 accepts the UAV form of ResourceBarrier. Slots 27 to 31 are not named here. The slots
+//   that follow are the desktop ones moved up by four
+//   (32 is SetDescriptorHeaps, desktop 28), so four console methods sit somewhere in 26 to 31.
+//   As a hypothesis, d3d12_xs_device.cpp binds 28, 29 and 30 as BeginQuery, EndQuery and
+//   ResolveQueryData, only with the diagnostic X2W_D3D12_QUERY_SLOTS=1. No fixture here establishes
+//   which console methods sit there.
+// - Slots 32 to 59 are named as the desktop slots 28 to 55 plus four. Implemented and checked
+//   against the desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52. Past 52 the rule is not
+//   checked: ExecuteIndirect (desktop 59) is at 61, desktop plus two, so the run of four has ended
+//   by then. The 56 to 58 names below are kept as the rule gives them.
 // - Slots 61 (ExecuteIndirect) and 139 (Reset) are implemented in d3d12_xs_device.cpp.
 // - Other slots have no confirmed meaning.
 #pragma once
@@ -41,6 +46,7 @@ inline constexpr int desktop_method_count = static_cast<int>(sizeof(desktop_name
 static_assert(desktop_method_count == 51, "ID3D12GraphicsCommandList has 51 methods of its own");
 
 inline constexpr int console_shift = 4;  // console slot = desktop slot + 4, from SetDescriptorHeaps on
+inline constexpr int resource_barrier_slot = 26;
 inline constexpr int first_shifted_slot = 32;
 inline constexpr int last_shifted_slot = 59;
 inline constexpr int execute_indirect_slot = 61;
@@ -53,7 +59,7 @@ inline const char* name(int slot) noexcept
     static constexpr const char* iunknown[] = {"QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData",
                                                 "SetPrivateDataInterface", "SetName", "GetDevice", "GetType"};
     if (slot >= 0 && slot < first_desktop_method) return iunknown[slot];
-    if (slot == first_desktop_method || (slot >= 12 && slot <= 25)) return desktop(slot);
+    if (slot == first_desktop_method || (slot >= 12 && slot <= resource_barrier_slot)) return desktop(slot);
     if (slot >= first_shifted_slot && slot <= last_shifted_slot) return desktop(slot - console_shift);
     if (slot == execute_indirect_slot) return "ExecuteIndirect";
     if (slot == reset_slot) return "Reset";

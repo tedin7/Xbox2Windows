@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -99,6 +100,29 @@ def extract_native_rdna2_code(program: bytes) -> bytes | None:
     return image[start:ends[-1]]
 
 
+def _write_atomic(path: Path, content: str) -> None:
+    """Write content to a sibling temp file and atomically replace path, leaving no temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def extract_shaders(
     archive_path: Path,
     output_dir: Path,
@@ -115,12 +139,21 @@ def extract_shaders(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
-        import tempfile
         fallback = Path(tempfile.gettempdir()) / "xbox2windows-shaders"
         fallback.mkdir(parents=True, exist_ok=True)
         print(f"[!] Warning: Cannot write to '{output_dir}'. Falling back to '{fallback}'.", file=sys.stderr)
         output_dir = fallback
 
+    def ensure_separate_output(path: Path) -> None:
+        try:
+            collision = path.samefile(archive_path)
+        except FileNotFoundError:
+            return
+        if collision:
+            raise ValueError(f"Output file would overwrite the input archive: {path}")
+
+    manifest_path = output_dir / "manifest.json"
+    ensure_separate_output(manifest_path)
     archive_size = archive_path.stat().st_size
     print(f"[*] Opening archive: {archive_path.name} ({archive_size / (1024*1024):.1f} MB)...")
     start_time = time.time()
@@ -214,6 +247,7 @@ def extract_shaders(
                 # Save formats
                 if extract_format in ("dxbc", "both"):
                     dxbc_path = stage_dir / f"{file_stem}.dxbc"
+                    ensure_separate_output(dxbc_path)
                     with dxbc_path.open("wb") as out_f:
                         out_f.write(blob)
                     record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
@@ -221,6 +255,7 @@ def extract_shaders(
                 if extract_format in ("native", "both"):
                     if native_code:
                         bin_path = stage_dir / f"{file_stem}.bin"
+                        ensure_separate_output(bin_path)
                         with bin_path.open("wb") as out_f:
                             out_f.write(native_code)
                         record_info["native_file"] = f"{stage}/{file_stem}.bin"
@@ -228,6 +263,7 @@ def extract_shaders(
                     elif extract_format == "native":
                         # Fallback to dxbc if native code not unpackable
                         dxbc_path = stage_dir / f"{file_stem}.dxbc"
+                        ensure_separate_output(dxbc_path)
                         with dxbc_path.open("wb") as out_f:
                             out_f.write(blob)
                         record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
@@ -244,7 +280,6 @@ def extract_shaders(
                     break
 
     # Save manifest.json
-    manifest_path = output_dir / "manifest.json"
     manifest_data = {
         "archive": archive_path.name,
         "total_extracted": extracted_count,
@@ -252,8 +287,7 @@ def extract_shaders(
         "stage_distribution": dict(stage_counters),
         "shaders": extracted_records,
     }
-    with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(manifest_data, f, indent=2)
+    _write_atomic(manifest_path, json.dumps(manifest_data, indent=2))
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
@@ -272,7 +306,7 @@ def extract_shaders(
     return output_dir, manifest_path
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path, help="Path to shaders.rpf file")
     parser.add_argument(
@@ -306,24 +340,32 @@ def main():
         help="Interpret a matching printable byte as a record name's length prefix",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
 
-    if not args.archive.is_file():
-        print(f"[-] Error: File not found: {args.archive}", file=sys.stderr)
-        return 1
-
-    target_stages = set(args.stage)
-    extract_shaders(
-        archive_path=args.archive,
-        output_dir=args.output_dir,
-        target_stages=target_stages,
-        limit=args.limit,
-        extract_format=args.format,
-        length_prefixed_names=args.length_prefixed_names,
-    )
+    try:
+        archive_path = args.archive.resolve()
+        output_dir = args.output_dir.resolve()
+        if not args.archive.exists():
+            raise FileNotFoundError(f"File not found: {args.archive}")
+        if not args.archive.is_file():
+            raise ValueError(f"Archive path is not a file: {args.archive}")
+        if output_dir == archive_path:
+            raise ValueError(f"Output directory must not match archive path: {args.output_dir}")
+        if args.output_dir.exists() and not args.output_dir.is_dir():
+            raise ValueError(f"Output path exists and is not a directory: {args.output_dir}")
+        extract_shaders(
+            archive_path=args.archive,
+            output_dir=args.output_dir,
+            target_stages=set(args.stage),
+            limit=args.limit,
+            extract_format=args.format,
+            length_prefixed_names=args.length_prefixed_names,
+        )
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        parser.exit(1, f"[-] Error: {exc}\n")
     return 0
 
 

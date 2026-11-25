@@ -1,4 +1,5 @@
 """Check the compute store profile's v_max3_u32 and v_min3_u32 lowering with an original synthetic kernel."""
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -189,6 +190,11 @@ def draw(directory, compiler, renderer, backend):
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"read_minmax3: mutation '{label}' escaped detection\n{bad.stderr}")
         print(f"read_minmax3: mutation '{label}' fails")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in READ_MINMAX3 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

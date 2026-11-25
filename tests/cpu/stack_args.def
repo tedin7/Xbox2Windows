@@ -1,0 +1,18 @@
+EXPORTS
+    call_six
+    call_seven
+    call_scratch
+    call_rec
+    call_eight
+    call_fill
+    call_edge
+    call_twelfth
+    lost_slot
+    unset_slot
+    narrow_slot
+    reread_slot
+    tail_six
+    export_fifth
+    far_slot
+    straddle_slot
+    high_slots

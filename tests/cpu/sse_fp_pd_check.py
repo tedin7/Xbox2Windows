@@ -354,7 +354,7 @@ def check_rejections(original_path):
     out_of_scope = [
         (name, (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(code, R.XMM0, R.XMM1), ret_ins))
         for name, code in (
-            ("andpd", Code.ANDPD_XMM_XMMM128), ("xorpd", Code.XORPD_XMM_XMMM128),
+            ("unpckhpd", Code.UNPCKHPD_XMM_XMMM128), ("cvtdq2pd", Code.CVTDQ2PD_XMM_XMMM64),
             ("unpcklpd", Code.UNPCKLPD_XMM_XMMM128), ("haddpd", Code.HADDPD_XMM_XMMM128),
             ("addsubpd", Code.ADDSUBPD_XMM_XMMM128), ("cvtps2pd", Code.CVTPS2PD_XMM_XMMM64),
             ("cvtpd2ps", Code.CVTPD2PS_XMM_XMMM128), ("addsd", Code.ADDSD_XMM_XMMM64),
@@ -363,7 +363,7 @@ def check_rejections(original_path):
             ("rcpps", Code.RCPPS_XMM_XMMM128), ("rsqrtps", Code.RSQRTPS_XMM_XMMM128),
         )
     ] + [
-        ("cmpsd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_u32(Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0, R.XMM1, 0), ret_ins)),
+        ("movupd", (Instruction.create_reg_mem(Code.MOVUPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX)), ret_ins)),
         ("shufpd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_u32(Code.SHUFPD_XMM_XMMM128_IMM8, R.XMM0, R.XMM1, 0), ret_ins)),
         ("cvtpi2pd", (Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM0, MemoryOperand(R.RDX)), ret_ins)),
     ]
@@ -455,7 +455,7 @@ def check_rejections(original_path):
         pdata_end_off = pe.get_offset_from_rva(pdata.VirtualAddress + rec_idx + 4)
         max_len = struct.unpack_from("<I", records, rec_idx + 4)[0] - entry
     by_label = {label: (seq, reason) for label, seq, reason in unit}
-    pe_patches = ("vaddpd_vex", "cmpsd", "cmppd_imm_8", "unaligned_cmppd_m128", "andpd", "addsd", "unaligned_divpd_m128", "nonvolatile_xmm7_addpd_dst",
+    pe_patches = ("vaddpd_vex", "movupd", "cmppd_imm_8", "unaligned_cmppd_m128", "unpckhpd", "addsd", "unaligned_divpd_m128", "nonvolatile_xmm7_addpd_dst",
                   "undefined_sqrtpd_src", "nonvolatile_base_rbx_sqrtpd", "missing_ret")
     with TemporaryDirectory() as folder:
         patched_path = Path(folder) / "patched.dll"

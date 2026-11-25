@@ -16,7 +16,7 @@
 // Before Submit each page holds a sentinel pattern of its own; the sentinels differ from each other and
 // from each stream's bytes at every offset of the destination, so a sentinel byte is never a data byte.
 // Checked:
-//   - status: S is S_OK, R is E_FAIL;
+//   - status: S is S_OK, R is ERROR_INSUFFICIENT_BUFFER;
 //   - fences: each runs after its own status entry and before the next request's, in queue order;
 //   - consumer read at each fence (in the fence callback) and again on the test thread after both:
 //     S's page shows its sentinel below 0xF000 and the exact inflated bytes from 0xF000; every byte of
@@ -303,7 +303,7 @@ int main(int argc, char** argv)
     const ULONGLONG live_before = live_sections(stats);
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, slot_count, "ConsumerPair", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {
@@ -346,7 +346,7 @@ int main(int argc, char** argv)
         return fences[slot].signaled != 0;
     };
     // At fence `slot`, the entries up to it are complete with their result and the later ones are not.
-    const long result[slot_count] = {S_OK, E_FAIL, S_OK};
+    const long result[slot_count] = {S_OK, HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), S_OK};
     auto check_fence = [&](unsigned slot, unsigned upto) {
         char what[160];
         const Fence& fence = fences[slot];
@@ -371,7 +371,7 @@ int main(int argc, char** argv)
         char what[96];
         const bool done = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i);
         const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-        std::snprintf(what, sizeof what, "%s status is %s (complete %d), got 0x%08lx", i ? "R" : "S", i ? "E_FAIL" : "S_OK",
+        std::snprintf(what, sizeof what, "%s status is %s (complete %d), got 0x%08lx", i ? "R" : "S", i ? "ERROR_INSUFFICIENT_BUFFER" : "S_OK",
                       done ? 1 : 0, static_cast<unsigned long>(hr));
         ok = expect(done && hr == result[i], what) && ok;
     }
@@ -443,7 +443,7 @@ int main(int argc, char** argv)
     VirtualFree(view, 0, MEM_RELEASE);
     DeleteFileW(log_path);
     if (!ok) return 1;
-    std::puts("S published its exact bytes at its fence; R reported E_FAIL and every byte of its page stayed its sentinel "
+    std::puts("S published its exact bytes at its fence; R reported ERROR_INSUFFICIENT_BUFFER and every byte of its page stayed its sentinel "
               "(no stream prefix) at its fence and after; the pages were unmapped and freed, and a follow-up of S's shape "
               "into a page allocated afterwards completed with exact bytes");
     return 0;

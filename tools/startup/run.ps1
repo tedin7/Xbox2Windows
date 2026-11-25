@@ -26,7 +26,10 @@ param(
     [switch]$FakeUser,                         # answer the user API for one local user
     [switch]$GpuMirror,                        # map CPU-view pages into the paired GPU-view reservation
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
-    [switch]$StartupBelow40                    # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
+    [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -45,8 +48,12 @@ if (Test-Path $config) {
 if ($StoragePath) { $env:X2W_STORAGE_PATH = $StoragePath }
 if ($InputScript) { $env:X2W_INPUT_SCRIPT = $InputScript }
 if ($FakeUser) { $env:X2W_FAKE_USER = "1" }
+if (-not $FakeUser -and $env:X2W_FAKE_USER -ne "1") {
+    Write-Warning "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
+}
 if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
+if ($TraceApi) { $env:X2W_TRACE_API = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
 if ($Render) {
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
@@ -56,8 +63,29 @@ if ($Render) {
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
-& $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-    --trace-files 1 --continue-asserts $ContinueAsserts *> "$LogDir.out"
-$debuggerExit = $LASTEXITCODE
+$translator = $null
+if ($Translate -and -not $Render) { Write-Warning "-Translate needs -Render (no shader cache without it); ignored" }
+if ($Translate -and $Render) {
+    $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
+        -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
+        -RedirectStandardOutput (Join-Path $LogDir "translate.txt") -RedirectStandardError (Join-Path $LogDir "translate_err.txt")
+}
+$traceArgs = @()
+if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+try {
+    & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
+        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
+    $debuggerExit = $LASTEXITCODE
+} finally {
+    # taskkill /T needs a live parent PID to reach the watcher's workers.
+    if ($translator -and -not $translator.HasExited) {
+        # Stop the workers as well. The watcher or a worker can exit during taskkill;
+        # in Windows PowerShell 5.1 its redirected stderr would then abort the launcher.
+        & {
+            $ErrorActionPreference = "Continue"
+            & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null
+        }
+    }
+}
 Get-Content "$LogDir.out" -TotalCount 5
 exit $debuggerExit

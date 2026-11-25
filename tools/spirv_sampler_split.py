@@ -26,6 +26,7 @@ from collections import defaultdict
 from pathlib import Path
 import shlex
 import sys
+import tempfile
 
 PREFIX = "%x2w_plain_sampler"
 ZERO = {"0", "0.0", "0x0p+0", "-0", "-0.0", "-0x0p+0"}
@@ -231,22 +232,49 @@ def split_comparison_sampler(assembly, ordinary_binding):
     return "\n".join(lines) + "\n", mappings if sequence else mappings[0]
 
 
-def main():
+def _write_atomic(path: Path, content: str) -> None:
+    """Write content to a sibling temp file and atomically replace path, leaving no temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("input", type=Path, help="SPIR-V assembly")
     parser.add_argument("output", type=Path, help="lowered SPIR-V assembly")
     parser.add_argument("--ordinary-binding", type=int, required=True, action="append",
                         help="free binding, in the comparison sampler's descriptor set, for the ordinary sampler; "
                              "repeat once per mixed sampler, in declaration order, with distinct values")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        assembly, mapping = split_comparison_sampler(args.input.read_text(encoding="utf-8"),
-                                                     args.ordinary_binding[0] if len(args.ordinary_binding) == 1
-                                                     else args.ordinary_binding)
-    except ValueError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
-    args.output.write_text(assembly, encoding="utf-8", newline="\n")
+        if any(binding < 0 for binding in args.ordinary_binding):
+            raise ValueError("Ordinary sampler binding must be nonnegative")
+        if len(set(args.ordinary_binding)) != len(args.ordinary_binding):
+            raise ValueError("Ordinary sampler bindings must be distinct")
+        if args.output.resolve() == args.input.resolve():
+            raise ValueError(f"output path must not match input path: {args.output}")
+        bindings = args.ordinary_binding[0] if len(args.ordinary_binding) == 1 else args.ordinary_binding
+        assembly, mapping = split_comparison_sampler(args.input.read_text(encoding="utf-8"), bindings)
+        _write_atomic(args.output, assembly)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        parser.exit(1, f"error: {error}\n")
     if mapping:
         for entry in mapping if isinstance(mapping, list) else [mapping]:
             print(" ".join(f"{key}={value}" for key, value in entry.items()))

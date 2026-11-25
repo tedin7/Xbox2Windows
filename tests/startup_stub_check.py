@@ -104,6 +104,9 @@ requests_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summ
 blank_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(2))} if summary else {}
 bcpack_ok = (requests_by_format.get(6) == 1 and blank_by_format.get(6) == 1
              and requests_by_format.get(1) == 2 and blank_by_format.get(1, 0) == 0
+             and requests_by_format.get(3) == 3 and blank_by_format.get(3, 0) == 0
+             and requests_by_format.get(4) == 4 and blank_by_format.get(4, 0) == 0
+             and requests_by_format.get(5) == 3 and blank_by_format.get(5, 0) == 0
              and requests_by_format.get(7) == 4 and blank_by_format.get(7, 0) == 0)
 if summary:
     print(summary.group(0))
@@ -146,6 +149,14 @@ ok = (run.returncode == 0 and "store context 5832575300000001" in run.stdout
 print(f"store context: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"store context: exit {run.returncode}, stdout {run.stdout.strip()!r}, stderr {run.stderr.strip()!r}")
+
+# File::GetFileInformation after Close returns ERROR_INVALID_HANDLE, with the trap log unset and set.
+run = subprocess.run([consumer, "dstorage-file-information"], capture_output=True, text=True, env=env, timeout=20)
+print(run.stdout.strip())
+ok = run.returncode == 0 and "dstorage-file-information ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage file-information control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage file-information control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
 
 if failures:
     print("FAIL")

@@ -1,0 +1,11 @@
+EXPORTS
+    pandn_reg
+    pandn_mem
+    pavgb_reg
+    pavgb_mem
+    pmaddubsw_reg
+    pmaddubsw_mem
+    pshufb_reg
+    pshufb_mem
+    bytes_mem_r8_chain
+    bytes_aligned

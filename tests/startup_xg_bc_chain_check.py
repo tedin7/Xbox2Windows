@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from startup_address_srv_check import draw_texture
-from startup_xg_bc7_layout_check import PTR, HRESULT, DESC, LAYOUT_BYTES, LAYOUT, COPY_INTO, RELEASE
+from startup_xg_bc7_layout_check import PTR, HRESULT, DESC, LAYOUT_BYTES, LAYOUT, COPY_INTO, COPY_FROM, RELEASE
 
 OFFSETS = (0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000)
 TOTAL = 0x160000
@@ -80,6 +80,7 @@ def prepare(create, fmt, path):
         assert entries.raw[36:] == b"\xfe" * 36
         guest = ctypes.create_string_buffer(b"\xa5" * TOTAL, TOTAL)
         expected_guest = bytearray(guest.raw)
+        copy_from = COPY_FROM(slots[9])
         for level in range(6):
             side = 256 >> level
             row_pitch = side * 16 + 16
@@ -94,8 +95,15 @@ def prepare(create, fmt, path):
             source = ctypes.create_string_buffer(bytes(linear), len(linear))
             assert COPY_INTO(slots[8])(computer, guest, 0, level, source, row_pitch, len(linear)) == 0
             result = ctypes.create_string_buffer(b"\xe7" * len(linear), len(linear))
-            assert COPY_INTO(slots[9])(computer, result, 0, level, guest, row_pitch, len(linear)) == 0
+            assert copy_from(computer, result, 0, level, 0, guest, row_pitch, 0) == 0
             assert result.raw == bytes(linear), f"mip {level} copy-out or row padding mismatch"
+        refused_mip = 5
+        blocks = 256 >> refused_mip
+        pitch = blocks * 16
+        sentinel = b"\xad" * (pitch * blocks)
+        refused = ctypes.create_string_buffer(sentinel, len(sentinel))
+        assert copy_from(computer, refused, 0, refused_mip, 1, guest, pitch, 0) & 0xffffffff == 0x80004001
+        assert refused.raw == sentinel, "unsupported copy-out option changed destination"
         assert guest.raw == bytes(expected_guest), "tiled blocks or padding differ"
         error = COPY_INTO(slots[8])(computer, guest, 0, 6, source, row_pitch, len(linear))
         assert error & 0xffffffff == 0x80070057 and guest.raw == bytes(expected_guest)

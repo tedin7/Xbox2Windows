@@ -56,6 +56,10 @@ skipped fixture. An `observed_without_pass` row appears in fixture evidence but
 has no passing or skipped fixture. An `unobserved` row has no matching evidence
 in the supplied measurement. A partial run can therefore list forms exercised
 elsewhere. Check current fixtures and open PRs before choosing a form to work on.
+Use the records directory of the preset that produced the JUnit file, for example
+`out/build/release/form_coverage` for a `release` run. The tool exits with status
+2 if that directory does not exist, and warns on stderr if none of its records
+was written during the JUnit run, since no record-mode or shader form then counts.
 
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 

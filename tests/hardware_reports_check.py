@@ -253,6 +253,31 @@ class HardwareReportChecks(unittest.TestCase):
                 self.assertEqual([(item["comment_id"], item["reason"]) for item in summary["review"]],
                                  [(700, f"duplicate test section: {name}")])
 
+    def test_conflicting_backends_go_to_manual_review(self):
+        hardware = report()
+        warp = report(backend="warp", adapter="Microsoft Basic Render Driver", lanes=4, lane_range="4..4")
+        cases = [
+            (hardware.replace("Backend: hardware", "Backend: warp"),
+             "conflicting backends: report says warp, test sections say hardware"),
+            (warp.replace("Backend: warp", "Backend: hardware"),
+             "conflicting backends: report says hardware, test sections say warp"),
+            (hardware.replace("### bvh_wave64_hardware", "### bvh_wave64_warp"),
+             "conflicting backends: test sections name both hardware and warp"),
+        ]
+        for body, reason in cases:
+            with self.subTest(reason=reason):
+                summary = hardware_reports.summarize([comment(702, body + "\n\n" + warp)], README)
+                self.assertEqual([(item["adapter"], item["backend"], item["row"]) for item in summary["unrecorded"]],
+                                 [("Microsoft Basic Render Driver", "warp", "Microsoft WARP (software)")])
+                self.assertEqual([(item["comment_id"], item["reason"]) for item in summary["review"]],
+                                 [(702, reason)])
+
+    def test_section_suffix_supplies_a_missing_backend_header(self):
+        for backend in ("hardware", "warp"):
+            with self.subTest(backend=backend):
+                body = report(backend=backend).replace(f"Backend: {backend}\r\n", "")
+                self.assertEqual(only_report(body).backend, backend)
+
     def test_edited_reports_are_read_with_a_note(self):
         edited = report().replace(f"Source commit: {COMMIT}", "**Source commit:** `0123456`")
         parsed = only_report(edited.replace(" - SKIP", " \u2014 SKIP"))

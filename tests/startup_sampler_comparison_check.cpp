@@ -51,10 +51,30 @@ int main()
     const auto both = x2w_startup::decode_statics(mixed);
     expect(both.size() == 2, "two samplers", int(both.size()));
     if (both.size() == 2) {
-        expect(both[0].ShaderRegister == 0 && both[0].Filter == 0x0 && both[0].ComparisonFunc == D3D12_COMPARISON_FUNC_ALWAYS,
+        expect(both[0].ShaderRegister == 0 && both[0].Filter == 0x0 && both[0].ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER,
                "ordinary sampler at register 0", both[0].Filter, both[0].ComparisonFunc);
         expect(both[1].ShaderRegister == 1 && both[1].Filter == 0x80 && both[1].ComparisonFunc == D3D12_COMPARISON_FUNC_LESS,
                "comparison sampler at register 1", both[1].Filter, both[1].ComparisonFunc);
+    }
+    // An smpl line (image_sample_b) carries MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12), u4.8, to MinLOD and
+    // MaxLOD; the same words on an smp line keep MinLOD 0 and an unbounded MaxLOD.
+    x2w_startup::TranslatedSamplers limits;
+    expect(limits.read_manifest_line("smpl 0 0x0 0x100200 0x4000000 0x0") &&
+           limits.read_manifest_line("smp 1 0x0 0x100200 0x4000000 0x0") &&
+           limits.read_manifest_line("smpl 2 0x0 0xfff000 0x4000000 0x0") &&
+           limits.read_manifest_line("smpl 3 0x0 0x180 0x4000000 0x0"), "limit lines parsed");
+    const auto bounded = x2w_startup::decode_statics(limits);
+    expect(bounded.size() == 4, "four limit samplers", int(bounded.size()));
+    if (bounded.size() == 4) {
+        expect(bounded[0].MinLOD == 2.0f && bounded[0].MaxLOD == 1.0f, "smpl MIN_LOD 2.0 and MAX_LOD 1.0",
+               int(bounded[0].MinLOD * 256), int(bounded[0].MaxLOD * 256));
+        expect(bounded[1].MinLOD == 0.0f && bounded[1].MaxLOD == D3D12_FLOAT32_MAX, "smp keeps unbounded limits",
+               int(bounded[1].MinLOD), 0);
+        expect(bounded[2].MaxLOD == 4095.0f / 256.0f, "smpl MAX_LOD 15.996", int(bounded[2].MaxLOD * 256), 0);
+        expect(bounded[3].MinLOD == 1.5f && bounded[3].MaxLOD == 0.0f, "smpl MIN_LOD 1.5 and MAX_LOD 0",
+               int(bounded[3].MinLOD * 256), int(bounded[3].MaxLOD * 256));
+        expect(bounded[0].Filter == bounded[1].Filter && bounded[0].AddressU == bounded[1].AddressU,
+               "smpl decodes the other fields like smp", bounded[0].Filter, bounded[1].Filter);
     }
     std::printf(failures ? "startup_sampler_comparison failed\n" : "startup_sampler_comparison ok\n");
     return failures ? 1 : 0;

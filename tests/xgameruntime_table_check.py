@@ -39,12 +39,19 @@ REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XSystemGetConsoleId",
     "XSystemGetDeviceType",
     "XGameGetXboxTitleId",
-}
-REQUIRED_STUBS = {
     "XUserAddAsync",
+    "XUserAddResult",
     "XGameSaveInitializeProviderAsync",
+    "XGameSaveInitializeProviderResult",
+    "XAsyncGetStatus",
+    "XAsyncGetResultSize",
+    "XTaskQueueCreate",
+    "XTaskQueueDispatch",
+    "XTaskQueueCloseHandle",
     "XPackageMountWithUiAsync",
+    "XPackageMountWithUiResult",
 }
+REQUIRED_STUBS = set()
 STATES = {"stub", "implemented_hr", "implemented_void", "implemented_value"}
 
 ROW_RE = re.compile(

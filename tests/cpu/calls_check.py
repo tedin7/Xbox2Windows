@@ -9,6 +9,7 @@ be emitted once, and patched copies must be refused with their stated reason.
 import ctypes
 from pathlib import Path
 import random
+import re
 import struct
 import sys
 
@@ -121,6 +122,9 @@ def layout(pe, export_rva):
         raise AssertionError(f"no call in {name}")
 
     rvas.update(leaf=first_call("call_leaf"), mid=first_call("chain3"), low=first_call("narrow_call"))
+    data = pe.get_data(rvas["chain3"], 64)
+    rvas["chain3_call"] = next(ins.ip for ins in Decoder(64, data, ip=rvas["chain3"])
+                               if ins.flow_control == FlowControl.CALL)
     return rvas
 
 
@@ -173,9 +177,12 @@ def check(probe_path, original_path, lifted_path):
 # the callees' RVAs as {leaf}, {mid} and {low}.
 CALL = "e8 ?? ?? ?? ??"
 CONTROLS = [
-    ("call_leaf", [("call_leaf", 0x08, CALL, ("call", "call_leaf"))], "self-recursion"),
-    ("chain3", [("mid", 0x0c, CALL, ("call", "chain3"))],
-     "callee at RVA {mid:#x} refused: mutual recursion: call cycle"),
+    # Recursion through CALL is translated (tests/cpu/recursion_check.py); a cycle that a tail jump
+    # closes is not. A reason of None means the patched copy must translate.
+    ("call_leaf", [("call_leaf", 0x08, CALL, ("call", "call_leaf"))], None),
+    ("chain3", [("mid", 0x0c, CALL, ("call", "chain3"))], None),
+    ("tail_after_frame", [("mid", 0x0c, CALL, ("call", "tail_after_frame"))],
+     "callee at RVA {mid:#x} refused: callee at RVA {tail_after_frame:#x} refused: tail jump within a call cycle"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("leaf", 1)))], "is not a function entry"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("leaf", 4)))], "is not a function entry"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("rva", "end")))], "call target outside the image"),
@@ -189,9 +196,9 @@ CONTROLS = [
     # first call left undefined.
     ("call_leaf", [("call_leaf", 0x0d, "48 89 03 48 83 c0 01", ("call", "leaf"))], "callee argument rcx is undefined"),
     ("narrow_call", [("narrow_call", 0x0d, "0f b6 c0", "0f 94 c0")], "flags clobbered by the call"),
-    # mid_step reads the fifth-argument slot above its caller's home area.
+    # mid_step reads the fifth-argument slot above its caller's home area, where chain3 pushed RSI.
     ("chain3", [("mid", 0x11, "48 03 44 24 20", "48 03 44 24 50")],
-     "callee at RVA {mid:#x} refused: unsupported stack argument"),
+     "stack argument 5 of the call at RVA {chain3_call:#x} holds a saved register"),
     # An unsupported instruction in leaf_mix refuses mid_step and with it chain3.
     ("chain3", [("leaf", 0x04, "48 03 c2", "0f a2 90")],
      "callee at RVA {mid:#x} refused: callee at RVA {leaf:#x} refused: unsupported instruction"),
@@ -236,7 +243,7 @@ def check_rejections(original_path):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "control.dll"
             for name, patches, reason in CONTROLS:
-                reason = reason.format(**rvas)
+                reason = None if reason is None else reason.format(**rvas)
                 damaged = bytearray(data)
                 sites = []
                 for function, delta, before, after in patches:
@@ -263,6 +270,12 @@ def check_rejections(original_path):
                             raise AssertionError(f"unexpected encoding for control {reason!r} in {function}")
                     damaged[at:at + len(after)] = after
                 path.write_bytes(damaged)
+                if reason is None:
+                    source, _ = aot.translate(path, [name])
+                    if not re.search(r"^static word fn_[0-9a-f]+\(word rcx, word rdx, word r8, word r9\);$", source, re.M):
+                        raise AssertionError(f"{name} control ({', '.join(sites)}) has no declared call cycle")
+                    print(f"control {name} ({', '.join(sites)}): translated with a declared call cycle")
+                    continue
                 try:
                     aot.translate(path, [name])
                 except ValueError as error:

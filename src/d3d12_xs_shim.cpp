@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
+#include <vector>
 
 #include "d3d12x_device_slots.h"
 
@@ -39,6 +41,152 @@ struct VmState {
     bool device_created = false;
 };
 VmState vm_state;
+
+// Desktop root-signature flags for direct heap indexing (CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and
+// SAMPLER_HEAP_DIRECTLY_INDEXED). A desktop runtime older than shader model 6.6 does not know them
+// and answers E_INVALIDARG; the in-box Windows 10 runtime is one. With X2W_D3D12_PERMISSIVE=1 the
+// serialization is then repeated without them, so that a caller that sets them on every root
+// signature still gets a blob. The result no longer declares direct heap indexing.
+constexpr std::uint32_t heap_indexing_flags = 0x00000C00u;
+
+// The serialized bytes do not say which input produced them: the legal baseline and inputs with only
+// 0x400, only 0x800 or both serialize to the same blob once the bits are removed. The removed bits are
+// therefore tied to the blob object a retry returns. That object registers its buffer while it lives
+// and unregisters it before the buffer can be freed and reused, so x2w_stripped_root_flags answers
+// for that exact buffer only. A copy of the bytes, or a blob from any other call, reports 0.
+struct StrippedBlob { const void* data; std::size_t bytes; std::uint32_t bits; };
+SRWLOCK stripped_lock = SRWLOCK_INIT;
+std::vector<StrippedBlob> stripped_blobs;
+
+class RetriedBlob final : public ID3DBlob {
+public:
+    // Take ownership only after the wrapper and its provenance record have both been allocated.
+    static ID3DBlob* wrap(ID3DBlob* inner, std::uint32_t bits) noexcept
+    {
+        RetriedBlob* wrapper = new (std::nothrow) RetriedBlob(inner);
+        if (!wrapper) return nullptr;
+        bool registered = true;
+        AcquireSRWLockExclusive(&stripped_lock);
+        try {
+            stripped_blobs.push_back({inner->GetBufferPointer(), inner->GetBufferSize(), bits});
+        } catch (...) {
+            registered = false;
+        }
+        ReleaseSRWLockExclusive(&stripped_lock);
+        if (registered) return wrapper;
+        wrapper->inner_ = nullptr;  // inner stays with the caller
+        delete wrapper;
+        return nullptr;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D10Blob)) return E_NOINTERFACE;
+        *out = static_cast<ID3DBlob*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG left = InterlockedDecrement(&refs_);
+        if (!left) delete this;
+        return static_cast<ULONG>(left);
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return inner_->GetBufferPointer(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return inner_->GetBufferSize(); }
+
+private:
+    explicit RetriedBlob(ID3DBlob* inner) : inner_(inner) {}
+    ~RetriedBlob()
+    {
+        if (!inner_) return;
+        const void* data = inner_->GetBufferPointer();
+        AcquireSRWLockExclusive(&stripped_lock);
+        for (std::size_t i = 0; i < stripped_blobs.size(); ++i)
+            if (stripped_blobs[i].data == data) {
+                stripped_blobs[i] = stripped_blobs.back();
+                stripped_blobs.pop_back();
+                break;
+            }
+        ReleaseSRWLockExclusive(&stripped_lock);
+        inner_->Release();  // only now may the buffer be reused
+    }
+    ID3DBlob* inner_;
+    LONG refs_ = 1;
+};
+
+bool permissive_switch()
+{
+    const DWORD saved = GetLastError();
+    char value[4] = {};
+    const bool on = GetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", value, sizeof(value)) > 0 && value[0] == '1';
+    SetLastError(saved);
+    return on;
+}
+
+HRESULT serialize_for_runtime(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3DBlob** blob, ID3DBlob** error_blob)
+{
+    const HRESULT hr = D3D12SerializeVersionedRootSignature(desc, blob, error_blob);
+    if (hr != E_INVALIDARG || !desc || !blob) return hr;
+    if (desc->Version != D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Version != D3D_ROOT_SIGNATURE_VERSION_1_1) return hr;
+    const bool version_1_0 = desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0;
+    const auto flags = static_cast<std::uint32_t>(version_1_0 ? desc->Desc_1_0.Flags : desc->Desc_1_1.Flags);
+    if (!(flags & heap_indexing_flags) || !permissive_switch()) return hr;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *desc;
+    auto& retry_flags = version_1_0 ? copy.Desc_1_0.Flags : copy.Desc_1_1.Flags;
+    retry_flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~heap_indexing_flags);
+    ID3DBlob* retry_blob = nullptr;
+    ID3DBlob* retry_error = nullptr;
+    const HRESULT retry = D3D12SerializeVersionedRootSignature(&copy, &retry_blob, &retry_error);
+    if (retry_error) retry_error->Release();
+    if (FAILED(retry) || !retry_blob) {
+        if (retry_blob) retry_blob->Release();
+        return hr;  // something else is wrong: keep the first answer and its error blob
+    }
+    *blob = RetriedBlob::wrap(retry_blob, flags & heap_indexing_flags);
+    if (error_blob && *error_blob) {
+        (*error_blob)->Release();
+        *error_blob = nullptr;
+    }
+    if (!*blob) {
+        retry_blob->Release();
+        return E_OUTOFMEMORY;
+    }
+    static LONG logged;
+    if (InterlockedIncrement(&logged) == 1)
+        std::fprintf(stderr, "x2w-d3d12 root signature flags 0x%x: this desktop runtime refuses the heap-indexing bits 0x%x; "
+                             "serialized without them (X2W_D3D12_PERMISSIVE)\n", flags, flags & heap_indexing_flags);
+    return retry;
+}
+}
+
+// The heap-indexing bits serialize_for_runtime removed for the live blob whose buffer is exactly
+// (blob, bytes), 0 for any other pointer or size.
+extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes)
+{
+    if (!blob || !bytes) return 0;
+    std::uint32_t bits = 0;
+    bool same_bytes_elsewhere = false;
+    // The byte comparison below only feeds a once-only line; it stops once that line is logged.
+    static LONG logged;
+    AcquireSRWLockShared(&stripped_lock);
+    for (const StrippedBlob& entry : stripped_blobs)
+        if (entry.data == blob && entry.bytes == bytes) bits = entry.bits;
+    // Live entries' buffers stay valid while the lock is held (the destructor unregisters first).
+    if (!bits && !InterlockedCompareExchange(&logged, 0, 0))
+        for (const StrippedBlob& entry : stripped_blobs)
+            if (entry.bytes == bytes && std::memcmp(entry.data, blob, bytes) == 0) {
+                same_bytes_elsewhere = true;
+                break;
+            }
+    ReleaseSRWLockShared(&stripped_lock);
+    // The bytes alone cannot say which it is, so the answer stays 0; the line says why bits may be missing.
+    if (same_bytes_elsewhere && InterlockedExchange(&logged, 1) == 0)
+        std::fprintf(stderr, "x2w-d3d12 root signature blob %p has the bytes of a retried blob at another address: a copy "
+                             "(its heap-indexing bits are not restored for translation) or a call without them\n", blob);
+    return bits;
 }
 
 extern "C" HRESULT WINAPI d3d12_xs_SerializeVersionedRootSignature(
@@ -47,24 +195,24 @@ extern "C" HRESULT WINAPI d3d12_xs_SerializeVersionedRootSignature(
     ID3DBlob** error_blob)
 {
     if (!root_signature) {
-        return D3D12SerializeVersionedRootSignature(root_signature, blob, error_blob);
+        return serialize_for_runtime(root_signature, blob, error_blob);
     }
     if (root_signature->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
         const auto flags = static_cast<std::uint32_t>(root_signature->Desc_1_1.Flags);
         if (flags & observed_console_flags) {
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *root_signature;
             copy.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~observed_console_flags);
-            return D3D12SerializeVersionedRootSignature(&copy, blob, error_blob);
+            return serialize_for_runtime(&copy, blob, error_blob);
         }
     } else if (root_signature->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
         const auto flags = static_cast<std::uint32_t>(root_signature->Desc_1_0.Flags);
         if (flags & observed_console_flags) {
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *root_signature;
             copy.Desc_1_0.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~observed_console_flags);
-            return D3D12SerializeVersionedRootSignature(&copy, blob, error_blob);
+            return serialize_for_runtime(&copy, blob, error_blob);
         }
     }
-    return D3D12SerializeVersionedRootSignature(root_signature, blob, error_blob);
+    return serialize_for_runtime(root_signature, blob, error_blob);
 }
 
 extern "C" HRESULT WINAPI d3d12_xs_CreateRootSignatureDeserializer(

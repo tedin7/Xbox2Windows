@@ -3,6 +3,9 @@
 import argparse
 import json
 import re
+import struct
+import tempfile
+import zlib
 from pathlib import Path
 
 from pixel_aot import container_code, disassemble
@@ -94,10 +97,36 @@ def coverage_exit(tail, scalar):
         raise ValueError("Unverified coverage export or branch target")
 
 
+def _validate_bindings(bindings):
+    if not isinstance(bindings, dict) or not bindings:
+        raise ValueError("Bindings must be a non-empty JSON object")
+    for key in ("selector_byte", "descriptors", "words", "interp"):
+        if key not in bindings:
+            raise ValueError(f"Missing bindings field: {key}")
+    descriptors = bindings["descriptors"]
+    if (
+        not isinstance(descriptors, (list, tuple))
+        or not descriptors
+        or any(
+            not isinstance(entry, (list, tuple)) or len(entry) != 4
+            for entry in descriptors
+        )
+    ):
+        raise ValueError(
+            "Bindings descriptors must be a non-empty list of 4-item entries"
+        )
+    words = bindings["words"]
+    if not isinstance(words, (list, tuple)) or any(
+        not isinstance(entry, (list, tuple)) or len(entry) != 2 for entry in words
+    ):
+        raise ValueError("Bindings words must be a list of 2-item entries")
+
+
 def lower(decoded, bindings):
     # Locations are keyed by low table-pointer register and byte offset. A
     # descriptor may refer to a static selector, a desktop CB slice, one SRV,
     # or the fixture's point-clamp sampler.
+    _validate_bindings(bindings)
     scalar = {}
     slots = {}
     selector_byte = bindings["selector_byte"]
@@ -350,27 +379,64 @@ void main(float2 uv : TEXCOORD0) {{
 
 
 def translate(blob, bindings, llvm):
-    code = container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+    sections = parts(blob)
+    if b"DXIL" not in sections:
+        raise ValueError("DXBC container has no DXIL part")
+    code = container_code(sections[b"DXIL"], stage=0, llvm=llvm)
     return lower(disassemble(code, llvm, offsets=True), bindings)
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("container", type=Path)
-    p.add_argument("--bindings", type=Path, required=True)
-    p.add_argument("--llvm", required=True)
-    p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
-        a.container.resolve(),
-        a.bindings.resolve(),
-    ):
-        p.error("Expected a separate HLSL output")
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("container", type=Path)
+    parser.add_argument("--bindings", type=Path, required=True)
+    parser.add_argument("--llvm", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
     try:
-        source = translate(
-            a.container.read_bytes(), json.loads(a.bindings.read_text()), a.llvm
-        )
-    except (ValueError, KeyError, TypeError, IndexError) as error:
-        p.error(f"Unsupported coverage input: {error}")
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(source, encoding="ascii")
+        dest = args.output.resolve()
+        src = args.container.resolve()
+        bindings_path = args.bindings.resolve()
+    except OSError as error:
+        parser.error(f"Unsupported coverage input: {error}")
+    if dest.suffix.lower() != ".hlsl" or dest in (src, bindings_path):
+        parser.error("Expected a separate HLSL output")
+    tmp_path = None
+    try:
+        blob = args.container.read_bytes()
+        bindings = json.loads(args.bindings.read_text(encoding="utf-8"))
+        _validate_bindings(bindings)
+        source = translate(blob, bindings, args.llvm)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            dir=dest.parent,
+            prefix=f".{dest.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(source)
+        tmp_path.replace(dest)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        struct.error,
+        zlib.error,
+    ) as error:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        parser.error(f"Unsupported coverage input: {error}")
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

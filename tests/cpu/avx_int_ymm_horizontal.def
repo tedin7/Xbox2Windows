@@ -1,0 +1,13 @@
+EXPORTS
+    op_vphaddw_ymm
+    op_vphaddd_ymm
+    op_vphaddsw_ymm
+    op_vphsubw_ymm
+    op_vphsubd_ymm
+    op_vphsubsw_ymm
+    op_vphaddw_ymm_dst_src1
+    op_vphaddd_ymm_dst_src2
+    op_vphaddsw_ymm_all
+    op_vphsubw_ymm_dst_src2
+    op_vphaddsw_ymm_then_xmm_vphsubsw
+    op_chain_ymm_horizontal

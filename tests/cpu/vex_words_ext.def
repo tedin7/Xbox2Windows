@@ -1,0 +1,11 @@
+EXPORTS
+    pabsw_reg
+    pabsw_mem
+    signw_reg
+    signw_mem
+    mulhrsw_reg
+    mulhrsw_mem
+    phaddw_reg
+    phaddw_mem
+    ext_mem_r8_chain
+    ext_aligned

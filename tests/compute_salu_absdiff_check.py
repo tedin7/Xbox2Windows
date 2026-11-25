@@ -1,4 +1,5 @@
 """Check s_absdiff_i32 in the compute store profile's scalar ALU subset, translated and dispatched."""
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -143,7 +144,7 @@ def controls():
         (unsupported + "s_absdiff_i32", (("s_absdiff_i32 s22, s16, s17", "s_absdiff_i32 s[22:23], s16, s17"),)),
         (unsupported + "s_absdiff_u32", (("s_absdiff_i32 s22, s16, s17", "s_absdiff_u32 s22, s16, s17"),)),
         # SCC is written but not modelled, so nothing may read it: a select and a branch on it are refused.
-        (unsupported + "s_cselect_b32", (("v_mov_b32_e32 v4, s25", "s_cselect_b32 s26, s25, 0\nv_mov_b32_e32 v4, s26"),)),
+        ("Unverified SCC for scalar select", (("v_mov_b32_e32 v4, s25", "s_cselect_b32 s26, s25, 0\nv_mov_b32_e32 v4, s26"),)),
         (unsupported + "s_cbranch_scc0", (("v_mov_b32_e32 v1, s22", "s_cbranch_scc0 .LBB0_2\nv_mov_b32_e32 v1, s22"),)),
         # A scalar result is data only: not a store address and not a lane-guard compare operand.
         ("Unsupported store address", (("v_mov_b32_e32 v1, s22", "v_mov_b32_e32 v1, s22\nv_mov_b32_e32 v5, s22"),
@@ -201,6 +202,11 @@ def draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mutation '{label}' escaped detection\n{bad.stderr}")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in ABSDIFF if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

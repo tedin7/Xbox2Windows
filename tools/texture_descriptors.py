@@ -231,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     archive = args.archives[0]
     try:
+        for index in (args.descriptor, args.raw_page_map, args.zlib_segment):
+            if index is not None and index < 0:
+                raise ValueError("Descriptor index outside the ETPF table (must be nonnegative)")
         if args.lookup_key is not None:
             key = int(args.lookup_key, 16 if args.lookup_key.lower().startswith("0x") else 10)
             seen: set[tuple[int, int]] = set()
@@ -261,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                     ]}, indent=2))
                 else:
                     print(json.dumps(raw_page_map(file, args.raw_page_map)._asdict(), indent=2))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
         parser.exit(1, f"{archive}: {exc}\n")
     return 0
 

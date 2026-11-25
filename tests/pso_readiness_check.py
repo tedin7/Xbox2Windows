@@ -108,7 +108,7 @@ def check_scanner_tracks_pixel_aot():
         "v_cvt_off_f32_i4_e32 v12, v13",
         "v_ldexp_f32_e64 v12, v13, s44",
         "v_cubeid_f32_e64 v12, v13, v14, v15",
-        "v_fma_mix_f32 v12, v13, v14, v15 op_sel:[1,1,0]",
+        "v_fma_mix_f32 v12, v13, v14, v15 op_sel_hi:[1,1,0]",
         "v_dot4_i32_i8 v12, v13, v14, v15 clamp",
         "v_med3_i32_e64 v12, v13, v14, v15",
         "v_cmp_lt_u32_e64 s[4:5], v12, v13",
@@ -146,7 +146,8 @@ def check_mesh():
                 # An empty allocation (0, 0) is refused by the count check.
                 (enumerate_pcs(invalid_alloc), "mesh_lowering_rejected", "blocked",
                  "Conflicting mesh counts, vertices or primitive indices"),
-                ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked", "99"),
+                ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked",
+                 "Scalar register s99 used before it is written"),
                 ([], "disassembly_failed", "blocked", "empty instruction stream"),
                 (ValueError("Unknown instruction at byte 4"), "disassembly_failed", "blocked",
                  "Unknown instruction at byte 4")):
@@ -167,7 +168,13 @@ def check_mesh():
         with patch("pixel_aot.disassemble", return_value=[(0, "s_getpc_b64 s[0:1]")]):
             row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
         assert row["shaders"]["mesh"]["status"] == "mesh_lowering_rejected", row
-        assert row["shaders"]["mesh"]["detail"].startswith("lowering failed unexpectedly"), row
+        assert row["shaders"]["mesh"]["detail"] == "Unsupported scalar instruction s_getpc_b64", row
+        assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
+        # An error the lowering did not anticipate must not abort the whole report.
+        with patch("pixel_aot.disassemble", return_value=[(0, "s_getpc_b64 s[0:1]")]), \
+                patch("mesh_entry_aot.lower", side_effect=IndexError("operand")):
+            row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+        assert row["shaders"]["mesh"]["detail"] == "lowering failed unexpectedly: IndexError", row
         assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
         untested = report(manifest, pipelines, root)["pipelines"][0]
         assert untested["shaders"]["mesh"]["status"] == "mesh_scan_untested", untested

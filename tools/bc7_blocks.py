@@ -1,9 +1,12 @@
 """Pack, unpack and decode BC7 blocks, and generate blocks with known field values."""
 import argparse
+import contextlib
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
+import tempfile
 
 
 # Per mode: subsets, partition bits, rotation bits, index selection bits, colour bits, alpha bits,
@@ -239,14 +242,71 @@ def fixture(columns=16, rows=32):
     return fields, b"".join(blocks), bytes(pixels)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _atomic_write_outputs(outputs: list[tuple[Path, bytes | str]]) -> None:
+    """Stage all payloads, then publish each output with a separate atomic replace."""
+    staged: list[tuple[Path, Path]] = []
+    with contextlib.ExitStack() as stack:
+        dirs_by_parent: dict[Path, Path] = {}
+        for destination, payload in outputs:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            parent_key = destination.parent.resolve()
+            staging_root = dirs_by_parent.get(parent_key)
+            if staging_root is None:
+                staging_root = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=destination.parent)))
+                dirs_by_parent[parent_key] = staging_root
+            staged_path = staging_root / f"{len(staged)}_{destination.name}"
+            if isinstance(payload, bytes):
+                staged_path.write_bytes(payload)
+            else:
+                staged_path.write_text(payload, encoding="ascii")
+            staged.append((staged_path, destination))
+        for index, (staged_path, destination) in enumerate(staged):
+            try:
+                os.replace(staged_path, destination)
+            except OSError as error:
+                if index:
+                    raise OSError(f"Updated {staged[0][1]}, but could not replace {destination}: {error}. "
+                                  "Retry with both output paths to regenerate the pair.") from error
+                raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("case", type=Path, help="Output in the BC7C layout read by offscreen_check")
     parser.add_argument("--columns", type=int, default=16, help="Blocks per row")
     parser.add_argument("--rows", type=int, default=32, help="Block rows")
     parser.add_argument("--fields", type=Path, help="Also write the field values of every block as JSON")
-    args = parser.parse_args()
-    known, block_rows, rgba = fixture(args.columns, args.rows)
-    args.case.write_bytes(struct.pack("<4sII", b"BC7C", args.columns * 4, args.rows * 4) + block_rows + rgba)
-    if args.fields:
-        args.fields.write_text(json.dumps(known, indent=1), encoding="ascii")
+    args = parser.parse_args(argv)
+    try:
+        if args.columns <= 0 or args.rows <= 0:
+            raise ValueError("Expected positive block dimensions")
+        for path in (args.case, args.fields):
+            if path is not None and path.exists() and path.is_dir():
+                raise ValueError(f"Output path is an existing directory: {path}")
+        if args.fields is not None:
+            if _same_path(args.case, args.fields):
+                raise ValueError(f"Fields path collides with case output: {args.fields}")
+            case_path, fields_path = args.case.resolve(), args.fields.resolve()
+            if case_path in fields_path.parents or fields_path in case_path.parents:
+                raise ValueError("Case and fields outputs cannot contain one another")
+        header = struct.pack("<4sII", b"BC7C", args.columns * 4, args.rows * 4)
+        known, block_rows, rgba = fixture(args.columns, args.rows)
+        outputs: list[tuple[Path, bytes | str]] = [
+            (args.case, header + block_rows + rgba)
+        ]
+        if args.fields is not None:
+            outputs.append((args.fields, json.dumps(known, indent=1)))
+        _atomic_write_outputs(outputs)
+    except (OSError, ValueError, struct.error) as exc:
+        parser.exit(1, f"{exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

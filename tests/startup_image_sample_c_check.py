@@ -73,7 +73,7 @@ IMAGE = {
     'offset': 'image_sample_c_lz_o v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'bias': 'image_sample_c_b v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'clamp': 'image_sample_c_cl v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
-    'gather': 'image_gather4_c_lz v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+    'gather': 'image_gather4_c v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'a16': 'image_sample_c_lz v4, v[0:1], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D a16',
     'tfe': 'image_sample_c_lz v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm',
@@ -200,7 +200,7 @@ WORDS = {
         '0f1800f804040404000081bf'),
     'gather': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
-        'ff02027e0000803ef202047ef402067e7fc08cbf08013cf10004c400703f8cbf'
+        'ff02027e0000803ef202047ef402067e7fc08cbf080120f10004c400703f8cbf'
         '0f1800f804040404000081bf'),
     'a16': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
@@ -416,7 +416,7 @@ def controls():
     refused('offset', 'image_sample_c_lz_o')
     refused('bias', 'image_sample_c_b')
     refused('clamp', 'image_sample_c_cl')
-    refused('gather', 'image_gather4_c_lz')
+    refused('gather', 'image_gather4_c')
     for name in ('a16', 'tfe', 'unorm', 'lwe', 'd16', 'r128'):
         refused(name, 'image_sample_c_lz modifier %s' % name)
     for name in RESERVED:

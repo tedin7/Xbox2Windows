@@ -96,8 +96,13 @@ def launch(exe, payload, timeout, eof_timeout):
         reader.start()
 
     started = time.perf_counter()
-    process.stdin.write(payload)
-    process.stdin.close()
+    try:
+        process.stdin.write(payload)
+        process.stdin.close()
+    except OSError:
+        # A fixture that exits without reading its selector breaks the pipe before or while this
+        # write runs. The outcome check below still decides: it must exit or time out as documented.
+        pass
     try:
         code = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:

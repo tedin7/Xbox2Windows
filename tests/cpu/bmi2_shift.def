@@ -1,0 +1,26 @@
+EXPORTS
+    op_rorx32
+    op_rorx32_imm32
+    op_rorx32_imm37
+    op_rorx64
+    op_rorx64_imm64
+    op_rorx64_imm73
+    op_shlx32
+    op_shlx64
+    op_shrx32
+    op_shrx64
+    op_sarx32
+    op_sarx64
+    op_rorx32_mem
+    op_rorx64_mem
+    op_shlx32_mem
+    op_shlx64_mem
+    op_shrx32_mem
+    op_shrx64_mem
+    op_sarx32_mem
+    op_sarx64_mem
+    op_mem_r8_source
+    op_flags_preserve32
+    op_flags_preserve64
+    op_flags_preserve_mem
+    op_bmi2_discarded_read

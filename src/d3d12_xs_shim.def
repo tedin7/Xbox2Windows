@@ -4,6 +4,7 @@ EXPORTS
     D3D12CreateRootSignatureDeserializer=d3d12_xs_CreateRootSignatureDeserializer
     D3D12XboxCreateDevice=d3d12_xs_XboxCreateDevice
     D3D12ConfigureVirtualMemoryX=d3d12_xs_ConfigureVirtualMemoryX
+    x2w_stripped_root_flags
     IID_ID3D12CommandAllocator DATA
     IID_ID3D12CommandList DATA
     IID_ID3D12CommandQueue DATA

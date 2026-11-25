@@ -519,7 +519,9 @@ struct SectionBuffer {
         section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(tile),
                                      nullptr);
         if (section) view = static_cast<std::uint32_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, tile));
-        if (!view || FAILED(device->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap)))) return false;
+        // OpenExistingHeapFromFileMapping can leave the section committed after exit (#2234), so the heap
+        // is opened on the mapped view. The destructor releases the heap before it unmaps the view.
+        if (!view || FAILED(device->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap)))) return false;
         const auto desc = buffer_desc(tile, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         return SUCCEEDED(device->CreatePlacedResource(heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,

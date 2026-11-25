@@ -28,11 +28,12 @@ using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
+using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 
 constexpr unsigned page = 4096;
 constexpr unsigned pages = 3;
 constexpr unsigned bytes = pages * page;
-constexpr unsigned cases = 6;
+constexpr unsigned cases = 12;
 unsigned char source[bytes];
 int failures;
 
@@ -47,13 +48,15 @@ void fail(const char* name, const char* what)
 }
 
 // Enqueues one uncompressed memory-source request and returns its status HRESULT, or -1 on timeout.
-long run_request(unsigned char* destination, unsigned capacity, unsigned size)
+long run_request(unsigned char* destination, unsigned capacity, unsigned size, u64 options = 0x400000,
+                 const void* from = source, u64 offset = 0)
 {
     unsigned char request[0x48] = {};
-    *reinterpret_cast<u64*>(request + 0x00) = 0x400000;
+    *reinterpret_cast<u64*>(request + 0x00) = options;
     *reinterpret_cast<unsigned char**>(request + 0x08) = destination;
     *reinterpret_cast<unsigned*>(request + 0x18) = capacity;
-    *reinterpret_cast<const unsigned char**>(request + 0x20) = source;
+    *reinterpret_cast<const void**>(request + 0x20) = from;
+    *reinterpret_cast<u64*>(request + 0x28) = offset;
     *reinterpret_cast<unsigned*>(request + 0x30) = size;
     const unsigned index = next_index++;
     reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
@@ -115,7 +118,7 @@ int main(int argc, char** argv)
     auto* factory = static_cast<Object*>(factory_pointer);
     void* status_pointer = nullptr;
     void* queue_pointer = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, cases, "Status", nullptr, &status_pointer) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_pointer) != 0)
@@ -157,6 +160,39 @@ int main(int argc, char** argv)
         UnmapViewOfFile(cow);
     }
     if (mapping) CloseHandle(mapping);
+
+    // Distinct failure codes: a destination too small for the data, and a read past the end of a file.
+    const long insufficient = static_cast<long>(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+    const long end_of_file = static_cast<long>(HRESULT_FROM_WIN32(ERROR_HANDLE_EOF));
+    unsigned char* small = fresh_region();
+    if (!small) return 1;
+    const long small_hr = run_request(small, page, bytes);
+    if (small_hr != insufficient) fail("destination too small", "status is not ERROR_INSUFFICIENT_BUFFER");
+    else if (!untouched(small, 0, bytes)) fail("destination too small", "destination was written");
+    else std::printf("ok: destination too small reports ERROR_INSUFFICIENT_BUFFER, nothing written\n");
+
+    wchar_t self[MAX_PATH];
+    void* file_pointer = nullptr;
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH) ||
+        reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, self, nullptr, &file_pointer) != 0 || !file_pointer)
+        return 1;
+    const long eof_hr = run_request(small, bytes, 4, 0, file_pointer, 1ull << 40);
+    if (eof_hr != end_of_file) fail("read past end of file", "status is not ERROR_HANDLE_EOF");
+    else if (!untouched(small, 0, bytes)) fail("read past end of file", "destination was written");
+    else std::printf("ok: read past the end of a file reports ERROR_HANDLE_EOF, nothing written\n");
+    VirtualFree(small, 0, MEM_RELEASE);
+
+    // Null arguments are refused with their own codes and leave the output null.
+    void* out = &out;
+    void* queue_out = &queue_out;
+    const long no_path = reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, nullptr, nullptr, &out);
+    if (no_path != E_INVALIDARG || out != nullptr) fail("OpenFile null path", "not E_INVALIDARG with a null output");
+    else std::printf("ok: OpenFile with a null path returns E_INVALIDARG\n");
+    if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, self, nullptr, nullptr) != E_POINTER)
+        fail("OpenFile null output", "not E_POINTER");
+    const long no_desc = reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &queue_out);
+    if (no_desc != E_INVALIDARG || queue_out != nullptr) fail("CreateQueue null descriptor", "not E_INVALIDARG with a null output");
+    else std::printf("ok: CreateQueue with a null descriptor returns E_INVALIDARG\n");
 
     if (failures) return 1;
     std::printf("dstorage destination: refused without writes, queue kept working\n");

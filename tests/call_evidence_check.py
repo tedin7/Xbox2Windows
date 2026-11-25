@@ -309,7 +309,7 @@ class CallEvidenceChecks(unittest.TestCase):
                 rc = call_evidence.main([str(build_dir)])
             self.assertEqual(rc, 0)
             expected_output = base / "repo" / "out" / "calls" / "six-apis.json"
-            self.assertEqual(Path(stdout.getvalue().strip()), expected_output)
+            self.assertEqual(Path(stdout.getvalue().strip()), expected_output.resolve())
             self.assertTrue(expected_output.is_file())
             parsed = json.loads(expected_output.read_text(encoding="utf-8"))
             self.assertEqual(list(parsed.keys()), list(call_evidence.NAMES))

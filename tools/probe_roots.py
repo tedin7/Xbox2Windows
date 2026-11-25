@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -311,44 +312,72 @@ def measure(build, inventory, probe, fixtures):
     return result
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("build", type=Path)
     p.add_argument("--inventory", type=Path, default=PROJECT / "out/calls/six-apis.json")
     p.add_argument("--probe", type=Path, default=PROJECT / "out/build/dev/root_probe.exe")
     p.add_argument("--controls", type=Path, help="Build directory with compute_root.cso and compute_tables.cso")
-    args = p.parse_args()
-    dest = PROJECT / "out/calls/desktop-roots.json"
-    build = args.build.resolve(strict=True)
-    if dest.resolve().is_relative_to(build) or dest.resolve() == args.inventory.resolve():
-        p.error("Report destination overlaps inputs")
-    fixtures = {}
-    control_checks = {}
-    probe = args.probe.resolve(strict=True)
-    if args.controls:
-        for name in ("compute_root", "compute_tables"):
-            blob = (args.controls / (name + ".cso")).read_bytes()
-            sections = parts(blob)
-            fixtures[name] = sections[b"RTS0"]
-            checks = validate_shader(probe, blob, sections[b"DXIL"])
-            if any(checks[k]["status"] != "0x00000000" for k in ("container", "module")):
-                raise ValueError(f"Desktop positive control failed for {name}")
-            control_checks[name] = checks
-    inventory_data = args.inventory.read_bytes()
-    result = measure(build, json.loads(inventory_data), probe, fixtures)
-    document = dict(schema=1, windows_build=sys.getwindowsversion().build,
-                    probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
-                    inventory_sha256=hashlib.sha256(inventory_data).hexdigest(),
-                    control_root_sha256={key: hashlib.sha256(b).hexdigest() for key, b in fixtures.items()},
-                    control_validation=control_checks, images=result)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(mode="w", dir=dest.parent, delete=False, encoding="utf-8") as f:
-        json.dump(document, f, indent=2)
-        f.write("\n")
-    Path(f.name).replace(dest)
+    p.add_argument("--output", type=Path, default=PROJECT / "out/calls/desktop-roots.json")
+    args = p.parse_args(argv)
+    try:
+        build = args.build.resolve(strict=True)
+        if not build.is_dir():
+            raise ValueError(f"Build path is not a directory: {build}")
+        probe = args.probe.resolve(strict=True)
+        if not probe.is_file():
+            raise ValueError(f"Probe path is not a file: {probe}")
+        controls = args.controls.resolve() if args.controls is not None else None
+        inventory_path = args.inventory.resolve()
+        dest = args.output.resolve()
+    except (OSError, ValueError) as exc:
+        p.exit(1, f"probe_roots: {exc}\n")
+
+    if (dest.is_relative_to(build) or dest == probe or dest == inventory_path or
+            (controls is not None and dest.is_relative_to(controls)) or
+            dest.is_dir()):
+        p.error("Report destination overlaps inputs or is a directory")
+
+    try:
+        fixtures = {}
+        control_checks = {}
+        if controls is not None:
+            for name in ("compute_root", "compute_tables"):
+                blob = (controls / (name + ".cso")).read_bytes()
+                sections = parts(blob)
+                fixtures[name] = sections[b"RTS0"]
+                checks = validate_shader(probe, blob, sections[b"DXIL"])
+                if any(checks[k]["status"] != "0x00000000" for k in ("container", "module")):
+                    raise ValueError(f"Desktop positive control failed for {name}")
+                control_checks[name] = checks
+        inventory_data = inventory_path.read_bytes()
+        result = measure(build, json.loads(inventory_data), probe, fixtures)
+        windows_build = sys.getwindowsversion().build if hasattr(sys, "getwindowsversion") else None
+        document = dict(schema=1, windows_build=windows_build,
+                        probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
+                        inventory_sha256=hashlib.sha256(inventory_data).hexdigest(),
+                        control_root_sha256={key: hashlib.sha256(b).hexdigest() for key, b in fixtures.items()},
+                        control_validation=control_checks, images=result)
+        tmp_path = None
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", suffix=".tmp", dir=dest.parent, delete=False, encoding="utf-8") as f:
+                tmp_path = Path(f.name)
+                json.dump(document, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, dest)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError,
+            pefile.PEFormatError, struct.error, subprocess.SubprocessError) as exc:
+        p.exit(1, f"probe_roots: {exc}\n")
+
     for name, report in result.items():
         print(name, report["containers"], report["results"])
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

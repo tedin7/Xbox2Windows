@@ -91,7 +91,13 @@ extern "C" __declspec(dllexport) DWORD finish_exe(const void* image_base, DWORD 
     // The console fixture uses UCRT stdin rather than read_selector.
     if (!prepare_test_worker(L"CPU_CRC_TEST_LIVE_WORKER"))
         code = 3;
-    if (image_base == GetModuleHandleW(nullptr))
+    // End the process only when Windows launched this image: it is then both the process image and a
+    // module in the loader's list. A pe_map main image is reported as the process image too (pe_map_run_main),
+    // but the loader does not know it, so its host gets the code back instead of losing the process.
+    HMODULE loaded = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(image_base), &loaded) &&
+        loaded == static_cast<HMODULE>(const_cast<void*>(image_base)) && loaded == GetModuleHandleW(nullptr))
         ExitProcess(code);
     return code;
 }

@@ -1,5 +1,6 @@
 """Check gfx1013 2D RGBA32 FLOAT image_store and explicit-mip SRV reads."""
 import argparse
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -138,6 +139,11 @@ def draw(directory, compiler, renderer, backend, source):
         else:
             assert result.returncode == 1 and mismatch in result.stderr, name
             assert "compared_words=1344 mismatches=32" in result.stdout, name
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in LINES if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

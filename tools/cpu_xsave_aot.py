@@ -15,7 +15,7 @@ Entry-state contract (`--entry-state`) and XRSTOR format contract (`--compacted-
     components from entry are rejected. MXCSR is tracked apart from the
     components: by default (standard-only XRSTOR), an xrstor whose RFBM selects
     SSE or AVX defines MXCSR, so vzeroupper alone does not, and a save that
-    stores MXCSR (xsaveopt with SSE or AVX selected, xsave/xsavec with SSE
+    stores MXCSR (xsave/xsaveopt with SSE or AVX selected, xsavec with SSE
     selected) is rejected without it.
   - --compacted-xrstor (opt-in): permits XRSTOR to accept compacted headers
     (XCOMP_BV[63] set) in addition to standard headers. Because the header
@@ -36,7 +36,8 @@ group XSAVE):
                        x87/SSE and AVX YMM[255:128] regions while leaving
                        legacy [416..511], XCOMP_BV [520..527], and header
                        [528..575] untouched, and updating XSTATE_BV[2:0] =
-                       (old & ~rfbm) | (xinuse & rfbm).
+                       (old & ~rfbm) | (xinuse & rfbm). MXCSR and MXCSR_MASK are stored when
+                       RFBM selects SSE or AVX.
   - xsavec / xsavec64: same alignment and mask contract as xsave; write the
                        compacted format: only components with XINUSE & RFBM set
                        are stored (SSE is in use when any XMM register is live
@@ -446,7 +447,16 @@ static inline Vec128 op_paddd(const Vec128& a, const Vec128& b) {
     return out;
 }
 
-static inline std::uint64_t get_mm(const XState& state, unsigned idx) {
+// Every MMX instruction but EMMS, one that only reads an MM register included, clears TOP, marks all tags valid
+// and leaves the x87 component in use.
+static inline void enter_mmx(XState& state) {
+    state.ftw = 0xFFu;
+    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
+    state.xinuse |= 1ull;
+}
+
+static inline std::uint64_t get_mm(XState& state, unsigned idx) {
+    enter_mmx(state);
     std::uint64_t v = 0ull;
     std::memcpy(&v, state.st[idx], 8);
     return v;
@@ -457,9 +467,7 @@ static inline void set_mm(XState& state, unsigned idx, std::uint64_t val) {
     state.st[idx][8] = 0xFFu;
     state.st[idx][9] = 0xFFu;
     std::memset(state.st[idx] + 10, 0, 6);
-    state.ftw = 0xFFu;
-    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
-    state.xinuse |= 1ull;
+    enter_mmx(state);
 }
 
 static inline void op_emms(XState& state) {
@@ -612,7 +620,9 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
     }
 }
 
-static inline void op_xsave(const XState& state, word address, word rax_val, word rdx_val, bool is64) {
+// XSAVE stores MXCSR and MXCSR_MASK when RFBM selects SSE or AVX (mxcsr_with_avx); XSAVEC only with SSE.
+static inline void op_xsave(const XState& state, word address, word rax_val, word rdx_val, bool is64,
+                            bool mxcsr_with_avx = true) {
     const std::uint32_t mask_lo = static_cast<std::uint32_t>(rax_val);
     const std::uint32_t mask_hi = static_cast<std::uint32_t>(rdx_val);
     if ((address & 63ull) != 0ull) raise_gp();
@@ -660,11 +670,11 @@ static inline void op_xsave(const XState& state, word address, word rax_val, wor
         for (unsigned i = 0; i < 16u; ++i) dst[4u + i] = st_words[i];
     }
 
+    if ((rfbm & (mxcsr_with_avx ? 6ull : 2ull)) != 0ull) {
+        dst[3] = static_cast<std::uint64_t>(state.mxcsr) | (static_cast<std::uint64_t>(state.mxcsr_mask) << 32);
+    }
+
     if ((rfbm & 2ull) != 0ull) {
-        std::uint64_t mxcsr_pair =
-            static_cast<std::uint64_t>(state.mxcsr) |
-            (static_cast<std::uint64_t>(state.mxcsr_mask) << 32);
-        dst[3] = mxcsr_pair;
         std::uint64_t xmm_words[32]{};
         std::memcpy(xmm_words, state.xmm, 256);
         for (unsigned i = 0; i < 32u; ++i) dst[20u + i] = xmm_words[i];
@@ -690,7 +700,7 @@ static inline void op_xsavec(const XState& state, word address, word rax_val, wo
     // SDM vol.1 13.6: SSE is also in use when MXCSR differs from its reset value, even if no XMM register is live.
     const std::uint64_t sse_live = state.mxcsr != 0x1F80u ? 2ull : 0ull;
     const std::uint64_t used = rfbm & (state.xinuse | sse_live);
-    op_xsave(state, address, used, 0ull, is64);
+    op_xsave(state, address, used, 0ull, is64, false);
     std::atomic_signal_fence(std::memory_order_seq_cst);
     auto* dst = reinterpret_cast<volatile std::uint64_t*>(address);
     dst[64] = used;
@@ -706,7 +716,7 @@ static inline void op_xsaveopt(const XState& state, word address, word rax_val, 
     // Init optimization only: SSE is in use while MXCSR is not at its reset value (SDM vol.1 13.6).
     const std::uint64_t sse_live = state.mxcsr != 0x1F80u ? 2ull : 0ull;
     const std::uint64_t inuse = state.xinuse | sse_live;
-    op_xsave(state, address, rfbm & inuse, 0ull, is64);
+    op_xsave(state, address, rfbm & inuse, 0ull, is64, false);
     std::atomic_signal_fence(std::memory_order_seq_cst);
     auto* dst = reinterpret_cast<volatile std::uint64_t*>(address);
     if ((rfbm & 6ull) != 0ull) {
@@ -906,8 +916,8 @@ def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False
             else:
                 needed_xcomp = 7
             missing = needed_xcomp & ~defined_xcomp
-            # xsave/xsavec store MXCSR with SSE; xsaveopt also stores it when only AVX is selected.
-            mxcsr_stored = bool(needed_xcomp & (6 if ins.code in XSAVEOPT_CODES else 2))
+            # xsave and xsaveopt store MXCSR with SSE or AVX; xsavec only with SSE.
+            mxcsr_stored = bool(needed_xcomp & (2 if ins.code in XSAVEC_CODES else 6))
             if missing != 0:
                 if entry_state != "canonical":
                     missing_names = ", ".join(lbl for bit, lbl in XCOMP_NAMES if missing & bit)
@@ -1018,6 +1028,7 @@ def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False
                 src_mm = read_mm(1, ins)
                 addr = flat_address(ins, ptr_origins, expected_bytes=8, write=True)
                 statements.append(f"store64({addr}, get_mm(state, {src_mm}));")
+                mmx_active = True
             elif ins.op1_kind == OpKind.MEMORY:
                 dst_mm = mm_index(ins.op0_register, ins)
                 addr = flat_address(ins, ptr_origins, expected_bytes=8)
@@ -1038,6 +1049,7 @@ def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = get_mm(state, {src_mm});")
                 defined_gpr.add(dst_gpr)
+                mmx_active = True
             else:
                 raise ValueError(f"unsupported movq operand shape at RVA {ins.ip:#x}: {ins}")
 

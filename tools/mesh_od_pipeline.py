@@ -69,6 +69,7 @@ MASK = 0xFFFFFFFF
 MAX_SIZE = 65536
 VARIANT_RE = re.compile(r"(chain|branches|loops)_(\d+)")
 OPTIMIZATIONS = ("default", "Od")
+FAMILIES = ("control", "chain", "branches", "loops")
 GREEN = bytes([0, 255, 0, 255])
 BLACK = bytes([0, 0, 0, 255])
 DEFAULT_CHECK_VARIANTS = "control,chain_64,branches_64,loops_16"
@@ -115,6 +116,12 @@ def _loop_step(h, k, tid, base):
 
 def expected_values(family, size, seed=SEED, base=LOOP_BASE):
     """Return the Python reference for h in threads 0, 1 and 2."""
+    if family not in FAMILIES:
+        raise ValueError(f"unknown family {family!r}; expected one of {', '.join(FAMILIES)}")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError(f"size {size!r} must be a non-negative integer")
+    if family == "control" and size != 0:
+        raise ValueError(f"control family requires size 0, got {size}")
     values = []
     for tid in range(3):
         h = seed & MASK
@@ -147,6 +154,9 @@ def _body(family, size):
 
 def variant_info(name, seed=SEED):
     """Return (family, size, source, expected) for a generated variant name."""
+    if not isinstance(name, str):
+        raise ValueError(
+            f"unknown variant {name!r}; use control, chain_N, branches_N or loops_N")
     if name == "control":
         family, size = "control", 0
     else:
@@ -224,20 +234,22 @@ def run_draw(renderer, adapter, mesh, pixel, data_path, timeout_s, sample_interv
         thread.start()
     timed_out = False
     try:
-        output, _ = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
-        output, _ = proc.communicate()
-    elapsed = time.perf_counter() - start
-    stop.set()
-    if thread:
-        thread.join(timeout=1.0)
-    if handle:
-        value = peak_working_set(handle)
-        if value and value > peak:
-            peak = value
-        close_process(handle)
+        try:
+            output, _ = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            output, _ = proc.communicate()
+    finally:
+        elapsed = time.perf_counter() - start
+        stop.set()
+        if thread:
+            thread.join(timeout=1.0)
+        if handle:
+            value = peak_working_set(handle)
+            if value and value > peak:
+                peak = value
+            close_process(handle)
     text = (output or b"").decode("utf-8", "replace")
     outcome, detail = classify_draw(proc.returncode, timed_out, text)
     pipeline = PIPELINE_MS_RE.search(text)
@@ -446,16 +458,19 @@ def main(argv=None):
             parser.error(f"--{option} not found: {getattr(args, option)}")
 
     temporary = None
-    if args.work_dir:
-        args.work_dir.mkdir(parents=True, exist_ok=True)
-        work = args.work_dir
-    else:
-        temporary = tempfile.TemporaryDirectory(prefix="mesh-od-pipeline-")
-        work = Path(temporary.name)
     try:
+        if args.work_dir:
+            args.work_dir.mkdir(parents=True, exist_ok=True)
+            work = args.work_dir
+        else:
+            temporary = tempfile.TemporaryDirectory(prefix="mesh-od-pipeline-")
+            work = Path(temporary.name)
         identity, records = measure(names, args.dxc, args.renderer, args.adapter, work,
                                     args.repeat, args.compile_timeout, args.pipeline_timeout,
                                     args.seed)
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     finally:
         if temporary:
             temporary.cleanup()
@@ -472,7 +487,11 @@ def main(argv=None):
             "repeat": args.repeat, "compile_timeout_s": args.compile_timeout,
             "pipeline_timeout_s": args.pipeline_timeout,
         }
-        write_report(args.out, payload, records)
+        try:
+            write_report(args.out, payload, records)
+        except OSError as exc:
+            print(f"error: failed to write {args.out}: {exc}", file=sys.stderr)
+            return 1
         print(f"\nwrote {args.out}")
     if not args.check:
         return 0

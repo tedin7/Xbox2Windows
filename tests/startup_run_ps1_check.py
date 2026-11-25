@@ -4,8 +4,8 @@
 On Windows the script runs under every PowerShell found (powershell is Windows
 PowerShell 5.1, pwsh is PowerShell 7) in a scratch tree whose debug_launch.py
 is a stub, so no process is ever started under a debugger. On other hosts,
-without a PowerShell, or with --text-only, only the text after the debugger
-call is checked. Mutated copies of the script must fail the same checks.
+without a PowerShell, or with --text-only, the launcher statements are checked
+as text. Mutated copies of the script must fail the same checks.
 """
 import json
 import os
@@ -24,17 +24,89 @@ HEAD_LINES = 5  # run.ps1 prints this many lines of "<LogDir>.out"
 # prints seven lines and exits with the code under test.
 STUB = """\
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
-Path(__file__).with_name("argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+record = [sys.argv[1:], os.environ.get("X2W_TRACE_API")]
+Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
+# Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
+watch = Path(__file__).with_name("watch.json")
+deadline = time.monotonic() + 30
+while Path(__file__).with_name("translate.flag").exists() and not watch.exists() \\
+        and time.monotonic() < deadline:
+    time.sleep(0.05)
+if {early_exit}:
+    # The watcher has published its PID. Wait for the OS to confirm it is gone before returning.
+    pid = json.loads(watch.read_text(encoding="utf-8"))[0]
+    pid_column = f'"{{pid}}"'.encode("ascii")
+    while pid_column in subprocess.check_output(["tasklist", "/FI", f"PID eq {{pid}}", "/FO", "CSV", "/NH"]):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("early-exit watcher did not exit")
+        time.sleep(0.05)
 for n in range(1, 8):
     print("stub debugger line", n)
 sys.exit({code})
 """
+# Stands in for tools/startup/gfx2hlsl.py under -Translate: starts a child process, as the parallel
+# workers are, records the PIDs and arguments, then waits to be stopped. The early-exit case
+# publishes just the watcher's PID and arguments and returns without spawning a child.
+WATCH_STUB = """\
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = None if {early_exit} else subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+record = Path(__file__).with_name("watch.json")
+temp = record.with_suffix(".tmp")
+temp.write_text(json.dumps([os.getpid(), child.pid if child else None] + sys.argv[1:]), encoding="utf-8")
+temp.replace(record)
+if child:
+    time.sleep(120)
+"""
+STOP = "taskkill.exe /T /F /PID $translator.Id"
+# Text-only hosts check that the native command is inside both the live-watcher
+# guard and the child scope that handles Windows PowerShell's native stderr.
+WATCH_CLEANUP = re.compile(
+    r"if\s*\(\s*\$translator\s+-and\s+-not\s+\$translator\.HasExited\s*\)\s*\{\s*&\s*\{\s*"
+    r"""\$ErrorActionPreference\s*=\s*['"]Continue['"]\s+&\s+taskkill\.exe\b[^|#\n]*\s/T\b""", re.I)
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
+# Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
+FAKE_USER_WARN = re.compile(
+    r"if\s*\(\s*-not\s+\$FakeUser\s+-and\s+\$env:X2W_FAKE_USER\s+-ne\s+\"1\"\s*\)\s*\{\s*"
+    r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
+    re.I | re.S,
+)
+FAKE_USER_WARNING = (
+    "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
+)
+FAKE_USER_WARN_LINE = f'Write-Warning "{FAKE_USER_WARNING}"'
+WARNING_PROBE = "x2w warning prefix probe"
+WARNING_PREFIXES = {}
+
+
+def warning_prefix(shell, env):
+    """Return the prefix this shell puts before a Write-Warning message, such as "WARNING: ".
+
+    PowerShell localizes the prefix with the host's UI language ("ADVERTENCIA: " on Spanish
+    Windows), so it is read from the shell under test with the same environment as run.ps1.
+    """
+    if shell not in WARNING_PREFIXES:
+        out = subprocess.run([shell, "-NoProfile", "-Command", f"Write-Warning '{WARNING_PROBE}'"],
+                             env=env, capture_output=True, text=True, errors="replace", timeout=60)
+        lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+        if len(lines) != 1 or not lines[0].endswith(WARNING_PROBE) or lines[0] == WARNING_PROBE:
+            raise SystemExit(f"{shell}: cannot read the Write-Warning prefix from {lines!r} "
+                             f"(stderr: {out.stderr.strip()!r})")
+        WARNING_PREFIXES[shell] = lines[0][:-len(WARNING_PROBE)]
+    return WARNING_PREFIXES[shell]
 
 
 def decode(raw):
@@ -43,13 +115,27 @@ def decode(raw):
     return raw.decode("utf-16" if wide else "utf-8-sig", errors="replace")
 
 
-def run_case(shell, script, code, work):
-    """Run one copy of the script on a stub that exits with `code`; return what is wrong."""
-    root = Path(tempfile.mkdtemp(dir=work))
+def alive(pid):
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True, errors="replace")
+    return f'"{pid}"' in out.stdout
+
+
+def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
+             early_exit=False, trace_api_env=None):
+    """Run one copy of the script on a stub that exits with `code`; return what is wrong.
+
+    `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
+    `translate` exercises -Render -Translate and requires the watcher to stop with its child.
+    With `early_exit` the watcher has no child and exits before the debugger finishes.
+    This checks the log head and debugger exit code. The live watcher case checks worker cleanup.
+    """
+    root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
-    (startup / "debug_launch.py").write_text(STUB.format(code=code), encoding="utf-8")
+    (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
+    (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
     (root / "bld").mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
         (root / "bld" / f"{dll}.dll").write_bytes(b"")
@@ -58,44 +144,93 @@ def run_case(shell, script, code, work):
     exe.write_bytes(b"")
     data.mkdir()
     env = dict(os.environ)
+    # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
+    env["NO_COLOR"] = "1"
+    env.pop("X2W_FAKE_USER", None)
+    if trace_api_env is None:
+        env.pop("X2W_TRACE_API", None)
+    else:
+        env["X2W_TRACE_API"] = trace_api_env
+    if fake_user_env:
+        env["X2W_FAKE_USER"] = "1"
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
                "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log), "-BuildDir", "bld",
-               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4"]
-    try:
-        out = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
-                             errors="replace", timeout=120)
-    except subprocess.TimeoutExpired:
-        return [f"stub exit {code}: run.ps1 did not finish in 120 s"]
+               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
+    if translate:
+        command += ["-Render", "-Translate", "-ShaderCache", "cache"]
+        (startup / "translate.flag").write_bytes(b"")
+    # A surviving watcher can keep a capture pipe open after PowerShell exits.
+    # Capture to files so we can check the watcher's PID as soon as the shell exits.
+    with (tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stdout,
+          tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stderr):
+        try:
+            out = subprocess.run(command, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=120)
+        except subprocess.TimeoutExpired:
+            return [f"stub exit {code}: run.ps1 did not finish in 120 s"]
+        stdout.seek(0)
+        stderr.seek(0)
+        printed = [line.strip() for line in stdout if line.strip()]
+        error_text = stderr.read().strip()
     found = []
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
-    printed = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    if printed != STUB_LINES[:HEAD_LINES]:
-        found.append(f"stub exit {code}: printed {printed} instead of the first {HEAD_LINES} "
-                     f"debugger lines (stderr: {out.stderr.strip()!r})")
+    want_output = STUB_LINES[:HEAD_LINES]
+    if not fake_user_env and "-FakeUser" not in switches:
+        want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
+    if printed != want_output:
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
+                     f"(stderr: {error_text!r})")
     summary = Path(str(log) + ".out")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
     elif [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] != STUB_LINES:
         found.append(f"stub exit {code}: {summary.name} does not hold the debugger's output")
     want = [str(exe), str(data), str(log), "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4"]
-    record = startup / "argv.json"
+            "--trace-files", "1", "--continue-asserts", "4", *passed]
+    record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
-    if got != want:
-        found.append(f"stub exit {code}: the debugger received {got}, expected {want}")
+    expected = [want, "1" if "-TraceApi" in switches else trace_api_env]
+    if got != expected:
+        found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API] was {got}, expected {expected}")
+    watch = startup / "watch.json"
+    if translate:
+        started = json.loads(watch.read_text(encoding="utf-8")) if watch.is_file() else None
+        if not started or started[2:] != ["--watch", str(root / "cache")]:
+            found.append(f"-Translate: the translator received {started}, expected --watch {root / 'cache'}")
+        else:
+            for pid, what in ((started[0], "translator"), (started[1], "translator's child process")):
+                if pid is not None and alive(pid):
+                    subprocess.run(["taskkill", "/T", "/PID", str(pid), "/F"], capture_output=True)
+                    found.append(f"-Translate: the {what} was still running after run.ps1 exited")
+    elif watch.is_file():
+        found.append(f"stub exit {code}: the translator started without -Translate")
     return found
 
 
 def run_problems(shell, script, work, first_only):
+    if shell is None:
+        return text_problems(script)
     found = []
     for code in (2, 0, 7):  # 2 is the debugger's "CreateProcess failed"; 7 rules out a fixed code
         found += run_case(shell, script, code, work)
         if found and first_only:
-            break
+            return found
+    found += run_case(shell, script, 0, work, switches=["-FakeUser"])
+    found += run_case(shell, script, 0, work, fake_user_env=True)
+    if found and first_only:
+        return found
+    # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
+    found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
+    found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
+    found += run_case(shell, script, 0, work, trace_api_env="1")
+    if found and first_only:
+        return found
+    found += run_case(shell, script, 7, work, translate=True)
+    for code in (0, 7):
+        found += run_case(shell, script, code, work, translate=True, early_exit=True)
     return found
 
 
@@ -124,6 +259,16 @@ def text_problems(script):
         found.append(f"the script does not end with 'exit ${capture.group(1)}'")
     if HEAD not in after[1:-1]:
         found.append("the log head is not printed between the capture and the exit")
+    if not FAKE_USER_WARN.search(code):
+        found.append("missing Write-Warning when -FakeUser is not passed")
+    before = "\n".join(statements[:calls[0]])
+    if not re.search(r"^\[switch\]\s*\$TraceApi\b", before, re.I | re.M):
+        found.append("missing -TraceApi switch")
+    if not re.search(r"""^if\s*\(\s*\$TraceApi\s*\)\s*\{\s*\$env:X2W_TRACE_API\s*=\s*["']1["']\s*\}""",
+                     before, re.I | re.M):
+        found.append("missing -TraceApi environment opt-in before launch")
+    if not WATCH_CLEANUP.search("\n".join(after)):
+        found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found
 
 
@@ -137,10 +282,15 @@ def mutants_of(script):
             early += [other for other in lines if is_exit(other)]
         if not is_exit(line):
             early.append(line)
+    no_fake_warn = [line for line in lines if FAKE_USER_WARN_LINE not in line]
     mutants = {
         "no capture and no exit": [line for line in lines if not is_exit(line) and not is_capture(line)],
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
+        "no FakeUser warning": no_fake_warn,
+        # The same text without the warning prefix: the run must still see Write-Warning's prefix.
+        "FakeUser warning printed with Write-Host": [
+            line.replace(FAKE_USER_WARN_LINE, f'Write-Host "{FAKE_USER_WARNING}"') for line in lines],
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 
@@ -161,19 +311,36 @@ def main():
             mode = "text only: no PowerShell found"
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
-        checks = {Path(shell).stem.lower(): (lambda text, first_only, shell=shell:
-                                             run_problems(shell, text, tmp, first_only))
-                  for shell in shells}
-        if not shells:
-            checks = {"text": lambda text, first_only: text_problems(text)}
-        for name, check in checks.items():
-            bad = check(script, False)
+        for shell in shells or [None]:
+            name = Path(shell).stem.lower() if shell else "text"
+            bad = run_problems(shell, script, tmp, False)
             failures += [f"{name}: {item}" for item in bad]
             if bad:
                 continue
             for label, mutant in mutants_of(script).items():
-                if mutant is None or not check(mutant, True):
+                if mutant is None or not run_problems(shell, mutant, tmp, True):
                     failures.append(f"{name}: mutant '{label}' was not detected")
+            if shell:
+                # Expire the live fixture tree after HasExited has been read. The launcher's
+                # own taskkill then hits the missing PID and writes native stderr.
+                kill = f"& {STOP} 2>&1 | Out-Null"
+                expire = kill + '\nif (-not $translator.WaitForExit(5000)) { throw "fixture watcher still alive" }\n'
+                race = script.replace(kill, expire + kill)
+                if race == script:
+                    failures.append(f"{name}: could not exercise the watcher exit during cleanup")
+                else:
+                    failures += [f"{name}: watcher exit during cleanup: {item}"
+                                 for item in run_case(shell, race, 7, tmp, translate=True)]
+                stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
+                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
+                for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
+                    problems = run_case(shell, mutant, 7, tmp, translate=True)
+                    if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
+                        failures.append(f"{name}: expected a surviving {who}, got {problems}")
+            else:
+                for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
+                    if not text_problems(script.replace(removed, '')):
+                        failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")

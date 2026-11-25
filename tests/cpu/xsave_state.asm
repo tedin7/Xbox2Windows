@@ -223,6 +223,29 @@ op_xrstor64_xsaveopt64_x87_avx PROC FRAME
     ret
 op_xrstor64_xsaveopt64_x87_avx ENDP
 
+; MOVQ that only reads MM3 still clears TOP, marks every tag valid and leaves the x87 component in use.
+op_xrstor64_movq_read_xsave64 PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    movq r9, mm3
+    xsave64 [r8]
+    emms
+    ret
+op_xrstor64_movq_read_xsave64 ENDP
+
+; RFBM = AVX alone: XSAVE stores MXCSR and MXCSR_MASK with the YMM upper halves, x87 and XMM are not stored.
+op_xrstor64_xsave64_avx PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    mov eax, 4
+    xsave64 [r8]
+    ret
+op_xrstor64_xsave64_avx ENDP
+
 ; RFBM = AVX alone: MXCSR and MXCSR_MASK are stored, x87 and XMM are not.
 op_xrstor64_xsaveopt64_avx PROC FRAME
     .endprolog

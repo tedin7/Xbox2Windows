@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "resource_budget.h"
 
 namespace x2w_upload {
 using Microsoft::WRL::ComPtr;
@@ -25,6 +26,7 @@ inline HRESULT make_page(ID3D12Device* device, UINT64 bytes, Page& page) {
     HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource));
     if (FAILED(hr)) return hr;
+    x2w_budget::committed(device, page.resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     D3D12_RANGE no_reads{};
     void* mapped = nullptr;
     hr = page.resource->Map(0, &no_reads, &mapped);
@@ -42,14 +44,18 @@ struct Arena {
     // The caller must retire all recordings and GPU submissions before releasing their pages.
     void reset() { allocations.clear(); pages.clear(); }
 
-    UINT64 translate(UINT64 cpu, UINT64 bytes) const {
-        if (!bytes) return 0;
+    Allocation range(UINT64 cpu, UINT64 bytes) const {
+        if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
-            if (offset < it->bytes && bytes <= it->bytes - offset) return it->gpu + offset;
+            if (offset < it->bytes && bytes <= it->bytes - offset)
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
         }
-        return 0;
+        return {};
+    }
+    UINT64 translate(UINT64 cpu, UINT64 bytes) const {
+        return range(cpu, bytes).gpu;
     }
     Allocation allocate(ID3D12Device* device, UINT64 bytes, UINT64 alignment) {
         if (!device || !bytes || !alignment || (alignment & (alignment - 1))) return {};

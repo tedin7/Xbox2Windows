@@ -232,7 +232,7 @@ def check_rejections():
     fld, fstp = "db 29", "db 3a"  # fld tbyte ptr [rcx]; fstp tbyte ptr [rdx]
     rejected = {
         "frndint on an empty stack": (attempt("d9 fc c3"), "x87 stack underflow"),
-        "fnstenv": (attempt(f"{fld} d9 31 {fstp} c3"), "unsupported x87 operation"),
+        "fnstenv": (attempt(f"{fld} d9 31 {fstp} c3"), "stores the tag word of a non-empty x87 stack"),
         "fldenv": (attempt(f"d9 21 {fld} d9 fc {fstp} c3"), "unsupported x87 operation"),
         "fbld": (attempt(f"df 21 d9 fc {fstp} c3"), "unsupported x87 operation"),
         "fxsave": (attempt(f"{fld} 0f ae 01 d9 fc {fstp} c3"), "unsupported x87 operation"),

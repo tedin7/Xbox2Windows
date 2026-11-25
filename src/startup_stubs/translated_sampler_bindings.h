@@ -21,7 +21,13 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false)
+// lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
+// 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json,
+// SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170 encodes them as S_FIXED(x, 8)), so MinLOD and MaxLOD are the fields
+// divided by 256. dynamic_sampler() sets it for every heap entry. Without it MinLOD stays 0 and MaxLOD unbounded, as
+// for the other sample forms.
+inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
+                                                bool lod_limits = false)
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -36,13 +42,17 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     s.AddressW = modes[(words[0] >> 6) & 7];
     s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
-    s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     if (comparison) {
         s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
     }
     s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
+    if (lod_limits) {
+        s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
+        s.MaxLOD = static_cast<float>((words[1] >> 12) & 0xfffu) / 256.0f;
+    }
     s.ShaderRegister = shader_register;
     s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     return s;
@@ -51,6 +61,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
 struct TranslatedSamplers {
     std::vector<SamplerWords> statics;
     std::vector<bool> comparison;  // parallel to statics: bound as SamplerComparisonState
+    std::vector<bool> lod_limits;  // parallel to statics: MIN_LOD and MAX_LOD carried over (line smpl)
     bool heap = false;
     bool reserved_fallback = false;
 
@@ -72,10 +83,12 @@ struct TranslatedSamplers {
             int index = 0;
             unsigned words[4] = {};
             const bool compare = std::strncmp(line, "smpc", 4) == 0;
-            if (std::sscanf(line, compare ? "smpc %d %x %x %x %x" : "smp %d %x %x %x %x", &index, &words[0], &words[1],
-                            &words[2], &words[3]) == 5) {
+            const bool limits = std::strncmp(line, "smpl", 4) == 0;
+            if (std::sscanf(line, compare ? "smpc %d %x %x %x %x" : limits ? "smpl %d %x %x %x %x" : "smp %d %x %x %x %x",
+                            &index, &words[0], &words[1], &words[2], &words[3]) == 5) {
                 statics.push_back({words[0], words[1], words[2], words[3]});
                 comparison.push_back(compare);
+                lod_limits.push_back(limits);
             }
         }
         return true;
@@ -87,7 +100,8 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
 {
     std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
     for (UINT i = 0; i < samplers.statics.size(); ++i)
-        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i]));
+        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i],
+                                         i < samplers.lod_limits.size() && samplers.lod_limits[i]));
     return statics;
 }
 
@@ -170,14 +184,18 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
-    const auto s = decode_sampler(words, 0);
+    // A heap entry is the title's own descriptor, so its MIN_LOD and MAX_LOD apply (#2221).
+    const auto s = decode_sampler(words, 0, false, true);
     return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
             {}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
-    return dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    // Not a title descriptor: its zero word 1 is not a LOD clamp, so the full mip range stays available.
+    auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    s.MaxLOD = D3D12_FLOAT32_MAX;
+    return s;
 }
 
 struct NullSamplerCounts {

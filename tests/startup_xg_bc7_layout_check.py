@@ -4,6 +4,7 @@ import ctypes
 import os
 import struct
 import sys
+from unittest.mock import patch
 
 from gfx10_texture_roundtrip_check import PADDING, oracle_surface
 
@@ -16,6 +17,7 @@ UINT = ctypes.c_uint32
 HRESULT = ctypes.c_int32
 LAYOUT = ctypes.WINFUNCTYPE(HRESULT, PTR, PTR)
 COPY_INTO = ctypes.WINFUNCTYPE(HRESULT, PTR, PTR, UINT, UINT, PTR, UINT, UINT)
+COPY_FROM = ctypes.WINFUNCTYPE(HRESULT, PTR, PTR, UINT, UINT, UINT, PTR, UINT, UINT)
 RELEASE = ctypes.WINFUNCTYPE(ctypes.c_uint64, PTR)
 
 
@@ -79,6 +81,46 @@ def check_copy(computer, copy, width, height, tiled, linear):
         os.environ["X2W_D3D12_RENDER"] = "0"
 
 
+def check_copy_from(computer, copy, width, height, tiled, linear):
+    rows = (height + 3) // 4
+    row_bytes = len(linear) // rows
+    label = f"BC7 {width}x{height} copy-out"
+    source = ctypes.create_string_buffer(tiled, len(tiled))
+    for padding in (b"", b"\xcd" * 16):
+        pitch = row_bytes + len(padding)
+        expected = b"".join(linear[i:i + row_bytes] + padding for i in range(0, len(linear), row_bytes))
+        blank = GUARD + b"\xcd" * len(expected) + GUARD
+        target = ctypes.create_string_buffer(blank, len(blank))
+        dest = ctypes.byref(target, len(GUARD))
+        span = (rows - 1) * pitch + row_bytes
+        expect(f"{label} HRESULT", copy(computer, dest, 0, 0, 0, source, pitch, span if padding else 0), 0)
+        expect_bytes(f"{label} rows and guards", target.raw, GUARD + expected + GUARD)
+        expect_bytes(f"{label} source preservation", source.raw, tiled)
+
+        target.raw = blank
+        for case, plane, subresource, option, row_pitch, slice_pitch, hr in (
+            ("plane", 1, 0, 0, pitch, span, 0x80070057),
+            ("subresource", 0, 1, 0, pitch, span, 0x80070057),
+            ("Scarlett option", 0, 0, 1, pitch, span, 0x80004001),
+            ("short row", 0, 0, 0, row_bytes - 1, span, 0x80070057),
+            ("short slice", 0, 0, 0, pitch, span - 1, 0x80070057),
+        ):
+            result = copy(computer, dest, plane, subresource, option, source, row_pitch, slice_pitch)
+            expect(f"{label} {case} HRESULT", result & 0xFFFFFFFF, hr)
+            expect_bytes(f"{label} {case} preserves destination", target.raw, blank)
+
+    # A partial surface has different tiled and linear lengths. Adjacent regions are valid in either order.
+    empty = b"\xcd" * len(linear)
+    for initial, expected, src_offset, dst_offset in (
+        (tiled + empty, tiled + linear, 0, len(tiled)),
+        (empty + tiled, linear + tiled, len(linear), 0),
+    ):
+        slab = ctypes.create_string_buffer(initial, len(initial))
+        result = copy(computer, ctypes.byref(slab, dst_offset), 0, 0, 0, ctypes.byref(slab, src_offset), row_bytes, 0)
+        expect(f"{label} adjacent buffers HRESULT", result, 0)
+        expect_bytes(f"{label} adjacent buffers", slab.raw, expected)
+
+
 def check_layout(create, width, height, padded_width, padded_height):
     # 2D, default alignment, one slice, one mip, BC7_UNORM, one sample,
     # UNKNOWN layout, and no resource flags.
@@ -113,8 +155,11 @@ def check_layout(create, width, height, padded_width, padded_height):
                (padded_width, pitch, 4096, padded_width, padded_height, 1, width, height, 1))
 
         check_copy(computer, COPY_INTO(vtable[8]), width, height, tiled, linear)
+        # Readback needs only the two CPU buffers, even with rendering enabled.
+        with patch.dict(os.environ, X2W_D3D12_RENDER="1"):
+            check_copy_from(computer, COPY_FROM(vtable[9]), width, height, tiled, linear)
         print(f"{label}: span={span} offset=0 padded_blocks={padded_width // 4}x{padded_height // 4} "
-              f"pitch={pitch} tiled copy exact, refusal controls passed")
+              f"pitch={pitch} copy-in and copy-out exact, refusal controls passed")
     finally:
         RELEASE(vtable[1])(computer)
 

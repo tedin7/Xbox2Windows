@@ -5,6 +5,7 @@
 #include "ray_candidates_pipeline.h"
 #include "ray_pipeline.h"
 #include "ray_query.h"
+#include "ray_query_table.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -321,8 +322,15 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     auto results = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     auto readback = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     // Per-triangle geometries are traced by the shader that handles non-opaque candidates.
+    const bool viaView = placedScene && placedScene->slot70;
+    if (viaView && (usePipeline || triangleGeometries || update))
+        throw std::runtime_error("The slot-70 view fixture traces one placed scene with the inline query shader");
     const D3D12_SHADER_BYTECODE shader = triangleGeometries
-        ? D3D12_SHADER_BYTECODE{ray_candidates, sizeof(ray_candidates)} : D3D12_SHADER_BYTECODE{ray_query, sizeof(ray_query)};
+        ? D3D12_SHADER_BYTECODE{ray_candidates, sizeof(ray_candidates)}
+        : viaView ? D3D12_SHADER_BYTECODE{ray_query_table, sizeof(ray_query_table)}
+                  : D3D12_SHADER_BYTECODE{ray_query, sizeof(ray_query)};
+    ComPtr<ID3D12DescriptorHeap> asHeap;
+    if (viaView) asHeap = placedScene->publish_as_view(device);
     ComPtr<ID3D12RootSignature> root;
     // Both backends share the global root signature embedded in the compute shader.
     check(device->CreateRootSignature(0, shader.pShaderBytecode, shader.BytecodeLength, IID_PPV_ARGS(&root)),
@@ -379,7 +387,13 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     order.UAV.pResource = tlas.Get();
     list->ResourceBarrier(1, &order);
     list->SetComputeRootSignature(root.Get());
-    list->SetComputeRootShaderResourceView(0, top.DestAccelerationStructureData);
+    if (asHeap) {
+        ID3D12DescriptorHeap* heaps[]{asHeap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootDescriptorTable(0, asHeap->GetGPUDescriptorHandleForHeapStart());
+    } else {
+        list->SetComputeRootShaderResourceView(0, top.DestAccelerationStructureData);
+    }
     list->SetComputeRootUnorderedAccessView(1, results->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, rayBuffer->GetGPUVirtualAddress());
     if (usePipeline) {
@@ -526,6 +540,51 @@ bool check_dxr_placed_build(ID3D12Device* device) {
         throw std::runtime_error("Routing the instance to the decoy BLAS still matched the direct reference");
     std::printf("Slot 133 placed BLAS/TLAS: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
                 "direct-address reference, decoy routing differs\n", output[3]);
+    return true;
+}
+
+// Device slot 70 (issue #1938): the TLAS is placed at a nonzero offset, published as an acceleration-structure
+// view through slot 70 and consumed from a descriptor table by an inline ray query, on the same adapter.
+bool check_dxr_slot70_as(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    if (!supported(device, Backend::inline_query)) return false;
+    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
+    const auto run = [&](bool misroute) {
+        PlacedBuildScene placement;
+        placement.slot70 = true;
+        placement.misroute = misroute;
+        return trace_scene(device, vertices, {instance(7,1)}, rays, Backend::inline_query,
+                           nullptr, nullptr, nullptr, &placement);
+    };
+    const auto viaView = run(false);
+    // The reference: the same builds and rays with the TLAS GPU address given as a root SRV; only slot 70 is bypassed.
+    const auto root = trace(device, vertices, {instance(7,1)}, rays);
+    // Distinct-AS control: the view names a TLAS whose instance routes to a decoy BLAS.
+    const auto decoy = run(true);
+    const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
+        std::printf("slot70_as_rows %s", label);
+        for (std::size_t i = 0; i + 3 < words.size(); i += 4)
+            std::printf(" [%u,%u,%u,0x%08x]", words[i], words[i + 1], words[i + 2], words[i + 3]);
+        std::puts("");
+    };
+    print("view", viaView);
+    print("root", root);
+    print("decoy", decoy);
+    const std::vector<bvh_fixture::Word> expected{1,7,0,0, 0,0,0,0, 0,0,0,0};
+    const auto fixed = [&](const std::vector<bvh_fixture::Word>& words) {
+        if (words.size() != expected.size()) return false;
+        for (std::size_t i = 0; i < words.size(); ++i)
+            if (i != 3 && words[i] != expected[i]) return false;
+        return true;
+    };
+    if (!fixed(viaView) || !fixed(root))
+        throw std::runtime_error("Slot-70 view rays differ from hit7, miss, masked miss");
+    if (viaView != root)
+        throw std::runtime_error("Slot-70 view rays differ from the root-address reference");
+    if (decoy == root) throw std::runtime_error("The decoy-routed view still matched the reference");
+    std::printf("Slot 70 acceleration-structure view: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
+                "root-address reference after three refused calls kept the descriptor and the decoy differs\n", viaView[3]);
     return true;
 }
 

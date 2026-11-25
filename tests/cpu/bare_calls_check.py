@@ -196,7 +196,8 @@ CONTROLS = [
      "call in a function without unwind data"),
     ("call_bare", [("bare_mix", 0x00, "48 6b c9 05", "53 5b 90 90")], None,
      "stack change in a function without unwind data"),
-    ("call_bare", [("bare_mix", 0x00, "48 6b c9 05 48 8b c1", ("call", "bare_mix"))], None, "self-recursion"),
+    ("call_bare", [("bare_mix", 0x00, "48 6b c9 05 48 8b c1", ("call", "bare_mix"))], None,
+     "call in a function without unwind data"),
 ]
 
 

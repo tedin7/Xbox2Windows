@@ -9,6 +9,7 @@
 #include "xmem_test_device.h"
 
 #include <cstdio>
+#include <share.h>
 #include <cstring>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -35,8 +36,10 @@ SIZE_T guest_cpu_base(ID3D12DescriptorHeap* heap)
 
 int count_shortcut_lines(const wchar_t* path)
 {
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"rb") != 0 || !file) return -1;
+    // The stand-ins keep the trap log open for appending (src/startup_stubs/trap.h), so read it
+    // with sharing allowed: _wfopen_s opens without sharing and fails while that handle is open.
+    FILE* file = _wfsopen(path, L"rb", _SH_DENYNO);
+    if (!file) return -1;
     char line[1024];
     int found = 0;
     while (std::fgets(line, sizeof(line), file))

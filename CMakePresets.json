@@ -42,7 +42,7 @@
       "displayName": "Windows pull request smoke tests",
       "filter": {
         "include": {
-          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint|startup_indirect_(dispatch|draw(_indexed)?|mesh)_warp)$"
+          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint|startup_indirect_(dispatch|draw(_indexed)?|mesh(_xmem_arguments(_skip_wait)?)?|counts_control)_warp)$"
         }
       }
     },

@@ -11,6 +11,8 @@ since instruction-form coverage is not a measure of port completion. Python stan
 import argparse
 import json
 from pathlib import Path
+import sys
+import tempfile
 from xml.sax.saxutils import escape
 
 AREAS = (("x64_zen2", "x64 (Zen 2 user-mode mnemonics)", 220), ("gfx1013", "gfx1013 forms", 300),
@@ -28,14 +30,24 @@ def text(x, y, s, size=12, fill=TEXT, bold=False):
 
 def squarify(items, x, y, w, h):
     """Squarified treemap (Bruls et al.): [(key, size)] largest first -> {key: (x, y, w, h)}."""
-    scale = w * h / sum(size for _, size in items)
-    areas, out = [(key, size * scale) for key, size in items], {}
+    items = list(items)
+    if not items or w <= 0 or h <= 0:
+        return {}
+    if sum(size for _, size in items) <= 0:
+        return {}
+    positive = [(key, size) for key, size in items if size > 0]
+    if not positive:
+        return {}
+    scale = w * h / sum(size for _, size in positive)
+    areas, out = [(key, size * scale) for key, size in positive], {}
 
     def worst(row, side):
         s = sum(a for _, a in row)
         return max(max(side * side * a / (s * s), s * s / (side * side * a)) for _, a in row)
 
     while areas:
+        if w <= 0 or h <= 0:
+            break
         side, n = min(w, h), 1
         while n < len(areas) and worst(areas[:n + 1], side) <= worst(areas[:n], side):
             n += 1
@@ -43,12 +55,16 @@ def squarify(items, x, y, w, h):
         s = sum(a for _, a in row)
         if w >= h:
             cw, yy = s / h, y
+            if cw <= 0:
+                break
             for key, a in row:
                 out[key] = (x, yy, cw, a / cw)
                 yy += a / cw
             x, w = x + cw, w - cw
         else:
             rh, xx = s / w, x
+            if rh <= 0:
+                break
             for key, a in row:
                 out[key] = (xx, y, a / rh, rh)
                 xx += a / rh
@@ -58,6 +74,8 @@ def squarify(items, x, y, w, h):
 
 def fit(total, w, h):
     """Largest square size (2 px or more, 1 px gaps) and column count that fit `total` squares in w x h."""
+    if total <= 0 or w <= 0 or h <= 0:
+        return None
     for size in range(int(min(w, h)), 1, -1):
         cols = int(w + 1) // (size + 1)
         if cols and -(-total // cols) * (size + 1) - 1 <= h:
@@ -87,23 +105,46 @@ def group(name, counts, x, y, w, h):
 
 
 def render(m, source):
+    if not isinstance(m, dict):
+        raise TypeError("coverage root must be a JSON object")
     rows = [text(20, 34, "Instruction-form coverage", 20, bold=True), text(20, 56, NOTE, 12, MUTED),
             text(20, 74, f"Measured on {source}. Green: covered. Amber: held back by skipped tests. "
                          "Grey: not covered.", 12, MUTED)]
     y = 92
     for key, label, height in AREAS:
         r = m[key]
+        if not isinstance(r, dict):
+            raise TypeError(f"{key} entry must be a JSON object")
+        blocked = r["blocked_by_skip"]
+        groups = r["groups"]
+        if not isinstance(blocked, list) or not isinstance(groups, dict):
+            raise TypeError(f"{key} entry has invalid blocked_by_skip or groups")
         held = {}
-        for form in r["blocked_by_skip"]:
-            held[form.split()[0]] = held.get(form.split()[0], 0) + 1
+        for form in blocked:
+            if not isinstance(form, str):
+                raise TypeError(f"{key} blocked_by_skip entries must be strings")
+            parts = form.split()
+            if not parts:
+                raise ValueError(f"{key} blocked_by_skip entry must not be empty")
+            held[parts[0]] = held.get(parts[0], 0) + 1
         title = (f"{label}: {r['covered']} of {r['total']} covered, "
-                 f"{len(r['blocked_by_skip'])} held back by skips")
+                 f"{len(blocked)} held back by skips")
         rows.append(f'<rect x="20" y="{y}" width="{WIDTH - 40}" height="{height + 58}" rx="6" '
                     f'fill="{PANEL}" stroke="{BORDER}"/>' + text(32, y + 21, title, 13, bold=True))
-        items = sorted(((g, v["total"]) for g, v in r["groups"].items() if v["total"]), key=lambda kv: -kv[1])
+        items = []
+        for g, v in groups.items():
+            if not isinstance(v, dict):
+                raise TypeError(f"{key}.{g} must be a JSON object")
+            total = v["total"]
+            covered = v["covered"]
+            if total < 0 or covered < 0:
+                raise ValueError(f"{key}.{g} counts must be non-negative")
+            if total > 0:
+                items.append((g, total))
+        items.sort(key=lambda kv: -kv[1])
         unlabelled = []
         for name, (gx, gy, gw, gh) in squarify(items, 30, y + 30, WIDTH - 60, height).items():
-            g = r["groups"][name]
+            g = groups[name]
             box, labelled = group(name, (g["covered"], held.get(name, 0), g["total"]), gx, gy, gw, gh)
             rows.append(box)
             if not labelled:
@@ -116,15 +157,46 @@ def render(m, source):
             f'<rect width="{WIDTH}" height="{y - 6}" fill="{BG}"/>' + "".join(rows) + "</svg>\n")
 
 
-def main():
+def _write_atomic(path: Path, content: str) -> None:
+    """Write content to a sibling temp file and atomically replace path, leaving no temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("coverage", type=Path, help="JSON written by form_coverage.py --json")
     parser.add_argument("output", type=Path)
     parser.add_argument("--source", required=True, help="commit, OS build and adapter of the measured run")
-    args = parser.parse_args()
-    svg = render(json.loads(args.coverage.read_text(encoding="utf-8")), args.source)
-    args.output.write_text(svg, encoding="utf-8")
+    args = parser.parse_args(argv)
+    try:
+        coverage_path = args.coverage.resolve()
+        output_path = args.output.resolve()
+        if output_path == coverage_path:
+            raise ValueError(f"output path must not match input path: {args.output}")
+        svg = render(json.loads(args.coverage.read_text(encoding="utf-8")), args.source)
+        _write_atomic(args.output, svg)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.exit(1, f"coverage_svg: {exc}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

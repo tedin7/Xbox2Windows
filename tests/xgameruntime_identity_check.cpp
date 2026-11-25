@@ -2,7 +2,7 @@
 // XGame identity subset. It loads the fixture-only DLL by explicit path,
 // verifies the fixed console ID, the documented PC device type, and the fixed
 // Xbox title ID, repeats each call for stability, and exercises the documented
-// short-buffer and null-pointer errors. XUserAddAsync remains a logged stub.
+// short-buffer and null-pointer errors. XUserAddAsync refuses the picker option (None) with a logged E_NOTIMPL.
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -288,7 +288,7 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
         return false;
     }
     if (user_add(XUserAddOptionsNone, nullptr) != not_implemented) {
-        std::printf("FAIL: XUserAddAsync is not a logged stub\n");
+        std::printf("FAIL: XUserAddAsync(None) is not refused with E_NOTIMPL\n");
         return false;
     }
     if (!log_checks(shim.module)) return false;

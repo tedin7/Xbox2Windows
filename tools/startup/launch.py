@@ -5,6 +5,7 @@ Prints the exit code (hex), how it ended and the trap log.
 """
 import ctypes
 import ctypes.wintypes as wt
+import math
 import os
 import sys
 import time
@@ -128,84 +129,178 @@ def inheritable_file(path):
     return h
 
 
-def main():
-    argv = sys.argv[1:]
-    extra = []
-    if "--" in argv:
-        extra = argv[argv.index("--") + 1:]
-        argv = argv[:argv.index("--")]
-    exe, cwd, logdir = (os.path.abspath(a) for a in argv[:3])
-    opts = dict(zip(argv[3::2], argv[4::2]))
-    timeout = float(opts.get("--timeout", 15))
-    memory = int(float(opts.get("--memory-gib", 16)) * 2**30)
-    max_processes = int(opts.get("--max-processes", 1))
-    os.makedirs(logdir, exist_ok=True)
-    trap_log = os.path.join(logdir, "trap.log")
-    if os.path.exists(trap_log):
-        os.remove(trap_log)
+VALID_OPTIONS = ("--timeout", "--memory-gib", "--max-processes")
+DWORD_MAX = (1 << 32) - 1
+GIB = 1 << 30
+SIZE_T_LIMIT = 1 << (ctypes.sizeof(ctypes.c_size_t) * 8)
 
-    k32.SetErrorMode(0x0001 | 0x0002 | 0x8000)  # FAILCRITICALERRORS | NOGPFAULTERRORBOX | NOOPENFILEERRORBOX
 
-    job = k32.CreateJobObjectW(None, None)
-    info = EXTENDED_LIMIT()
-    # KILL_ON_JOB_CLOSE | DIE_ON_UNHANDLED_EXCEPTION | JOB_MEMORY | ACTIVE_PROCESS (when limited)
-    info.Basic.LimitFlags = 0x2000 | 0x400 | 0x200 | (0x8 if max_processes else 0)
-    info.Basic.ActiveProcessLimit = max_processes
-    info.JobMemoryLimit = memory
-    if not k32.SetInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
-        raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
+def _parse_finite_float(raw, flag, allow_zero):
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{flag} expects a number, got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{flag} must be finite, got {raw!r}")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{flag} must be >= 0, got {raw!r}")
+    elif value <= 0:
+        raise ValueError(f"{flag} must be > 0, got {raw!r}")
+    return value
 
-    out = inheritable_file(os.path.join(logdir, "stdout.txt"))
-    err = inheritable_file(os.path.join(logdir, "stderr.txt"))
-    si = STARTUPINFOW()
-    si.cb = ctypes.sizeof(si)
-    si.dwFlags = 0x100  # STARTF_USESTDHANDLES
-    si.hStdOutput, si.hStdError = out, err
-    env = dict(os.environ, X2W_TRAP_LOG=trap_log)
-    storage_note = prepare_storage_path(env, logdir)
-    if storage_note:
-        print(storage_note)
-    shader_warning = check_shader_cache_warning(env, cwd)
-    if shader_warning:
-        print(shader_warning)
-    block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
-    cmdline = ctypes.create_unicode_buffer(" ".join(quote_argument(a) for a in [exe, *extra]))
-    pi = PROCESS_INFORMATION()
-    flags = 0x4 | 0x400  # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
-    if not k32.CreateProcessW(exe, cmdline, None, None, True, flags, ctypes.create_unicode_buffer(block),
-                              cwd, ctypes.byref(si), ctypes.byref(pi)):
-        print(f"CreateProcess failed: error {ctypes.get_last_error()}")
+
+def _parse_non_negative_int(raw, flag):
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise ValueError(f"{flag} expects an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{flag} must be >= 0, got {raw!r}")
+    return value
+
+
+def parse_args(argv):
+    """Parse and validate CLI arguments for launch.py."""
+    args = list(argv)
+    if "--" in args:
+        split_at = args.index("--")
+        head = args[:split_at]
+        extra = args[split_at + 1:]
+    else:
+        head = args
+        extra = []
+    if len(head) < 3:
+        raise ValueError("usage: launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--max-processes N] [-- args...]")
+    for label, value in zip(("exe", "cwd", "logdir"), head[:3]):
+        if not value or not value.strip():
+            raise ValueError(f"<{label}> must not be empty")
+    exe, cwd, logdir = (os.path.abspath(a) for a in head[:3])
+
+    opts = {}
+    index = 3
+    while index < len(head):
+        flag = head[index]
+        if flag not in VALID_OPTIONS:
+            raise ValueError(f"unknown option {flag!r} (expected {', '.join(VALID_OPTIONS)})")
+        if index + 1 >= len(head):
+            raise ValueError(f"option {flag} requires a value")
+        opts[flag] = head[index + 1]
+        index += 2
+
+    timeout = _parse_finite_float(opts.get("--timeout", "15"), "--timeout", allow_zero=False)
+    memory_gib = _parse_finite_float(opts.get("--memory-gib", "16"), "--memory-gib", allow_zero=True)
+    max_processes = _parse_non_negative_int(opts.get("--max-processes", "1"), "--max-processes")
+    # INFINITE (DWORD_MAX) is reserved. A positive cap must not round to zero.
+    if not 1 <= timeout * 1000 < DWORD_MAX:
+        raise ValueError("--timeout must be at least 1 ms and below the Windows INFINITE sentinel")
+    if memory_gib and not 1 <= memory_gib * GIB < SIZE_T_LIMIT:
+        raise ValueError("--memory-gib must be 0 or represent at least one byte within the Windows size_t limit")
+    if max_processes > DWORD_MAX:
+        raise ValueError("--max-processes exceeds the Windows DWORD limit")
+    return exe, cwd, logdir, timeout, memory_gib, max_processes, extra
+
+
+def main(argv=None):
+    try:
+        exe, cwd, logdir, timeout, memory_gib, max_processes, extra = parse_args(
+            sys.argv[1:] if argv is None else argv)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess)):
-        k32.TerminateProcess(wt.HANDLE(pi.hProcess), 1)
-        raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
-    start = time.time()
-    k32.ResumeThread(wt.HANDLE(pi.hThread))
-    result = k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), int(timeout * 1000))
-    ended = "exited"
-    if result == 0x102:  # WAIT_TIMEOUT
-        k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0001)
-        k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000)
-        ended = f"killed after {timeout:g} s timeout"
-    code = wt.DWORD()
-    k32.GetExitCodeProcess(wt.HANDLE(pi.hProcess), ctypes.byref(code))
-    k32.QueryInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info), None)
-    elapsed = time.time() - start
-    for h in (out, err, pi.hThread, pi.hProcess):
-        k32.CloseHandle(wt.HANDLE(h))
-    print(f"pid {pi.dwProcessId} {ended} in {elapsed:.2f} s, exit code {code.value:#010x}, "
-          f"peak job memory {info.PeakJobMemoryUsed / 2**20:.1f} MiB")
-    fast_fail = format_fast_fail_diagnostic(code.value, elapsed, trap_log, env)
-    if fast_fail:
-        print(fast_fail)
-    for name in ("stdout.txt", "stderr.txt", "trap.log"):
-        path = os.path.join(logdir, name)
-        text = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else None
-        print(f"--- {name}: " + ("(absent)" if text is None else f"{len(text)} chars"))
-        if text:
-            print(text[-4000:])
-    k32.CloseHandle(wt.HANDLE(job))
-    return 0
+
+    if k32 is None:
+        print("error: kernel32 is required to launch processes", file=sys.stderr)
+        return 2
+
+    memory = int(memory_gib * GIB)
+    job = None
+    out = None
+    err = None
+    process_handle = None
+    thread_handle = None
+    try:
+        os.makedirs(logdir, exist_ok=True)
+        trap_log = os.path.join(logdir, "trap.log")
+        if os.path.exists(trap_log):
+            os.remove(trap_log)
+
+        k32.SetErrorMode(0x0001 | 0x0002 | 0x8000)  # FAILCRITICALERRORS | NOGPFAULTERRORBOX | NOOPENFILEERRORBOX
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW")
+        info = EXTENDED_LIMIT()
+        # KILL_ON_JOB_CLOSE | DIE_ON_UNHANDLED_EXCEPTION | JOB_MEMORY (when > 0) | ACTIVE_PROCESS (when limited)
+        info.Basic.LimitFlags = 0x2000 | 0x400 | (0x200 if memory > 0 else 0) | (0x8 if max_processes else 0)
+        info.Basic.ActiveProcessLimit = max_processes
+        info.JobMemoryLimit = memory
+        if not k32.SetInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
+
+        out = inheritable_file(os.path.join(logdir, "stdout.txt"))
+        err = inheritable_file(os.path.join(logdir, "stderr.txt"))
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(si)
+        si.dwFlags = 0x100  # STARTF_USESTDHANDLES
+        si.hStdOutput, si.hStdError = out, err
+        env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+        storage_note = prepare_storage_path(env, logdir)
+        if storage_note:
+            print(storage_note)
+        shader_warning = check_shader_cache_warning(env, cwd)
+        if shader_warning:
+            print(shader_warning)
+        block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
+        cmdline = ctypes.create_unicode_buffer(" ".join(quote_argument(a) for a in [exe, *extra]))
+        pi = PROCESS_INFORMATION()
+        flags = 0x4 | 0x400  # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+        if not k32.CreateProcessW(exe, cmdline, None, None, True, flags, ctypes.create_unicode_buffer(block),
+                                  cwd, ctypes.byref(si), ctypes.byref(pi)):
+            print(f"CreateProcess failed: error {ctypes.get_last_error()}")
+            return 2
+        process_handle = pi.hProcess
+        thread_handle = pi.hThread
+        if not k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(process_handle)):
+            k32.TerminateProcess(wt.HANDLE(process_handle), 1)
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
+        start = time.time()
+        k32.ResumeThread(wt.HANDLE(thread_handle))
+        result = k32.WaitForSingleObject(wt.HANDLE(process_handle), int(timeout * 1000))
+        ended = "exited"
+        if result == 0x102:  # WAIT_TIMEOUT
+            k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0001)
+            k32.WaitForSingleObject(wt.HANDLE(process_handle), 5000)
+            ended = f"killed after {timeout:g} s timeout"
+        code = wt.DWORD()
+        k32.GetExitCodeProcess(wt.HANDLE(process_handle), ctypes.byref(code))
+        k32.QueryInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info), None)
+        elapsed = time.time() - start
+        for handle in (out, err, thread_handle, process_handle):
+            k32.CloseHandle(wt.HANDLE(handle))
+        out = err = thread_handle = process_handle = None
+        print(f"pid {pi.dwProcessId} {ended} in {elapsed:.2f} s, exit code {code.value:#010x}, "
+              f"peak job memory {info.PeakJobMemoryUsed / 2**20:.1f} MiB")
+        fast_fail = format_fast_fail_diagnostic(code.value, elapsed, trap_log, env)
+        if fast_fail:
+            print(fast_fail)
+        for name in ("stdout.txt", "stderr.txt", "trap.log"):
+            path = os.path.join(logdir, name)
+            text = None
+            if os.path.exists(path):
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            print(f"--- {name}: " + ("(absent)" if text is None else f"{len(text)} chars"))
+            if text:
+                print(text[-4000:])
+        return 0
+    except OSError as exc:
+        print(f"error: launch failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        for handle in (out, err, thread_handle, process_handle, job):
+            if handle is not None:
+                k32.CloseHandle(wt.HANDLE(handle))
 
 
 if __name__ == "__main__":

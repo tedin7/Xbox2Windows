@@ -34,10 +34,12 @@ SOFTWARE
 
 ## Ahmet Dedeler bcpack-rs
 
-`src/startup_stubs/bcpack_tables.h` contains BC7 and BC1 codebook, window, and dictionary tables
-(`BC7_CONTROL_TABLE`, `BC7_DICTIONARY`, `BC1_WINDOW`, `BC1_QUAD_MASKS`) adapted from
-https://github.com/Ahmet-Dedeler/bcpack-rs (pinned revision c55c5fad539644b8cf5a705051df214291763fc0).
-The BC7 and BC1 block reconstruction routines in `src/startup_stubs/bcpack_decoder.h` are adapted from
+`src/startup_stubs/bcpack_tables.h` and `src/startup_stubs/bcpack_tables_bcn.inl` contain BC1, BC3, BC4, BC5, and BC7
+codebook, rank, window, and dictionary tables (`BC7_CONTROL_TABLE`, `BC7_DICTIONARY`, `BC1_WINDOW`, `BC1_QUAD_MASKS`,
+`RANK_PAIR_BC4`, `BC4_DICTIONARY`, `RANK_PAIR_BC5`, `BC5_DICTIONARY`, `RANK_PAIR_BC3_ALPHA`, `RANK_QUAD_BC3_COLOUR`,
+`BC3_DICTIONARY`) adapted from https://github.com/Ahmet-Dedeler/bcpack-rs
+(pinned revision c55c5fad539644b8cf5a705051df214291763fc0).
+The BC1, BC3, BC4, BC5, and BC7 block reconstruction routines in `src/startup_stubs/bcpack_decoder.h` are adapted from
 the same repository. Used under the MIT License:
 
 ```

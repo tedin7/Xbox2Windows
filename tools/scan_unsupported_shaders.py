@@ -128,6 +128,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wakeup",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
+    # s_round_mode keeping binary32 at nearest even and writing MODE[3:2] = 0 or 3, as pixel_aot lowers it.
+    r"s_round_mode\s+0x[0c]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
     # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
     r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",
@@ -137,6 +139,16 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wqm_(?:b64|b32)\s+(?:exec|exec_lo),\s+(?:exec|exec_lo)",
     r"s_and_b64\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+(?:s\[\d+:\d+\]|s\d+)",
     r"s_and_b32\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+s\d+",
+    # The structured masked region pixel_aot lowers: the s_and_saveexec opener, the s_or close, the s_andn2 else
+    # transition and the empty-mask skip, in the wave64 spellings and the wave32 ones on exec_lo (the MOV close is the
+    # s_mov line above). Whether a line sits in a well-formed region is decided by the translator, not here.
+    r"s_and_saveexec_b64\s+s\[\d+:\d+\],\s+(?:vcc|s\[\d+:\d+\])",
+    r"s_and_saveexec_b32\s+s\d+,\s+(?:vcc_lo|s\d+)",
+    r"s_or_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
+    r"s_or_b32\s+exec_lo,\s+exec_lo,\s+s\d+",
+    r"s_andn2_b64\s+exec,\s+s\[\d+:\d+\],\s+exec",
+    r"s_andn2_b32\s+exec_lo,\s+s\d+,\s+exec_lo",
+    r"s_cbranch_execz\s+-?(?:0x[0-9a-f]+|0|[1-9]\d*)",
     rf"s_(?:cmov|not|brev)_b64\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE}",
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -186,6 +198,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_cmp_class_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cmp_class_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cndmask_b32(?:_e32|_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+{PIXEL_LANE_MASK}",
+    # This pattern recognizes the opcode and destination. pixel_aot.lower validates
+    # the selectors and source operands, so a scanner match can still fail lowering.
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
     r"v_div_fmas_f32(?:_e64)?\s+v\d+,\s+[^,\s]+,\s+[^,\s]+,\s+[^,\s]+(?:\s+clamp)?",
     r"(?:v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4)\s+v\d+,\s+.+",
@@ -432,6 +446,8 @@ KNOWN_RDNA2_BASE_OPCODES |= (
         # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
         "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
         "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16",
+        "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
         "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
     }
     | {name for name, _, _ in MUBUF_OPS.values()}
@@ -646,6 +662,13 @@ def is_instruction_supported(instruction_line: str) -> bool:
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
         counters = [token.partition("(")[0] for token in wait[1].split()]
         return len(counters) == len(set(counters))
+    if re.match(r"s_and_saveexec_b(?:32|64)\s|s_(?:or|andn2)_b(?:32|64)\s+exec", clean):
+        # Masked-region exec forms: an aligned SGPR pair or an SGPR up to s105, as pixel_aot's sgpr_pair/sgpr_name.
+        return (all(_sgpr_pair_ok(pair) for pair in re.finditer(r"s\[(\d+):(\d+)\]", clean))
+                and all(int(n) <= 105 for n in re.findall(r"(?<![\w\[:])s(\d+)(?!\d)", clean)))
+    if execz := re.fullmatch(r"s_cbranch_execz\s+(-?(?:0x[0-9a-f]+|0|[1-9]\d*))", clean):
+        # The 16-bit signed displacement pixel_aot accepts.
+        return -0x8000 <= int(execz[1], 0) <= 0x7fff
     return True
 
 

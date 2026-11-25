@@ -23,9 +23,11 @@ The value set is checked to separate a lowering that ignores the select or sext(
 
 Binary32 class compares read a DWORD float in SRC0 and a selected, optionally sign-extended integer mask in SRC1.
 The emitted predicate is checked against the selected mask for each of the ten classes. Ordinary float predicates
-remain refused in their SDWA form pending the NaN predicate work (#1920).
+with DWORD selections must lower as their e64 form with the same neg/abs; tests/startup_gfx2hlsl_f32_sdwa_check.py
+checks them against the ISA reference.
 
-Refused: a float source with a sub-dword select, an SDWA modifier the decoder does not print for
+Refused: a sub-dword or sign-extended class value, a byte or word select on an ordinary float source (its result
+depends on the binary32 denormal mode), sext() on a float source, an SDWA modifier the decoder does not print for
 compares, a missing or repeated select, and a destination that is not vcc_lo, EXEC or an SGPR.
 
 The draw: a source-built pixel program multiplies the packed screen position by a constant and keeps a pixel when
@@ -269,9 +271,16 @@ def controls():
           and all(expr.run({'s3': a, 'v2': b})[0] == int(field(a, 'BYTE_3', True) != field(b, 'WORD_1', False))
                   for a, b in PAIRS), str((asm, stage.lines)))
 
-    # 6. Float compares stay refused in their SDWA form, with every modifier and destination.
-    accepted, float_forms = [], 0
+    # 6. Float compares in their SDWA form (#1906): with DWORD selections every condition, modifier and destination
+    # emits the text of the e64 form with the same modifiers. Byte and word selections, NaN and the compiler models
+    # are checked in tests/startup_gfx2hlsl_f32_sdwa_check.py.
+    differ, float_forms = [], 0
     modifiers = [(False, False), (True, False), (False, True), (True, True)]
+
+    def spelled(reg, neg, absolute):
+        reg = '|%s|' % reg if absolute else reg
+        return '-' + reg if neg else reg
+
     for op, (cmpx, cond, typ) in sorted(COMPARES.items()):
         if typ != 'f32' or cond in ('class', 'tru'):
             continue
@@ -281,9 +290,20 @@ def controls():
                                  SGPR_DST if destination == 'sgpr' else None)
                 name, asm = decode_one(code)
                 float_forms += 1
-                if refusal(name, asm) != '%s: f32 SDWA compares are not lowered' % name:
-                    accepted.append(asm)
-    check('%d float SDWA forms refused' % float_forms, not accepted and float_forms == 15 * 16 * 3, str(accepted[:2]))
+                e64 = name.replace('_sdwa', '_e64')
+                operands = '%s, %s' % (spelled('v1', neg0, abs0), spelled('v2', neg1, abs1))
+                if not cmpx:
+                    operands = '%s, %s' % ('s%d' % SGPR_DST if destination == 'sgpr' else 'vcc_lo', operands)
+                if refusal(name, asm) is not None:
+                    differ.append((asm, refusal(name, asm)))
+                    continue
+                _, sdwa_stage = translate(code)
+                e64_stage = Probe()
+                e64_stage.one(e64, '%s %s' % (e64, operands))
+                if sdwa_stage.lines != e64_stage.lines or sdwa_stage.masks != e64_stage.masks:
+                    differ.append((asm, sdwa_stage.lines, e64_stage.lines))
+    check('%d float SDWA forms with DWORD selections lower as the e64 form' % float_forms,
+          not differ and float_forms == 15 * 16 * 3, str(differ[:2]))
 
     # 7. Refusals, each with its own message.
     def expect(label, name, asm, message):
@@ -326,11 +346,21 @@ def controls():
                                         None, 'DWORD', 'BYTE_1'))
     check('class float source preserves abs and neg', 'class32((-abs(F(v1))))' in class_stage.lines[0],
           str(class_stage.lines))
+    # A byte or word select on an ordinary float source stays refused (#1906): the field is +0 or a denormal, so the
+    # result depends on the binary32 denormal mode.
     for index in (0, 1):
         for sel in SELS[:-1]:
             sels = ('DWORD', sel) if index else (sel, 'DWORD')
             name, asm = decode_one(vopc_sdwa(0x01, source('v', 1), source('v', 2), None, *sels))
-            expect('float src%d_sel:%s' % (index, sel), name, asm, 'v_cmp_lt_f32_sdwa: f32 SDWA compares are not lowered')
+            expect('float src%d_sel:%s' % (index, sel), name, asm,
+                   'v_cmp_lt_f32_sdwa: f32 SDWA byte/word selection depends on the binary32 denormal mode')
+    expect('sext() on a float source', 'v_cmp_lt_f32_sdwa',
+           'v_cmp_lt_f32_sdwa vcc_lo, sext(v1), v2 src0_sel:BYTE_0 src1_sel:DWORD',
+           'v_cmp_lt_f32_sdwa: sext() on a float source')
+    for extra in ('clamp', 'mul:2'):
+        expect('float compare modifier %s' % extra, 'v_cmp_lt_f32_sdwa',
+               'v_cmp_lt_f32_sdwa vcc_lo, v1, v2 src0_sel:DWORD src1_sel:DWORD %s' % extra,
+               'v_cmp_lt_f32_sdwa with SDWA modifier %s' % extra)
     base = 'v_cmp_lt_i32_sdwa vcc_lo, v1, v2'
     for extra in ('clamp', 'dst_sel:DWORD', 'dst_unused:UNUSED_PAD', 'src2_sel:DWORD', 'mul:2'):
         expect('modifier %s' % extra, 'v_cmp_lt_i32_sdwa', '%s src0_sel:DWORD src1_sel:DWORD %s' % (base, extra),
@@ -512,7 +542,7 @@ def draw(renderer, adapter, vs, ps, expected):
                           str(expected)], capture_output=True, text=True)
     if run.returncode == 77:
         print(run.stdout + run.stderr)
-        sys.exit(77)
+        sys.exit(1 if failures else 77)
     return run
 
 

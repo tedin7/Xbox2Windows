@@ -3,6 +3,7 @@
 Modes: "controls" runs the translator checks only; "draw <dxc> <renderer> <adapter>" also dispatches the fixture
 and compares the UAV readback with words from an independent CPU reference.
 """
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -194,6 +195,11 @@ def draw(directory, compiler, renderer, backend):
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"{name}: mutation '{label}' escaped detection")
     print(f"{name}: {bound} lanes match; {len(WRONG_REFERENCES) + 1} reference and 4 source mutations rejected")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in lines if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

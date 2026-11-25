@@ -1,7 +1,11 @@
 """Identify the first ID 16 writer and reader in the pinned default dispatch graph."""
 import argparse
+import os
 from pathlib import Path
 import struct
+import tempfile
+
+import pefile
 
 from ffx_version_query import UPSCALER, checked_image, lower, region
 from resource_inventory import parts
@@ -126,13 +130,42 @@ def inspect(pe):
     yield "initializer", init_data
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output_directory", type=Path)
-    args = parser.parse_args()
-    with checked_image(args.image, UPSCALER) as pe:
-        programs = list(inspect(pe))
-    args.output_directory.mkdir(parents=True, exist_ok=True)
-    for name, code in programs:
-        (args.output_directory / (name + ".bin")).write_bytes(code)
+    args = parser.parse_args(argv)
+    try:
+        if _same_path(args.output_directory, args.image):
+            raise ValueError(f"Output directory collides with image: {args.output_directory}")
+        if args.output_directory.exists() and not args.output_directory.is_dir():
+            raise ValueError(f"Output directory is not a directory: {args.output_directory}")
+        with checked_image(args.image, UPSCALER) as pe:
+            programs = list(inspect(pe))
+        outputs = [(args.output_directory / f"{name}.bin", code) for name, code in programs]
+        for destination, _ in outputs:
+            if _same_path(destination, args.image):
+                raise ValueError(f"Output file collides with image: {destination}")
+        args.output_directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=args.output_directory) as staging_dir:
+            staging_root = Path(staging_dir)
+            staged = []
+            for destination, code in outputs:
+                staging_path = staging_root / destination.name
+                staging_path.write_bytes(code)
+                staged.append((staging_path, destination))
+            for staging_path, destination in staged:
+                os.replace(staging_path, destination)
+    except (OSError, ValueError, struct.error, pefile.PEFormatError) as exc:
+        parser.exit(1, f"{exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

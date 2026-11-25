@@ -1,11 +1,17 @@
 // Input for tests/startup_host_cpu_debug_check.py: a program that executes SHA-extension and RDPID
 // instructions, which a host processor may lack. It prints the SHA-256 digest of "abc" computed
-// with SHA256RNDS2, SHA256MSG1 and SHA256MSG2, and whether two RDPID reads agree with RDTSCP.
+// with SHA256RNDS2, SHA256MSG1 and SHA256MSG2, how many threads read RDPID when released together,
+// and whether two RDPID reads agree with RDTSCP.
 #include <immintrin.h>
 #include <intrin.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #if defined(__clang__)
 #define HOST_CPU_TARGET __attribute__((target("sha,sse4.1,ssse3,rdpid")))
@@ -56,6 +62,41 @@ HOST_CPU_TARGET __declspec(noinline) unsigned read_processor_id()
 {
     return _rdpid_u32();
 }
+
+// Separate RDPID sites (the added constant keeps the linker from folding them into one function).
+template <unsigned N>
+HOST_CPU_TARGET __declspec(noinline) unsigned processor_id_site()
+{
+    return _rdpid_u32() + N;
+}
+
+template <unsigned... N>
+constexpr std::array<unsigned (*)(), sizeof...(N)> make_sites(std::integer_sequence<unsigned, N...>)
+{
+    return {processor_id_site<N>...};
+}
+constexpr auto sites = make_sites(std::make_integer_sequence<unsigned, 32>{});
+
+// Several threads reach each site together, before it has run anywhere: on a host without RDPID they
+// fault at the same time, and every one has to continue after the debugger replaces the instruction.
+// Returns how many threads passed every site.
+int race_sites(int thread_count)
+{
+    std::atomic<int> arrived[sites.size()] = {};
+    std::atomic<int> finished{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i)
+        threads.emplace_back([&] {
+            for (std::size_t site = 0; site < sites.size(); ++site) {
+                arrived[site].fetch_add(1);
+                while (arrived[site].load() < thread_count) _mm_pause();
+                sites[site]();
+            }
+            finished.fetch_add(1);
+        });
+    for (auto& thread : threads) thread.join();
+    return finished.load();
+}
 }  // namespace
 
 int main()
@@ -65,6 +106,7 @@ int main()
     std::printf("sha256 abc ");
     for (std::uint32_t word : digest) std::printf("%08x", word);
     std::printf("\n");
+    std::printf("rdpid threads %d of 8\n", race_sites(8));
     // A thread can move between processors, so RDPID is compared with RDTSCP on both sides.
     bool agrees = false;
     for (int attempt = 0; attempt < 8 && !agrees; ++attempt) {

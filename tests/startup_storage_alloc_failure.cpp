@@ -3,8 +3,11 @@
 //
 // Request buffers are sized from request fields. The failure here is a real one, the same kind a
 // job-wide commit cap causes in a startup run: this process joins a job object whose process-memory
-// limit is a little above its current commit, then submits a zlib request whose declared inflated
-// size is far above the limit. The stand-in's buffer allocation throws std::bad_alloc on the worker.
+// limit is a little above its current commit, then submits a zlib + BCPack request whose
+// IntermediateSize (+0x34, the inflated size of such a request) is far above the limit. The stand-in's
+// buffer allocation throws std::bad_alloc on the worker. A zlib request that carries the same number
+// as its CancellationTag (+0x38) is submitted under the same limit and must succeed: the tag is not a
+// size (public DSTORAGE_REQUEST layout).
 // The stand-in is a DLL with its own C++ runtime, so replacing operator new here would not reach it;
 // the commit limit is the one seam that works the same on the real worker.
 //
@@ -32,7 +35,7 @@ namespace {
 using u64 = std::uint64_t;
 constexpr int skipped = 77;
 constexpr SIZE_T commit_headroom = SIZE_T{256} << 20;     // job limit above the current commit
-constexpr unsigned oversized_inflated = 1536u << 20;       // declared inflated size, above the limit
+constexpr unsigned oversized_inflated = 1536u << 20;       // declared IntermediateSize, above the limit
 constexpr DWORD completion_timeout_ms = 15000;
 // The submit threads start before commit runs out; a stack committed at creation is all they will have.
 constexpr SIZE_T submit_thread_stack = SIZE_T{256} << 10;
@@ -119,17 +122,19 @@ struct Queue {
     Object* status = nullptr;
 
     // Enqueues a memory-source zlib request into a linear destination and a status entry, submits,
-    // and waits for the status. Returns false on a timeout; hr receives the status.
-    bool run(std::vector<unsigned char>& destination, const std::vector<unsigned char>& stream, unsigned inflated,
-             unsigned index, long& hr) const
+    // and waits for the status. Returns false on a timeout; hr receives the status. A nonzero
+    // intermediate_size also asks for BCPack (format 7) and is written as IntermediateSize.
+    bool run(std::vector<unsigned char>& destination, const std::vector<unsigned char>& stream, unsigned index, long& hr,
+             unsigned intermediate_size = 0, u64 cancellation_tag = 0) const
     {
         unsigned char request[0x48] = {};
-        *reinterpret_cast<u64*>(request + 0x00) = 1 | 0x400000;
+        *reinterpret_cast<u64*>(request + 0x00) = 1 | 0x400000 | (intermediate_size ? 7u << 1 : 0u);
         *reinterpret_cast<unsigned char**>(request + 0x08) = destination.data();
         *reinterpret_cast<unsigned*>(request + 0x18) = static_cast<unsigned>(destination.size());
         *reinterpret_cast<const unsigned char**>(request + 0x20) = stream.data();
         *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(stream.size());
-        *reinterpret_cast<unsigned*>(request + 0x38) = inflated;
+        *reinterpret_cast<unsigned*>(request + 0x34) = intermediate_size;
+        *reinterpret_cast<u64*>(request + 0x38) = cancellation_tag;
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, index);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
@@ -358,8 +363,7 @@ struct WorkerQueue {
         queue = static_cast<Object*>(queue_ptr);
         return true;
     }
-    void enqueue_request(std::vector<unsigned char>& destination, const std::vector<unsigned char>& stream,
-                         unsigned inflated)
+    void enqueue_request(std::vector<unsigned char>& destination, const std::vector<unsigned char>& stream)
     {
         unsigned char bytes[0x48] = {};
         *reinterpret_cast<u64*>(bytes + 0x00) = 1 | 0x400000;
@@ -367,7 +371,6 @@ struct WorkerQueue {
         *reinterpret_cast<unsigned*>(bytes + 0x18) = static_cast<unsigned>(destination.size());
         *reinterpret_cast<const unsigned char**>(bytes + 0x20) = stream.data();
         *reinterpret_cast<unsigned*>(bytes + 0x30) = static_cast<unsigned>(stream.size());
-        *reinterpret_cast<unsigned*>(bytes + 0x38) = inflated;
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, bytes);
     }
     void enqueue_status(unsigned index) { reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, index); }
@@ -432,7 +435,7 @@ bool scenario_three_failures_then_start(const InjectedInputs& in)
     std::vector<unsigned char> destination(plain.size(), 0xAA);
     OrderedFence fence{};
     arm_failures(6);
-    q.enqueue_request(destination, *in.stream, static_cast<unsigned>(plain.size()));
+    q.enqueue_request(destination, *in.stream);
     q.enqueue_status(0);
     q.enqueue_signal(fence, 0xA1);
     bool ok = injected_check(create_thread_calls == 6 && create_thread_failures == 6, name,
@@ -458,7 +461,7 @@ bool scenario_default_stack_fallback(const InjectedInputs& in)
     std::vector<unsigned char> destination(plain.size(), 0xAA);
     OrderedFence fence{};
     arm_failures(1);
-    q.enqueue_request(destination, *in.stream, static_cast<unsigned>(plain.size()));
+    q.enqueue_request(destination, *in.stream);
     q.enqueue_status(0);
     q.enqueue_signal(fence, 0xB2);
     q.submit();
@@ -488,16 +491,15 @@ bool scenario_worker_never_starts(const InjectedInputs& in)
     WorkerQueue q;
     if (!injected_check(q.create(in.factory, in.description, "Injected3"), name, "cannot create the queue")) return false;
     const auto& plain = *in.plain;
-    const unsigned inflated = static_cast<unsigned>(plain.size());
     std::vector<unsigned char> first(plain.size(), 0xAA), second(plain.size(), 0xAA), third(plain.size(), 0xAA);
     OrderedFence fence_a{}, fence_b{}, fence_c{};
     arm_failures(100000);
 
     // Batch one: request, status, signal, request, status, signal.
-    q.enqueue_request(first, *in.stream, inflated);
+    q.enqueue_request(first, *in.stream);
     q.enqueue_status(0);
     q.enqueue_signal(fence_a, 1);
-    q.enqueue_request(second, *in.stream, inflated);
+    q.enqueue_request(second, *in.stream);
     q.enqueue_status(1);
     q.enqueue_signal(fence_b, 2);
     bool ok = injected_check(!q.complete(0) && !q.complete(1) && !fence_a.signaled && !fence_b.signaled, name,
@@ -519,7 +521,7 @@ bool scenario_worker_never_starts(const InjectedInputs& in)
                         "a thread was created while every CreateThread call was set to fail") && ok;
 
     // Batch two on the same queue, which still has no worker; then an empty Submit.
-    q.enqueue_request(third, *in.stream, inflated);
+    q.enqueue_request(third, *in.stream);
     q.enqueue_status(2);
     q.enqueue_signal(fence_c, 3);
     q.submit();
@@ -531,7 +533,7 @@ bool scenario_worker_never_starts(const InjectedInputs& in)
     // Threads can be created again: the same queue starts its worker and serves a request.
     arm_failures(0);
     std::vector<unsigned char> recovered(plain.size(), 0xAA);
-    q.enqueue_request(recovered, *in.stream, inflated);
+    q.enqueue_request(recovered, *in.stream);
     q.enqueue_status(3);
     q.submit();
     ok = injected_check(q.wait_complete(3) && q.hresult(3) == 0 && recovered == plain, name,
@@ -594,9 +596,9 @@ int main(int argc, char** argv)
     Queue queue;
     void* status_ptr = nullptr;
     void* queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
-    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "Status", nullptr, &status_ptr) != 0 ||
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "Status", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {
         std::fprintf(stderr, "cannot create the queue\n");
         return 1;
@@ -607,11 +609,10 @@ int main(int argc, char** argv)
     std::vector<unsigned char> plain(60000);
     for (std::size_t i = 0; i < plain.size(); ++i) plain[i] = static_cast<unsigned char>((i % 251) ^ 0x5a);
     const auto stream = stored_zlib(plain);
-    const unsigned plain_size = static_cast<unsigned>(plain.size());
 
     long hr = -1;
     std::vector<unsigned char> first(plain.size(), 0xAA);
-    if (!queue.run(first, stream, plain_size, 0, hr) || hr != 0 || first != plain) {
+    if (!queue.run(first, stream, 0, hr) || hr != 0 || first != plain) {
         std::fprintf(stderr, "the baseline request did not succeed (hr 0x%08lx)\n", static_cast<unsigned long>(hr));
         return 1;
     }
@@ -635,8 +636,16 @@ int main(int argc, char** argv)
         return skipped;
     }
 
+    // The same number as a CancellationTag sizes nothing: the request succeeds under the limit.
+    std::vector<unsigned char> tagged(plain.size(), 0xAA);
+    if (!queue.run(tagged, stream, 3, hr, 0, oversized_inflated) || hr != 0 || tagged != plain) {
+        std::fprintf(stderr, "a zlib request with a large CancellationTag did not succeed (hr 0x%08lx)\n",
+                     static_cast<unsigned long>(hr));
+        return 1;
+    }
+
     std::vector<unsigned char> failing(plain.size(), 0xAA);
-    if (!queue.run(failing, stream, oversized_inflated, 1, hr)) {
+    if (!queue.run(failing, stream, 1, hr, oversized_inflated)) {
         std::fprintf(stderr, "the request that hit an allocation failure never completed\n");
         return 1;
     }
@@ -652,7 +661,7 @@ int main(int argc, char** argv)
         }
 
     std::vector<unsigned char> after(plain.size(), 0xAA);
-    if (!queue.run(after, stream, plain_size, 2, hr) || hr != 0 || after != plain) {
+    if (!queue.run(after, stream, 2, hr) || hr != 0 || after != plain) {
         std::fprintf(stderr, "the worker did not serve a request after the failure (hr 0x%08lx)\n", static_cast<unsigned long>(hr));
         return 1;
     }
@@ -716,7 +725,6 @@ int main(int argc, char** argv)
     *reinterpret_cast<unsigned*>(req + 0x18) = static_cast<unsigned>(during_exhaustion.size());
     *reinterpret_cast<const unsigned char**>(req + 0x20) = stream.data();
     *reinterpret_cast<unsigned*>(req + 0x30) = static_cast<unsigned>(stream.size());
-    *reinterpret_cast<unsigned*>(req + 0x38) = plain_size;
 
     reinterpret_cast<EnqueueRequestFn>(recovery_queue.queue->vtable[3])(recovery_queue.queue, req);
     reinterpret_cast<EnqueueStatusFn>(recovery_queue.queue->vtable[4])(recovery_queue.queue, recovery_queue.status, 0);
@@ -769,7 +777,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (!recovery_queue.run(after_recovery, stream, plain_size, 1, hr) || hr != 0 || after_recovery != plain) {
+    if (!recovery_queue.run(after_recovery, stream, 1, hr) || hr != 0 || after_recovery != plain) {
         std::fprintf(stderr, "the queue did not recover after worker startup failure (hr 0x%08lx)\n",
                      static_cast<unsigned long>(hr));
         return 1;

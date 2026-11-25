@@ -160,7 +160,8 @@ def classify(blob, sections, stage, llvm, emit):
             if not isinstance(blob, (bytes, bytearray, memoryview)) or len(blob) < 32:
                 raise ValueError("Missing or truncated mesh container payload")
     emit = emit if emit is not None else _emit_noop
-    code = pixel_aot.container_code(dxil, stage=stage, llvm=llvm)
+    features = pixel_aot.MESH_WAVE64 if stage == 13 else b""
+    code = pixel_aot.container_code(dxil, stage=stage, llvm=llvm, features=features)
     if stage == 0:
         return pixel_profiles(code, llvm, emit)
     if stage == 5:

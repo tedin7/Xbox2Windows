@@ -328,6 +328,11 @@ class TestRdna2Disasm(unittest.TestCase):
             # SMEM: register widths per op and soffset vs immediate offset
             ("01050cf4000000fa", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], 0x0"),
             ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
+            # SMEM OFFSET[20:0] is a signed 21-bit byte offset
+            ("000000f4ffff1ffa", "s_load_dword", "s_load_dword s0, s[0:1], -0x1"),
+            ("000000f4000010fa", "s_load_dword", "s_load_dword s0, s[0:1], -0x100000"),
+            ("000000f4ffff0ffa", "s_load_dword", "s_load_dword s0, s[0:1], 0xfffff"),
+            ("000000f4ffff1f00", "s_load_dword", "s_load_dword s0, s[0:1], s0 offset:-0x1"),
             ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
             ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
             ("420160f400000000", "s_buffer_store_dword", "s_buffer_store_dword s5, s[4:7], s0"),
@@ -856,6 +861,41 @@ class TestRdna2Disasm(unittest.TestCase):
         # The neighbouring opcodes stay as they were: 0x1c is not defined and 0x42 is v_movreld_b32.
         self.assertEqual(decode_instruction(bytes.fromhex("0038007e"), 0)[:2], (4, "v_vop1_1c"))
         self.assertEqual(decode_instruction(bytes.fromhex("0284007e"), 0)[1], "v_movreld_b32_e32")
+
+    def test_vop1_binary16_transcendental_opcodes(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`; the texts are llvm-mc's disassembly of them.
+        vectors = (
+            ("01a90a7e", 4, "v_rcp_f16_e32 v5, v1"),
+            ("01ab0a7e", 4, "v_sqrt_f16_e32 v5, v1"),
+            ("01ad0a7e", 4, "v_rsq_f16_e32 v5, v1"),
+            ("01af0a7e", 4, "v_log_f16_e32 v5, v1"),
+            ("01b10a7e", 4, "v_exp_f16_e32 v5, v1"),
+            ("01b30a7e", 4, "v_frexp_mant_f16_e32 v5, v1"),
+            ("01b50a7e", 4, "v_frexp_exp_i16_f16_e32 v5, v1"),
+            ("01c10a7e", 4, "v_sin_f16_e32 v5, v1"),
+            ("01c30a7e", 4, "v_cos_f16_e32 v5, v1"),
+            ("0500d4d50101012a", 8, "v_rcp_f16_e64 v5, -v1 mul:2"),
+            ("0500d5d50101012a", 8, "v_sqrt_f16_e64 v5, -v1 mul:2"),
+            ("0500d6d50101012a", 8, "v_rsq_f16_e64 v5, -v1 mul:2"),
+            ("0500d7d50101012a", 8, "v_log_f16_e64 v5, -v1 mul:2"),
+            ("0500d8d50101012a", 8, "v_exp_f16_e64 v5, -v1 mul:2"),
+            ("0500d9d50101012a", 8, "v_frexp_mant_f16_e64 v5, -v1 mul:2"),
+            ("0501dad501010102", 8, "v_frexp_exp_i16_f16_e64 v5, |v1|"),
+            ("0500e0d50101012a", 8, "v_sin_f16_e64 v5, -v1 mul:2"),
+            ("0500e1d50101012a", 8, "v_cos_f16_e64 v5, -v1 mul:2"),
+            ("f9a80a7e01050400", 8,
+             "v_rcp_f16_sdwa v5, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0"),
+            ("f9b40a7e01040500", 8,
+             "v_frexp_exp_i16_f16_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1"),
+            ("fac00a7e010101af", 8, "v_sin_f16_dpp v5, v1 row_shl:1 row_mask:0xa bank_mask:0xf"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # The opcodes around them keep their names: 0x5b is v_floor_f16 and 0x5f is v_fract_f16.
+        self.assertEqual(decode_instruction(bytes.fromhex("01b70a7e"), 0)[1], "v_floor_f16_e32")
+        self.assertEqual(decode_instruction(bytes.fromhex("01bf0a7e"), 0)[1], "v_fract_f16_e32")
 
     def test_vop1_f64_source_conversions_have_one_register_result(self):
         # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`. A 32-bit result from a binary64 source
@@ -2375,15 +2415,8 @@ class TestRdna2Disasm(unittest.TestCase):
             repro[0]["assembly"],
             "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
         )
-        operands, op_sel, op_sel_hi, clamp = parse_fma_mix(repro[0]["assembly"].split(" ", 2)[2])
-        self.assertEqual((operands, op_sel, op_sel_hi, clamp), (["|s44|", "-v19", "v20"], [1, 1, 0], [1, 0, 0], False))
-        scalar = {"s44": "params[0].x"}
-        vector = {"v19": "alu_19", "v20": "alu_20"}
-        lowered = [
-            fma_mix_operand(tok, bool(f16), bool(hi), scalar, vector, set(), set())
-            for tok, f16, hi in zip(operands, op_sel, op_sel_hi)
-        ]
-        self.assertEqual(lowered, ["abs(widen16(asuint(params[0].x) >> 16))", "(-widen16(asuint(alu_19)))", "alu_20"])
+        with self.assertRaisesRegex(ValueError, "High-half selection requires an f16 operand"):
+            parse_fma_mix(repro[0]["assembly"].split(" ", 2)[2])
 
         def encode_fma_mix(op, vdst, src0, src1, src2, abs_bits=(0, 0, 0), neg_bits=(0, 0, 0),
                            sel=(0, 0, 0), sel_hi=(0, 0, 0), use_clamp=False, literal=None):
@@ -2425,8 +2458,8 @@ class TestRdna2Disasm(unittest.TestCase):
             ((0, 0, 0), (1, 0, 0), (0, 0, 0), (0, 0, 0), False, "-v2, v3, v4", ""),
             ((0, 0, 0), (0, 1, 0), (0, 0, 0), (0, 0, 0), False, "v2, -v3, v4", ""),
             ((0, 0, 0), (0, 0, 1), (0, 0, 0), (0, 0, 0), False, "v2, v3, -v4", ""),
-            ((1, 1, 1), (1, 0, 1), (1, 1, 1), (1, 0, 1), True,
-             "-|v2|, |v3|, -|v4|", " op_sel:[1,1,1] op_sel_hi:[1,0,1] clamp"),
+            ((1, 1, 1), (1, 0, 1), (1, 0, 1), (1, 1, 1), True,
+             "-|v2|, |v3|, -|v4|", " op_sel:[1,0,1] op_sel_hi:[1,1,1] clamp"),
         )
         vec = {"v2": "alu_2", "v3": "alu_3", "v4": "alu_4"}
         for op, name in opcodes:
@@ -2442,8 +2475,33 @@ class TestRdna2Disasm(unittest.TestCase):
                     self.assertTrue(is_instruction_supported(asm))
                     parsed_ops, parsed_sel, parsed_hi, parsed_clamp = parse_fma_mix(asm.split(" ", 2)[2])
                     self.assertEqual((parsed_sel, parsed_hi, parsed_clamp), (list(sel), list(sel_hi), use_clamp))
-                    for tok, f16, hi in zip(parsed_ops, parsed_sel, parsed_hi):
+                    for tok, f16, hi in zip(parsed_ops, parsed_hi, parsed_sel):
                         fma_mix_operand(tok, bool(f16), bool(hi), {}, vec, set(), set())
+
+        # LLVM prints these forms for three low or three high f16 register halves.
+        for selectors, shift in (
+            ("op_sel_hi:[1,1,1]", ""),
+            ("op_sel:[1,1,1] op_sel_hi:[1,1,1]", " >> 16"),
+        ):
+            with self.subTest(selectors=selectors):
+                ops, sel, sel_hi, _ = parse_fma_mix(f"v2, v3, v4 {selectors}")
+                lowered = [
+                    fma_mix_operand(tok, f16, hi, {}, vec, set(), set())
+                    for tok, f16, hi in zip(ops, sel_hi, sel)
+                ]
+                self.assertEqual(lowered, [f"widen16(asuint(alu_{i}){shift})" for i in (2, 3, 4)])
+
+        # The inline zero's negation applies after half selection and widening.
+        for is_f16, is_hi in ((False, False), (True, False), (True, True)):
+            with self.subTest(is_f16=is_f16, is_hi=is_hi):
+                self.assertEqual(
+                    fma_mix_operand("-0", is_f16, is_hi, {}, vec, set(), set()),
+                    "asfloat(0x80000000u)",
+                )
+                for value in range(-16, 0):
+                    with self.subTest(value=value):
+                        with self.assertRaisesRegex(ValueError, "Ambiguous mixed-precision inline constant"):
+                            fma_mix_operand(str(value), is_f16, is_hi, {}, vec, set(), set())
 
         # Literal operand with combined -|literal| modifiers must consume trailing DWORD and round-trip.
         lit_raw = encode_fma_mix(0x20, 1, 255, 259, 260, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0), literal=0x3f800000)
@@ -2465,7 +2523,7 @@ class TestRdna2Disasm(unittest.TestCase):
         for bad_tail in (
             "s44, v19, v20 neg_lo:[0,1,0]",
             "s44, v19, v20 neg_hi:[1,0,0]",
-            "v2, v3, v4 op_sel:[0,0,0] op_sel_hi:[1,0,0]",
+            "v2, v3, v4 op_sel:[1,0,0]",
         ):
             with self.assertRaises(ValueError):
                 parse_fma_mix(bad_tail)
@@ -2513,7 +2571,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 struct.pack("<I", 0x7e000000 | (9 << 17) | (0x01 << 9) | 30),         # v_mov_b32_e32 v9, s30
                 struct.pack("<I", 0x7e000000 | (10 << 17) | (0x01 << 9) | 31),        # v_mov_b32_e32 v10, s31
                 encode_fma_mix(0x20, 12, 28, 256 + 8, 256 + 9, abs_bits=abs_b, neg_bits=neg_b,
-                               sel=(1, 1, 0), sel_hi=(1, 0, 0)),
+                               sel=(1, 0, 0), sel_hi=(1, 1, 0)),
                 encode_fma_mix(0x22, 10, 256 + 8, 256 + 12, 256 + 9, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0),
                                sel=(1, 0, 0), sel_hi=(1, 0, 0), use_clamp=True),
                 struct.pack("<I", 0x7e000000 | (13 << 17) | (0x0b << 9) | (256 + 10)),  # v_cvt_f32_f16_e32 v13, v10
@@ -2529,8 +2587,8 @@ class TestRdna2Disasm(unittest.TestCase):
 
         shader_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(False))]
         swapped_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(True))]
-        self.assertIn("v_fma_mix_f32 v12, |s28|, -v8, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", shader_asm)
-        self.assertIn("v_fma_mix_f32 v12, -s28, |v8|, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", swapped_asm)
+        self.assertIn("v_fma_mix_f32 v12, |s28|, -v8, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0]", shader_asm)
+        self.assertIn("v_fma_mix_f32 v12, -s28, |v8|, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0]", swapped_asm)
         self.assertIn("v_fma_mixhi_f16 v10, -|v8|, v12, v9 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp", shader_asm)
         self.assertIn("v_pk_add_f16 v11, s28, v8 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]", shader_asm)
         self.assertIn("v_pk_mul_f16 v11, v11, v9 neg_hi:[1,0]", shader_asm)
@@ -2543,7 +2601,7 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("saturate(mad((-abs(widen16(asuint(alu5) >> 16))), alu8, alu6))", hlsl)
 
         bad_shader_asm = [
-            "v_fma_mix_f32 v12, s28, v8, v9 op_sel:[1,1,0] neg_lo:[0,1,0]"
+            "v_fma_mix_f32 v12, s28, v8, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0] neg_lo:[0,1,0]"
             if line.startswith("v_fma_mix_f32 v12,") else line
             for line in shader_asm
         ]
@@ -3533,6 +3591,36 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("s_nop 0", res.stdout)
         self.assertIn("s_endpgm", res.stdout)
 
+    def test_cli_hex_output_and_input_errors(self):
+        script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listing.txt"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "000080bf", "--output", str(out)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("s_nop 0", out.read_text(encoding="utf-8"))
+
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "0000810"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertIn("--hex", res.stderr)
+
+            missing = Path(tmp) / "nonexist.bin"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(missing)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not found", res.stderr)
+
     def test_llvm_comparison(self):
         llvm_lib_env = os.environ.get("LLVM_LIB")
         if not llvm_lib_env:
@@ -3666,7 +3754,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_pk_add_u16 v4, v3, 1",
             "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]",
             "v_pk_mul_f16 v23, v22, v20 neg_hi:[1,0]",
-            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
+            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,0,0] op_sel_hi:[1,1,0]",
             "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
             "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
             "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
@@ -5341,6 +5429,62 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual([d["raw"] for d in control["unsupported_details"]],
                          ["s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1"])
 
+    def test_masked_region_forms_are_supported(self):
+        """The structured masked region forms pixel_aot lowers count as supported, in both wave widths, and an
+        if/else region built from them is accepted end to end; neighbouring saveexec and exec forms stay refused."""
+        for line in ("s_and_saveexec_b64 s[60:61], vcc", "s_and_saveexec_b64 s[60:61], s[62:63]",
+                     "s_and_saveexec_b32 s60, vcc_lo", "s_and_saveexec_b32 s60, s62",
+                     "s_or_b64 exec, exec, s[60:61]", "s_or_b32 exec_lo, exec_lo, s60",
+                     "s_andn2_b64 exec, s[60:61], exec", "s_andn2_b32 exec_lo, s60, exec_lo",
+                     "s_cbranch_execz 2", "s_cbranch_execz -1", "s_cbranch_execz 0x10", "s_cbranch_execz 32767",
+                     "s_cbranch_execz -32768", "s_cbranch_execz 0x7fff", "s_cbranch_execz -0x8000",
+                     "s_and_saveexec_b32 s105, s104", "s_or_b64 exec, exec, s[104:105]"):
+            self.assertTrue(is_instruction_supported(line), line)
+        # The register check covers only the exec forms: ordinary scalar s_or/s_andn2 lines keep their verdict.
+        import scan_unsupported_shaders as scanner
+        for line in ("s_or_b32 s5, s6, s7", "s_or_b32 s106, s1, s2", "s_andn2_b64 s[61:62], s[60:61], s[62:63]"):
+            self.assertEqual(is_instruction_supported(line),
+                             any(pattern.match(line) for pattern in scanner.COMPILED_SUPPORTED_PATTERNS), line)
+        for line in ("s_or_saveexec_b64 s[60:61], s[62:63]", "s_andn2_saveexec_b64 s[60:61], vcc",
+                     "s_and_saveexec_b32 s60, vcc", "s_and_saveexec_b64 s60, vcc",
+                     "s_or_b64 exec, s[60:61], exec", "s_andn2_b64 exec, exec, s[60:61]",
+                     "s_andn2_b32 exec_lo, exec_lo, s60", "s_cbranch_execnz 2", "s_xor_b64 exec, exec, s[60:61]",
+                     # Registers and displacements pixel_aot refuses: an odd or out-of-range pair, an SGPR past s105,
+                     # a displacement outside 16 signed bits.
+                     "s_and_saveexec_b64 s[61:62], vcc", "s_and_saveexec_b64 s[106:107], vcc",
+                     "s_and_saveexec_b64 s[60:61], s[63:64]", "s_and_saveexec_b32 s106, vcc_lo",
+                     "s_and_saveexec_b32 s60, s106", "s_or_b64 exec, exec, s[61:62]", "s_or_b32 exec_lo, exec_lo, s106",
+                     "s_andn2_b64 exec, s[106:107], exec", "s_andn2_b32 exec_lo, s106, exec_lo",
+                     "s_cbranch_execz 40000", "s_cbranch_execz -32769", "s_cbranch_execz 0x8000",
+                     "s_cbranch_execz -0x8001", "s_cbranch_execz 010"):
+            self.assertFalse(is_instruction_supported(line), line)
+        prefix = ["s_mov_b64 s[50:51], exec", "s_wqm_b64 exec, exec", "s_mov_b32 m0, s24",
+                  "v_interp_p1_f32_e32 v8, v0, attr0.x", "v_interp_p1_f32_e32 v9, v0, attr0.y",
+                  "v_interp_p2_f32_e32 v9, v1, attr0.y", "v_interp_p2_f32_e32 v8, v1, attr0.x",
+                  "s_and_b64 exec, exec, s[50:51]", "s_mov_b32 s21, 0", "s_load_dwordx8 s[28:35], s[20:21], null",
+                  "s_mov_b32 s40, 1", "s_mov_b32 s41, 2", "s_mov_b32 s42, 3", "s_mov_b32 s43, 4",
+                  "s_waitcnt lgkmcnt(0)",
+                  "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                  "s_waitcnt vmcnt(0)"]
+        region = ["v_cmp_lt_f32_e64 vcc_lo, v12, v13", "s_and_saveexec_b64 s[60:61], vcc", "v_mov_b32_e32 v14, v12",
+                  "s_andn2_b64 exec, s[60:61], exec", "v_mov_b32_e32 v14, v13", "s_or_b64 exec, exec, s[60:61]"]
+        tail = ["v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+                "exp mrt0 v16, v16, v17, v17 done compr vm", "s_endpgm"]
+        wave32 = {"s_mov_b64 s[50:51], exec": "s_mov_b32 s50, exec_lo", "s_wqm_b64 exec, exec": "s_wqm_b32 exec_lo, exec_lo",
+                  "s_and_b64 exec, exec, s[50:51]": "s_and_b32 exec_lo, exec_lo, s50",
+                  "s_and_saveexec_b64 s[60:61], vcc": "s_and_saveexec_b32 s60, vcc_lo",
+                  "s_andn2_b64 exec, s[60:61], exec": "s_andn2_b32 exec_lo, s60, exec_lo",
+                  "s_or_b64 exec, exec, s[60:61]": "s_or_b32 exec_lo, exec_lo, s60"}
+        for label, program, wave_size in (
+                ("wave64", [*prefix, *region, *tail], None),
+                ("wave32", [wave32.get(line, line) for line in [*prefix, *region, *tail]], 32)):
+            with self.subTest(wave=label):
+                result = analyze_shader_instructions(f"ps_masked_region_{label}", program, wave_size=wave_size)
+                self.assertTrue(result["translator_accepted"], result.get("lower_error"))
+                self.assertEqual(result["unsupported_details"], [])
+                self.assertTrue(result["is_fully_supported"])
+                self.assertEqual(result["compatibility_category"], "accepted")
+
     def test_binary_scan_hwreg_recognition_stays_separate_from_translation_support(self):
         """Issue #938 follow-up: hwreg SOPK opcodes are recognized ISA opcodes while s_getreg/s_setreg stay unlowered."""
         for op in ("s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32"):
@@ -5378,6 +5522,8 @@ class TestRdna2Scanner(unittest.TestCase):
                 "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400",
                 "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
                 "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0",
+                "s_round_mode 0xc",
+                "s_round_mode 0x0",
                 *base_pixel_tail,
             ],
         )
@@ -5392,6 +5538,8 @@ class TestRdna2Scanner(unittest.TestCase):
         for label, line in (
             ("getreg", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
             ("setreg", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4"),
+            ("round_mode_binary32", "s_round_mode 0x3"),
+            ("round_mode_directed", "s_round_mode 0x4"),
         ):
             with self.subTest(form=label):
                 self.assertFalse(is_instruction_supported(line), line)

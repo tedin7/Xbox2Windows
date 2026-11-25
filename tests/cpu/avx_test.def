@@ -1,0 +1,17 @@
+EXPORTS
+    op_vptest_xmm_reg
+    op_vptest_xmm_mem
+    op_vptest_ymm_reg
+    op_vptest_ymm_mem
+    op_vtestps_xmm_reg
+    op_vtestps_xmm_mem
+    op_vtestps_ymm_reg
+    op_vtestps_ymm_mem
+    op_vtestpd_xmm_reg
+    op_vtestpd_xmm_mem
+    op_vtestpd_ymm_reg
+    op_vtestpd_ymm_mem
+    op_vptest_ymm_after_xmm_zero
+    op_vtestps_ymm_after_xmm_zero
+    op_vtest_self
+    op_vtest_r8_store_reload

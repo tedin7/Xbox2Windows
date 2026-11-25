@@ -59,4 +59,5 @@ v_cmp_eq_u32_e64 s[20:21], 1, v0
 v_mov_b32_e32 v9, 0x200400
 v_cndmask_b32_e64 v9, v9, s14, s[20:21]
 exp prim v9, off, off, off done
+mesh_exit:
 s_endpgm

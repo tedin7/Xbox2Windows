@@ -154,3 +154,23 @@ def rect_raster_oracle(
             color = foreground if hit else background
             pixels.extend(color)
     return bytes(pixels)
+
+
+MAX_CONVERTIBLE_RECTANGLES = 0x2AAAAAAA
+
+
+def convert_indirect_draw_arguments(arguments: Sequence[int]) -> Tuple[int, int, int, int]:
+    """Model of the GPU pass that turns a rectangle-list indirect Draw record into a triangle-list one.
+
+    `arguments` is (VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation).
+    Three console vertices name one rectangle; the desktop draw uses six vertices per rectangle. A trailing
+    partial rectangle is dropped, like the direct draw (count // 3 * 6). A count that would not fit 32 bits
+    becomes 0 vertices, so nothing is drawn.
+    Mirrors src/startup_stubs/rect_indirect_args.h.
+    """
+    if len(arguments) != 4 or any(not 0 <= word <= 0xFFFFFFFF for word in arguments):
+        raise ValueError("an indirect Draw record is four 32-bit words")
+    count, instances, start_vertex, start_instance = arguments
+    rectangles = count // 3
+    vertices = 0 if rectangles > MAX_CONVERTIBLE_RECTANGLES else rectangles * 6
+    return (vertices, instances, start_vertex, start_instance)

@@ -241,6 +241,9 @@ def controls():
                           'SMEM immediate offset', sampler_heap=False)
     must_refuse_asm('s_buffer_load_dword s24, s[16:19], -4', 'SMEM immediate offset')
     must_refuse_asm('s_load_dword s24, s[4:5], -4', 'SMEM immediate offset')
+    for token in ('-0x4', '-4', '0x1ffffc'):
+        must_refuse_asm(f's_buffer_load_dword s24, s[16:19], s0 offset:{token}', 'SMEM immediate offset')
+        must_refuse_asm(f's_load_dword s24, s[4:5], 0x0 offset:{token}', 'SMEM immediate offset')
 
     # 6. Invalid SMEM soffset operands (special registers, SGPRs > 105, VGPRs, pairs, descriptor SGPRs) are refused.
     for soffset, expected in (
@@ -260,7 +263,7 @@ def controls():
         must_refuse_asm(f's_buffer_load_dword s24, s[16:19], {bad_op}', 'operand')
 
     # 7. Unmodeled SMEM modifiers, duplicate offset tokens and wrong register widths are refused.
-    for mod in ('slc', 'lds', 'tfe', 'offset:-4', 'offset:bad'):
+    for mod in ('slc', 'lds', 'tfe', 'offset:bad'):
         must_refuse_asm(f's_buffer_load_dword s24, s[16:19], s8 {mod}', 'SMEM modifier')
         must_refuse_asm(f's_load_dword s24, s[4:5], 0x0 {mod}', 'SMEM modifier')
     must_refuse_asm('s_buffer_load_dword s24, s[16:19], s8 offset:0x10 offset:0x20', 'SMEM modifier offset:0x20')

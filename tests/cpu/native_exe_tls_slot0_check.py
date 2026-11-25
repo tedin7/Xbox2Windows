@@ -18,6 +18,11 @@ pe_map_run_main the guest's TLS callback must not run for the late thread (it do
 its thread-attach/detach totals must count only the guest's own workers; under pe_map_run (plain) the late
 thread's attach and detach still reach the guest, as before. A refused release returns 0 with the status
 API reporting the refusal; the accepted release is the only one that returns 1.
+Process image: the guest's process-attach callback reports whether GetModuleHandleW(nullptr) is its own base
+(the third m1 result), as under a Windows launch; under pe_map_run_main it must be, under pe_map_run it must
+not. The host reads GetModuleHandleW(nullptr) after the start, after a refused release and after the accepted
+release: the mapped base until the accepted release, including across a refusal with a worker paused inside
+the image, and its own base afterwards; under pe_map_run the host's base throughout.
 - main: pe_map_run_main; the guest log equals the Windows log; a host thread enters and leaves; release
   is accepted once.
 - alive: a host participant is still entered at the first release, which returns 0 and changes nothing;
@@ -61,8 +66,8 @@ import sys
 from tempfile import TemporaryDirectory
 
 TIMEOUT = 60
-EXPECTED = "m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0"
-PLAIN = "m1=n- m:n--- a2=n- a:n--- a3=n- b2=n- b:n--- b3=n- X=8"
+EXPECTED = "m1=yyy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0"
+PLAIN = "m1=n-n m:n--- a2=n- a:n--- a3=n- b2=n- b:n--- b3=n- X=9"
 MAIN_TRACKED = 64
 PAUSED = EXPECTED.replace(" X=0", " c2=yy c:yyyy X=0")
 PROBED = EXPECTED.replace(" a2=", " p2=yy p:yyyy p3=y- a2=")
@@ -148,7 +153,7 @@ def check(mapper, image, host, scenario, want):
     log = want["log"]
     if result["log"] != log:
         problems.append(f"guest log {result['log']!r}, expected {log!r}")
-    if fields["started"] != "1" or int(fields["exit"], 16) != (8 if scenario == "plain" else 0):
+    if fields["started"] != "1" or int(fields["exit"], 16) != (9 if scenario == "plain" else 0):
         problems.append(f"started {fields['started']}, guest exit {fields['exit']}")
     if flag(fields, "installed_main") != (scenario != "plain"):
         problems.append(f"installed_main {fields['installed_main']}")
@@ -171,6 +176,11 @@ def check(mapper, image, host, scenario, want):
     if fields["callbacks"] != want["callbacks"]:
         problems.append(f"guest thread-attach,thread-detach callbacks {fields['callbacks']}, "
                         f"expected {want['callbacks']}")
+    # The process image: the mapped EXE from before its callbacks until the accepted release, including across a
+    # refused one; the host's again afterwards. Under plain pe_map_run it never changes.
+    identity = ("h" if scenario == "plain" else "i") + ("i" if want["refused"] else "-") + "h"
+    if fields["process_image"] != identity:
+        problems.append(f"process_image {fields['process_image']} (after start, refusal, release), expected {identity}")
     if not flag(fields, "cleaned") or not flag(fields, "second_release"):
         problems.append(f"cleaned {fields['cleaned']}, second_release {fields['second_release']}: expected one "
                         "final cleanup (image freed, unwind data gone, carrier unloaded) and a further release 0")

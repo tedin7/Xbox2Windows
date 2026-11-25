@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <bcrypt.h>
+#include <intrin.h>
 #include <psapi.h>
 #include <sddl.h>
 
@@ -745,6 +746,35 @@ MainImage& main_image() {
 
 // The main image's base while it is started, read without slot_lock by the notification path.
 std::uint8_t* volatile g_main_base = nullptr;
+
+// Process image (pe_map_run_main). Under a Windows launch the EXE is the process image: the PEB's
+// ImageBaseAddress holds its base, and GetModuleHandle(NULL), and with it FindResource(NULL, ...), return
+// that base. pe_map_run_main makes the mapped EXE the process image in the same field until its accepted
+// pe_map_release, which restores the host's value. Guarded by slot_lock. Only one image at a time; the
+// PEB's loader list (GetModuleFileName(NULL), GetModuleHandleEx on an image address) is not changed.
+struct ProcessImage {
+    std::uint8_t* base = nullptr;  // the mapped EXE reported as the process image, or null
+    void* saved = nullptr;         // the host's ImageBaseAddress, written back on release
+};
+ProcessImage g_process_image;
+
+void* volatile* peb_image_base() {
+    // x64 PEB: ImageBaseAddress follows the four flag bytes and the Mutant handle.
+    return reinterpret_cast<void* volatile*>(__readgsqword(0x60) + 0x10);
+}
+
+// Call with slot_lock held.
+void report_process_image(std::uint8_t* base) {
+    g_process_image.saved = InterlockedExchangePointer(peb_image_base(), base);
+    g_process_image.base = base;
+}
+
+// Call with slot_lock held. Restores the host's value only if base is the reported process image.
+void restore_process_image(std::uint8_t* base) {
+    if (!base || g_process_image.base != base) return;
+    InterlockedExchangePointer(peb_image_base(), g_process_image.saved);
+    g_process_image = {};
+}
 
 // Entries in main_image().enrolling that are not FREE, read without slot_lock by DLL_THREAD_ATTACH. An entry
 // becomes READY before its thread is resumed, so the thread itself always sees a nonzero count.
@@ -1542,6 +1572,10 @@ extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, cons
 // and the caller may retry later.
 extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
     if (!end_main(static_cast<std::uint8_t*>(mapped))) return 0;
+    {
+        const SlotLock hold;
+        restore_process_image(static_cast<std::uint8_t*>(mapped));
+    }
     Mapped* record = nullptr;
     {
         const ExclusiveLock hold;
@@ -1623,7 +1657,8 @@ extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exi
 // CreateThread imports to it), and into that of host threads that call pe_map_main_thread_enter. Same preconditions and results as pe_map_run, and in addition returns 0
 // without running anything when another image is started as the main image, when a participant of an
 // earlier one is still pending, or when pe_map's own TLS slots cannot be reserved. An image without a TLS
-// template has no block to install and simply starts.
+// template has no block to install and simply starts. Either way the image becomes the process image (see
+// "Process image") before its process-attach callbacks, until its accepted pe_map_release.
 extern "C" __declspec(dllexport) int pe_map_run_main(void* mapped, std::uint32_t* exit_code) {
     auto* base = static_cast<std::uint8_t*>(mapped);
     const auto* nt = Image{base, 0}.headers();
@@ -1637,20 +1672,24 @@ extern "C" __declspec(dllexport) int pe_map_run_main(void* mapped, std::uint32_t
         for (auto* record : mapped_images())
             if (record->base == base) carrier = record->carrier.module != nullptr;
     }
-    if (carrier) {
+    {
         const SlotLock hold;
-        auto& main = main_image();
-        if (main.base || pending(main) || !reserve_slots()) return 0;
-        const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
-        const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
-        std::memcpy(&main.index, reinterpret_cast<const void*>(t->AddressOfIndex), sizeof(main.index));
-        main.base = base;
-        main.size = nt->OptionalHeader.SizeOfImage;
-        if (!install_current(main)) {
-            main.base = nullptr;
-            return 0;
+        if (g_process_image.base) return 0;  // another image is the process image
+        if (carrier) {
+            auto& main = main_image();
+            if (main.base || pending(main) || !reserve_slots()) return 0;
+            const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
+            const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
+            std::memcpy(&main.index, reinterpret_cast<const void*>(t->AddressOfIndex), sizeof(main.index));
+            main.base = base;
+            main.size = nt->OptionalHeader.SizeOfImage;
+            if (!install_current(main)) {
+                main.base = nullptr;
+                return 0;
+            }
+            g_main_base = base;
         }
-        g_main_base = base;
+        report_process_image(base);
     }
     return start_exe(base, nt, callbacks, exit_code);
 }

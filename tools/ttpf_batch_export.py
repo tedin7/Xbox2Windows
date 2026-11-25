@@ -246,6 +246,18 @@ def batch_export(pool_path: Path, out_dir: Path,
                  require_rust: bool = False,
                  calibration_path: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
+    if calibration_path is not None and (allow_provisional or history_path is not None):
+        raise ValueError("--calibration cannot be combined with --allow-provisional or --history")
+
+    history_dict = None
+    if allow_provisional and history_path is not None:
+        try:
+            history_dict = json.loads(history_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Cannot read --history {history_path}: {exc}") from exc
+        if not isinstance(history_dict, dict):
+            raise ValueError(f"Expected a JSON object in --history {history_path}")
+
     ttpf = load_tools(tools_path)
     if ttpf is None:
         raise RuntimeError("Could not find ttpf_mips module. Provide --tools-path or set TTPF_TOOLS_DIR.")
@@ -254,8 +266,6 @@ def batch_export(pool_path: Path, out_dir: Path,
 
     fitted_decoder = None
     if calibration_path is not None:
-        if allow_provisional or history_path is not None:
-            raise ValueError("--calibration cannot be combined with --allow-provisional or --history")
         try:
             calibrated = importlib.import_module("calibrated_texture")
             if (calibrated.ttpf is not ttpf
@@ -277,13 +287,6 @@ def batch_export(pool_path: Path, out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
     if manifest_path is None:
         manifest_path = out_dir / "manifest.json"
-
-    history_dict = None
-    if allow_provisional and history_path and history_path.exists():
-        try:
-            history_dict = json.loads(history_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"Warning: could not read calibration history from {history_path}: {e}", file=sys.stderr)
 
     start_time = time.perf_counter()
     pool = ttpf.Pool(str(pool_path))

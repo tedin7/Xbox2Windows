@@ -165,7 +165,7 @@ int main(int argc, char** argv)
     void* file_ptr = nullptr;
     if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, data_path, nullptr, &file_ptr) != 0 || !file_ptr) return 1;
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "Refusal", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0)
@@ -220,8 +220,8 @@ int main(int argc, char** argv)
         std::snprintf(what, sizeof what, "request %u (%s) status complete", i, plan[i].zlib ? "zlib" : "raw");
         ok = expect(done, what) && ok;
         std::snprintf(what, sizeof what, "request %u status is %s, got 0x%08lx", i,
-                      plan[i].valid ? "S_OK" : "E_FAIL", static_cast<unsigned long>(hr));
-        ok = expect(hr == (plan[i].valid ? S_OK : E_FAIL), what) && ok;
+                      plan[i].valid ? "S_OK" : "ERROR_HANDLE_EOF", static_cast<unsigned long>(hr));
+        ok = expect(hr == (plan[i].valid ? S_OK : HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)), what) && ok;
         if (plan[i].valid) {
             const std::vector<unsigned char>& expected = plan[i].zlib ? plain : std::vector<unsigned char>(
                 raw.begin() + static_cast<std::ptrdiff_t>(plan[i].offset),
@@ -237,7 +237,7 @@ int main(int argc, char** argv)
         bool order = fences[i].value == 0x100u + i && (i == 0 || fences[i].position > fences[i - 1].position);
         for (unsigned k = 0; k < request_count; ++k) {
             order = order && fences[i].complete_at_signal[k] == (k <= i);
-            if (k <= i) order = order && fences[i].hr_at_signal[k] == (plan[k].valid ? S_OK : E_FAIL);
+            if (k <= i) order = order && fences[i].hr_at_signal[k] == (plan[k].valid ? S_OK : HRESULT_FROM_WIN32(ERROR_HANDLE_EOF));
         }
         ok = expect(order, what) && ok;
     }

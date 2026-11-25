@@ -1,0 +1,10 @@
+EXPORTS
+    sum_export
+    parity_export
+    walk_export
+    fold_export
+    tail_ping
+    wide_odd
+    lost_k
+    bad_a
+    stale_e

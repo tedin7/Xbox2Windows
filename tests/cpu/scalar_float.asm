@@ -516,4 +516,28 @@ ENDIF
     ret
 round_cvt ENDP
 
+; uint64_t movq_gpr(double d, uint64_t q)
+; Round-trips 64-bit values across XMM and 64-bit GPRs via MOVQ (encoded with DB bytes
+; for MASM portability across ML64 versions). Returns d_bits XOR q (or d_bits + q in
+; the SWAP_OPERANDS control), preserving all 64 bits across -0.0, NaNs, subnormals, and +/-inf.
+movq_gpr PROC FRAME
+    .endprolog
+    ; movq r9, xmm0
+    DB 66h, 49h, 0Fh, 7Eh, 0C1h
+    ; movq xmm2, r9
+    DB 66h, 49h, 0Fh, 6Eh, 0D1h
+    ; movq rax, xmm2
+    DB 66h, 48h, 0Fh, 7Eh, 0D0h
+    ; movq xmm3, rdx
+    DB 66h, 48h, 0Fh, 6Eh, 0DAh
+    ; movq r10, xmm3
+    DB 66h, 49h, 0Fh, 7Eh, 0DAh
+IFDEF SWAP_OPERANDS
+    add rax, r10
+ELSE
+    xor rax, r10
+ENDIF
+    ret
+movq_gpr ENDP
+
 END

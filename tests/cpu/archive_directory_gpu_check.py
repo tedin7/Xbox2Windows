@@ -106,8 +106,9 @@ def check(mapper, native, lifted, provider):
                     next_pos, next_size = directory[j]
                     assert trace.pop() == "storage release 0 0 0"
                     expected = [f"file {selected_file.stat().st_ino & 0xffffffffffffffff:016x}",
+                                # only the EOF case has no destination page: ERROR_HANDLE_EOF
                                 f"request {i+1} {pos+bias} {size} {PAGE} 0", f"request {j+1} {next_pos} {next_size} {PAGE} 0",
-                                "status 00000000" if a else "status 80004005", "status 00000000"]
+                                "status 00000000" if a else "status 80070026", "status 00000000"]
                     assert trace[:5] == expected, (runner, mode, trace, expected)
                     assert pages.read_bytes() == ((a[1] if a else b"\xa5" * PAGE) + b[1]), (runner, mode, "BC pages")
                     if a:

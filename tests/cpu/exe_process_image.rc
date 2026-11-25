@@ -1,0 +1,3 @@
+// RCDATA for tests/cpu/exe_process_image.cpp. The bytes must match resource_bytes there,
+// including the terminating zero. Resource 102 is deliberately absent.
+101 RCDATA { "xbox2windows process image resource 101\0" }

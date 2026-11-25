@@ -66,3 +66,5 @@ EXPORTS
     op_cmpsd_7
     op_cmpsd_mem
     op_cmpsd_mem_plus1
+    read_mxcsr
+    write_mxcsr

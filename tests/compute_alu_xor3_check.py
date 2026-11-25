@@ -1,4 +1,5 @@
 """Check v_xor3_b32 in the compute store profile: exact lowering, refusals and a WARP or GPU readback."""
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -178,6 +179,11 @@ def draw(directory, compiler, renderer, backend):
             raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{bad.stderr}")
     print(f"{NAME}: {len(base.READ_RUNS)} dispatches, {len(WRONG) + 2} wrong references and "
           f"{len(MUTATIONS)} mutated sources checked")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in LINES if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

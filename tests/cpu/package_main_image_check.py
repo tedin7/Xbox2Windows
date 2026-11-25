@@ -10,8 +10,8 @@ kernel32 CreateThread import (tests/cpu/exe_tls_slot0.cpp). The check compares t
   and the JSON result must match the Windows launch.
 - The same package without --system kernel32.dll: refused before mapping, with no guest log.
 
-Under the previous pe_map_run start, every slot-0 check in the guest log failed
-(native_exe_tls_slot0_check.PLAIN, exit 8).
+Under the previous pe_map_run start, every slot-0 check and the process-image check in the guest
+log failed (native_exe_tls_slot0_check.PLAIN, exit 9).
 """
 
 import json
@@ -90,7 +90,7 @@ def check(mapper, exe):
                                   capture_output=True, text=True, timeout=TIMEOUT, check=True)
         explicit_log = guest_log(explicit.stdout)
         explicit_result = json.loads(explicit.stdout[explicit.stdout.index("{"):])
-        if (explicit.stderr or explicit_log != "m1=yy m:yyyy a:n--- b:n--- X=2"
+        if (explicit.stderr or explicit_log != "m1=yyy m:yyyy a:n--- b:n--- X=2"
                 or explicit_result != {**expected_result, "exit_code": 2}):
             raise AssertionError(f"runner replaced the explicit CreateThread provider: {explicit!r}")
         print("explicit kernel32 provider: entry owns slot 0; unwrapped workers remain unenrolled")

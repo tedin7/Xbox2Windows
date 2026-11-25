@@ -79,16 +79,104 @@ def controls(llvm_mc):
     # v[254:257] and v[255:258], which would otherwise write past v255.
     refused(shader(dst=0xfe), 'four destination registers')
     refused(shader(dst=0xff), 'four destination registers')
+    # The explicit-LOD and fixed-mip comparison gathers are lowered by their own tests; the implicit,
+    # biased and offset gathers stay refused here.
     refused(shader(opcode=0x40), 'image_gather4')
-    refused(shader(opcode=0x44), 'image_gather4_l')
-    refused(shader(opcode=0x4f), 'image_gather4_c_lz')
+    refused(shader(opcode=0x45), 'image_gather4_b')
+    refused(shader(opcode=0x54), 'image_gather4_l_o')
+    refused(shader(opcode=0x48), 'image_gather4_c')
+    refused(shader(opcode=0x5f), 'image_gather4_c_lz_o')
     bad_wrap = PREFIX.replace(bytes.fromhex('920398be'), bytes.fromhex('930398be'))
     bad_min_lod = PREFIX.replace(bytes.fromhex('800399be'), bytes.fromhex('810399be'))
     missing_sampler = PREFIX.replace(bytes.fromhex('80039bbe'), b'')
     refused(shader(prefix=bad_wrap), 'requires normalized clamp')
     refused(shader(prefix=bad_min_lod), 'requires normalized clamp')
     refused(shader(prefix=missing_sampler), 'constant sampler')
+    check_clamp_z()
+    check_point_xy()
+    check_mip_point_preclamp()
     print('Four fixed-mip gather channels and unsupported encodings checked')
+
+
+# CLAMP_Z (SQ_IMG_SAMP_WORD0 bits 8:6) addresses a third coordinate a 2D view does not have. Word 0 is moved
+# with a literal (s_mov_b32 s24, <word>), so the words below are the 0x12 profile with CLAMP_Z set.
+CLAMP_WORD0 = bytes.fromhex('920398be')
+
+
+def with_word0(word):
+    return PREFIX.replace(CLAMP_WORD0, bytes.fromhex('ff0398be') + struct.pack('<I', word))
+
+
+def check_clamp_z():
+    for clamp_z in range(1, 8):
+        word = 0x12 | clamp_z << 6
+        pipe = pipeline(shader(prefix=with_word0(word)))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        # The title's own words are bound, CLAMP_Z included.
+        assert f'smp 0 {word:#x} 0x0 0x4500000 0x0\n' in pipe.manifest(), pipe.manifest()
+    # The X and Y address modes are still checked: mirror in Y, wrap in X, each with CLAMP_Z set as well.
+    refused(shader(prefix=with_word0(0x0a)), 'requires normalized clamp')
+    refused(shader(prefix=with_word0(0x10 | 2 << 6)), 'requires normalized clamp')
+    refused(shader(prefix=with_word0(0x13 | 2 << 6)), 'requires normalized clamp')
+    # Other word 0 fields beside CLAMP_Z still refuse: anisotropy ratio (bits 11:9).
+    refused(shader(prefix=with_word0(0x92 | 1 << 9)), 'requires normalized clamp')
+    # Negative control: without the 2D profile the CLAMP_Z word is refused, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: tuple(words)
+    try:
+        refused(shader(prefix=with_word0(0x92)), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
+
+
+# Word 2 is moved as a literal (s_mov_b32 s26, 0x04500000: bilinear XY, point mip).
+FILTER_WORD2 = bytes.fromhex('ff039abe00005004')
+
+
+def with_word2(word, prefix=PREFIX):
+    return prefix.replace(FILTER_WORD2, bytes.fromhex('ff039abe') + struct.pack('<I', word))
+
+
+def check_point_xy():
+    # Gather returns the bilinear footprint whatever the XY filter (D3D11.3 functional spec 22.4.2), so point
+    # magnification, minification or both translate. The last word pair is clamp-last-texel in X, Y and Z with
+    # point XY and point mip filtering.
+    for word0, word2 in ((0x12, 0x04000000), (0x12, 0x04100000), (0x12, 0x04400000), (0x92, 0x04000000)):
+        pipe = pipeline(shader(prefix=with_word2(word2, with_word0(word0))))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        assert f'smp 0 {word0:#x} 0x0 {word2:#x} 0x0\n' in pipe.manifest(), pipe.manifest()
+    # Still refused: anisotropic XY, a linear mip filter, a nonzero LOD bias field.
+    refused(shader(prefix=with_word2(0x04a00000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x04800000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x08000000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x04000001)), 'requires normalized clamp')
+    # Negative control: a profile that only clears CLAMP_Z refuses the point filter, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: (words[0] & ~(7 << 6),) + tuple(words[1:])
+    try:
+        refused(shader(prefix=with_word2(0x04000000, with_word0(0x92))), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
+
+
+def check_mip_point_preclamp():
+    # MIP_POINT_PRECLAMP (word 2 bit 28) only acts on mip selection; the _lz gather reads mip zero.
+    # The last pair is the full sampler state the refused run pipelines bind.
+    for word0, word2 in ((0x12, 0x14500000), (0x92, 0x14000000)):
+        pipe = pipeline(shader(prefix=with_word2(word2, with_word0(word0))))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        assert f'smp 0 {word0:#x} 0x0 {word2:#x} 0x0\n' in pipe.manifest(), pipe.manifest()
+    # Bits 29 to 31 (ANISO_OVERRIDE, BLEND_ZERO_PRT, unnamed) stay refused.
+    for bit in (29, 30, 31):
+        refused(shader(prefix=with_word2(0x04500000 | 1 << bit)), 'requires normalized clamp')
+    # Negative control: a profile that leaves bit 28 refuses it, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: tuple(w | (1 << 28 if i == 2 and words[2] >> 28 & 1 else 0)
+                                                    for i, w in enumerate(profile(words)))
+    try:
+        refused(shader(prefix=with_word2(0x14000000, with_word0(0x92))), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
 
 
 def expected_taps(mip, component, uv):
@@ -134,6 +222,12 @@ def draw(dxc, renderer, adapter):
         clamped = PREFIX.replace(bytes.fromhex('f002007e'), bytes.fromhex('f102007e'))
         clamped = clamped.replace(bytes.fromhex('0000803e'), bytes.fromhex('0000a03f'))
         run(3, 0, 1, (-0.5, 1.25), shader(2, prefix=clamped))
+        # The same draw with the title's CLAMP_Z set: a 2D gather cannot observe it.
+        run(3, 1, 0, uv, shader(1, prefix=with_word0(0x92)))
+        # Point XY filtering with CLAMP_Z set, the sampler state of the refused run pipelines: the same four texels.
+        run(3, 1, 3, uv, shader(8, prefix=with_word2(0x04000000, with_word0(0x92))))
+        # The full sampler state of those pipelines, MIP_POINT_PRECLAMP included.
+        run(3, 1, 1, uv, shader(2, prefix=with_word2(0x14000000, with_word0(0x92))))
         run(3, 1, 2, uv, shader(4), mutant=True)
 
 

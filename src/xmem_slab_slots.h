@@ -5,8 +5,8 @@
 //
 // A slab holds 4096 slots (256 MiB of 64 KiB pages). Slots are handed out in order from the newest slab; a
 // released slot goes back to an ordered set and is reused lowest first, so pages that are reused together
-// are adjacent slots again. Slabs are never closed while the object lives: a slab already counts against
-// commit, so this class only reports how many are open and how many of their slots are used.
+// are adjacent slots again. Slabs are never closed while the object lives. A slab is only reserved; its slots
+// are committed by the caller on first use. This class reports how many slabs are open and how many slots are used.
 #include <cstddef>
 #include <cstdint>
 #include <set>

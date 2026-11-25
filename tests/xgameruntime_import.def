@@ -2,4 +2,4 @@
 ; the fixture-only xgameruntime.dll into a synthetic package.
 LIBRARY xgameruntime
 EXPORTS
-    XUserAddAsync
+    XPackageMountWithUiAsync

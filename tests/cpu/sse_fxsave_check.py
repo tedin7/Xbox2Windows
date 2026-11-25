@@ -32,6 +32,8 @@ DEFINED_EXPORTS = (
     "op_fxrstor64_fxsave",
     "op_fxrstor64_disp",
     "op_pipeline",
+    "op_fxrstor64_movq_store",
+    "op_fxrstor64_movq_gpr",
 )
 
 EXPORTS = CANONICAL_EXPORTS + DEFINED_EXPORTS
@@ -45,6 +47,8 @@ EXPORT_MODES = {
     "op_fxrstor64_fxsave": (True, False, 0),
     "op_fxrstor64_disp": (True, True, 64),
     "op_pipeline": (True, True, 0),
+    "op_fxrstor64_movq_store": (True, True, 0),
+    "op_fxrstor64_movq_gpr": (True, True, 0),
 }
 
 ALTERED_EXPORTS = (
@@ -313,13 +317,18 @@ class FxModel:
             out[160 + i * 16 : 160 + i * 16 + 16] = self.xmm[i]
         dst[offset : offset + 416] = out
 
-    def set_mm(self, idx: int, val: int) -> None:
-        struct.pack_into("<QH", self.st[idx], 0, val & 0xFFFFFFFFFFFFFFFF, 0xFFFF)
-        self.st[idx][10:16] = b"\x00" * 6
+    def enter_mmx(self) -> None:
+        """Every MMX instruction but EMMS, one that only reads an MM register included, clears TOP and tags all valid."""
         self.ftw = 0xFF
         self.fsw &= ~0x3800
 
+    def set_mm(self, idx: int, val: int) -> None:
+        struct.pack_into("<QH", self.st[idx], 0, val & 0xFFFFFFFFFFFFFFFF, 0xFFFF)
+        self.st[idx][10:16] = b"\x00" * 6
+        self.enter_mmx()
+
     def get_mm(self, idx: int) -> int:
+        self.enter_mmx()
         return struct.unpack_from("<Q", self.st[idx], 0)[0]
 
 
@@ -358,6 +367,12 @@ def reference(
     elif name == "op_fxrstor64_disp":
         m.fxrstor(a[64:], is64=not altered)
         m.fxsave(out, 64, is64=True)
+    elif name in ("op_fxrstor64_movq_store", "op_fxrstor64_movq_gpr"):
+        m.fxrstor(a, is64=True)
+        mm3 = m.get_mm(3)
+        if name == "op_fxrstor64_movq_store":
+            struct.pack_into("<Q", out, 512, mm3)
+        m.fxsave(out, 0, is64=True)
     elif name == "op_pipeline":
         m.fxrstor(a, is64=True)
         mm0 = struct.unpack_from("<Q", b, 0)[0]
@@ -811,6 +826,19 @@ def check_differential(
                 assert_equal_output("native", name, idx, got_n, want_native)
                 assert_equal_output("lifted", name, idx, got_l, want)
                 total += 1
+
+        # Negative control: an MM read that leaves TOP and the tag word alone must be caught.
+        a, b = fx_pairs(mxcsr_mask)[0]
+        want = reference("op_fxrstor64_movq_gpr", a, b, mxcsr_mask, deprecates_cs_ds)
+        unchanged = reference("op_fxrstor64_fxsave64", a, b, mxcsr_mask, deprecates_cs_ds)
+        if want == unchanged:
+            raise AssertionError("the MM read control does not change the saved state")
+        try:
+            assert_equal_output("lifted", "op_fxrstor64_movq_gpr", 0, unchanged, want)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("an MM read that leaves TOP and the tags alone was not caught by the comparator")
 
         diverged = {}
         for name in ALTERED_EXPORTS:

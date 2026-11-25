@@ -69,6 +69,15 @@ long __stdcall bc64_copy(Computer* self, unsigned char* target, UINT plane, UINT
     if constexpr (into) notify_texture_write(target, chain.bytes());
     return S_OK;
 }
+long __stdcall bc64_copy_from(Computer* self, unsigned char* target, UINT plane, UINT subresource,
+                              UINT scarlett_option, const unsigned char* source, UINT pitch, UINT slice_pitch)
+{
+    // DirectXTex's Scarlett copy-out call passes zero between the subresource and the tiled base.
+    // Reject unknown options before interpreting the remaining arguments or touching either buffer.
+    if (scarlett_option != 0) return E_NOTIMPL;
+    return bc64_copy<false>(self, target, plane, subresource, source, pitch, slice_pitch);
+}
+
 u64 __stdcall bc64_size(Computer* self) { return bc64::Chain(self->desc).bytes(); }
 u64 __stdcall bc64_alignment(Computer*) { return 65536; }
 u64 __stdcall bc64_offset(Computer* self, UINT plane, UINT level)

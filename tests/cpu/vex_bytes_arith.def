@@ -1,0 +1,12 @@
+EXPORTS
+    paddb_reg
+    paddb_mem
+    psubb_reg
+    psubb_mem
+    psubb_self
+    pcmpeqb_reg
+    pcmpeqb_mem
+    pcmpgtb_reg
+    pcmpgtb_mem
+    bytes_arith_mem_r8_chain
+    bytes_arith_aligned

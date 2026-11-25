@@ -245,6 +245,13 @@ def translate_cases(directory):
         assert line + "\n" in manifest, line + "\n" + manifest
     print("translate: fetch loads and manifest as expected")
 
+    # R8G8B8A8_UINT contributes the first three raw bytes to this XYZ fetch record.
+    layout = LAYOUT_TEXT.replace("POSITION 0 6 ", "POSITION 0 30 ")
+    status, vs, _ = translate(directory / "rgba8_uint", vertex(), layout)
+    assert status == "ok", status
+    for line in ("w = ldu(r0, a);", "v4 = w & 255u;", "v5 = (w >> 8) & 255u;", "v6 = (w >> 16) & 255u;"):
+        assert "    %s\n" % line in vs, line + "\n" + vs
+
     # Refused: no layout; a register nothing defines; the only write masked off by exec, or bypassed by a branch.
     for label, words, layout, want in (
             ("no layout", None, None, NO_LAYOUT),

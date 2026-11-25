@@ -1,0 +1,109 @@
+// The limits of src/startup_stubs/memory_srv_census.h without a device: detail flags for the first 8
+// distinct refused shapes, the first 4 pipelines and the first 8 written entries, shapes only for
+// description-dependent reasons, the overflow counters, and a periodic report that is skipped when
+// nothing changed.
+#include "startup_stubs/memory_srv_census.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+int failures = 0;
+void check(const char* what, bool ok)
+{
+    if (!ok) {
+        std::printf("FAIL %s\n", what);
+        ++failures;
+    }
+}
+D3D12_RESOURCE_DESC texture(UINT64 width, DXGI_FORMAT format, UINT16 mips)
+{
+    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 64, 1, mips, format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            D3D12_RESOURCE_FLAG_NONE};
+}
+template <class Census> std::vector<std::string> lines(Census& census, bool only_if_changed)
+{
+    std::vector<std::string> out;
+    census.report([&](const char* line) { out.emplace_back(line); }, only_if_changed);
+    return out;
+}
+}  // namespace
+
+int main()
+{
+    using namespace x2w_startup;
+    MemorySrvCensus srv;
+    const auto a = texture(64, DXGI_FORMAT_BC1_UNORM, 7);
+    check("first shape is detailed", srv.note("unsupported_description", &a));
+    check("repeat is not", !srv.note("unsupported_description", &a));
+    check("same shape, other reason is a new shape", srv.note("texture_unavailable", &a));
+    check("reasons without a shape keep none", !srv.note("null_address", &a) && !srv.note("null_destination", &a));
+    check("unreadable description keeps no shape", !srv.note("unsupported_description", nullptr));
+    const auto b = texture(128, DXGI_FORMAT_BC7_UNORM, 8), c = texture(256, DXGI_FORMAT_R8G8B8A8_UNORM, 9),
+               d = texture(512, DXGI_FORMAT_BC3_UNORM, 10);
+    check("third shape is detailed", srv.note("buffer_unavailable", &b));
+    check("fourth shape is detailed", srv.note("unsupported_description", &c));
+    check("fifth shape is detailed", srv.note("unsupported_description", &d));
+    check("unknown reason counts as other", !srv.note("acme_reason", &d));
+    for (UINT64 w = 1; w <= MemorySrvCensus::max_shapes; ++w) {
+        const auto e = texture(1000 + w, DXGI_FORMAT_R8_UNORM, 1);
+        const bool detailed = srv.note("unsupported_description", &e);
+        if (w <= 3) check("sixth to eighth shapes are detailed", detailed);
+        if (w == 4) check("ninth shape is not", !detailed);
+    }
+    auto report = lines(srv, true);
+    check("report has a summary and a line per kept shape", report.size() == 1 + MemorySrvCensus::max_shapes);
+    check("summary", !report.empty() && report[0] ==
+          "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
+          "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, gpu_written_resource 0, "
+          "buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
+          "console_layout_xg_rows 0, console_layout_without_footprints 0, console_layout_beyond_xg_size 0, overlapping_resource 0, "
+          "other 1; distinct shapes 128 (calls past the shape table 5)");
+    check("first shape line", report.size() > 1 && report[1] ==
+          "x2w-d3d12 memory SRV refused shape 1: reason=unsupported_description dim=3 fmt=71 size=64x64x1 mips=7 layout=0x0 "
+          "flags=0x0 calls=2");
+    check("unchanged periodic report is skipped", lines(srv, true).empty());
+    srv.note("unsupported_description", &a);
+    const auto changed = lines(srv, true);
+    check("periodic report lists only the shapes counted since", changed.size() == 2 && changed[1].find("shape 1:") != std::string::npos);
+    check("a forced report lists every shape", lines(srv, false).size() == report.size());
+    check("forced report still prints", lines(srv, false).size() == report.size());
+    srv.note("null_address", nullptr);
+    check("forced report does not hide the next change", lines(srv, false).size() == report.size() && lines(srv, true).size() == 1);
+
+    TokenNullCensus tokens;
+    check("first pipeline is detailed", tokens.note(0x1000000000000001ull));
+    check("its repeat is not", !tokens.note(0x1000000000000001ull));
+    check("second pipeline is detailed", tokens.note(2));
+    check("third pipeline is detailed", tokens.note(3));
+    for (std::uint64_t p = 10; p < 10 + TokenNullCensus::max_pipelines; ++p) {
+        const bool detailed = tokens.note(p);
+        if (p == 10) check("fourth pipeline is detailed", detailed);
+        if (p == 11) check("fifth pipeline is not", !detailed);
+    }
+    const auto token_report = lines(tokens, true);
+    check("token report", token_report.size() == 1 && token_report[0].rfind(
+          "x2w-draw token texture nulls: total 20 in 16 pipelines; 1000000000000001=2 0000000000000002=1 0000000000000003=1 ", 0) == 0 &&
+          token_report[0].size() > 10 && token_report[0].compare(token_report[0].size() - 8, 8, " other=3") == 0);
+    check("unchanged token report is skipped", lines(tokens, true).empty());
+
+    MemorySrvWrites writes;
+    check("first entry is the first", writes.note(0x1000) == 1);
+    check("a rewrite is not new", writes.note(0x1000) == 0);
+    for (std::uint64_t e = 2; e <= 8; ++e) check("entries 2 to 8 are numbered", writes.note(0x1000 + 0x40 * e) == e);
+    check("ninth entry is only counted", writes.note(0x9000) == 0);
+    const auto write_report = lines(writes, true);
+    check("write report", write_report.size() == 1 &&
+          write_report[0] == "x2w-d3d12 memory SRV writes (slot 70): calls 10, distinct entries 9 (untracked 0)");
+    check("unchanged write report is skipped", lines(writes, true).empty());
+
+    char line[256];
+    const std::uint32_t words[8] = {0, 0, 0, 0, 0, 0, 0, 0x12345678};
+    report_token_entry(line, sizeof(line), 0x1000000000000001ull, 1, 0x7ff000, words);
+    check("entry line", !std::strcmp(line, "x2w-draw token texture null: pipeline 1000000000000001 srv 1 entry 0x7ff000 words "
+                                           "00000000 00000000 00000000 00000000 00000000 00000000 00000000 12345678"));
+    std::printf("memory SRV census: %s\n", failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}

@@ -35,9 +35,19 @@ EXPORTS = (
     "op_movdqa_reg_ls",
     "op_movdqu_reg_ls",
     "op_mmx_sse2_bridge",
+    "op_cvtpi2pd_reg",
+    "op_cvtpi2pd_mem",
+    "op_cvtpi2pd_mem_disp",
+    "op_cvtpi2pd_discarded_read",
+    "op_cvtpi2pd_bridge",
 )
 
-ALTERED_EXPORTS = ("op_cvtpd2pi_reg", "op_cvttpd2pi_reg")
+ALTERED_EXPORTS = (
+    "op_cvtpd2pi_reg",
+    "op_cvttpd2pi_reg",
+    "op_cvtpi2pd_reg",
+    "op_cvtpi2pd_mem",
+)
 
 
 # --- Independent Python ISA reference model ---
@@ -65,6 +75,11 @@ def cvt_i32(v, trunc):
 def ref_pd2pi(buf16, trunc):
     q0, q1 = u64s(buf16)
     return pk_d(cvt_i32(d64(q0), trunc), cvt_i32(d64(q1), trunc))
+
+
+def ref_pi2pd(buf8):
+    lo, hi = struct.unpack("<2i", buf8[:8])
+    return struct.pack("<2d", float(lo), float(hi))
 
 
 def reference(name, a, b, altered=False):
@@ -98,6 +113,19 @@ def reference(name, a, b, altered=False):
         out[0:16] = pi_a + b"\x00" * 8
         out[16:24] = pi_b
         out[24:32] = pi_a
+    elif name == "op_cvtpi2pd_reg":
+        out[0:16] = ref_pi2pd(b[:8] if altered else a[:8])
+    elif name == "op_cvtpi2pd_mem":
+        out[0:16] = ref_pi2pd(b[:8] if altered else a[:8])
+    elif name == "op_cvtpi2pd_mem_disp":
+        out[3:19] = ref_pi2pd(b[1:9])
+    elif name == "op_cvtpi2pd_discarded_read":
+        out[0:16] = a[:16]
+        out[16:32] = a[:16]
+    elif name == "op_cvtpi2pd_bridge":
+        converted = ref_pi2pd(a[:8])
+        out[0:16] = converted
+        out[16:32] = ref_pi2pd(ref_pd2pi(converted, trunc=False))
     else:
         raise ValueError(f"unknown export {name}")
     return bytes(out)
@@ -172,9 +200,59 @@ def byte_pairs():
     return pairs
 
 
+INT32_BITS = (
+    -2147483648,  # INT32_MIN
+    -2147483647,  # INT32_MIN + 1
+    -1,
+    0,
+    1,
+    2147483646,   # INT32_MAX - 1
+    2147483647,   # INT32_MAX
+    -16777216,    # -(2^24)
+    -16777217,    # -(2^24 + 1)
+    16777217,     # 2^24 + 1
+    0x12345678,
+    -0x12345678,
+)
+
+
+def int32_pairs():
+    """(a, b) 32-byte pairs sweeping int32 edges, lane orders and unaligned m64 offsets."""
+    pairs = []
+    n = len(INT32_BITS)
+    for i in range(0, n, 2):
+        lo_a = INT32_BITS[i]
+        hi_a = INT32_BITS[(i + 1) % n]
+        lo_b = INT32_BITS[(i + 2) % n]
+        hi_b = INT32_BITS[(i + 3) % n]
+        a = struct.pack("<2i", lo_a, hi_a) + struct.pack("<6i", hi_a, lo_a, lo_b, hi_b, 0, -1)
+        b = struct.pack("<2i", lo_b, hi_b) + b"\xA5" + struct.pack("<5i", hi_a, lo_a, -2147483648, 2147483647, -1) + b"\x5A\x3C\x7E"
+        pairs.append((a, b))
+    explicit = [
+        ((-2147483648, 2147483647), (2147483647, -2147483648), (-2147483648, -1)),
+        ((-1, 0), (0, 1), (1, 2147483647)),
+        ((1, -1), (-2147483648, 0), (0, -2147483648)),
+    ]
+    for a_pair, b_pair, unaligned_b in explicit:
+        a = struct.pack("<2i", *a_pair) + bytes(range(0x10, 0x28))
+        b = struct.pack("<2i", *b_pair) + b"\x77" * 16 + b"\x33" * 8
+        b = b[:1] + struct.pack("<2i", *unaligned_b) + b[9:]
+        pairs.append((a, b))
+    rng = random.Random(0x5EED4)
+    for _ in range(6):
+        a = rng.randbytes(32)
+        b = rng.randbytes(32)
+        if a[:8] == b[:8]:
+            b = bytes([b[0] ^ 0xFF]) + b[1:]
+        pairs.append((a, b))
+    return pairs
+
+
 def inputs_for(name):
     if name.startswith(("op_cvtpd2pi", "op_cvttpd2pi", "op_mmx_sse2_bridge")):
         return double_pairs()
+    if name.startswith("op_cvtpi2pd"):
+        return int32_pairs()
     return byte_pairs()
 
 
@@ -228,6 +306,28 @@ def bind_exports(dll_path, prefix="", names=EXPORTS):
     return funcs
 
 
+def check_discarded_read(native_path, lifted_path):
+    """Verify volatile load ordering on a discarded cvtpi2pd m64 source read."""
+    payload = bytes(range(32))
+    name = "op_cvtpi2pd_discarded_read"
+    for label, dll, prefix in (("native", native_path, ""), ("lifted", lifted_path, "lifted_")):
+        fn = bind_exports(dll, prefix, (name,))[name]
+        source, ptr, _, _, _ = alloc_aligned_buffer(payload)
+        for readable in (True, False):
+            result, result_ptr, pre, off, post = alloc_aligned_buffer(FILL)
+            try:
+                fn(ptr, ptr if readable else 0, result_ptr)
+            except OSError as error:
+                assert not readable and "access violation reading" in str(error).lower(), (label, error)
+            else:
+                assert readable, f"{label} discarded a faulting CVTPI2PD read"
+            expected = payload[:16] + (payload[:16] if readable else FILL[16:])
+            assert_equal_output(
+                label, name, readable, check_guards_and_read(result, pre, off, post, label), expected
+            )
+        _ = source
+
+
 def check_differential(native_path, lifted_path, altered_path):
     native = bind_exports(native_path)
     lifted = bind_exports(lifted_path, "lifted_")
@@ -269,8 +369,21 @@ def check_differential(native_path, lifted_path, altered_path):
     else:
         raise AssertionError("mutated output was not caught by comparator")
 
+    # Mutated signedness and lane-order negative controls for cvtpi2pd.
+    signed_a = struct.pack("<2i", -2147483648, 2147483647) + b"\x00" * 24
+    signed_expected = reference("op_cvtpi2pd_reg", signed_a, signed_a)
+    unsigned_mutated = struct.pack("<2d", float(0x80000000), float(2147483647)) + signed_expected[16:]
+    swapped_lane_mutated = signed_expected[8:16] + signed_expected[0:8] + signed_expected[16:]
+    for mut_label, mut_bytes in (("signedness", unsigned_mutated), ("lane_order", swapped_lane_mutated)):
+        try:
+            assert_equal_output(f"mutation_{mut_label}", "op_cvtpi2pd_reg", 0, mut_bytes, signed_expected)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"mutated {mut_label} output was not caught by comparator")
+
     print(f"{total} native/lifted/reference MMX/SSE2 cases across {len(EXPORTS)} exports matched "
-          f"bit-for-bit; altered controls diverged on {changed}; output mutation control caught")
+          f"bit-for-bit; altered controls diverged on {changed}; output/signedness/lane-order mutation controls caught")
 
 
 # --- Alternate-encoding acceptance & translator rejection controls ---
@@ -287,12 +400,30 @@ def check_alt_encodings_and_rejections(original_path):
     ld_xmm0 = Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX))
     ld_xmm1 = Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM1, MemoryOperand(R.RDX))
     ld_mm0 = Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM0, MemoryOperand(R.RCX))
+    ld_mm7 = Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM7, MemoryOperand(R.RCX))
     st_xmm0 = Instruction.create_mem_reg(Code.MOVDQA_XMMM128_XMM, MemoryOperand(R.R8), R.XMM0)
+    st_xmm2 = Instruction.create_mem_reg(Code.MOVDQA_XMMM128_XMM, MemoryOperand(R.R8), R.XMM2)
+    st_xmm3 = Instruction.create_mem_reg(Code.MOVDQA_XMMM128_XMM, MemoryOperand(R.R8), R.XMM3)
+    st_xmm5 = Instruction.create_mem_reg(Code.MOVDQA_XMMM128_XMM, MemoryOperand(R.R8), R.XMM5)
     st_mm0 = Instruction.create_mem_reg(Code.MOVQ_MMM64_MM, MemoryOperand(R.R8), R.MM0)
     emms_ins = Instruction.create(Code.EMMS)
     ret_ins = Instruction.create(Code.RETNQ)
 
     alt_accept = [
+        ("cvtpi2pd_xmm5_mm7", (
+            ld_mm7,
+            Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM5, R.MM7),
+            st_xmm5, emms_ins, ret_ins)),
+        ("cvtpi2pd_mem_r8_neg_disp", (
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM2, MemoryOperand(R.R8, displ=-3, displ_size=1)),
+            st_xmm2, ret_ins)),
+        ("cvtpi2pd_mem_rcx_unaligned", (
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM0, MemoryOperand(R.RCX, displ=5, displ_size=1)),
+            st_xmm0, ret_ins)),
+        ("cvtpi2pd_undef_xmm_dst", (
+            ld_mm0,
+            Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM3, R.MM0),
+            st_xmm3, emms_ins, ret_ins)),
         ("movq_r10_r11", (
             ld_mm0,
             Instruction.create_reg_reg(Code.MOVQ_RM64_MM, R.R10, R.MM0),
@@ -329,6 +460,10 @@ def check_alt_encodings_and_rejections(original_path):
             ld_xmm0, st_xmm0, ret_ins)),
     ]
     alt_expected = {
+        "cvtpi2pd_xmm5_mm7": "xmm5 = op_cvtpi2pd(mm[7]);",
+        "cvtpi2pd_mem_r8_neg_disp": "xmm2 = op_cvtpi2pd(load64((r8 + 0xfffffffffffffffdull)));",
+        "cvtpi2pd_mem_rcx_unaligned": "xmm0 = op_cvtpi2pd(load64((rcx + 0x5ull)));",
+        "cvtpi2pd_undef_xmm_dst": "xmm3 = op_cvtpi2pd(mm[0]);",
         "movq_r10_r11": "mm[3] = r11;",
         "movq_0f7f_reg": "mm[4] = mm[0];",
         "movdqa_0f7f_reg": "xmm2 = xmm0;",
@@ -368,6 +503,14 @@ def check_alt_encodings_and_rejections(original_path):
             ld_mm0,
             Instruction.create_reg_reg(Code.MOVQ2DQ_XMM_MM, R.XMM0, R.MM0),
             st_xmm0, ret_ins), "missing emms before ret"),
+        ("missing_emms_cvtpi2pd_reg", (
+            ld_mm0,
+            Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM0, R.MM0),
+            st_xmm0, ret_ins), "missing emms before ret"),
+        ("missing_emms_prior_mm_then_cvtpi2pd_mem", (
+            ld_mm0,
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM0, MemoryOperand(R.RCX)),
+            st_xmm0, ret_ins), "missing emms before ret"),
         # Reading MM after emms without redefining
         ("read_mm_after_emms", (
             ld_mm0, emms_ins,
@@ -377,6 +520,10 @@ def check_alt_encodings_and_rejections(original_path):
         ("vex_vcvtpd2dq", (
             ld_xmm0,
             Instruction.create_reg_reg(Code.VEX_VCVTPD2DQ_XMM_XMMM128, R.XMM1, R.XMM0),
+            ret_ins), "non-legacy encoding"),
+        ("vex_vcvtdq2pd", (
+            ld_xmm0,
+            Instruction.create_reg_reg(Code.VEX_VCVTDQ2PD_XMM_XMMM64, R.XMM1, R.XMM0),
             ret_ins), "non-legacy encoding"),
         ("vex_vmovdqa", (
             Instruction.create_reg_mem(Code.VEX_VMOVDQA_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX)),
@@ -393,6 +540,13 @@ def check_alt_encodings_and_rejections(original_path):
         # Nonvolatile XMM6..XMM15
         ("nonvolatile_xmm6_dst", (
             Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM6, MemoryOperand(R.RCX)),
+            ret_ins), "nonvolatile vector register"),
+        ("nonvolatile_xmm6_cvtpi2pd_reg", (
+            ld_mm0,
+            Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM6, R.MM0),
+            emms_ins, ret_ins), "nonvolatile vector register"),
+        ("nonvolatile_xmm6_cvtpi2pd_mem", (
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM6, MemoryOperand(R.RCX)),
             ret_ins), "nonvolatile vector register"),
         ("nonvolatile_xmm15_src", (
             Instruction.create_reg_reg(Code.CVTPD2PI_MM_XMMM128, R.MM0, R.XMM15),
@@ -421,12 +575,21 @@ def check_alt_encodings_and_rejections(original_path):
         ("undefined_mm3", (
             Instruction.create_reg_reg(Code.MOVQ2DQ_XMM_MM, R.XMM0, R.MM3),
             emms_ins, ret_ins), "undefined MMX register mm3"),
+        ("undefined_mm_cvtpi2pd", (
+            Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM0, R.MM2),
+            emms_ins, ret_ins), "undefined MMX register mm2"),
         ("undefined_gpr_rax", (
             Instruction.create_reg_reg(Code.MOVQ_MM_RM64, R.MM0, R.RAX),
             emms_ins, ret_ins), "undefined GPR rax"),
         # Memory base & addressing violations
         ("non_arg_base_rax", (
             Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM0, MemoryOperand(R.RAX)),
+            ret_ins), "unsupported memory operand"),
+        ("non_arg_base_cvtpi2pd_rax", (
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM0, MemoryOperand(R.RAX)),
+            ret_ins), "unsupported memory operand"),
+        ("non_arg_base_cvtpi2pd_rbx", (
+            Instruction.create_reg_mem(Code.CVTPI2PD_XMM_MMM64, R.XMM0, MemoryOperand(R.RBX)),
             ret_ins), "unsupported memory operand"),
         ("rip_rel_mem", (
             Instruction.create_reg_mem(Code.CVTPD2PI_MM_XMMM128, R.MM0,
@@ -474,9 +637,6 @@ def check_alt_encodings_and_rejections(original_path):
             ret_ins), "unaligned 16-byte memory operand"),
         # Unsupported instructions
         ("unsupported_femms", (Instruction.create(Code.FEMMS), ret_ins), "unsupported instruction"),
-        ("unsupported_cvtpi2pd", (
-            ld_mm0, Instruction.create_reg_reg(Code.CVTPI2PD_XMM_MMM64, R.XMM0, R.MM0),
-            emms_ins, ret_ins), "unsupported instruction"),
         ("unsupported_cvtps2pi", (
             ld_xmm0, Instruction.create_reg_reg(Code.CVTPS2PI_MM_XMMM64, R.MM0, R.XMM0),
             emms_ins, ret_ins), "unsupported instruction"),
@@ -536,6 +696,10 @@ def check_alt_encodings_and_rejections(original_path):
     seq_map = {label: seq for label, seq, _ in reject_cases}
     pe_patches = [
         ("pe_missing_emms", encode_seq(*seq_map["missing_emms_cvtpd2pi"]), "missing emms before ret"),
+        ("pe_missing_emms_cvtpi2pd", encode_seq(*seq_map["missing_emms_cvtpi2pd_reg"]), "missing emms before ret"),
+        ("pe_undef_mm_cvtpi2pd", encode_seq(*seq_map["undefined_mm_cvtpi2pd"]), "undefined MMX register mm2"),
+        ("pe_nonvolatile_xmm6_cvtpi2pd", encode_seq(*seq_map["nonvolatile_xmm6_cvtpi2pd_mem"]), "nonvolatile vector register"),
+        ("pe_non_arg_base_cvtpi2pd", encode_seq(*seq_map["non_arg_base_cvtpi2pd_rax"]), "unsupported memory operand"),
         ("pe_vex_vmovdqa", encode_seq(*seq_map["vex_vmovdqa"]), "non-legacy encoding"),
         ("pe_nonvolatile_xmm6", encode_seq(*seq_map["nonvolatile_xmm6_dst"]), "nonvolatile vector register"),
         ("pe_unaligned_cvtpd2pi", encode_seq(*seq_map["unaligned_cvtpd2pi_m128"]), "unaligned 16-byte memory operand"),
@@ -567,5 +731,6 @@ def check_alt_encodings_and_rejections(original_path):
 
 
 if __name__ == "__main__":
+    check_discarded_read(*sys.argv[1:3])
     check_differential(*sys.argv[1:4])
     check_alt_encodings_and_rejections(sys.argv[1])

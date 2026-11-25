@@ -252,8 +252,15 @@ ALLOWED_CODES = {
     *MASKMOV_SPECS,
 }
 
-PRELUDE = """#include <cstdint>
+PRELUDE = """#include <atomic>
+#include <cstdint>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define X2W_UNALIGNED __unaligned
+#else
+#define X2W_UNALIGNED
+#endif
 
 using word = std::uint64_t;
 
@@ -261,44 +268,74 @@ struct Vec256 {
     std::uint64_t q[4];
 };
 
-static std::uint32_t load32(word address) {
-    std::uint32_t val = 0u;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 4);
+static inline std::uint32_t load32(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint32_t X2W_UNALIGNED*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     return val;
 }
 
-static std::uint64_t load64(word address) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
+static inline std::uint64_t load64(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     return val;
 }
 
-static void store32(word address, std::uint32_t val) {
+static inline void store32(word address, std::uint32_t val) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), &val, 4);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-static void store64(word address, std::uint64_t val) {
+static inline void store64(word address, std::uint64_t val) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), &val, 8);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-static Vec256 load128(word address) {
+static inline Vec256 load128(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto* p = reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    const std::uint64_t q0 = p[0];
+    const std::uint64_t q1 = p[1];
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{q0, q1, 0ull, 0ull}};
+}
+
+static inline Vec256 load256(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto* p = reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    const std::uint64_t q0 = p[0];
+    const std::uint64_t q1 = p[1];
+    const std::uint64_t q2 = p[2];
+    const std::uint64_t q3 = p[3];
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{q0, q1, q2, q3}};
+}
+
+static inline Vec256 load_vec32(word address) {
     Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 16);
+    v.q[0] = static_cast<std::uint64_t>(load32(address));
     return v;
 }
 
-static Vec256 load256(word address) {
+static inline Vec256 load_vec64(word address) {
     Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 32);
+    v.q[0] = load64(address);
     return v;
 }
 
-static void store128(word address, const Vec256& v) {
+static inline void store128(word address, const Vec256& v) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), v.q, 16);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-static void store256(word address, const Vec256& v) {
+static inline void store256(word address, const Vec256& v) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), v.q, 32);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
 static Vec256 copy128(const Vec256& v) {
@@ -676,6 +713,15 @@ static void op_vmaskmovpd_store(word address, const Vec256& mask, const Vec256& 
         }
     }
 }
+#if defined(_MSC_VER)
+extern "C" __declspec(dllexport) std::uint32_t host_has_avx() {
+    int info[4]{};
+    __cpuid(info, 1);
+    const int need = (1 << 27) | (1 << 28);
+    if ((info[2] & need) != need) return 0u;
+    return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
+}
+#endif
 """
 
 
@@ -701,19 +747,20 @@ def gpr_scratch(register, ins):
     raise ValueError(f"unsupported GPR {register} at RVA {ins.ip:#x}: {ins}")
 
 
-def flat_address(ins):
+def flat_address(ins, *, store=False):
     """Lower a flat [base + disp] pointer operand rooted in an argument GPR64."""
     base = ins.memory_base
+    allowed = {R.R8} if store else ARGUMENTS
     if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
             or ins.memory_index != R.NONE or not RegisterExt.is_gpr64(base)
-            or base not in ARGUMENTS):
+            or base not in allowed):
         raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}: {ins}")
     disp = ins.memory_displacement & ((1 << 64) - 1)
     name = ARGUMENTS[base]
     return f"({name} + {disp:#x}ull)" if disp else name
 
 
-def lift_code(name, start, raw):
+def lift_code(name, start, raw, *, allow_memory=False):
     """Decode and lift one bounded straight-line AVX bit-move/shuffle/blend/logical leaf function."""
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
@@ -737,6 +784,12 @@ def lift_code(name, start, raw):
             raise ValueError(f"undefined vector register ymm{idx} at RVA {ins.ip:#x}: {ins}")
         used.add(idx)
         return f"ymm{idx}", wide
+
+    def read_vec_or_mem(op_index, ins, mem_loader):
+        if ins.op_kind(op_index) == OpKind.MEMORY:
+            return f"{mem_loader}({flat_address(ins)})"
+        expr, _ = read_vec(op_index, ins)
+        return expr
 
     def write_vec(op_index, ins):
         if ins.op_kind(op_index) != OpKind.REGISTER:
@@ -770,7 +823,7 @@ def lift_code(name, start, raw):
                 or ins.zeroing_masking or ins.is_broadcast):
             raise ValueError(f"unsupported EVEX instruction at RVA {ins.ip:#x}: {ins}")
         mnemonic = ins.mnemonic
-        if mnemonic in REGISTER_ONLY_AVX and any(
+        if mnemonic in REGISTER_ONLY_AVX and not allow_memory and any(
                 ins.op_kind(i) == OpKind.MEMORY for i in range(ins.op_count)):
             raise ValueError(
                 f"unsupported memory operand for register-domain AVX instruction at RVA {ins.ip:#x}: {ins}")
@@ -816,17 +869,17 @@ def lift_code(name, start, raw):
             defined.add(dst_idx)
         elif mnemonic in (M.VBLENDPD, M.VBLENDPS):
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
             imm = ins.immediate8 & 0xff
             helper = "op_vblendpd" if mnemonic == M.VBLENDPD else "op_vblendps"
             statements.append(f"{dst} = {helper}({src1}, {src2}, {imm:#x}u, {'true' if wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in (M.VBLENDVPD, M.VBLENDVPS):
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
             mask, _ = read_vec(3, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
             helper = "op_vblendvpd" if mnemonic == M.VBLENDVPD else "op_vblendvps"
             statements.append(f"{dst} = {helper}({src1}, {src2}, {mask}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
@@ -857,33 +910,41 @@ def lift_code(name, start, raw):
             defined.add(dst_idx)
         elif mnemonic == M.VEXTRACTF128:
             src, _ = read_vec(1, ins)
-            dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
-            statements.append(f"{dst} = op_vextractf128({src}, {imm:#x}u);")
-            defined.add(dst_idx)
+            if ins.op0_kind == OpKind.MEMORY:
+                addr = flat_address(ins, store=True)
+                statements.append(f"store128({addr}, op_vextractf128({src}, {imm:#x}u));")
+            else:
+                dst_idx, dst, _ = write_vec(0, ins)
+                statements.append(f"{dst} = op_vextractf128({src}, {imm:#x}u);")
+                defined.add(dst_idx)
         elif mnemonic == M.VINSERTF128:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load128")
             dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
             statements.append(f"{dst} = op_vinsertf128({src1}, {src2}, {imm:#x}u);")
             defined.add(dst_idx)
         elif mnemonic == M.VEXTRACTPS:
             src, _ = read_vec(1, ins)
-            reg_name, _ = write_gpr(0, ins)
             imm = ins.immediate8 & 0xff
-            statements.append(f"{reg_name} = op_vextractps({src}, {imm:#x}u);")
-            defined_gpr.add(reg_name)
+            if ins.op0_kind == OpKind.MEMORY:
+                addr = flat_address(ins, store=True)
+                statements.append(f"store32({addr}, static_cast<std::uint32_t>(op_vextractps({src}, {imm:#x}u)));")
+            else:
+                reg_name, _ = write_gpr(0, ins)
+                statements.append(f"{reg_name} = op_vextractps({src}, {imm:#x}u);")
+                defined_gpr.add(reg_name)
         elif mnemonic == M.VINSERTPS:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load_vec32")
             dst_idx, dst, _ = write_vec(0, ins)
-            imm = ins.immediate8 & 0xff
+            imm = (ins.immediate8 & 0x3f) if ins.op2_kind == OpKind.MEMORY else (ins.immediate8 & 0xff)
             statements.append(f"{dst} = op_vinsertps({src1}, {src2}, {imm:#x}u);")
             defined.add(dst_idx)
         elif mnemonic == M.VPERM2F128:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load256")
             dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
             statements.append(f"{dst} = op_vperm2f128({src1}, {src2}, {imm:#x}u);")
@@ -891,36 +952,38 @@ def lift_code(name, start, raw):
         elif mnemonic in (M.VPERMILPD, M.VPERMILPS):
             is_pd = mnemonic == M.VPERMILPD
             if ins.op2_kind == OpKind.IMMEDIATE8:
-                src, _ = read_vec(1, ins)
                 dst_idx, dst, wide = write_vec(0, ins)
+                src = read_vec_or_mem(1, ins, "load256" if wide else "load128")
                 imm = ins.immediate8 & 0xff
                 helper = "op_vpermilpd_imm" if is_pd else "op_vpermilps_imm"
                 statements.append(f"{dst} = {helper}({src}, {imm:#x}u, {'true' if wide else 'false'});")
             else:
                 src, _ = read_vec(1, ins)
-                ctrl, _ = read_vec(2, ins)
                 dst_idx, dst, wide = write_vec(0, ins)
+                ctrl = read_vec_or_mem(2, ins, "load256" if wide else "load128")
                 helper = "op_vpermilpd_var" if is_pd else "op_vpermilps_var"
                 statements.append(f"{dst} = {helper}({src}, {ctrl}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in (M.VSHUFPD, M.VSHUFPS):
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
             imm = ins.immediate8 & 0xff
             helper = "op_vshufpd" if mnemonic == M.VSHUFPD else "op_vshufps"
             statements.append(f"{dst} = {helper}({src1}, {src2}, {imm:#x}u, {'true' if wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in UNPACK_HELPERS:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
             helper = UNPACK_HELPERS[mnemonic]
             statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in DUP_HELPERS:
-            src, _ = read_vec(1, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            mem_loader = ("load256" if wide else "load_vec64") if mnemonic == M.VMOVDDUP else (
+                "load256" if wide else "load128")
+            src = read_vec_or_mem(1, ins, mem_loader)
             helper = DUP_HELPERS[mnemonic]
             statements.append(f"{dst} = {helper}({src}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
@@ -1045,25 +1108,25 @@ def lift_code(name, start, raw):
     return "\n".join(lines), len(instructions)
 
 
-def lift(pe, name):
+def lift(pe, name, *, allow_memory=False):
     entry = export_rva(pe, name)
     raw = bounded_code(pe, entry)
-    source, count = lift_code(name, entry, raw)
+    source, count = lift_code(name, entry, raw, allow_memory=allow_memory)
     return source, entry, count
 
 
-def translate_pe(pe, names):
+def translate_pe(pe, names, *, allow_memory=False):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    lifted = [lift(pe, name) for name in names]
+    lifted = [lift(pe, name, allow_memory=allow_memory) for name in names]
     source = PRELUDE + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
     meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
     return source, meta
 
 
-def translate(image, names):
+def translate(image, names, *, allow_memory=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, allow_memory=allow_memory)
 
 
 if __name__ == "__main__":
@@ -1071,9 +1134,10 @@ if __name__ == "__main__":
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help="comma-separated export names")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--mem-ops", action="store_true", help="allow memory operands on register-domain AVX forms")
     args = parser.parse_args()
     try:
-        source, meta = translate(args.image, args.exports.split(","))
+        source, meta = translate(args.image, args.exports.split(","), allow_memory=args.mem_ops)
         args.output.write_text(source, encoding="utf-8")
         for name, entry, count in meta:
             print(f"{name} at RVA {entry:#x}: {count} instructions")

@@ -16,12 +16,15 @@ struct Case {
     bool accepted;
 };
 
-constexpr auto chain_layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x109);
+constexpr UINT chain_layout = 0x109;
 
 D3D12_RESOURCE_DESC shape(UINT16 mips, UINT height, UINT16 slices, DXGI_FORMAT format)
 {
-    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips, format, {1, 0}, chain_layout,
-            D3D12_RESOURCE_FLAG_NONE};
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips, format, {1, 0},
+                            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    static_assert(sizeof(desc.Layout) == sizeof(chain_layout));
+    std::memcpy(&desc.Layout, &chain_layout, sizeof(chain_layout));
+    return desc;
 }
 
 D3D12_RESOURCE_DESC nine() { return shape(9, 1024, 1, DXGI_FORMAT_BC7_UNORM); }

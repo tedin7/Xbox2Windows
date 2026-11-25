@@ -29,10 +29,11 @@
 //    proof is printed.
 //
 // --mutate region-only trusts the allocation size without checking that every page is committed: it
-// exits 1 only if decisions differ in the partly committed cases and nowhere else.
-// --mutate walk-only never uses the region information: it exits 1 only if the call count of case 9
-// fails and nothing else does. Either exits 0 otherwise, so its WILL_FAIL test fails. A refused
-// allocation or mapping is a capability skip (77) in the controls and a failure in the main check.
+// passes (exits 0) only if decisions differ in the partly committed cases and nowhere else.
+// --mutate walk-only never uses the region information: it passes only if the call count of case 9
+// fails and nothing else does. Either exits 1 otherwise. The controls are ordinary tests, not
+// WILL_FAIL, so a crash or another failure cannot pass them. A refused allocation or mapping is a
+// capability skip (77) in the controls and a failure in the main check.
 #include "startup_stubs/placed_buffer_range.h"
 
 #include <cstdio>
@@ -421,7 +422,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "placed buffer range control: failures other %d, partly committed %d, cost %d -> %s\n",
                      failures[other], failures[partial], failures[cost],
                      stated ? "failed for the stated reason" : "did NOT fail for the stated reason");
-        return stated ? 1 : 0;
+        return stated ? 0 : 1;
     }
     if (total || setup_failures) {
         std::fprintf(stderr, "placed buffer range: %d failure(s), %d setup failure(s)\n", total, setup_failures);

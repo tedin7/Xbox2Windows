@@ -14,8 +14,8 @@
 // stays retired until the D3D12 fence of its last submission (XMem owns slots, D3D12 the fence).
 //
 // Paths:
-//   share     The pool is opened once as a heap (OpenExistingHeapFromFileMapping for the section,
-//             OpenExistingHeapFromAddress on the allocation base for the private range, after
+//   share     The pool is opened once as a heap (OpenExistingHeapFromAddress on a whole-pool view of the
+//             section, or on the allocation base for the private range, after
 //             D3D12_FEATURE_EXISTING_HEAPS) and a cross-adapter buffer is placed at the slot offset.
 //             The GPU reads and writes title memory; nothing is copied.
 //   copy      A default-heap buffer fed from a two-slot upload ring that wraps like reserve_upload_ring
@@ -382,6 +382,7 @@ struct TitlePool {
     std::vector<bool> used;
     ComPtr<ID3D12Heap> heap;  // the shared heap, opened once per pool as slot 133 caches it
     std::vector<std::uint8_t*> runs;  // the section's mapped CPU runs
+    std::uint8_t* pool_view = nullptr;  // the section pool's whole-pool view; the shared heap is opened on it
 
     TitlePool(PoolKind k, bool reuse_early)
         : kind(k), pages(k == PoolKind::section ? section_pages : private_pages), slots(pages), used(pages, false)
@@ -393,11 +394,14 @@ struct TitlePool {
     ~TitlePool()
     {
         heap.Reset();
+        if (pool_view) UnmapViewOfFile(pool_view);
         while (!runs.empty()) unmap_run(runs.back());
         if (base) VirtualFree(base, 0, MEM_RELEASE);
         if (section) CloseHandle(section);
     }
     UINT64 bytes() const { return UINT64{pages} * page; }
+    // OpenExistingHeapFromFileMapping leaks Windows commit (#2234), so heaps are opened on an address.
+    void* heap_address() const { return kind == PoolKind::section ? static_cast<void*>(pool_view) : base; }
 
     bool init()
     {
@@ -407,6 +411,11 @@ struct TitlePool {
                                          static_cast<DWORD>(bytes()), nullptr);
             if (section) view = static_cast<std::uint32_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0,
                                                                          reserved_pages * page));
+            if (view) pool_view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+            if (view && !pool_view) {
+                UnmapViewOfFile(view);
+                view = nullptr;
+            }
         } else {
             base = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
             view = reinterpret_cast<std::uint32_t*>(base);
@@ -592,9 +601,7 @@ struct Runner {
     {
         if (!gpu.existing_heaps) return DXGI_ERROR_UNSUPPORTED;
         if (!pool.heap) {
-            const HRESULT hr = pool.kind == PoolKind::section
-                                   ? gpu.device->OpenExistingHeapFromFileMapping(pool.section, IID_PPV_ARGS(&pool.heap))
-                                   : gpu.device->OpenExistingHeapFromAddress(pool.base, IID_PPV_ARGS(&pool.heap));
+            const HRESULT hr = gpu.device->OpenExistingHeapFromAddress(pool.heap_address(), IID_PPV_ARGS(&pool.heap));
             if (FAILED(hr)) return hr;
         }
         const auto desc = buffer_desc(buffer_bytes, placed_flags);
@@ -1117,7 +1124,7 @@ unsigned refusal_probes(Gpu& gpu)
             CloseHandle(read_only);
         }
     }
-    const HRESULT open_hr = gpu.device->OpenExistingHeapFromFileMapping(section.section, IID_PPV_ARGS(&section.heap));
+    const HRESULT open_hr = gpu.device->OpenExistingHeapFromAddress(section.heap_address(), IID_PPV_ARGS(&section.heap));
     if (SUCCEEDED(open_hr)) {
         const Refusal refusal(gpu);
         const auto desc = buffer_desc(buffer_bytes, placed_flags);
@@ -1130,7 +1137,7 @@ unsigned refusal_probes(Gpu& gpu)
               gpu.device->CreatePlacedResource(section.heap.Get(), section.bytes() - page, &desc,
                                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&placed)));
     } else {
-        std::printf("refusal placement probes not run: OpenExistingHeapFromFileMapping hr=%s\n", hex(open_hr).c_str());
+        std::printf("refusal placement probes not run: OpenExistingHeapFromAddress(section pool view) hr=%s\n", hex(open_hr).c_str());
     }
     return bad;
 }

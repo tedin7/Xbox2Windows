@@ -1,0 +1,22 @@
+EXPORTS
+    native_read_segs
+    lar_reg16
+    lar_reg32
+    lar_reg64
+    lar_mem16
+    lar_mem32_disp
+    lar_mem64_disp
+    lsl_reg16
+    lsl_reg32
+    lsl_reg64
+    lsl_mem16
+    lsl_mem32_disp
+    lsl_mem64_disp
+    verr_reg
+    verw_reg
+    verr_mem_disp
+    verw_mem_disp
+    seg_imm_select
+    seg_flags_preserve
+    seg_cmov32
+    seg_discarded_read

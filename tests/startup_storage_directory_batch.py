@@ -111,7 +111,7 @@ def check(consumer, folder):
         batch, file, offset, _ = spec
         page = bytes([0xa5 if tag is None else tag]) * PAGE
         actual = data[i * stride:(i + 1) * stride]
-        assert statuses[i] == (0x80004005 if tag is None else 0), (spec, hex(statuses[i]))
+        assert statuses[i] == (0x80070026 if tag is None else 0), (spec, hex(statuses[i]))
         assert actual == GUARD + page + GUARD, (spec, "changed guard or wrong bytes")
         if batch >= 2 and offset == (0x8100, 0xe8100)[file] + SHIFT:
             assert actual[len(GUARD):-len(GUARD)] != bytes([labels[file][0]]) * PAGE

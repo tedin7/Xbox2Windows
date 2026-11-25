@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import math
 import mmap
+import os
 from pathlib import Path
 import re
 import struct
@@ -201,6 +202,8 @@ def inspect(path, state=None):
     candidates = []
     state_id = joaat(state) if state is not None else None
     with path.open("rb") as stream:
+        if os.fstat(stream.fileno()).st_size == 0:
+            raise ValueError("Empty archive; expected an RPF9 archive")
         if stream.read(4) != b"9FPR":
             raise ValueError("Expected an RPF9 archive")
         with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
@@ -220,13 +223,18 @@ def inspect(path, state=None):
     return result
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--state", help="Report at most one hash-verified example for this state label")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         result = inspect(args.archive, args.state)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
         parser.exit(1, f"{args.archive}: {exc}\n")
     print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from mesh_entry_aot import lower
+from mesh_entry_aot import UNDEF, Wave, lower
 
 # Two explicitly modeled wave64s. Only the first three group threads export vertices.
 PROGRAM = """
@@ -805,10 +805,207 @@ def offset_draw():
     return lower(enumerate_pcs(program), words, (3, 1)), [(inputs, positions, True)]
 
 
+SKIPPED_PROGRAM = PROGRAM.copy()
+# s7 is written only inside the range that wave 1 skips (no lane has global thread 0 there), yet it is
+# read after the range. Wave 0 sees 0x1003, wave 1 never has a defined s7, and none of its lanes are live.
+SKIPPED_PROGRAM[-2:-2] = [
+    "s_add_u32 s9, s7, 0x3e7feffd",  # 0x1003 + 0x3e7feffd = 0x3e800000 = 0.25
+    "v_add_f32_e32 v3, s9, v3",
+]
+SKIPPED_DEPTH = 0.5 + 0.25
+RESTORE_EXEC = SKIPPED_PROGRAM.index("s_mov_b64 exec, s[22:23]") + 1
+
+
+def skipped_draw(program=None):
+    program = SKIPPED_PROGRAM if program is None else program
+    positions = [(x, y, SKIPPED_DEPTH, w) for x, y, _, w in TRIANGLE]
+    return lower(enumerate_pcs(program), [0x1003], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def skipped_refusals():
+    # Each control lets an undefined scalar reach something the draw can see. All must be refused.
+    after_range = SKIPPED_PROGRAM.index("s_add_u32 s9, s7, 0x3e7feffd") + 1
+    controls = {
+        "live lane reads it": (RESTORE_EXEC, ["v_add_f32_e32 v3, s9, v3"]),
+        "live lane selects with it": (SKIPPED_PROGRAM.index("v_mov_b32_e32 v9, 0xbf800000") + 1, ["v_cndmask_b32_e64 v1, v9, v8, s[8:9]"]),
+        "branch on it": (after_range, ["s_cmp_eq_u32 s9, 0", "s_cbranch_scc0 0"]),
+        "exec from it": (after_range, ["s_and_b64 exec, exec, s[8:9]"]),
+        "m0 from it": (after_range, ["s_mov_b32 m0, s9"]),
+        "never written anywhere": (after_range, ["s_add_u32 s14, s5, 1", "v_add_f32_e32 v3, s14, v3"]),
+    }
+    for name, (at, lines) in controls.items():
+        program = SKIPPED_PROGRAM.copy()
+        program[at:at] = lines
+        try:
+            lower(enumerate_pcs(program), [0x1003], (3, 1))
+        except KeyError:
+            # A register no instruction writes is an unknown operand, refused by its number.
+            if name != "never written anywhere":
+                raise
+            continue
+        except ValueError as error:
+            if all(text not in str(error) for text in ("not written on this wave", "Undefined", "before it is written")):
+                raise AssertionError(f"{name}: refused for another reason: {error}")
+            continue
+        raise AssertionError(f"{name}: accepted")
+
+
+def skipped_unsupported_refusal():
+    # An opcode with implicit EXEC/SCC effects is refused even when an operand is undefined.
+    after_range = SKIPPED_PROGRAM.index("s_add_u32 s9, s7, 0x3e7feffd") + 1
+    program = SKIPPED_PROGRAM.copy()
+    program[after_range:after_range] = ["s_nand_saveexec_b64 s[34:35], s[8:9]"]
+    # Wave 1 reaches the instruction with an undefined operand; it must still see the unsupported opcode.
+    try:
+        Wave(1, [0x1003]).run(enumerate_pcs(program), {})
+    except ValueError as error:
+        assert "Unsupported scalar instruction s_nand_saveexec_b64" in str(error), error
+    else:
+        raise AssertionError("Unsupported scalar opcode accepted with an undefined operand")
+
+
+def skipped_cpu():
+    text = skipped_draw()[0]
+    # The first range in the program is skipped only by wave 1: the skipped write must not leak into wave 0.
+    wave = Wave(1, [0x1003])
+    wave.run(enumerate_pcs(SKIPPED_PROGRAM), {})
+    assert 7 not in wave.s and wave.s[9] is UNDEF, wave.s
+    wave = Wave(0, [0x1003])
+    wave.run(enumerate_pcs(SKIPPED_PROGRAM), {})
+    assert wave.s[7] == 0x1003 and wave.s[9] == 0x3E800000, wave.s
+    # Dropping the contribution changes the exported depth, so the reference is not satisfied by accident.
+    plain = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    assert plain != text
+    skipped_refusals()
+    skipped_unsupported_refusal()
+
+
+def skipped_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = skipped_draw()
+    expected = cases[0][1]
+    plain = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    word = struct.unpack("<I", struct.pack("<f", SKIPPED_DEPTH))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [
+        (source, [(x, y, off_by_one, w) for x, y, _, w in TRIANGLE]),
+        (plain, expected),
+    ]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+# Exec restored inside a per-lane range without the plain "copy, then move it back" form (#1998 item C): a copy
+# moved between registers, 32-bit halves, a saved mask flipped and joined with the saveexec family, and a restore
+# joined from two arms. Every form must give the same mesh as PROGRAM.
+EXEC_COPY = "s_mov_b64 s[22:23], exec"
+EXEC_BACK = "s_mov_b64 exec, s[22:23]"
+EXEC_FIRST = ["s_mov_b64 s[42:43], s[22:23]"]
+EXEC_HALVES = ["s_mov_b32 exec_lo, s42", "s_mov_b32 exec_hi, s43"]
+EXEC_JOIN = [
+    "v_cmp_eq_u32_e64 s[10:11], 1, v0",
+    "s_and_saveexec_b64 s[46:47], s[10:11]",
+    "s_xor_b64 exec, exec, s[46:47]",
+    "s_or_saveexec_b64 s[48:49], s[46:47]",
+    "s_cmp_eq_u32 s8, 0",
+    "s_cbranch_scc0 2",
+    "s_mov_b64 s[50:51], s[46:47]",
+    "s_branch 1",
+    "s_mov_b64 s[50:51], 0",
+    "s_mov_b64 exec, s[50:51]",
+]
+
+
+def exec_restore_program(change=None):
+    # The program, with one line of the join replaced (a dict of old line to new line) for the refusal controls.
+    program = PROGRAM.copy()
+    program[program.index(EXEC_COPY) + 1 : program.index(EXEC_COPY) + 1] = EXEC_FIRST
+    at = program.index(EXEC_BACK)
+    program[at : at + 1] = EXEC_HALVES + EXEC_JOIN
+    return [(change or {}).get(line, line) for line in program]
+
+
+def exec_restore_draw(program=None):
+    program = exec_restore_program() if program is None else program
+    return lower(enumerate_pcs(program), [0x1003], (3, 1)), [(triangle_inputs(), TRIANGLE, True)]
+
+
+# Each change breaks the restore, or uses a form that is not modeled: all are refused.
+EXEC_REFUSED = (
+    # The mask saved before the flip is not the mask before the range: lane 1 is lost.
+    {"s_mov_b64 s[50:51], s[46:47]": "s_mov_b64 s[50:51], s[48:49]"},
+    # The restore reads a pair that was never written.
+    {"s_mov_b64 s[50:51], s[46:47]": "s_mov_b64 s[50:51], s[52:53]"},
+    # Only the high half is restored: lanes 1 to 31 stay off.
+    {"s_mov_b32 exec_lo, s42": "s_nop 0"},
+    # A 64-bit write to one half, and a saveexec form that is not modeled.
+    {"s_mov_b32 exec_lo, s42": "s_mov_b64 exec_lo, s[42:43]"},
+    {"s_or_saveexec_b64 s[48:49], s[46:47]": "s_nand_saveexec_b64 s[48:49], s[46:47]"},
+    # The wave 0 arm is never taken, so the join gives wave 0 an empty mask.
+    {"s_cbranch_scc0 2": "s_cbranch_scc1 2"},
+    # The join takes a backward branch.
+    {"s_branch 1": "s_branch -1"},
+)
+
+
+# The complemented saveexec forms negate the old exec, not the source: ANDN2 is SRC0 & ~EXEC, ORN2 is SRC0 | ~EXEC.
+# With exec 7 (wave 0) and source 2, ANDN2 leaves no lane (the swapped form would leave lanes 0 and 2). A write under
+# the new mask must match the same masks built from ordinary scalar instructions, and differ from PROGRAM.
+COMPLEMENT_FORMS = {
+    "s_andn2_saveexec_b64 s[46:47], s[44:45]": ["s_mov_b64 s[46:47], exec", "s_andn2_b64 exec, s[44:45], exec"],
+    "s_orn2_saveexec_b64 s[46:47], s[44:45]": [
+        "s_mov_b64 s[46:47], exec", "s_not_b64 s[48:49], exec", "s_or_b64 exec, s[44:45], s[48:49]",
+    ],
+}
+
+
+def complement_program(mask_lines):
+    program = PROGRAM.copy()
+    at = program.index("v_mov_b32_e32 v4, 0x3f800000") + 1
+    program[at:at] = ["s_mov_b64 s[44:45], 2", *mask_lines, "v_mov_b32_e32 v4, 0x40000000", "s_mov_b64 exec, s[46:47]"]
+    return program
+
+
+def complement_checks():
+    reference = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    for form, scalar in COMPLEMENT_FORMS.items():
+        saved = lower(enumerate_pcs(complement_program([form])), [0x1003], (3, 1))
+        plain = lower(enumerate_pcs(complement_program(scalar)), [0x1003], (3, 1))
+        assert saved == plain, form
+    # ANDN2 leaves no lane under mask 7, so its write never lands.
+    andn2 = lower(enumerate_pcs(complement_program(list(COMPLEMENT_FORMS)[:1])), [0x1003], (3, 1))
+    assert andn2 == reference
+    orn2 = lower(enumerate_pcs(complement_program(list(COMPLEMENT_FORMS)[1:])), [0x1003], (3, 1))
+    assert orn2 != reference
+
+
+def exec_restore_checks():
+    reference = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    assert lower(enumerate_pcs(exec_restore_program()), [0x1003], (3, 1)) == reference
+    complement_checks()
+    for change in EXEC_REFUSED:
+        try:
+            lower(enumerate_pcs(exec_restore_program(change)), [0x1003], (3, 1))
+        except (KeyError, ValueError):
+            continue
+        raise AssertionError(f"Invalid exec restore accepted: {change}")
+
+
+def exec_restore_negative_draws(dxc, renderer, adapter, tmp):
+    # A depth word one unit in the last place off in the last vertex must be reported by the export trace.
+    source, cases = exec_restore_draw()
+    expected = cases[0][1]
+    word = struct.unpack("<I", struct.pack("<f", expected[2][2]))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = expected[:2] + [(*expected[2][:2], off_by_one, expected[2][3])]
+    return mismatch(dxc, renderer, adapter, tmp, source, wrong)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
-            binary(Path(directory), *sys.argv[2:])
+            text0 = binary(Path(directory), *sys.argv[2:])
             text = binary(
                 Path(directory), *sys.argv[2:], program=ALU_PROGRAM, words=[4099]
             )
@@ -820,10 +1017,31 @@ if __name__ == "__main__":
             assert text.count("asfloat(0xbfc00000u)") == 2, text
             float_binary(Path(directory), sys.argv[2:])
             cvt_minmax_binary(Path(directory), sys.argv[2:])
+            # The assembled restore forms must lower to the same text as the plain restore.
+            assert binary(Path(directory), *sys.argv[2:], program=exec_restore_program(), words=[4099]) == text0
             unary_binary(Path(directory), sys.argv[2:])
             fract_tiny_binary(Path(directory), sys.argv[2:])
             fract_nan_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "skipped":
+            skipped_cpu()
+            sys.exit(0)
+        if sys.argv[1] == "draw-skipped":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *skipped_draw())
+                or skipped_negative_draws(*args, Path(directory))
+            )
+        if sys.argv[1] == "exec-restore":
+            exec_restore_checks()
+            print("Exec restore forms matched the plain restore and the refusals held")
+            sys.exit(0)
+        if sys.argv[1] == "draw-exec-restore":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *exec_restore_draw())
+                or exec_restore_negative_draws(*args, Path(directory))
+            )
         if sys.argv[1] == "draw-cvt-minmax":
             args = sys.argv[2:]
             sys.exit(

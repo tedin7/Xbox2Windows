@@ -219,6 +219,11 @@ def formatted_mubuf_request_controls():
             mnemonic = 'buffer_load_format_' + suffix
             assert G.decode(load) == [(0, 8, mnemonic, f'{mnemonic} {dest}, off, s[32:35], 0')]
             result, name = request(load)
+            if op < 3:
+                # x, xy and xyz take FORMAT and DST_SEL from descriptor word 3 at draw time.
+                assert result == 'ok', result
+                assert 'switch ((ud' in name.with_suffix('.vs.hlsl').read_text()
+                continue
             reason = name.with_suffix('.fail').read_text().strip()
             assert reason == f'{mnemonic} requires descriptor FORMAT and DST_SEL', reason
             assert result == f'unsupported: {reason}', result

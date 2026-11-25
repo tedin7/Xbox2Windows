@@ -18,6 +18,7 @@ A family is a dict with:
   body:      mnemonic -> the recorded pixel body words (llvm-mc -mcpu=gfx1013)
   refused:   assembly lines that must stay refused
   accepted:  assembly lines that must translate (one instruction, no pipeline)
+  pipeline:  optional keyword arguments of the Pipeline built for the fixture (a selected contract)
 Every reference is written from the ISA description with plain integer arithmetic, not from the lowering.
 """
 import re
@@ -46,7 +47,8 @@ def body_source(family, op):
 
 
 def translate(family, op, mutate=False):
-    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PRE_WORDS + family['body'][op] + POST_WORDS, root_blob())
+    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PRE_WORDS + family['body'][op] + POST_WORDS, root_blob(),
+                      **family.get('pipeline', {}))
     text = pipe.hlsl_ps()
     if mutate:
         pattern, replacement, _ = family['mutations'][op]
@@ -121,7 +123,8 @@ def check_draw(family, dxc, renderer, adapter, fxc=None):
                 for index in range(0, len(sets), 4):
                     chunk = sets[index:index + 4]
                     vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), PRE_WORDS + family['body'][op]
-                                                                 + POST_WORDS, root_blob()).hlsl_vs(),
+                                                                 + POST_WORDS, root_blob(),
+                                                                 **family.get('pipeline', {})).hlsl_vs(),
                                       'vs_%s_%d_%s' % (op, index, kind), vs_profile, directory)
                     want = words_text(expected(family, op, chunk))
                     run = draw(renderer, adapter, vs, good, want)

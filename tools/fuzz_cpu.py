@@ -1879,8 +1879,8 @@ def plant_stale_rsp(cpu_switch_aot, image, functions):
     shifts = {}  # RVA -> (RSP at the instruction minus RSP after the prologue, bytes of the frame array)
     original_frame = cpu_switch_aot.Frame.__init__
 
-    def frame_init(self, function, edges):
-        original_frame(self, function, edges)
+    def frame_init(self, function, edges, internal=False):
+        original_frame(self, function, edges, internal)
         if self.adjustments:
             floor = self.offsets[function.instructions[min(self.adjustments)].next_ip]
             for ip, offset in self.offsets.items():

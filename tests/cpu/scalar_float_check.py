@@ -10,19 +10,20 @@ import sys
 from tempfile import TemporaryDirectory
 
 import pefile
-from iced_x86 import Decoder, Mnemonic as M, OpKind
+from iced_x86 import Code, Decoder, Instruction, Mnemonic as M, OpKind, Register as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
-from cpu_sse_aot import translate
+from cpu_sse_aot import ScalarLifter, translate
 
 SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "from_int": "d:qq",
               "classify_ss": "q:ff", "classify_sd": "q:dq", "round_trip": "f:f",
               "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d", "probe_ss": "q:qff",
               "neg_jcc": "q:q", "setcc_mix": "q:qqq", "cmovcc_mix": "q:qqq",
               "min_ss": "f:ffq", "max_ss": "f:ffq", "min_sd": "d:ddq", "max_sd": "d:ddq",
-              "root_ss": "f:fq", "root_sd": "d:dq", "root_const_ss": "f:", "root_const_sd": "d:", "round_cvt": "q:fdq"}
+              "root_ss": "f:fq", "root_sd": "d:dq", "root_const_ss": "f:", "root_const_sd": "d:",
+              "round_cvt": "q:fdq", "movq_gpr": "q:dq"}
 # MIN, MAX and SQRT: the seed behind the pointer and how far each export writes into it.
 SEED = struct.pack("<II", 0x0badf00d, 0x1badcafe)
 EXTREMA = {"min_ss": ("min", 4), "max_ss": ("max", 4), "min_sd": ("min", 8), "max_sd": ("max", 8)}
@@ -249,6 +250,9 @@ def cases():
         for b in flag_values:
             found.append(("setcc_mix", (a, b, None), bytes([FILL]) * 4))
             found.append(("cmovcc_mix", (a, b, None), struct.pack("<QQ", 0xdeadbeefcafebabe, 0xaaaa555511112222)))
+    for d in DOUBLES:
+        for q in INTEGERS:
+            found.append(("movq_gpr", (d, q), b""))
     return found
 
 
@@ -525,6 +529,20 @@ def known_answers():
          99, struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222)),
         ("cmovcc_mix", (1 << 63, 7, None), struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222),
          0xaaaa555511112222, struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222)),
+        # MOVQ between XMM and 64-bit GPR preserves all 64 bits verbatim across -0.0, NaNs, subnormals, and +/-inf.
+        ("movq_gpr", (min64, 0), b"", min64, b""),
+        ("movq_gpr", (0x7ff0000000000001, 0), b"", 0x7ff0000000000001, b""),
+        ("movq_gpr", (0xfff4000000000000, 0), b"", 0xfff4000000000000, b""),
+        ("movq_gpr", (0x7ff7ffffffffffff, 0), b"", 0x7ff7ffffffffffff, b""),
+        ("movq_gpr", (0x7ff8000012345678, 0), b"", 0x7ff8000012345678, b""),
+        ("movq_gpr", (0xfffc0000deadbeef, 0), b"", 0xfffc0000deadbeef, b""),
+        ("movq_gpr", (0x0000000000000001, 0), b"", 0x0000000000000001, b""),
+        ("movq_gpr", (0x800fffffffffffff, 0), b"", 0x800fffffffffffff, b""),
+        ("movq_gpr", (0x7ff0000000000000, 0), b"", 0x7ff0000000000000, b""),
+        ("movq_gpr", (0xfff0000000000000, 0), b"", 0xfff0000000000000, b""),
+        ("movq_gpr", (0, min64), b"", min64, b""),
+        ("movq_gpr", (0, 0x7ff0000000000001), b"", 0x7ff0000000000001, b""),
+        ("movq_gpr", (0x7ff8000012345678, 0xfedcba9876543210), b"", 0x7ff8000012345678 ^ 0xfedcba9876543210, b""),
     ]
 
 
@@ -552,6 +570,10 @@ def check(original, lifted, swapped, swapped_lifted):
             expected = rounded_answer(values, payload, DEFAULT_MXCSR)
             if native != (expected[0], GUARD + expected[1] + GUARD):
                 raise AssertionError(f"{name}{values}: the processor gave {native}, the reference {expected}")
+        if name == "movq_gpr":
+            expected = values[0] ^ values[1]
+            if native != (expected, GUARD + GUARD):
+                raise AssertionError(f"{name}{values}: the processor gave {native}, expected {expected:#x}")
         control = run(swapped, name, values, payload)
         actual = run(swapped_lifted, name, values, payload)
         if actual != control:
@@ -735,6 +757,9 @@ def check_rejections(original_path):
     setcc_mov_r9 = next(i for i in code["setcc_mix"] if i.mnemonic == M.MOV and i.ip > first("setcc_mix", M.CMP).ip)
     setcc_setl = first("setcc_mix", M.SETL)
     cmov_32 = first("cmovcc_mix", M.CMOVG)
+    movq_to_gpr = next(i for i in code["movq_gpr"] if i.code == Code.MOVQ_RM64_XMM)
+    movq_from_gpr = next(i for i in code["movq_gpr"] if i.code == Code.MOVQ_XMM_RM64)
+    movq_from_rdx = next(i for i in code["movq_gpr"] if i.code == Code.MOVQ_XMM_RM64 and i.op1_register == R.RDX)
     assert load.next_ip == multiply.ip and compare.next_ip == parity.ip
     everything = [f"{name}={signature}" for name, signature in SIGNATURES.items()]
     controls = [
@@ -760,7 +785,15 @@ def check_rejections(original_path):
         (patch(round_ss, "f3 0f 2d c5"), "undefined register xmm5", "CVTSS2SI of an unwritten register"),
         (patch(round_ss, "f3 0f 2d d8"), "nonvolatile register rbx", "CVTSS2SI into RBX"),
         (patch(round_mem, "f3 0f 2d 0d 00 00 00 00", round_mem_next), "unsupported memory operand", "RIP-relative CVTSS2SI source"),
-        (patch(truncate, "66 48 0f 7e c2"), "unsupported instruction", "MOVQ to an integer register"),
+        (patch(load, "66 48 0f 7e c8"), "undefined register xmm1[63:32]", "MOVQ reading XMM with only low 32-bit float defined"),
+        (patch(movq_to_gpr, "66 48 0f 7e e8"), "undefined register xmm5", "MOVQ reading unwritten XMM register"),
+        (patch(movq_from_rdx, "66 49 0f 6e db"), "undefined register r11", "MOVQ reading undefined 64-bit GPR"),
+        (patch(movq_to_gpr, "66 48 0f 7e c3"), "nonvolatile register rbx", "MOVQ targeting nonvolatile RBX"),
+        (patch(movq_from_gpr, "66 49 0f 6e f1"), "nonvolatile register xmm6", "MOVQ targeting nonvolatile XMM6"),
+        (patch(movq_from_gpr, "66 48 0f 6e d3"), "nonvolatile register rbx", "MOVQ reading nonvolatile RBX"),
+        (patch(movq_to_gpr, "66 48 0f 7e f0"), "nonvolatile register xmm6", "MOVQ reading nonvolatile XMM6"),
+        (patch(movq_to_gpr, "48 0f 7e c2"), "unsupported instruction", "MOVQ from MMX register to 64-bit GPR"),
+        (patch(movq_from_gpr, "48 0f 6e c2"), "unsupported instruction", "MOVQ from 64-bit GPR to MMX register"),
         ((below_equal.ip, b"\x7e"), "unsupported condition after a float compare", "JLE after COMISS"),
         (patch(below_equal, ""), "float compare without a conditional branch", "COMISS without a jump"),
         # CMP EAX, 1 and JB in place of UCOMISS and JP: the JNE that follows no longer has a producer.
@@ -799,6 +832,8 @@ def check_rejections(original_path):
         ("from_int=q:qq", "undefined register rax"),
         ("round_cvt=q:fqq", "undefined register xmm1 at"),
         ("round_cvt=q:ffq", "undefined register xmm1[63:32]"),
+        ("movq_gpr=q:fq", "undefined register xmm0[63:32]"),
+        ("movq_gpr=q:df", "undefined register rdx"),
         ("blend_ss=f:ffqfq", "invalid signature"),
         ("blend_ss=i:ffqf", "invalid signature"),
     ]
@@ -810,7 +845,22 @@ def check_rejections(original_path):
                 raise AssertionError(f"{export}: {exc}") from exc
         else:
             raise AssertionError(f"accepted signature: {export}")
-    print(f"{len(controls)} patched-instruction rejections and {len(signatures)} signature rejections passed")
+    width_controls = [
+        Instruction.create_reg_reg(Code.MOVD_RM32_XMM, R.RAX, R.XMM0),
+        Instruction.create_reg_reg(Code.MOVD_XMM_RM32, R.XMM0, R.RAX),
+        Instruction.create_reg_reg(Code.MOVQ_RM64_XMM, R.EAX, R.XMM0),
+        Instruction.create_reg_reg(Code.MOVQ_XMM_RM64, R.XMM0, R.EAX),
+    ]
+    for ins in width_controls:
+        try:
+            ScalarLifter("q").statement(ins, None)
+        except ValueError as exc:
+            if "unsupported instruction" not in str(exc):
+                raise AssertionError(f"unexpected rejection for {ins}: {exc}") from exc
+        else:
+            raise AssertionError(f"accepted width-mismatched instruction: {ins}")
+    print(f"{len(controls)} patched-instruction rejections, {len(signatures)} signature rejections, "
+          f"and {len(width_controls)} width-control rejections passed")
 
 
 if __name__ == "__main__":

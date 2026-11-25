@@ -1,14 +1,14 @@
 """Compare native and translated FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX, FCLEX and the 8087/287 controls
-FENI, FNENI, FDISI, FNDISI and FSETPM, FFREEP ST(0), FFREE of an empty register and FSTSW AX, in the x87
-profile.
+FENI, FNENI, FDISI, FNDISI and FSETPM, FFREEP ST(0), FFREE of an empty register, FSTSW AX and the pair FFREE ST(0),
+FINCSTP, in the x87 profile.
 
 Each export runs through the native harness (control word 0x027F, empty stack) and writes C0, C2 and C3
 after each status-word writer, and any stored m80 value, to its output block. An independent model gives
 the expected block: comparisons use exact rationals, and FXAM classifies the 80-bit encoding (unsupported,
 NaN, normal, infinity, zero, empty, denormal); FFREEP ST(0) gives the physical TOP after each pop and leaves the
-values below it unchanged, FFREE of an empty register keeps TOP and every value, and FSTSW AX (WAIT and
-FNSTSW AX) gives TOP from the depth. Nine mutated translations must each mismatch, and
-translation must reject the sequences in check_rejections.
+values below it unchanged, FFREE of an empty register keeps TOP and every value, FSTSW AX (WAIT and
+FNSTSW AX) gives TOP from the depth, and FFREE ST(0), FINCSTP pops as FFREEP ST(0) does. Eleven mutated
+translations must each mismatch, and translation must reject the sequences in check_rejections.
 """
 from fractions import Fraction
 from pathlib import Path
@@ -20,9 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import x87_add as base  # noqa: E402  (tests/cpu is the script directory)
 
 EXPORTS = ("ftst_fxam", "ficom_m16", "ficom_m32", "fnop_fclex", "legacy_controls", "ffreep_top", "ffree_empty",
-           "fstsw_top")
+           "fstsw_top", "ffree_fincstp")
 INPUT, OUTPUT = base.INPUT, base.OUTPUT
 J = 1 << 63
+# The TOP literal of the FNSTSW AX right after the FINCSTP of an FFREE ST(0), FINCSTP pair.
+PAIR_TOP = re.compile(r"(;  // fincstp\n\s+block_\w+: rax = \(rax & ~0xffffull\) \| static_cast<uint16_t>\(x87_sw \| )"
+                      r"(0x[0-9a-f]{4})\)")
 # Mutations of the lifted source that the check requires to mismatch: (pattern, replacement).
 CONTROLS = {
     "normal": (re.compile(re.escape("return x87_exp(v) == 0 ? 0x4400 : 0x0400;")), "return 0x0400;"),
@@ -44,6 +47,10 @@ CONTROLS = {
     # FSTSW AX (the FNSTSW AX right after a WAIT) that reads TOP 0 at every depth.
     "fstsw": (re.compile(r"(;  // wait\n\s+block_\w+: rax = \(rax & ~0xffffull\) \| static_cast<uint16_t>\(x87_sw \| )"
                          r"0x[0-9a-f]{4}\)"), r"\g<1>0x0000)"),
+    # FFREE ST(0), FINCSTP that did not pop (TOP as before the pair) or popped twice, seen by the status read right
+    # after each pair.
+    "nopop": (PAIR_TOP, lambda m: f"{m[1]}{(int(m[2], 16) - 0x0800) & 0x3800:#06x})"),
+    "twopop": (PAIR_TOP, lambda m: f"{m[1]}{(int(m[2], 16) + 0x0800) & 0x3800:#06x})"),
 }
 
 
@@ -127,6 +134,12 @@ def reference(name, data):
         out[16:26] = struct.pack("<QH", 0, 0)
         out[26:36] = struct.pack("<QH", J, 0x3FFF)
         out[40:50] = data[0:10]
+    elif name == "ffree_fincstp":  # TOP 0, 7, 1 and 0 at depths 0, 1, 7 and 8; 1.0, 0.0, 1.0 and the input stored
+        out[0:4] = bytes((0, 7 << 3, 1 << 3, 0))
+        out[16:26] = struct.pack("<QH", J, 0x3FFF)
+        out[26:36] = struct.pack("<QH", 0, 0)
+        out[36:46] = struct.pack("<QH", J, 0x3FFF)
+        out[46:56] = data[0:10]
     elif name == "fstsw_top":  # TOP 0, 7 and 6 at depths 0, 1 and 2; the input stored from depth 1
         out[0:3] = bytes((0, 7 << 3, 6 << 3))
         out[16:26] = data[0:10]
@@ -157,7 +170,8 @@ INTEGERS32 = (*INTEGERS, 2147483647, -2147483648, 1 << 30)
 def cases():
     for sig, se in values():
         m80 = struct.pack("<QH", sig, se)
-        for name in ("ftst_fxam", "fnop_fclex", "legacy_controls", "ffreep_top", "ffree_empty", "fstsw_top"):
+        for name in ("ftst_fxam", "fnop_fclex", "legacy_controls", "ffreep_top", "ffree_empty", "fstsw_top",
+                     "ffree_fincstp"):
             yield name, (m80 + b"\0" * 6 + struct.pack("<h", 7) + b"\0" * 6 + struct.pack("<i", 9)).ljust(INPUT, b"\0")
         for n in INTEGERS:
             yield "ficom_m16", (m80 + b"\0" * 6 + struct.pack("<h", n)).ljust(INPUT, b"\0")
@@ -168,7 +182,9 @@ def cases():
 def check_rejections():
     """Translation must reject an underflowing FTST, FICOMP or FFREEP, a reader of C0 after FNOP, FNCLEX, FNENI,
     FNSETPM, FFREEP or FFREE, or after FTST and FSTSW AX, and FFREE of an occupied register, FFREEP ST(i) for
-    i > 0, FINCSTP and FDECSTP."""
+    i > 0, FINCSTP and FDECSTP. Of the pair FFREE ST(0), FINCSTP it rejects a reader of C0 or C1 after it, the
+    pair on an empty stack, FFREE ST(1) or FNOP in place of FFREE ST(0) or between the two, the reverse order,
+    and a branch to the FINCSTP."""
     from iced_x86 import Decoder
     from ffx_version_query import lower
 
@@ -176,7 +192,9 @@ def check_rejections():
     def sequence(op):
         return f"d9e8{op}dfe0f6c4017500ddd8b800000000c3"
 
-    accepted = {"ftst then a reader of C0": sequence("d9e4")}
+    accepted = {"ftst then a reader of C0": sequence("d9e4"),
+                # fld1; fld1; test eax, eax; je to the ffree; ffree st(0); fincstp; fstp st(0); ret
+                "a branch to ffree st(0), fincstp": "d9e8d9e885c07400ddc0d9f7ddd8c3"}
     rejected = {
         "ftst on an empty stack": ("d9e4c3", "underflow"),
         "ficomp on an empty stack": ("de19c3", "underflow"),
@@ -196,6 +214,16 @@ def check_rejections():
         "ffree st(1)": ("d9e8d9e8ddc1ddd8ddd8c3", "frees an occupied register"),
         "fincstp": ("d9e8d9f7ddd8c3", "unsupported x87 operation"),
         "fdecstp": ("d9e8d9f6ddd8c3", "unsupported x87 operation"),
+        # fld1; fld1; ftst; ffree st(0); fincstp; then the reader of C0 of sequence()
+        "ffree st(0), fincstp after ftst then a reader of C0": (sequence("d9e8d9e4ddc0d9f7"), "not known"),
+        # fld1; fld1; ffree st(0); fincstp; fnstsw ax; test ah, 2 (C1); jne +0; fstp st(0); mov eax, 0; ret
+        "ffree st(0), fincstp then a reader of C1": ("d9e8d9e8ddc0d9f7dfe0f6c4027500ddd8b800000000c3", "not known"),
+        "ffree st(0), fincstp on an empty stack": ("ddc0d9f7c3", "underflow"),
+        "ffree st(1), fincstp": ("d9e8d9e8ddc1d9f7ddd8c3", "frees an occupied register"),
+        "ffree st(0), fnop, fincstp": ("d9e8ddc0d9d0d9f7c3", "frees an occupied register"),
+        "fincstp, ffree st(0)": ("d9e8d9f7ddc0c3", "unsupported x87 operation"),
+        # fld1; fld1; test eax, eax; je to the fincstp; ffree st(0); fincstp; fstp st(0); ret
+        "a branch into ffree st(0), fincstp": ("d9e8d9e885c07402ddc0d9f7ddd8c3", "branch into the FFREE ST(0), FINCSTP"),
         # The accepted ftst case with fstsw ax (wait; fnstsw ax): the wait leaves C0 undefined.
         "fstsw ax after ftst then a reader of C0": (sequence("d9e49b"), "not known"),
     }

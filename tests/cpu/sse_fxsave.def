@@ -8,4 +8,6 @@ EXPORTS
     op_fxrstor64_fxsave
     op_fxrstor64_disp
     op_pipeline
+    op_fxrstor64_movq_store
+    op_fxrstor64_movq_gpr
     op_discarded_read

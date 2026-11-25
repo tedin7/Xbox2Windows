@@ -103,7 +103,7 @@ int run(bool system)
         real_query = reinterpret_cast<QueryApi>(GetProcAddress(dll,"QueryApiImpl"));
         if (!real_query) return 77;
         void* runtime{};
-        if (FAILED(real_query(&submit_async_family,&submit_async_family,&runtime)) || !runtime) return 77;
+        if (FAILED(load_real_query()(&submit_async_family,&submit_async_family,&runtime)) || !runtime) return 77;
         auto** methods = *static_cast<void***>(runtime);
         using CreateQueue = HRESULT(WINAPI*)(void*,unsigned,unsigned,void**);
         // XTaskQueueDispatchMode::Immediate for work and completion.

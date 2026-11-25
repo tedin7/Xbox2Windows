@@ -254,13 +254,21 @@ static std::uint64_t op_cmpsd_q(std::uint64_t a, std::uint64_t b, std::uint8_t i
     return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(r)));
 }
 
-// MAXSD/MINSD return src2 on ties, unordered inputs and equal values.
+// MAXSD/MINSD run on the processor, on run-time operands: it returns src2 on ties, unordered inputs and equal
+// values, and under MXCSR.DAZ it reads a denormal operand as a zero of its sign, also when that operand is the
+// result (a C comparison would return the denormal bits unchanged).
 static std::uint64_t op_maxsd_q(std::uint64_t a, std::uint64_t b) {
-    return q_as_double(a) > q_as_double(b) ? a : b;
+    volatile std::uint64_t va = a, vb = b;
+    const __m128d x = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(va)));
+    const __m128d y = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(vb)));
+    return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(_mm_max_sd(x, y))));
 }
 
 static std::uint64_t op_minsd_q(std::uint64_t a, std::uint64_t b) {
-    return q_as_double(a) < q_as_double(b) ? a : b;
+    volatile std::uint64_t va = a, vb = b;
+    const __m128d x = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(va)));
+    const __m128d y = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(vb)));
+    return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(_mm_min_sd(x, y))));
 }
 
 // SQRTSD keeps the NaN payload (quieted) and yields the real-indefinite QNaN

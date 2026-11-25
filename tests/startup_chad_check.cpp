@@ -218,8 +218,23 @@ int main(int argc, char** argv)
         submit(reinterpret_cast<u64>(handle), 0x1234, reinterpret_cast<u64>(&gated_sequence), 0);
     check(gated_sequence == 0, "caller gated on activation success never submits");
 
-    check(deactivate(reinterpret_cast<u64>(handle), 0, 0, 0) == hr_ok, "XDspDeactivate returns S_OK");
-    check(disconnect(reinterpret_cast<u64>(handle), 0, 0, 0) == hr_ok, "XDspDisconnect returns S_OK");
+    // Deactivate and disconnect write nothing back; they refuse null and unknown handles instead of
+    // reporting them as released, and release only the handle connect published.
+    check(deactivate(0, 0, 0, 0) == hr_invalidarg, "XDspDeactivate(null handle) -> E_INVALIDARG");
+    check(deactivate(reinterpret_cast<u64>(handle) + 4, 0, 0, 0) == hr_invalidarg,
+          "XDspDeactivate(unknown handle) -> E_INVALIDARG");
+    check(disconnect(0, 0, 0, 0) == hr_invalidarg, "XDspDisconnect(null handle) -> E_INVALIDARG");
+    check(disconnect(reinterpret_cast<u64>(handle) + 4, 0, 0, 0) == hr_invalidarg,
+          "XDspDisconnect(unknown handle) -> E_INVALIDARG");
+
+    // Synthetic caller: teardown of the stream that the failed activation cleared is not reported as done.
+    stream_out = reinterpret_cast<void*>(0x2);
+    activate(0x11, 0x22, reinterpret_cast<u64>(&status_out), reinterpret_cast<u64>(&stream_out));
+    check(deactivate(reinterpret_cast<u64>(stream_out), 0, 0, 0) != hr_ok,
+          "caller deactivating the stream a failed activation cleared is refused");
+
+    check(deactivate(reinterpret_cast<u64>(handle), 0, 0, 0) == hr_ok, "XDspDeactivate(known handle) returns S_OK");
+    check(disconnect(reinterpret_cast<u64>(handle), 0, 0, 0) == hr_ok, "XDspDisconnect(known handle) returns S_OK");
 
     if (!log_path.empty()) {
         const std::string log_text = read_file_bytes(log_path.c_str());
@@ -243,6 +258,9 @@ int main(int argc, char** argv)
                   log_text.find("XDspDeactivate") != std::string::npos &&
                   log_text.find("XDspDisconnect") != std::string::npos,
               "permissive lifecycle exports logged");
+        check(log_text.find("x2w-audio XDspDeactivate handle=0x0 -> E_INVALIDARG") != std::string::npos &&
+                  log_text.find("x2w-audio XDspDisconnect handle=0x0 -> E_INVALIDARG") != std::string::npos,
+              "permissive deactivate and disconnect refusals logged");
         DeleteFileW(log_path.c_str());
     }
 

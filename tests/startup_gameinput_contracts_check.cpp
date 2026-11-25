@@ -208,6 +208,14 @@ struct IGameInput {
         using Fn = bool(__stdcall*)(IGameInput*, std::uint64_t, std::uint64_t);
         return reinterpret_cast<Fn>(vtbl[13])(this, token, timeoutUs);
     }
+
+    // GameInput.h v0 slot 7: GetTemporalReading(uint64_t timestamp, IGameInputDevice* device,
+    // IGameInputReading** reading). Documented as never implemented in v0 (removed in v1).
+    HRESULT GetTemporalReading(std::uint64_t timestamp, IGameInputDevice* device, IGameInputReading** reading)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, std::uint64_t, IGameInputDevice*, IGameInputReading**);
+        return reinterpret_cast<Fn>(vtbl[7])(this, timestamp, device, reading);
+    }
     HRESULT FindDevice(int slot, const void* arg, IGameInputDevice** device)
     {
         using Fn = HRESULT(__stdcall*)(IGameInput*, const void*, IGameInputDevice**);
@@ -312,6 +320,21 @@ int main(int argc, char** argv)
     const std::uint64_t ts0 = input->GetCurrentTimestamp();
     check(ts0 > 0, "GetCurrentTimestamp returns non-zero microseconds");
     input->SetFocusPolicy(1);
+
+    // GetTemporalReading (v0 slot 7) was never implemented by Microsoft and is documented to
+    // return E_NOTIMPL; the stand-in keeps that refusal and never produces a reading.
+    {
+        IGameInputReading* temporal = reinterpret_cast<IGameInputReading*>(static_cast<std::uintptr_t>(1));
+        check(input->GetTemporalReading(ts0, nullptr, &temporal) == E_NOTIMPL,
+              "GetTemporalReading -> E_NOTIMPL (never implemented in v0)");
+        check(temporal == nullptr, "GetTemporalReading never produces a reading");
+        check(input->GetTemporalReading(ts0, nullptr, nullptr) == E_POINTER,
+              "GetTemporalReading(null out) -> E_POINTER");
+        if (ro_page) {
+            check(input->GetTemporalReading(ts0, nullptr, reinterpret_cast<IGameInputReading**>(ro_page)) == E_POINTER,
+                  "GetTemporalReading(PAGE_READONLY) -> E_POINTER");
+        }
+    }
 
     // 3. Callback registration, StopCallback, UnregisterCallback, and unwritable token guards.
     DeviceCapture cap{};

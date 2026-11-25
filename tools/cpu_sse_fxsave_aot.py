@@ -264,7 +264,14 @@ static inline Vec128 op_paddd(const Vec128& a, const Vec128& b) {
     return out;
 }
 
-static inline std::uint64_t get_mm(const FxState& state, unsigned idx) {
+// Every MMX instruction but EMMS, one that only reads an MM register included, clears TOP and marks all tags valid.
+static inline void enter_mmx(FxState& state) {
+    state.ftw = 0xFFu;
+    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
+}
+
+static inline std::uint64_t get_mm(FxState& state, unsigned idx) {
+    enter_mmx(state);
     std::uint64_t v = 0ull;
     std::memcpy(&v, state.st[idx], 8);
     return v;
@@ -275,8 +282,7 @@ static inline void set_mm(FxState& state, unsigned idx, std::uint64_t val) {
     state.st[idx][8] = 0xFFu;
     state.st[idx][9] = 0xFFu;
     std::memset(state.st[idx] + 10, 0, 6);
-    state.ftw = 0xFFu;
-    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
+    enter_mmx(state);
 }
 
 static inline void op_emms(FxState& state) {

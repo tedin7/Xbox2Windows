@@ -1,0 +1,10 @@
+EXPORTS
+    op_vpacksswb_ymm
+    op_vpackssdw_ymm
+    op_vpackusdw_ymm
+    op_vpacksswb_ymm_dst_src1
+    op_vpackssdw_ymm_dst_src2
+    op_vpackusdw_ymm_all
+    op_vpacksswb_ymm_dst_src2
+    op_vpackusdw_ymm_then_xmm_vpacksswb
+    op_chain_ymm_pack

@@ -82,7 +82,7 @@ MUTATIONS = {
                       lambda a: 0 if value(a) != value(a) or value(a) <= 0 else round(value(a))),
     'v_cvt_f32_ubyte0': (r'& 255\)\)', r'& 127))', lambda a: f32(float(a & 127))),
     'v_cvt_f32_ubyte1': (r'>> 8\)', r'>> 16)', lambda a: f32(float(a >> 16 & 255))),
-    'v_cvt_f32_ubyte2': (r'>> 16\)', r'>> 8)', lambda a: f32(float(a >> 8 & 255))),
+    'v_cvt_f32_ubyte2': (r'(v\d+) >> 16\)', r'\1 >> 8)', lambda a: f32(float(a >> 8 & 255))),
     'v_cvt_f32_ubyte3': (r'U\(float\((v\d+) >> 24\)\)', r'U(float((\1 >> 16) & 255))', lambda a: f32(float(a >> 16 & 255))),
     'v_cvt_f32_f16': (r'f16tof32\((v\d+)\)', r'f16tof32(\1 >> 16)', lambda a: f32(half(a >> 16))),
     'v_cvt_f16_f32': (r'f32tof16\(F\((v\d+)\)\)', r'f32tof16(-F(\1))', lambda a: to_half(a ^ 0x80000000)),

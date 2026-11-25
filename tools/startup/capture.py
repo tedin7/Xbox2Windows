@@ -1,8 +1,10 @@
 """Reader for capture.bin written by the frame capture (startup tools; see docs/startup-runtime.md)."""
+import argparse
 import itertools
 import struct
 import sys
 from collections import defaultdict, Counter
+from pathlib import Path
 
 LIST_SLOTS = {
     9: 'Close', 12: 'DrawInstanced', 13: 'DrawIndexedInstanced', 14: 'Dispatch', 20: 'IASetPrimitiveTopology',
@@ -131,12 +133,19 @@ class Capture:
 
     def on_VIEW(self, h, b):
         vid, slot, resource, counter, dest_title, dest_desktop, desc_bytes = struct.unpack_from('<IIQQQQI', h, 0)
+        if len(h) < 48 + desc_bytes:
+            raise ValueError('truncated VIEW descriptor: header %d bytes, expected at least %d' % (
+                len(h), 48 + desc_bytes))
         self.views[vid] = dict(slot=slot, resource=resource, counter=counter, dest_title=dest_title,
                                desc=h[48:48 + desc_bytes])
 
     def on_TABL(self, h, b):
         seq, slot, parameter, entries, gpu, heap, index = struct.unpack_from('<IIIIQQQ', h, 0)
+        if len(b) % 4 != 0:
+            raise ValueError('malformed TABL body: %d bytes is not a multiple of 4' % len(b))
         ids = struct.unpack_from('<%dI' % (len(b) // 4), b, 0)
+        if entries > len(ids):
+            raise ValueError('truncated TABL body: declares %d entries, got %d ids' % (entries, len(ids)))
         self.tables[seq].append(dict(slot=slot, parameter=parameter, entries=entries, gpu=gpu, heap=heap, index=index,
                                      shadow=ids[:entries], tokens=ids[entries:]))
 
@@ -197,5 +206,16 @@ def describe(cap, out=sys.stdout):
         w('present frame %d surface %s\n' % (frame, cap.name(surface)))
 
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('capture', type=Path, help='Path to capture.bin')
+    args = parser.parse_args(argv)
+    try:
+        describe(Capture(args.capture), out=sys.stdout)
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"{exc}\n")
+    return 0
+
+
 if __name__ == '__main__':
-    describe(Capture(sys.argv[1]))
+    raise SystemExit(main())

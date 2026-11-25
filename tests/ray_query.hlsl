@@ -44,7 +44,13 @@ void ClosestHit(inout Payload payload, BuiltInTriangleIntersectionAttributes att
     payload.value = uint4(status, InstanceID(), PrimitiveIndex(), asuint(RayTCurrent()));
 }
 #else
-[RootSignature("SRV(t0),UAV(u0),SRV(t1)")]
+// AS_TABLE binds the structure through a descriptor table, as a title that published it with a view does.
+#ifdef AS_TABLE
+#define RAY_ROOT "DescriptorTable(SRV(t0)),UAV(u0),SRV(t1)"
+#else
+#define RAY_ROOT "SRV(t0),UAV(u0),SRV(t1)"
+#endif
+[RootSignature(RAY_ROOT)]
 [numthreads(1, 1, 1)]
 void CSMain(uint3 thread : SV_DispatchThreadID)
 {

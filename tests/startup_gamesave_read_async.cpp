@@ -228,7 +228,7 @@ int read_phase(bool system)
         if (!dll) return 77;
         real_query = reinterpret_cast<QueryApi>(GetProcAddress(dll, "QueryApiImpl"));
         if (!real_query) return 77;
-        if (FAILED(real_query(&submit_async_family, &submit_async_family, &runtime)) || !runtime) return 77;
+        if (FAILED(load_real_query()(&submit_async_family, &submit_async_family, &runtime)) || !runtime) return 77;
         methods = *static_cast<void***>(runtime);
         held.service = runtime;
         held.methods = methods;

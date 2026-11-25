@@ -22,3 +22,4 @@ EXPORTS
     root_const_ss
     root_const_sd
     round_cvt
+    movq_gpr

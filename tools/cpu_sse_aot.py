@@ -23,7 +23,7 @@ from pathlib import Path
 import re
 
 import pefile
-from iced_x86 import ConditionCode as CC, FlowControl, MemorySizeExt, Mnemonic as M, OpKind, Register as R, RegisterExt
+from iced_x86 import Code, ConditionCode as CC, FlowControl, MemorySizeExt, Mnemonic as M, OpKind, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_switch_aot import (CMOVCC, FLAG_PRODUCERS, Function, Lifter, NAMES, PRELUDE, SETCC, VOLATILE,
@@ -48,6 +48,8 @@ ROOTS = {M.SQRTSS: 4, M.SQRTSD: 8}
 # MIN and MAX with the comparison that keeps the destination operand.
 EXTREMA = {M.MINSS: ("<", 4), M.MAXSS: (">", 4), M.MINSD: ("<", 8), M.MAXSD: (">", 8)}
 ZEROING = {M.XORPS, M.XORPD, M.PXOR}
+GPR_STORE_MOVES = {Code.MOVD_RM32_XMM: (4, RegisterExt.is_gpr32), Code.MOVQ_RM64_XMM: (8, RegisterExt.is_gpr64)}
+GPR_LOAD_MOVES = {Code.MOVD_XMM_RM32: (4, RegisterExt.is_gpr32), Code.MOVQ_XMM_RM64: (8, RegisterExt.is_gpr64)}
 SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *ROOTS, *EXTREMA, *FROM_INTEGER, *TRUNCATIONS, *ROUNDINGS, *RESIZES, *COMPARES, *ZEROING,
           M.MOVD, M.MOVQ}
 # fc holds ZF, PF and CF of the last compare as bits 2, 1 and 0. An unordered compare sets all three.
@@ -144,19 +146,24 @@ class ScalarLifter(Lifter):
                 bits = self.source(ins, 1, width, reads)
                 return f"store<{unsigned(width)}>({self.pointer(ins, reads)}, {bits});", reads, writes
             if ins.op0_register not in XMM:
-                # MOVD r32, xmm zero-extends like any 32-bit write. MOVQ to or from an integer
-                # register is left out: ML64 versions disagree on how to spell it in a fixture.
-                if mnemonic != M.MOVD:
+                # MOVD r32, xmm zero-extends like any 32-bit write; MOVQ r64, xmm transfers all 64 bits verbatim.
+                if ins.code not in GPR_STORE_MOVES:
                     raise unsupported
-                bits = self.source(ins, 1, 4, reads)
+                gpr_width, is_gpr_width = GPR_STORE_MOVES[ins.code]
+                if not is_gpr_width(ins.op0_register):
+                    raise unsupported
+                bits = self.source(ins, 1, gpr_width, reads)
                 writes.add(full(ins.op0_register))
-                return self.write(ins, 4, bits), reads, writes
+                return self.write(ins, gpr_width, bits), reads, writes
             destination = self.xmm(ins, 0)
             if ins.op1_kind == OpKind.REGISTER and ins.op1_register not in XMM:
-                if mnemonic != M.MOVD:
+                if ins.code not in GPR_LOAD_MOVES:
+                    raise unsupported
+                gpr_width, is_gpr_width = GPR_LOAD_MOVES[ins.code]
+                if not is_gpr_width(ins.op1_register):
                     raise unsupported
                 reads.add(full(ins.op1_register))
-                bits = self.operand(ins, 1, 4)
+                bits = self.operand(ins, 1, gpr_width)
             else:
                 bits = self.source(ins, 1, width, reads)
             if mnemonic == M.MOVSS and ins.op1_kind == OpKind.REGISTER:

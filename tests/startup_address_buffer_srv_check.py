@@ -18,10 +18,10 @@ def check_refusal_lines(log):
         + r"view\{dim=1 fmt=39 map=0x1688 first=0 count=4 stride=0 flags=0x1 \(buffer views are not supported\)\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
         prefix
-        + r"unsupported memory SRV arguments: reason=unsupported_description "
+        + r"unavailable acceleration structure at the supplied address: reason=as_wrong_state "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
         + r"view\{dim=11 fmt=0 map=0x1688 raw=(00000000,){5}00000000 "
-        + r"\(acceleration structure views are not supported\)\} "
+        + r"\(acceleration structure view\)\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
     ]
     lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
@@ -56,7 +56,7 @@ def check(directory, consumer, backend):
     if actual != expected:
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
     check_refusal_lines(trap_log.read_text(errors="replace"))
-    print(f"{backend}: buffer memory SRV (raw base, raw interior, structured, refused unaligned, refused acceleration structure) exact")
+    print(f"{backend}: buffer memory SRV (raw base, raw interior, structured, refused unaligned, refused acceleration structure view) exact")
     return 0
 
 

@@ -12,11 +12,20 @@ import re
 import struct
 from pathlib import Path
 
-from pixel_aot import container_code, disassemble
+from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
+from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
 U32 = (1 << 32) - 1
 WAVE = (1 << 64) - 1
+LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
+VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
+LDS_BYTES = 1 << 16
+
+
+def branch_target(offset, operand):
+    """Byte offset a branch at `offset` jumps to. LLVM 15 prints the SIMM16 unsigned (s_branch 65535 is -1)."""
+    return offset + 4 + 4 * (((int(operand) & 0xFFFF) ^ 0x8000) - 0x8000)
 
 
 def span(token):
@@ -46,6 +55,66 @@ UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() f
 # stride, identity component selects, and the observed raw-buffer flags.
 VERTEX_DESCRIPTOR = [0x20000, 0x10000, U32, 0x11014FAC]
 VERTEX_BYTES = 512
+# A zero descriptor is the null resource; reads through it return zero.
+NULL_DESCRIPTOR = [0, 0, 0, 0]
+DYNAMIC_COMPARE = {"s_cmp_eq_u32": "==", "s_cmp_lt_u32": "<", "s_cmp_gt_u32": ">"}
+
+
+class Dyn:
+    """A scalar predicate that depends on a constant-buffer value (HLSL text)."""
+
+    def __init__(self, expr):
+        self.expr = expr
+
+
+class Select:
+    """A scalar register whose value depends on a Dyn predicate at a join."""
+
+    def __init__(self, cond, when_true, when_false):
+        self.cond, self.when_true, self.when_false = cond, when_true, when_false
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Select)
+            and self.cond is other.cond
+            and self.when_true == other.when_true
+            and self.when_false == other.when_false
+        )
+
+
+class _Undefined:
+    """A scalar register no executed instruction has written on this wave.
+
+    A range skipped by s_cbranch_execz leaves its scalar writes undone. The
+    registers keep whatever the hardware held, which no export may depend on.
+    """
+
+    def __repr__(self):
+        return "UNDEF"
+
+
+UNDEF = _Undefined()
+UNDEFINED_SCALAR = "Scalar not written on this wave (skipped range) is used"
+
+
+SUPPORTED_SCALAR_OPS = frozenset(
+    (
+        "s_mov_b32", "s_mov_b64", "s_movk_i32", "s_cselect_b32", "s_cselect_b64",
+        "s_bfe_u32", "s_lshl_b32", "s_lshr_b32", "s_add_i32", "s_add_u32",
+        "s_sub_u32", "s_mul_i32", "s_and_b32", "s_and_b64", "s_or_b32",
+        "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64",
+    )
+)
+
+# Lane-mask updates that keep the previous exec in the destination pair. The complemented forms negate the
+# old exec, not the source: ANDN2 is SRC0 & ~EXEC and ORN2 is SRC0 | ~EXEC.
+SAVEEXEC = {
+    "s_and_saveexec_b64": lambda old, a: old & a,
+    "s_andn2_saveexec_b64": lambda old, a: a & ~old,
+    "s_or_saveexec_b64": lambda old, a: old | a,
+    "s_orn2_saveexec_b64": lambda old, a: a | ~old,
+    "s_xor_saveexec_b64": lambda old, a: old ^ a,
+}
 
 
 class Wave:
@@ -62,27 +131,54 @@ class Wave:
         self.scc = None
         self.pending = set()
         self.pending_v = set()
+        self.spill_slots = {}
+        self.spill_vgprs = set()
+        # First ordinary use of each spill VGPR after a spill write. Never cleared, on purpose: any later
+        # reload of that VGPR is refused, which can only over-refuse, never return a stale word.
+        self.spill_vector_uses = {}
         self.barriers = []
+        # Group LDS: `lds` holds dwords published at an earlier barrier. A wave's own
+        # stores stay in `staged` until every wave reaches the next barrier.
+        self.lds = {}
+        self.staged = {}
+        self.reads = set()
+        self.pending_ds = set()
+        self.ds_writes_pending = False
         self.counts = []
         self.positions = {}
         self.attributes = {}
         self.indices = {}
         self.m0 = None
+        self.written = set()
+        # Position exports per vertex in program order: (target, values, done).
+        self.position_exports = {}
 
-    def scalar(self, t):
+    def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
             regs = span(t)
             if len(regs) != 2:
                 raise ValueError("Expected a scalar pair")
-            lo, hi = (self.scalar(f"s{i}") for i in regs)
+            lo, hi = (self.scalar(f"s{i}", allow_undef) for i in regs)
+            if lo is UNDEF or hi is UNDEF:
+                return UNDEF
+            if type(lo) is not int or type(hi) is not int:
+                raise ValueError("Scalar pair requires concrete words")
             return lo | hi << 32
         if re.fullmatch(r"s\d+", t):
             i = int(t[1:])
             if i in self.pending:
                 raise ValueError("Scalar load used before wait")
-            return self.s[i]
+            # A register no instruction ever writes is a bad operand, not a skipped write.
+            if i not in self.written and i not in self.s:
+                raise ValueError(f"Scalar register s{i} used before it is written")
+            value = self.s.get(i, UNDEF)
+            if value is UNDEF and not allow_undef:
+                raise ValueError(UNDEFINED_SCALAR)
+            return value
         if t == "exec":
             return self.exec
+        if t in ("exec_lo", "exec_hi"):
+            return self.exec >> (32 if t == "exec_hi" else 0) & U32
         if t == "vcc":
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
@@ -92,8 +188,16 @@ class Wave:
         return int(t, 0)
 
     def put(self, dest, value, wide=False):
+        if value is UNDEF and dest in ("exec", "vcc", "m0"):
+            raise ValueError(UNDEFINED_SCALAR)
         if dest == "exec":
             self.exec = value & WAVE
+        elif dest in ("exec_lo", "exec_hi"):
+            # A 32-bit write replaces one half of the 64-bit lane mask and keeps the other.
+            if wide:
+                raise ValueError("Unsupported scalar destination")
+            shift = 32 if dest == "exec_hi" else 0
+            self.exec = self.exec & ~(U32 << shift) | (value & U32) << shift
         elif dest == "vcc":
             self.vcc = value & WAVE
         elif dest == "m0":
@@ -113,11 +217,15 @@ class Wave:
             if self.pending.intersection(regs):
                 raise ValueError("Pending scalar destination")
             for j, i in enumerate(regs):
-                self.s[i] = (value >> (32 * j)) & U32
+                self.s[i] = UNDEF if value is UNDEF else (value >> (32 * j)) & U32
+
+    def vector_pending(self, lane, reg):
+        """True while a vector load or LDS read still owes this register."""
+        return (lane, reg) in self.pending_v or (lane, reg) in self.pending_ds
 
     def lane_value(self, t, lane):
         if re.fullmatch(r"v\d+", t):
-            if (lane, t) in self.pending_v:
+            if self.vector_pending(lane, t):
                 raise ValueError("Vector load used before wait")
             return self.v[lane][int(t[1:])]
         return self.scalar(t)
@@ -150,10 +258,12 @@ class Wave:
                 self.pending.update(regs)
                 return
             kind = desc[0][0] if isinstance(desc[0], tuple) else None
-            if desc != [(kind, j) for j in range(4)]:
-                raise ValueError("Unbound buffer")
             first = off // 4
-            if kind == 32:
+            if any(isinstance(d, Select) for d in desc):
+                data = self.selected_words(desc, first, count)
+            elif desc != [(kind, j) for j in range(4)]:
+                raise ValueError("Unbound buffer")
+            elif kind == 32:
                 data = self.geometry[first : first + count]
             elif kind in (96, 128) and first + count <= 128:
                 name = "pointData" if kind == 96 else "matrixData"
@@ -168,6 +278,79 @@ class Wave:
         self.s.update(zip(regs, data))
         self.pending.update(regs)
 
+    def selected_words(self, desc, first, count):
+        """Read constant words through a descriptor chosen by a join predicate."""
+        conds = {id(d.cond): d.cond for d in desc if isinstance(d, Select)}
+        if len(conds) != 1:
+            raise ValueError("Descriptor words join different predicates")
+        cond = next(iter(conds.values()))
+        sides = [
+            [getattr(d, arm) if isinstance(d, Select) else d for d in desc]
+            for arm in ("when_true", "when_false")
+        ]
+        arms = []
+        for side in sides:
+            if side == NULL_DESCRIPTOR:
+                arms.append(["0.0f"] * count)
+                continue
+            kind = side[0][0] if isinstance(side[0], tuple) else None
+            if kind not in (96, 128) or side != [(kind, j) for j in range(4)]:
+                raise ValueError("Unsupported descriptor in a join")
+            if first + count > 128:
+                raise ValueError("Unsupported uniform read")
+            name = "pointData" if kind == 96 else "matrixData"
+            arms.append(
+                [f"{name}[{i // 4}].{'xyzw'[i % 4]}" for i in range(first, first + count)]
+            )
+        return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
+
+    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+        """Run both arms of a uniform branch on a constant predicate and merge them.
+
+        Only scalar ALU and loads may appear inside an arm; the arms write no
+        exports and leave EXEC, VCC and M0 as they were.
+        """
+        target = jumps[target_offset]
+        if target <= pc:
+            raise ValueError("Expected a forward mesh branch")
+        end = target
+        last = decoded[target - 1][1] if target - 1 >= pc else ""
+        if last.startswith("s_branch "):
+            join_offset = branch_target(decoded[target - 1][0], last.split()[1])
+            if join_offset not in jumps or jumps[join_offset] <= target:
+                raise ValueError("Expected a forward mesh branch")
+            end, join = target - 1, jumps[join_offset]
+        else:
+            join = target
+        before = (self.exec, self.vcc, self.m0)
+        base = (dict(self.s), set(self.pending), set(self.pending_v))
+        outcomes = []
+        for start, stop in ((pc, end), (target, join)):
+            self.s, self.pending = dict(base[0]), set(base[1])
+            self.pending_v = set(base[2])
+            self.scc = None
+            for _ in self.exec_range(decoded, expressions, jumps, start, stop, arm=True):
+                raise ValueError("Barrier inside a descriptor join arm")
+            # Each arm is checked on its own so two changes cannot cancel.
+            if (self.exec, self.vcc, self.m0) != before:
+                raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
+            outcomes.append((self.s, self.pending, self.pending_v))
+        (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
+        self.pending_v = true_v | false_v
+        if true_s.keys() != false_s.keys():
+            raise ValueError("A scalar register is defined in only one join arm")
+        merged = {}
+        for reg, value in true_s.items():
+            other = false_s[reg]
+            if value == other:
+                merged[reg] = value
+            elif isinstance(value, Select) or isinstance(other, Select):
+                raise ValueError("Nested descriptor joins are not supported")
+            else:
+                merged[reg] = Select(cond, value, other)
+        self.s, self.pending, self.scc = merged, true_p | false_p, None
+        return join
+
     def scalar_op(self, op, args):
         d, *src = args
         if op in (
@@ -180,24 +363,56 @@ class Wave:
             self.load(op, args)
             return
         if op.startswith("s_cmp_"):
-            a, b = map(self.scalar, args)
+            a, b = (self.scalar(t, True) for t in args)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
+            if (
+                op in DYNAMIC_COMPARE
+                and {type(a), type(b)} <= {int, str}
+                and str in (type(a), type(b))
+            ):
+                text = [f"asuint({v})" if type(v) is str else f"{v & U32}u" for v in (a, b)]
+                self.scc = Dyn(f"({text[0]} {DYNAMIC_COMPARE[op]} {text[1]})")
+                return
             if not isinstance(a, int) or not isinstance(b, int):
                 raise ValueError("Dynamic scalar predicate")
-            a, b = a & U32, b & U32
-            self.scc = {
+            # 64-bit forms compare whole wave masks; 32-bit forms keep their rules.
+            width = WAVE if op.endswith("_u64") else U32
+            a, b = a & width, b & width
+            relation = {
                 "s_cmp_eq_u32": a == b,
+                "s_cmp_lg_u32": a != b,
                 "s_cmp_lt_u32": a < b,
                 "s_cmp_gt_u32": a > b,
-            }[op]
+                "s_cmp_eq_u64": a == b,
+                "s_cmp_lg_u64": a != b,
+            }
+            if op not in relation:
+                raise ValueError(f"Unsupported scalar compare {op}")
+            self.scc = relation[op]
             return
-        if op == "s_and_saveexec_b64":
+        if op in SAVEEXEC:
             a = self.scalar(src[0])
+            if type(a) is not int:
+                raise ValueError("Scalar ALU requires concrete operands")
             old = self.exec
-            self.exec &= a
+            self.exec = SAVEEXEC[op](old, a) & WAVE
             self.put(d, old, True)
             self.scc = self.exec != 0
             return
-        vals = [self.scalar(t) for t in src]
+        if op not in SUPPORTED_SCALAR_OPS:
+            # Refuse before any undefined operand can hide an implicit EXEC/SCC/VCC effect.
+            raise ValueError(f"Unsupported scalar instruction {op}")
+        vals = [self.scalar(t, True) for t in src]
+        if op in ("s_cselect_b32", "s_cselect_b64") and self.scc is not None:
+            # The arm that is not selected is never read.
+            vals = [vals[0] if self.scc else vals[-1]] * 2
+        if any(v is UNDEF for v in vals):
+            self.put(d, UNDEF, op.endswith("_b64"))
+            if not op.startswith(("s_mov", "s_cselect", "s_mul")):
+                self.scc = None
+            return
         if any(type(v) is not int for v in vals):
             raise ValueError("Scalar ALU requires concrete operands")
         a = vals[0]
@@ -209,6 +424,8 @@ class Wave:
         elif op in ("s_cselect_b32", "s_cselect_b64"):
             if self.scc is None:
                 raise ValueError("Undefined scalar predicate")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate")
             v = a if self.scc else b
         elif op == "s_bfe_u32":
             v = ((a & U32) >> (b & 31)) & ((1 << ((b >> 16) & 127)) - 1)
@@ -230,6 +447,10 @@ class Wave:
             v = a ^ b
         elif op == "s_andn2_b64":
             v = a & ~b
+        elif op == "s_orn2_b64":
+            v = a | ~b
+        elif op == "s_not_b64":
+            v = ~a
         else:
             raise ValueError(f"Unsupported scalar instruction {op}")
         wide = op.endswith("_b64")
@@ -244,6 +465,54 @@ class Wave:
                 if op == "s_add_i32"
                 else bool(v & (WAVE if wide else U32))
             )
+
+    def lane_spill(self, op, args):
+        if len(args) != 3:
+            raise ValueError(f"Expected three operands for {op}")
+        dest, source, lane_token = args
+        if not re.fullmatch(r"-?(?:[0-9]+|0x[0-9a-fA-F]+)", lane_token):
+            raise ValueError(f"{op} requires a constant integer lane: {lane_token}")
+        lane = int(lane_token, 16 if "0x" in lane_token else 10)
+        if not 0 <= lane < len(self.v):
+            raise ValueError(f"{op} lane {lane} out of range for wave{len(self.v)}")
+        writing = op == "v_writelane_b32"
+        vgpr = dest if writing else source
+        if not re.fullmatch(r"v\d+", vgpr):
+            raise ValueError(f"{op} requires a single VGPR")
+        reg = int(vgpr[1:])
+        slot = (reg, lane)
+        if writing:
+            if any(int(token[1:]) == reg for _, token in self.pending_v):
+                raise ValueError(f"{op} overlaps a pending vector load into {vgpr}")
+            if source in ("exec_lo", "exec_hi"):
+                value = self.exec >> (32 if source == "exec_hi" else 0)
+            else:
+                value = self.scalar(source)
+            if not isinstance(value, (int, str)):
+                raise ValueError(f"{op} requires a scalar word: {source}")
+            value = value & U32 if isinstance(value, int) else value
+            self.spill_vgprs.add(reg)
+            self.spill_slots[slot] = value
+            # Keep the lane visible if ordinary vector use follows the final reload.
+            self.v[lane][reg] = value
+            return
+        if reg in self.spill_vector_uses:
+            offset, other_op = self.spill_vector_uses[reg]
+            raise ValueError(
+                f"Mixed lane spill use of {vgpr}: {other_op} at {offset:#x} between write and read"
+            )
+        if slot not in self.spill_slots:
+            raise ValueError(f"Read of unwritten lane spill slot {vgpr}[{lane}]")
+        if not re.fullmatch(r"s\d+", dest):
+            raise ValueError(f"{op} requires a single SGPR destination")
+        scalar_reg = int(dest[1:])
+        if scalar_reg in self.pending:
+            raise ValueError("Pending scalar destination")
+        self.s[scalar_reg] = self.spill_slots[slot]
+
+    def image_op(self, op, tail, expressions):
+        # Only the runtime lowerer's opt-in sampler heap path samples images.
+        raise ValueError(f"Unsupported mesh instruction {op}")
 
     def vector_op(self, op, args, expressions):
         d, *src = args
@@ -379,24 +648,104 @@ class Wave:
                 v = expressions[expr]
             else:
                 raise ValueError(f"Unsupported lane instruction {op}")
-            if (lane, d) in self.pending_v:
+            if self.vector_pending(lane, d):
                 raise ValueError("Pending vector destination")
             self.v[lane][int(d[1:])] = v & U32 if isinstance(v, int) else v
 
+    def lds_op(self, op, tail):
+        """One dword per live lane at a concrete, aligned, in-range LDS address.
+
+        A load sees only dwords published at an earlier barrier. A wave's own
+        unpublished store is refused rather than guessed at.
+        """
+        write = op == "ds_write_b32"
+        match = re.fullmatch(r"(v\d+), (v\d+)(?: offset:(\d+))?", tail)
+        if not match:
+            raise ValueError(f"Unsupported {op} operands")
+        first, second = match[1], match[2]
+        offset = int(match[3] or 0)
+        address_reg, data_reg, dest = (first, second, None) if write else (second, None, first)
+        if offset >= LDS_BYTES:
+            raise ValueError("LDS offset outside the group allocation")
+        writes = {}
+        for lane in range(64):
+            if not self.exec & (1 << lane):
+                continue
+            address = self.lane_value(address_reg, lane)
+            if type(address) is not int:
+                raise ValueError("Dynamic LDS address")
+            address += offset
+            if address % 4 or not 0 <= address < LDS_BYTES:
+                raise ValueError("LDS address outside the group allocation or unaligned")
+            if write:
+                data = self.lane_value(data_reg, lane)
+                if type(data) is not int:
+                    raise ValueError("LDS store of a non-integer value")
+                if writes.setdefault(address, data & U32) != data & U32:
+                    raise ValueError("Lanes store different values to one LDS dword")
+            else:
+                if address in self.staged:
+                    raise ValueError("LDS load of this wave's store before a barrier")
+                if address not in self.lds:
+                    raise ValueError("LDS load of a dword no wave published")
+                if self.vector_pending(lane, dest):
+                    raise ValueError("LDS load overwrites a pending result")
+                self.reads.add(address)
+                self.v[lane][int(dest[1:])] = self.lds[address]
+                self.pending_ds.add((lane, dest))
+        if write:
+            for address, data in writes.items():
+                if self.staged.setdefault(address, data) != data:
+                    raise ValueError("Conflicting LDS stores before a barrier")
+            self.ds_writes_pending = True
+
     def run(self, decoded, expressions):
+        run_group([self], decoded, expressions)
+
+    def steps(self, decoded, expressions):
+        """Execute the wave, yielding at each group barrier."""
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
-        pc = 0
-        while pc < len(decoded):
+        for _, line in decoded:
+            dest = line.partition(" ")[2].split(", ")[0]
+            if re.fullmatch(r"s\d+", dest):
+                self.written.add(int(dest[1:]))
+            elif dest.startswith("s["):
+                self.written.update(span(dest))
+        if (yield from self.exec_range(decoded, expressions, jumps, 0, len(decoded))):
+            return
+        raise ValueError("No program exit")
+
+    def exec_range(self, decoded, expressions, jumps, pc, stop, arm=False):
+        """Execute decoded[pc:stop]; return True at s_endpgm, else False."""
+        while pc < stop:
             offset, line = decoded[pc]
             pc += 1
             op, _, tail = line.partition(" ")
             args = tail.split(", ")
+            if op in LANE_SPILL_OPS:
+                self.lane_spill(op, args)
+                continue
+            if self.spill_vgprs:
+                # Only a subsequent reload makes an ordinary use part of a spill interval.
+                for single, first, last in VGPR_OPERAND.findall(tail):
+                    regs = (int(single),) if single else range(int(first), int(last) + 1)
+                    for reg in self.spill_vgprs.intersection(regs):
+                        self.spill_vector_uses.setdefault(reg, (offset, op))
+            if arm and (
+                not op.startswith("s_")
+                or op.startswith("s_cbranch_")
+                or op in ("s_branch", "s_endpgm", "s_barrier", "s_sendmsg")
+            ):
+                raise ValueError("Unsupported instruction inside a descriptor join arm")
             if op == "s_endpgm":
-                return
+                return True
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
             if op == "s_barrier":
+                if self.ds_writes_pending:
+                    raise ValueError("LDS store not waited before the barrier")
                 self.barriers.append(offset)
+                yield
             elif op == "s_waitcnt":
                 if not re.fullmatch(
                     r"(?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\))(?: (?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\)))*",
@@ -405,23 +754,33 @@ class Wave:
                     raise ValueError("Unsupported wait")
                 if "lgkmcnt" in tail:
                     self.pending.clear()
+                    self.pending_ds.clear()
+                    self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
+            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+                pc = self.join_arms(
+                    decoded, expressions, jumps, pc, offset,
+                    branch_target(offset, tail), self.scc,
+                )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
-                    op == "s_cbranch_scc0"
+                    op in ("s_cbranch_scc0", "s_cbranch_scc1")
                     and self.scc is None
                     or op == "s_cbranch_vccnz"
                     and self.vcc is None
                 ):
                     raise ValueError("Undefined branch predicate")
+                if op not in ("s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_execz", "s_cbranch_vccnz"):
+                    raise ValueError(f"Unsupported mesh branch {op}")
                 take = {
                     "s_branch": True,
                     "s_cbranch_scc0": not self.scc,
+                    "s_cbranch_scc1": bool(self.scc),
                     "s_cbranch_execz": not self.exec,
                     "s_cbranch_vccnz": bool(self.vcc),
                 }[op]
-                target = jumps[offset + 4 + 4 * int(tail)]
+                target = jumps[branch_target(offset, tail)]
                 if target < pc:
                     raise ValueError("Expected a forward mesh branch")
                 if take:
@@ -455,7 +814,7 @@ class Wave:
                             )
                         for j, reg in enumerate(span(match[1])):
                             key = (lane, f"v{reg}")
-                            if key in self.pending_v:
+                            if self.vector_pending(*key):
                                 raise ValueError(
                                     "Vertex load overwrites an outstanding result"
                                 )
@@ -472,17 +831,20 @@ class Wave:
                 for lane in range(64):
                     if self.exec & (1 << lane):
                         addr = self.lane_value(match[2], lane)
-                        if (lane, match[1]) in self.pending_v:
+                        if self.vector_pending(lane, match[1]):
                             raise ValueError("Vector load overwrites pending result")
                         if addr % 4 or not 0 <= addr // 4 < len(self.geometry):
                             raise ValueError("Geometry address out of range")
                         self.v[lane][int(match[1][1:])] = self.geometry[addr // 4]
                         self.pending_v.add((lane, match[1]))
+            elif op in ("ds_write_b32", "ds_read_b32"):
+                self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param0),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
-                if not m[3] and m[1] != "param0":
+                # A position export may leave done to a later clip or cull distance export.
+                if not m[3] and m[1] == "prim":
                     raise ValueError("Expected completed primitive or position export")
                 operands = m[2].split(", ")
                 for lane in range(64):
@@ -500,19 +862,75 @@ class Wave:
                         if i in self.positions:
                             raise ValueError("Duplicate position")
                         self.positions[i] = [self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], None, bool(m[3])))
+                    elif m[1].startswith("pos") and len(operands) == 4:
+                        values = [None if t == "off" else self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], values, bool(m[3])))
                     elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
                         if i in self.attributes:
                             raise ValueError("Duplicate vertex attribute")
                         self.attributes[i] = [self.lane_value(t, lane) for t in operands]
                     else:
                         raise ValueError("Unsupported live export")
+            elif op.startswith("image_"):
+                self.image_op(op, tail, expressions)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
             elif op.startswith("v_"):
                 self.vector_op(op, args, expressions)
             else:
                 raise ValueError(f"Unsupported mesh instruction {op}")
-        raise ValueError("No program exit")
+        return False
+
+
+def live_barriers_agree(first, second):
+    # Wave.run only returns at S_ENDPGM. RDNA 2 ISA section 4.3 drops a retired
+    # wave from later barriers. While both waves are live their PCs must match.
+    return all(a == b for a, b in zip(first.barriers, second.barriers))
+
+
+def check_interval(waves):
+    """Validate one barrier interval of every wave; return the stores to publish."""
+    published = {}
+    for wave in waves:
+        for address, data in wave.staged.items():
+            if published.setdefault(address, data) != data:
+                raise ValueError("Waves store different values to one LDS dword")
+    for wave in waves:
+        others = {a for other in waves if other is not wave for a in other.staged}
+        if wave.reads & others:
+            raise ValueError("LDS dword read and stored by different waves without a barrier")
+    for wave in waves:
+        wave.staged, wave.reads = {}, set()
+    return published
+
+
+def run_group(waves, decoded, expressions):
+    """Run the waves of one group in lockstep between barriers.
+
+    Each wave runs to its next barrier before any wave goes on. Stores become
+    visible to every wave only when all of them have reached the barrier.
+    """
+    lds = {}
+    for wave in waves:
+        wave.lds = lds
+    running = [wave.steps(decoded, expressions) for wave in waves]
+    while True:
+        # A wave that ends its program drops out of later barriers (RDNA 2 ISA
+        # section 4.3); the waves still live release each other.
+        live = []
+        for steps in running:
+            try:
+                next(steps)
+                live.append(steps)
+            except StopIteration:
+                pass
+        if not live:
+            check_interval(waves)
+            return
+        running = live
+        published = check_interval(waves)
+        lds.update(published)
 
 
 def float4(values):
@@ -553,7 +971,8 @@ def emit_compute_draw(bindings, expressions, positions, indices, attributes):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False):
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+    layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
     ):
@@ -566,10 +985,9 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         raise ValueError("Geometry binding requires unsigned words")
     waves = [Wave(i, geometry, vertex_header) for i in range(2)]
     expressions = {}
-    for wave in waves:
-        wave.run(decoded, expressions)
+    run_group(waves, decoded, expressions)
     if (
-        waves[0].barriers != waves[1].barriers
+        not live_barriers_agree(*waves)
         or len(waves[0].counts) != 1
         or waves[1].counts
     ):
@@ -593,6 +1011,9 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         or any(max(tri) >= nv for tri in idx.values())
     ):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
+    distances = vertex_distances(waves[0].position_exports | waves[1].position_exports, layout)
+    if compute_fallback and layout and layout.vectors:
+        raise ValueError("The compute fallback has no room for clip or cull distances")
     bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
@@ -606,7 +1027,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "") + "};",
+        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "")
+        + hlsl_fields(layout) + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
         f"  SetMeshOutputCounts({nv},{np});",
@@ -625,6 +1047,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         )
         if attributes:
             lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
+        if i in distances:
+            lines.append(f"  if(id=={i}) {{ {hlsl_writes(f'v[{i}]', distances[i])} }}")
     for i, tri in idx.items():
         lines.extend(
             [
@@ -693,13 +1117,14 @@ def decode_mesh(blob, library):
     limits = struct.unpack_from("<HH", p, 16)
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
-    code = container_code(chunks[b"DXIL"], stage=13)
-    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+    code = container_code(chunks[b"DXIL"], stage=13, llvm=library, features=MESH_WAVE64)
+    return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback,
+                 vs_out_cntl=vs_out_cntl)
 
 
 if __name__ == "__main__":
@@ -717,6 +1142,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Emit SM 6.0 compute (main) and vertex (vertex_main) entry points",
     )
+    p.add_argument(
+        "--pa-cl-vs-out-cntl",
+        type=lambda s: int(s, 0),
+        help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
@@ -730,6 +1160,7 @@ if __name__ == "__main__":
         a.llvm,
         a.vertex_header,
         compute_fallback=a.compute_fallback,
+        vs_out_cntl=a.pa_cl_vs_out_cntl,
     )
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(src, encoding="ascii")

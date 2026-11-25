@@ -12,6 +12,7 @@
 #include <array>
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/tile64_plan.h"
+#include "startup_stubs/small_texture_4k.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -126,29 +127,94 @@ void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layou
     put32(mip + 0x3c, 1);
 }
 
+template <bool into>
 HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, const unsigned char* source,
                      UINT row_pitch, UINT slice_pitch)
 {
     const Bc16Surface surface(desc);
     const UINT row_bytes = surface.columns * Bc16Surface::block_bytes;
-    const u64 source_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
-    if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < source_bytes))
+    const u64 linear_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
+    if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < linear_bytes))
         return E_INVALIDARG;
 
+    const u64 dest_bytes = into ? surface.size() : linear_bytes;
+    const u64 source_bytes = into ? linear_bytes : surface.size();
     const auto dest_begin = reinterpret_cast<std::uintptr_t>(dest);
     const auto source_begin = reinterpret_cast<std::uintptr_t>(source);
-    const bool overlap = dest_begin <= source_begin ? source_begin - dest_begin < surface.size()
+    const bool overlap = dest_begin <= source_begin ? source_begin - dest_begin < dest_bytes
                                                     : dest_begin - source_begin < source_bytes;
     if (overlap) return E_INVALIDARG;
-    if (!x2w_local::readable(source, source_bytes) || !x2w_local::writable(dest, surface.size()))
+    if (!x2w_local::readable(source, source_bytes) || !x2w_local::writable(dest, dest_bytes))
         return E_FAIL;
 
-    for (UINT y = 0; y < surface.rows; ++y) {
-        const auto* row = source + u64{y} * row_pitch;
-        for (UINT x = 0; x < surface.columns; ++x)
-            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
+    if constexpr (into) {
+        for (UINT y = 0; y < surface.rows; ++y) {
+            const auto* row = source + u64{y} * row_pitch;
+            for (UINT x = 0; x < surface.columns; ++x)
+                std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
+        }
+    } else {
+        surface.detile(source, dest, row_pitch);
     }
     return S_OK;
+}
+
+long __stdcall bc7_4k_s_copy_from(Computer* self, unsigned char* dest, UINT plane, UINT subresource,
+                                  UINT scarlett_option, const unsigned char* source, UINT row_pitch, UINT slice_pitch)
+{
+    if (scarlett_option) return E_NOTIMPL;
+    if (plane || subresource) return E_INVALIDARG;
+    return copy_bc7_4k_s<false>(self->desc, dest, source, row_pitch, slice_pitch);
+}
+
+// A description given the 4 KiB allocation answer (small_texture_4k.h): slot 2 describes the compact plan
+// that slot 8 writes and the texture upload reads, inside the answered size at 4 KiB alignment.
+void write_compact_layout(const D3D12_RESOURCE_DESC& desc, const x2w_startup::SmallTexturePlan& compact, unsigned char* layout)
+{
+    const u64 total = x2w_startup::small_texture_4k_extent(desc);
+    const bool blocks = x2w_startup::small_texture_4k_compressed(desc.Format);
+    put64(layout + 0x00, total);
+    put64(layout + 0x08, 0x1000);
+    put32(layout + 0x10, compact.levels);
+    put32(layout + 0x14, 1);
+    unsigned char* plane = layout + layout_header;
+    put64(plane + 0x08, total);
+    put64(plane + 0x18, 0x1000);
+    for (unsigned m = 0; m < compact.levels; ++m) {
+        const auto& level = compact.level[m];
+        const UINT width = static_cast<UINT>((desc.Width >> m) ? (desc.Width >> m) : 1), height = (desc.Height >> m) ? (desc.Height >> m) : 1;
+        const UINT padded_width = blocks ? (width + 3) & ~3u : width, padded_height = blocks ? (height + 3) & ~3u : height;
+        unsigned char* mip = plane + mip_base + m * mip_bytes;
+        put64(mip + 0x00, level.bytes);
+        put64(mip + 0x08, level.offset);
+        put64(mip + 0x10, level.bytes);
+        put32(mip + 0x18, padded_width);
+        put32(mip + 0x1c, static_cast<std::uint32_t>(level.row_bytes));
+        put32(mip + 0x20, 1);
+        put32(mip + 0x24, padded_width);
+        put32(mip + 0x28, padded_height);
+        put32(mip + 0x2c, 1);
+        put32(mip + 0x30, width);
+        put32(mip + 0x34, height);
+        put32(mip + 0x38, 1);
+        put32(mip + 0x3c, 1);
+    }
+}
+
+// Slot 8 for the compact plan: every row of one level, or nothing when the call cannot be served whole.
+long copy_compact(const D3D12_RESOURCE_DESC& desc, const x2w_startup::SmallTexturePlan& compact, unsigned char* base, unsigned plane,
+                  unsigned subresource, const unsigned char* linear, unsigned row_pitch)
+{
+    if (!base || !linear || plane || subresource >= compact.levels) return static_cast<long>(0x80070057);
+    const auto& level = compact.level[subresource];
+    if (row_pitch < level.row_bytes) return static_cast<long>(0x80070057);
+    if (!x2w_local::writable(base + level.offset, level.bytes) ||
+        !x2w_local::readable(linear, u64{row_pitch} * (level.rows - 1) + level.row_bytes))
+        return static_cast<long>(0x80004005);
+    for (u64 y = 0; y < level.rows; ++y)
+        std::memcpy(base + level.offset + y * level.row_bytes, linear + y * row_pitch, static_cast<std::size_t>(level.row_bytes));
+    notify_texture_write(base, x2w_startup::small_texture_4k_extent(desc));
+    return 0;
 }
 
 long __stdcall computer_layout(Computer* self, unsigned char* layout)
@@ -157,6 +223,10 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     std::memset(layout, 0, layout_header + 4 * plane_bytes + 8);
     if (self->bc7_4k_s_layout) {
         write_bc7_4k_s_layout(self->desc, layout);
+        return S_OK;
+    }
+    if (x2w_startup::SmallTexturePlan compact; x2w_startup::small_texture_4k_plan(self->desc, compact)) {
+        write_compact_layout(self->desc, compact, layout);
         return S_OK;
     }
     ID3D12Device* device = layout_device();
@@ -174,16 +244,17 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     if (!valid) slice_total = 0x10000;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;
+    const u64 alignment = 0x10000;
 
     put64(layout + 0x00, total);
-    put64(layout + 0x08, 0x10000);
+    put64(layout + 0x08, alignment);
     put32(layout + 0x10, mips);
     put32(layout + 0x14, plan.planes);
     for (unsigned p = 0; p < plan.planes; ++p) {
         unsigned char* plane = layout + layout_header + p * plane_bytes;
         put64(plane + 0x08, total);
         put64(plane + 0x10, slices > 1 ? stride : 0);
-        put64(plane + 0x18, 0x10000);
+        put64(plane + 0x18, alignment);
         for (unsigned m = 0; valid && m < mips; ++m) {
             const unsigned i = p * mips + m;
             unsigned char* mip = plane + mip_base + m * mip_bytes;
@@ -213,9 +284,9 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
             used += std::snprintf(sizes + used, sizeof sizes - used, " %llx@%llx",
                                   u64{footprints[i].Footprint.RowPitch} * rows[i] * footprints[i].Footprint.Depth, footprints[i].Offset);
         x2w_local::logf("x2w-xg TextureComputer::slot2(layout) dim=%d %llux%ux%u mips=%u fmt=%d(->%d) layout=0x%x -> %s "
-                        "slice=0x%llx total=0x%llx mip0 pitch=%u mips:%s", self->desc.Dimension, self->desc.Width, self->desc.Height,
+                        "slice=0x%llx total=0x%llx align=0x%llx mip0 pitch=%u mips:%s", self->desc.Dimension, self->desc.Width, self->desc.Height,
                         self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, desc.Format, self->desc.Layout,
-                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, valid ? footprints[0].Footprint.RowPitch : 0, sizes);
+                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, alignment, valid ? footprints[0].Footprint.RowPitch : 0, sizes);
     }
     return 0;
 }
@@ -297,11 +368,19 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
         const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
         const auto notify = d3d ? reinterpret_cast<NotifyBc7>(GetProcAddress(d3d, "x2w_d3d12_bc7_4k_s_written")) : nullptr;
         if (!notify && x2w_local::env_on("X2W_D3D12_RENDER")) return E_NOTIMPL;
-        const HRESULT hr = copy_bc7_4k_s(self->desc, base, linear, row_pitch, slice_pitch);
+        const HRESULT hr = copy_bc7_4k_s<true>(self->desc, base, linear, row_pitch, slice_pitch);
         if (SUCCEEDED(hr) && notify) notify(base, static_cast<UINT>(self->desc.Width), self->desc.Height);
         return hr;
     }
     static LONG calls, refused;
+    if (x2w_startup::SmallTexturePlan compact; x2w_startup::small_texture_4k_plan(self->desc, compact)) {
+        const long hr = copy_compact(self->desc, compact, base, plane, subresource, linear, row_pitch);
+        if (x2w_local::first_calls(calls, 12) || hr)
+            x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u %llux%u fmt=%d pitch %u compact plan of "
+                            "the 4 KiB answer -> 0x%08lx", static_cast<void*>(base), subresource, self->desc.Width, self->desc.Height,
+                            self->desc.Format, row_pitch, static_cast<unsigned long>(hr));
+        return hr;
+    }
     ID3D12Device* device = layout_device();
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -354,7 +433,7 @@ template <int N>
 __declspec(noinline) u64 computer_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 1) {
+    if (x2w_local::first_calls(calls, 1)) {
         char name[48];
         std::snprintf(name, sizeof(name), "TextureComputer::slot%d(no-op)", N);
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N, rcx, rdx, r8, r9, _ReturnAddress());
@@ -397,14 +476,23 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         slots[5] = reinterpret_cast<void*>(&bc64_offset);
         slots[6] = reinterpret_cast<void*>(&bc64_element);
         slots[8] = reinterpret_cast<void*>(&bc64_copy<true>);
-        slots[9] = reinterpret_cast<void*>(&bc64_copy<false>);
+        slots[9] = reinterpret_cast<void*>(&bc64_copy_from);
         slots[10] = reinterpret_cast<void*>(&bc64_tiling);
         return slots;
     }();
-    auto* computer = new Computer{bc64::supports(desc) ? bc_table.data() : table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
+    static const auto bc7_4k_table = [] {
+        auto slots = table;
+        slots[9] = reinterpret_cast<void*>(&bc7_4k_s_copy_from);
+        return slots;
+    }();
+    const bool bc7_4k = use_bc7_4k_s_layout(desc);
+    // The 4 KiB profile requires UNKNOWN layout and one mip. BC64 requires layout 0x109 and six or nine mips.
+    const auto* slots = bc64::supports(desc) ? bc_table.data() : table.data();
+    if (bc7_4k) slots = bc7_4k_table.data();
+    auto* computer = new Computer{slots, desc, 1, bc7_4k};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 3)
+    if (x2w_local::first_calls(calls, 3))
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGCreateTextureComputer(stand-in)", 0, rcx, rdx, r8,
                          r9, _ReturnAddress());
     return 0;
@@ -418,7 +506,7 @@ extern "C" __declspec(noinline) long XGSuggestSwizzleMode(u64 rcx, u64 rdx, u64 
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGSuggestSwizzleMode", 1, rcx, rdx, r8, r9, _ReturnAddress());
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 3)
+    if (x2w_local::first_calls(calls, 3))
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGSuggestSwizzleMode(keep default, S_OK)", 1, rcx,
                          rdx, r8, r9, _ReturnAddress());
     return 0;

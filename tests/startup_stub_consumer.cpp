@@ -17,6 +17,7 @@
 #endif
 #include <windows.h>
 #include "startup_stubs/dstorage_error_record.h"
+#include "bcpack_encoder.h"
 #include <cstdint>
 #include <cstdio>
 #include <array>
@@ -280,7 +281,7 @@ bool dstorage_error_record_checks()
     failing.enqueue(first);
     failing.enqueue(next);
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "event signaled before Submit")) return false;
-    if (!check(failing.submit() == E_FAIL && first_dest == sentinel && next_dest == sentinel,
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && first_dest == sentinel && next_dest == sentinel,
                "out-of-range requests failed and preserved their destinations")) return false;
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0 &&
                WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "failed request did not leave the error event signaled"))
@@ -317,7 +318,7 @@ bool dstorage_error_record_checks()
                "expected two failures and an intact guard") ||
         !check(rec::read<std::int32_t>(record, rec::command_type) == rec::command_request,
                "first failure's CommandType is not DSTORAGE_COMMAND_TYPE_REQUEST") ||
-        !check(rec::read<HRESULT>(record, rec::hresult) == E_FAIL && rec::read<u64>(record, rec::options) == first.options &&
+        !check(rec::read<HRESULT>(record, rec::hresult) == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && rec::read<u64>(record, rec::options) == first.options &&
                rec::read<void*>(record, rec::destination) == first.destination &&
                rec::read<std::uint32_t>(record, rec::destination_size) == first.destination_size &&
                rec::read<u64>(record, rec::file_offset) == first.file_offset &&
@@ -340,12 +341,12 @@ bool dstorage_error_record_checks()
     static_assert(sizeof long_name - 1 == 70);
     const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, long_name};
     failing.enqueue(too_small);
-    if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && memory == sentinel, "short memory destination was not refused") ||
         !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
     const unsigned char* memory_failure = retrieve(failing);
     return check(rec::read<std::uint32_t>(memory_failure, rec::failure_count) == 1 &&
                  rec::read<std::int32_t>(memory_failure, rec::command_type) == rec::command_request &&
-                 rec::read<HRESULT>(memory_failure, rec::hresult) == E_FAIL &&
+                 rec::read<HRESULT>(memory_failure, rec::hresult) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
                  rec::read<u64>(memory_failure, rec::options) == too_small.options &&
                  rec::read<void*>(memory_failure, rec::destination) == too_small.destination &&
                  rec::read<std::uint32_t>(memory_failure, rec::destination_size) == too_small.destination_size &&
@@ -740,7 +741,7 @@ bool dstorage_checks() {
         bool bounds_ok = true;
         for (unsigned i = 0; i < 3; ++i) {
             const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            bounds_ok &= hr == (i == 1 ? HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) : S_OK);
             for (unsigned j = 0; j < 6; ++j)
                 bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
         }
@@ -1575,6 +1576,106 @@ bool dstorage_checks() {
             0xc2, 0x5b, 0x48, 0x7a, 0xea, 0x84, 0xa4, 0x4b, 0xfd, 0xf7, 0x15, 0x87, 0x90, 0xc4, 0x49, 0xac
         };
 
+        // 3-block BC4, BC5, and BC3 streams generated with tests/bcpack_encoder.h (q=0, narrow=0, trim=false).
+        // Each stream exercises non-zero delta (er != xr), dictionary lookup (r > i), and history lookup (r <= i),
+        // with expected output bytes independently computed from bcpack_tables_bcn.inl.
+        auto encode_bcn = [](const uint8_t ab[12], size_t target, const std::vector<uint16_t> syms[12],
+                             std::vector<uint8_t>& out) -> bool {
+            std::vector<std::vector<uint8_t>> lane_bytes(12);
+            for (size_t l = 0; l < 12; ++l) {
+                if (!bcpack_test::encode_fragment(ab[l], 0, 0, syms[l].data(), target, false, lane_bytes[l]))
+                    return false;
+            }
+            out.clear();
+            return bcpack_test::interleave(lane_bytes, ab, 12, target, out);
+        };
+
+        const uint8_t ab_bc4[12] = {7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5};
+        const std::vector<uint16_t> bc4_syms[12] = {
+            {2, 1, 4},     // delta (+1, -1, +2) -> er != xr in all 3 blocks
+            {0, 1, 1},     // xr (0=zero, 1=hist[0], 1=hist[1]; er=1=dict[0], 0=zero, 3=dict[0])
+            {1, 3, 5},     {2, 4, 6},     {1, 2, 3},     {4, 5, 6},
+            {7, 8, 9},     {10, 11, 12},  {13, 14, 15},  {16, 17, 18},
+            {19, 20, 21},  {22, 23, 24},
+        };
+        std::vector<uint8_t> bc4_packed;
+        if (!encode_bcn(ab_bc4, 3, bc4_syms, bc4_packed)) return false;
+        const unsigned char bc4_expected[24] = {
+            0x01, 0x02, 0x00, 0x89, 0xfd, 0x33, 0x93, 0x51,
+            0x7e, 0x82, 0x5b, 0x62, 0x25, 0xf2, 0xd6, 0xc9,
+            0xff, 0x04, 0x89, 0xd2, 0x57, 0x6a, 0xd5, 0x98
+        };
+
+        const uint8_t ab_bc5[12] = {3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5};
+        const std::vector<uint16_t> bc5_syms[12] = {
+            {2, 0, 1, 0, 0, 1},     // delta (+2, -1, +1) -> er != xr in all 3 blocks
+            {0, 0, 1, 0, 0, 1},     // xr (0=zero, 1=hist[0], 2=hist[0]; er=2=dict[1], 0=zero, 3=dict[0])
+            {3, 5, 7, 9, 11, 13},   {2, 4, 6, 8, 10, 12},
+            {1, 2, 3, 4, 5, 6},     {7, 8, 9, 10, 11, 12},
+            {13, 14, 15, 16, 17, 18}, {19, 20, 21, 22, 23, 24},
+            {25, 26, 27, 28, 29, 30}, {31, 32, 33, 34, 35, 36},
+            {37, 38, 39, 40, 41, 42}, {43, 44, 45, 46, 47, 48},
+        };
+        std::vector<uint8_t> bc5_packed;
+        if (!encode_bcn(ab_bc5, 6, bc5_syms, bc5_packed)) return false;
+        const unsigned char bc5_expected[48] = {
+            0x7d, 0x7b, 0x09, 0x09, 0x22, 0xad, 0x90, 0x8f,
+            0x7f, 0x7f, 0x9e, 0x99, 0x69, 0x37, 0xeb, 0x8b,
+            0x7c, 0x7b, 0x12, 0xa0, 0x26, 0x35, 0x7c, 0x61,
+            0x83, 0x84, 0x49, 0x4a, 0xbb, 0xba, 0xc9, 0xe5,
+            0x7b, 0x78, 0xf6, 0x39, 0x42, 0x62, 0xd7, 0x0f,
+            0x85, 0x84, 0x48, 0xc3, 0x55, 0x50, 0xe8, 0x3d
+        };
+
+        const uint8_t ab_bc3[12] = {3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7};
+        const std::vector<uint16_t> bc3_syms[12] = {
+            {2, 0, 1, 0, 0, 1},     // delta (+2, -1, +1) -> er != xr in all 3 blocks
+            {0, 0, 1, 0, 0, 1},     // xr (0=zero, 1=hist[0], 2=hist[0]; er=2=dict[1], 0=zero, 3=dict[0])
+            {3, 5, 7, 9, 11, 13},
+            {1, 2, 3, 4, 5, 6},     {7, 8, 9, 10, 11, 12},
+            {13, 14, 15, 16, 17, 18}, {19, 20, 21, 22, 23, 24},
+            {3, 5, 7, 9, 11, 13},   {40, 45, 50, 55, 60, 62},  // green residuals > 31 exercise 6-bit mask
+            {4, 6, 8, 10, 12, 14},  {10, 20, 30, 40, 50, 60},  {70, 80, 90, 100, 110, 120},
+        };
+        std::vector<uint8_t> bc3_packed;
+        if (!encode_bcn(ab_bc3, 6, bc3_syms, bc3_packed)) return false;
+        const unsigned char bc3_expected[48] = {
+            0x7e, 0x7d, 0x89, 0x1d, 0x3b, 0xd8, 0x30, 0x72,
+            0xb2, 0x76, 0x13, 0x61, 0x0b, 0xfa, 0x2a, 0x06,
+            0x7c, 0x7b, 0x5b, 0x92, 0x36, 0x20, 0xe1, 0xec,
+            0x24, 0xe3, 0x85, 0xdc, 0x8f, 0x7f, 0x94, 0x37,
+            0x79, 0x7a, 0x24, 0xe9, 0xd6, 0xe2, 0xf9, 0xd1,
+            0xf6, 0x57, 0xd6, 0x47, 0xd2, 0x54, 0x6e, 0x51
+        };
+
+        // 260-block wrap streams for BC4, BC5, and BC3: block 59 sets ep[0]=10, block 187 sets ep[0]=20,
+        // and block 259 looks back r=200 (259-200=59) with residual +1 -> ep[0]=11 (encoded byte0 = 11^0x80 = 0x8b).
+        // A 128-entry history ring would overwrite slot 59 at block 187 and yield 0x95 instead.
+        auto make_wrap_stream = [&](unsigned fmt, std::vector<uint8_t>& out) -> bool {
+            const uint8_t* ab = (fmt == 4) ? ab_bc4 : (fmt == 5) ? ab_bc5 : ab_bc3;
+            const size_t blocks = 260;
+            const size_t target = (fmt == 4) ? blocks : 2 * blocks;
+            std::vector<uint16_t> syms[12];
+            for (size_t l = 0; l < 12; ++l) syms[l].assign(target, 0);
+            if (fmt == 4) {
+                syms[2][59] = 20;   // unzigzag(20) = +10
+                syms[2][187] = 40;  // unzigzag(40) = +20
+                syms[1][259] = 200; // xr = 200, er = 200 (delta = 0) -> hist[59]
+                syms[2][259] = 2;   // unzigzag(2) = +1 -> ep[0] = 11
+            } else {
+                syms[2][2 * 59] = 20;
+                syms[2][2 * 187] = 40;
+                syms[1][2 * 259] = 8;      // interleave(8, 10) = 200
+                syms[1][2 * 259 + 1] = 10;
+                syms[2][2 * 259] = 2;
+            }
+            return encode_bcn(ab, target, syms, out);
+        };
+        std::vector<uint8_t> bc4_wrap_packed, bc5_wrap_packed, bc3_wrap_packed;
+        if (!make_wrap_stream(4, bc4_wrap_packed) || !make_wrap_stream(5, bc5_wrap_packed) ||
+            !make_wrap_stream(3, bc3_wrap_packed))
+            return false;
+
         // 64-block BC1 stream from tools/_bcpack_rans/vectors/synthetic_11.json (515 bytes)
         const unsigned char bc1_packed[515] = {
             0x15, 0x14, 0x1b, 0x1b, 0xdf, 0x10, 0x13, 0x14, 0x3d, 0x3e, 0x09, 0x11, 0x03, 0x28, 0x14, 0x03,
@@ -1653,14 +1754,14 @@ bool dstorage_checks() {
         };
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 7, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 17, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
             return false;
         }
         auto* status = static_cast<Object*>(status_ptr);
 
         void* queue_ptr = nullptr;
         unsigned char desc[0x20] = {};
-        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        *reinterpret_cast<uint16_t*>(desc + 8) = 32;
         if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
             return false;
         }
@@ -1673,6 +1774,16 @@ bool dstorage_checks() {
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
         std::vector<unsigned char> dest_bc6h_blank(64, 0xAA);
+        std::vector<unsigned char> dest_bc4_wrong_size(8, 0x5A);
+        std::vector<unsigned char> dest_bc4_non_mult(7, 0x5B);
+        std::vector<unsigned char> dest_bc5_wrong_size(16, 0x5C);
+        std::vector<unsigned char> dest_bc3_wrong_size(16, 0x5D);
+        std::vector<unsigned char> dest_bc4(24, 0x44);
+        std::vector<unsigned char> dest_bc5(48, 0x55);
+        std::vector<unsigned char> dest_bc3(48, 0x33);
+        std::vector<unsigned char> dest_bc4_wrap(260 * 8, 0x64);
+        std::vector<unsigned char> dest_bc5_wrap(260 * 16, 0x65);
+        std::vector<unsigned char> dest_bc3_wrap(260 * 16, 0x63);
 
         // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
         unsigned char req0[0x48] = {};
@@ -1752,63 +1863,110 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req6 + 0x30) = sizeof(bc6h_packed);
         *reinterpret_cast<unsigned*>(req6 + 0x38) = 64;
 
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req3);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 3);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req4);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 4);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req5);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req6);
-        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 6);
+        auto fill_bc_req = [](unsigned char* req, u64 fmt, void* dst, unsigned dst_size,
+                              const unsigned char* src, unsigned src_size) {
+            *reinterpret_cast<u64*>(req + 0x00) = (fmt << 1) | 0x400000;
+            *reinterpret_cast<void**>(req + 0x08) = dst;
+            *reinterpret_cast<u64*>(req + 0x10) = 0;
+            *reinterpret_cast<unsigned*>(req + 0x18) = dst_size;
+            *reinterpret_cast<const unsigned char**>(req + 0x20) = src;
+            *reinterpret_cast<u64*>(req + 0x28) = 0;
+            *reinterpret_cast<unsigned*>(req + 0x30) = src_size;
+            *reinterpret_cast<unsigned*>(req + 0x38) = dst_size;
+        };
+
+        // Requests 7-10: wrong/unaligned destination size negative controls (BC4, BC5, BC3).
+        unsigned char req7[0x48] = {};
+        fill_bc_req(req7, 4, dest_bc4_wrong_size.data(), 8, bc4_packed.data(), static_cast<unsigned>(bc4_packed.size()));
+        unsigned char req8[0x48] = {};
+        fill_bc_req(req8, 4, dest_bc4_non_mult.data(), 7, bc4_packed.data(), static_cast<unsigned>(bc4_packed.size()));
+        unsigned char req9[0x48] = {};
+        fill_bc_req(req9, 5, dest_bc5_wrong_size.data(), 16, bc5_packed.data(), static_cast<unsigned>(bc5_packed.size()));
+        unsigned char req10[0x48] = {};
+        fill_bc_req(req10, 3, dest_bc3_wrong_size.data(), 16, bc3_packed.data(), static_cast<unsigned>(bc3_packed.size()));
+
+        // Requests 11-13: valid 3-block BC4, BC5, and BC3 streams (non-zero delta, dict ref, history ref).
+        unsigned char req11[0x48] = {};
+        fill_bc_req(req11, 4, dest_bc4.data(), 24, bc4_packed.data(), static_cast<unsigned>(bc4_packed.size()));
+        unsigned char req12[0x48] = {};
+        fill_bc_req(req12, 5, dest_bc5.data(), 48, bc5_packed.data(), static_cast<unsigned>(bc5_packed.size()));
+        unsigned char req13[0x48] = {};
+        fill_bc_req(req13, 3, dest_bc3.data(), 48, bc3_packed.data(), static_cast<unsigned>(bc3_packed.size()));
+
+        // Requests 14-16: 260-block BC4, BC5, and BC3 streams exercising 256-entry history wrap.
+        unsigned char req14[0x48] = {};
+        fill_bc_req(req14, 4, dest_bc4_wrap.data(), 260 * 8, bc4_wrap_packed.data(), static_cast<unsigned>(bc4_wrap_packed.size()));
+        unsigned char req15[0x48] = {};
+        fill_bc_req(req15, 5, dest_bc5_wrap.data(), 260 * 16, bc5_wrap_packed.data(), static_cast<unsigned>(bc5_wrap_packed.size()));
+        unsigned char req16[0x48] = {};
+        fill_bc_req(req16, 3, dest_bc3_wrap.data(), 260 * 16, bc3_wrap_packed.data(), static_cast<unsigned>(bc3_wrap_packed.size()));
+
+        unsigned char* reqs[] = {
+            req0, req1, req2, req3, req4, req5, req6, req7, req8, req9,
+            req10, req11, req12, req13, req14, req15, req16,
+        };
+        for (unsigned idx = 0; idx < 17; ++idx) {
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, reqs[idx]);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, idx);
+        }
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 16)) break;
             Sleep(10);
         }
-        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) {
-            return false;
+        for (unsigned idx = 0; idx < 17; ++idx) {
+            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, idx)) {
+                return false;
+            }
         }
 
-        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
-        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
-        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
-        long hr3 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 3);
-        long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
-        long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
-        long hr6 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 6);
+        long hrs[17] = {};
+        for (unsigned idx = 0; idx < 17; ++idx) {
+            hrs[idx] = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, idx);
+        }
 
-        if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
-        if (hr1 == 0) return false;
+        if (hrs[0] != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
+        if (hrs[1] == 0) return false;
         for (unsigned char b : dest_wrong_size) {
             if (b != 0xBB) return false;
         }
-        if (hr2 != 0 || std::memcmp(dest_bc7_mode1.data(), bc7_mode1_expected, 16) != 0) return false;
-        if (hr3 == 0) return false;
+        if (hrs[2] != 0 || std::memcmp(dest_bc7_mode1.data(), bc7_mode1_expected, 16) != 0) return false;
+        if (hrs[3] == 0) return false;
         for (unsigned char b : dest_truncated) {
             if (b != 0xCC) return false;
         }
-        if (hr4 != 0 || std::memcmp(dest_bc1_valid.data(), bc1_expected, 512) != 0) return false;
-        if (hr5 == 0) return false;
+        if (hrs[4] != 0 || std::memcmp(dest_bc1_valid.data(), bc1_expected, 512) != 0) return false;
+        if (hrs[5] == 0) return false;
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
         }
-        if (hr6 != 0) return false;
+        if (hrs[6] != 0) return false;
         for (unsigned char b : dest_bc6h_blank) {
             if (b != 0) return false;
         }
+        if (hrs[7] == 0) return false;
+        for (unsigned char b : dest_bc4_wrong_size) {
+            if (b != 0x5A) return false;
+        }
+        if (hrs[8] == 0) return false;
+        for (unsigned char b : dest_bc4_non_mult) {
+            if (b != 0x5B) return false;
+        }
+        if (hrs[9] == 0) return false;
+        for (unsigned char b : dest_bc5_wrong_size) {
+            if (b != 0x5C) return false;
+        }
+        if (hrs[10] == 0) return false;
+        for (unsigned char b : dest_bc3_wrong_size) {
+            if (b != 0x5D) return false;
+        }
+        if (hrs[11] != 0 || std::memcmp(dest_bc4.data(), bc4_expected, 24) != 0) return false;
+        if (hrs[12] != 0 || std::memcmp(dest_bc5.data(), bc5_expected, 48) != 0) return false;
+        if (hrs[13] != 0 || std::memcmp(dest_bc3.data(), bc3_expected, 48) != 0) return false;
+        if (hrs[14] != 0 || dest_bc4_wrap[259 * 8] != 0x8b) return false;
+        if (hrs[15] != 0 || dest_bc5_wrap[259 * 16] != 0x8b) return false;
+        if (hrs[16] != 0 || dest_bc3_wrap[259 * 16] != 0x8b) return false;
     }
 
     return true;
@@ -1836,7 +1994,8 @@ bool dstorage_directory_batches()
     const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
     for (unsigned i = 0; i < 2; ++i)
         if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
-    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    const unsigned char queue_description[0x28] = {};
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, queue_description, nullptr, &object)) return false;
     auto* queue = static_cast<Object*>(object);
     const unsigned count = static_cast<unsigned>(requests.size());
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;
@@ -1873,6 +2032,68 @@ bool dstorage_directory_batches()
     return readback.good();
 }
 
+using FileInformationFn = long(__stdcall*)(void*, BY_HANDLE_FILE_INFORMATION*);
+
+// File::GetFileInformation must return the Win32 error of its own failed call, not the error left by the
+// logging that follows. Runs the same sequence with the trap-log variable unset and set, because the stand-in's
+// logger calls GetEnvironmentVariableW (and CreateFileW when the variable is set), and both overwrite the
+// thread's last error. A closed file object keeps its vtable and holds INVALID_HANDLE_VALUE, so the call is
+// well defined and must fail with ERROR_INVALID_HANDLE.
+bool dstorage_file_information_checks()
+{
+    HMODULE library = LoadLibraryW(L"XCRDAPI.dll");
+    if (!library) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(library, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH], log_file[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp_dir) || !GetTempFileNameW(temp_dir, L"x2w", 0, temp_file) ||
+        !GetTempFileNameW(temp_dir, L"x2w", 0, log_file))
+        return false;
+    constexpr DWORD size = 1234;
+    HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> bytes(size, 0x5a);
+    DWORD written = 0;
+    const bool wrote = WriteFile(h, bytes.data(), size, &written, nullptr) && written == size;
+    CloseHandle(h);
+    if (!wrote) {
+        DeleteFileW(temp_file);
+        return false;
+    }
+
+    bool ok = true;
+    for (const bool log_set : {false, true}) {
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_set ? log_file : nullptr);
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            ok = false;
+            break;
+        }
+        auto* file = static_cast<Object*>(file_ptr);
+        auto information = reinterpret_cast<FileInformationFn>(file->vtable[4]);
+        BY_HANDLE_FILE_INFORMATION info{};
+        const long open_hr = information(file, &info);
+        const bool open_ok = open_hr == S_OK && info.nFileSizeHigh == 0 && info.nFileSizeLow == size;
+        reinterpret_cast<CloseFileFn>(file->vtable[3])(file);
+        SetLastError(0);
+        const long closed_hr = information(file, &info);
+        const long expected = HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
+        const bool closed_ok = closed_hr == expected;
+        std::printf("file-information log=%s open: hr=0x%08lx size=%lu %s; closed: hr=0x%08lx expected=0x%08lx %s\n",
+                    log_set ? "set" : "unset", static_cast<unsigned long>(open_hr), info.nFileSizeLow,
+                    open_ok ? "ok" : "MISMATCH", static_cast<unsigned long>(closed_hr),
+                    static_cast<unsigned long>(expected), closed_ok ? "ok" : "MISMATCH");
+        ok = ok && open_ok && closed_ok;
+    }
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
+    DeleteFileW(temp_file);
+    DeleteFileW(log_file);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1902,6 +2123,11 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage-file-information")) {
+        if (!dstorage_file_information_checks()) return 10;
+        std::puts("dstorage-file-information ok");
         return 0;
     }
     if (!std::strcmp(which, "dstorage-status-initial")) {

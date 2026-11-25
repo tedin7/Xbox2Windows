@@ -546,6 +546,34 @@ def check_differential(native_path, lifted_path, altered_path):
           f"bit-for-bit; altered controls diverged on {changed}; output mutation control caught")
 
 
+def check_daz_extrema(native_path, lifted_path):
+    """MAXSD and MINSD under MXCSR.DAZ return a denormal operand as a zero of its sign."""
+    names = ("op_maxsd_reg", "op_minsd_reg")
+    native, lifted = bind_exports(native_path, "", names), bind_exports(lifted_path, "lifted_", names)
+    host = ctypes.CDLL(str(Path(native_path).resolve()))
+    for function in (host.read_mxcsr, host.write_mxcsr):
+        function.argtypes, function.restype = [ctypes.POINTER(ctypes.c_uint32)], None
+    denormal, sign, minus_one, one = 0x000123456789ABCD, 1 << 63, 0xBFF0000000000000, 0x3FF0000000000000
+    # (export, destination, source, result): the result is the second operand or the first, flushed by DAZ.
+    cases = (("op_maxsd_reg", denormal, minus_one, 0), ("op_maxsd_reg", denormal | sign, minus_one, sign),
+             ("op_minsd_reg", one, denormal | sign, sign), ("op_minsd_reg", one, denormal, 0))
+    saved = ctypes.c_uint32()
+    host.read_mxcsr(ctypes.byref(saved))
+    try:
+        host.write_mxcsr(ctypes.byref(ctypes.c_uint32(0x1FC0)))
+        for name, a0, b0, result in cases:
+            a, b = pk_q(a0, 7), pk_q(b0, 9)
+            unflushed = a0 if name == "op_maxsd_reg" else b0  # what a C comparison returns
+            if unflushed == result:
+                raise AssertionError(f"{name}: control case cannot tell a flushed result apart")
+            for label, function in (("native", native[name]), ("lifted", lifted[name])):
+                assert_equal_output(f"{label} DAZ", name, hex(a0), invoke(function, a, b),
+                                    pk_q(result, 7) + FILL[16:])
+    finally:
+        host.write_mxcsr(ctypes.byref(saved))
+    print(f"{len(cases)} MAXSD/MINSD denormal results under MXCSR.DAZ matched the native instruction")
+
+
 # --- Alternative-encoding acceptance & translator rejection controls ---
 
 def encode_seq(*instructions):
@@ -841,4 +869,5 @@ def check_alt_encodings_and_rejections(original_path):
 
 if __name__ == "__main__":
     check_differential(*sys.argv[1:4])
+    check_daz_extrema(*sys.argv[1:3])
     check_alt_encodings_and_rejections(sys.argv[1])

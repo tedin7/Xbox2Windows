@@ -287,7 +287,7 @@ def check_rejections():
         "fldenv": (attempt(f"{fld} d9 21 {fstp} c3"), "unsupported x87 operation"),
         "fdecstp": (attempt(f"{fld} d9 f6 {fstp} c3"), "unsupported x87 operation"),
         "fxsave": (attempt(f"{fld} 0f ae 01 {fstp} c3"), "unsupported x87 operation"),
-        "fnstenv": (attempt(f"{fld} {fld} d9 31 {fstp} {fstp} c3"), "unsupported x87 operation"),
+        "fnstenv": (attempt(f"{fld} {fld} d9 31 {fstp} {fstp} c3"), "stores the tag word of a non-empty x87 stack"),
         "fcos": (attempt(f"{fld} d9 ff {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():

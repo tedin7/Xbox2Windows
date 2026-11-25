@@ -308,7 +308,7 @@ def check_rejections():
         "fstp st(1) as DF D9": (attempt(f"{fld} {fld} df d9 {fstp} c3"), "unsupported x87 encoding"),
         "fxch st(1) as DD C9": (attempt(f"{fld} {fld} dd c9 {fstp} {fstp} c3"), "unsupported x87 encoding"),
         "fxch st(1) as DF C9": (attempt(f"{fld} {fld} df c9 {fstp} {fstp} c3"), "unsupported x87 encoding"),
-        "fnstenv m28": (attempt(f"{fld} d9 32 {fstp} c3"), "unsupported x87 operation"),
+        "fnstenv m28": (attempt(f"{fld} d9 32 {fstp} c3"), "stores the tag word of a non-empty x87 stack"),
         "fsin": (attempt(f"{fld} d9 fe {fstp} c3"), "unsupported x87 operation"),
         "ffree st(0)": (attempt(f"{fld} dd c0 {fstp} c3"), "frees an occupied register"),
         "fdecstp": (attempt(f"{fld} d9 f6 {fstp} c3"), "unsupported x87 operation"),

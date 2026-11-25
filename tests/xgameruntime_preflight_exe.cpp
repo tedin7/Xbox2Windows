@@ -4,7 +4,7 @@
 // before any image is mapped or executed.
 #include <windows.h>
 
-extern "C" __declspec(dllimport) HRESULT WINAPI XUserAddAsync(int options, void* async);
+extern "C" __declspec(dllimport) HRESULT WINAPI XPackageMountWithUiAsync(const char* package_identifier, void* async);
 
 // The Debug preset enables /RTC1. This CRT-free fixture still references the
 // two RTC bookkeeping symbols, so provide inert definitions instead of linking
@@ -14,5 +14,5 @@ extern "C" void _RTC_Shutdown() {}
 
 extern "C" HRESULT WINAPI fixture_entry()
 {
-    return XUserAddAsync(0, nullptr);
+    return XPackageMountWithUiAsync(nullptr, nullptr);
 }

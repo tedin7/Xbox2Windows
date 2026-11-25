@@ -45,8 +45,19 @@ std::uint32_t word0(unsigned u, unsigned v, unsigned w, unsigned aniso)
     return u | v << 3 | w << 6 | aniso << 9;
 }
 
+void lod_range(const char* name, const char* kind, float bias, float min_lod, float max_lod, float expected_min,
+               float expected_max)
+{
+    if (bias == 0.0f && min_lod == expected_min && max_lod == expected_max) return;
+    std::printf("FAIL %s: %s LOD bias %g, range %g..%g, expected 0, %g..%g\n", name, kind, bias, min_lod, max_lod,
+                expected_min, expected_max);
+    ++failures;
+}
+
+// min_lod and max_lod are the expected word 1 limits of a table entry (and of an smpl static sampler); word 1 = 0
+// is MIN_LOD = MAX_LOD = 0. An smp static sampler keeps MinLOD 0 and an unbounded MaxLOD.
 void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v, unsigned w, unsigned filter,
-             unsigned anisotropy, UINT reg = 0)
+             unsigned anisotropy, UINT reg = 0, float min_lod = 0.0f, float max_lod = 0.0f)
 {
     ++cases;
     const int before = failures;
@@ -57,12 +68,14 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "static AddressV", s.AddressV, v);
     expect(name, "static AddressW", s.AddressW, w);
     expect(name, "static MaxAnisotropy", s.MaxAnisotropy, anisotropy);
-    expect(name, "static ComparisonFunc", s.ComparisonFunc, 8);  // ALWAYS
+    expect(name, "static ComparisonFunc", s.ComparisonFunc, 1);  // NEVER for ordinary filters
     expect(name, "static BorderColor", s.BorderColor, 0);       // TRANSPARENT_BLACK
     expect(name, "static ShaderRegister", s.ShaderRegister, reg);
     expect(name, "static RegisterSpace", s.RegisterSpace, 0);
     expect(name, "static ShaderVisibility", s.ShaderVisibility, 0);  // ALL
-    if (s.MipLODBias != 0.0f || s.MinLOD != 0.0f || s.MaxLOD != FLT_MAX) fail(name, "static LOD range", 0, 0);
+    lod_range(name, "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, FLT_MAX);
+    const D3D12_STATIC_SAMPLER_DESC limited = decode_sampler(words, reg, false, true);
+    lod_range(name, "static smpl", limited.MipLODBias, limited.MinLOD, limited.MaxLOD, min_lod, max_lod);
 
     const D3D12_SAMPLER_DESC d = dynamic_sampler(words);
     expect(name, "dynamic Filter", d.Filter, filter);
@@ -70,10 +83,10 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "dynamic AddressV", d.AddressV, v);
     expect(name, "dynamic AddressW", d.AddressW, w);
     expect(name, "dynamic MaxAnisotropy", d.MaxAnisotropy, anisotropy);
-    expect(name, "dynamic ComparisonFunc", d.ComparisonFunc, 8);
+    expect(name, "dynamic ComparisonFunc", d.ComparisonFunc, 1);
     for (float component : d.BorderColor)
         if (component != 0.0f) fail(name, "dynamic BorderColor", 1, 0);
-    if (d.MipLODBias != 0.0f || d.MinLOD != 0.0f || d.MaxLOD != FLT_MAX) fail(name, "dynamic LOD range", 0, 0);
+    lod_range(name, "dynamic", d.MipLODBias, d.MinLOD, d.MaxLOD, min_lod, max_lod);
     if (failures != before) std::printf("  words %08x %08x %08x %08x\n", words[0], words[1], words[2], words[3]);
 }
 
@@ -189,18 +202,33 @@ int main(int argc, char** argv)
     decoded("anisotropic mag", {0, 0, 2u << 20, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic min", {0, 0, 2u << 22, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic mag 3, ratio 4", {word0(0, 0, 0, 4), 0, 3u << 20, 0}, wrap, wrap, wrap, anisotropic, 16);
-    // Bits the decoder does not read: word 1, word 3, Z_FILTER and the high bits of words 0 and 2.
+    // Bits the decoder does not read: PERF_MIP and PERF_Z in word 1, word 3, Z_FILTER and the high bits of
+    // words 0 and 2. MIN_LOD and MAX_LOD are both 0xfff, 4095 / 256, for a table entry.
     decoded("ignored bits", {word0(2, 1, 3, 0) | 0xfffff000u, ~0u, 1u << 22 | 3u << 24 | 0xf0000000u | 0xfffffu, ~0u},
-            clamp, mirror, mirror_once, min_linear, 1, 7);
+            clamp, mirror, mirror_once, min_linear, 1, 7, 15.99609375f, 15.99609375f);
+    // Word 1: MIN_LOD bits 11:0 and MAX_LOD bits 23:12, unsigned 4.8 fixed point. Each field is read on its
+    // own: a whole level, a fraction, the smallest step and the largest value.
+    decoded("min lod 2", {0, 0x200u | 0xfffu << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 2.0f, 15.99609375f);
+    decoded("max lod 1", {0, 0x100u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.0f, 1.0f);
+    decoded("lod fractions", {0, 0x140u | 0x1c0u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.25f, 1.75f);
+    // MIN_LOD above MAX_LOD is passed through unchanged: D3D12 documents MaxLOD >= MinLOD, and no source here
+    // says what the console sampler does with that pair, so the decoder does not pick one. Device-free only.
+    decoded("min lod above max lod", {0, 0x1c0u | 0x140u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
+    decoded("lod smallest steps", {0, 0x001u | 0x001u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.00390625f,
+            0.00390625f);
+    decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0,
+            0.5f, 3.0f);
 
     // The border sampler a missing table entry uses: border on all three axes, point, transparent black.
     {
         ++cases;
         const D3D12_SAMPLER_DESC b = border_sampler();
         expect("border sampler", "Filter", b.Filter, point);
+        expect("border sampler", "ComparisonFunc", b.ComparisonFunc, 1);
         expect("border sampler", "AddressU", b.AddressU, border);
         expect("border sampler", "AddressV", b.AddressV, border);
         expect("border sampler", "AddressW", b.AddressW, border);
+        lod_range("border sampler", "dynamic", b.MipLODBias, b.MinLOD, b.MaxLOD, 0.0f, FLT_MAX);  // not a title descriptor
         for (float component : b.BorderColor)
             if (component != 0.0f) fail("border sampler", "BorderColor", 1, 0);
     }

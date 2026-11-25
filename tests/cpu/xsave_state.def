@@ -10,6 +10,8 @@ EXPORTS
     op_xrstor64_mask_sse
     op_vzeroupper_xsave64
     op_pipeline
+    op_xrstor64_xsave64_avx
+    op_xrstor64_movq_read_xsave64
     op_discarded_read
     op_xrstor64_xsavec
     op_xrstor64_xsavec64

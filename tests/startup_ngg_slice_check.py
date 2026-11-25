@@ -1,6 +1,7 @@
 """Source-built NGG primitive-shader cases: an identity triangle against single-change contrasts (#1723).
 
   (no arguments)        encode, decode and run every case, pure Python
+  binary <llvm-mc>      also reassemble all six programs with llvm-mc (gfx1013, wave64) and compare every word
 
 The fixture models this NGG primitive-shader pattern (no claim is made here about any shader archive): one
 lane of wave 0 writes the vertex and primitive counts to LDS, waits on s_barrier and sends GS_ALLOC_REQ; the other
@@ -55,11 +56,14 @@ primitive counts swapped, the wave offset of the thread index dropped, s_barrier
 reverse wave order alone), and exec ignored by vector ALU instructions. The expected results are written out below
 from the encoding, not computed by the model.
 
-The words are not reassembled here (no llvm-mc binary mode yet); they are checked against the decoder, against
-golden vectors of tests/rdna2_tools_check.py and against ANCHORS. This is a semantic fixture for classification;
+The words are checked against the decoder, against golden vectors of tests/rdna2_tools_check.py and against
+ANCHORS; 'binary <llvm-mc>' reassembles the six programs with LLVM and requires the same words (a deliberately
+wrong encoder word must be reported). This is a semantic fixture for classification;
 it is not a lowering and makes no claim about any console compiler.
 """
+import re
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -603,6 +607,47 @@ def evaluate(blob, case, mode='ngg', fault=None, keep=None):
         return dict(error=str(error))
 
 
+def llvm_text(text, pc):
+    """the decoder's spelling of one fixture line -> llvm-mc syntax"""
+    text = {'s_barrier 0x0': 's_barrier'}.get(text, text)
+    text = text.replace('s_sendmsg 0x9', 's_sendmsg sendmsg(MSG_GS_ALLOC_REQ)').replace('exp target_20', 'exp prim')
+    text = text.replace('vcc_lo', 'vcc')  # wave64
+    m = re.fullmatch(r'(s_branch|s_cbranch_\w+) label_0x([0-9a-f]+)', text)
+    return '%s %d' % (m.group(1), (int(m.group(2), 16) - pc - 4) // 4) if m else text
+
+
+def llvm_words(llvm_mc, code):
+    lines, pc = [], 0
+    for text, w in code:
+        lines.append(llvm_text(text, pc))
+        pc += 4 * len(w)
+    proc = subprocess.run([llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64,-wavefrontsize32',
+                           '-show-encoding'], input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True)
+    built = [bytes(int(b, 16) for b in m.group(1).split(','))
+             for m in re.finditer(r'encoding: \[([^\]]*)\]', proc.stdout)]
+    if len(built) != len(code):
+        raise AssertionError('llvm-mc encoded %d of %d instructions: %s' % (len(built), len(code), proc.stderr[:300]))
+    return [(line, struct.pack('<%dI' % len(w), *w), raw) for line, (_, w), raw in zip(lines, code, built) if
+            struct.pack('<%dI' % len(w), *w) != raw]
+
+
+def check_binary(llvm_mc):
+    count = 0
+    for case in EXPECTED:
+        code = program(case)
+        bad = llvm_words(llvm_mc, code)
+        if bad:
+            raise AssertionError('%s: llvm-mc encoding mismatch: %s' % (
+                case, '; '.join('%s: encoder %s, llvm-mc %s' % (t, a.hex(), b.hex()) for t, a, b in bad)))
+        count += len(code)
+    wrong = program(None)
+    wrong[1][1] = sop1('s_mov_b64', 's10', 'exec')  # encoder word for s[10:11] under the text for s[8:9]
+    if len(llvm_words(llvm_mc, wrong)) != 1:
+        raise AssertionError('a wrong encoder word was not reported by the llvm-mc comparison')
+    print('%d instructions of %d programs match llvm-mc; a wrong encoder word is reported' % (count, len(EXPECTED)))
+    return 0
+
+
 def main():
     failures = ['encoder gives %s, pinned %s' % (struct.pack('<%dI' % len(w), *w).hex(), want)
                 for want, w in GOLDEN if struct.pack('<%dI' % len(w), *w).hex() != want]
@@ -639,4 +684,10 @@ def main():
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == 'binary':
+        if main():
+            sys.exit(1)
+        sys.exit(check_binary(sys.argv[2]))
+    if len(sys.argv) != 1:
+        raise SystemExit(__doc__)
     sys.exit(main())

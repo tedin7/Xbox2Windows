@@ -1,5 +1,5 @@
 """Per-lane bit operations in tools/startup/gfx2hlsl.py: v_bfe_i32, v_bcnt_u32_b32, v_ffbl_b32, v_ffbh_u32,
-v_ffbh_i32 and v_bfrev_b32.
+v_ffbh_i32, v_bfrev_b32 and v_xor3_b32.
 
   (no arguments)                       translation controls, pure Python
   binary <llvm-mc>                     reassemble the fixture sources and compare them with the words below
@@ -54,6 +54,7 @@ OPS = {
     'v_ffbh_u32': (1, True, lambda x: next((k for k in range(32) if x >> (31 - k) & 1), MASK)),
     'v_ffbh_i32': (1, True, ref_ffbh_i32),
     'v_bfrev_b32': (1, True, lambda x: int('{:032b}'.format(x)[::-1], 2)),
+    'v_xor3_b32': (3, False, lambda x, y, z: x ^ y ^ z),  # LLVM 15 VOP3 v_xor3_b32: D.u = S0.u ^ S1.u ^ S2.u
 }
 # mnemonic -> (pattern in the translated text, replacement): a wrong lowering of the same operation
 MUTATIONS = {
@@ -63,6 +64,7 @@ MUTATIONS = {
     'v_ffbh_u32': (r'31u - firstbithigh', 'firstbithigh'),                    # counts from the low end
     'v_ffbh_i32': (r'asint\((v\d+)\) < 0 \? ~v\d+ : v\d+', r'\1'),            # negative values scanned as is
     'v_bfrev_b32': (r'reversebits\((v\d+)\)', r'\1'),                         # not reversed
+    'v_xor3_b32': (r'(v\d+) \^ (v\d+) \^ v\d+', r'\1 ^ \2'),                    # the third operand is dropped
 }
 # mnemonic -> the word the mutated lowering must produce, defined from the mutation and the inputs with plain integer
 # arithmetic (not from the evaluator and not from a readback)
@@ -73,14 +75,17 @@ MUTATION_REF = {
     'v_ffbh_u32': lambda x: MASK if x == 0 else x.bit_length() - 1,
     'v_ffbh_i32': lambda x: MASK if x in (0, MASK) else 32 - x.bit_length(),
     'v_bfrev_b32': lambda x: x,
+    'v_xor3_b32': lambda x, y, z: x ^ y,
 }
 SPECIAL = [0, 1, 2, 3, 0x7f, 0x80, 0xff, 0x7fffffff, 0x80000000, 0x80000001, 0xfffffffe, MASK, 0x55555555,
            0xaaaaaaaa, 0x12345678, 0xdeadbeef, 0x00ff0000]
 BITS = SPECIAL + [1 << k for k in range(32)] + [~(1 << k) & MASK for k in range(32)]
+XOR3_WORDS = [0, 1, 0x80000000, MASK, 0x13579bdf, 0x2468ace0, 0xfedcba98, 0x0f0f0f0f, 0xa5c30f96]
 GRID = {
     'v_bfe_i32': [(x, off, w) for x in SPECIAL for off in range(32) for w in range(32)]
                  + [(x, off, w) for x in SPECIAL for off, w in ((32, 33), (63, 0xffffffe5), (0x25, 0x1f))],
     'v_bcnt_u32_b32': [(x, y, 0) for x in BITS for y in (0, 1, 32, MASK)],
+    'v_xor3_b32': [(x, y, z) for x in XOR3_WORDS for y in XOR3_WORDS for z in XOR3_WORDS],
 }
 for _name, (_arity, _vop1, _ref) in OPS.items():
     GRID.setdefault(_name, [(x, 0, 0) for x in BITS])
@@ -91,6 +96,11 @@ DRAW = {
                   (0x00ff0000, 16, 8), (0x00800000, 16, 8), (0x12345678, 32, 5), (0xdeadbeef, 5, 37)],
     'v_bcnt_u32_b32': [(0, 0, 0), (0xff, 5, 0), (MASK, MASK, 0), (0x80000001, 1, 0),
                        (0x55555555, 0, 0), (0, MASK, 0), (0xf0f0f0f0, 7, 0), (0x00010000, 0x80000000, 0)],
+    # Three different sources in every byte (13/24/fe, 57/68/dc, 9b/ac/ba, df/e0/98), so dropping any one source,
+    # or OR, AND or an add for the XOR, reads a different word; the other sets check zero, all ones and a repeat.
+    'v_xor3_b32': [(0x13579bdf, 0x2468ace0, 0xfedcba98), (0x2468ace0, 0xfedcba98, 0x13579bdf),
+                   (0xfedcba98, 0x13579bdf, 0x2468ace0), (0x0f0f0f0f, 0xa5c30f96, 0x80000001),
+                   (0, 0, 0), (MASK, MASK, MASK), (0x13579bdf, 0x13579bdf, 0x2468ace0), (0, 0xdeadbeef, MASK)],
 }
 for _name in ('v_ffbl_b32', 'v_ffbh_u32', 'v_ffbh_i32', 'v_bfrev_b32'):
     DRAW[_name] = [(x, 0, 0) for x in (0, 0x100, 0x80000000, 0xfffffff0, 1, MASK, 0x7fffffff, 0xdeadbeef,
@@ -113,6 +123,8 @@ BODY_WORDS = {
         '0077187e0d00bbd50101000002771c7e0f00bbd503010000'),
     'v_bfrev_b32': bytes.fromhex(
         '0071187e0d00b8d50101000002711c7e0f00b8d503010000'),
+    'v_xor3_b32': bytes.fromhex(
+        '0c0078d5000922040d0078d5010b26040e0078d5020d2a040f0078d5030f2e04'),
 }
 PRE_SOURCE = 's_mov_b32 m0, s2\n' + ''.join('v_interp_mov_f32 v%d, p0, attr%d.%s\n' % (4 * p + c, p, 'xyzw'[c])
                                            for p in range(3) for c in range(4))
@@ -343,13 +355,16 @@ def controls():
           lane_results(exprs, [(0x80, 0, 8), (0x12345678, 8, 0), (0x80000000, 16, 31), (0x7fffffff, 31, 31)])
           == [0xffffff80, 0, 0xffff8000, 0])
     check('the same forms without a modifier or operand error translate', not any(refused(a) for a in (
-        'v_ffbh_i32_e64 v1, v2', 'v_bfe_i32 v1, v2, v3, v4', 'v_bcnt_u32_b32 v1, v2, v3', 'v_bfrev_b32 v1, v2')))
+        'v_ffbh_i32_e64 v1, v2', 'v_bfe_i32 v1, v2, v3, v4', 'v_bcnt_u32_b32 v1, v2, v3', 'v_bfrev_b32 v1, v2',
+        'v_xor3_b32 v1, v2, v3, v4')))
     check('modifiers refused', all(refused(a) for a in (
         'v_ffbh_u32_e64 v1, v2 clamp', 'v_bfe_i32 v1, v2, v3, v4 clamp', 'v_bcnt_u32_b32 v1, v2, v3 clamp',
         'v_ffbl_b32_e64 v1, v2 mul:2', 'v_bfrev_b32_e64 v1, -v2', 'v_ffbh_i32_e64 v1, |v2|',
-        'v_bfe_i32 v1, v2, v3, v4 op_sel:[1,0,0,0]')))
+        'v_bfe_i32 v1, v2, v3, v4 op_sel:[1,0,0,0]', 'v_xor3_b32 v1, v2, v3, v4 clamp',
+        'v_xor3_b32 v1, -v2, v3, v4', 'v_xor3_b32 v1, v2, |v3|, v4', 'v_xor3_b32 v1, v2, v3, v4 op_sel:[1,0,0,0]')))
     check('wrong operand count refused', all(refused(a) for a in (
-        'v_bfe_i32 v1, v2, v3', 'v_bcnt_u32_b32 v1, v2', 'v_ffbl_b32 v1, v2, v3', 'v_bfrev_b32 v1')))
+        'v_bfe_i32 v1, v2, v3', 'v_bcnt_u32_b32 v1, v2', 'v_ffbl_b32 v1, v2, v3', 'v_bfrev_b32 v1',
+        'v_xor3_b32 v1, v2, v3', 'v_xor3_b32 v1, v2, v3, v4, v5')))
 
 
 def check_binary(llvm_mc):

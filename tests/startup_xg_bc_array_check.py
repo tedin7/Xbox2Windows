@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 from startup_address_srv_check import draw_texture
-from startup_xg_bc7_layout_check import DESC, PTR, HRESULT, LAYOUT_BYTES, LAYOUT, COPY_INTO, RELEASE
+from startup_xg_bc7_layout_check import DESC, PTR, HRESULT, LAYOUT_BYTES, LAYOUT, COPY_INTO, COPY_FROM, RELEASE
 from startup_xg_bc_chain_check import block, color
 
 GUARD = b"\xd7" * 64
@@ -67,7 +67,7 @@ def prepare(create, fmt, height, path):
         assert memory.raw[:-1] == GUARD + expected + GUARD, "tile address, tail padding or slice guard changed"
         for sub, pitch, rows, linear in subresources:
             dst = ctypes.create_string_buffer(b"\xa1" * (pitch * rows))
-            assert COPY_INTO(vt[9])(instance, dst, 0, sub, base, pitch, len(linear)) == 0
+            assert COPY_FROM(vt[9])(instance, dst, 0, sub, 0, base, pitch, len(linear)) == 0
             assert dst.raw[:-1] == linear, f"copy-out mismatch at subresource {sub}"
         assert COPY_INTO(vt[8])(instance, base, 0, 18, b"\x00" * 16, 16, 16) & 0xffffffff == 0x80070057
         assert memory.raw[:-1] == GUARD + expected + GUARD

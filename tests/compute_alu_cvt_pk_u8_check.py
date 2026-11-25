@@ -5,6 +5,7 @@ and do not define flt32_to_uint8. Every binary32 S0 that reaches the conversion 
 where truncation, any rounding mode and any clamp give the same byte. Fractional, negative, out-of-range and NaN inputs
 are not exercised, and the translator refuses them as constants.
 """
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -206,6 +207,11 @@ def draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in PROGRAM if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

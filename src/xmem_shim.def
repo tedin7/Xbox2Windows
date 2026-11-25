@@ -16,3 +16,9 @@ EXPORTS
     x2w_xmem_write_physical @14
     x2w_xmem_page_stats @15
     x2w_xmem_slab_stats @16
+    x2w_xmem_commit_range @17
+    x2w_xmem_commit_block @18
+    x2w_xmem_lease_section @19
+    x2w_xmem_release_section @20
+    x2w_xmem_match_section @21
+    X2WMapPageBatch @22

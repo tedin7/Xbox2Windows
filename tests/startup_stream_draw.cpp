@@ -190,6 +190,8 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
     return binding.table ? 0 : 41;
 }
 
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding);
+
 bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
 {
     std::ifstream file(input.blocks, std::ios::binary);
@@ -217,7 +219,45 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
     void* texture = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
         D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
 
+bool bind_small4k(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    std::ifstream file(input.blocks, std::ios::binary);
+    const std::vector<unsigned char> texels{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
+    if (texels.size() != 32 * 32 * 4 + 16 * 16 * 4) return false;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0x1000, 32, 32, 1, 2,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    void** computer = nullptr;
+    if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return false;
+    const auto table = static_cast<void**>(computer[0]);
+    using Query = HRESULT(*)(void*, unsigned char*);
+    using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+    UINT64 total = 0, alignment = 0;
+    HRESULT hr = reinterpret_cast<Query>(table[2])(computer, layout.data());
+    std::memcpy(&total, layout.data(), sizeof total);
+    std::memcpy(&alignment, layout.data() + 8, sizeof alignment);
+    std::printf("small4k: slot 2 total 0x%llx alignment 0x%llx\n", static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(alignment));
+    if (SUCCEEDED(hr) && (total != 0x2000 || alignment != 0x1000)) hr = E_FAIL;
+    auto* memory = SUCCEEDED(hr) ? static_cast<unsigned char*>(VirtualAlloc(nullptr, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) : nullptr;
+    DWORD old = 0;
+    if (!memory || !VirtualProtect(memory + 0x2000, 0x1000, PAGE_NOACCESS, &old)) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = reinterpret_cast<Write>(table[8])(computer, memory, 0, 0, texels.data(), 128, 0);
+    if (SUCCEEDED(hr)) hr = reinterpret_cast<Write>(table[8])(computer, memory, 0, 1, texels.data() + 32 * 32 * 4, 64, 0);
+    reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    if (FAILED(hr)) return false;
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(memory), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
+
+// A shader-visible heap whose first entry is a view of every mip of texture; binding.table is its GPU handle.
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding)
+{
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment;
     binding.views.resize(static_cast<std::size_t>(entries) * increment);
@@ -240,19 +280,24 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
-    const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
+    const bool console_view = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", nullptr, 0) != 0;
+    const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
+    const bool bc = console_view || console_gate || GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
-    const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const bool single = typed;
     const bool legacy = !single;
-    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
     if (bc7 && bc7->packed) {
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
+    } else if (bc7 && bc7->small4k) {
+        if (!bind_small4k(desktop.Get(), guest, *bc7, binding)) return 35;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
@@ -281,9 +326,24 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_MEMORY_SRV_DIAG", nullptr, 0)) {
+        extern int draw_memory_srv_diagnostics(ID3D12Device*, void*, void*);
+        if (const int result = draw_memory_srv_diagnostics(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", nullptr, 0)) {
+        extern int draw_single_element_srvs(void*, void*);
+        if (const int result = draw_single_element_srvs(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0)) {
+        extern int draw_formatted_buffer(void*, void*);
+        if (const int result = draw_formatted_buffer(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_VOLUME_SRV", nullptr, 0)) {
+        extern int draw_volume_address_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_volume_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0)) {
+        extern int draw_d16_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_d16_srvs(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_VERTEX_FETCH", nullptr, 0)) {
         // TEXCOORD float3 in slot 0 and POSITION float3 in slot 1, 12 bytes each; vertices 0-2 are unused. Vertices
         // 3-8 are drawn from start vertex 3: positions cover pixels [1, 3) x [1, 3) of the 8x4 target, texture
@@ -319,7 +379,57 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
     }
-    if (bc) {
+    if (console_view) {
+        extern int draw_console_address_srv(void*, void*);
+        if (const int result = draw_console_address_srv(guest, list)) return result;
+    } else if (console_gate) {
+        // X2W_TEST_CONSOLE_GATE: the queue waits on a fence this fixture holds while eighteen lists are
+        // recorded and submitted on one list object, each after a new payload was written at the same
+        // address (draw_gated_console_payload). Nothing may complete before the fence is signalled; the
+        // target is read back after the last submit has completed.
+        extern int draw_gated_console_payload(void*, void*, unsigned, bool);
+        constexpr unsigned payloads = 18;
+        void* gate = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate))))) return 44;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        const auto next_recording = [&] {
+            if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+                FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return false;
+            invoke(list, 50, 1, arg(&rtv));
+            invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            invoke(list, 25, arg(pso));
+            return true;
+        };
+        // Retrying the same bytes after abandoning a recording still needs an upload. Keep the
+        // shared-ring control's first upload submitted so its mismatch comes from ring wrap.
+        if (!GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0)) {
+            if (const int result = draw_gated_console_payload(guest, list, 0, true)) return result;
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || !next_recording()) return 35;
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 17, arg(gate), 1)))) return 45;
+        for (unsigned payload = 0; payload < payloads; ++payload) {
+            if (payload && !next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, payload, payload == 0)) return result;
+            invoke(list, 9);
+            invoke(queue, 10, 1, arg(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payload + 1)))) return 24;
+        }
+        Sleep(250);
+        if (invoke(fence, 8) != 0) return 46;  // a submit completed although the queue was held
+        if (FAILED(static_cast<HRESULT>(invoke(gate, 10, 1)))) return 47;
+        // One more recording without a draw: its submit is where the stand-in visits the completed ones.
+        const auto reached = [&](UINT64 value) {
+            const auto deadline = GetTickCount64() + 60000;
+            while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+            return invoke(fence, 8) == value;
+        };
+        if (!reached(payloads)) return 25;
+        if (!next_recording()) return 35;
+        invoke(list, 9);
+        invoke(queue, 10, 1, arg(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;
+        return read_stream_target(desktop.Get(), frame, pixels);
+    } else if (bc) {
         extern int draw_bc_address_srvs(void*, void*);
         if (const int result = draw_bc_address_srvs(guest, list)) return result;
     }

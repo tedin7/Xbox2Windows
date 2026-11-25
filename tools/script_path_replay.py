@@ -110,13 +110,13 @@ def replay(tree, states, children, paths, host):
     return results
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--host", type=Path, required=True)
     parser.add_argument("--record-with", required=True, help="State ID unique to one record")
     parser.add_argument("paths", nargs="+", help="State paths relative to the states container")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         tree, states, children = select_tree(args.archive, joaat(args.record_with))
     except (OSError, ValueError) as exc:
@@ -126,3 +126,8 @@ if __name__ == "__main__":
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{args.archive}: {exc}\n")
     print(json.dumps(results, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

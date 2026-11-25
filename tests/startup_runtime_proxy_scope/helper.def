@@ -1,0 +1,3 @@
+LIBRARY startup_runtime_proxy_helper
+EXPORTS
+    resolve_query

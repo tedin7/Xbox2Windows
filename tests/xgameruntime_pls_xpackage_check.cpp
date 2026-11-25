@@ -2,7 +2,8 @@
 // subset. It loads the fixture-only DLL by explicit path, writes a test-owned
 // marker under the PLS directory, verifies the package mount path and unmount
 // status, and checks that no implemented call logged E_NOTIMPL. The negative
-// controls are the XPackage async stub and the XUserAddAsync stub.
+// controls are XPackageMountWithUiAsync with a null block (E_INVALIDARG) and
+// XUserAddAsync(None), which the shim refuses (E_NOTIMPL).
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -377,7 +378,7 @@ bool log_checks(HMODULE module)
     bool saw_package_invalid = false;
     bool saw_package_pointer = false;
     bool saw_package_handle = false;
-    bool saw_async_stub = false;
+    bool saw_async_null_block = false;
     bool saw_user_stub = false;
     for (std::size_t i = 0; i < count; ++i) {
         const auto& entry = entries[i];
@@ -388,8 +389,7 @@ bool log_checks(HMODULE module)
         const bool pls = std::strcmp(entry.component, "XPersistentLocalStorage") == 0;
         const bool package = std::strcmp(entry.component, "XPackage") == 0;
         const bool user = std::strcmp(entry.component, "XUser") == 0;
-        if ((pls || package) && entry.result == not_implemented &&
-            std::strcmp(entry.function, "XPackageMountWithUiAsync") != 0) {
+        if ((pls || package) && entry.result == not_implemented) {
             std::printf("FAIL: implemented contract logged E_NOTIMPL: %s\n", entry.function);
             return false;
         }
@@ -417,12 +417,12 @@ bool log_checks(HMODULE module)
             } else if (std::strcmp(entry.function, "XPackageCloseMountHandle") == 0) {
                 saw_package_close = true;
             } else if (std::strcmp(entry.function, "XPackageMountWithUiAsync") == 0) {
-                if (entry.result != not_implemented) {
-                    std::printf("FAIL: async package stub returned 0x%08lx\n",
+                if (entry.result != E_INVALIDARG) {
+                    std::printf("FAIL: async package null block returned 0x%08lx\n",
                                 static_cast<unsigned long>(entry.result));
                     return false;
                 }
-                saw_async_stub = true;
+                saw_async_null_block = true;
             } else {
                 std::printf("FAIL: unexpected XPackage function %s\n", entry.function);
                 return false;
@@ -433,7 +433,7 @@ bool log_checks(HMODULE module)
         }
         if (user && std::strcmp(entry.function, "XUserAddAsync") == 0) {
             if (entry.result != not_implemented) {
-                std::printf("FAIL: XUserAddAsync stub returned 0x%08lx\n",
+                std::printf("FAIL: XUserAddAsync(None) returned 0x%08lx\n",
                             static_cast<unsigned long>(entry.result));
                 return false;
             }
@@ -443,7 +443,7 @@ bool log_checks(HMODULE module)
     if (!saw_pls_path_size || !saw_pls_path || !saw_pls_space || !saw_package_mount ||
         !saw_package_path_size || !saw_package_path || !saw_package_close ||
         !saw_pls_invalid || !saw_pls_pointer || !saw_package_invalid ||
-        !saw_package_pointer || !saw_package_handle || !saw_async_stub || !saw_user_stub) {
+        !saw_package_pointer || !saw_package_handle || !saw_async_null_block || !saw_user_stub) {
         std::printf("FAIL: log is missing positive or negative controls\n");
         return false;
     }
@@ -489,17 +489,17 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
         !package_checks(mount, get_mount_path_size, get_mount_path, close_mount)) {
         return false;
     }
-    if (mount_with_ui("x2w-synthetic-package-0001", nullptr) != not_implemented) {
-        std::printf("FAIL: XPackageMountWithUiAsync is not a logged stub\n");
+    if (mount_with_ui("x2w-synthetic-package-0001", nullptr) != E_INVALIDARG) {
+        std::printf("FAIL: XPackageMountWithUiAsync accepted a null block\n");
         return false;
     }
     if (user_add(XUserAddOptionsNone, nullptr) != not_implemented) {
-        std::printf("FAIL: XUserAddAsync is not a logged stub\n");
+        std::printf("FAIL: XUserAddAsync(None) is not refused\n");
         return false;
     }
     if (!log_checks(shim.module)) return false;
 
-    std::printf("xgameruntime PLS/XPackage: space=%llu/%llu/%llu async=stub "
+    std::printf("xgameruntime PLS/XPackage: space=%llu/%llu/%llu async-null-block=E_INVALIDARG "
                 "unmount=E_HANDLE user-async=E_NOTIMPL calls=%zu PASS\n",
                 static_cast<unsigned long long>(synthetic_available_free_bytes),
                 static_cast<unsigned long long>(synthetic_total_free_bytes),

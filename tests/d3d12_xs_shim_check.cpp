@@ -8,12 +8,14 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <vector>
 
 #include "pso_compute_embedded.h"
 #include "pso_compute_stripped.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace std::literals;
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
 namespace {
 constexpr std::uint32_t observed_console_flags = 0x03000000u;
@@ -194,6 +196,195 @@ bool serialize_checks()
     std::printf("v11_cases=4 v10_cases=1 negative_cases=5 null_hr=0x%08lx bad_ver_hr=0x%08lx\n",
                 static_cast<unsigned long>(shim_null_hr), static_cast<unsigned long>(shim_ver_hr));
     return true;
+}
+
+// The RTS0 flags word of a serialized root signature, ~0u if the container has none.
+std::uint32_t rts0_flags(const unsigned char* data, std::size_t bytes)
+{
+    std::uint32_t parts = 0;
+    if (bytes < 32 || std::memcmp(data, "DXBC", 4) != 0) return ~0u;
+    std::memcpy(&parts, data + 28, 4);
+    for (std::uint32_t i = 0; i < parts && 32 + 4 * (i + 1) <= bytes; ++i) {
+        std::uint32_t at = 0, flags = 0;
+        std::memcpy(&at, data + 32 + 4 * i, 4);
+        if (std::size_t{at} + 8 + 24 > bytes || std::memcmp(data + at, "RTS0", 4) != 0) continue;
+        std::memcpy(&flags, data + at + 8 + 20, 4);
+        return flags;
+    }
+    return ~0u;
+}
+
+// Provenance (switch on, retry reachable). The baseline without heap-indexing bits and inputs with
+// only 0x400, only 0x800 and both all serialize to the same bytes, so the bytes cannot say which call
+// produced a blob. All four blobs are alive at once, in both call orders; each goes through the
+// recording device's CreateRootSignature, and the copy that device keeps for shader translation must
+// carry exactly its own call's bits. A copy of the bytes in other memory gets none.
+// The flags command-list slot 34 acts on (src/startup_stubs/heap_indexed_root.h) come from the desktop
+// blob, which has no heap-indexing bits after a retry: the desktop root signature does not index heaps,
+// so slot 34 must set it directly (recorded flags 0), whatever the translation copy carries.
+bool provenance_checks(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& base, std::uint32_t(__cdecl* stripped_bits)(const void*, std::size_t))
+{
+    using TranslationBlob = std::size_t(__cdecl*)(void*, void*, std::size_t, UINT*);
+    const auto translation_blob = reinterpret_cast<TranslationBlob>(
+        GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"), "x2w_d3d12_root_translation_blob"));
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter> warp;
+    std::array<unsigned char, 64> parameters{};
+    void* device = nullptr;
+    if (!translation_blob || FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) ||
+        FAILED(D3D12XboxCreateDevice(warp.Get(), parameters.data(), __uuidof(ID3D12Device), &device)) || !device) {
+        std::fprintf(stderr, "provenance: no recording device (translation export %p)\n", reinterpret_cast<void*>(translation_blob));
+        return false;
+    }
+    // Device slot 16: CreateRootSignature(node, blob, size, riid, ppv).
+    const auto create_root = [device](const void* blob, std::size_t size, void** root) {
+        using Slot = HRESULT(WINAPI*)(void*, UINT, const void*, SIZE_T, const GUID*, void**);
+        return reinterpret_cast<Slot>((*static_cast<void***>(device))[16])(device, 0, blob, size, &__uuidof(ID3D12RootSignature), root);
+    };
+    // The flags of the copy the recording device kept for translation, ~0u if it kept none; desktop gets
+    // the heap-indexing flags slot 34 acts on.
+    const auto translation_flags = [translation_blob](void* root, UINT* desktop) {
+        std::array<unsigned char, 4096> copy{};
+        *desktop = ~0u;
+        const std::size_t bytes = translation_blob(root, copy.data(), copy.size(), desktop);
+        return bytes && bytes <= copy.size() ? rts0_flags(copy.data(), bytes) : ~0u;
+    };
+
+    const auto base_flags = static_cast<std::uint32_t>(base.Desc_1_1.Flags);
+    bool ok = true;
+    for (const std::array<std::uint32_t, 4>& order :
+         {std::array<std::uint32_t, 4>{0u, 0x400u, 0x800u, 0xC00u}, std::array<std::uint32_t, 4>{0xC00u, 0x800u, 0x400u, 0u}}) {
+        std::array<ComPtr<ID3DBlob>, 4> blobs;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = base;
+            desc.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(base_flags | order[i]);
+            if (FAILED(D3D12SerializeVersionedRootSignature(&desc, &blobs[i], nullptr)) || !blobs[i]) {
+                std::fprintf(stderr, "provenance: serialization of 0x%x failed\n", order[i]);
+                return false;
+            }
+        }
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            ComPtr<IUnknown> root;
+            const HRESULT hr = create_root(blobs[i]->GetBufferPointer(), blobs[i]->GetBufferSize(), reinterpret_cast<void**>(root.GetAddressOf()));
+            const std::uint32_t lookup = stripped_bits(blobs[i]->GetBufferPointer(), blobs[i]->GetBufferSize());
+            UINT desktop = ~0u;
+            const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get(), &desktop) : ~0u;
+            const bool same_bytes = same_blob(blobs[i].Get(), blobs[0].Get());
+            const bool good = SUCCEEDED(hr) && same_bytes && lookup == order[i] && used == (base_flags | order[i]) && desktop == 0;
+            std::printf("provenance order=%s input=0x%03x: create=0x%08lx same_bytes=%d lookup=0x%03x translation_flags=0x%08x "
+                        "slot34_heap_flags=0x%x %s\n",
+                        order[0] == 0 ? "baseline-first" : "both-first", order[i], static_cast<unsigned long>(hr), same_bytes ? 1 : 0,
+                        lookup, used, desktop, good ? "ok" : "WRONG");
+            ok = ok && good;
+        }
+        // The same bytes copied elsewhere carry no provenance: the translation copy keeps the
+        // desktop flags rather than guess which call they came from.
+        std::vector<unsigned char> copied(static_cast<const unsigned char*>(blobs[3]->GetBufferPointer()),
+                                          static_cast<const unsigned char*>(blobs[3]->GetBufferPointer()) + blobs[3]->GetBufferSize());
+        ComPtr<IUnknown> root;
+        const HRESULT hr = create_root(copied.data(), copied.size(), reinterpret_cast<void**>(root.GetAddressOf()));
+        UINT desktop = ~0u;
+        const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get(), &desktop) : ~0u;
+        const bool good = SUCCEEDED(hr) && stripped_bits(copied.data(), copied.size()) == 0 && used == base_flags && desktop == 0;
+        std::printf("provenance copy of 0x%03x: translation_flags=0x%08x slot34_heap_flags=0x%x %s\n", order[3], used, desktop,
+                    good ? "ok" : "WRONG");
+        ok = ok && good;
+    }
+    static_cast<IUnknown*>(device)->Release();
+    return ok;
+}
+
+// Heap-indexing flags (CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED). A desktop
+// runtime older than shader model 6.6 refuses them with E_INVALIDARG; with X2W_D3D12_PERMISSIVE=1
+// d3d12_xs.dll serializes again without them and records which bits it removed for that blob.
+// Returns 0 (pass), 1 (fail) or 77 when the desktop runtime accepts the flags (retry unreachable).
+int heap_indexing_checks()
+{
+    constexpr std::uint32_t heap_indexing = 0x00000C00u;
+    DesktopD3D12 desktop;
+    if (!desktop.load()) return 1;
+    using Stripped = std::uint32_t(__cdecl*)(const void*, std::size_t);
+    const auto stripped_bits = reinterpret_cast<Stripped>(
+        GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"), "x2w_stripped_root_flags"));
+    if (!stripped_bits) {
+        std::fprintf(stderr, "x2w_stripped_root_flags not exported\n");
+        return 1;
+    }
+
+    constexpr auto desktop_flag = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS;
+    D3D12_ROOT_PARAMETER1 param = make_constants_param1();
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC base{};
+    base.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    base.Desc_1_1.NumParameters = 1;
+    base.Desc_1_1.pParameters = &param;
+    base.Desc_1_1.Flags = desktop_flag;
+    ComPtr<ID3DBlob> baseline;
+    if (FAILED(desktop.serialize(&base, &baseline, nullptr)) || !baseline) return 1;
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed = base;
+    const auto indexed_flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(desktop_flag) | heap_indexing);
+    indexed.Desc_1_1.Flags = indexed_flags;
+    ComPtr<ID3DBlob> desktop_indexed;
+    const HRESULT desktop_hr = desktop.serialize(&indexed, &desktop_indexed, nullptr);
+    SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", nullptr);
+
+    if (SUCCEEDED(desktop_hr)) {
+        // A runtime with shader model 6.6 keeps the flags; the shim must pass them through unchanged.
+        ComPtr<ID3DBlob> shim_indexed;
+        const HRESULT shim_hr = D3D12SerializeVersionedRootSignature(&indexed, &shim_indexed, nullptr);
+        const bool same = SUCCEEDED(shim_hr) && same_blob(shim_indexed.Get(), desktop_indexed.Get()) &&
+                          stripped_bits(shim_indexed->GetBufferPointer(), shim_indexed->GetBufferSize()) == 0;
+        std::printf("desktop accepts heap-indexing flags (hr=0x%08lx); pass-through %s; retry not reachable: skip\n",
+                    static_cast<unsigned long>(desktop_hr), same ? "identical" : "DIFFERENT");
+        return same ? 77 : 1;
+    }
+
+    // Negative control: without the switch the shim answers like the desktop runtime.
+    ComPtr<ID3DBlob> refused;
+    const HRESULT off_hr = D3D12SerializeVersionedRootSignature(&indexed, &refused, nullptr);
+    if (desktop_hr != E_INVALIDARG || off_hr != E_INVALIDARG || refused) {
+        std::fprintf(stderr, "switch off: desktop=0x%08lx shim=0x%08lx\n", static_cast<unsigned long>(desktop_hr),
+                     static_cast<unsigned long>(off_hr));
+        return 1;
+    }
+
+    SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", L"1");
+    int failures = 0;
+    // The retry: the blob equals the desktop serialization without the two bits, the caller's
+    // descriptor is untouched, and the removed bits are recorded for that blob (and only for it).
+    for (const std::uint32_t extra : {0u, 0x03000000u}) {
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC tagged = indexed;
+        const auto tagged_flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(indexed_flags) | extra);
+        tagged.Desc_1_1.Flags = tagged_flags;
+        ComPtr<ID3DBlob> retried;
+        const HRESULT hr = D3D12SerializeVersionedRootSignature(&tagged, &retried, nullptr);
+        const std::uint32_t recorded = retried ? stripped_bits(retried->GetBufferPointer(), retried->GetBufferSize()) : ~0u;
+        const bool ok = SUCCEEDED(hr) && same_blob(retried.Get(), baseline.Get()) && tagged.Desc_1_1.Flags == tagged_flags &&
+                        recorded == heap_indexing;
+        std::printf("retry extra=0x%08x: hr=0x%08lx same_as_desktop_without_bits=%d recorded=0x%x\n", extra,
+                    static_cast<unsigned long>(hr), retried && same_blob(retried.Get(), baseline.Get()) ? 1 : 0, recorded);
+        if (!ok) ++failures;
+    }
+    // A blob with other content records nothing, nor does a null blob.
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC other = base;
+    other.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    ComPtr<ID3DBlob> other_blob;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&other, &other_blob, nullptr)) || !other_blob ||
+        stripped_bits(other_blob->GetBufferPointer(), other_blob->GetBufferSize()) != 0 || stripped_bits(nullptr, 0) != 0) {
+        std::fprintf(stderr, "stripped bits recorded for a blob without a retry\n");
+        ++failures;
+    }
+    if (!provenance_checks(base, stripped_bits)) ++failures;
+    // The retry does not hide another fault: unobserved invalid bits next to 0xC00 stay refused.
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC bad = indexed;
+    bad.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(indexed_flags) | 0x04000000u);
+    ComPtr<ID3DBlob> bad_blob;
+    const HRESULT bad_hr = D3D12SerializeVersionedRootSignature(&bad, &bad_blob, nullptr);
+    std::printf("invalid bits with heap-indexing: hr=0x%08lx\n", static_cast<unsigned long>(bad_hr));
+    if (bad_hr != E_INVALIDARG || bad_blob) ++failures;
+    SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", nullptr);
+    return failures ? 1 : 0;
 }
 
 bool deserialize_checks()
@@ -391,6 +582,10 @@ int main(int argc, char** argv)
         passed = iid_checks();
     } else if (scenario == "warp_root"sv) {
         passed = warp_root_checks();
+    } else if (scenario == "heap_indexing"sv) {
+        const int result = heap_indexing_checks();
+        std::printf("Desktop d3d12_xs.dll heap_indexing: %s\n", result == 0 ? "PASS" : result == 77 ? "SKIP" : "FAIL");
+        return result;
     } else {
         return 2;
     }

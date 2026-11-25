@@ -95,6 +95,25 @@ ENDIF
     ret
 op_pipeline ENDP
 
+; MOVQ that only reads MM3, to memory or to a register, still clears TOP and marks every tag valid.
+op_fxrstor64_movq_store PROC FRAME
+    .endprolog
+    fxrstor64 [rcx]
+    movq QWORD PTR [r8+512], mm3
+    fxsave64 [r8]
+    emms
+    ret
+op_fxrstor64_movq_store ENDP
+
+op_fxrstor64_movq_gpr PROC FRAME
+    .endprolog
+    fxrstor64 [rcx]
+    movq r9, mm3
+    fxsave64 [r8]
+    emms
+    ret
+op_fxrstor64_movq_gpr ENDP
+
 ; The discarded fxrstor64 [rdx] must fault after [r8] and before [r8+512].
 op_discarded_read PROC FRAME
     .endprolog

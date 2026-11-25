@@ -9,7 +9,8 @@ modeled as std::uint64_t mm[8]. Volatile scratch GPRs (rax, r9, r10, r11) carry
 EVEX and other non-legacy forms reject.
 
 Supported instructions:
-  - MMX/SSE2 conversion & bridge ops: cvtpd2pi, cvttpd2pi, movdq2q, movq2dq, emms
+  - MMX/SSE2 conversion & bridge ops: cvtpd2pi, cvttpd2pi, cvtpi2pd, movdq2q,
+    movq2dq, emms
   - Transport & ABI glue: movdqa (16-byte aligned), movdqu, movq (between
     mm/scratch-r64/[rcx|rdx|r8]), and terminal ret
 
@@ -19,14 +20,16 @@ MMX state policy:
     Floating-point status flags and physical x87 tag transitions are outside
     the ABI. The exported result is the caller's output bytes.
   - mmx_active starts false and becomes true whenever any MM0..MM7 register is
-    touched; ret rejects while mmx_active is true.
+    touched (cvtpi2pd xmm, m64 reads memory without touching MMX registers or
+    setting mmx_active); ret rejects while mmx_active is true.
   - emms clears mmx_active and invalidates active MM register definitions, and
     is allowed unconditionally (even when mmx_active is false).
 
 Memory policy:
   - All memory operands must be flat [base + disp] rooted in rcx, rdx or r8.
   - Memory stores are restricted to r8.
-  - cvtpd2pi/cvttpd2pi m128 and movdqa m128 require disp % 16 == 0.
+  - cvtpd2pi/cvttpd2pi m128 and movdqa m128 require disp % 16 == 0; cvtpi2pd m64
+    and movq m64 allow any byte displacement.
 """
 
 import argparse
@@ -59,6 +62,7 @@ ALLOWED_CODES = {
     Code.RETNQ,
     Code.EMMS,
     *CVT_PD2PI_HELPERS,
+    Code.CVTPI2PD_XMM_MMM64,
     Code.MOVDQ2Q_MM_XMM,
     Code.MOVQ2DQ_XMM_MM,
     Code.MOVDQA_XMM_XMMM128,
@@ -71,7 +75,8 @@ ALLOWED_CODES = {
     Code.MOVQ_RM64_MM,
 }
 
-PRELUDE = """#include <cmath>
+PRELUDE = """#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -81,10 +86,13 @@ struct Vec128 {
     std::uint64_t q[2];
 };
 
+// Guest reads can fault even when the translated result is dead. Keep surrounding guest
+// writes on their original side of the read when the compiler inlines these helpers.
 static inline std::uint64_t load64(word address) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
-    return val;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto value = *reinterpret_cast<const volatile std::uint64_t __unaligned*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return value;
 }
 
 static inline void store64(word address, std::uint64_t val) {
@@ -92,9 +100,12 @@ static inline void store64(word address, std::uint64_t val) {
 }
 
 static inline Vec128 load128(word address) {
-    Vec128 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 16);
-    return v;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Vec128 value;
+    std::memcpy(value.q, reinterpret_cast<const void*>(address), sizeof(value.q));
+    const volatile Vec128 observed = value;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{observed.q[0], observed.q[1]}};
 }
 
 static inline void store128(word address, const Vec128& v) {
@@ -105,6 +116,18 @@ static inline double q_as_double(std::uint64_t bits) {
     double v;
     std::memcpy(&v, &bits, 8);
     return v;
+}
+
+static inline std::uint64_t double_as_q(double v) {
+    std::uint64_t bits = 0ull;
+    std::memcpy(&bits, &v, 8);
+    return bits;
+}
+
+static inline Vec128 op_cvtpi2pd(std::uint64_t src) {
+    const auto lo = static_cast<std::int32_t>(static_cast<std::uint32_t>(src));
+    const auto hi = static_cast<std::int32_t>(static_cast<std::uint32_t>(src >> 32));
+    return {{double_as_q(static_cast<double>(lo)), double_as_q(static_cast<double>(hi))}};
 }
 
 // Default MXCSR round-to-nearest-even; NaN, infinity and out-of-int32_t range
@@ -259,6 +282,11 @@ def lift_code(name, start, raw):
             return f"load128({flat_address(ins, alignment=alignment)})"
         return read_vec(op_index, ins)
 
+    def mm_src64(op_index, ins):
+        if ins.op_kind(op_index) == OpKind.MEMORY:
+            return f"load64({flat_address(ins)})"
+        return read_mm(op_index, ins)
+
     for ins in instructions:
         if returned:
             raise ValueError(f"unreachable instruction after ret at RVA {ins.ip:#x}: {ins}")
@@ -284,6 +312,11 @@ def lift_code(name, start, raw):
             dst_idx, dst_name = write_mm(0, ins)
             statements.append(f"{dst_name} = {CVT_PD2PI_HELPERS[ins.code]}({src});")
             defined_mm.add(dst_idx)
+        elif ins.code == Code.CVTPI2PD_XMM_MMM64:
+            src = mm_src64(1, ins)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name} = op_cvtpi2pd({src});")
+            defined_xmm.add(dst_idx)
         elif ins.code == Code.MOVDQ2Q_MM_XMM:
             src = read_vec(1, ins)
             dst_idx, dst_name = write_mm(0, ins)
@@ -310,7 +343,7 @@ def lift_code(name, start, raw):
                 statements.append(f"{dst_name} = {src};")
                 defined_xmm.add(dst_idx)
         elif ins.code == Code.MOVQ_MM_MMM64:
-            src = f"load64({flat_address(ins)})" if ins.op1_kind == OpKind.MEMORY else read_mm(1, ins)
+            src = mm_src64(1, ins)
             dst_idx, dst_name = write_mm(0, ins)
             statements.append(f"{dst_name} = {src};")
             defined_mm.add(dst_idx)

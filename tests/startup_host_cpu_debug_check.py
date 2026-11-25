@@ -1,5 +1,6 @@
 """Run the startup debugger with X2W_HOST_CPU=1 on a source-built probe that executes SHA-extension
-and RDPID instructions (tests/startup_host_cpu_probe.cpp).
+and RDPID instructions (tests/startup_host_cpu_probe.cpp), including RDPID sites that eight threads
+reach at the same time: every thread that faulted before a site was rewritten has to continue.
 
 On a host that has the instructions the probe just runs. On a host that lacks them the debugger
 has to perform them, and the same run without the switch must stop at an illegal instruction.
@@ -35,6 +36,7 @@ def main(probe):
         out, printed = run(probe, work, "with", True)
         assert "process exited with 0x00000000" in out, out
         assert expected in printed and "rdpid agrees with rdtscp" in printed, printed
+        assert "rdpid threads 8 of 8" in printed, printed  # threads that faulted on the site together
         summary = next((line for line in out.splitlines() if "host-cpu sites rewritten" in line), "")
         plain, plain_printed = run(probe, work, "without", False)
         if summary:
@@ -44,6 +46,9 @@ def main(probe):
                 count = int(summary.split("sha (per hit) x")[1].split(",")[0].split()[0])
                 assert count == 56, summary  # 32 SHA256RNDS2, 12 SHA256MSG1 and 12 SHA256MSG2 for one block
             case = "performed by the debugger: " + summary.split("rewritten:")[1].strip()
+            resumed = next((line for line in out.splitlines() if "host-cpu threads resumed" in line), "")
+            if resumed:
+                case += "; threads resumed after another thread's rewrite: " + resumed.rsplit(":", 1)[1].strip()
         else:
             assert "process exited with 0x00000000" in plain and expected in plain_printed, plain
             case = "host has the instructions, nothing rewritten"

@@ -26,13 +26,38 @@ LONG window_presents;
 
 // The output window belongs to this layer and has its own thread and message loop; the title's
 // window is left alone (a swap chain on it made the title stop at one of its own fatal checks).
+// With X2W_HIDE_TITLE_WINDOW=1, a timer on this thread hides the title's own window while frames
+// are shown here (x2w_startup::TitleWindowHider, docs/startup-runtime.md#switches).
 HWND output_handle;
+LONG last_frame_shown;  // whether the latest present reached this window (set by queue_present)
+x2w_startup::TitleWindowHider title_hider;  // used on the output window's thread only
 DWORD WINAPI output_window_thread(void* ready)
 {
     WNDCLASSW cls{};
     cls.lpfnWndProc = [](HWND window, UINT message, WPARAM w, LPARAM l) -> LRESULT {
         if (message == WM_CLOSE) {
             ShowWindow(window, SW_MINIMIZE);
+            return 0;
+        }
+        if (message == WM_TIMER && w == x2w_startup::hide_title_timer) {
+            bool refused = false;
+            const int changed = title_hider.step(window, InterlockedCompareExchange(&window_presents, 0, 0),
+                                                 InterlockedCompareExchange(&last_frame_shown, 0, 0), &refused);
+            // These flags are shared by every output window, so each line is logged once per process,
+            // not once per window. That is fine while there is one output window.
+            static bool told_refused, told_hidden, told_shown;
+            if (refused && !told_refused) {
+                told_refused = true;  // keyboard input reaches the title only while this process is in front
+                log("x2w-present the output window could not take the foreground from the title's window");
+            }
+            if (changed > 0 && !told_hidden) {
+                told_hidden = true;
+                log("x2w-present X2W_HIDE_TITLE_WINDOW: hid %d title window(s)", changed);
+            }
+            if (changed < 0 && !told_shown) {
+                told_shown = true;
+                log("x2w-present X2W_HIDE_TITLE_WINDOW: frames no longer shown, %d title window(s) shown again", -changed);
+            }
             return 0;
         }
         return DefWindowProcW(window, message, w, l);
@@ -43,9 +68,12 @@ DWORD WINAPI output_window_thread(void* ready)
     RegisterClassW(&cls);
     RECT area{0, 0, 1600, 900};
     AdjustWindowRect(&area, WS_OVERLAPPEDWINDOW, FALSE);
-    output_handle = CreateWindowExW(0, cls.lpszClassName, L"Xbox2Windows - output", WS_OVERLAPPEDWINDOW, 60, 60,
+    wchar_t title[80];  // 22 fixed characters and the revision (at most 46)
+    swprintf(title, 80, L"Xbox2Windows %ls - output", x2w_build_rev_w);
+    output_handle = CreateWindowExW(0, cls.lpszClassName, title, WS_OVERLAPPEDWINDOW, 60, 60,
                                     area.right - area.left, area.bottom - area.top, nullptr, nullptr, cls.hInstance, nullptr);
     if (output_handle) ShowWindow(output_handle, SW_SHOWNOACTIVATE);
+    if (output_handle) x2w_startup::TitleWindowHider::start(output_handle);
     SetEvent(static_cast<HANDLE>(ready));
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -161,6 +189,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
 // Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
+    X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
     if (p.failed || !queue || !surface) return false;
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();

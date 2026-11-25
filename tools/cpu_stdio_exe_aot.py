@@ -74,13 +74,18 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
                           "int main() { return static_cast<int>(process_entry()); }", ""])
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--entry-export", help="Lift a returning entry exported separately from PE startup")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         args.output.write_text(translate(args.image, entry_export=args.entry_export), encoding="ascii")
     except (ValueError, OSError, pefile.PEFormatError) as exc:
         parser.exit(1, f"{exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

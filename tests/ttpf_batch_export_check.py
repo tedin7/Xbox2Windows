@@ -238,6 +238,36 @@ class BatchExportTests(unittest.TestCase):
             self.assertEqual(res_prov["sha256"], hashlib.sha256(b"DDS_PROVISIONAL_BC7_DATA").hexdigest())
             self.assertTrue((out_dir / "tex_00001.dds").exists())
 
+    def test_requested_provisional_history_is_read_before_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, history = root / "pool.ttpf", root / "history.json"
+            pool.write_bytes(make_synthetic_ttpf_archive())
+            dds, manifest = root / "tex_00001.dds", root / "manifest.json"
+            dds.write_bytes(b"previous DDS")
+            manifest.write_bytes(b"previous manifest")
+            command = [sys.executable, "-B", batch.__file__, pool, "-o", root,
+                       "--indices", "1", "--allow-provisional", "--history", history]
+            for data in (None, b"{", b"\xff", b"null", b"[]"):
+                with self.subTest(data=data):
+                    if data is not None:
+                        history.write_bytes(data)
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--history " + str(history), result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(dds.read_bytes(), b"previous DDS")
+                    self.assertEqual(manifest.read_bytes(), b"previous manifest")
+
+            with patch.object(batch, "load_tools", return_value=MockTtpfModule), patch.object(
+                MockTtpfModule, "export", wraps=MockTtpfModule.export
+            ) as export:
+                for profile in ({}, {"bc7": {"historyIndices": [2, 5]}}):
+                    history.write_text(json.dumps(profile), encoding="utf-8")
+                    summary = batch.batch_export(pool, root, indices=[1], allow_provisional=True, history_path=history)
+                    self.assertEqual(summary["stats"]["provisional"], 1)
+                    self.assertEqual(export.call_args.kwargs["history"], profile)
+
     def test_require_rust_checks_selected_tools_and_kernels(self):
         library = SimpleNamespace(
             unpack_lanes=object(), decode_strict_bc1=object(),

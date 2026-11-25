@@ -293,9 +293,9 @@ bool contract_checks(HMODULE module)
     close_provider(provider);
     close_user(user);
 
-    // The negative controls stay logged stubs, not implemented contracts.
-    if (package_mount(nullptr, nullptr) != not_implemented) {
-        std::printf("FAIL: negative stub result\n");
+    // Negative control: a null block and null identifier are refused, and logged.
+    if (package_mount(nullptr, nullptr) != E_INVALIDARG) {
+        std::printf("FAIL: negative async package result\n");
         return false;
     }
     return true;
@@ -339,7 +339,7 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
         if (user_component) saw_user = true;
         if (save_component) saw_save = true;
         if (std::strcmp(entry.function, "XPackageMountWithUiAsync") == 0) {
-            saw_package = entry.result == not_implemented;
+            saw_package = entry.result == E_INVALIDARG;
         }
         if (std::strcmp(entry.function, "XGameSaveSubmitUpdate") == 0 &&
             entry.result == e_gs_handle_expired) {

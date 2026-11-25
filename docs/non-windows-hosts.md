@@ -82,6 +82,8 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 ## Quick start on Linux
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
+Both jobs use `tools/run_checks_parallel.py`; the machine-code matrix supplies per-check LLVM arguments and environment overrides.
+The runner lists checks that exit 77 under `SKIPPED:` and other nonzero exits under `FAILED:`. Either summary makes the runner exit 1 so CI catches required checks that did not run. Open a skipped check's log group to see its output.
 
 On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
 
@@ -167,6 +169,34 @@ python3 -B tests/pixel_fp32_vulkan_check.py /path/to/dxc /path/to/vkrunner
 ```
 
 The probe checks finite output bits, signed zero, infinities, and NaN class through a compute buffer. A second dispatch uses an intentionally incorrect underflow rounding rule and must fail the same comparison. Repeat `--device <index>` to test specific one-based VkRunner device indices. The fixture exercises the desktop helpers through SPIR-V. Pixel shader lowering and D3D12 readback have their own tests.
+
+## Optional Vulkan subnormal check
+
+With the Linux build of DXC, `spirv-val` and `spirv-dis` from SPIRV-Tools, a C compiler, the Vulkan loader headers and a Vulkan 1.2 device, check whether the driver keeps binary32 subnormals in a source-built pixel shader. [`tests/vk_pixel_draw.c`](../tests/vk_pixel_draw.c) is a small Vulkan host that draws a full-screen triangle with a compiled vertex and pixel shader, 256 bytes of constants and an RGBA32F or RGBA32UI target, and writes the raw pixels to a file. The check builds it when you pass the `.c` file.
+
+```bash
+python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
+```
+
+`--device` is a substring of the Vulkan device name (repeat it for several adapters), and `VK_DRIVER_FILES` selects a driver such as lavapipe. To build the host once and reuse it, run `cc -std=c11 -O1 -o out/vk/vk_pixel_draw tests/vk_pixel_draw.c -lvulkan` and pass `out/vk/vk_pixel_draw` instead of the `.c` file.
+
+A `ps_6_2` pixel shader runs seven operations whose inputs or results are binary32 subnormals and writes each result word to its own RGBA32UI pixel. DXC compiles it with `-spirv -fspv-target-env=vulkan1.2 -fvk-b-shift 0 0 -fvk-t-shift 16 0 -fvk-s-shift 32 0 -fvk-u-shift 48 0`. The words read back must equal IEEE binary32 arithmetic computed in Python under `-denorm preserve`. The same shader compiled with `-denorm ftz` is the negative control and must differ, otherwise the check fails because it cannot tell preserve from flush. The log lists the device, driver, DXC and SPIRV-Tools versions, the SPIR-V execution mode, every word read back for both modes and the cases where the control differs.
+
+A device that reports `shaderDenormPreserveFloat32` as false is a capability skip (exit code 77). A module that `spirv-val` rejects or that the driver refuses to build is a validation refusal (exit code 78). Neither counts as a mismatch, and a mismatch exits with 1. A refusal that follows a `preserve` readback that differs from IEEE (for example, `-denorm ftz` refused) is still a mismatch and exits with 1, because 78 means a refusal with no measured mismatch. Run without arguments, `python3 -B tests/pixel_denorm_vulkan_check.py` needs no device, DXC or SPIR-V tools: it checks the classification of the two readbacks (preserve mismatch with an FTZ refusal, an FTZ control that matches preserve, and the nominal cases), and the Linux Python checks job runs it.
+
+## Optional `draw-core` under Vulkan
+
+The `draw-core` mode of `tests/pixel_aot_check.py` draws the core translated pixel shaders and compares every channel bit for bit, with the negative controls of `check_render`. On Windows it uses D3D12. `draw-core-vulkan` runs the same shaders and controls on a Vulkan 1.2 device. It needs the same tools as the subnormal check above (DXC, `spirv-val`, a C compiler and the Vulkan loader headers).
+
+```bash
+python3 -B tests/pixel_aot_check.py draw-core-vulkan /path/to/dxc Intel
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  python3 -B tests/pixel_aot_check.py draw-core-vulkan /path/to/dxc llvmpipe --allow-denorm-mismatch
+```
+
+The second argument is a substring of the Vulkan device name. The mode builds `tests/vk_pixel_draw.c` under `out/`, compiles each shader to SPIR-V with the DXC options of the subnormal check plus `-fvk-invert-y` for the vertex shader, validates it with `spirv-val` and draws it through [`tests/vk_offscreen.py`](../tests/vk_offscreen.py), a stand-in for the `offscreen_check` operations `--check-pixel`, `--check-pixel-case`, `--check-pixel-batch` and `--check-pixel-quad-lod`. It keeps their command lines, exit codes, `pixel_mismatch x= y=` words and `case=N status=` lines. Cases with title-memory trailers are refused, and there is no debug layer (the log says `debug_layer=unavailable`). Other `offscreen_check` modes are not reproduced.
+
+The shaders are compiled with `-denorm preserve`. A device without `shaderDenormPreserveFloat32` therefore exits 77, a capability skip. `--allow-denorm-mismatch` draws anyway. Such a run is a diagnostic: a pass shows that the device produced the expected bits for these shaders, not that it preserves subnormals, and a failure may come from the missing guarantee instead of from the shader. It is not a conformance result. `X2W_VK_ALLOW_NO_DENORM`, `X2W_VK_HOST`, `X2W_VK_VS`, `X2W_VK_DEVICE` and `X2W_VK_WORK` are the variables the mode sets for `vk_offscreen.py`; you do not need to set them. Run without arguments, `python3 -B tests/vk_offscreen.py` needs no device or DXC: it checks the case parser, the comparison, the batch status lines and the refusals against synthetic readbacks, and the Linux Python checks job runs it.
 
 ## Expected CMake failure and no-stub policy
 
@@ -324,7 +354,10 @@ not Windows verification; report it as such.
   on a sampler heap). This is an open difference; the stand-ins hand out the desktop handle for
   those heap types.
 - **Two top-level windows.** The executable's own window can sit above the stand-in's output
-  window under an X11 window manager. Minimise it to see the output.
+  window under an X11 window manager. With `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`),
+  the stand-in hides it while frames are shown in the output window
+  ([Switches](startup-runtime.md#switches)). Keyboard input to the title after the hide is not
+  measured. Otherwise, minimise it to see the output.
 
 Known cost under Wine: one section per 64 KiB physical page
 (`src/xmem_mapped_pages.cpp`) is slow there. A request for about 100,000 pages did not finish

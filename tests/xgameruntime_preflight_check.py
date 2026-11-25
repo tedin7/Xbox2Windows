@@ -15,7 +15,7 @@ from pe_run_package import plan  # noqa: E402
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("entry", type=Path, help="Source-built EXE importing XUserAddAsync")
+    parser.add_argument("entry", type=Path, help="Source-built EXE importing XPackageMountWithUiAsync")
     parser.add_argument("xmem", type=Path, help="Normal xmem.dll shim")
     parser.add_argument("d3d12_xs", type=Path, help="Normal d3d12_xs.dll shim")
     parser.add_argument("fixture_shim_dir", type=Path, help="Directory containing the fixture DLL")
@@ -59,9 +59,9 @@ def main(argv=None):
         row = next((item for item in report["imports"]
                     if item["image"] == entry.name
                     and item["dll"].casefold() == "xgameruntime.dll"
-                    and item["symbol"] == "XUserAddAsync"), None)
+                    and item["symbol"] == "XPackageMountWithUiAsync"), None)
         if row is None:
-            return fail("the source-built EXE has no xgameruntime.dll!XUserAddAsync import")
+            return fail("the source-built EXE has no xgameruntime.dll!XPackageMountWithUiAsync import")
         if row["status"] != "external_unverified":
             return fail(f"preflight status is {row['status']}, expected external_unverified")
         if row["kind"] != "normal":
@@ -75,14 +75,14 @@ def main(argv=None):
         try:
             plan(report, allow_external=False)
         except ValueError as error:
-            expected = "xgameruntime.dll!XUserAddAsync: external_unverified"
+            expected = "xgameruntime.dll!XPackageMountWithUiAsync: external_unverified"
             if expected not in str(error):
                 return fail(f"strict plan refused a different import: {error}")
         else:
             return fail("strict plan accepted the unimplemented XGameRuntime import")
 
     print("xgameruntime preflight: package=real-source-exe "
-          "import=xgameruntime.dll!XUserAddAsync status=external_unverified "
+          "import=xgameruntime.dll!XPackageMountWithUiAsync status=external_unverified "
           "strict_plan=refused mapped=0 PASS")
     return 0
 

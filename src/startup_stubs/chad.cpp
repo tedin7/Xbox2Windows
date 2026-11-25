@@ -10,7 +10,8 @@
 //   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success,
 //   E_POINTER when handle is null or unwritable.
 // No stream is processed: activation and submission fail with the documented XDSP code instead of
-// returning success with their outputs untouched (issue #1887).
+// returning success with their outputs untouched, and deactivation and disconnection refuse null and
+// unknown handles (issue #1887).
 namespace {
 using u64 = std::uint64_t;
 constexpr long hr_ok = 0;
@@ -27,6 +28,22 @@ long accept(const char* name, unsigned index, u64 rcx, u64 rdx, u64 r8, u64 r9, 
     if (x2w_local::first_calls(calls, 6))
         x2w_trap::record("x2w-audio", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, index, rcx, rdx, r8, r9, return_address);
     return hr_ok;
+}
+
+// XDspDeactivate(stream) and XDspDisconnect(client) take a handle and write nothing back. As in
+// XDspSubmitCommand, only the handle XDspConnectWithMaximumStreamLimit published is known: a null or
+// unknown handle is refused instead of being reported as released.
+long release_handle(const char* name, unsigned index, u64 rcx, u64 rdx, u64 r8, u64 r9, void* return_address,
+                    LONG& calls)
+{
+    const long result = accept(name, index, rcx, rdx, r8, r9, return_address, calls);
+    if (reinterpret_cast<void*>(static_cast<std::uintptr_t>(rcx)) != &connection) {
+        x2w_local::logf("x2w-audio %s handle=0x%llx -> E_INVALIDARG (unknown handle)", name,
+                        static_cast<unsigned long long>(rcx));
+        return hr_invalidarg;
+    }
+    x2w_local::logf("x2w-audio %s handle=0x%llx -> 0", name, static_cast<unsigned long long>(rcx));
+    return result;
 }
 }  // namespace
 
@@ -77,13 +94,13 @@ extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, 
 extern "C" __declspec(noinline) long XDspDeactivate(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    return accept("XDspDeactivate", 2, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    return release_handle("XDspDeactivate", 2, rcx, rdx, r8, r9, _ReturnAddress(), calls);
 }
 
 extern "C" __declspec(noinline) long XDspDisconnect(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    return accept("XDspDisconnect", 3, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    return release_handle("XDspDisconnect", 3, rcx, rdx, r8, r9, _ReturnAddress(), calls);
 }
 
 extern "C" __declspec(noinline) long XDspSubmitCommand(u64 rcx, u64 rdx, u64 r8, u64 r9)

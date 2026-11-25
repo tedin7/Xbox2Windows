@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import sys
-from typing import Iterable
+from typing import Any, Iterable
 
 
 LOG_EXTENSIONS = {".txt", ".log", ".out"}
@@ -42,8 +43,18 @@ SLOT70_REASONS = {
     "null_address",
     "unsupported_description",
     "destination_outside_view_heaps",
+    "gpu_written_resource",
     "buffer_unavailable",
     "texture_unavailable",
+    # the partial-tile holds of device_memory_srv
+    "partial_tile_xg_rows",
+    "partial_tile_beyond_xg_size",
+    # the console-layout holds of device_memory_srv (#2015)
+    "unsupported_desktop_format",
+    "console_layout_xg_rows",
+    "console_layout_without_footprints",
+    "console_layout_beyond_xg_size",
+    "overlapping_resource",
 }
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",
@@ -82,6 +93,83 @@ SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(MNEMONIC_FAMILY + r" with\b"), r"\1_* with modifier"),
     (re.compile(MNEMONIC_FAMILY + r"\Z"), r"\1_* instruction"),
 ]
+
+
+# Run end-point: how far a run got and how it ended. Only decimal counts, the fixed failure-cause names of the
+# DirectStorage heartbeat and the 32-bit exception code with its chance are copied; the rest of those lines (module
+# names, paths, addresses, exception parameters) is dropped.
+FAILURE_CAUSES = (
+    "read-at-or-past-eof",
+    "read-crossing-eof",
+    "read-other",
+    "destination-capacity",
+    "destination-not-writable",
+    "zlib",
+    "bcpack",
+    "other",
+)
+# Omit common debugger events from the observed exception list unless they are second-chance.
+FILTERED_FIRST_CHANCE = {"0x80000003", "0x80000004", "0x406d1388", "0x40010006"}
+RE_HEARTBEAT_SECOND = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s:")
+RE_COMMIT_PEAK = re.compile(r"x2w-dstorage heartbeat \d{1,10} s: .*?\bcommit peak=(\d{1,10}) MiB\b")
+RE_FAILURE_CAUSES = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s: failed requests by cause ((?:[a-z-]+=\d{1,10}(?:\s+|$))+)")
+RE_CAUSE_COUNT = re.compile(r"([a-z-]+)=(\d{1,10})")
+# debug_launch.py events.txt: "<seconds> exception <code> <name> at <where> first|second-chance params=[...]".
+RE_EXCEPTION = re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]{8})\b.*?\b(first|second)-chance\b")
+RE_DEBUGGER_STOP = re.compile(r"^debugger stop (0x[0-9a-fA-F]{8}) (first|second)-chance$")
+RE_STOP_SUMMARY = re.compile(
+    r"^stopped at [^(]+\((0x[0-9a-fA-F]{8})\) at .+ after \d+\.\d+ s \((first|second) chance\) params=\["
+)
+
+
+def _keep_peak(old: int | None, new: int) -> int:
+    return new if old is None else max(old, new)
+
+
+def _is_later_sample(old_second: int | None, new_second: int) -> bool:
+    return old_second is None or new_second >= old_second
+
+
+@dataclass
+class RunEndpoint:
+    """Where a run got to, built only from allowlisted values."""
+
+    peak_commit_mib: int | None = None
+    last_heartbeat_s: int | None = None
+    failure_second: int | None = None
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    first_exception: tuple[str, str] | None = None
+    last_exception: tuple[str, str] | None = None
+    exception_events: int = 0
+    confirmed_stop: tuple[str, str] | None = None
+
+    def observe(self, line: str) -> None:
+        m = RE_HEARTBEAT_SECOND.search(line)
+        if m:
+            second = int(m.group(1))
+            if self.last_heartbeat_s is None or second > self.last_heartbeat_s:
+                self.last_heartbeat_s = second
+            peak = RE_COMMIT_PEAK.search(line)
+            if peak:
+                self.peak_commit_mib = _keep_peak(self.peak_commit_mib, int(peak.group(1)))
+            causes = RE_FAILURE_CAUSES.search(line)
+            if causes and _is_later_sample(self.failure_second, int(causes.group(1))):
+                self.failure_second = int(causes.group(1))
+                self.failure_counts = {
+                    name: int(count) for name, count in RE_CAUSE_COUNT.findall(causes.group(2)) if name in FAILURE_CAUSES
+                }
+            return
+        m = RE_DEBUGGER_STOP.match(line) or RE_STOP_SUMMARY.match(line)
+        if m:
+            self.confirmed_stop = (m.group(1).lower(), m.group(2))
+            return
+        m = RE_EXCEPTION.match(line)
+        if m and (m.group(2) == "second" or m.group(1).lower() not in FILTERED_FIRST_CHANCE):
+            exception = (m.group(1).lower(), m.group(2))
+            self.exception_events += 1
+            if self.first_exception is None:
+                self.first_exception = exception
+            self.last_exception = exception
 
 
 def _dec(text: str | None) -> str:
@@ -195,7 +283,7 @@ def iter_log_files(log_target: Path) -> list[Path]:
     return files
 
 
-def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
+def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
     """Aggregate startup telemetry counters from an iterable of log lines."""
     slot70_refusals: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
     d3d12_unhandled: Counter[str] = Counter()
@@ -204,11 +292,13 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
     runtime_failures: Counter[tuple[str, str]] = Counter()
+    endpoint = RunEndpoint()
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
+        endpoint.observe(line)  # reads only; the line is still classified below
 
         # 1. slot70 memory SRV refusals
         m = RE_SLOT70.search(line)
@@ -343,6 +433,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
         "dstorage_failures": dstorage_failures,
         "dstorage_hresults": dstorage_hresults,
         "runtime_failures": runtime_failures,
+        "endpoint": endpoint,
     }
 
 
@@ -364,7 +455,11 @@ def summarize_shader_cache(cache_dir: Path | None) -> Counter[str]:
                 break
         if not first_line:
             first_line = "(empty .fail)"
-        reasons["(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)] += 1
+        reason = "(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)
+        # A device slot 67 compute request (req_<key>.c67) gets its own class, so graphics counts do not move.
+        if (cache_dir / ("req_" + fail_path.stem + ".c67")).is_file():
+            reason = "compute: " + reason
+        reasons[reason] += 1
     return reasons
 
 
@@ -391,8 +486,41 @@ def _format_table(
     return lines
 
 
+def _stop_text(stop: tuple[str, str] | None) -> str:
+    return "not reported" if stop is None else f"`{stop[0]}` ({stop[1]}-chance)"
+
+
+def format_endpoint(endpoint: RunEndpoint) -> list[str]:
+    """Render the run end-point section."""
+    peak = "not reported" if endpoint.peak_commit_mib is None else f"`{endpoint.peak_commit_mib}` MiB"
+    beat = "not reported" if endpoint.last_heartbeat_s is None else f"`{endpoint.last_heartbeat_s}` s"
+    out = [
+        "### Run End-Point",
+        "",
+        "| Item | Value |",
+        "| --- | --- |",
+        f"| Peak commit (maximum of the `commit peak=` values) | {peak} |",
+        f"| Last heartbeat | {beat} |",
+        f"| Confirmed debugger stop | {_stop_text(endpoint.confirmed_stop)} |",
+        f"| First observed exception | {_stop_text(endpoint.first_exception)} |",
+        f"| Last observed exception | {_stop_text(endpoint.last_exception)} |",
+        f"| Observed exceptions | `{endpoint.exception_events}` |",
+        "",
+    ]
+    if endpoint.failure_second is None:
+        out.extend(["_No failed-requests-by-cause heartbeat line._", ""])
+        return out
+    out.extend([f"Failed requests by cause at heartbeat second `{endpoint.failure_second}`:", ""])
+    out.extend(["| Cause | Count |", "| --- | --- |"])
+    for cause in FAILURE_CAUSES:
+        count = endpoint.failure_counts.get(cause)
+        out.append(f"| {cause} | {'?' if count is None else count} |")
+    out.append("")
+    return out
+
+
 def format_markdown(
-    summary: dict[str, Counter],
+    summary: dict[str, Any],
     shader_failures: Counter[str],
     files_scanned: int,
     shader_cache_provided: bool,
@@ -514,7 +642,10 @@ def format_markdown(
         )
     )
 
-    # 6. X2W_SHADER_CACHE .fail reasons
+    # 6. Run end-point
+    out.extend(format_endpoint(summary["endpoint"]))
+
+    # 7. X2W_SHADER_CACHE .fail reasons
     if shader_cache_provided:
         out.extend(["### `X2W_SHADER_CACHE` `.fail` Reasons", ""])
         sh_rows = [[count, f"`{reason}`"] for reason, count in shader_failures.most_common()]

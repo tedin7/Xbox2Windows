@@ -260,7 +260,9 @@ Word invoke(void* object, unsigned index, Word a, Word b, Word c, Word d,
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
                        DXGI_FORMAT format, UINT scissor_width, StreamTarget& state)
 {
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
+    const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
     // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
@@ -281,7 +283,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
         const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? DXGI_FORMAT_R32_TYPELESS : view_format;
+        const auto resource_format = !i && integer ? mrt.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -290,7 +292,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (view_format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 

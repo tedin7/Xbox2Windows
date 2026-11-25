@@ -1,5 +1,6 @@
 // Checks src/startup_stubs/local_log.h without a GPU device: GetLastError-preserving env_on
-// gating, atomic first_calls countdown, logf formatting/truncation/X2W_TRAP_LOG append,
+// gating, the atomic saturating first_calls gate (also on a counter at the 32-bit wrap point),
+// logf formatting/truncation/X2W_TRAP_LOG append,
 // one X2W_TRAP_LOG open per module under 8 concurrent writers (in a child process), recovery
 // after a first open into a missing directory or of a locked file fails (in child processes),
 // probe_readable page truncation and PAGE_GUARD re-arming, and readable/writable boundary checks.
@@ -78,14 +79,15 @@ void test_first_calls()
     check(x2w_local::first_calls(counter, 3) && counter == 1, "first_calls 1/3");
     check(x2w_local::first_calls(counter, 3) && counter == 2, "first_calls 2/3");
     check(x2w_local::first_calls(counter, 3) && counter == 3, "first_calls 3/3");
-    check(!x2w_local::first_calls(counter, 3) && counter == 4, "first_calls 4/3 false");
-    check(!x2w_local::first_calls(counter, 3) && counter == 5, "first_calls 5/3 false");
+    // Past the limit the counter stays where it is, so it can never wrap.
+    check(!x2w_local::first_calls(counter, 3) && counter == 3, "first_calls 4/3 false, counter stays at 3");
+    check(!x2w_local::first_calls(counter, 3) && counter == 3, "first_calls 5/3 false, counter stays at 3");
 
     LONG zero_limit = 0;
-    check(!x2w_local::first_calls(zero_limit, 0) && zero_limit == 1, "first_calls limit=0 false");
+    check(!x2w_local::first_calls(zero_limit, 0) && zero_limit == 0, "first_calls limit=0 false");
 
     LONG neg_limit = 0;
-    check(!x2w_local::first_calls(neg_limit, -1) && neg_limit == 1, "first_calls limit=-1 false");
+    check(!x2w_local::first_calls(neg_limit, -1) && neg_limit == 0, "first_calls limit=-1 false");
 
     LONG shared = 0;
     std::atomic<int> accepted{0};
@@ -98,8 +100,27 @@ void test_first_calls()
         });
     }
     for (auto& th : threads) th.join();
-    check(shared == 400 && accepted.load(std::memory_order_relaxed) == 10,
-          "first_calls concurrent InterlockedIncrement exactness");
+    check(shared == 10 && accepted.load(std::memory_order_relaxed) == 10,
+          "first_calls concurrent exactness, counter saturates at the limit");
+}
+
+// The gate the stand-ins used before: it counts every call, so after 2^31 calls the counter turns
+// negative and every later call passes again. Used only by the --mutate wrap control.
+bool counting_gate(volatile LONG& counter, LONG limit)
+{
+    return InterlockedIncrement(&counter) <= limit;
+}
+
+// A counter that has already reached the wrap point (instead of looping 2^31 times): no call may
+// pass a gate whose first calls are long over.
+void test_first_calls_wrap(bool counting)
+{
+    volatile LONG counter = 0x7FFFFFFE;
+    int passed = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (counting ? counting_gate(counter, 4) : x2w_local::first_calls(counter, 4)) ++passed;
+    }
+    check(passed == 0, "first_calls passes no call at the wrap point");
 }
 
 // Child process body: 8 threads x 2,000 lines through logf to the inherited %X2W_TRAP_LOG%. Every
@@ -590,7 +611,9 @@ int main(int argc, char** argv)
     // unmodified build, or any other fault, makes the control fail.
     const bool cache_failure_mutate =
         two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "cache-failure") == 0;
-    if (argc > 1 && !guard_drop_mutate && !reopen_mutate && !cache_failure_mutate) {
+    // --mutate wrap: negative control running only the wrap-point case with the counting gate.
+    const bool wrap_mutate = two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "wrap") == 0;
+    if (argc > 1 && !guard_drop_mutate && !reopen_mutate && !cache_failure_mutate && !wrap_mutate) {
         std::printf("unknown mutation\n");
         return 2;
     }
@@ -601,8 +624,14 @@ int main(int argc, char** argv)
         return code == 3 && failures == 0 ? 1 : 0;
     }
 
+    if (wrap_mutate) {
+        test_first_calls_wrap(true);
+        std::printf("startup_local_log: wrap control %d of %d FAILED\n", failures, cases);
+        return failures ? 1 : 0;
+    }
     test_env_on();
     test_first_calls();
+    test_first_calls_wrap(false);
     const DWORD child = test_concurrency(false);
     check(child == 0, "concurrent logging child passes");
     const DWORD want = cache_failure_mutate ? 3 : 0;

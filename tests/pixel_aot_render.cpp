@@ -2,6 +2,7 @@
 #include "desktop_gpu.h"
 #include "pixel_aot_vs.h"
 #include "pixel_aot_vs_linear.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -158,7 +159,8 @@ struct Extent {
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr,
+                   ID3D12RootSignature* rootOverride = nullptr, const char* vsPath = nullptr)
 {
     const auto& input = levels.front();
     ComPtr<ID3D12Resource> uploadedConstants;
@@ -179,13 +181,24 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
     const bool titleMemory = !input.titleRanges.empty();
     ComPtr<ID3D12RootSignature> root;
-    const D3D12_SHADER_BYTECODE vs = input.linearMips
+    std::vector<char> vsFile;
+    D3D12_SHADER_BYTECODE vs = input.linearMips
         ? D3D12_SHADER_BYTECODE{pixel_aot_vs_linear, sizeof(pixel_aot_vs_linear)}
         : D3D12_SHADER_BYTECODE{pixel_aot_vs, sizeof(pixel_aot_vs)};
+    if (vsPath) {
+        // A comparison gather compiles its pixel stage with FXC ps_5_1 too, which needs a matching
+        // vs_5_1 blob instead of the embedded DXC vertex shader.
+        std::ifstream file(vsPath, std::ios::binary);
+        vsFile.assign(std::istreambuf_iterator<char>(file), {});
+        if (vsFile.empty() || file.bad()) throw std::runtime_error("Cannot read compiled vertex shader");
+        vs = {vsFile.data(), vsFile.size()};
+    }
     // The title root signature has its own point sampler.
     if (titleMemory && input.linearMips)
         throw std::runtime_error("The mip-linear sampler is not available with title memory");
-    if (titleMemory)
+    if (rootOverride)
+        root = rootOverride;  // the caller owns the comparison-sampler root and keeps it alive
+    else if (titleMemory)
         root = title_root_signature(device);
     else
         check(device->CreateRootSignature(0, vs.pShaderBytecode, vs.BytecodeLength, IID_PPV_ARGS(&root)), "Pixel root");
@@ -546,11 +559,13 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    UINT firstResident, UINT sampledLevel, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr,
+                   ID3D12RootSignature* rootOverride = nullptr, const char* vsPath = nullptr)
 {
     const auto& top = levels.front();
     draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
-                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants, rawReadback);
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants, rawReadback,
+                  rootOverride, vsPath);
 }
 
 ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char* path)
@@ -694,6 +709,67 @@ void check_pixel_gather(ID3D12Device* device, const char* shader, const char* re
     if (!file || file.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("Invalid pixel gather case data");
     draw_verified(device, shader, levels, first, 0, nullptr);
+}
+
+// Comparison gathers bind a SamplerComparisonState built from the translated smpc line and a
+// single-component R32_FLOAT view (R32G32B32A32_FLOAT does not advertise SHADER_GATHER_COMPARISON).
+// The case layout is the gather case with one float per texel instead of four.
+void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const char* reference,
+                                const char* sampler_line, const char* vsPath)
+{
+    constexpr UINT side = 8;
+    std::ifstream file(reference, std::ios::binary);
+    std::array<UINT, 2> view{};
+    file.read(reinterpret_cast<char*>(view.data()), sizeof(view));
+    const auto [first, count] = view;
+    if (!file || first > 1 || !count || count > 3)
+        throw std::runtime_error("Invalid comparison gather view");
+    std::vector<PixelInput> levels;
+    for (UINT mip = 0; mip < count; ++mip) {
+        const UINT extent = side >> mip;
+        PixelInput input{extent, extent, 1, DXGI_FORMAT_R32_FLOAT};
+        input.rows.resize(size_t(extent) * extent * sizeof(float));
+        file.read(reinterpret_cast<char*>(input.rows.data()), static_cast<std::streamsize>(input.rows.size()));
+        levels.push_back(std::move(input));
+    }
+    auto& expected = levels.front().expected;
+    expected.resize(side * side);
+    file.read(reinterpret_cast<char*>(expected.data()), side * side * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Invalid comparison gather case data");
+
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1 ||
+        samplers.comparison.size() != 1 || !samplers.comparison[0])
+        throw std::runtime_error("Expected exactly one smpc line for the comparison gather");
+    const auto statics = x2w_startup::decode_statics(samplers);
+
+    // Same parameter layout as tests/pixel_aot_vs.hlsl, with the comparison sampler in place of its
+    // ordinary point sampler: table t0 at 0, b0..b2 at 1..3, one static sampler at s0.
+    D3D12_DESCRIPTOR_RANGE srv{};
+    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable = {1, &srv};
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    for (UINT i = 1; i < 4; ++i) {
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        parameters[i].Descriptor.ShaderRegister = i - 1;
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 4;
+    signature.pParameters = parameters;
+    signature.NumStaticSamplers = 1;
+    signature.pStaticSamplers = statics.data();
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+          "Serialize comparison gather root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "Comparison gather root");
+    draw_verified(device, shader, levels, first, 0, nullptr, nullptr, nullptr, root.Get(), vsPath);
 }
 
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback,

@@ -307,4 +307,67 @@ with tempfile.TemporaryDirectory(dir=output) as directory:
         assert lowered_atomics[at - 3] == f"OpSelectionMerge {stem}_merge None"
         assert lowered_atomics[at + 1] == f"OpBranch {stem}_merge"
         assert lowered_atomics[at + 3].startswith(f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 ")
-print("physical, logical and combined SPIR-V validated; 8 atomics, bounded QWORD accesses and rejection cases passed")
+
+# Comments and 64-bit indices in the source assembly: the lowering must either keep the module valid or refuse it.
+atomic_source = Path(__file__).with_name("atomic.spvasm").read_text(encoding="utf-8")
+access = "%target = OpAccessChain %_ptr_PSB_uint %array %c1"
+entry = 'OpEntryPoint GLCompute %main "main" %user_data'
+assert access in atomic_source and entry in atomic_source
+with tempfile.TemporaryDirectory() as folder:
+    directory = Path(folder)
+    # A trailing comment on an instruction the lowering rewrites, on the entry point, and one that
+    # mentions a word the lowering looks for, must not change the result.
+    commented = atomic_source.replace(access, access + " ; element one of the array")
+    commented = commented.replace(entry, entry + " ; the interface lists the push constants")
+    commented = commented.replace("OpReturn", "; a comment that says PushConstant\nOpReturn")
+    validate_sampler(directory, "commented_original", commented)
+    assert window.lower(commented) == window.lower(atomic_source)
+    validate_sampler(directory, "commented_lowered", window.lower(commented))
+
+    # A semicolon inside a quoted string literal must survive comment stripping.
+    quoted_semi = atomic_source.replace("OpExecutionMode %main LocalSize 1 1 1",
+                                        'OpExecutionMode %main LocalSize 1 1 1\nOpName %main "main;tag" ; trailing comment', 1)
+    validate_sampler(directory, "quoted_semi_original", quoted_semi)
+    quoted_lowered = window.lower(quoted_semi)
+    validate_sampler(directory, "quoted_semi_lowered", quoted_lowered)
+    assert 'OpName %main "main;tag"' in quoted_lowered.splitlines()
+
+    # A string literal may span lines; a semicolon on a continuation line is text, not a comment, and the
+    # literal keeps its inner newline and spacing.
+    multiline = atomic_source.replace("OpExecutionMode %main LocalSize 1 1 1",
+                                      'OpExecutionMode %main LocalSize 1 1 1\n%text = OpString "first line\n  int tmp = 0; }" ; note', 1)
+    validate_sampler(directory, "multiline_original", multiline)
+    multiline_lowered = window.lower(multiline)
+    validate_sampler(directory, "multiline_lowered", multiline_lowered)
+    assert '%text = OpString "first line\n  int tmp = 0; }"' in multiline_lowered
+
+    # An index that is already 64 bits wide is used as it is (not converted again) and guarded against
+    # shift wrap-around so a huge 64-bit index cannot drop high bits and alias an in-window address.
+    wide_index = atomic_source.replace(access, "%index64 = OpUConvert %ulong %c1\n"
+                                       "%target = OpAccessChain %_ptr_PSB_uint %array %index64")
+    assert wide_index != atomic_source
+    validate_sampler(directory, "wide_index_original", wide_index)
+    wide_lowered = window.lower(wide_index)
+    validate_sampler(directory, "wide_index_lowered", wide_lowered)
+    wide_lines = wide_lowered.splitlines()
+    assert "OpUConvert %ulong %index64" not in wide_lowered
+    assert "%x2w_address_target_unshifted = OpShiftRightLogical %ulong %x2w_address_target_delta %x2w_shift" in wide_lines
+    assert "%x2w_address_target_noshift = OpIEqual %bool %x2w_address_target_unshifted %index64" in wide_lines
+    assert "%x2w_address_target_checked64 = OpLogicalAnd %bool %x2w_address_target_checked %x2w_address_target_noshift" in wide_lines
+    assert "%x2w_address_target_selected = OpSelect %uint %x2w_address_target_checked64 %x2w_address_target_word %x2w_invalid" in wide_lines
+
+    # A signed 64-bit index is bit-cast to %ulong before the shift and shift-wrap check so OpIEqual matches types.
+    signed_wide = (atomic_source
+                   .replace("%ulong = OpTypeInt 64 0",
+                            "%ulong = OpTypeInt 64 0\n%long = OpTypeInt 64 1\n%index_s64 = OpConstant %long 1", 1)
+                   .replace(access, "%target = OpAccessChain %_ptr_PSB_uint %array %index_s64"))
+    validate_sampler(directory, "signed_wide_original", signed_wide)
+    signed_wide_lowered = window.lower(signed_wide)
+    validate_sampler(directory, "signed_wide_lowered", signed_wide_lowered)
+    signed_wide_lines = signed_wide_lowered.splitlines()
+    assert "%x2w_address_target_index = OpBitcast %ulong %index_s64" in signed_wide_lines
+    assert "%x2w_address_target_noshift = OpIEqual %bool %x2w_address_target_unshifted %x2w_address_target_index" in signed_wide_lines
+
+    narrow_lowered = window.lower(atomic_source)
+    assert "OpUConvert %ulong %c1" in narrow_lowered, "a 32-bit index must still be widened"
+print("physical, logical and combined SPIR-V validated; 8 atomics, bounded QWORD accesses, comments, 64-bit indices and rejection cases passed")

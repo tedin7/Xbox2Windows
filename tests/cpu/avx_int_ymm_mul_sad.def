@@ -1,0 +1,11 @@
+EXPORTS
+    op_vpmuldq_ymm
+    op_vpmuludq_ymm
+    op_vpmulhrsw_ymm
+    op_vpsadbw_ymm
+    op_vpmuldq_ymm_dst_src1
+    op_vpmuludq_ymm_dst_src2
+    op_vpmulhrsw_ymm_all
+    op_vpsadbw_ymm_dst_src2
+    op_vpmuldq_ymm_then_xmm_vpmuludq
+    op_chain_ymm_mul_sad

@@ -364,26 +364,34 @@ def translate(name, instructions, machine_code):
     return "\n".join([*lines, "}", ""])
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--llvm", required=True)
-    args = parser.parse_args()
-    initializer = (args.directory / "initializer.bin").read_bytes()
-    if hashlib.sha256(initializer).hexdigest() != "a54e552ff69a3f7199861417f7ae461d1f67f636ab532c6ec9d8ea5d2963735a":
-        raise ValueError("Unknown model initializer")
-    programs = {}
-    for name, digest in DIGEST.items():
-        code = (args.directory / (name + ".bin")).read_bytes()
-        if hashlib.sha256(code).hexdigest() != digest:
-            raise ValueError(f"Unknown {name} machine code")
-        ins = disassemble(code, args.llvm, cpu=b"gfx1013" if name == "rcas" else b"gfx1030", offsets=True)
-        programs[name] = ins
-        if name == "rcas":
-            accesses = [line.split()[0] for _, line in ins if line.startswith("image_")]
-            if accesses.count("image_load") != 20 or accesses.count("image_store") != 4 or len(accesses) != 24:
-                raise ValueError("Expected twenty integer texture loads and four output stores")
-        shader = predecessor(name, ins, initializer) if name.startswith("pass") else translate(name, ins, code)
-        (args.directory / (name + ".hlsl")).write_text(shader, encoding="ascii")
-        print(f"{name} instructions={len(ins)}")
-    (args.directory / "scratch_reference.h").write_text(make_reference(programs, initializer), encoding="ascii")
+    args = parser.parse_args(argv)
+    try:
+        initializer = (args.directory / "initializer.bin").read_bytes()
+        if hashlib.sha256(initializer).hexdigest() != "a54e552ff69a3f7199861417f7ae461d1f67f636ab532c6ec9d8ea5d2963735a":
+            raise ValueError("Unknown model initializer")
+        programs = {}
+        for name, digest in DIGEST.items():
+            code = (args.directory / (name + ".bin")).read_bytes()
+            if hashlib.sha256(code).hexdigest() != digest:
+                raise ValueError(f"Unknown {name} machine code")
+            ins = disassemble(code, args.llvm, cpu=b"gfx1013" if name == "rcas" else b"gfx1030", offsets=True)
+            programs[name] = ins
+            if name == "rcas":
+                accesses = [line.split()[0] for _, line in ins if line.startswith("image_")]
+                if accesses.count("image_load") != 20 or accesses.count("image_store") != 4 or len(accesses) != 24:
+                    raise ValueError("Expected twenty integer texture loads and four output stores")
+            shader = predecessor(name, ins, initializer) if name.startswith("pass") else translate(name, ins, code)
+            (args.directory / (name + ".hlsl")).write_text(shader, encoding="ascii")
+            print(f"{name} instructions={len(ins)}")
+        (args.directory / "scratch_reference.h").write_text(make_reference(programs, initializer), encoding="ascii")
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"{exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

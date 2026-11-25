@@ -90,10 +90,58 @@ int main()
         untouched.AlphaToCoverageEnable != 77 || !reason)
         fail("refused other targets", "not refused, a refused target is unreported, or the output was written");
 
+    // Dual-source factors (SRC1_*) read the second pixel shader output, which only target 0 has.
+    // Target 0 may use them when no other target blends; any other target that blends with a SRC1_*
+    // factor, or blends at all alongside a dual-source target 0, is refused and reported. The same
+    // words with ENABLE clear use no factor and do not blend: not refused.
+    const std::uint32_t dual_words[] = {x2w_cb_blend::control_word(15, 0, 1, 1, 0, 0, true, true), x2w_cb_blend::control_word(1, 0, 16, 1, 0, 0, true, true),
+                                        x2w_cb_blend::control_word(1, 0, 0, 17, 0, 0, true, true), x2w_cb_blend::control_word(1, 0, 0, 1, 0, 18, true, true)};
+    for (const std::uint32_t dual : dual_words) {
+        block = block_with(dual);
+        if (!x2w_startup::state_block_blend(block.data(), block.size(), false, &blend, &reason, &refused) || refused)
+            fail("dual source on target 0", "refused");
+        for (unsigned target = 1; target < 8; ++target) {
+            block = block_with(0xE5040504);
+            std::memcpy(block.data() + x2w_startup::state_block_blend_offset + 4 * target, &dual, 4);
+            untouched.AlphaToCoverageEnable = 77;
+            reason = nullptr;
+            refused = 0;
+            if (x2w_startup::state_block_blend(block.data(), block.size(), false, &untouched, &reason, &refused) || refused != 1u << target ||
+                untouched.AlphaToCoverageEnable != 77 || !reason)
+                fail("dual source on target > 0", "not refused, the target is unreported, or the output was written");
+            const std::uint32_t off = dual & ~(1u << 30);
+            std::memcpy(block.data() + x2w_startup::state_block_blend_offset + 4 * target, &off, 4);
+            if (!x2w_startup::state_block_blend(block.data(), block.size(), false, &blend, &reason, &refused) || refused)
+                fail("dual source, ENABLE clear", "a target that does not blend was refused");
+
+            // Dual-source on target 0 cannot be combined with blending enabled on another target.
+            block = block_with(dual);
+            const std::uint32_t normal_blend = 0xE5040504;
+            std::memcpy(block.data() + x2w_startup::state_block_blend_offset + 4 * target, &normal_blend, 4);
+            untouched.AlphaToCoverageEnable = 77;
+            reason = nullptr;
+            refused = 0;
+            if (x2w_startup::state_block_blend(block.data(), block.size(), false, &untouched, &reason, &refused) || refused != 1u << target ||
+                untouched.AlphaToCoverageEnable != 77 || !reason)
+                fail("dual source on target 0 with blending target > 0", "not refused, the target is unreported, or the output was written");
+            const std::uint32_t normal_off = 0x00040504;
+            std::memcpy(block.data() + x2w_startup::state_block_blend_offset + 4 * target, &normal_off, 4);
+            if (!x2w_startup::state_block_blend(block.data(), block.size(), false, &blend, &reason, &refused) || refused)
+                fail("dual source on target 0 with disabled target > 0", "a disabled target was refused");
+        }
+        block = block_with(dual, 0xE5040504);
+        untouched.AlphaToCoverageEnable = 77;
+        reason = nullptr;
+        refused = 0;
+        if (x2w_startup::state_block_blend(block.data(), block.size(), false, &untouched, &reason, &refused) || refused != 0xFE ||
+            untouched.AlphaToCoverageEnable != 77 || !reason)
+            fail("dual source on target 0 with all other targets blending", "not refused, a refused target is unreported, or the output was written");
+    }
+
     if (failures) {
         std::printf("startup_state_block_blend: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_state_block_blend: PASS (4 measured words, enable clear, 5 controls)\n");
+    std::printf("startup_state_block_blend: PASS (4 measured words, enable clear, 5 controls, dual source)\n");
     return 0;
 }

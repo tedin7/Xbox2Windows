@@ -6,6 +6,7 @@ eight contiguous six-byte records for diagnostics.
 import argparse
 import json
 from pathlib import Path
+import sys
 
 
 LOWER = 1 << 24
@@ -117,7 +118,7 @@ def probe(prefix, blocks, *, prefetch_mask=0, prefetch=b"", next_mask=0, next_by
     return matches
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("packet", type=Path)
     parser.add_argument("--blocks", type=int,
@@ -130,21 +131,36 @@ if __name__ == "__main__":
                         help="Header layout: 8 for the interleaved default, 6 for contiguous six-byte records")
     parser.add_argument("--scan-lanes", action="store_true",
                         help="Print each lane's mode and budget without attempting a decode")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.scan_lanes and args.blocks is None:
         parser.error("--blocks is required unless --scan-lanes is used")
     try:
+        if not args.scan_lanes and not 1 <= args.blocks <= 1 << 20:
+            raise ValueError(f"Expected --blocks in 1..{1 << 20}, got {args.blocks}")
         with args.packet.open("rb") as stream:
             prefix = stream.read(48)
-            prefetch = stream.read(args.prefetch_mask.bit_count())
-            next_bytes = stream.read(args.next_mask.bit_count())
-            if args.scan_lanes:
-                result = {"lane_stride": args.lane_stride,
-                          "lanes": scan_lanes(prefix, lane_stride=args.lane_stride)}
-            else:
-                result = probe(prefix, args.blocks, prefetch_mask=args.prefetch_mask, prefetch=prefetch,
-                               next_mask=args.next_mask, next_bytes=next_bytes,
-                               lane_stride=args.lane_stride)
+            if len(prefix) != 48:
+                raise ValueError(f"Expected a 48-byte prefix, got {len(prefix)} bytes")
+            expected_prefetch = args.prefetch_mask.bit_count()
+            prefetch = stream.read(expected_prefetch)
+            if len(prefetch) != expected_prefetch:
+                raise ValueError(f"Expected {expected_prefetch} prefetch byte(s), got {len(prefetch)}")
+            expected_next = args.next_mask.bit_count()
+            next_bytes = stream.read(expected_next)
+            if len(next_bytes) != expected_next:
+                raise ValueError(f"Expected {expected_next} next-round byte(s), got {len(next_bytes)}")
+        if args.scan_lanes:
+            result = {"lane_stride": args.lane_stride,
+                      "lanes": scan_lanes(prefix, lane_stride=args.lane_stride)}
+        else:
+            result = probe(prefix, args.blocks, prefetch_mask=args.prefetch_mask, prefetch=prefetch,
+                           next_mask=args.next_mask, next_bytes=next_bytes,
+                           lane_stride=args.lane_stride)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{args.packet}: {exc}\n")
     print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -11,3 +11,8 @@ EXPORTS
     op_movdqa_reg_ls
     op_movdqu_reg_ls
     op_mmx_sse2_bridge
+    op_cvtpi2pd_reg
+    op_cvtpi2pd_mem
+    op_cvtpi2pd_mem_disp
+    op_cvtpi2pd_discarded_read
+    op_cvtpi2pd_bridge

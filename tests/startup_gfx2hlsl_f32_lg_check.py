@@ -25,7 +25,8 @@ Controls: every f32 condition in the compare table (v_cmp and v_cmpx; the e32 fo
 neg/abs combination on both sources) is decoded from words built here, translated, and the emitted HLSL is evaluated
 on the CPU with IEEE binary32 comparisons over every pair of 16 source words: +-0, +-min denormal, +-1.0, +-max
 finite, +-inf, +-quiet NaN, +-signalling NaN and +-NaN with a payload. The same forms with the old `!=` lowering
-restored must disagree with the reference. The f32 SDWA compares stay refused.
+restored must disagree with the reference. The f32 SDWA lg/nlg forms with DWORD selections must lower as the e64
+form; tests/startup_gfx2hlsl_f32_sdwa_check.py checks every f32 SDWA form.
 
 The draws: a source-built pixel program builds one of those 16 words from the pixel's x and one from its y with
 integer operations, so 16 x 16 pixels cover every pair: finite unequal, equal (+0 and -0 among them), infinite and
@@ -452,8 +453,9 @@ def controls():
                         wrong.append((asm, hex(a), hex(b), lane))
     check('inactive lane: lg/nlg results masked by EXEC in the e32 and e64 forms', not wrong, str(wrong[:3]))
 
-    # 5. The f32 SDWA compares stay refused (#1906): lg and nlg, v_cmp and v_cmpx, with and without modifiers.
-    refused = []
+    # 5. The f32 SDWA lg/nlg compares (#1906) with DWORD selections: the same text as the e64 form with the same
+    # modifiers. Every f32 SDWA form is checked in tests/startup_gfx2hlsl_f32_sdwa_check.py.
+    differ = []
     for op in F32_OPS:
         cmpx, cond, _ = COMPARES[op]
         if cond not in ('lg', 'nlg'):
@@ -462,12 +464,16 @@ def controls():
             name, asm = decode_one(vopc_sdwa(op, source('v', 1, neg=neg, absolute=absolute), source('v', 2),
                                              None if cmpx else SGPR_DST))
             try:
-                Probe().one(name, asm)
-                refused.append((asm, None))
+                stage = Probe()
+                stage.one(name, asm)
             except G.Unsupported as error:
-                refused.append((asm, str(error)))
-    check('f32 SDWA lg/nlg compares stay refused (%d forms)' % len(refused), len(refused) == 16 and all(
-        error == '%s: f32 SDWA compares are not lowered' % asm.split()[0] for asm, error in refused), str(refused[:3]))
+                differ.append((asm, str(error)))
+                continue
+            _asm, e64 = translate(compare_code(op, 'e64', ((neg, absolute), (False, False))))
+            if stage.lines != e64.lines:
+                differ.append((asm, stage.lines, e64.lines))
+    check('f32 SDWA lg/nlg compares with DWORD selections lower as the e64 form (16 forms)', not differ,
+          str(differ[:3]))
 
 
 # ---- the pixel fixtures -----------------------------------------------------------------------------------------
@@ -670,7 +676,7 @@ def draw(renderer, adapter, vs, ps, expected):
                           str(expected)], capture_output=True, text=True)
     if run.returncode == 77:
         print(run.stdout + run.stderr)
-        sys.exit(77)
+        sys.exit(1 if failures else 77)
     return run
 
 

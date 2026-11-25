@@ -34,7 +34,7 @@
 //   HOST: scenario=<s> started=<0|1> exit=<hex> installed_main=<y/n> reader_untouched=<y/n>
 //         reader_samples=<n> participant=<y/n|-> refused=<y/n|-> intact_on_refusal=<y/n|->
 //         resumed=<y/n|-> late_untouched=<y/n> late_callbacks=<n> callbacks=<ta>,<td> host_tls=<y/n>
-//         cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
+//         process_image=<start><refusal><release> cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
 //         stats=<installed>,<restored>,<exited>,<refusals>,<pending>,<active>,<last release>,<untracked>,
 //               <enrollments refused>,<enrolled threads failed>
 //         [probe=<sentinel>,<created 1/0>,<last error>,<exit code hex>]   probe scenarios only
@@ -51,6 +51,9 @@
 // starting thread's slot 0 still held the image's block ('-' where no refusal is expected).
 // resumed: the paused worker found its own block and values after the refusal.
 // host_tls: after the accepted release the starting thread's slot 0 and sentinel are the host's again.
+// process_image: which image GetModuleHandleW(nullptr) returns right after the start, right after the
+// refused release ('-' without one) and right after the accepted release: i the mapped image, h this
+// host, o neither.
 // cleaned: after the accepted release the image is no longer committed, its unwind data is gone and
 // the carrier is unloaded; it is the only pe_map_release that returned 1. second_release: a further
 // pe_map_release returns 0 (one cleanup only).
@@ -324,6 +327,12 @@ HANDLE host_event(const wchar_t* suffix) {
     return CreateEventW(nullptr, TRUE, FALSE, name);
 }
 
+// Which image GetModuleHandleW(nullptr) reports as the process image: 'i' the mapped image, 'h' this host.
+char process_image(const void* image, HMODULE host) {
+    const HMODULE now = GetModuleHandleW(nullptr);
+    return now == image ? 'i' : now == host ? 'h' : 'o';
+}
+
 bool same(const wchar_t* a, const wchar_t* b) {
     for (; *a && *a == *b; ++a, ++b) {
     }
@@ -375,6 +384,7 @@ extern "C" int host_entry() {
     HANDLE reader_thread = CreateThread(nullptr, 0, reader, nullptr, 0, nullptr);
     if (!reader_thread || WaitForSingleObject(g_reader_ready, 10000) != WAIT_OBJECT_0) ExitProcess(fail_setup("reader"));
 
+    const HMODULE host_image = GetModuleHandleW(nullptr);
     std::uint32_t status = 0;
     void* base = map(argv[2], resolve, &status, g_detail, sizeof(g_detail));
     if (!base) ExitProcess(fail_setup(g_detail[0] ? g_detail : "map failed"));
@@ -392,6 +402,8 @@ extern "C" int host_entry() {
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);
     const bool installed_main = holds_image_block();
+    // The process image after the start, after a refused release ('-' when none) and after the accepted release.
+    char identity[3] = {process_image(base, host_image), '-', '-'};
 
     // More than one table's worth of workers can end without ever entering their start routine.
     if (cancelled && started) {
@@ -455,6 +467,7 @@ extern "C" int host_entry() {
         std::int64_t status_now[STATS];
         stats(status_now);
         refused = first == 0 && status_now[6] == 2;
+        identity[1] = process_image(base, host_image);
         intact = committed(base) && has_unwind(entry_point) && carrier_loaded() && holds_image_block();
         if (stay >= 0) leave_ok = finish_participant(stay) && leave_ok;
         if (paused) {
@@ -476,6 +489,7 @@ extern "C" int host_entry() {
     LONG probe_out[4] = {};
     if (probe) probe_result(probe_out);  // the guest's export, read while the image is still mapped
     const int released = release(base);
+    identity[2] = process_image(base, host_image);
     const bool cleaned = released == 1 && !committed(base) && !has_unwind(entry_point) && !carrier_loaded();
     const bool second_release = release(base) == 0;
     // From here on the starting thread has the host's block back, so the host may read its thread-locals.
@@ -510,6 +524,8 @@ extern "C" int host_entry() {
     put(',');
     put_number(final_counts[3], false);
     put_flag("host_tls", host_tls);
+    put(" process_image=");
+    for (char c : identity) put(c);
     put_flag("cleaned", cleaned);
     put_flag("second_release", second_release);
     put_flag("heap_valid", heap_valid);

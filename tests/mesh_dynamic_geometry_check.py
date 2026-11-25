@@ -15,6 +15,7 @@ from pixel_aot import disassemble
 
 SOURCE = Path(__file__).with_name("mesh_dynamic_geometry.s")
 WAVE64 = "+wavefrontsize64,-wavefrontsize32"
+RETIRED_PREFIX = bytes.fromhex("00008abf 03ff8893 18000400 088006bf 020084bf 00008abf 010082bf 4c0082bf")
 MESH_LIMITS = (4, 2)
 SECOND = 0x300402  # (2, 1, 3)
 DUPLICATE = 0x402  # (2, 1, 0)
@@ -53,6 +54,23 @@ CODE = bytes.fromhex(
     000081bf
     """
 )
+
+# Wave 0 exports the first 64 vertices and ends. Wave 1 passes a second barrier
+# and exports the last four. The second triangle uses its top-right corner (67).
+WIDE_COUNTS, WIDE_SECOND = 0x2044, 0x4300402
+SURVIVOR_BARRIER = """s_barrier
+s_cmp_eq_u32 s8, 1
+s_cbranch_scc0 export_vertices
+s_barrier
+export_vertices:"""
+
+
+def surviving_wave_code():
+    barrier = bytes.fromhex("00008abf")
+    assert CODE.count(barrier) == 1
+    code = CODE.replace(barrier, barrier + bytes.fromhex("088106bf 010084bf 00008abf"))
+    return code.replace(struct.pack("<I", 0x2004), struct.pack("<I", WIDE_COUNTS)).replace(
+        struct.pack("<I", SECOND), struct.pack("<I", WIDE_SECOND))
 
 
 def wave64_pair(token):
@@ -94,17 +112,30 @@ def decode(code):
     return instructions
 
 
-def reassemble(assembler, objcopy, library):
+def reassemble(assembler, objcopy, library, *, retiring_wave=None):
     with tempfile.TemporaryDirectory() as directory:
+        source = SOURCE
+        expected = CODE
+        if retiring_wave == 1:
+            source = Path(directory) / "retired.s"
+            prefix = SOURCE.with_name("mesh_retired_wave_prefix.s").read_text(encoding="ascii")
+            source.write_text(prefix + "\n" + SOURCE.read_text(encoding="ascii"), encoding="ascii")
+            expected = RETIRED_PREFIX + CODE
+        elif retiring_wave == 0:
+            source = Path(directory) / "wide.s"
+            program = SOURCE.read_text(encoding="ascii").replace("s_barrier\n", SURVIVOR_BARRIER + "\n")
+            program = program.replace("0x2004\n", f"{WIDE_COUNTS:#x}\n").replace("0x300402\n", f"{WIDE_SECOND:#x}\n")
+            source.write_text(program, encoding="ascii")
+            expected = surviving_wave_code()
         obj, raw = (Path(directory) / name for name in ("fixture.o", "fixture.bin"))
         subprocess.run(
             [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-mattr=" + WAVE64,
-             "-filetype=obj", SOURCE, "-o", obj],
+             "-filetype=obj", source, "-o", obj],
             check=True,
         )
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
         code = raw.read_bytes()
-    assert code == CODE, "Embedded bytes differ from the assembled mesh"
+    assert code == expected, "Embedded bytes differ from the assembled mesh"
     native = disassemble(code, library, offsets=True, features=WAVE64.encode("ascii"))
     for llvm_instruction, python_instruction in zip(native, decode(code), strict=True):
         assert llvm_instruction == python_instruction, (llvm_instruction, python_instruction)
@@ -139,6 +170,8 @@ def check_cases(decoded):
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "binary":
         reassemble(*sys.argv[2:])
+        reassemble(*sys.argv[2:], retiring_wave=1)
+        reassemble(*sys.argv[2:], retiring_wave=0)
     elif len(sys.argv) != 1:
         raise SystemExit("Usage: mesh_dynamic_geometry_check.py [binary llvm-mc llvm-objcopy libLLVM]")
     check_cases(decode(CODE))

@@ -1,7 +1,10 @@
 # Vendored MDU rANS entropy reference
 
 From [bcpack-rs by Ahmet Dedeler](https://github.com/Ahmet-Dedeler/bcpack-rs),
-revision `5bf5cc56ed56f1ababf1f9592300bd182ff90bd8`.
+revision `5bf5cc56ed56f1ababf1f9592300bd182ff90bd8` (the runtime codebook,
+rank, and dictionary tables in `src/startup_stubs/bcpack_tables.h` and
+`src/startup_stubs/bcpack_tables_bcn.inl` are pinned to revision
+`c55c5fad539644b8cf5a705051df214291763fc0` from the same repository).
 The code is licensed MIT OR Apache-2.0. Microsoft's model tables and per-lane
 decoder port additionally carry the MIT notice in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 The complete upstream license terms are included: [MIT](LICENSE-MIT) and

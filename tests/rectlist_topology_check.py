@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from rectlist_topology import (
     compute_signed_area_2d,
+    convert_indirect_draw_arguments,
     derive_fourth_vertex,
     expand_indices,
     expand_rectangles,
@@ -207,6 +208,27 @@ class RectlistTopologyTests(unittest.TestCase):
         baseline = rect_raster_oracle([((0.0, 0.0), (1.0, 1.0))], 16, 16)
         mutant = rect_raster_oracle([((-0.5, -0.5), (0.5, 0.5))], 16, 16)
         self.assertNotEqual(baseline, mutant)
+
+
+class IndirectArgumentTests(unittest.TestCase):
+    def test_counts_become_six_vertices_per_rectangle(self):
+        self.assertEqual(convert_indirect_draw_arguments((3, 1, 0, 0)), (6, 1, 0, 0))
+        self.assertEqual(convert_indirect_draw_arguments((6, 5, 7, 9)), (12, 5, 7, 9))
+
+    def test_partial_rectangle_is_dropped_like_the_direct_draw(self):
+        self.assertEqual(convert_indirect_draw_arguments((4, 1, 0, 0))[0], 6)
+        self.assertEqual(convert_indirect_draw_arguments((2, 1, 0, 0))[0], 0)
+
+    def test_overflowing_count_draws_nothing(self):
+        self.assertEqual(convert_indirect_draw_arguments((0xFFFFFFFF, 1, 0, 0))[0], 0)
+        self.assertEqual(convert_indirect_draw_arguments((0x2AAAAAAA * 3, 1, 0, 0))[0], 0x2AAAAAAA * 6)
+        self.assertEqual(convert_indirect_draw_arguments((0x2AAAAAAB * 3, 1, 0, 0))[0], 0)
+
+    def test_malformed_record_is_refused(self):
+        with self.assertRaises(ValueError):
+            convert_indirect_draw_arguments((3, 1, 0))
+        with self.assertRaises(ValueError):
+            convert_indirect_draw_arguments((3, 1, 0, 1 << 32))
 
 
 def run_draw(renderer: str, backend: str) -> int:

@@ -15,12 +15,17 @@ class PlacedBuildScene {
         ~Buffer() { wrapper.Reset(); if (memory) VirtualFree(memory, 0, MEM_RELEASE); }
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
+    Microsoft::WRL::ComPtr<IUnknown> cpu_heap_;
     std::array<Buffer, 7> buffers_;
+    UINT64 tlas_title_{}, scratch_title_{};
 
 public:
     // Wrong-routing control (issue #874): also build a decoy BLAS from another triangle into its own placed
     // destination and scratch, and route the TLAS instance to the decoy instead of the BLAS under test.
     bool misroute = false;
+    // Slot-70 variant (issue #1938): the TLAS is handed to the trace as an acceleration-structure view that
+    // device slot 70 published, instead of as a root address.
+    bool slot70 = false;
     void attach(ID3D12Device* device) {
         device->AddRef();
         x2w_startup::attach_device(device, reinterpret_cast<void**>(guest_.GetAddressOf()));
@@ -28,6 +33,7 @@ public:
     void* guest() const { return guest_.Get(); }
     unsigned release() {
         unsigned count = 0;
+        cpu_heap_.Reset();
         for (auto& buffer : buffers_) {
             if (auto* wrapper = buffer.wrapper.Detach()) {
                 if (wrapper->Release()) throw std::runtime_error("Placed resource still referenced");
@@ -81,6 +87,8 @@ public:
         must_reject(ts, tlas);
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS");
+        tlas_title_ = tlas;
+        scratch_title_ = ts;
         const auto verify_offset = [&](const auto& build, UINT64 dest, UINT64 scratch, const auto& sizes) {
             auto base = build;
             check(x2w_startup::resolve_placed_build(guest_.Get(), dest - dest_offset, scratch - scratch_offset,
@@ -94,6 +102,51 @@ public:
         std::printf("Placed DXR bytes dest/scratch: BLAS=%llu/%llu TLAS=%llu/%llu; short scratch, missing dest and swapped states rejected before recording\n",
             bottom_size.ResultDataMaxSizeInBytes, bottom_size.ScratchDataSizeInBytes,
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
+    }
+
+    // Publishes the placed TLAS through guest device slot 70 into a CPU-only guest view heap, then three refused
+    // calls at the same destination (wrong buffer state, unaligned, outside every placed buffer), and returns a
+    // shader-visible desktop heap holding a copy of that one descriptor. Call after prepare().
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> publish_as_view(ID3D12Device* device) {
+        struct Extended {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 address, bytes;
+        } extended{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0}, 0, 0};
+        using Create = HRESULT (WINAPI*)(void*, const void*, const GUID*, void**);
+        auto create = reinterpret_cast<Create>((*reinterpret_cast<void***>(guest_.Get()))[14]);
+        check(create(guest_.Get(), &extended, &__uuidof(ID3D12DescriptorHeap),
+            reinterpret_cast<void**>(cpu_heap_.ReleaseAndGetAddressOf())), "Create the guest view heap");
+        using CpuStart = UINT64 (WINAPI*)(void*);
+        const UINT64 destination = reinterpret_cast<CpuStart>((*reinterpret_cast<void***>(cpu_heap_.Get()))[9])(cpu_heap_.Get());
+        D3D12_RESOURCE_DESC resource{};
+        resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        resource.Width = 256;
+        resource.Height = resource.DepthOrArraySize = resource.MipLevels = resource.SampleDesc.Count = 1;
+        resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        struct ViewAt {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            UINT64 address, tail[2];
+        } at{};
+        at.view.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        at.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        using Publish = void (WINAPI*)(void*, const D3D12_RESOURCE_DESC*, const void*, UINT64);
+        auto slot70 = reinterpret_cast<Publish>((*reinterpret_cast<void***>(guest_.Get()))[70]);
+        const auto publish = [&](UINT64 address) {
+            at.address = address;
+            slot70(guest_.Get(), &resource, &at, destination);
+        };
+        publish(tlas_title_);
+        publish(scratch_title_);   // as_wrong_state: a placed buffer, but not in the acceleration-structure state
+        publish(tlas_title_ + 16); // as_unaligned
+        publish(0x1000);           // as_not_placed
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> visible;
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&visible)), "Create the shader-visible view heap");
+        // The published descriptor lives in a title-side handle range; the guest device copy (slot 24) translates it.
+        using Copy = void (WINAPI*)(void*, UINT, UINT64, UINT64, UINT);
+        reinterpret_cast<Copy>((*reinterpret_cast<void***>(guest_.Get()))[24])(guest_.Get(), 1,
+            visible->GetCPUDescriptorHandleForHeapStart().ptr, destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return visible;
     }
 
     // The decoy BLAS for the wrong-routing control, placed and resolved through the same slot-133 path.

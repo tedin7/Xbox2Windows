@@ -313,7 +313,7 @@ def check_rejections():
         "fldpi without a store": (attempt("d9 eb c3"), "x87 stack not empty at return"),
         "f2xm1": (attempt(f"{fld} d9 f0 {fstp} c3"), "unsupported x87 operation"),
         "fyl2x": (attempt(f"{fld} {fld} d9 f1 {fstp} c3"), "unsupported x87 operation"),
-        "fnstenv": (attempt(f"{fld} d9 31 {fstp} c3"), "unsupported x87 operation"),
+        "fnstenv": (attempt(f"{fld} d9 31 {fstp} c3"), "stores the tag word of a non-empty x87 stack"),
     })
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

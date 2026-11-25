@@ -49,7 +49,7 @@ int main()
            "x2w-d3d12 Device::slot70 unsupported memory SRV arguments: reason=unsupported_description "
            "res{dim=1 fmt=0 size=4096x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0} "
            "view{dim=11 fmt=0 map=0x1688 raw=55667788,11223344,00000000,00000000,00000000,00000000 "
-           "(acceleration structure views are not supported)} dest=0x1000 dest_in_view_heap=1 address=0x2000 address_readable=0");
+           "(acceleration structure view)} dest=0x1000 dest_in_view_heap=1 address=0x2000 address_readable=0");
 
     auto b = view(D3D12_SRV_DIMENSION_BUFFER, DXGI_FORMAT_UNKNOWN);
     b.Buffer.FirstElement = 7;
@@ -145,6 +145,20 @@ int main()
            "x2w-d3d12 Device::slot70 unsupported memory SRV arguments: reason=null_destination "
            "res{unreadable} view{unreadable} dest=0x0 dest_in_view_heap=0 address=0x0 address_readable=0");
 
+    // A 3D texture view.
+    D3D12_RESOURCE_DESC tex3d{D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 32, 32, 32, 1, DXGI_FORMAT_R8_UNORM, {1, 0},
+                             D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    auto v3d = view(D3D12_SRV_DIMENSION_TEXTURE3D, DXGI_FORMAT_R8_UNORM);
+    v3d.Texture3D.MostDetailedMip = 0;
+    v3d.Texture3D.MipLevels = 1;
+    v3d.Texture3D.ResourceMinLODClamp = 0.0f;
+    line(out, "destination_outside_view_heaps", &tex3d, &v3d, 0x3000, true, 0x1000, false);
+    expect("texture 3D view", out,
+           "x2w-d3d12 Device::slot70 unsupported memory SRV arguments: reason=destination_outside_view_heaps "
+           "res{dim=4 fmt=61 size=32x32x32 mips=1 layout=0x0 flags=0x0 align=0 samples=1/0} "
+           "view{dim=8 fmt=61 map=0x1688 mostmip=0 mips=1 clamp=0} "
+           "dest=0x1000 dest_in_view_heap=0 address=0x3000 address_readable=1");
+
     // A small buffer is cut, never overrun, and stays terminated.
     char tiny_buf[40];
     std::memset(tiny_buf, 'x', sizeof(tiny_buf));
@@ -155,6 +169,6 @@ int main()
         std::printf("FAIL truncated line is not terminated\n");
     }
     if (failures) return 1;
-    std::printf("slot 70 refusal lines: 8 lines and a truncation exact\n");
+    std::printf("slot 70 refusal lines: 9 lines and a truncation exact\n");
     return 0;
 }

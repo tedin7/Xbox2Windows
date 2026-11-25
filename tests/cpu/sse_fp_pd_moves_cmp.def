@@ -1,0 +1,24 @@
+EXPORTS
+    op_cmpsd_0
+    op_cmpsd_1
+    op_cmpsd_2
+    op_cmpsd_3
+    op_cmpsd_4
+    op_cmpsd_5
+    op_cmpsd_6
+    op_cmpsd_7
+    op_cmpsd_mem
+    op_cmpsd_mem_plus1
+    op_cmpsd_self
+    op_movlpd_load
+    op_movlpd_store
+    op_movhpd_load
+    op_movhpd_store
+    op_movlpd_load_plus1
+    op_movhpd_load_plus1
+    op_movlpd_store_plus1
+    op_movhpd_store_plus1
+    op_movntpd
+    op_movntpd_disp16
+    op_pd_moves_cmp_pipeline
+    op_pd_moves_cmp_discarded_read

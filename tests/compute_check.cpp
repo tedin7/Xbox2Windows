@@ -34,21 +34,39 @@ constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_s
                                      texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag |
                                      texture_atomic_cas_flag;
 constexpr UINT texture_rgba32_float_flag = 1u << 30;
-constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_rgba32_float_flag;
+// Image-load cases only: bind the t0 SRV from resource mip 1 (MostDetailedMip = 1).
+constexpr UINT texture_view_mip1_flag = 1u << 31;
+// Texture-store cases use only scalar X group counts of 1 or 2, leaving bits 21 and 22
+// free below the format and view selectors.
+constexpr UINT texture_uav_load_flag = 1u << 21;
+constexpr UINT texture_rgba16_float_flag = 1u << 22;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_rgba32_float_flag |
+                                     texture_rgba16_float_flag | texture_uav_load_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
+
+UINT texture_words_per_texel(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return texture_channels;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return texture_channels / 2;
+    default: return 1;
+    }
+}
 }
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
-static void fill_upload(ID3D12Resource* upload)
+// source replaces the generated t0 words when a store case supplies its own.
+static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>* source = nullptr)
 {
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
     check(upload->Map(0, &no_reads, &mapped), "Map compute upload");
     auto* words = static_cast<UINT*>(mapped);
     for (UINT i = 0; i < capacity; ++i) {
-        words[i] = input_word(i);
+        words[i] = source ? (*source)[i] : input_word(i);
         words[capacity + i] = sentinel;
     }
     auto* cb = static_cast<unsigned char*>(mapped) + constants_offset;
@@ -64,8 +82,7 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
                                              const std::vector<UINT>& texels,
                                              DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false)
 {
-    const bool rgba32 = format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
-    const UINT words_per_texel = rgba32 ? texture_channels : 1;
+    const UINT words_per_texel = texture_words_per_texel(format);
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
@@ -113,7 +130,8 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
 
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                          ID3D12Resource* input, ID3D12Resource* output,
-                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0)
+                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0,
+                                         UINT input_register = srvs - 1, UINT texture_first_mip = 0)
 {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
@@ -148,10 +166,19 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride) {
         // A texture SRV at t0 selects its own format; every other slot stays a raw buffer or null.
-        if (texture && i == 0)
+        if (texture && i == 0 && texture_first_mip) {
+            // A view that starts below the base level, so view-relative mip numbers differ from the resource's.
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = texture->GetDesc().Format;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2D.MostDetailedMip = texture_first_mip;
+            view.Texture2D.MipLevels = static_cast<UINT>(-1);
+            device->CreateShaderResourceView(texture, &view, cpu);
+        } else if (texture && i == 0)
             device->CreateShaderResourceView(texture, nullptr, cpu);
         else
-            device->CreateShaderResourceView(!texture && i == srvs - 1 ? input : nullptr, &srv, cpu);
+            device->CreateShaderResourceView(!texture && i == input_register ? input : nullptr, &srv, cpu);
     }
     ID3D12DescriptorHeap* heaps[]{heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -169,6 +196,9 @@ struct StoreCase {
     UINT groups;
     std::array<UINT, capacity> expected;
     std::array<UINT, constants.size()> root_constants = constants;
+    // Optional t0 words after the constants; otherwise t0 holds input_word(i).
+    std::array<UINT, capacity> source{};
+    bool has_source = false;
     UINT axis(UINT index) const
     {
         const UINT n = (groups >> (8 * index)) & 0xff;
@@ -180,7 +210,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
                         DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
-                        bool dpp_case = false)
+                        bool dpp_case = false, bool sized_views = false, UINT texture_first_mip = 0)
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
@@ -196,7 +226,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     auto output = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    fill_upload(input.Get());
+    fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr);
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
@@ -210,7 +240,10 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         // An image-load case binds its output at u0 and the source texture at t0; the table
         // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
         auto* image = rendered_texture ? rendered_texture : texture.Get();
-        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
+        // A sized-view case binds both raw buffers at u0 and t0, so GetDimensions reports the view's byte size.
+        heap = sized_views ? bind_tables(device, list.Get(), input.Get(), output.Get(), nullptr, 0, 0, 0)
+                           : bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1,
+                                         0, srvs - 1, texture_first_mip);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -276,7 +309,7 @@ void check_compute(ID3D12Device* device, bool tables)
 }
 
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
-                        bool dpp_case)
+                        bool dpp_case, bool sized_views)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
@@ -299,11 +332,21 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
             throw std::runtime_error("Invalid compute DPP reference dispatch");
         if (file.peek() != std::char_traits<char>::eof()) {
             file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
-            if (!file || file.peek() != std::char_traits<char>::eof())
+            if (!file)
                 throw std::runtime_error("Invalid compute store constants");
+            if (file.peek() != std::char_traits<char>::eof()) {
+                file.read(reinterpret_cast<char*>(store.source.data()), sizeof(store.source));
+                if (!file || file.peek() != std::char_traits<char>::eof())
+                    throw std::runtime_error("Invalid compute store source words");
+                store.has_source = true;
+            }
         }
-        run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
-                    DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
+        if (sized_views)
+            run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true);
+        else
+            run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }
@@ -333,7 +376,9 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
     source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
     const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
-    store.groups &= ~texture_rgba8_flag;
+    const bool rgba32_float = (store.groups & texture_rgba32_float_flag) != 0;
+    const bool view_mip1 = (store.groups & texture_view_mip1_flag) != 0;
+    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag);
     const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
     std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
@@ -344,10 +389,13 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         source.read(reinterpret_cast<char*>(texels.data() + base_words), extra_words * sizeof(UINT));
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
-        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
+        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5 || (rgba8 && rgba32_float) ||
+        (view_mip1 && texels.size() == base_words))
         throw std::runtime_error("Invalid compute image load reference");
-    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
-    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format);
+    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
+        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format,
+                nullptr, false, false, view_mip1 ? 1 : 0);
 }
 
 static ComPtr<ID3D12Resource> render_msaa_texture(ID3D12Device* device, D3D12_SHADER_BYTECODE vs,
@@ -450,6 +498,11 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     switch (selector) {
     case 0: break;
     case texture_rgba32_float_flag: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+    case texture_uav_load_flag:
+        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+        break;
+    case texture_rgba16_float_flag: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
     case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
     case texture_atomic_uint_flag:
         format = DXGI_FORMAT_R32_UINT;
@@ -476,7 +529,9 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
     const bool float_image = selector == texture_rgba32_float_flag;
-    const UINT words_per_texel = (!selector || float_image) ? texture_channels : 1;
+    const bool uav_load = selector == texture_uav_load_flag;
+    const bool half_image = selector == texture_rgba16_float_flag;
+    const UINT words_per_texel = texture_words_per_texel(format);
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT all_words = base_words + base_words / 4 + base_words / 16;
     std::vector<UINT> initial(all_words), expected(all_words);
@@ -485,12 +540,21 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     std::vector<UINT> input_texels(float_image ? all_words : 0);
     if (float_image) source.read(reinterpret_cast<char*>(input_texels.data()), all_words * sizeof(UINT));
     if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
-        || ((selector & texture_atomic_mask) && mip != 0))
+        || (((selector & texture_atomic_mask) || uav_load) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
+    check(check_feature(device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
           "Check texture UAV format");
+    if (uav_load) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+              "Check typed UAV loads for additional formats");
+        if (!options.TypedUAVLoadAdditionalFormats) {
+            std::puts("R32G32B32A32_FLOAT requires TypedUAVLoadAdditionalFormats");
+            return false;
+        }
+    }
     if ((support.Support2 & required) != required) {
         std::printf("format=%u required_support2=0x%x support1=0x%x support2=0x%x\n",
                     static_cast<UINT>(format), required, static_cast<UINT>(support.Support1),
@@ -548,7 +612,19 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
             const auto* row = reinterpret_cast<const UINT*>(static_cast<const unsigned char*>(mapped) +
                                                              layout.Offset + y * layout.Footprint.RowPitch);
             for (UINT x = 0; x < row_words; ++x, ++word) {
-                if (row[x] != expected[word]) {
+                if (row[x] == expected[word]) continue;
+                if (half_image) {
+                    for (UINT half = 0; half < 2; ++half) {
+                        const UINT shift = 16u * half;
+                        const UINT want = (expected[word] >> shift) & 0xffffu;
+                        const UINT got = (row[x] >> shift) & 0xffffu;
+                        if (want == got) continue;
+                        if (!mismatches)
+                            std::fprintf(stderr, "mip=%u half=%u expected=%04x actual=%04x\n",
+                                         level, 2 * word + half, want, got);
+                        ++mismatches;
+                    }
+                } else {
                     if (!mismatches)
                         std::fprintf(stderr, "mip=%u word=%u expected=%08x actual=%08x\n", level, word, expected[word], row[x]);
                     ++mismatches;
@@ -557,7 +633,8 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         }
     }
     readback->Unmap(0, &no_writes);
-    std::printf("groups=%u view_mip=%u compared_words=%u mismatches=%u\n", groups, mip, word, mismatches);
+    std::printf("groups=%u view_mip=%u compared_%s=%u mismatches=%u\n", groups, mip,
+                half_image ? "halves" : "words", half_image ? 2 * word : word, mismatches);
     if (mismatches) throw std::runtime_error("Image store readback differs from CPU reference");
     return true;
 }

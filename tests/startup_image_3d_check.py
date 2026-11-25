@@ -12,11 +12,13 @@ constant 1 (s9), samples with dim:SQ_RSRC_IMG_3D and exports the result. tests/s
 binds a 2x2x2 R32G32B32A32_FLOAT texture whose texel (x, y, z) holds ((1 + x + 2y + 4z) / 8, x, y, z)
 and a point sampler with wrap addressing.
 """
+import os
 import re
 import struct
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -143,6 +145,32 @@ def compile_hlsl(compiler, kind, source, out, profile, directory):
         args = [compiler, '-T', profile, '-E', 'main', '-Fo', str(directory / ('%s.cso' % out)), str(path)]
     subprocess.run(args, check=True, capture_output=True, text=True)
     return directory / ('%s.cso' % out)
+
+
+class CompileQueue:
+    """Runs independent shader compiles on a thread pool, and hands each result back in source order.
+
+    submit() starts a compile; call() returns that compile's result, or compiles inline when nothing was
+    submitted for the same arguments. A failed compile raises where call() reaches it, so the first failure in
+    source order is still the one reported. Every submitted compile needs its own output name."""
+
+    def __init__(self, workers=None):
+        self.pool = ThreadPoolExecutor(max_workers=workers or min(8, os.cpu_count() or 1))
+        self.futures = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, trace):
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def submit(self, function, *args):
+        assert (function, args) not in self.futures, 'duplicate compile %r' % (args[3],)
+        self.futures[(function, args)] = self.pool.submit(function, *args)
+
+    def call(self, function, *args):
+        future = self.futures.pop((function, args), None)
+        return future.result() if future else function(*args)
 
 
 def texel(x, y, z):

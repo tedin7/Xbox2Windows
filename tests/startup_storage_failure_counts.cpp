@@ -54,6 +54,15 @@ using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
 using EnqueueSignalFn = void(__stdcall*)(void*, void*, std::uint64_t);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
+// The status a refused request reports, written out: EOF causes and a too-small destination are
+// distinct codes; every other cause stays E_FAIL.
+long failure_hresult(StorageFailure cause)
+{
+    if (cause == StorageFailure::read_at_or_past_eof || cause == StorageFailure::read_crossing_eof)
+        return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    if (cause == StorageFailure::destination_capacity) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    return E_FAIL;
+}
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
 
 struct Fence {
@@ -234,7 +243,7 @@ int main(int argc, char** argv)
     constexpr unsigned request_count = sizeof(plan) / sizeof(plan[0]);
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "Counts", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {
@@ -274,8 +283,8 @@ int main(int argc, char** argv)
         const bool done = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i);
         const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
         std::snprintf(what, sizeof what, "request %u status is %s (complete %d), got 0x%08lx", i,
-                      plan[i].valid ? "S_OK" : "E_FAIL", done ? 1 : 0, static_cast<unsigned long>(hr));
-        ok = expect(done && hr == (plan[i].valid ? S_OK : E_FAIL), what) && ok;
+                      plan[i].valid ? "S_OK" : "its cause's failure", done ? 1 : 0, static_cast<unsigned long>(hr));
+        ok = expect(done && hr == (plan[i].valid ? S_OK : failure_hresult(plan[i].cause)), what) && ok;
         if (!plan[i].valid) {
             ++expected[static_cast<unsigned>(plan[i].cause)];
             ++expected_failed;

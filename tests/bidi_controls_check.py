@@ -18,7 +18,7 @@ import unicodedata
 CONTROLS = frozenset([0x061C, *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
 SOURCE_SUFFIXES = frozenset({
     ".asm", ".c", ".cc", ".cpp", ".cxx", ".def", ".h", ".hh", ".hlsl", ".hlsli", ".hpp", ".inc",
-    ".inl", ".py",                                     # sources
+    ".inl", ".py", ".s", ".spvasm", ".zig",            # sources
     ".bat", ".cmd", ".ps1", ".psm1", ".sh",            # scripts
     ".cmake",                                          # build scripts
 })
@@ -64,18 +64,26 @@ def self_test():
             "tests/isolate.cpp": f"int x = 0;\r\n\x0cint z = 0;{isolate}\r\n",
             "tests/ordinary.cpp": "// 64×64 texels, café, naïve – ≡\nint y = 0;\n",
             "docs/notes.md": f"Markdown is out of scope {override}\n",
+            "docs/coverage/table.tsv": f"a data table is out of scope\t{override}\n",
             "CMakeLists.txt": "project(sample)\n",
             ".github/workflows/ci.yml": f"name: ci{override}\n",
             "tools/mark.py": f"label = 'r\u00e9sum\u00e9{arabic_letter_mark}'\n",
+            # Zig, SPIR-V assembly and assembler sources are source files like the ones above.
+            "tests/cpu/archive/reader.zig": f"const a = 1;{override}\n",
+            "tests/spirv_window/case.spvasm": f"; note\n%1 = OpTypeVoid {isolate}\n",
+            "tests/kernel.s": f"s_mov_b32 s0, 0{arabic_letter_mark}\n",
         }
         for name, text in files.items():
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_bytes(text.encode("utf-8"))  # exact bytes, no newline translation
         scoped = [name for name in files if in_scope(name)]
-        assert "docs/notes.md" not in scoped
+        assert "docs/notes.md" not in scoped and "docs/coverage/table.tsv" not in scoped
         assert list(findings(root, scoped)) == [
             ".github/workflows/ci.yml:1: U+202E RIGHT-TO-LEFT OVERRIDE",
+            "tests/cpu/archive/reader.zig:1: U+202E RIGHT-TO-LEFT OVERRIDE",
             "tests/isolate.cpp:2: U+2066 LEFT-TO-RIGHT ISOLATE",
+            "tests/kernel.s:1: U+061C ARABIC LETTER MARK",
+            "tests/spirv_window/case.spvasm:2: U+2066 LEFT-TO-RIGHT ISOLATE",
             "tools/hidden.py:2: U+202E RIGHT-TO-LEFT OVERRIDE",
             "tools/mark.py:1: U+061C ARABIC LETTER MARK",
         ], list(findings(root, scoped))

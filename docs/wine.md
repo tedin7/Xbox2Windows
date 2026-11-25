@@ -36,17 +36,32 @@ passes and failures, as [AGENTS.md](../AGENTS.md#evidence) asks for capability s
 
 ## Launch environment
 
-[`run.ps1`](../tools/startup/run.ps1) is PowerShell, so on Linux set its variables yourself and start
-`tools/startup/debug_launch.py` with the Windows Python inside Wine. These variables matter on Linux:
+[`run.sh`](../tools/startup/run.sh) is the Linux counterpart of [`run.ps1`](../tools/startup/run.ps1):
+the same switches as GNU long options (`--exe`, `--data`, `--log`, `--render`, `--translate`, ...). It starts
+`tools/startup/debug_launch.py` with a Windows Python inside Wine and exits with the debugger's exit code.
+Set `WINEPREFIX` to a prepared prefix ([Startup debugger under Wine](non-windows-hosts.md#startup-debugger-under-wine))
+and `X2W_WIN_PYTHON` to the host path of a Windows `python.exe`; `WINE` (or `PROTON`) picks the Wine
+binary. `--data`, `--log`, `--storage` and `--shader-cache` take a host path or a drive path such as `G:\`.
+A drive path is passed on as it is; run.sh creates the log and shader-cache folders through the prefix's drive links. A
+title that opens its package by drive letter needs that letter. The title id and storage size come from the package's
+`MicrosoftGame.config`, the first tag of each in any case, as `run.ps1` reads them. Unlike `run.ps1`, a value must start
+on its tag's line, and a UTF-16 config is not read. With `--render --translate`, the shader watcher runs in
+its own process group with `d3dcompiler_47=n` added to its `WINEDLLOVERRIDES`, and the whole group is
+stopped when the run ends. `--hide-title-window` sets `X2W_HIDE_TITLE_WINDOW=1`
+([Switches](startup-runtime.md#switches)).
+
+These variables matter on Linux. `run.sh` sets them, except where the table says otherwise; a value you
+set yourself stays, except `XDG_RUNTIME_DIR`, which it always unsets:
 
 | Variable | Why |
 |---|---|
-| The `run.ps1` set: `X2W_AUDIO_PERMISSIVE`, `X2W_D3D12_DEVICE_NOOP`, `X2W_D3D12_LIST_NOOP`, `X2W_D3D12_PERMISSIVE`, `X2W_XMEM_PERMISSIVE`, `X2W_RUNTIME_PROXY` (all `=1`) | The same stand-in behaviour as a Windows run. Add the variables behind `-Render`, `-FakeUser`, `-GpuMirror` and `-HostCpu` as [Switches](startup-runtime.md#switches) lists them |
+| The `run.ps1` set: `X2W_AUDIO_PERMISSIVE`, `X2W_D3D12_DEVICE_NOOP`, `X2W_D3D12_LIST_NOOP`, `X2W_D3D12_PERMISSIVE`, `X2W_XMEM_PERMISSIVE`, `X2W_RUNTIME_PROXY` (all `=1`) | The same stand-in behaviour as a Windows run. `run.sh` sets the variables behind `--render`, `--fake-user`, `--gpu-mirror` and `--host-cpu` as [Switches](startup-runtime.md#switches) lists them |
 | `X2W_XMEM_SHARED_VIEWS=1` | With one section and view per page, a start-up batch of about 100,000 pages took 42.9 s under Wine. With shared views it took 82 ms ([Physical pages in shared sections](startup-runtime.md#physical-pages-in-shared-sections)). Without it, the measured runs did not get past start-up |
 | `XDG_RUNTIME_DIR` unset | Wine then backs sections in `/tmp`, not on a small tmpfs ([Startup debugger under Wine](non-windows-hosts.md#startup-debugger-under-wine)). This also breaks audio; see the next section |
-| `PULSE_SERVER=unix:/run/user/$(id -u)/pulse/native` | Restores audio while `XDG_RUNTIME_DIR` stays unset |
+| `PULSE_SERVER=unix:/run/user/$(id -u)/pulse/native` | Restores audio while `XDG_RUNTIME_DIR` stays unset. `run.sh` sets it only when that socket exists |
+| `WINEDLLOVERRIDES=d3d12,d3d12core,dxgi,d3d11=n`, `WINEFSYNC=1` | Wine's built-in D3D12 is not enough; the prefix holds vkd3d-proton and DXVK |
 | `WINEDEBUG` | `-all` keeps the logs small. For audio, add `err+xaudio2,warn+xaudio2,err+mmdevapi,err+pulse,err+alsa` |
-| `_NO_DEBUG_HEAP` | The debugger sets it to `1` unless it is already set. It has no effect under Wine (below) |
+| `_NO_DEBUG_HEAP` | The debugger, not `run.sh`, sets it to `1` unless it is already set. It has no effect under Wine (below) |
 
 ## Audio
 

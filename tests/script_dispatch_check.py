@@ -18,8 +18,10 @@ LIMITS (preserved explicitly):
      runtime executable code.
   2. The reference native resolver (`resolve_script_path` in
      `tools/script_path_host.cpp`) is intentionally `id`-only, so returning -2
-     on sibling `id` collisions is conservative; type filtering here is a
-     caller-side pre-filter that preserves original node indices and links.
+     on sibling `id` collisions is conservative; `filter_siblings_by_type`
+     exercises that path via a caller-side pre-filter, while
+     `resolve_script_typed_path` accepts caller-provided `type` hash arrays to
+     disambiguate `(id, type)` siblings natively in-place.
   3. The native runtime event or caller that supplies `(id, type)` at runtime
      is still unidentified.
   4. A synthetic tree is a reproducible semantic model, not evidence of runtime
@@ -41,27 +43,57 @@ DEFAULT_HOST = Path(__file__).resolve().parents[1] / "out" / "build" / "dev" / "
 HOST = DEFAULT_HOST
 
 
-def load_resolver(host):
+def _load_symbol(host, symbol, extra_argtypes=()):
     library = ctypes.CDLL(str(Path(host).resolve()))
-    resolve = library.resolve_script_path
+    resolve = getattr(library, symbol)
     u32 = ctypes.c_uint32
     resolve.argtypes = [
         ctypes.c_void_p, u32, ctypes.c_void_p, u32, u32, ctypes.POINTER(u32),
-        ctypes.c_bool, u32, ctypes.POINTER(u32), u32,
+        ctypes.c_bool, u32, *extra_argtypes, u32,
     ]
     resolve.restype = ctypes.c_int
     return resolve
 
 
-def resolve_path(resolver, nodes, attrs, container, active, path_hashes, *, relative=False, up=0):
-    u32 = ctypes.c_uint32
+def load_resolver(host):
+    return _load_symbol(host, "resolve_script_path", (ctypes.POINTER(ctypes.c_uint32),))
+
+
+def load_typed_resolver(host):
+    u32_ptr = ctypes.POINTER(ctypes.c_uint32)
+    return _load_symbol(host, "resolve_script_typed_path", (u32_ptr, u32_ptr))
+
+
+def _pack_tree(nodes, attrs):
     node_buf = ctypes.create_string_buffer(b"".join(NODE.pack(*row) for row in nodes))
     attr_buf = ctypes.create_string_buffer(b"".join(ATTRIBUTE.pack(*row) for row in attrs))
+    return node_buf, attr_buf
+
+
+def resolve_path(resolver, nodes, attrs, container, active, path_hashes, *, relative=False, up=0):
+    u32 = ctypes.c_uint32
+    node_buf, attr_buf = _pack_tree(nodes, attrs)
     active_var = u32(active)
     path_arr = (u32 * len(path_hashes))(*path_hashes)
     rc = resolver(
         node_buf, len(nodes), attr_buf, len(attrs), container, ctypes.byref(active_var),
         relative, up, path_arr, len(path_hashes),
+    )
+    return rc, active_var.value
+
+
+def resolve_typed_path(
+    resolver, nodes, attrs, container, active, path_hashes, type_hashes, *, relative=False, up=0
+):
+    u32 = ctypes.c_uint32
+    node_buf, attr_buf = _pack_tree(nodes, attrs)
+    active_var = u32(active)
+    path_arr = (u32 * len(path_hashes))(*path_hashes) if path_hashes is not None else None
+    type_arr = (u32 * len(type_hashes))(*type_hashes) if type_hashes is not None else None
+    depth = len(path_hashes) if path_hashes is not None else 0
+    rc = resolver(
+        node_buf, len(nodes), attr_buf, len(attrs), container, ctypes.byref(active_var),
+        relative, up, path_arr, type_arr, depth,
     )
     return rc, active_var.value
 
@@ -431,6 +463,215 @@ class ScriptDispatchTests(unittest.TestCase):
         # Start from active=2 ('default'); scanning siblings under container=1 hits kind=4 id on node 4 -> -3.
         rc, active = resolve_path(self.resolve, nodes, attrs, 1, 2, [joaat("trigger_a")])
         self.assertEqual((rc, active), (-3, 2))
+
+
+def _build_typed_collision_tree(*, missing_type=False, duplicate_pair=False,
+                                bad_type_kind=False, duplicate_type_attr=False):
+    """Build a minimal `states` tree for resolve_script_typed_path edge cases."""
+    nodes = []
+    attrs = []
+
+    def add_node(tag, parent, child, sibling, previous, node_attrs=()):
+        first = len(attrs) if node_attrs else 0
+        attrs.extend(node_attrs)
+        nodes.append((joaat(tag), parent, child, sibling, previous, first, len(node_attrs), 1))
+
+    add_node("root", NONE, 1, NONE, NONE)
+    add_node("states", 0, 2, NONE, NONE)
+    add_node("state", 1, NONE, 3, NONE, [_attr_hash("id", "default"), _attr_hash("type", "default")])
+
+    node3_attrs = [_attr_hash("id", "trigger_a")]
+    if bad_type_kind:
+        node3_attrs.append(_attr_int("type", 42))
+    elif not missing_type:
+        node3_attrs.append(_attr_hash("type", "item"))
+    if duplicate_type_attr:
+        node3_attrs.append(_attr_hash("type", "item"))
+
+    if duplicate_pair:
+        add_node("state", 1, NONE, 4, 2, node3_attrs)
+        add_node("state", 1, NONE, 5, 3, [_attr_hash("id", "trigger_a"), _attr_hash("type", "item")])
+        add_node("state", 1, NONE, NONE, 4, [_attr_hash("id", "trigger_a"), _attr_hash("type", "weaponitem")])
+    else:
+        add_node("state", 1, NONE, NONE, 2, node3_attrs)
+    return nodes, attrs
+
+
+class TypedScriptPathTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.resolve_typed = load_typed_resolver(HOST)
+
+    def test_sibling_collision_resolved_by_type_hash_and_shop_carrier(self):
+        nodes, attrs, vectors = build_states_library()
+        shop_nodes, shop_attrs = build_shop_carrier()
+        trigger_id = joaat("trigger_a")
+
+        # Direct typed lookup resolves colliding sibling 4 ('item') without pre-filtering.
+        rc, active = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 1, [trigger_id], [joaat("item")]
+        )
+        self.assertEqual((rc, active), (4, 4))
+        self.assertEqual(read_camera_leaves(nodes, attrs, vectors, 4), [])
+        leaf_idx, vecs = read_vector_leaf(nodes, attrs, vectors, 4, "preview_offset")
+        self.assertEqual(leaf_idx, 5)
+        self.assertEqual(vecs[joaat("position")], "0.100000,0.000000,-0.250000")
+
+        # Alternate type selects colliding sibling 6 ('weaponitem') -> relative subview 7 -> cam 8.
+        rc, active = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, active, [trigger_id], [joaat("weaponitem")]
+        )
+        self.assertEqual((rc, active), (6, 6))
+        rc_rel, active_rel = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, active,
+            [joaat("detail_view")], [joaat("subview")], relative=True, up=0,
+        )
+        self.assertEqual((rc_rel, active_rel), (7, 7))
+        self.assertEqual(read_camera_leaves(nodes, attrs, vectors, 7)[0][0], 8)
+
+        # Shop-component carriers feed (id, type) directly into resolve_script_typed_path.
+        pos_id, pos_type = extract_carrier_pair(shop_nodes, shop_attrs, 5, joaat("weapon"))
+        alt_id, alt_type = extract_carrier_pair(shop_nodes, shop_attrs, 6, joaat("weapon"))
+        rc_pos, active = resolve_typed_path(self.resolve_typed, nodes, attrs, 1, 1, [pos_id], [pos_type])
+        self.assertEqual((rc_pos, active), (4, 4))
+        rc_alt, active = resolve_typed_path(self.resolve_typed, nodes, attrs, 1, active, [alt_id], [alt_type])
+        self.assertEqual((rc_alt, active), (6, 6))
+
+    def test_multilevel_hierarchy_paths_and_relative_switch(self):
+        nodes, attrs, vectors = build_states_library()
+
+        rc_deep, active = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 1,
+            [joaat("trigger_a"), joaat("detail_view")],
+            [joaat("weaponitem"), joaat("subview")],
+        )
+        self.assertEqual((rc_deep, active), (7, 7))
+        self.assertEqual(read_camera_leaves(nodes, attrs, vectors, 7)[0][0], 8)
+
+        p_compact = [joaat("site_north"), joaat("compact"), joaat("inspect")]
+        t_hierarchy = [joaat("location"), joaat("vehiclesize"), joaat("angle")]
+        p_heavy = [joaat("site_north"), joaat("heavy"), joaat("inspect")]
+
+        rc1, active = resolve_typed_path(self.resolve_typed, nodes, attrs, 1, active, p_compact, t_hierarchy)
+        self.assertEqual((rc1, active), (11, 11))
+        self.assertEqual(read_camera_leaves(nodes, attrs, vectors, 11)[0][1]["orbitdistance"], "3.500000")
+
+        rc2, active = resolve_typed_path(self.resolve_typed, nodes, attrs, 1, active, p_heavy, t_hierarchy)
+        self.assertEqual((rc2, active), (14, 14))
+        self.assertEqual(read_camera_leaves(nodes, attrs, vectors, 14)[0][1]["orbitdistance"], "5.500000")
+
+        rc3, active = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, active,
+            [joaat("compact"), joaat("inspect")], [joaat("vehiclesize"), joaat("angle")],
+            relative=True, up=2,
+        )
+        self.assertEqual((rc3, active), (11, 11))
+
+    def test_missing_type_attribute_and_mismatched_type_return_missing(self):
+        # Missing type attribute on candidate matching id -> -1, active preserved.
+        nodes_no_type, attrs_no_type = _build_typed_collision_tree(missing_type=True)
+        rc, active = resolve_typed_path(
+            self.resolve_typed, nodes_no_type, attrs_no_type, 1, 2,
+            [joaat("trigger_a")], [joaat("item")],
+        )
+        self.assertEqual((rc, active), (-1, 2))
+
+        # Mismatched type hash at single and deeper hierarchy levels -> -1, active preserved.
+        nodes, attrs, _ = build_states_library()
+        rc_miss, active_miss = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 2, [joaat("trigger_a")], [joaat("unmatched_type")]
+        )
+        self.assertEqual((rc_miss, active_miss), (-1, 2))
+        rc_deep_miss, active_deep_miss = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 2,
+            [joaat("site_north"), joaat("compact")], [joaat("location"), joaat("angle")],
+        )
+        self.assertEqual((rc_deep_miss, active_deep_miss), (-1, 2))
+
+    def test_duplicate_identical_id_and_type_siblings_return_ambiguous(self):
+        nodes, attrs = _build_typed_collision_tree(duplicate_pair=True)
+        rc, active = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 2, [joaat("trigger_a")], [joaat("item")]
+        )
+        self.assertEqual((rc, active), (-2, 2))
+
+        # Distinct (id, type) sibling under the same parent still resolves uniquely.
+        rc_ok, active_ok = resolve_typed_path(
+            self.resolve_typed, nodes, attrs, 1, 2, [joaat("trigger_a")], [joaat("weaponitem")]
+        )
+        self.assertEqual((rc_ok, active_ok), (5, 5))
+
+    def test_out_of_bounds_and_malformed_inputs_return_malformed(self):
+        base_nodes, base_attrs, _ = build_states_library()
+
+        # Out-of-bounds sibling index -> -3.
+        oob_node = [list(row) for row in base_nodes]
+        oob_node[4][3] = len(oob_node)
+        rc, active = resolve_typed_path(
+            self.resolve_typed, [tuple(r) for r in oob_node], base_attrs, 1, 2,
+            [joaat("trigger_a")], [joaat("item")],
+        )
+        self.assertEqual((rc, active), (-3, 2))
+
+        # Out-of-bounds attribute span -> -3.
+        oob_attr = [list(row) for row in base_nodes]
+        oob_attr[4][5] = len(base_attrs) - 1
+        oob_attr[4][6] = 2
+        rc, active = resolve_typed_path(
+            self.resolve_typed, [tuple(r) for r in oob_attr], base_attrs, 1, 2,
+            [joaat("trigger_a")], [joaat("item")],
+        )
+        self.assertEqual((rc, active), (-3, 2))
+
+        # Out-of-bounds container / active, null types, and zero depth -> -3.
+        self.assertEqual(
+            resolve_typed_path(
+                self.resolve_typed, base_nodes, base_attrs, len(base_nodes), 2,
+                [joaat("default")], [joaat("default")],
+            ),
+            (-3, 2),
+        )
+        self.assertEqual(
+            resolve_typed_path(
+                self.resolve_typed, base_nodes, base_attrs, 1, len(base_nodes),
+                [joaat("default")], [joaat("default")],
+            ),
+            (-3, len(base_nodes)),
+        )
+        self.assertEqual(
+            resolve_typed_path(
+                self.resolve_typed, base_nodes, base_attrs, 1, 2,
+                [joaat("default")], None,
+            ),
+            (-3, 2),
+        )
+        self.assertEqual(
+            resolve_typed_path(
+                self.resolve_typed, base_nodes, base_attrs, 1, 2, [], []
+            ),
+            (-3, 2),
+        )
+
+        # Malformed non-label `type`, duplicate `type`, and non-label `id` -> -3.
+        for kwargs in ({"bad_type_kind": True}, {"duplicate_type_attr": True}):
+            with self.subTest(**kwargs):
+                bad_nodes, bad_attrs = _build_typed_collision_tree(**kwargs)
+                self.assertEqual(
+                    resolve_typed_path(
+                        self.resolve_typed, bad_nodes, bad_attrs, 1, 2,
+                        [joaat("trigger_a")], [joaat("item")],
+                    ),
+                    (-3, 2),
+                )
+
+        bool_nodes, bool_attrs, _ = build_states_library(malformed_bool_id=True)
+        self.assertEqual(
+            resolve_typed_path(
+                self.resolve_typed, bool_nodes, bool_attrs, 1, 2,
+                [joaat("trigger_a")], [joaat("item")],
+            ),
+            (-3, 2),
+        )
 
 
 if __name__ == "__main__":

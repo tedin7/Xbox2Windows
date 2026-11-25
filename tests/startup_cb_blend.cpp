@@ -11,6 +11,7 @@
 #include "startup_cb_blend_ps.h"
 #include "startup_cb_blend_vs.h"
 #include "startup_stubs/cb_blend.h"
+#include "startup_stubs/export_write_mask.h"
 
 #include <algorithm>
 #include <array>
@@ -307,5 +308,41 @@ int check_startup_cb_blend(ID3D12Device* device, bool swapped)
                     got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3], same ? "" : "  MISMATCH");
     }
     std::printf("startup_cb_blend swapped=%d drawn=%d skipped=%d mismatches=%d\n", swapped ? 1 : 0, drawn, skipped, mismatches);
+    return mismatches;
+}
+
+// Export write masks (src/startup_stubs/export_write_mask.h, #1674): a manifest 'wmask' line applied to an
+// opaque blend state. The draw writes a constant source over a cleared target; the channels outside the mask
+// must keep the cleared value and the others must take the source. With unmasked the mask is not applied, so
+// every channel takes the source and every case must disagree. Returns the number of cases that differ from
+// that expectation.
+int check_startup_export_write_mask(ID3D12Device* device, bool unmasked)
+{
+    struct MaskCase {
+        const char* line;
+        unsigned mask;
+    };
+    const MaskCase cases[] = {{"wmask 0 0x3", 0x3}, {"wmask 0 0xc", 0xC}, {"wmask 0 0x5", 0x5}, {"wmask 0 0x8", 0x8}};
+    // Every channel of the source differs from the cleared value, so each one shows whether it was written.
+    const Color source{0.75f, 0.5f, 0.25f, 0.75f}, destination{0.125f, 0.875f, 1.0f, 0.0625f}, constant{0, 0, 0, 0};
+    const auto root = create_root(device);
+    int mismatches = 0;
+    for (const auto& c : cases) {
+        x2w_startup::ExportWriteMasks masks;
+        if (!masks.read_manifest_line(c.line)) throw std::runtime_error(std::string("manifest line refused: ") + c.line);
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0] = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
+                                 D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+        if (!unmasked && !x2w_startup::apply_export_write_masks(blend, masks, 1))
+            throw std::runtime_error("single-target export mask refused");
+        const Color got = draw(device, root.Get(), blend.RenderTarget[0], source, destination, constant);
+        Color want{};
+        for (int ch = 0; ch < 4; ++ch) want[ch] = (c.mask >> ch) & 1 ? source[ch] : destination[ch];
+        const bool same = got == want;
+        mismatches += !same;
+        std::printf("startup_export_write_mask %s: got %g %g %g %g, written channels -> %g %g %g %g%s\n", c.line, got[0], got[1],
+                    got[2], got[3], want[0], want[1], want[2], want[3], same ? "" : "  MISMATCH");
+    }
+    std::printf("startup_export_write_mask unmasked=%d cases=%zu mismatches=%d\n", unmasked ? 1 : 0, std::size(cases), mismatches);
     return mismatches;
 }

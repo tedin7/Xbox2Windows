@@ -1,0 +1,21 @@
+EXPORTS
+    op_sha1rnds4_0_reg
+    op_sha1rnds4_1_reg
+    op_sha1rnds4_2_reg
+    op_sha1rnds4_3_reg
+    op_sha1rnds4_hi_imm
+    op_sha1rnds4_0_mem
+    op_sha1rnds4_1_mem
+    op_sha1rnds4_2_mem
+    op_sha1rnds4_3_mem
+    op_sha1rnds4_self
+    op_sha1nexte_reg
+    op_sha1nexte_mem
+    op_sha1nexte_self
+    op_sha1msg1_reg
+    op_sha1msg1_mem
+    op_sha1msg1_self
+    op_sha1msg2_reg
+    op_sha1msg2_mem
+    op_sha1msg2_self
+    op_sha1_pipeline

@@ -8,9 +8,13 @@ fxc discovery: a translation asked to compile (check) with no fxc.exe anywhere m
 naming X2W_FXC and no manifest; with the empty X2W_FXC or check=False it publishes the manifest alone.
 """
 import contextlib
+import io
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
 import gfx2hlsl  # noqa: E402
@@ -93,6 +97,9 @@ class StubPipeline:
 
     def manifest(self):
         return 'manifest\n'
+
+    def ps_profile(self):
+        return 'ps_5_1'
 
 
 @contextlib.contextmanager
@@ -186,11 +193,89 @@ def check_negative_discovery(failures):
                 failures.append('negative control: a Windows Kits tree with fxc.exe was not found')
 
 
+def check_pending_manifest_upgrade(failures):
+    with tempfile.TemporaryDirectory() as work:
+        out = Path(work)
+        key = '0000000000001234'
+        (out / ('req_%s.a' % key)).touch()
+        manifest = out / (key + '.txt')
+        failure = out / (key + '.fail')
+        vs, ps = (out / (key + '.' + stage + '.cso') for stage in ('vs', 'ps'))
+        runs = []
+        fail_pixel = True
+
+        def compile_shader(command, **kwargs):
+            profile = command[command.index('/T') + 1]
+            runs.append(profile)
+            Path(command[command.index('/Fo') + 1]).write_bytes(profile.encode('ascii'))
+            if fail_pixel and profile == 'ps_5_1':
+                return subprocess.CompletedProcess(command, 1, '', 'synthetic compiler failure')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        def pending(configured):
+            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None)
+            with fxc_environment(work, configured, os.path.join(work, 'none')), \
+                 mock.patch.object(sys, 'argv', ['gfx2hlsl.py', '--pending', work]), \
+                 mock.patch.object(gfx2hlsl, 'load_request', return_value=request), \
+                 mock.patch.object(subprocess, 'run', side_effect=compile_shader), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                gfx2hlsl.main()
+            return output.getvalue()
+
+        if pending('') != '%s: ok\n' % key or not manifest.is_file() or vs.exists() or ps.exists():
+            failures.append('pending manifest-only pass did not publish just the manifest and HLSL')
+        if pending('') or runs:
+            failures.append('pending manifest-only pass did not skip an existing manifest')
+
+        fxc = out / 'fxc.exe'
+        fxc.touch()
+        if 'fxc ps failed' not in pending(str(fxc)) or runs != ['vs_5_1', 'ps_5_1']:
+            failures.append('pending did not compile an existing manifest when FXC became available')
+        if vs.exists() or ps.exists():
+            failures.append('a failed compilation published partial shader bytecode')
+        if not failure.is_file():
+            failures.append('a failed compilation did not write a failure report')
+
+        fail_pixel = False
+        if pending(str(fxc)) != '%s: ok\n' % key or not all(path.is_file() for path in (vs, ps)):
+            failures.append('pending did not retry and publish both shader stages')
+            return
+        if (vs.read_bytes(), ps.read_bytes()) != (b'vs_5_1', b'ps_5_1'):
+            failures.append('pending did not publish the expected bytecode for both stages')
+        if failure.exists():
+            failures.append('pending left a stale failure report after successful compilation')
+        runs.clear()
+        if pending(str(fxc)) or runs:
+            failures.append('pending recompiled an already complete translation')
+        ps.write_bytes(b'')
+        if pending(str(fxc)) != '%s: ok\n' % key or ps.read_bytes() != b'ps_5_1':
+            failures.append('pending did not repair an empty shader bytecode file')
+
+        replace = os.replace
+
+        def reject_manifest_publish(source, destination):
+            if Path(destination) == manifest:
+                raise PermissionError('synthetic manifest publication failure')
+            replace(source, destination)
+
+        ps.unlink()
+        with mock.patch.object(StubPipeline, 'manifest', return_value='updated bindings\n'):
+            with mock.patch.object(os, 'replace', side_effect=reject_manifest_publish):
+                # translate_one records unexpected I/O errors as <key>.fail instead of ending the scan.
+                result = pending(str(fxc))
+                if 'translator error: PermissionError' not in result:
+                    failures.append('pending did not attempt to publish the changed manifest')
+            if manifest.exists():
+                failures.append('failed publication left an old manifest beside the new bytecode')
+            if pending(str(fxc)) != '%s: ok\n' % key or manifest.read_text() != 'updated bindings\n':
+                failures.append('pending did not retry an interrupted manifest publication')
+
+
 def main():
     failures = []
     for check in (check_wide_load, check_offset_load, check_root_descriptor, check_numeric_symbol_refusal,
                   check_negative_control, check_missing_fxc,
-                  check_fxc_discovery, check_negative_discovery):
+                  check_fxc_discovery, check_negative_discovery, check_pending_manifest_upgrade):
         check(failures)
     for line in failures:
         print('FAIL', line)

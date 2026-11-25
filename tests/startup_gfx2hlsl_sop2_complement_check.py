@@ -1,4 +1,5 @@
-"""32-bit scalar complement logic operations in tools/startup/gfx2hlsl.py: s_nand_b32, s_nor_b32, s_xnor_b32 (#1919).
+"""Scalar SOP2 complement logic (#1919), high-halfword packing (#1996) and unsigned multiply-high in
+tools/startup/gfx2hlsl.py.
 
   (no arguments)        translation controls, pure Python
   binary <llvm-mc>      assemble the decoded text of every form with llvm-mc and compare with the words built here
@@ -21,7 +22,24 @@ is; the translator's per-lane projection cannot show that, so no mask lowering i
 
 Mutations: the table entry with the complement dropped, and the entry with the SCC write dropped, must each read a
 wrong result or SCC. Refused: every SOP2 operation the decoder names that still has no lowering.
+
+The `s_pack_hh_b32_b16` forms use the same encoder and evaluator. The reference places the high half of src0
+in the low result half and the high half of src1 in the high result half, preserving SCC. Swapping the inputs
+must fail the value check.
+
+The `s_bfe_u32` forms use the same encoder and evaluator. The reference reads the ISA text: offset = S1[4:0], width =
+S1[22:16], a width of 0 gives 0, offset + width < 32 gives the field, and any wider field gives S0 >> offset. SCC is
+D != 0. HLSL reduces a shift count to 5 bits, so a lowering that shifts by the 7-bit width gives 0 at width 32 and a
+truncated mask at 33 to 127. The inputs reach widths 0 to 127 with the source sign bit set, as SGPR, inline and
+literal controls. The mutated table entries must read a wrong word.
+
+The `s_mul_hi_u32` forms use the same encoder and evaluator. The emitted mul_hi_u32 helper is taken from the
+translator's common preamble and run statement by statement in 32-bit arithmetic; the reference is (a * b) >> 32 on
+Python integers, SCC unchanged. The value set adds 0 x 0, 1 x 1, all ones squared, 0x80000000 x 2 and seeded random
+pairs. Mutations that must each fail: the low word of the product, the signed high word, the helper without the
+low-halfword carry, the helper without the final carry limb, an added SCC write and a disabled lowering.
 """
+import random
 import re
 import struct
 import sys
@@ -35,10 +53,12 @@ import disasm_rdna2 as D  # noqa: E402
 import gfx2hlsl as G  # noqa: E402
 import pixel_aot as P  # noqa: E402
 from startup_flat_param_check import assemble  # noqa: E402
-from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
+from startup_gfx2hlsl_bit_alu_check import Expr as BitExpr  # noqa: E402
 
 MASK = 0xffffffff
 OPCODE = {name: op for op, (name, _) in D.SOP2_OPS.items()}
+PACK_HH = 's_pack_hh_b32_b16'
+BFE = 's_bfe_u32'
 # operation -> (non-complement sibling, reference)
 OPS = {
     's_nand_b32': ('s_and_b32', lambda a, b: ~(a & b) & MASK),
@@ -130,6 +150,43 @@ def source_value(code_, literal, env):
     return env['s%d' % code_]
 
 
+def common_lines():
+    pipe = object.__new__(G.Pipeline)
+    pipe.uds, pipe.resources, pipe.samplers, pipe.uses_sampler_heap = [], {}, {}, False
+    return pipe.common()
+
+
+def mul_hi_helper():
+    """The emitted mul_hi_u32 body as (declarations, return expression), parsed for the evaluator."""
+    text = ''.join(entry for entry in common_lines() if entry.startswith('uint mul_hi_u32('))
+    m = re.fullmatch(r'uint mul_hi_u32\(uint a, uint b\) \{ (.*) \}', text)
+    assert m, text
+    *statements, result = [part.strip() for part in m.group(1).split(';') if part.strip()]
+    assert result.startswith('return '), result
+    declarations = []
+    for statement in statements:
+        assert statement.startswith('uint '), statement
+        for item in statement[5:].split(', '):
+            name, value = item.split(' = ', 1)
+            declarations.append((name, BitExpr(value)))
+    return declarations, BitExpr(result[7:])
+
+
+class Expr(BitExpr):
+    """The bit-ALU evaluator, plus the translator's own mul_hi_u32 helper text."""
+    helper = None
+
+    def call(self, name, args):
+        if name != 'mul_hi_u32':
+            return BitExpr.call(name, args)
+        assert not args[0][1] and not args[1][1], 'mul_hi_u32 reads uint operands'
+        declarations, result = Expr.helper
+        env = {'a': args[0][0], 'b': args[1][0]}
+        for local, value in declarations:
+            env[local] = value.run(env)[0]
+        return result.run(env)[0], False
+
+
 def run_lines(lines, env):
     env = dict(env)
     for line in lines:
@@ -150,9 +207,10 @@ def check(label, ok, detail=''):
             print('  ' + detail)
 
 
-def first_mismatch(name):
+def first_mismatch(name, reference=None, updates_scc=True):
     """The first (form, a, b, got, want) whose result or SCC differs from the reference, or None."""
-    reference = OPS[name][1]
+    if reference is None:
+        reference = OPS[name][1]
     for form in VALUE_FORMS:
         sdst, ssrc0, ssrc1, literal = form
         asm, stage = attempt(code(name, form))
@@ -164,9 +222,238 @@ def first_mismatch(name):
             want = reference(source_value(ssrc0, literal, env), source_value(ssrc1, literal, env))
             out = run_lines(stage.lines, env)
             got = (out.get(destination), out['scc'])
-            if got != (want, int(want != 0)):
-                return asm, hex(a), hex(b), got, (want, int(want != 0))
+            expected = (want, int(want != 0) if updates_scc else SCC_UNSET)
+            if got != expected:
+                return asm, hex(a), hex(b), got, expected
     return None
+
+
+def pack_controls():
+    def reference(a, b):
+        return (b // 65536) * 65536 + a // 65536
+
+    check('pack_hh matches the LLVM 15 SOP2 encoding', sop2(PACK_HH, 0, 1, 2).hex() == '0102009a')
+    mismatch = first_mismatch(PACK_HH, reference, updates_scc=False)
+    check('pack_hh result and untouched SCC across %d forms and %d input pairs' % (len(VALUE_FORMS), len(PAIRS)),
+          mismatch is None, str(mismatch))
+    if mismatch is not None:
+        return
+
+    # The shader's per-lane masks cannot stand in for the wave's full 32-bit words.
+    mask_forms = MASK_FORMS + [(3, 107, 2, None), (127, 1, 2, None)]
+    masked = [(form, attempt(code(PACK_HH, form))[1].lines) for form in mask_forms]
+    check('pack_hh refuses whole-wave mask sources and destinations',
+          all(lines == ['refused: %s on a lane mask' % PACK_HH] for _, lines in masked), str(masked))
+    _, reserved = attempt(sop2(PACK_HH, 3, 209, 2))
+    check('pack_hh refuses a reserved scalar source encoding',
+          reserved.lines == ['refused: %s source s209' % PACK_HH], str(reserved.lines))
+
+    for symbolic in ('mask', 'descriptor'):
+        stage = Probe()
+        if symbolic == 'mask':
+            stage.masks.add(1)
+        else:
+            stage.sym[1] = ('ptr', 0, 0)
+        try:
+            stage.one(PACK_HH, decode_one(sop2(PACK_HH, 3, 1, 2))[1])
+        except G.Unsupported as error:
+            reason = 'a lane mask' if symbolic == 'mask' else 'descriptor data'
+            check('pack_hh refuses a symbolic %s' % symbolic,
+                  str(error) == '%s on %s' % (PACK_HH, reason) and not stage.lines, str(error))
+        else:
+            check('pack_hh refuses a symbolic %s' % symbolic, False, str(stage.lines))
+
+    saved = G.SCA[PACK_HH]
+    try:
+        del G.SCA[PACK_HH]
+        disabled = first_mismatch(PACK_HH, reference, updates_scc=False)
+        check('pack_hh negative control catches a disabled lowering',
+              disabled is not None and disabled[-1] == 'refused: %s' % PACK_HH, str(disabled))
+        text, scc = saved
+        G.SCA[PACK_HH] = (text.format('{1}', '{0}'), scc)
+        check('pack_hh negative control catches reversed source halves',
+              first_mismatch(PACK_HH, reference, updates_scc=False) is not None)
+    finally:
+        G.SCA[PACK_HH] = saved
+
+
+BFE_OFFSETS = [0, 1, 4, 8, 16, 24, 31]
+BFE_WIDTHS = [0, 1, 8, 16, 31, 32, 33, 40, 48, 63, 64, 65, 96, 127]
+BFE_SOURCES = [MASK, 0x80000000, 0x9a345f50, 0xdeadbeef, 0x12345678, 1, 0, 0xaaaaaaaa, 0x55555555]
+# Control bits 15:5 and 31:23 are ignored; the second spelling of each control sets them all.
+BFE_CONTROLS = sorted({(w << 16) | o | junk for o in BFE_OFFSETS for w in BFE_WIDTHS for junk in (0, 0xff80ffe0)}
+                      | {0xffffffff, 0x007f0000, 0x00200000, 0x00400000})
+BFE_PAIRS = [(a, c) for a in BFE_SOURCES for c in BFE_CONTROLS]
+# Pairs that separate the old lowering from the ISA: width 32 and 64 read 0 before, a wide field loses its mask.
+BFE_WIDE = [(0x80000000, 0x00200000), (MASK, 0x00400000), (0x9a345f50, 0x00280000), (0x80000001, 0x007f0000),
+            (0x80000000, 0x003f0000), (0xdeadbeef, 0x00200008)]
+
+
+def bfe_reference(src, ctrl):
+    offset, width = ctrl & 31, (ctrl >> 16) & 127
+    if width == 0:
+        return 0
+    if offset + width < 32:
+        return (src >> offset) & ((1 << width) - 1)
+    return src >> offset
+
+
+def bfe_first_mismatch(reference=bfe_reference, pairs=BFE_PAIRS):
+    """The first (form, source, control, got, want) of s_bfe_u32 that differs from the ISA reference, or None.
+
+    Control forms: SGPR (separate, in place on either source), m0 destination, inline 0, 1 and -1, and a literal
+    for the control and for the source, so each operand kind of the translator is evaluated."""
+    cases = [((3, 1, 2, None), pairs), ((1, 1, 2, None), pairs), ((2, 1, 2, None), pairs), ((M0, 1, 2, None), pairs)]
+    cases += [((3, 1, code_, None), [(a, c) for a, c in pairs if c == INLINE[code_]]) for code_ in INLINE]
+    cases += [((3, 1, LITERAL, c), [(a, x) for a, x in pairs if x == c]) for c in sorted({x for _, x in pairs})]
+    cases += [((3, LITERAL, 2, a), [(x, c) for x, c in pairs if x == a]) for a in sorted({x for x, _ in pairs})]
+    for form, inputs in cases:
+        sdst, ssrc0, ssrc1, literal = form
+        asm, stage = attempt(code(BFE, form))
+        if stage.lines[0].startswith('refused: '):
+            return asm, stage.lines[0]
+        destination = 'm0' if sdst == M0 else 's%d' % sdst
+        for a, c in inputs:
+            env = {'s1': a, 's2': c, 'scc': SCC_UNSET}
+            want = reference(source_value(ssrc0, literal, env), source_value(ssrc1, literal, env))
+            out = run_lines(stage.lines, env)
+            got = (out.get(destination), out['scc'])
+            if got != (want, int(want != 0)):
+                return asm, hex(a), hex(c), got, (want, int(want != 0))
+    return None
+
+
+def bfe_controls():
+    check('s_bfe_u32 matches the LLVM 15 SOP2 encoding', sop2(BFE, 0, 1, 2).hex() == '01028093')
+    widths = {(c >> 16) & 127 for _, c in BFE_PAIRS}
+    wide = [bfe_reference(a, c) for a, c in BFE_WIDE]
+    check('s_bfe_u32 inputs reach widths 0 to 127, and wide fields with a nonzero result',
+          widths >= {0, 31, 32, 33, 40, 63, 64, 127} and all(wide), str(wide))
+    mismatch = bfe_first_mismatch()
+    check('s_bfe_u32 result and SCC across %d (source, control) pairs and all operand kinds' % len(BFE_PAIRS),
+          mismatch is None, str(mismatch))
+    mismatch = bfe_first_mismatch(pairs=BFE_WIDE)
+    check('s_bfe_u32 wide fields (width 32 and above)', mismatch is None, str(mismatch))
+
+    saved = G.SCA[BFE]
+    old = '({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)'
+    try:
+        # The reference itself would pass a formula that agrees with it; the old table entry must not.
+        G.SCA[BFE] = (old, saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: the width taken mod 32 by the shift fails: %s' % (found,),
+              found is not None)
+        G.SCA[BFE] = (saved[0], None)
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: no SCC write fails: %s' % (found,), found is not None)
+        G.SCA[BFE] = ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 63)) - 1)', saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: a 6-bit width fails: %s' % (found,), found is not None)
+        G.SCA[BFE] = ('{0} >> ({1} & 31)', saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: no field mask fails: %s' % (found,), found is not None)
+    finally:
+        G.SCA[BFE] = saved
+
+
+MUL_HI = 's_mul_hi_u32'
+MUL_EDGES = [(0, 0), (1, 1), (MASK, MASK), (0x80000000, 2), (2, 0x80000000), (0x10000, 0x10000), (0xffff, 0xffff),
+             (0x1ffff, 0x1ffff), (MASK, 1), (0x80000000, 0x80000000), (0xaaaaaaab, 0xfffffffd)]
+_random = random.Random(0x1723)
+MUL_PAIRS = MUL_EDGES + PAIRS + [(_random.getrandbits(32), _random.getrandbits(32)) for _ in range(512)]
+
+
+def mul_reference(a, b):
+    return (a * b) >> 32
+
+
+def mul_mismatch():
+    """first_mismatch() over the multiply value set, with the helper re-read from the preamble."""
+    global PAIRS
+    Expr.helper = mul_hi_helper()
+    saved, PAIRS = PAIRS, MUL_PAIRS
+    try:
+        return first_mismatch(MUL_HI, mul_reference, updates_scc=False)
+    finally:
+        PAIRS = saved
+
+
+def mul_controls():
+    check('mul_hi matches the LLVM 15 SOP2 encoding', sop2(MUL_HI, 0, 1, 2).hex() == '0102809a')
+    text, scc = G.SCA.get(MUL_HI, (None, None))
+    arity, aot_text, aot_scc = P.SCALAR['mul_hi_u32']
+    check('mul_hi: %r SCC %r equals pixel_aot %r SCC %r' % (text, scc, aot_text, aot_scc),
+          arity == 2 and text == aot_text and scc is None and aot_scc is None and MUL_HI not in G.SCC_UNMODELLED)
+    check('mul_hi: reference gives 0xfffffffe for all ones squared and 1 for 0x80000000 x 2',
+          mul_reference(MASK, MASK) == 0xfffffffe and mul_reference(0x80000000, 2) == 1)
+    mismatch = mul_mismatch()
+    check('mul_hi result and untouched SCC across %d forms and %d input pairs' % (len(VALUE_FORMS), len(MUL_PAIRS)),
+          mismatch is None, str(mismatch))
+    asm, stage = translate(sop2(MUL_HI, 3, LITERAL, 2, 0xaaaaaaab))
+    check('mul_hi literal form emits the helper call', stage.lines == ['s3 = mul_hi_u32(0xaaaaaaabu, s2);'],
+          '%s -> %s' % (asm, stage.lines))
+
+    masked = [(form, attempt(code(MUL_HI, form))[1].lines) for form in MASK_FORMS + [(3, 107, 2, None)]]
+    check('mul_hi refuses whole-wave mask sources and destinations',
+          all(lines == ['refused: %s on a lane mask' % MUL_HI] for _, lines in masked), str(masked))
+    _, reserved = attempt(sop2(MUL_HI, 3, 209, 2))
+    check('mul_hi refuses a reserved scalar source encoding',
+          reserved.lines == ['refused: %s source s209' % MUL_HI], str(reserved.lines))
+    for symbolic in ('mask', 'descriptor'):
+        stage = Probe()
+        if symbolic == 'mask':
+            stage.masks.add(1)
+        else:
+            stage.sym[1] = ('ptr', 0, 0)
+        try:
+            stage.one(MUL_HI, decode_one(sop2(MUL_HI, 3, 1, 2))[1])
+        except G.Unsupported as error:
+            reason = 'a lane mask' if symbolic == 'mask' else 'descriptor data'
+            check('mul_hi refuses a symbolic %s' % symbolic,
+                  str(error) == '%s on %s' % (MUL_HI, reason) and not stage.lines, str(error))
+        else:
+            check('mul_hi refuses a symbolic %s' % symbolic, False, str(stage.lines))
+    # An SGPR that held a compare mask is overwritten with a plain word, and is no longer a mask.
+    stage = Probe()
+    stage.masks.add(3)
+    stage.one(MUL_HI, decode_one(sop2(MUL_HI, 3, 1, 2))[1])
+    check('mul_hi over a mask-marked destination writes the word and drops the mark',
+          stage.lines == ['s3 = mul_hi_u32(s1, s2);'] and 3 not in stage.masks, str((stage.lines, stage.masks)))
+
+    # Mutations: each must read a wrong word or SCC somewhere in the value set.
+    saved_entry, saved_common = G.SCA[MUL_HI], G.Pipeline.common
+    table = {
+        'the low word of the product': ('{0} * {1}', None),
+        'the signed high word': ('mul_hi_u32({0}, {1}) - (({0} >> 31) != 0u ? {1} : 0u)'
+                                 ' - (({1} >> 31) != 0u ? {0} : 0u)', None),
+        'an added SCC write': (saved_entry[0], '$ != 0'),
+    }
+    helper = {
+        'the low-halfword carry dropped': (' + ((la * lb) >> 16)', ''),
+        'the final carry limb dropped': ('(((middle & 0xffffu) + la * (b >> 16)) >> 16)', '((la * (b >> 16)) >> 16)'),
+    }
+    try:
+        for label, entry in table.items():
+            G.SCA[MUL_HI] = entry
+            found = mul_mismatch()
+            check('mul_hi mutation with %s fails: %s' % (label, found), found is not None)
+        G.SCA[MUL_HI] = saved_entry
+        for label, (old, new) in helper.items():
+            def mutated(self, old=old, new=new):
+                lines = saved_common(self)
+                assert sum(old in line for line in lines) == 1, old
+                return [line.replace(old, new) for line in lines]
+            G.Pipeline.common = mutated
+            found = mul_mismatch()
+            check('mul_hi mutation with %s fails: %s' % (label, found), found is not None)
+        G.Pipeline.common = saved_common
+        del G.SCA[MUL_HI]
+        disabled = mul_mismatch()
+        check('mul_hi negative control catches a disabled lowering',
+              disabled is not None and disabled[-1] == 'refused: %s' % MUL_HI, str(disabled))
+    finally:
+        G.SCA[MUL_HI] = saved_entry
+        G.Pipeline.common = saved_common
 
 
 def controls():
@@ -273,10 +560,15 @@ def controls():
                 wrong.append((asm, str(error)))
     check('%d SOP2 operations without a lowering are refused by name (%s)' % (len(missing), ', '.join(missing)),
           missing and not wrong and not set(OPS) & set(missing), str(wrong))
+    pack_controls()
+    bfe_controls()
+    mul_controls()
 
 
 def all_codes():
-    return [code(name, form) for name in list(OPS) + [s for s, _ in OPS.values()] for form in VALUE_FORMS + MASK_FORMS]
+    logic = [code(name, form) for name in list(OPS) + [s for s, _ in OPS.values()] for form in VALUE_FORMS + MASK_FORMS]
+    return (logic + [code(name, form) for name in (PACK_HH, MUL_HI) for form in VALUE_FORMS]
+            + [code(BFE, form) for form in VALUE_FORMS])
 
 
 def check_binary(llvm_mc):

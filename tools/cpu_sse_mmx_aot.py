@@ -14,6 +14,9 @@ Supported instructions (docs/coverage/x64_zen2.tsv groups SSE and SSE2):
   - cvtps2pi: convert two float32 in xmm[63:0]/m64 to int32_t in mm (round-to-nearest-even)
   - cvttps2pi: convert two float32 in xmm[63:0]/m64 to int32_t in mm (truncate toward zero)
   - pshufw: 16-bit word permutation of mm/m64 by imm8 into mm
+  - pavgb, pavgw, pmulhuw, psadbw: packed unsigned byte/word averaging,
+    unsigned high 16-bit multiply, and sum of absolute byte differences
+    (both MMX mm/m64 with unaligned m64 allowed and SSE2 xmm/16B-aligned m128)
   - movntq: non-temporal 64-bit store from mm to [r8 + disp]
   - maskmovq: conditional 8-byte store from mm1 under mm2 MSB mask to implicit [rdi]
   - maskmovdqu: conditional 16-byte store from xmm1 under xmm2 MSB mask to implicit [rdi]
@@ -65,6 +68,20 @@ CVT_PS2PI_HELPERS = {
     Code.CVTTPS2PI_MM_XMMM64: "op_cvttps2pi",
 }
 
+MM_PACKED_HELPERS = {
+    Code.PAVGB_MM_MMM64: "op_pavgb64",
+    Code.PAVGW_MM_MMM64: "op_pavgw64",
+    Code.PMULHUW_MM_MMM64: "op_pmulhuw64",
+    Code.PSADBW_MM_MMM64: "op_psadbw64",
+}
+
+XMM_PACKED_HELPERS = {
+    Code.PAVGB_XMM_XMMM128: "op_pavgb128",
+    Code.PAVGW_XMM_XMMM128: "op_pavgw128",
+    Code.PMULHUW_XMM_XMMM128: "op_pmulhuw128",
+    Code.PSADBW_XMM_XMMM128: "op_psadbw128",
+}
+
 LOAD_ALIGNED_VEC_CODES = {Code.MOVAPS_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128}
 STORE_ALIGNED_VEC_CODES = {Code.MOVAPS_XMMM128_XMM, Code.MOVDQA_XMMM128_XMM}
 
@@ -73,6 +90,8 @@ ALLOWED_CODES = {
     Code.EMMS,
     Code.CVTPI2PS_XMM_MMM64,
     *CVT_PS2PI_HELPERS,
+    *MM_PACKED_HELPERS,
+    *XMM_PACKED_HELPERS,
     Code.PSHUFW_MM_MMM64_IMM8,
     Code.MOVNTQ_M64_MM,
     Code.MASKMOVQ_RDI_MM_MM,
@@ -221,6 +240,65 @@ static inline void op_maskmovdqu(word address, const Vec128& src, const Vec128& 
         }
     }
     std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
+static inline std::uint64_t op_pavgb64(std::uint64_t a, std::uint64_t b) {
+    std::uint64_t out = 0ull;
+    for (unsigned i = 0u; i < 8u; ++i) {
+        const std::uint16_t ab = static_cast<std::uint8_t>(a >> (i * 8u));
+        const std::uint16_t bb = static_cast<std::uint8_t>(b >> (i * 8u));
+        const std::uint64_t avg = (ab + bb + 1u) >> 1u;
+        out |= (avg & 0xFFull) << (i * 8u);
+    }
+    return out;
+}
+
+static inline std::uint64_t op_pavgw64(std::uint64_t a, std::uint64_t b) {
+    std::uint64_t out = 0ull;
+    for (unsigned i = 0u; i < 4u; ++i) {
+        const std::uint32_t aw = static_cast<std::uint16_t>(a >> (i * 16u));
+        const std::uint32_t bw = static_cast<std::uint16_t>(b >> (i * 16u));
+        const std::uint64_t avg = (aw + bw + 1u) >> 1u;
+        out |= (avg & 0xFFFFull) << (i * 16u);
+    }
+    return out;
+}
+
+static inline std::uint64_t op_pmulhuw64(std::uint64_t a, std::uint64_t b) {
+    std::uint64_t out = 0ull;
+    for (unsigned i = 0u; i < 4u; ++i) {
+        const std::uint32_t aw = static_cast<std::uint16_t>(a >> (i * 16u));
+        const std::uint32_t bw = static_cast<std::uint16_t>(b >> (i * 16u));
+        const std::uint64_t prod = (aw * bw) >> 16u;
+        out |= (prod & 0xFFFFull) << (i * 16u);
+    }
+    return out;
+}
+
+static inline std::uint64_t op_psadbw64(std::uint64_t a, std::uint64_t b) {
+    std::uint32_t sum = 0u;
+    for (unsigned i = 0u; i < 8u; ++i) {
+        const unsigned ab = static_cast<std::uint8_t>(a >> (i * 8u));
+        const unsigned bb = static_cast<std::uint8_t>(b >> (i * 8u));
+        sum += ab >= bb ? (ab - bb) : (bb - ab);
+    }
+    return static_cast<std::uint64_t>(sum);
+}
+
+static inline Vec128 op_pavgb128(const Vec128& a, const Vec128& b) {
+    return {{op_pavgb64(a.q[0], b.q[0]), op_pavgb64(a.q[1], b.q[1])}};
+}
+
+static inline Vec128 op_pavgw128(const Vec128& a, const Vec128& b) {
+    return {{op_pavgw64(a.q[0], b.q[0]), op_pavgw64(a.q[1], b.q[1])}};
+}
+
+static inline Vec128 op_pmulhuw128(const Vec128& a, const Vec128& b) {
+    return {{op_pmulhuw64(a.q[0], b.q[0]), op_pmulhuw64(a.q[1], b.q[1])}};
+}
+
+static inline Vec128 op_psadbw128(const Vec128& a, const Vec128& b) {
+    return {{op_psadbw64(a.q[0], b.q[0]), op_psadbw64(a.q[1], b.q[1])}};
 }
 """
 
@@ -399,6 +477,18 @@ def lift_code(name, start, raw):
             dst_idx, dst_name = write_mm(0, ins)
             statements.append(f"{dst_name} = op_pshufw({src}, {imm:#x}u);")
             defined_mm.add(dst_idx)
+        elif ins.code in MM_PACKED_HELPERS:
+            dst = read_mm(0, ins)
+            src = mm_src64(1, ins)
+            dst_idx, dst_name = write_mm(0, ins)
+            statements.append(f"{dst_name} = {MM_PACKED_HELPERS[ins.code]}({dst}, {src});")
+            defined_mm.add(dst_idx)
+        elif ins.code in XMM_PACKED_HELPERS:
+            dst = read_vec(0, ins)
+            src = vec_src128(1, ins, alignment=16)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name} = {XMM_PACKED_HELPERS[ins.code]}({dst}, {src});")
+            defined_xmm.add(dst_idx)
         elif ins.code == Code.MOVNTQ_M64_MM:
             if ins.op0_kind != OpKind.MEMORY:
                 raise ValueError(f"expected memory destination at RVA {ins.ip:#x}: {ins}")

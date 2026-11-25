@@ -5,10 +5,8 @@ from pathlib import Path
 import random
 import sys
 
-from iced_x86 import Decoder
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from cpu_switch_aot import Lifter, translate
+from cpu_switch_aot import translate
 from direct_check import GUARDS, MASK, SENTINELS, input_pairs, observe, register_probe
 
 OPERATIONS = ("bt", "bts", "btr", "btc")
@@ -20,8 +18,6 @@ NAMES = ([f"{op}{bits}_{form}" for form in ("reg", "imm", "mem") for op in OPERA
 WIDTHS = {name: 8 for name in NAMES}
 
 REJECTIONS = (
-    ("neg_bt_mem_reg", "unsupported bit-string operand"),
-    ("neg_bts_mem_reg", "unsupported bit-string operand"),
     ("neg_bt_sete", "only CF is defined after BT"),
     ("neg_btc_cmovs", "only CF is defined after BTC"),
     ("neg_bt_seto", "only CF is defined after BT"),
@@ -130,16 +126,7 @@ def check_rejections(original_path):
             print(f"rejected {name}: {exc}")
         else:
             raise AssertionError(f"accepted negative control {name}")
-    # BT r/m, r with a memory base addresses a bit string beyond the operand; Lifter refuses it itself.
-    ins = next(Decoder(64, bytes.fromhex("0f a3 08"), ip=0x1000))  # bt dword ptr [rax], ecx
-    try:
-        Lifter().lower(ins)
-    except ValueError as exc:
-        if "unsupported bit-string operand" not in str(exc):
-            raise AssertionError(f"bt [rax], ecx: {exc}") from exc
-    else:
-        raise AssertionError("accepted bt [rax], ecx")
-    print(f"{len(REJECTIONS) + 1} rejection controls passed")
+    print(f"{len(REJECTIONS)} rejection controls passed")
 
 
 def check(probe_path, original_path, lifted_path):

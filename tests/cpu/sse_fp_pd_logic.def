@@ -1,0 +1,21 @@
+EXPORTS
+    op_andpd
+    op_andpd_mem
+    op_andpd_mem_disp
+    op_andpd_self
+    op_andnpd
+    op_andnpd_mem
+    op_andnpd_mem_disp
+    op_andnpd_self
+    op_orpd
+    op_orpd_mem
+    op_orpd_mem_disp
+    op_orpd_self
+    op_xorpd
+    op_xorpd_mem
+    op_xorpd_mem_disp
+    op_xorpd_self
+    op_xorpd_zero_logic
+    op_xorpd_zero_arith
+    op_pd_logic_pipeline
+    op_pd_logic_discarded_read
