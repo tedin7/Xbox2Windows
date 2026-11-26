@@ -3498,7 +3498,7 @@ x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
     // grows and a found entry never changes, so no lock and no walk. A miss is looked up again every time.
     static const bool speed_root = [] { wchar_t v[4]; return GetEnvironmentVariableW(L"X2W_SPEED_ROOT", v, 4) && v[0] == L'1'; }();
     static thread_local x2w_startup::ResolvedTableCache cache;
-    const u64 view_heap = reinterpret_cast<u64>(pass.source_view_heap);
+    const u64 view_heap = pass.source_view_heap;
     if (speed_root) {
         if (const auto kept = cache.find(view_heap, gpu_handle); kept.address) return kept;
     }
