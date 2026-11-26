@@ -51,6 +51,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/gpu_time_probe.h"
+#include "startup_stubs/dispatch_phases.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -7572,6 +7573,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
+        log_dispatch_phases();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
         if (now - last_key_report >= 60000) {

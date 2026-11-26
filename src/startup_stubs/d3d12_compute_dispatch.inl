@@ -186,6 +186,18 @@ const char* load_compute_translation(ComputeTranslation& tr)
 }
 
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
+x2w_phase::Totals dispatch_phase_totals;
+
+// Every 300 frames with the render totals: where translated dispatches spent their time since the last line.
+void log_dispatch_phases()
+{
+    const auto window = dispatch_phase_totals.take();
+    if (!window.calls[x2w_phase::direct] && !window.calls[x2w_phase::indirect] && !window.calls[x2w_phase::refused]) return;
+    char line[1024];
+    x2w_phase::format_window(window, line, sizeof(line));
+    log("%s", line);
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -205,7 +217,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
+    x2w_phase::Timer timer;
+    timer.start(dispatch_phase_totals);
     AcquireSRWLockExclusive(&draw_lock);
+    timer.got_lock();
     ComputeTranslation* const tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
@@ -400,6 +415,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
+    timer.resolved();
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
             if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
@@ -432,11 +448,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
             tr->first_refusal = reason;
             std::memcpy(tr->refusal_words, words, sizeof(tr->refusal_words));
         }
+        timer.finish(x2w_phase::refused);
         ReleaseSRWLockExclusive(&draw_lock);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
@@ -510,6 +528,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (const auto address = pass.desktop_compute_upload_srvs[parameter]) list->SetComputeRootShaderResourceView(parameter, address);
     }
     ++tr->translated;
+    timer.finish(dispatch.signature ? x2w_phase::indirect : x2w_phase::direct);
     ReleaseSRWLockExclusive(&draw_lock);
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
