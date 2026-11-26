@@ -4646,6 +4646,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_shift64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # s_bitset0_b32, s_bitset1_b32 and s_ff1_i32_b32 against an integer reference (#1723).
+    add_test(NAME startup_gfx2hlsl_s_bitset_ff1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitset_ff1_check.py")
     # The SOPK arithmetic forms s_mulk_i32 and s_addk_i32 (#1723).
     add_test(NAME startup_gfx2hlsl_s_mulk_addk COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_mulk_addk_check.py")
