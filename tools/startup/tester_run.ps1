@@ -17,7 +17,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
    finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
-   files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
+   files. Over -LimitMB (default 9, so each part fits a mail as it is: never re-zip; every part carries part_NN_of_MM.txt, which says what each part holds) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
 
 The launcher's job memory cap (run.ps1 -MemoryGiB, default 14) is set to 75% of physical RAM, at least 14 GiB: a run whose
@@ -37,7 +37,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input accept (the default): ONLY the A button (mask 4), 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input accept (the default): ONLY the A button (mask 4), first at 35 s after the first pad poll, then every 10 s; a 0.3 s tap, every 3rd press held 1.5 s (movie skips); no press from 420 s on (gameplay) or after the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -62,7 +62,7 @@ param(
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
-    [int]$LimitMB = 20,
+    [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed

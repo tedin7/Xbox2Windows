@@ -31,7 +31,7 @@ import host_cpu  # noqa: E402
 
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
-from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes  # noqa: E402
+from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes, shape_note  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
@@ -843,6 +843,7 @@ def main():
     pace = MenuPace(capture_every, capture_menu_every)
 
     def capture_loop():
+        last_shape = None
         while not capture_done.wait(pace.interval()):
             try:
                 frame = grab_window()
@@ -851,6 +852,10 @@ def main():
                 else:
                     seconds = time.time() - start
                     series.offer(seconds, frame[0], frame[1], frame[2])
+                    note = shape_note(last_shape, frame[0], frame[1], frame[3], seconds)
+                    if note:
+                        print(note, flush=True)
+                    last_shape = (frame[0], frame[1], frame[3])
                     if pace.note(seconds, frame_mean(frame[0], frame[1], frame[2])):
                         print(f"  window captures: the menu phase ended at {seconds:.0f} s (loading-like picture), "
                               f"pictures every {capture_every:g} s from here", flush=True)
