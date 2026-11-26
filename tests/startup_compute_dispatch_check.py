@@ -1,6 +1,6 @@
 """A translated compute program dispatched through the stand-in's command list (list slot 14).
 
-usage: startup_compute_dispatch_check.py <startup_stream_consumer> <dxc> <warp|hardware>
+usage: startup_compute_dispatch_check.py <startup_stream_consumer> <dxc> <warp|hardware> [--output-view-tokens]
 
 The consumer creates case A of startup_gfx2hlsl_compute_check.py as a device slot 67 pipeline and records, on a
 stand-in list, the descriptor heap, the pipeline, its root signature, two root constants (word 0 by slot 37, word 1
@@ -133,7 +133,96 @@ def main(consumer, dxc, adapter):
               'same root set again; untouched before translation, without a Dispatch and for 6 refusals)')
 
 
+TOKEN_SHADER = """\
+RWByteAddressBuffer output_buffer : register(u0);
+cbuffer entry : register(b0) { uint word3; uint stride; uint records; }
+[numthreads(8, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint size;
+    output_buffer.GetDimensions(size);
+    if (size == 32 && tid.x * 4 < size)
+        output_buffer.Store(tid.x * 4, 0x71243000u ^ word3 ^ (stride << 8) ^ records ^ tid.x);
+}
+"""
+TOKEN_MANIFEST = """\
+x2w-manifest 2
+stage cs
+group 8 1 1
+ud 3
+udsrc 0 uav_descword3 0
+udsrc 1 uav_stride 0
+udsrc 2 uav_numrecords 0
+uav 0 table 1 32
+"""
+
+
+def token_reference(first=None, word3=0x30000fac, stride=0, records=32):
+    output = [0x63140000 + i for i in range(C.WORDS)]
+    if first is not None:
+        for lane in range(8):
+            output[first + lane] = 0x71243000 ^ word3 ^ (stride << 8) ^ records ^ lane
+    return output
+
+
+def output_view_tokens(consumer, dxc):
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        cache, env = prepare(directory)
+        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
+        env.pop('X2W_TEST_DISPATCH_HARDWARE', None)
+        env.pop('X2W_OUTPUT_VIEW_TOKENS', None)
+        root = directory / 'compute_root'
+        root.write_bytes(C.root_blob(3, table_range=True))
+        env['X2W_TEST_COMPUTE_ROOT'] = str(root)
+        # The slot 67 code identifies this synthetic translation. The test supplies the
+        # compiled HLSL directly so it exercises the runtime binder independently of lowering.
+        (directory / 'program').write_bytes(struct.pack('<2I', 0xbf800025, 0xbf810000))  # s_nop 37; s_endpgm
+        (directory / 'data').write_bytes(b'output-token-fixture')
+        (directory / 'state').write_bytes(state_a((8, 1, 1), 0))
+        mode = 'dispatch-output-token-raw'
+        got, result = dispatch(directory, consumer, env, mode)
+        print(result.stdout, end='')
+        assert got == token_reference()
+        assert len(lines(result, 'Dispatch(1, 1, 1) refused: no translation')) == 1, result.stderr[-3000:]
+        [request] = lines(result, 'x2w-draw compute request')
+        key = request.split()[3]
+        source = directory / 'token.hlsl'
+        source.write_text(TOKEN_SHADER, encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / (key + '.cs.cso'), source], check=True)
+        (cache / (key + '.txt')).write_text(TOKEN_MANIFEST, encoding='ascii')
+
+        got, result = dispatch(directory, consumer, env, mode)
+        assert got == token_reference()
+        assert len(lines(result, 'Dispatch(1, 1, 1) refused: an output is a view token, not a buffer descriptor')) == 1, result.stderr[-3000:]
+        assert not lines(result, 'Dispatch(1, 1, 1) translated')
+
+        env['X2W_OUTPUT_VIEW_TOKENS'] = '1'
+        for variant, first, word3, stride, records in (
+            ('raw', 8, 0x30000fac, 0, 32),
+            ('structured', 8, 0xfac, 8, 4),
+            ('typed', 8, 0x01016fac, 4, 8),
+            ('shifted', 12, 0x30000fac, 0, 32),
+        ):
+            got, result = dispatch(directory, consumer, env, 'dispatch-output-token-' + variant)
+            assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1 and not lines(result, 'Dispatch(1, 1, 1) refused'), result.stderr[-3000:]
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
+            expected = token_reference(first, word3, stride, records)
+            wrong = [i for i, (actual, want) in enumerate(zip(got, expected, strict=True)) if actual != want]
+            assert not wrong, f'{variant}: first mismatch at word {wrong[0]}, {len(wrong)} total'
+            if variant == 'shifted':
+                mismatches = sum(a != b for a, b in zip(got, token_reference(8), strict=True))
+                assert mismatches == 12, f'wrong-range control had {mismatches} mismatches'
+                print(f'WARP wrong-range control: {mismatches} mismatches against the correct CPU reference')
+            else:
+                print(f'WARP {variant} UAV token: {len(got)} dwords, zero mismatches')
+    print('WARP switch-off control: original refusal and untouched output')
+
+
 if __name__ == '__main__':
+    if len(sys.argv) == 5 and sys.argv[3:] == ['warp', '--output-view-tokens']:
+        output_view_tokens(*sys.argv[1:3])
+        sys.exit(0)
     if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
         sys.exit(__doc__)
     main(*sys.argv[1:])

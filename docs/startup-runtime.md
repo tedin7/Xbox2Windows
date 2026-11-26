@@ -1089,6 +1089,25 @@ Its `wrong_group` control swaps the group size in the state block and must misma
 request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
 the fixture builds the block at the offsets the translator reads.
 
+### Compute buffer output view tokens
+
+Set `X2W_OUTPUT_VIEW_TOKENS=1` to let a translated compute buffer output resolve a
+UAV token from a title descriptor table. The default is off. The runtime reads
+the recorded UAV and builds a raw view of its byte range in a whole slot of the
+translated heap. The range must start on a 16-byte boundary and contain a whole
+number of dwords, up to 16 MiB. Counter views and views of released resources
+are refused. Texture outputs use the manifest's existing texture binding.
+
+`startup_compute_dispatch_output_view_tokens_warp` checks raw, structured and
+typed buffer views by reading back all 320 dwords after a dispatch. The fixture
+copies the token and replaces its source descriptor before dispatch. The
+switch-off control expects the original refusal and unchanged readback. A
+shifted-range control expects 12 mismatches against the correct CPU reference.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_output_view_tokens_warp$' -V
+```
+
 ### Shader requests from the archive, before a run
 
 `tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes

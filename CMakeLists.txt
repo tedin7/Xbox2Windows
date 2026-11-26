@@ -5048,6 +5048,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             startup_compute_dispatch_input_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_compute_dispatch_output_view_tokens_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        "${DXC_EXECUTABLE}" warp --output-view-tokens)
+    set_tests_properties(startup_compute_dispatch_output_view_tokens_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_list_cost_bench_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py" "$<TARGET_FILE:startup_stream_consumer>"

@@ -251,6 +251,66 @@ void log_dispatch_phases()
     log("%s", line);
 }
 
+// Buffer translations use RWByteAddressBuffer. Rebuild the token's exact byte range as
+// a raw view in the translated heap, independent of where the title stored or copied its token.
+const char* resolve_compute_buffer_uav(Wrapper* device, const std::uint32_t* token, Wrapper*& wrapper,
+                                      ID3D12Resource*& resource, u64& offset, u64& bytes, std::uint32_t (&words)[4])
+{
+    ViewRecord record{};
+    bool created = false;
+    note_lock_acquire(false);
+    if (token[1] < view_records().size()) {
+        record = view_records()[token[1]];
+        created = view_materialized()[token[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    if (record.slot != 19) return "an output token is not an unordered access view";
+    if (!created || record.desc_bytes < sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))
+        return "an output token has no materialized UAV description";
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    std::memcpy(&view, record.desc, sizeof(view));
+    if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+        return "an output token does not match the buffer manifest";
+    if (record.counter || view.Buffer.CounterOffsetInBytes)
+        return "an output buffer view has a UAV counter";
+    wrapper = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    if (!wrapper || wrapper->own().kind != resource_kind || !wrapper->own().real ||
+        !InterlockedCompareExchange(&wrapper->own().refs, 0, 0))
+        return "an output buffer view has no live desktop resource";
+    const auto* info = resource_info(wrapper);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return "an output buffer view resource was not created in the common state";
+    resource = static_cast<ID3D12Resource*>(wrapper->own().real);
+    x2w_startup::ComPtr<ID3D12Device> native_device;
+    if (FAILED(resource->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device))
+        return "an output buffer view belongs to another device";
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return "an output view resource is not a UAV buffer";
+
+    const auto format = desktop_format(view.Format);
+    const UINT stride = view.Buffer.StructureByteStride;
+    const bool raw = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW && !stride && format == DXGI_FORMAT_R32_TYPELESS;
+    const bool structured = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && stride && format == DXGI_FORMAT_UNKNOWN;
+    const bool typed = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && !stride;
+    const UINT element = raw ? 4 : structured ? stride : typed ? x2w_startup::typed_buffer_format_bytes(format) : 0;
+    if (!element || element > 0x3fff || view.Buffer.FirstElement > desc.Width / element)
+        return "an output buffer view has an unsupported element size or start";
+    offset = view.Buffer.FirstElement * element;
+    bytes = u64{view.Buffer.NumElements} * element;
+    if (!bytes || bytes > (16u << 20) || bytes > desc.Width - offset ||
+        bytes % 4 || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+        return "an output buffer view range cannot be bound as a raw UAV";
+
+    words[1] = raw ? 0 : element << 16;
+    words[2] = raw ? static_cast<UINT>(bytes) : view.Buffer.NumElements;
+    const UINT code = typed ? x2w_startup::buffer_format_code(format) : 0;
+    // Identity channel selection, unified FORMAT for typed views, and byte bounds for raw views.
+    words[3] = 0xfacu | (raw ? 3u << 28 : 0) | (code ? (1u << 24) | (code << 12) : 0);
+    return nullptr;
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -473,8 +533,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        if (words[0] == view_token_magic) {
+            static const bool output_view_tokens = x2w_local::env_on("X2W_OUTPUT_VIEW_TOKENS");
+            if (output_view_tokens) {
+                View& view = views[i];
+                reason = resolve_compute_buffer_uav(self->own().list_device, words, view.wrapper,
+                                                    view.resource, view.offset, view.bytes, view.words);
+                for (std::size_t input = 0; input < inputs && !reason; ++input)
+                    if (views[input].resource == view.resource) reason = "an output buffer is also an input";
+                continue;
+            }
+        }
+        // Hardware addresses require a placed buffer that aliases title memory.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
@@ -582,6 +652,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
         }
+        if (view.wrapper) retire_hold(self, view.wrapper);
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
