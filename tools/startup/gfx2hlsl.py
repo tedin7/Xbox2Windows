@@ -8890,6 +8890,31 @@ class Stage:
         if getattr(self, 'descriptor_instruction_index', None) is not None:  # unit probes build a Stage without translate()
             self.__dict__.setdefault('reload_proven', {})[self.descriptor_instruction_index] = proven
 
+    def op_v_permlane16_b32(self, ops, mods):
+        """v_permlane16_b32 vdst, vsrc0, ssrc1, ssrc2 (RDNA 2 ISA, VOP3 lane permutes; LLVM 15 gfx10): inside each row of
+        16 lanes, lane i reads vsrc0 of lane sel[i] of the same row, where sel[i] is the 4-bit field i of ssrc1 (lanes
+        0..7) or of ssrc2 (lanes 8..15). The op_sel flags (fetch-inactive, bound_ctrl) only decide what a disabled lane
+        reads, so the form is taken only where every lane is enabled: a straight-line compute program with entry EXEC
+        in a group of whole rows. Exchanged through groupshared memory like the DPP swaps (compute_quad_gate)."""
+        name = 'v_permlane16_b32'
+        dst, src = (reg_range(ops[0]), reg_range(ops[1])) if len(ops) == 4 else (None, None)
+        if not dst or not src or dst[0] != 'v' or src[0] != 'v' or dst[1] != dst[2] or src[1] != src[2]:
+            raise Unsupported('%s requires VGPR destination and source and two lane selects' % name)
+        if any(not re.fullmatch(r'op_sel:\[[01],[01]\]', m) for m in mods):
+            raise Unsupported('%s with %s' % (name, ' '.join(m for m in mods if not re.fullmatch(r'op_sel:\[[01],[01]\]', m))))
+        if getattr(self, 'kind', None) != 'cs':
+            raise Unsupported('%s outside a compute program' % name)
+        self.compute_quad_gate(name, row_ror8=True)
+        x, y, _z = self.pipe.group
+        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        lane = '(%s & 15u)' % flat
+        select = '(((%s < 8u ? %s : %s) >> ((%s & 7u) * 4u)) & 15u)' % (lane, self.u(ops[2]), self.u(ops[3]), lane)
+        self.uses_quad_shared = True
+        self.emit('x2w_quad[%s] = %s;' % (flat, self.u(ops[1])))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        self.set_v(dst[1], 'x2w_quad[(%s & ~15u) | %s]' % (flat, select))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+
     def op_v_mov_b32(self, ops, mods):
         if len(ops) != 2:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
