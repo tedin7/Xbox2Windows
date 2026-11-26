@@ -10139,14 +10139,6 @@ and the changed root or argument page at submission.
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_warp_dual-trace$' -V
 ```
 
-For a rejected indirect graphics pipeline, the runtime census records the
-command kind, key and refusal reason. A refused mesh dispatch with a known
-request key contributes to `x2w-render key use mesh`. The tester bundle ranks
-refused mesh requests by these counts and includes their request files within
-its existing limits. The `startup_indirect_mesh_request_warp` fixture checks
-per-key counts for both stage layouts. The `startup_tester_pack` check
-exercises request ranking and zip contents.
-
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound

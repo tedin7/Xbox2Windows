@@ -407,7 +407,7 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute|mesh) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
 LATEST_USED_KEYS = 40
 
 
@@ -503,10 +503,6 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     # base key, and the variant's request file travels with the base's files (Run R: be7c1a1a / ca7cec3b were never picked because
     # their draws were counted under variant keys).
     weights, variants = dict(weights), {}
-    if uses:
-        for key, kind, _, _ in rows:
-            if kind in ("mesh57", "mesh86") and key in uses:
-                weights[key] = uses[key][2]
     for name in names:
         match = re.match(r"^req_([0-9a-f]{16})\.rtv$", name)
         if not match:
