@@ -3,7 +3,9 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S]
+//                   [--from-present K] [--max-seconds S] [--dump <hex address>:<bytes>]
+// --dump: after the last call, before the pages recorded after it are written, the bytes at that address of the title memory
+// go to <out dir>\dump.bin: what the stand-in's own GPU work left there (a compute result), not what the recording holds.
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
@@ -57,6 +59,7 @@ struct Options {
     std::wstring recording, out;
     bool hardware = false;
     double max_seconds = 0;
+    u64 dump_address = 0, dump_bytes = 0;
 };
 
 struct HeapInfo {
@@ -316,6 +319,13 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--dump") {
+            wchar_t* end = nullptr;
+            o.dump_address = _wcstoui64(value.c_str(), &end, 16);
+            if (!end || *end != L':') return false;
+            o.dump_bytes = _wcstoui64(end + 1, nullptr, 10);
+            if (!o.dump_address || !o.dump_bytes || o.dump_bytes > (u64{64} << 20)) return false;
+        }
         else if (name == L"--mode" || name == L"--threads" || name == L"--from-present") say("x2w-replay: %ls %ls is not in version 1 (ignored)", name.c_str(), value.c_str());
         else return false;
     }
@@ -462,6 +472,17 @@ int run(const Options& o)
             break;
         }
         play(p, r, s);
+    }
+    if (!stopped && o.dump_bytes) {
+        // The stand-in's GPU work is complete here (the recorded fence waits were played): what it wrote into title memory.
+        const std::wstring path = o.out + L"\\dump.bin";
+        if (std::FILE* f = _wfopen(path.c_str(), L"wb")) {
+            if (IsBadReadPtr(reinterpret_cast<const void*>(o.dump_address), static_cast<UINT_PTR>(o.dump_bytes)))
+                say("x2w-replay: the dump range 0x%llx + %llu is not readable", o.dump_address, o.dump_bytes);
+            else
+                std::fwrite(reinterpret_cast<const void*>(o.dump_address), 1, static_cast<std::size_t>(o.dump_bytes), f);
+            std::fclose(f);
+        }
     }
     if (!stopped) apply_pages_before(r, ~0ull);  // the pages recorded after the last call
     const double wall = elapsed();
