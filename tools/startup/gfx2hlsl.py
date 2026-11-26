@@ -3303,11 +3303,15 @@ class Stage:
         reads_before_write = set()
         defined = {key}
         keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
+        restricted_alu = {'s_bfe_i32', 's_lshr_b32'}
+        pure_alu = restricted_alu | {'s_bfe_u32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_mov_b32'}
+        proven = {key}
         for j in range(head + 2, close - 1):
             base, ops, mods = parse(ins[j][3])
             base = re.sub(r'_e(32|64)$', '', base)
-            if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
-                            's_bfe_u32', 's_max_u32', 's_mul_i32', 'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32',
+            if base not in pure_alu and base not in (
+                            's_add_u32', 's_max_u32', 's_mul_i32', 's_waitcnt',
+                            'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32',
                             's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2', 'buffer_load_dword'):
                 return 'body instruction %s is not proven lane-local' % base
             if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
@@ -3315,6 +3319,16 @@ class Stage:
             reads, writes, may_write = effects[j]
             if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
                 return 'body reads or changes a lane mask or special register'
+            # Keep the existing ALU paths eligible. For the new ones, trace the
+            # explicit inputs through pure scalar operations back to the key or literals.
+            proven_inputs = base in pure_alu and all(
+                token in proven or re.fullmatch(r'-?(?:[0-9]+|0x[0-9a-f]+)', token) for token in ops[1:]
+            )
+            if base in restricted_alu and not proven_inputs:
+                return 'body instruction %s requires readfirstlane-derived or immediate operands' % base
+            proven -= may_write
+            if proven_inputs and re.fullmatch(r's\d+', ops[0]):
+                proven.add(ops[0])
             if base in ('s_load_dwordx8', 's_buffer_load_dwordx2'):
                 scalar_loads.add(ins[j][0])
             if base in ('s_load_dwordx4', 's_load_dwordx8'):

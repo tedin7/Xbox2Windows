@@ -31,6 +31,20 @@ FIXED_LOAD = (('s_load_dwordx4 s[28:31], s[10:11], 0', '050708f4000000fa'), ('s_
               ('s_waitcnt vmcnt(0)', '703f8cbf'))
 
 
+BFE_U32 = ('s_bfe_u32 s23, s22, 0x40003', '16ff979303000400')
+BFE_I32 = ('s_bfe_i32 s23, s22, 0x40003', '16ff179403000400')
+LSHR = ('s_lshr_b32 s23, s22, 3', '16831790')
+MASK_INDEX = ('s_and_b32 s23, s23, 31', '179f1787')
+SET_LOW_BIT = ('s_or_b32 s23, s23, 1', '17811788')
+SCALE_INDEX = ('s_lshl_b32 s23, s23, 2', '1782178f')
+INDEXED_LOAD = (*FIXED_LOAD[:2], ('v_mov_b32_e32 v8, s23', '1702107e'), *FIXED_LOAD[3:])
+INDEX_CASES = (
+    ('unsigned-extract', (BFE_U32, SET_LOW_BIT), lambda key: ((key >> 3) & 15) | 1),
+    ('signed-extract', (BFE_I32, MASK_INDEX), lambda key: (((key >> 3) + 8) % 16 - 8) & 31),
+    ('logical-shift', (LSHR, MASK_INDEX), lambda key: (key >> 3) & 31),
+)
+
+
 def program(*, before_save=(), after_save=(), compare=COMPARE, body=(ADD, XOR), after_restore=()):
     loop = (HEAD, compare, *body, CLOSE)
     offset = -(sum(len(bytes.fromhex(code)) for _, code in loop) // 4 + 1)
@@ -74,6 +88,14 @@ def controls(llvm_mc=None):
         (program(body=(('s_load_dwordx4 s[28:31], s[22:23], 0', '0b0708f4000000fa'), *FIXED_LOAD[1:])),
          'per-lane descriptor selection'),
     )
+    cases += tuple((program(body=(*alu, SCALE_INDEX, *INDEXED_LOAD)), None) for _, alu, _ in INDEX_CASES)
+    bad_source = 'body instruction %s requires readfirstlane-derived or immediate operands'
+    cases += (
+        (program(body=(('s_lshr_b32 s23, s4, 3', '04831790'), XOR)), bad_source % 's_lshr_b32'),
+        (program(body=(('s_mov_b32 s22, s4', '040396be'), BFE_I32, XOR)), bad_source % 's_bfe_i32'),
+        (program(body=(BFE_I32, XOR), after_restore=(live,)), 'body scalar is live'),
+        (program(body=(BFE_I32, ('s_lshr_b32 s23, s23, 3', '17831790'), XOR)), None),
+    )
     for rows, reason in cases:
         if llvm_mc:
             source = '\n'.join(asm for asm, _ in rows) + '\n'
@@ -116,4 +138,37 @@ def dispatch(directory, dxc, runner, adapter):
                 case.write_bytes(struct.pack('<%dI' % len(words), *words))
                 cases.append((case, 'uniform key', 'word=1 expected=%08x actual=%08x' % (wrong, output[1])))
         check_references(label + ' waterfall', runner, adapter, shader, cases)
+    return dispatch_indexed(directory, dxc, runner, adapter)
+
+
+def dispatch_indexed(directory, dxc, runner, adapter):
+    # Repeated, non-consecutive keys exercise grouping, with bit 6 set in two
+    # keys so that their four-bit fields are negative for signed extraction.
+    keys = (0x80, 0x58, 0x80, 0x1e0)
+    source = [17 * i + 9 for i in range(WORDS)]
+    source[:4] = keys
+    src, shader = directory / 'waterfall-index.hlsl', directory / 'waterfall-index.cso'
+
+    def write_case(name, active, output):
+        case = directory / ('waterfall-index-' + name + '.case')
+        words = [1, *output, *([SENTINEL] * (WORDS - 4)), active, *([0] * 15), *source]
+        case.write_bytes(struct.pack('<%dI' % len(words), *words))
+        return case
+
+    for label, alu, index in INDEX_CASES:
+        src.write_text(translate(program(body=(*alu, SCALE_INDEX, *INDEXED_LOAD))), encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+        expected = [source[index(key)] for key in keys]
+        cases = [(write_case(str(n), n, expected[:n] + [13] * (4 - n)), '%d active' % n, None)
+                 for n in (0, 3, 4)]
+
+        # Use the first lane's key for lane 1. For signed extraction, model a
+        # zero-extended field instead of a sign-extended field in that lane.
+        wrong = source[(keys[1] >> 3) & 15] if label == 'signed-extract' else expected[0]
+        assert wrong != expected[1]
+        case = write_case('wrong', 4, [expected[0], wrong, *expected[2:]])
+        cases.append((case, 'wrong index', 'word=1 expected=%08x actual=%08x' % (wrong, expected[1])))
+        result = check_references(label, runner, adapter, shader, cases, allow_skip=True)
+        if result:
+            return result
     return 0
