@@ -716,8 +716,14 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
             CloseHandle(ev);
             return check(done, "stagefail queue wait");
         };
-        // Attempt 1: the upload fails at level 1.
-        invoke<void>(list.Get(), 17, dst.Get(), src.Get());
+        // Attempt 1: the upload fails at level 1. CopyTextureRegion (list slot 16) is used because it has no second guard:
+        // CopyResource also checks the staged flag, which hides a false "uploaded" answer. Level 0 was staged before the fault,
+        // so a copy that ran from the half-staged texture would leave the pattern in the destination's level 0.
+        D3D12_TEXTURE_COPY_LOCATION copy_dst{reinterpret_cast<ID3D12Resource*>(dst.Get()), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        D3D12_TEXTURE_COPY_LOCATION copy_src{reinterpret_cast<ID3D12Resource*>(src.Get()), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        copy_dst.SubresourceIndex = 0;
+        copy_src.SubresourceIndex = 0;
+        invoke<void>(list.Get(), 16, &copy_dst, 0u, 0u, 0u, &copy_src, nullptr);
         if (!submit_and_wait("stagefail list close 1")) return 4;
         if (!verify_texture_box(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val, dst_real.Get(),
                                 0, 0, 64, 64, sw, 30, "level 0 after the failed upload", 0, footprints[0].Offset, false))
