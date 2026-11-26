@@ -566,9 +566,7 @@ def check_request_code_files():
                 write(cache, "req_%s%s" % (key, ext), b"G" * 100)
             write(cache, "%s.fail" % key, b"MRTZ requires one uncompressed depth export\n")
             stderr.append("x2w-render not drawn key %s: %d (translation_not_ready)" % (key, 5000 - n))
-        write(cache, "req_c00000000000001e.sb", b"x")   # a compute key with no .c67/.data in the cache
-        for ext in (".c67", ".data"):
-            (cache / ("req_%s%s" % ("c%015x" % 29, ext))).unlink()
+        (cache / ("req_%s.data" % ("c%015x" % 29))).unlink()   # a compute key whose .data is not in the cache
         cache_rows = T.cache_results(str(cache))
         chosen = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)))
         kinds = [c[1] for c in chosen]
@@ -585,7 +583,7 @@ def check_request_code_files():
         # the one that lost its code files is listed with what is missing (here: it is outside the top 25, so use a small family)
         few = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)), top=40, compute_share=40)
         broken = [c for c in few if c[0] == "c%015x" % 29]
-        assert broken and broken[0][4] == [".c67", ".data"], broken
+        assert broken and broken[0][4] == [".data"], broken
         run = tmp / "run"
         run.mkdir()
         make_run(run, 1)
