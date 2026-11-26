@@ -3060,6 +3060,69 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_retiring_loop(self, guard, join, branch, end, jumps, effects, live_in):
+        """Prove a single-entry loop whose SCC exit tests the remaining EXEC mask.
+
+        A lane cleared by the compare cannot execute another vector instruction. The
+        guest may still take the latch for other lanes. Only the scalar latch counter
+        and SCC can differ when the host lane leaves early, so both must be dead.
+        """
+        old_reason = 'loop exit crosses a backward s_cbranch_scc0'
+        latch = end - 1
+        if not (0 < guard < branch - 2 and branch + 1 == join <= latch - 2):
+            return old_reason
+        offsets = [item[0] for item in self.ins]
+        edges = {(i, target) for i, target in jumps
+                 if guard <= i <= latch or offsets[guard] <= target <= offsets[latch]}
+        if edges != {(guard, offsets[join]), (branch, offsets[end]), (latch, offsets[guard])}:
+            return old_reason
+        if self.ins[latch][2] != 's_cbranch_scc0':
+            return old_reason
+        decoded = [parse(item[3]) for item in self.ins[guard - 1:end]]
+        if any(mods for _, _, mods in decoded):
+            return old_reason
+        compare_at = branch - guard - 1
+        for name, operands, _ in decoded[2:compare_at]:
+            base = re.sub(r'_e(32|64)$', '', name)
+            if base not in ('v_mov_b32', 'v_add_nc_u32', 'v_xor_b32', 's_nop'):
+                return old_reason
+            if base != 's_nop' and not all(self.execz_loop_vector_operand(op) for op in operands):
+                return old_reason
+        compare, mask, _, *tail = decoded[compare_at:]
+        if (not compare[0].startswith('v_cmpx_')
+                or not all(self.execz_loop_vector_operand(op) for op in compare[1])
+                or not {('exec', 0), ('exec_hi', 1)} <= clear_after(
+                    *self.ins[branch - 2][2:], effects[branch - 2][2], {('exec', 0), ('exec_hi', 1)})):
+            return old_reason
+        if (mask[:2] != ('s_and_b32', ['exec_lo'] * 3)
+                or getattr(getattr(self, 'pipe', None), 'wave_size', None) not in (None, 32)
+                or not wave32_exec_proof(self.ins)):
+            return old_reason
+        if any(name != 's_nop' for name, _, _ in tail[:-3]):
+            return old_reason
+        init = decoded[0]
+        step, limit, _ = tail[-3:]
+        if step[0] != 's_add_u32' or len(step[1]) != 3:
+            return old_reason
+        counter = step[1][0]
+        if (not re.fullmatch(r's(?:[0-9]|[1-9][0-9]|10[0-5])', counter)
+                or step[1] != [counter, counter, '1']
+                or init[:2] != ('s_mov_b32', [counter, '0'])
+                or limit[0] != 's_cmp_ge_u32' or len(limit[1]) != 2 or limit[1][0] != counter
+                or not re.fullmatch(r'[1-9][0-9]{0,4}|0x[0-9a-f]{1,5}', limit[1][1])
+                or not 0 < int(limit[1][1], 0) <= 65536):
+            return old_reason
+        for i in range(guard, end):
+            # The per-lane EXEC bit is exact, including on the skipped edge.
+            for word in sorted((effects[i][1] - EXEC_KEYS) & live_in[end]):
+                return 'no uniform or lane-local loop-exit value for %s' % word
+        self.retiring_exec_loops[offsets[guard]] = offsets[end]
+        return None
+
+    @staticmethod
+    def execz_loop_vector_operand(token):
+        return re.fullmatch(r'v\d+|-?(?:\d+|0x[0-9a-f]+)', token) is not None
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3124,6 +3187,7 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        self.retiring_exec_loops = {}
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -3180,7 +3244,7 @@ class Stage:
                     if inner == 's_cbranch_scc0' and any(
                             t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
                             and target in index and index[target] <= b for latch, target in jumps):
-                        reason = 'loop exit crosses a backward s_cbranch_scc0'
+                        reason = self.execz_retiring_loop(b, t, i, exit_index, jumps, effects, live_in)
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
@@ -10320,7 +10384,33 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
+        retiring = getattr(self, 'retiring_exec_loops', {})
+        fused = set()
         for i, (off, lines, term) in enumerate(self.blocks):
+            if i in fused:
+                continue
+            if off in retiring:
+                end = goto(retiring[off])
+                join = goto(term[-1])
+                assert join == i + 2 and end == join + 1
+                _, active_lines, active_term = self.blocks[i + 1]
+                _, latch_lines, latch_term = self.blocks[join]
+                fused.update((i + 1, join))
+                out.append('    %sif (pc == %d) {' % ('else ' if i else '', i))
+                out += ['        bool left = false;',
+                        '        [loop] while (!left) {']
+                out += ['            ' + line for line in lines]
+                out.append('            if (!(%s)) {' % term[1])
+                out += ['                ' + line for line in active_lines]
+                out += ['                left = %s;' % active_term[1],
+                        '                if (left) break;',
+                        '            }']
+                out += ['            ' + line for line in latch_lines]
+                out += ['            left = !(%s);' % latch_term[1],
+                        '        }',
+                        '        pc = %d;' % end,
+                        '    }']
+                continue
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '

@@ -1,4 +1,4 @@
-"""Unit checks of tools/startup/lane_exec.py against an independent per-lane reference (no GPU, no D3D12).
+"""Per-lane EXEC checks and a D3D12 WARP readback of a loop with retiring lanes.
 
 The emitted statements are run by a tiny line interpreter for every exec mask of a small wave, once per lowering
 (skip_flag, run_restore), and compared with the reference of the model (the lane-exact EXEC model, 3b):
@@ -8,13 +8,19 @@ The DPP16 rule (section 2a) is checked on all 2^5 combinations of in_range, sour
 exec against a table written from the rule's text. Mutants (ignore FI, restore per group, write under bound_ctrl 0)
 must each be caught. The GPU half of the proof (WARP readback of the same cases) is a separate test.
 """
+import argparse
 import itertools
 import re
+import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools' / 'startup'))
 import lane_exec as L  # noqa: E402
+from compute_load_format_check import check_references
+from startup_gfx2hlsl_compute_check import G, SENTINEL, USER7, WORDS, assemble, refused, root_blob
 
 WAVE = 4
 FAILED = []
@@ -134,14 +140,133 @@ def join_checks():
             if 'Barrier' in line or 'Interlocked' in line], [])
 
 
+
+# The input word gives the number of list entries for one lane. Zero bypasses
+# the body. Each processed entry adds seven, with at most nine entries visited.
+RETIRE_SOURCE = """\
+s_mov_b32 s36, s6
+s_mov_b32 s37, 0
+s_load_dwordx8 s[40:47], s[36:37], 0
+s_waitcnt lgkmcnt(0)
+v_lshlrev_b32_e32 v11, 2, v0
+buffer_load_dword v12, v11, s[40:43], 0 offen
+s_waitcnt vmcnt(0)
+v_mov_b32_e32 v13, 19
+v_mov_b32_e32 v14, 0
+s_mov_b32 s50, exec_lo
+v_cmpx_lt_u32_e32 0, v12
+s_mov_b32 s53, 0
+s_cbranch_execz 5
+v_add_nc_u32_e32 v13, 7, v13
+v_add_nc_u32_e32 v14, 1, v14
+v_cmpx_gt_u32_e32 v12, v14
+s_and_b32 exec_lo, exec_lo, exec_lo
+s_cbranch_scc0 3
+s_add_u32 s53, s53, 1
+s_cmp_ge_u32 s53, 9
+s_cbranch_scc0 -9
+s_mov_b32 exec_lo, s50
+buffer_store_dword v13, v11, s[44:47], 0 offen
+s_endpgm
+"""
+RETIRE_CODE = bytes.fromhex(
+    '0603a4be 8003a5be 120a0cf4000000fa 7fc08cbf 82001634 001030e00b0c0a80 '
+    '703f8cbf 93021a7e 80021c7e 7e03b2be 8018a27d 8003b5be 050088bf '
+    '871a1a4a 811c1c4a 0c1da87d 7e7e7e87 030084bf '
+    '35813580 358909bf f7ff84bf 3203febe 001070e00b0d0b80 000081bf')
+
+# The identity fill and permutations OR the active requests across a wave32.
+# Putting this at the join makes skipping the tail for one lane unsafe.
+REDUCE_SOURCE = """\
+s_or_saveexec_b32 s57, -1
+v_cndmask_b32_e64 v21, 0, v12, s57
+v_or_b32_dpp v21, v21, v21 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+v_or_b32_dpp v21, v21, v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_or_b32_dpp v21, v21, v21 row_mirror row_mask:0xf bank_mask:0xf
+v_or_b32_dpp v21, v21, v21 row_half_mirror row_mask:0xf bank_mask:0xf
+v_permlanex16_b32 v22, v21, 0, 0
+v_or_b32_e32 v21, v22, v21
+s_mov_b32 exec_lo, s57
+v_readlane_b32 s58, v21, 31
+"""
+REDUCE_CODE = bytes.fromhex(
+    'c13db9be 150001d58018e600 fa2a2a38154e00ff fa2a2a3815b100ff '
+    'fa2a2a38154001ff fa2a2a38154101ff 160078d715010102 162b2a38 3903febe 3a0060d7153f0100')
+OLD_EXIT = ('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: '
+            'loop exit crosses a backward s_cbranch_scc0')
+
+
+def retire_hlsl(code):
+    return G.ComputePipeline(code, root_blob(), USER7, (64, 1, 1)).hlsl_cs()
+
+
+def retire_controls(llvm_mc):
+    # The reduction sits between the exit branch and the original latch. Adjust
+    # both displacements that cross it; the EXEC skip still targets the join.
+    extra = len(REDUCE_CODE) // 4
+    reduction_source = RETIRE_SOURCE.replace('s_cbranch_scc0 3\n',
+                                              f's_cbranch_scc0 {3 + extra}\n' + REDUCE_SOURCE)
+    reduction_source = reduction_source.replace('s_cbranch_scc0 -9', f's_cbranch_scc0 {-9 - extra}')
+    tail = bytes.fromhex('030084bf 35813580 358909bf f7ff84bf')
+    with_reduction = RETIRE_CODE.replace(tail, struct.pack('<H', 3 + extra) + tail[2:4]
+                                        + REDUCE_CODE + tail[4:-4]
+                                        + struct.pack('<H', (-9 - extra) & 0xffff) + tail[-2:])
+    # Reading the scalar loop counter after the common exit would expose the
+    # number of wave iterations, which a retiring thread does not observe.
+    with_counter = RETIRE_CODE.replace(bytes.fromhex('3203febe'), bytes.fromhex('3203febe 35021a7e'))
+    if llvm_mc:
+        assert assemble(llvm_mc, RETIRE_SOURCE) == RETIRE_CODE
+        assert assemble(llvm_mc, reduction_source) == with_reduction
+
+    source = retire_hlsl(RETIRE_CODE)
+    assert 'while (!left)' in source
+    refused(OLD_EXIT, lambda: retire_hlsl(with_reduction))
+    refused('no uniform or lane-local loop-exit value for s53', lambda: retire_hlsl(with_counter))
+    return source
+
+
+def dispatch_retiring(directory, dxc, runner, adapter, source):
+    counts = [(lane * 17) % 64 for lane in range(64)]
+    expected = [19 + 7 * min(count, 9) for count in counts]
+    padding = [SENTINEL] * (WORDS - len(expected))
+    data = [1, *expected, *padding, *([0] * 16), *counts, *padding]
+    case = directory / 'retiring.case'
+    case.write_bytes(struct.pack('<%dI' % len(data), *data))
+
+    # Vote at the join so bypassing lanes also take the erroneous wave exit.
+    local_exit = '                if (left) break;\n            }'
+    assert source.count(local_exit) == 1
+    mutant = source.replace(local_exit, '            }\n'
+                            '            left = WaveActiveAnyTrue(left);\n'
+                            '            if (left) break;')
+    for name, hlsl, diagnostic in (('retiring', source, None), ('wave-break', mutant, 'word=')):
+        src = directory / (name + '.hlsl')
+        shader = src.with_suffix('.cso')
+        src.write_text(hlsl, encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+        if check_references(name, runner, adapter, shader, [(case, name, diagnostic)], allow_skip=True) == 77:
+            return 77
+    return 0
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--llvm-mc')
+    parser.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RUNNER', 'ADAPTER'))
+    args = parser.parse_args()
     range_checks()
     dpp_checks()
     join_checks()
+    source = retire_controls(args.llvm_mc)
     if FAILED:
         print('FAILED: %d' % len(FAILED))
         return 1
     print('lane_exec: all checks passed')
+    if args.dispatch:
+        output = Path(__file__).resolve().parent.parent / 'out'
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output) as tmp:
+            return dispatch_retiring(Path(tmp), *args.dispatch, source)
     return 0
 
 
