@@ -680,6 +680,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;
+        if (views[i].wrapper) note_placed_gpu_write(views[i].wrapper, views[i].offset, views[i].bytes);  // title memory is stale now
         list->ResourceBarrier(1, &barrier);
     }
     // The translated root replaced the desktop compute root of the title and its arguments.
