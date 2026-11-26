@@ -15,7 +15,7 @@ compared whole. Every other form keeps a refusal: another shift, another index, 
 again, a branch target between the shift and the load, a high word that is not a constant zero, an offset
 modifier, eight dwords, an index read from a buffer at an offset that differs between groups (named as such;
 startup_gfx2hlsl_heap_word_check.py covers the buffer forms that are accepted), a formatted load or a store through
-the record, and the graphics stages. --llvm-mc reassembles every instruction used here and compares the words.
+the record, and a nonzero graphics pointer high word. --llvm-mc reassembles every instruction used here and compares the words.
 """
 import argparse
 import struct
@@ -190,10 +190,10 @@ def check_refusals():
             raise AssertionError('%s: %s' % (name, error)) from None
     # A root signature without the directly indexed heap has no heap pointer: s8 is then a plain user SGPR.
     refused('s_load through s8 holding', lambda: pipeline(root=root_blob(flags=0)))
-    # The graphics stages keep their refusal.
+    # A graphics descriptor still requires a zero high word.
     stage = pipeline().cs
     stage.kind = 'ps'
-    stage.heap_index[6] = ('rootconst', 0, INDEX_WORD)
+    stage.sym[9] = ('const', 1)
     refused("s_load with a register offset through ('resheap',)",
             lambda: stage.op_s_load_dwordx4(['s[16:19]', 's[8:9]', 's6'], []))
     # Only a buffer read is named in the manifest; a store or another kind through a record is refused there too.

@@ -1708,6 +1708,35 @@ bool allocator_idle(const DesktopAllocator* allocator)
     return true;
 }
 
+// allocator_lock held. A recording retains its descriptor snapshots behind the same fences as its upload pages.
+x2w_upload::Arena* recording_arena(Wrapper* self)
+{
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (!state.list_open || !state.list_device || found == list_recordings.end() || !found->second) return nullptr;
+    if (!state.list_uploads) {
+        reclaim_finished_arenas(*found->second);
+        found->second->uploads.push_back(std::make_unique<x2w_upload::Arena>());
+        state.list_uploads = found->second->uploads.back().get();
+    }
+    return state.list_uploads;
+}
+
+bool retain_descriptor_snapshot(Wrapper* self, x2w_upload::DescriptorSnapshot&& snapshot)
+{
+    bool retained = false;
+    AcquireSRWLockExclusive(&allocator_lock);
+    try {
+        if (auto* arena = recording_arena(self)) {
+            arena->descriptor_snapshots.push_back(std::move(snapshot));
+            retained = true;
+        }
+    } catch (const std::bad_alloc&) {
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return retained;
+}
+
 // List slot 148 (Xbox order), allocate CPU-writable upload memory for this recording.
 void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignment)
 {
@@ -1715,21 +1744,12 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
         bytes > UINT64_MAX - (std::max)(alignment, UINT64{16})) return nullptr;
     x2w_upload::Allocation allocation{};
     AcquireSRWLockExclusive(&allocator_lock);
-    auto& state = self->own();
-    const auto found = list_recordings.find(self);
-    if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
-        try {
-            if (!state.list_uploads) {
-                reclaim_finished_arenas(*found->second);
-                auto arena = std::make_unique<x2w_upload::Arena>();
-                found->second->uploads.push_back(std::move(arena));
-                state.list_uploads = found->second->uploads.back().get();
-            }
-            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment,
-                                                          !upload_page_reuse() || upload_reuse_mutant() ? nullptr : &free_upload_pages);
-        } catch (const std::bad_alloc&) {
-            // Refuse the allocation without invalidating any range already recorded.
-        }
+    try {
+        if (auto* arena = recording_arena(self))
+            allocation = arena->allocate(device_of(self->own().list_device), bytes, alignment,
+                                         !upload_page_reuse() || upload_reuse_mutant() ? nullptr : &free_upload_pages);
+    } catch (const std::bad_alloc&) {
+        // Refuse the allocation without invalidating any range already recorded.
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     return reinterpret_cast<void*>(allocation.cpu);
@@ -1809,11 +1829,11 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_distinct_rect_scratch(void* firs
     return distinct;
 }
 
-x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes)
+x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes, bool remaining = false)
 {
     AcquireSRWLockShared(&allocator_lock);
     const auto& state = self->own();
-    const auto allocation = state.list_open && state.list_uploads ? state.list_uploads->range(address, bytes) : x2w_upload::Allocation{};
+    const auto allocation = state.list_open && state.list_uploads ? state.list_uploads->range(address, bytes, remaining) : x2w_upload::Allocation{};
     ReleaseSRWLockShared(&allocator_lock);
     return allocation;
 }
@@ -2951,6 +2971,8 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
+    UINT title_view_heap_entries = 0;
+    std::array<u64, 64> compute_root_addresses{};
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -3255,7 +3277,10 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
     // A different root signature invalidates the title's cached compute root arguments.
-    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    if (pass.compute_root_wrapper != w) {
+        pass.compute_constants.clear();
+        pass.compute_root_addresses.fill(0);
+    }
     pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
@@ -4342,16 +4367,29 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
 {
     auto* list = recording(self);
     auto& pass = pass_of(self);
-    const auto* params = pass.compute_params;
+    const auto* params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
     if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
     const auto gpu = list_upload_gpu(self, address, 1);
+    pass.compute_root_addresses[parameter] = gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) ? address : 0;
+    if (!pass.compute_root) return;
     // A rejected replacement leaves no valid binding: the desktop list may still hold the previous address.
     if (parameter < 32) pass.compute_srv_bound &= ~(1u << parameter);
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_SRV, gpu);
         if (parameter < 32) pass.compute_srv_bound |= 1u << parameter;
     }
+}
+
+// A guest compute CBV can supply a read-only buffer to a translated dispatch.
+void __stdcall list_compute_upload_cbv(Wrapper* self, UINT parameter, UINT64 address)
+{
+    auto& pass = pass_of(self);
+    const auto* params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
+    if (!recording(self) || !params || parameter >= params->size() || parameter >= pass.compute_root_addresses.size() ||
+        (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_CBV) return;
+    const auto gpu = list_upload_gpu(self, address, 1);
+    pass.compute_root_addresses[parameter] = gpu && !(gpu % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) ? address : 0;
 }
 
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
@@ -8152,6 +8190,7 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[41] = reinterpret_cast<ListTyped>(&list_compute_upload_cbv);
         list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
