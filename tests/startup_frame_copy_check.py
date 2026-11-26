@@ -118,8 +118,56 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_mirror(directory, consumer, backend):
+    shader = """ByteAddressBuffer constants : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint first = ((uint)p.y * 8 + (uint)p.x) * 16;
+    for (uint block = first; block < first + 16; ++block) {
+        if (asfloat(constants.Load(block * 65536 + 4)) != float(block + 1))
+            return float4(1, 0, 1, 1);
+    }
+    return asfloat(uint4(constants.Load(0), constants.Load(11534336),
+                         constants.Load(33554424), constants.Load(33554428)));
+}
+"""
+    block = 64 << 10
+    size = 32 << 20
+    expected = [bytes(255 if channel <= frame or channel == 3 else 0
+                      for channel in range(4)) * 32 for frame in range(3)]
+    cases = (
+        ("mirror", "1", "0", (512, 1, 1), (size, block, block), expected),
+        ("mirror_off", "0", "0", (1, 1, 1), (size, size, size), expected),
+        ("stale_mutant", "1", "1", (512, 0, 0), (size, 0, 0), [expected[0]] * 3),
+    )
+    for name, enabled, stale, copies, uploaded, reference in cases:
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        last = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-mirror", "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+            "X2W_GPU_MIRROR": enabled, "X2W_TEST_GPU_MIRROR_STALE": stale,
+            "X2W_TEST_GPU_MIRROR_FULL_COPY": "1" if enabled == "0" else "0",
+        }, binding="srv 0 buf table 0 0")
+        if last is None:
+            return 77
+        actual = [(folder / f"pixels.{frame}").read_bytes() for frame in range(2)] + [last]
+        for frame, (pixels, wanted) in enumerate(zip(actual, reference), 1):
+            if pixels != wanted:
+                raise AssertionError(f"{name} frame {frame}: actual {pixels.hex()} expected {wanted.hex()}")
+        frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
+                            log.read_text(errors="replace"))
+        counters = [tuple(map(int, record)) for record in frames]
+        wanted = [(frame, 1, copies[frame - 1], 1, uploaded[frame - 1]) for frame in range(1, 4)]
+        if counters != wanted:
+            raise AssertionError(f"{name}: actual counters {counters}, expected {wanted}")
+        print(f"{backend} {name}: upload bytes {uploaded}, "
+              + ("stale pixels detected in frames 2 and 3" if stale == "1" else "all frames match CPU"))
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "mirror": check_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))
