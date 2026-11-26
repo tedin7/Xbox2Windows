@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
-  tester_pack.py input-preset <menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py input-preset <none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
@@ -110,10 +110,13 @@ def privacy_labels(boxes):
     return labels
 
 
+NO_INPUT = ("none", "off", "")  # input presets that press nothing
+
+
 def input_labels(spec, seconds, privacy_boxes=2):
     """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
     `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
-    if spec != "menus":
+    if spec != "menus":  # none, off, menus2 and raw scripts have no labelled passes
         return []
     count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
     if privacy_boxes > 0:
@@ -124,10 +127,13 @@ def input_labels(spec, seconds, privacy_boxes=2):
 
 
 def input_preset(spec, seconds, privacy_boxes=2):
-    """`menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
+    """`none` (or `off`, or an empty value) is no automatic press at all: an empty script, so the title only sees the tester's own
+    input. `menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
     `seconds` of script time, but not past 300 s, at most 256 entries (about 260 s at one press a second). With privacy_boxes > 0 (the default; the privacy
     screen has two boxes) the presses are instead privacy_cycles() repeated, which also carries the title through the
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
+    if spec.strip().lower() in NO_INPUT:
+        return ""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
