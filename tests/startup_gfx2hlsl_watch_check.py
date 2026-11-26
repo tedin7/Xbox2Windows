@@ -3,7 +3,8 @@
 A request is consumed only once its ready marker (.a or .rtv) exists and it is not finished: a
 published .txt with both .cso files (or a .txt under X2W_FXC='') is done; a .txt without bytecode
 is resumed. After the watcher's first pass, a request whose .fail is newer than its marker is not
-retried; the first pass and the one-shot --pending scan retry it. The --watch process must retry an
+retried; the first pass and the one-shot --pending scan retry it only when the translator files are newer than the
+.fail (another build) or with X2W_RETRY_FAILED=1. The --watch process must retry an
 earlier failure once, translate a new request while it runs and not rewrite a failure on later
 passes. A --pending scan with four parallel workers must print the same results and write the same
 failures as one worker, an unexpected translator error must become <key>.fail, a broken process
@@ -260,10 +261,11 @@ else:
 
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
-    # A failure from an earlier run, newer than its marker: the watcher's first pass retries it once.
-    now = time.time()
-    touch(d / ('req_%016x.rtv' % 8), b'not an rtv request either', mtime=now - 20)
-    touch(d / ('%016x.fail' % 8), b'stale reason\n', mtime=now - 10)
+    # A failure an earlier translator build wrote (older than the translator files, newer than its marker): the
+    # watcher's first pass retries it once.
+    built = gfx2hlsl.translator_stamp()
+    touch(d / ('req_%016x.rtv' % 8), b'not an rtv request either', mtime=built - 20)
+    touch(d / ('%016x.fail' % 8), b'stale reason\n', mtime=built - 10)
     watch = subprocess.Popen([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
                               '--watch', str(d), '0.1'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -437,6 +439,37 @@ finally:
         os.environ.pop('X2W_FXC', None)
     else:
         os.environ['X2W_FXC'] = saved_fxc
+
+# A failure this translator build already wrote is final: '--pending' (as a tester run's finish step calls it) does
+# not translate it again, a failure older than the translator's files is retried, and X2W_RETRY_FAILED=1 retries it.
+# The --watch first pass follows the same rule.
+def pending_cli(d, **env):
+    run = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--pending', str(d)],
+                         capture_output=True, text=True, env=dict(os.environ, **env))
+    return run.stdout + run.stderr
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    built = gfx2hlsl.translator_stamp()
+    touch(d / ('req_%016x.rtv' % 0x51), b'not an rtv request', mtime=built - 100)
+    fail = d / ('%016x.fail' % 0x51)
+    pending_cli(d)
+    reason = fail.read_text() if fail.exists() else None
+    expect('first --pending writes the refusal', bool(reason), True)
+    os.utime(fail, (built + 50, built + 50))  # written by this build, after its request
+    out = pending_cli(d)
+    expect('a failure of this build is not translated again', ('%016x' % 0x51 in out, fail.stat().st_mtime), (False, built + 50))
+    os.utime(fail, (built - 10, built - 10))  # newer than the request, older than the translator files
+    pending_cli(d)
+    expect('a failure of an older build is retried', fail.stat().st_mtime > built - 10, True)
+    os.utime(fail, (built + 50, built + 50))
+    pending_cli(d, X2W_RETRY_FAILED='1')
+    expect('X2W_RETRY_FAILED=1 retries it', fail.stat().st_mtime != built + 50, True)
+    os.utime(fail, (built + 50, built + 50))
+    gfx2hlsl.watch_pass(str(d), False, None, gfx2hlsl.translator_stamp())
+    expect('the --watch first pass keeps it final', fail.stat().st_mtime, built + 50)
+    expect('the reason is unchanged', fail.read_text(), reason)
 
 for item in failures:
     print('FAIL', item)
