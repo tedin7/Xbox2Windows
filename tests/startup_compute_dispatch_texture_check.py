@@ -1,6 +1,8 @@
 """Translated compute programs with 2D texture views, dispatched through the stand-in's command list (slot 14).
 
 usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware>
+       startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> warp <table|implicit>
+       startup_compute_dispatch_texture_check.py sampler-controls
 
 Texture output: the consumer creates the image store program of startup_compute_image_store_d16_check.py as a
 device slot 67 pipeline, fills a 32x8 RGBA16_FLOAT texture with sentinel halves, creates an unordered access view of
@@ -23,7 +25,9 @@ every word keeps the sentinel.
 Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
 and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
 changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
-Exit 77 when the adapter is not available.
+Compute sampling: table wrap and clamp use different 16-byte records with the same compiled program.
+Implicit LOD samples mip zero. Its control recompiles the HLSL with explicit level one.
+Exit 77 when the adapter or the required direct sampler indexing capability is unavailable.
 """
 import os
 from pathlib import Path
@@ -263,6 +267,85 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+TABLE_LOAD = 's_load_dwordx4 s[20:23], s[10:11], 0x60'
+WAIT = 's_waitcnt lgkmcnt(0)'
+
+
+def sampler_program(case):
+    C.SPLICE.update({XOR: '05190a3a', LOD_SAMPLED[2]: 'ff0395be0000c000', LOD_SAMPLED[3]: 'ff0396be00005018',
+                     TABLE_LOAD: '050508f4600000fa', WAIT: '7fc08cbf', 's_mov_b32 s21, 0': '800395be'})
+    explicit = SAMPLED[-2]
+    implicit = explicit.replace('image_sample_lz', 'image_sample')
+    if case == 'table':
+        return C.splice(TABLE_LOAD, SAMPLED[2], WAIT, explicit, XOR)
+    if case == 'combined':
+        return C.splice(TABLE_LOAD, SAMPLED[2], WAIT, implicit, XOR)
+    return C.splice(*LOD_SAMPLED[:-2], implicit, XOR)
+
+
+def sampler_controls():
+    assert G.decode(bytes.fromhex('050508f4600000fa'))[0][-1] == TABLE_LOAD
+    table = C.translate('A', code=sampler_program('table'))
+    combined = C.translate('A', code=sampler_program('combined'), compute_implicit_lod=True)
+    assert table.hlsl_cs() == combined.hlsl_cs()
+    assert 'SamplerDescriptorHeap[0u]' in table.hlsl_cs()
+    assert table.manifest().endswith('smptable 0 table 1 96\n')
+    C.refused('image_sample with implicit LOD', lambda: C.translate(
+        'A', code=sampler_program('combined'), compute_implicit_lod=False).hlsl_cs())
+    modified = C.splice(TABLE_LOAD, SAMPLED[2], WAIT, 's_mov_b32 s21, 0', SAMPLED[-2], XOR)
+    C.refused('sampler from a descriptor', lambda: C.translate('A', code=modified).hlsl_cs())
+    print('compute sampler controls: fixed table, implicit LOD opt-out and modified descriptor')
+
+
+def sampler_readback(consumer, dxc, case):
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        cache, env = prepare(directory)
+        (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+        _, _, rsrc2, group, groups = C.CASES['A']
+        env.update(X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'), X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
+        (directory / 'program').write_bytes(sampler_program(case))
+        (directory / 'data').write_bytes(DATA)
+        (directory / 'state').write_bytes(state_a(group, rsrc2))
+        mode = 'dispatch-sampled-table-wrap' if case == 'table' else 'dispatch-sampled-two-mips'
+        written = 24 * groups[0] * groups[1] * groups[2]
+        plain = C.expected('A')
+        layout = '<%dI' % C.WORDS
+
+        def matches(got, red):
+            if got[written:] != plain[written:]:
+                return False
+            return all(abs(struct.unpack('<f', struct.pack('<I', g ^ p))[0] - red) <= 1 / 255
+                       for g, p in zip(got[:written], plain[:written]))
+
+        got, result = run(directory, consumer, env, mode, layout)
+        assert got == [C.SENTINEL] * C.WORDS
+        key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+        translate(cache, dxc, key)
+
+        def translated(mode, red):
+            got, result = run(directory, consumer, env, mode, layout)
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+            assert matches(got, red), (red, result.stderr[-3000:])
+            return got, clean(result)
+
+        _, layer = translated(mode, (0.0 + 1.0) / 2)
+        if case == 'table':
+            mutant, _ = translated('dispatch-sampled-table-clamp', 0.0)
+        else:
+            stem = cache / f'{key:016x}'
+            shader = stem.with_suffix('.cs.hlsl').read_text()
+            sample = next(line for line in shader.splitlines() if '.SampleLevel(' in line)
+            assert sample.endswith(', 0);'), sample
+            mutant_source = directory / 'lod-one.hlsl'
+            mutant_source.write_text(shader.replace(sample, sample[:-4] + ' 1);'))
+            subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main',
+                            '-Fo', stem.with_suffix('.cs.cso'), mutant_source], check=True)
+            mutant, _ = translated(mode, 1.0)
+        assert not matches(mutant, 0.5), 'mutant passed the mip-zero wrap reference'
+        print(f'compute {case}: {written} samples and output tail checked; mutant rejected; debug layer: {layer}')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
@@ -275,6 +358,11 @@ def main(consumer, dxc, adapter):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
+    if sys.argv[1:] == ['sampler-controls']:
+        sampler_controls()
+    elif len(sys.argv) == 5 and sys.argv[3] == 'warp' and sys.argv[4] in ('table', 'implicit'):
+        sampler_readback(sys.argv[1], sys.argv[2], sys.argv[4])
+    elif len(sys.argv) == 4 and sys.argv[3] in ('warp', 'hardware'):
+        main(*sys.argv[1:])
+    else:
         sys.exit(__doc__)
-    main(*sys.argv[1:])

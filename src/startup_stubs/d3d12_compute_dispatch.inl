@@ -32,7 +32,8 @@ struct ComputeTranslation {
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
-    x2w_startup::TranslatedSamplers samplers;  // static ones only
+    x2w_startup::TranslatedSamplers samplers;
+    std::vector<Slot> table_samplers;  // parameter and byte offset for each direct sampler heap entry
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
@@ -194,8 +195,10 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.srvs.push_back({a, b, true});
             tr.srvs.back().cube = true;
         }
-        // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
-        // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
+        // Direct heap entries name original table records. Static entries contain the four sampler words.
+        else if (std::sscanf(line.c_str(), "smptable %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.table_samplers.size() && i < x2w_startup::translated_sampler_count && a >= 0 && b >= 0 && !(b & 3))
+            tr.table_samplers.push_back({a, b});
         else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
         else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
         else if ((std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
@@ -223,9 +226,20 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
+    if (!tr.table_samplers.empty()) {
+        D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        auto* device = device_of(the_device);
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+            model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
+            FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+            return "direct sampler indexing needs shader model 6.6 and resource binding tier 3";
+    }
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()),
+            !tr.table_samplers.empty())))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -536,6 +550,38 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    // Snapshot each table record into a private heap. The recorded list owns the heap through submission.
+    DrawSamplerHeap sampler_heap;
+    if (!reason && !tr->table_samplers.empty()) {
+        auto* device = device_of(the_device);
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            static_cast<UINT>(tr->table_samplers.size()), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&sampler_heap))))
+            reason = "a compute sampler heap could not be created";
+        if (!reason) {
+            auto dest = sampler_heap->GetCPUDescriptorHandleForHeapStart();
+            const UINT stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+            for (const auto& slot : tr->table_samplers) {
+                x2w_startup::SamplerWords record{};
+                const u64 entry = pass.compute_tables.table(slot.a).record(slot.b, sizeof(record));
+                if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(record))) {
+                    reason = "a table sampler descriptor is not bound";
+                    break;
+                }
+                std::memcpy(record.data(), reinterpret_cast<const void*>(entry), sizeof(record));
+                auto sampler = x2w_startup::dynamic_sampler(record);
+                const UINT mip = (record[2] >> 26) & 3u;
+                if (sampler.MinLOD > sampler.MaxLOD || (record[2] & 0xfffffu) ||
+                    mip == 3 || (record[3] >> 30) == 3) {
+                    reason = "a table sampler has unsupported LOD fields or border color";
+                    break;
+                }
+                if (mip == 0) sampler.MinLOD = sampler.MaxLOD = 0;
+                device->CreateSampler(&sampler, dest);
+                dest.ptr += stride;
+            }
+        }
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -590,10 +636,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (!pass.heap_set) {
-        x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
+    auto* samplers = sampler_heap.Get();
+    if (samplers) recorded_draw_sampler_heaps[list].push_back(std::move(sampler_heap));
+    if (!pass.heap_set || (samplers && pass.bound_sampler_heap != samplers)) {
+        x2w_startup::bind_translated_heaps(list, draw_heap, samplers);
         pass.heap_set = true;
-        pass.bound_sampler_heap = nullptr;
+        pass.bound_sampler_heap = samplers;
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());

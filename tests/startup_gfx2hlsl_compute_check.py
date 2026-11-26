@@ -1054,9 +1054,10 @@ def expected(name):
     return out
 
 
-def translate(name, rsrc2=None, code=None, group=None):
+def translate(name, rsrc2=None, code=None, group=None, *, compute_implicit_lod=None):
     source, words, default_rsrc2, local, _ = CASES[name]
-    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local)
+    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local,
+                             compute_implicit_lod=compute_implicit_lod)
 
 
 def refused(fragment, build):
@@ -2262,13 +2263,15 @@ def check_controls():
     refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 16'], blend, cnd_s)))    # M holds data, not lane bits
     for read in (['s_cmp_eq_u32 s20, 0'] + cnd_s, ['s_mov_b32 s7, s20'] + cnd_s):
         refused(live('s20'), lambda read=read: phi_text(phi(z20, blend, read)))
-    # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
+    # Compute uses the level-zero approximation by default and can opt out.
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
-    refused('image_sample with implicit LOD', lambda: translate('A', code=splice(*load, sample)).hlsl_cs())
+    implicit = translate('A', code=splice(*load, sample), compute_implicit_lod=True)
+    refused('image_sample with implicit LOD',
+            lambda: translate('A', code=splice(*load, sample), compute_implicit_lod=False).hlsl_cs())
     pipeline = translate('A', code=splice(*load, sample.replace('image_sample', 'image_sample_lz')))
     lz = pipeline.hlsl_cs()
-    assert '.SampleLevel(' in lz, lz
+    assert '.SampleLevel(' in lz and implicit.hlsl_cs() == lz, lz
     refused('compute d16 image load requires validated SRV formats',
             lambda: pipeline.cs.image(['v12', 'v[0:1]', 's[24:31]'],
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))

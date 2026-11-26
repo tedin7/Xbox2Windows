@@ -3053,6 +3053,24 @@ class Stage:
         # sends unaligned or out-of-range offsets to the fallback entry.
         return 'qh[x2w_sampler_entry(s%d)]' % first[1]
 
+    def compute_table_sampler(self, tok):
+        """Bind a fixed table load whose four sampler words still have their original values."""
+        r = reg_range(tok)
+        first = self.sym.get(r[1]) if r and r[0] == 's' and r[2] - r[1] == 3 else None
+        if (not first or first[0] != 'desc' or first[1][0] != 'table'
+                or first[2] is None or first[3] % 4
+                or desc_key(first) in self.pipe.modified
+                or any(self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
+            return None
+        source, offset = self.descriptor(tok)
+        records = self.pipe.table_samplers
+        if (source, offset) not in records and len(records) >= SAMPLER_HEAP_SIZE:
+            raise Unsupported('too many compute table samplers')
+        index = records.setdefault((source, offset), len(records))
+        name = 'table_sampler_%x' % self.pc
+        self.emit('SamplerState %s = SamplerDescriptorHeap[%du];' % (name, index))
+        return name
+
     def const_words(self, tok):
         r = reg_range(tok)
         fconst = getattr(self, 'float_const_s', {})
@@ -7875,6 +7893,8 @@ class Stage:
                 # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
                 self.lod_sampler_words(name, words, mip_filter_none_ok=True)
                 smp = self.pipe.sampler(tuple(words), lod_limits=bool((words[2] >> 26) & 3))
+            elif self.kind == 'cs' and how in ('sample', 'l', 'lz', 'd') and not words:
+                smp = self.compute_table_sampler(ops[3]) or self.pipe.sampler(self.descriptor(ops[3]))
             else:
                 smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             if packed_2d:
@@ -7894,8 +7914,8 @@ class Stage:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
                 uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
-            if how == 'sample' and self.kind == 'cs':
-                # A compute lane has no pixel quad to supply derivatives; level 0 would be a guess.
+            if how == 'sample' and self.kind == 'cs' and not self.pipe.compute_implicit_lod:
+                # The compatibility mode refuses the level-zero approximation.
                 raise Unsupported('image_sample with implicit LOD in a compute program')
             if how == 'd':
                 axes = len(grads[0])
@@ -11817,7 +11837,8 @@ class ComputePipeline(Pipeline):
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None,
+                 *, compute_implicit_lod=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -11835,6 +11856,8 @@ class ComputePipeline(Pipeline):
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
+        self.compute_implicit_lod = (os.environ.get('X2W_COMPUTE_IMPLICIT_LOD') != '0'
+                                     if compute_implicit_lod is None else compute_implicit_lod)
         self.uses_sampler_heap = False
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
@@ -11877,6 +11900,7 @@ class ComputePipeline(Pipeline):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.table_samplers = {}
         self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
@@ -11962,6 +11986,8 @@ class ComputePipeline(Pipeline):
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
         lines += self.sampler_lines()
+        for (source, offset), index in self.table_samplers.items():
+            lines.append('smptable %d table %d %d' % (index, source[1], offset))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         return '\n'.join(lines) + '\n'
@@ -12145,7 +12171,7 @@ def log_unvalidated_lod(key, pipe):
 
 
 def translate_compute(out_dir, key):
-    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
+    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
     with suppress(FileNotFoundError):
@@ -12159,16 +12185,19 @@ def translate_compute(out_dir, key):
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
+    profile = 'cs_6_6' if pipe.table_samplers else 'cs_6_0'
     if os.environ.get('X2W_FXC') != '':
         compiler = find_dxc()
         if compiler is None:
-            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            model = '6.6' if pipe.table_samplers else '6.0'
+            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model %s' % (
+                os.environ.get('X2W_DXC', '<unset>'), model)
             write_failure(name + '.fail', message)
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
             bytecode = os.path.join(staging, 'cs.cso')
-            r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
                                capture_output=True, text=True)
             if r.returncode or not has_bytecode(bytecode):
                 # DXC names the source path; keep only the diagnostic after it.

@@ -210,6 +210,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // CopyTextureRegion (list slot 16) and a shader resource view of it (device slot 18) whose token the stand-in
 // writes at table byte 64. dispatch-sampled-unbound creates no view, so that entry holds no token.
 // dispatch-sampled-2x1 makes the texture 2x1 with red 0 in its left texel and 1.0 in its right one.
+// dispatch-sampled-table-wrap/clamp add a four-dword sampler at table byte 96.
+// dispatch-sampled-two-mips adds a second mip with red 1.0.
 // dispatch-heap runs the program of startup_gfx2hlsl_heap_record_check.py: a third root constant, 2, indexes the
 // 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
 // descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
@@ -234,6 +236,20 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool table_sampler = mode.rfind("dispatch-sampled-table-", 0) == 0;
+    const bool two_mips = mode == "dispatch-sampled-two-mips";
+    if (table_sampler) {
+        auto* guest = static_cast<ID3D12Device*>(device);
+        D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(guest->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+            model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
+            FAILED(guest->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3) {
+            std::puts("SKIP: direct sampler indexing needs shader model 6.6 and resource binding tier 3");
+            return 77;
+        }
+    }
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -328,9 +344,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
-        const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
-        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
-        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+        const UINT width = (mode == "dispatch-sampled-2x1" || table_sampler || two_mips) ? 2 : 1;
+        const UINT16 mips = two_mips ? 2 : 1;
+        if (table_sampler) {
+            const UINT record[4] = {mode == "dispatch-sampled-table-clamp" ? 0x92u : 0u,
+                0xc00000u, 0x18500000u, 0u};
+            std::memcpy(reinterpret_cast<void*>(cpu + 96), record, sizeof(record));
+        }
+        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
+        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, two_mips ? 768ull : 256ull, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
         void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -341,13 +363,19 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         unsigned char rgba[8] = {255, 64, 128, 32, 255, 64, 128, 32};
         if (width == 2) rgba[0] = 0;
         std::memcpy(texel, rgba, sizeof(rgba));
+        if (two_mips) std::memcpy(static_cast<unsigned char*>(texel) + 512, rgba + 4, 4);
         invoke(upload, 9, 0, 0);
         D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         source.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, width, 1, 1, 256}};
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        if (two_mips) {
+            image.SubresourceIndex = 1;
+            source.PlacedFootprint = {512, {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-        view.Texture2D.MipLevels = 1;
+        view.Texture2D.MipLevels = mips;
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
     }
     if (mode == "dispatch-input-null-token") {

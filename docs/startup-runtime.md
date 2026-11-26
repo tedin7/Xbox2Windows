@@ -1049,7 +1049,7 @@ cache path in the text) when:
 
 The translation is `ComputePipeline(code, root, COMPUTE_PGM_RSRC2, group size)`. Both register values come
 from state block A, which must be 28 bytes. The stage writes `<key>.cs.hlsl`, then `<key>.cs.cso` (DXC
-`cs_6_0`), then the `stage cs` manifest `<key>.txt` last; a stage refusal goes to `<key>.fail` with the
+`cs_6_0`, or `cs_6_6` for a [table sampler](experiments/compute-sampling.md)), then the `stage cs` manifest `<key>.txt` last; a stage refusal goes to `<key>.fail` with the
 stage's own reason. A request is done once `<key>.txt` and `<key>.cs.cso` exist. `X2W_FXC=` (empty)
 publishes the manifest alone, as for graphics. `<key>.cs.cso` has the same form as the slot 62 results of
 #1441 in the same directory. The keys come from different hashes, so the names clash only on a 64-bit
