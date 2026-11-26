@@ -4595,6 +4595,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Compute front door: the default translator first, the engine on a refusal (same key); graphics and mesh never reach the engine.
     add_test(NAME startup_engine_front_door COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_engine_front_door_check.py")
+    # X2W_ENGINE=compute: compute requests go to the engine, graphics and mesh stay on the default translator.
+    add_test(NAME startup_engine_compute_only COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_engine_compute_only_check.py")
+    # v_readfirstlane_b32 of a per-lane value under a partial EXEC mask (wave32 and wave64, short last wave, no enabled lane),
+    # read back against the guest rule; the lane-0 and host-first-lane rewrites must fail the same readback.
+    add_test(NAME startup_engine_first_lane_sparse_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_engine_first_lane_sparse_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_engine_first_lane_sparse_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_engine_first_lane_sparse_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_engine_first_lane_sparse_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_engine_wavesync_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_engine_wavesync_check.py")
     foreach(adapter IN ITEMS warp hardware)
