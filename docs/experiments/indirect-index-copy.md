@@ -9,6 +9,9 @@ address and length of at most 16 MiB. It reports `index_unreadable` or
 
 The fallback caches up to 256 snapshots by address and length until Present.
 The frame and every recording that uses a snapshot hold its ring chunk.
+A snapshot is not refreshed inside the frame: if the title rewrites the same
+address and length between two draws of one frame, the later draw reuses the
+older bytes. Only a new frame takes a fresh copy.
 A GPU-written command selects the index subrange through the existing GPU
 bounds check. Direct indexed draws can calculate their subrange on the CPU.
 
