@@ -213,15 +213,17 @@ $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
 # run took 16 workers at 100% CPU and the tester had to kill it).
 $backgroundJobs = 4
 # The --watch pool beside the title leaves old refusals for the pass after the run, so a translator lift would reach
-# only the next run: every old refusal (a .fail an older build wrote) is translated again now, on every core, for at
+# only the next run: every old refusal (a .fail an older build wrote) is translated again now, on 4 workers, for at
 # most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
 # Never blocks the run.
-try {
+# A cache without any refusal has nothing to retry: the translator is not even started (it takes seconds to load).
+$anyFailure = Get-ChildItem -LiteralPath $cache -Filter "*.fail" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($anyFailure) { try {
     $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 --jobs $backgroundJobs } | Out-String).Trim()
     if ($retryLine) { Write-Host "tester_run: $retryLine" }
 } catch {
     Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"
-}
+} }
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
