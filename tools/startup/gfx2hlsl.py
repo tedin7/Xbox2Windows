@@ -12679,6 +12679,8 @@ RETRIED_NAME = 'pre_run_retried.txt'
 # The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
 NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')
 CENSUS_LINE = re.compile(r'x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated')
+# One line per pipeline key the title used (graphics and compute): a run killed before its census still has these.
+USE_LINE = re.compile(r'x2w-render key use \S+ ([0-9a-f]{16}) first \S+ s last \S+ s uses (\d+)')
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
@@ -12693,8 +12695,9 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
 
 
 def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=frozenset(), weights=None):
-    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
-    then the requests the last run used most (`weights`: draws not drawn or dispatches without a translation), then
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the requests the last run
+    used first, most used first (`weights`: draws not drawn, dispatches without a translation, else the key's uses),
+    then the lifted families, then
     graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
     since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
     family and this build has not retried it yet (`final`): a .fail's time does not prove which build wrote it (Run P
@@ -12713,8 +12716,8 @@ def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=froze
         if newer and (not lifted or key in final):
             continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
-        rows.append((not lifted, -weights.get(key, 0), compute, order, key, lifted))
-    return [(key, lifted) for _l, _w, _c, _o, key, lifted in sorted(rows)]
+        rows.append((not weights.get(key, 0), -weights.get(key, 0), not lifted, compute, order, key, lifted))
+    return [(key, lifted) for _u, _w, _l, _c, _o, key, lifted in sorted(rows)]
 
 
 def retried_by_build(out_dir, stamp):
@@ -12744,20 +12747,23 @@ def note_retried(out_dir, stamp, keys):
 def run_weights(path):
     """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
     key's newest cumulative line; {} when the file cannot be read."""
-    weights = {}
+    weights, uses = {}, {}
     try:
         with open(path, encoding='utf-8', errors='replace') as handle:
             for line in handle:
                 if not line.startswith('x2w-render '):
                     continue
-                drawn, census = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line)
+                drawn, census, use = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line), USE_LINE.match(line)
                 if drawn:
                     weights[int(drawn.group(1), 16)] = int(drawn.group(2))
                 elif census:
                     weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
+                elif use:
+                    uses[int(use.group(1), 16)] = int(use.group(2))
     except OSError:
         return {}
-    return weights
+    # A key with no draw/dispatch line (a run killed before its census) counts by how often the title used it.
+    return {**{key: count for key, count in uses.items() if count > 0}, **weights}
 
 
 class RetryReport:
