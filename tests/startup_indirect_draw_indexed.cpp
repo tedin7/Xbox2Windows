@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -596,7 +597,7 @@ struct Gate {
 };
 
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
-                     alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
+                     alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, equivalent_root_disabled, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
@@ -1770,12 +1771,14 @@ int main(int argc, char** argv) try
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
+    const bool root_fix_control = argc == 3 && std::strcmp(argv[2], "translated-root-control") == 0;
+    const bool root_fix = root_fix_control || (argc == 3 && std::strcmp(argv[2], "translated-root") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2226,6 +2229,27 @@ int main(int argc, char** argv) try
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
         const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+        if (root_fix) {
+            check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", "1") ? S_OK : E_FAIL, "enable indirect root fix");
+            if (root_fix_control)
+                check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", nullptr) ? S_OK : E_FAIL, "unset indirect root fix");
+            ComPtr<ID3D12RootSignature> equivalent_root;
+            check(guest->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                                             IID_PPV_ARGS(&equivalent_root)), "create second guest root from the same blob");
+            const auto refusal = root_fix_control ? Refusal::equivalent_root_disabled : Refusal::none;
+            const bool pixels_ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), equivalent_root.Get(),
+                pso.Get(), signature.Get(), DrawKind::vertices, false, refusal,
+                root_fix_control ? "equivalent root refused with switch unset" : "equivalent root draws with switch on",
+                &red_binding);
+            const auto needed = x2w_d3d12_census_report(nullptr, 0);
+            std::vector<char> report(needed + 1);
+            x2w_d3d12_census_report(report.data(), report.size());
+            const std::string_view census(report.data());
+            const bool refused = census.find("reason=missing_guest_root calls=1") != std::string_view::npos;
+            if (refused != root_fix_control) std::fprintf(stderr, "unexpected root refusal census:\n%s", report.data());
+            std::filesystem::remove_all(cache);
+            return pixels_ok && refused == root_fix_control && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         TranslatedDrawFixture full_buffer(guest.Get(), 0, device.Get()), short_buffer(guest.Get(), 0, device.Get(), true),
             copied_buffer(guest.Get(), green, device.Get(), false, true);
         const TranslatedDrawFixture raw_upload(guest.Get(), 0);

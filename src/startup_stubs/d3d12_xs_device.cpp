@@ -2932,6 +2932,7 @@ struct Pass {
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
     const std::vector<RootParameter>* root = nullptr;
+    const Wrapper* guest_root_wrapper = nullptr;
     // Heap-indexing flags of the title root signature last set by slot 34. While nonzero, that root signature is
     // deferred: it is not set on the desktop list, root SRVs are not forwarded, and real draws go through decide_real_root.
     UINT root_heap_flags = 0;
@@ -3865,6 +3866,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;
+    pass.guest_root_wrapper = params ? w : nullptr;
     pass.srv_bound = 0;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
     pass.root_heap_flags = real ? root_heap_flags(w) : 0;
