@@ -2332,6 +2332,8 @@ class Stage:
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
+        if kind == 'ps':
+            self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -2410,6 +2412,23 @@ class Stage:
             self.sym[3] = ('ud', self.pipe.ud(('startinstance',)))
         else:
             self.sym[reg] = ('const', 0)  # primitive mask: only ever moved to m0
+
+    def derive_packed_position(self):
+        """Without a published SPI_PS_INPUT_ENA / ADDR (a request with no .psin), take the packed pixel position from the
+        program's own register use: the one live-in VGPR that is split into both 16-bit halves (tools/startup/
+        ps_input_scan.py: read before any write, low half and high half used) is the POS_FIXED_PT input, which the entry
+        code of the declarations fills from SV_Position. Several such registers, or none, leave the pipeline as it was."""
+        pipe = getattr(self, 'pipe', None)
+        if pipe is None or getattr(pipe, 'ps_inputs_known', True) or getattr(pipe, 'packed_position_vgpr', 0) is not None:
+            return
+        try:
+            from ps_input_scan import contract_of_decoded
+            halves = sorted(contract_of_decoded(self.ins).split16)
+        except Exception:  # noqa: BLE001  (an undecodable stream keeps the old behaviour)
+            return
+        if len(halves) == 1:
+            pipe.packed_position_vgpr = halves[0]
+            pipe.packed_position_derived = True
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
@@ -10002,6 +10021,8 @@ class Pipeline:
         self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
+        # False without SPI_PS_INPUT_ENA / ADDR: Stage.derive_packed_position then reads the register from the program.
+        self.ps_inputs_known = ps_hw_inputs is not None
         # First VGPR of the PERSP_CENTER I/J entry pair (SPI_PS_INPUT_ADDR bit 1, after the PERSP_SAMPLE pair when that
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0
