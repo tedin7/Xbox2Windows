@@ -2832,6 +2832,31 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
         pass.placed_vb[start + i] = placed_buffer_range(self->own().list_device, views[i].BufferLocation, views[i].SizeInBytes);
     }
 }
+// List slot 49 (desktop 45 + 4), SOSetTargets(start, count, views). The bindings are kept on the pass;
+// draws do not write stream output yet (opt-in: X2W_D3D12_SO_TARGETS=1), so the first calls with a bound buffer are logged.
+void __stdcall list_stream_output_targets(Wrapper* self, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+{
+    static LONG logged;
+    x2w_startup::StreamOutputView kept[x2w_startup::stream_output_slot_count] = {};
+    const bool fits = start < x2w_startup::stream_output_slot_count && count <= x2w_startup::stream_output_slot_count - start;
+    const bool have_views = views && fits && x2w_local::readable(views, std::size_t{count} * sizeof(*views));
+    if (have_views)
+        for (UINT i = 0; i < count; ++i)
+            kept[i] = {views[i].BufferLocation, views[i].SizeInBytes, views[i].BufferFilledSizeLocation};
+    // An unreadable array is refused like one that does not fit; a null array unbinds.
+    if (views && !have_views) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u, views unreadable or out of range", start, count);
+        return;
+    }
+    Pass& pass = pass_of(self);
+    const auto result = x2w_startup::set_stream_output_targets(pass.stream_output, start, count, views ? kept : nullptr);
+    if (result == x2w_startup::StreamOutputResult::refused) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u (4 slots)", start, count);
+    } else if (result == x2w_startup::StreamOutputResult::applied && first_calls(logged, 4)) {
+        log("x2w-render SOSetTargets: start %u, count %u, %u bound (draws do not write stream output yet)", start, count,
+            pass.stream_output.bound_count());
+    }
+}
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {

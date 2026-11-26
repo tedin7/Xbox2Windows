@@ -57,6 +57,7 @@
 #include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/stream_output_targets.h"
 #include "startup_stubs/present_signature_sampler.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
@@ -2632,6 +2633,7 @@ struct Pass {
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
+    x2w_startup::StreamOutputTargets stream_output;  // set by slot 49; recorded, not yet written by draws
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool targets_single_sample = false;
@@ -2673,6 +2675,17 @@ Pass& pass_of(Wrapper* self)
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
 }
+// Fixtures: the stream-output binding a list holds in a slot (BufferLocation, SizeInBytes, BufferFilledSizeLocation).
+// Returns 1 if the slot is bound, 0 if empty, -1 for a bad list or slot.
+extern "C" __declspec(dllexport) int x2w_d3d12_stream_output_slot(void* list, unsigned slot, unsigned long long* out)
+{
+    Wrapper* l = as_wrapper(list);
+    if (!l || l->own().kind != list_kind || slot >= x2w_startup::stream_output_slot_count) return -1;
+    const auto& v = pass_of(l).stream_output.views[slot];
+    if (out) { out[0] = v.location; out[1] = v.size; out[2] = v.filled_size_location; }
+    return v.location != 0;
+}
+
 
 bool indirect_copy_ranges()
 {
@@ -7360,6 +7373,8 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        // Slot 49 is inferred from the desktop order (45 + 4), with no independent evidence yet: opt in.
+        if (x2w_local::env_on("X2W_D3D12_SO_TARGETS")) list_typed[49] = reinterpret_cast<ListTyped>(&list_stream_output_targets);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
         // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
         // bindings are opt-in. Unset, the slots stay no-ops.
