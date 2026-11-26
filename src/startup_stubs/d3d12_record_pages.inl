@@ -20,6 +20,11 @@ ThreadBuffer* page_target;            // the buffer the running scan appends to 
 u64 page_prev_mark;                   // the previous present's mark, the stamp of the next scan
 SRWLOCK pages_lock = SRWLOCK_INIT;   // one scan at a time; held for the whole scan
 double page_scan_ms = 250.0;
+// The pages have a budget of their own (X2W_REPLAY_PAGES_MAX_MIB, default half of X2W_REPLAY_MAX_MIB): when it is spent no more
+// pages are written but the calls go on. Resources over X2W_REPLAY_PAGES_MAX_RANGE_MIB (default 8) are left out (counted), and
+// the smaller ranges come first: constants, vertex and index data, small textures before the big ones.
+u64 page_budget_bytes, page_range_limit = 8ull << 20, page_bytes_out, page_skipped_big;
+bool page_budget_reached;
 std::vector<PageRange> page_ranges;   // pages_lock
 std::size_t page_cursor_range;        // pages_lock
 u64 page_cursor_offset;               // pages_lock
@@ -35,7 +40,9 @@ void page_flush_target()
 }
 void page_sink(const char* tag, const void* header, std::size_t header_bytes, const void* data, std::size_t data_bytes)
 {
+    const std::size_t before = page_target->bytes.size();
     append_chunk(page_target->bytes, tag, header, header_bytes, data, data_bytes);
+    page_bytes_out += page_target->bytes.size() - before;
     if (page_target->bytes.size() >= (1u << 20)) page_flush_target();
 }
 
@@ -43,12 +50,13 @@ void page_sink(const char* tag, const void* header, std::size_t header_bytes, co
 void page_gather_ranges()
 {
     std::vector<PageRange> raw;
-    u64 unsized = 0;
+    u64 unsized = 0, big = 0;
     note_lock_acquire(false);
     for (const auto& item : resource_infos()) {
         const void* memory = item.first->own().title_memory;
         if (!memory) continue;
         if (!item.second.bytes) { ++unsized; continue; }
+        if (item.second.bytes > page_range_limit) { ++big; continue; }
         const u64 start = reinterpret_cast<u64>(memory) & ~u64{x2w_replay::page_bytes - 1};
         const u64 end = (reinterpret_cast<u64>(memory) + item.second.bytes + x2w_replay::page_bytes - 1) & ~u64{x2w_replay::page_bytes - 1};
         raw.push_back({start, end - start});
@@ -58,13 +66,17 @@ void page_gather_ranges()
     page_ranges.clear();
     for (const PageRange& r : raw) {
         if (!page_ranges.empty() && r.address <= page_ranges.back().address + page_ranges.back().bytes) {
-            const u64 end = std::max(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
+            const u64 end = (std::max)(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
             page_ranges.back().bytes = end - page_ranges.back().address;
         } else {
             page_ranges.push_back(r);
         }
     }
+    std::sort(page_ranges.begin(), page_ranges.end(), [](const PageRange& a, const PageRange& b) {
+        return a.bytes != b.bytes ? a.bytes < b.bytes : a.address < b.address;
+    });
     page_skipped_no_size = unsized;
+    page_skipped_big = big;
     if (page_cursor_range >= page_ranges.size()) { page_cursor_range = 0; page_cursor_offset = 0; }
 }
 
@@ -82,13 +94,21 @@ void page_scan(bool everything, u64 stamp)
     while (visited < page_ranges.size() && !stopped_early) {
         const PageRange range = page_ranges[page_cursor_range];
         while (page_cursor_offset < range.bytes) {
+            if (page_bytes_out >= page_budget_bytes) {
+                if (!page_budget_reached) {
+                    page_budget_reached = true;
+                    log("x2w-replay pages: budget of %llu MiB reached, no more pages are written (calls go on)", page_budget_bytes >> 20);
+                }
+                stopped_early = true;
+                break;
+            }
             if (bytes_written + page_target->bytes.size() >= max_bytes) {  // the same cap as the calls: the recording ends with its XEND
                 if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
                 stopped_early = true;
                 break;
             }
             const u64 at = range.address + page_cursor_offset;
-            const std::size_t want = static_cast<std::size_t>(std::min<u64>(page_slab_bytes, range.bytes - page_cursor_offset));
+            const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset));
             page_cursor_offset += want;
             const std::size_t readable = readable_window(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
             SIZE_T got = 0;
@@ -120,9 +140,9 @@ void page_scan(bool everything, u64 stamp)
         u64 total = 0;
         for (const PageRange& r : page_ranges) total += r.bytes;
         log("x2w-replay pages: ranges %zu (%llu MiB), pages seen %llu, distinct %llu, zero %llu, unchanged %llu, written %llu MiB, "
-            "skipped (no size) %llu, unreadable %llu, scan %.0f ms%s",
+            "skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
             page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_skipped_no_size,
-            page_unreadable, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart),
+            page_range_limit >> 20, page_skipped_big, page_unreadable, page_bytes_out >> 20, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart),
             everything ? " (base image)" : "");
     }
 }
@@ -139,6 +159,11 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
             const double ms = std::atof(value);
             if (ms > 0.0) page_scan_ms = ms;
         }
+        page_budget_bytes = max_bytes / 2;
+        if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
+            page_budget_bytes = static_cast<u64>(std::atof(value) * 1048576.0);
+        if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_RANGE_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
+            page_range_limit = static_cast<u64>(std::atof(value) * 1048576.0);
         page_writer = new x2w_replay::PageWriter(page_sink);
     }
     page_prev_mark = seq;
