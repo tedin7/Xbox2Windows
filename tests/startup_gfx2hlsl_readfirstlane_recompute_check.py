@@ -65,6 +65,7 @@ ACCEPTED = [
     ('chain through a second VGPR', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 'v_mul_f32_e64 v7, v6, 2.0', READ)),
     ('unrelated scalar write in between', JOIN + (LOAD, DEFINE, 's_mov_b32 s2, 0', READ)),
     ('median of three after a join', JOIN + (LOAD, 'v_med3_f32 v7, s3, 0, 0.5', READ)),
+    ('log2 then ceil after a join', JOIN + (LOAD, 'v_log_f32_e32 v7, s3', 'v_ceil_f32_e32 v7, v7', READ)),
     # A one-path scalar written before the join stays proven across a join whose other paths do not write it.
     ('one-path scalar written before the join', (LOAD,) + JOIN + (DEFINE, READ)),
     ('one-path scalar across a divergent branch when untouched',
@@ -82,7 +83,8 @@ ACCEPTED = [
       's_cbranch_scc1 label_0018', DEFINE, READ, 's_endpgm')),
 ]
 EXPECTED = {'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);',
-            'median of three after a join': 's9 = U(med3_32(F(s3), F(0x00000000u), 0.5));'}
+            'median of three after a join': 's9 = U(med3_32(F(s3), F(0x00000000u), 0.5));',
+            'log2 then ceil after a join': 's9 = U(ceil(F((U(log2(F(s3)))))));'}
 for label, instructions in ACCEPTED:
     got = run(*instructions)
     want = EXPECTED.get(label, RECOMPUTED)

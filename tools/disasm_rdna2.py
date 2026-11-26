@@ -2753,7 +2753,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         a16 = (w1 >> 30) & 1
         packed_2d = (
             a16
-            and op_name in ("image_load", "image_sample", "image_sample_lz")
+            and op_name in ("image_load", "image_store", "image_sample", "image_sample_lz")
             and dim_name == "SQ_RSRC_IMG_2D"
         )
         if packed_2d:

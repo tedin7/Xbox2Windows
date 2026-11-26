@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -46,6 +47,14 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
+if ($env:STUB_STALL) {
+    # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
+    Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
+    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 60 }
+    $deadline = (Get-Date).AddSeconds($wait)
+    while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    Set-Content -LiteralPath (Join-Path $LogDir "finished.txt") -Value "stub finished.txt"
+}
 exit 0
 """
 TRANSLATOR = """\
@@ -81,7 +90,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -169,7 +178,11 @@ def check_shell(shell):
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
-        assert args["InputScript"].startswith("80@5+1.2,80@7+1.2,4@9+1.2,80@11+1.2"), args["InputScript"]
+        assert manifest["gpu_time"] is True and manifest["env"].get("X2W_GPU_TIME") == "1", manifest  # GPU time per frame on
+        assert manifest["hdd_mode"] is True and manifest["env"].get("X2W_STORAGE_HDD") == "1", manifest  # HDD mode on by default
+        # The default menus script: clock-free privacy passes (up x3, one box, down to Conferma, A), see tester_pack.privacy_cycles.
+        assert args["InputScript"].startswith("40@5+1.2,40@7+1.2,40@9+1.2,80@11+1.2,80@13+1.2,4@15+1.2"), args["InputScript"]
+        assert manifest["cache_repaired"] == -1, manifest  # no repair tool in the scratch tree: skipped with a warning, the run goes on
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
@@ -207,6 +220,23 @@ def check_shell(shell):
             mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        assert mem_manifest["stop_reason"] == "" and mem_manifest["stall_seconds"] == 90, mem_manifest
+        # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
+        # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
+        started = time.monotonic()
+        stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
+                             "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
+        assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
+        assert time.monotonic() - started < 50, "the run did not end through the stop file"
+        assert "tester_run: STALL STOP at " in stalled.stdout and "frozen:" in stalled.stdout, stalled.stdout
+        newest_stall = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_stall) as z:
+            stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+            assert "stall_stop.json" in z.namelist(), z.namelist()
+        assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
+        off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
+                         "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
+        assert "STALL STOP" not in off.stdout, off.stdout
         nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
         assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)
         newest_snap = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
@@ -224,15 +254,17 @@ def check_shell(shell):
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
         assert plain_args["Sysmem"] == "1" and plain_manifest["sysmem_fallback"] is True  # -NoLazyTextures leaves it on
 
-        # -NoSysmemFallback leaves its variable unset and the manifest says so.
-        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback")
+        # -NoSysmemFallback and -NoGpuTime leave their variables unset and the manifest says so.
+        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback", "-NoGpuTime", "-NoHddMode")
         assert nosys.returncode == 0, (nosys.stdout, nosys.stderr)
         newest_nosys = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_nosys) as z:
             nosys_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             nosys_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not nosys_args["Sysmem"] and nosys_manifest["sysmem_fallback"] is False
+        assert nosys_manifest["gpu_time"] is False and "X2W_GPU_TIME" not in nosys_manifest["env"], nosys_manifest
         assert "X2W_D3D12_SYSMEM_FALLBACK" not in nosys_manifest["env"]
+        assert nosys_manifest["hdd_mode"] is False and "X2W_STORAGE_HDD" not in nosys_manifest["env"], nosys_manifest
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
         for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):

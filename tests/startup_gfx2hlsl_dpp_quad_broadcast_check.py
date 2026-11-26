@@ -349,14 +349,14 @@ def controls():
     check('refused: branch back to the broadcast entry block', refused_in_stage(ENTRY_BACKEDGE_WORDS))
     check('refused: divergent EXEC before the broadcast', refused_in_stage(DIVERGENT_WORDS))
     # The refusal names the mnemonics of the EXEC writers before the read (never operands), so a run says which shape it is.
-    for words, expect in ((DIVERGENT_WORDS, 'EXEC written before it by s_mov_b32 x1'), (NO_WQM_WORDS, None)):
+    for words, expect in ((DIVERGENT_WORDS, ': EXEC written at +0x4 by s_mov_b32'), (NO_WQM_WORDS, None)):
         try:
             pixel_stage(words).hlsl_ps()
             reason = ''
         except G.Unsupported as error:
             reason = str(error)
         check('refusal text for EXEC writers: %s' % (expect or 'no writer, no note'),
-              ('entry prefix' in reason and expect in reason) if expect else 'EXEC written before' not in reason, reason)
+              ('entry prefix' in reason and expect in reason) if expect else 'EXEC written at' not in reason, reason)
     for kind, code in NARROW_WORDS.items():
         text = pixel_stage(code).hlsl_ps()
         check('%s translates with unconditional quad reads' % kind,
