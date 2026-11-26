@@ -32,6 +32,7 @@ struct Scene {
     void* list = nullptr;
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
+    alignas(64) unsigned char title_rtvs[512]{};
 };
 
 int create_scene(void* device, Scene& s)
@@ -56,20 +57,39 @@ int create_scene(void* device, Scene& s)
         return 21;
     }
     const bool descriptor_window = GetEnvironmentVariableA("X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", nullptr, 0) != 0;
+    const bool null_views = GetEnvironmentVariableA("X2W_TEST_REPLAY_NULL_VIEWS", nullptr, 0) != 0;
     constexpr UINT ranges = 40;  // handle array is larger than the recorder's generic 256-byte argument capture
     // The title's heap descriptor: the desktop one, then a title CPU address and its size (none here).
-    const struct {
+    struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
     } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, descriptor_window ? 2 * ranges : 1u}, 0, 0};
+    const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+    Word title_stride = 0;
+    if (null_views) {
+        rtv_desc.desc.NumDescriptors = 2;
+        title_stride = invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        if (!title_stride || title_stride > sizeof(s.title_rtvs) / 2) return 26;
+        rtv_desc.backing = arg(s.title_rtvs);
+        rtv_desc.bytes = 2 * title_stride;
+    }
     if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&rtv_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.rtv_heap)))))
         return 22;
+    if (null_views) {
+        // The title uses the backing directly, before it queries the heap start.
+        auto null_view = view;
+        null_view.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+        invoke(device, 20, 0, arg(&null_view), rtv_desc.backing);
+        invoke(device, 20, arg(s.target), arg(&view), rtv_desc.backing + title_stride);
+    }
     // The heap start read as a title compiled for struct returns reads it: (return buffer, object).
     using Start = SIZE_T* (*)(SIZE_T*, void*);
     const auto start = reinterpret_cast<Start>((*static_cast<void***>(s.rtv_heap))[9]);
     if (start(&s.rtv, s.rtv_heap) != &s.rtv || !s.rtv) return 24;
-    const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
-    if (descriptor_window) {
+    if (null_views) {
+        if (s.rtv != rtv_desc.backing) return 26;
+        s.rtv += title_stride;
+    } else if (descriptor_window) {
         const auto type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         const Word stride = invoke(device, 15, type);
         if (!stride) return 25;

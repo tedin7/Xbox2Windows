@@ -14,7 +14,7 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
 
-usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware> [slot-layouts]
+usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware> [slot-layouts|null-views]
 """
 import json
 import os
@@ -198,6 +198,44 @@ def check_slot_layouts(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_null_views(scene, player, backend, env, directory, vs, ps, root):
+    frames = 3
+    recorded_dir = directory / "recorded"
+    recorded_dir.mkdir()
+    recording = directory / "null_views.x2wr"
+    code, text = run([scene, vs, ps, root, backend, frames],
+                     dict(env, X2W_TEST_REPLAY_NULL_VIEWS="1", X2W_REPLAY_PAGES="0",
+                          X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = recording.read_bytes()
+    backing, calls = [], []
+    for tag, header, header_bytes, _payload, size in chunks(data):
+        if tag == b"DHPM":
+            assert header_bytes == 24 and size == 0
+            backing.append(struct.unpack_from("<QQQ", data, header))
+        elif tag == b"CALL":
+            calls.append(CALL.unpack_from(data, header))
+        assert tag not in (b"PAGE", b"MAP "), tag
+    [(seq, address, length)] = backing
+    [create] = [call for call in calls if call[0] == seq]
+    assert create[2:4] == (0, 14), create
+    null_rtv, render_rtv = sorted(call for call in calls if call[2:4] == (0, 20))
+    assert seq < null_rtv[0] < render_rtv[0] and null_rtv[5] == 0 and render_rtv[5] != 0
+    assert length > 0 and (null_rtv[7], render_rtv[7]) == (address, address + length // 2)
+    out = directory / "replayed"
+    _score, rendered = replay(player, recording, out, backend, env, presents=frames)
+    summary = json.loads((out / "replay_summary.json").read_text())
+    [reserved] = summary["ranges"]
+    base = int(reserved["address"], 16)
+    assert base <= address < address + length <= base + reserved["bytes"], reserved
+    recorded = pictures(recorded_dir)
+    assert len(recorded) == frames and len(set(recorded.values())) > 1
+    assert recorded == rendered, "null_views replay differs from the recorded scene"
+    print("null_views: stack-backed RTV heap replayed with all three pictures equal")
+    return 0
+
+
 def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -210,7 +248,7 @@ def main(scene, player, backend, mode=None):
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
         for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES", "X2W_REPLAY_SLOT_LAYOUTS",
-                     "X2W_TEST_REPLAY_DESCRIPTOR_WINDOW"):
+                     "X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", "X2W_TEST_REPLAY_NULL_VIEWS"):
             env.pop(name, None)
         code, text = run([scene, vs, ps, root, backend, 1], env)
         if code == 77 and backend == "hardware":
@@ -221,6 +259,8 @@ def main(scene, player, backend, mode=None):
 
         if mode == "slot-layouts":
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "null-views":
+            return check_null_views(scene, player, backend, env, directory, vs, ps, root)
 
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()

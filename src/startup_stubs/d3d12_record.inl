@@ -275,6 +275,20 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
+    if (kind == device_kind && slot == 14 && SUCCEEDED(static_cast<HRESULT>(ret)) &&
+        x2w_local::readable(reinterpret_cast<const void*>(args[2]), sizeof(void*))) {
+        const auto* heap = as_wrapper(*reinterpret_cast<void* const*>(args[2]));
+        const u64 extension = args[0] + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
+        if (heap && heap->own().kind == descriptor_heap_kind && heap->own().title_cpu &&
+            x2w_local::readable(reinterpret_cast<const void*>(extension), 2 * sizeof(u64))) {
+            const auto* extra = reinterpret_cast<const u64*>(extension);
+            // The wrapper has already validated the extension against the heap's descriptor count and stride.
+            if (extra[0] == heap->own().title_cpu && extra[1]) {
+                const u64 backing[] = {seq, extra[0], extra[1]};
+                append_chunk(b.bytes, "DHPM", backing, sizeof(backing), nullptr, 0);
+            }
+        }
+    }
     // The generic argument memory is recorded as well: a file without the DARR chunk still replays the copy, cut short.
     const bool typed_arrays = descriptor_copy && record_descriptor_arrays(b, seq, args);
     if (descriptor_copy && !typed_arrays) {

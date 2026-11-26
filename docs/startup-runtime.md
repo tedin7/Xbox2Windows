@@ -1912,8 +1912,11 @@ destination starts, destination sizes, source starts and source sizes of every `
 the window (the generic argument memory is cut at a few hundred bytes). Its header is the call sequence (u64); the payload
 omits null arrays and uses the counts from the call. The player relocates the descriptor handles in the arrays and runs the
 call from them. An array that cannot be read or is over the size cap is logged (`CopyDescriptors arrays of call N not
-recorded exactly`) and the call falls back to the generic memory. Direct CPU writes to descriptor backing memory are outside
-this recipe: the pages of the heap's title memory carry them.
+recorded exactly`) and the call falls back to the generic memory. A successful heap creation with caller-supplied backing
+has a `DHPM` chunk with three u64 fields (call sequence, address, byte count) and an empty payload. The player reserves and
+commits that range through the same allocator as `MAP` before playing any calls. It passes the original backing address
+to heap creation and uses that address for descriptor writes. `DHPM` carries no memory contents and is recorded even
+with `X2W_REPLAY_PAGES=0`. Older recordings without `DHPM` still use generic argument relocation.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
@@ -1927,7 +1930,7 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 `SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
 (the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
 `replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
-recording, 3 a page range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+recording, 3 a title range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
 Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack

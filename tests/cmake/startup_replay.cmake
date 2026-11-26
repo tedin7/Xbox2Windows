@@ -8,7 +8,10 @@ if(TARGET startup_replay_quad AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}
         add_test(NAME startup_replay_slot_layouts_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_check.py"
             "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>" "${backend}" slot-layouts)
-        set_tests_properties(startup_replay_${backend} startup_replay_slot_layouts_${backend}
+        add_test(NAME startup_replay_null_views_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_check.py"
+            "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:x2w_replay>" "${backend}" null-views)
+        set_tests_properties(startup_replay_${backend} startup_replay_slot_layouts_${backend} startup_replay_null_views_${backend}
             PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
