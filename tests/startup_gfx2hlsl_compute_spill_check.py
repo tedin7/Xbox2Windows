@@ -158,6 +158,11 @@ VARIANTS = {
                                              's_cmp_lg_u32 s4, 0\ns_cbranch_scc0 Lnoload\n'
                                              's_load_dwordx8 s[12:19], s[10:11], 0x0\ns_waitcnt lgkmcnt(0)\nLnoload:\n')],
                                  'holds a lane mask or descriptor', 'the descriptor is loaded on one path only, so a spill of it has no single load to prove'),
+    'pointer-clobbered-on-one-path': (SOURCE_S, [('s_mov_b32 s10, s6\n',
+                                                  's_mov_b32 s24, s6\ns_cmp_lg_u32 s4, 0\ns_cbranch_scc0 Lr\ns_mov_b32 s6, 0\nLr:\n'
+                                                  's_mov_b32 s6, s24\ns_mov_b32 s10, s6\n')],
+                                      'proven in the entry block',
+                                      'the table pointer is cleared on one path before the descriptor load'),
     'written-in-region-read-outside': (SOURCE_S, [
         (S_ARM + 'v_mov_b32 v1, 1', 'v_mov_b32 v1, 1'), (S_ARM + 'v_mov_b32 v1, 0', 'v_mov_b32 v1, 0'),
         (''.join('s_mov_b32 s%d, 0\n' % r for r in range(16, 20)), ''),
@@ -287,6 +292,14 @@ WORDS = {
         '6a03febe150088bf0c0060d7280101000d0060d7280301000e0060d7280501000f0060d728070100100060d728090100'
         '110060d7280b0100120060d7280d0100130060d7280f010002300ce000050380703f8cbf001078e0040504801503febe'
         '000081bf'),
+    'pointer-clobbered-on-one-path': bytes.fromhex(
+        '060398be048007bf010084bf800386be180386be06038abe80038bbe05030cf4000000fa7fc08cbf280061d70c000100'
+        '280061d70d020100280061d70e040100280061d70f06010004811787178007bf0a0084bf280061d710080100280061d7'
+        '110a0100280061d7120c0100280061d7130e01008102027e090082bf280061d710080100280061d7110a0100280061d7'
+        '120c0100280061d7130e01008002027e80038cbe80038dbe80038ebe80038fbe800390be800391be800392be800393be'
+        '840008347e0395be8c00887d6a03febe150088bf0c0060d7280101000d0060d7280301000e0060d7280501000f0060d7'
+        '28070100100060d728090100110060d7280b0100120060d7280d0100130060d7280f010002300ce000050380703f8cbf'
+        '001078e0040504801503febe000081bf'),
     'S-load-above-arms': bytes.fromhex(
         '06038abe80038bbe05030cf4000000fa7fc08cbf04811787178007bf120084bf280061d710080100280061d7110a0100'
         '280061d7120c0100280061d7130e0100280061d70c000100280061d70d020100280061d70e040100280061d70f060100'
