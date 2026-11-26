@@ -1,5 +1,6 @@
 // Unit test of src/startup_stubs/texture_residency.h (pure logic, no GPU). Each case guards one rule; the
 // "mutant" argument flips one rule off and the matching case must then fail (exit 1), proving the case bites.
+#include "startup_stubs/texture_flights.h"
 #include "startup_stubs/texture_residency.h"
 
 #include <cstdio>
@@ -90,6 +91,38 @@ int main(int argc, char** argv)
         expect(!late.pinned, "back after pin_frames: not pinned");
         if (!std::strcmp(mutant, "no-pin")) t.pinned = false;
         expect(t.pinned, "thrash guard keeps the quick-return texture");
+    }
+    // 9. Flights (texture_flights.h): busy from the recorded use until the fence of the submission has completed AND the list is reset.
+    {
+        Flights f;
+        int a = 0, b = 0;
+        const void* list = &a;
+        const void* other = &b;
+        f.note_use(list, 7);
+        f.note_use(list, 7);
+        expect(f.busy(7) && f.open_lists() == 1, "a recorded use makes the texture busy (open list)");
+        expect(!f.busy(8), "an unnamed texture is not busy");
+        f.submit({list}, 0, 5, true);
+        f.discard(list);  // the title resets the list after executing it
+        expect(f.busy(7) && f.flights() == 1, "submitted: busy until the fence passes");
+        f.complete(1, 99);
+        expect(f.busy(7), "another queue's fence does not end the flight");
+        if (!std::strcmp(mutant, "early-complete")) f.complete(0, 1000);
+        f.complete(0, 4);
+        expect(f.busy(7), "a lower fence value does not end the flight");
+        f.complete(0, 5);
+        expect(!f.busy(7) && f.flights() == 0, "fence reached: the texture is free");
+        // A list submitted twice without a reset stays busy; a discarded unsubmitted list frees it.
+        f.note_use(other, 9);
+        f.discard(other);
+        expect(!f.busy(9), "a discarded unsubmitted list frees the texture");
+        f.note_use(other, 10);
+        f.submit({other}, 0, 6, false);
+        f.discard(other);
+        f.complete(0, 1000);
+        expect(f.busy(10), "a submission that could not be fenced keeps the texture busy for the process");
+        f.forget(10);
+        expect(!f.busy(10), "forget (resource released) clears it");
     }
     std::printf(failures ? "startup_texture_residency: %d failure(s)\n" : "startup_texture_residency: ok\n", failures);
     return failures ? 1 : 0;
