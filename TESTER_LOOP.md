@@ -42,6 +42,8 @@ Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
 Lazy slot 133 textures are on for now: the script sets `X2W_D3D12_LAZY_TEXTURES=1` so read-only slot 133 textures are created
 on first use and video memory does not run out. `-NoLazyTextures` turns it off; the manifest records the choice.
 
+Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.
+
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
 
 ## What to send

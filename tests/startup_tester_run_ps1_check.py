@@ -28,13 +28,13 @@ STARTUP = REPO / "tools" / "startup"
 STUB_RUN = r"""
 param([string]$Exe, [string]$DataDir, [string]$LogDir, [int]$Seconds, [string]$BuildDir, [string]$ShaderCache,
       [int]$ContinueAsserts, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
-      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi)
+      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi, [switch]$LazyMemory)
 $seen = @(Get-ChildItem -LiteralPath $ShaderCache -Force | ForEach-Object { $_.Name })
 $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -128,6 +128,7 @@ def check_shell(shell):
                                 "args.json", "debugger_summary.out", "manifest.json"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
+        assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
@@ -162,6 +163,13 @@ def check_shell(shell):
             plain_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             plain_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not plain_args["Lazy"] and plain_manifest["lazy_textures"] is False
+        nomem = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoLazyMemory")
+        assert nomem.returncode == 0, (nomem.stdout, nomem.stderr)
+        newest_mem = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_mem) as z:
+            mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
@@ -253,7 +261,7 @@ def check_build(shell):
         assert not (build / "xmem.dll").exists()
         result = run_script(shell, tree, "-CaptureEvery", "0")
         assert result.returncode == 0, (result.stdout, result.stderr)
-        assert "building the run's targets" in result.stdout, result.stdout
+        assert "building startup_runtime" in result.stdout, result.stdout
         for dll in DLLS:
             assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"
         assert (build / "generated" / "x2w_build_rev.cpp").read_text().count('"%s"' % head) == 1
