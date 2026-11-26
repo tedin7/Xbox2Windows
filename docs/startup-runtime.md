@@ -2512,9 +2512,17 @@ These are measured on one executable; treat them as hypotheses for others.
   for a load. Before, the stage was refused and every draw through its pipeline was skipped.
   Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
   hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
-  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
-  and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
-  in the draw path.
+  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). The experiment covers array
+  views, with a single-slice 2D view bound to an array declaration left unverified.
+- **Cube sampling.** Graphics shaders use `TextureCube` for plain, level-zero and explicit-level
+  samples, plus bias in a pixel stage under the existing derivative and sampler rules.
+  The version-3 manifest names a table entry with `srv N texcube table P B`. The draw binds a cube
+  SRV on at least six square 2D faces, or binds a typed null and counts a dimension mismatch when
+  a resolved view or resource has the wrong dimension. Array views are rejected at binding because
+  the instruction dimension is shared. Explicit face-space gradients remain refused by the translator.
+  The WARP fixture compares eight synthetic directions with the CPU face colours for each supported
+  form. It also swaps the X faces and binds incompatible views. Run
+  `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cube_sample_warp$' -V`.
 - **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
   `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
   `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison

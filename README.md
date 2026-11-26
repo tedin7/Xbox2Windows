@@ -105,6 +105,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
 | SPIR-V sampler views at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V` |
+| Point-sampled cube faces through the translated D3D12 draw path | `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cube_sample_warp$' -V` |
 | SPIR-V standalone sampler split for 1D and cube images, including arrays (SPIRV-Tools) | `python3 -B tests/spirv_window/check.py` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |

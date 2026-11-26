@@ -7699,8 +7699,14 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
-        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        stage = getattr(self, 'kind', None)
+        graphics = stage in ('ps', 'vs')
+        if graphics and dim == 'SQ_RSRC_IMG_CUBE' and how == 'd':
+            raise Unsupported('image_sample_d on a cube image: face-space gradients are unsupported')
+        # Cube arrays share the same instruction dimension. The draw binder rejects array SRVs.
+        cube = dim == 'SQ_RSRC_IMG_CUBE' and (
+            (stage == 'cs' and how in ('lz', 'l')) or
+            (graphics and how in ('sample', 'lz', 'l', 'b')))
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:
@@ -7799,6 +7805,8 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
+        if graphics and cube and desc_key[0][0] != 'table':
+            raise Unsupported('a graphics cube sample requires a descriptor table')
         tex = self.pipe.resource(desc_key, kinds[dim])
         if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
@@ -11742,8 +11750,11 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def manifest(self):
-        # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
-        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
+        # Older draw readers reject unknown versions and would otherwise interpret texcube as a buffer.
+        version = 2 if self.stored_images() else 1
+        if any(r['kind'] == 'texcube' for r in self.resources.values()):
+            version = 3
+        lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
