@@ -27,6 +27,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | commit counters in the heartbeat | fork branch `x2w-commit-counters` | `3c7b2a56f` |
 | watch translator serves the newest requests first | fork branch `x2w-watch-newest` | `e7b617bcb` |
 | residency slice 1 | fork branch `f4-residency-s1` | `df147080e` |
+| tester_run turns on `X2W_XMEM_STARTUP_BELOW_40` (`-NoStartupBelow40` off) | fork branch `c15-bvh40` | `2b9643b13` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
