@@ -1480,18 +1480,36 @@ LONG frame_copies_frame = -1;
 
 LONG64 big_copies_reused, big_copies_made;
 
+// X2W_BIG_COPY_REUSE=0 turns the cross-frame reuse of large copies off (every copy ends with its frame, as before).
+bool big_copy_reuse_enabled()
+{
+    static const bool on = [] {
+        char value[8]{};
+        return !GetEnvironmentVariableA("X2W_BIG_COPY_REUSE", value, sizeof(value)) || value[0] != '0';
+    }();
+    return on;
+}
+// X2W_TEST_FRAME_COPY_STALE=1 (fixtures only): a large copy is reused without comparing it with the title's memory (the control of
+// startup_frame_copy: a title write between two frames must then be missed).
+bool stale_large_copy_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_FRAME_COPY_STALE", nullptr, 0) != 0;
+    return on;
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
         frame_copies_frame = frame_number;
-        x2w_local::trim_frame_copies(frame_copies());
+        if (big_copy_reuse_enabled()) x2w_local::trim_frame_copies(frame_copies());
+        else frame_copies().clear();
     }
     const u64 key = address * 1099511628211ull ^ bytes;
     const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+    if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
         const auto& slice = found->second.slice;
         AcquireSRWLockExclusive(&allocator_lock);
         for (unsigned i = 0; i < upload_chunks.size(); ++i) {

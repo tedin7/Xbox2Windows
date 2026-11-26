@@ -12,14 +12,20 @@
 // memory between the draws:
 //   changed  the colour is rewritten in place (red, then blue)
 //   same     the memory is left alone (red both times)
+//   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
+//            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
 int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width, UINT height)
 {
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
-    const bool changed = !std::strcmp(mode, "changed");
-    if (!changed && std::strcmp(mode, "same")) return 2;
+    const bool big = !std::strncmp(mode, "big-", 4);
+    const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
+    if (!changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
-    alignas(256) static float constants[64] = {1.0f, 0.0f, 0.0f, 1.0f};
+    // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
+    alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
+    if (big)
+        for (int i = 4; i < 16384; ++i) constants[i] = 0.5f;
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment;
     static std::vector<unsigned char> views;
@@ -35,7 +41,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
                                            reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(constants), sizeof(constants)};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(constants), big ? sizeof(constants) : 256};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
     const StreamWord table = invoke(heap, 10);
     if (!table) return 43;
@@ -46,6 +52,15 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     if (changed) {
         constants[0] = 0.0f;  // the same address now holds blue
         constants[2] = 1.0f;
+    }
+    if (big) {
+        // A present on a second queue starts the next frame (the draws are recorded, not executed, so frame_number moves now).
+        void* queue = nullptr;
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 8, reinterpret_cast<std::uintptr_t>(&queue_desc),
+                                               reinterpret_cast<std::uintptr_t>(&__uuidof(ID3D12CommandQueue)),
+                                               reinterpret_cast<std::uintptr_t>(&queue))))) return 44;
+        invoke(queue, 32, 0, 0, 0);
     }
     const D3D12_RECT right{static_cast<LONG>(width / 2), 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&right));  // RSSetScissorRects
