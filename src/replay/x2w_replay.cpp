@@ -265,14 +265,34 @@ void learn_after(Player& p, const Recording& r, const Played& call)
 const char* volatile phase = "start";
 const Step* volatile current_step = nullptr;
 
+// The crash line: the exception, the module and offset it happened in, the address an access violation touched, and
+// what the player was doing. Written from a vectored handler (it runs first, before any frame or filter): an
+// exception some code handles itself is reported too, so the line says "first chance" and at most four are written.
 LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
 {
+    const EXCEPTION_RECORD& x = *e->ExceptionRecord;
+    if (x.ExceptionCode < 0xC0000000ul || x.ExceptionCode == 0xE06D7363ul) return EXCEPTION_CONTINUE_SEARCH;  // C++ throw
+    static volatile LONG reported = 0;
+    if (InterlockedIncrement(&reported) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    char module[MAX_PATH] = "?";
+    HMODULE owner = nullptr;
+    u64 offset = reinterpret_cast<u64>(x.ExceptionAddress);
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<const char*>(x.ExceptionAddress), &owner) &&
+        GetModuleFileNameA(owner, module, MAX_PATH)) {
+        offset -= reinterpret_cast<u64>(owner);
+    }
+    const char* base = std::strrchr(module, '\\');
+    base = base ? base + 1 : module;
+    const u64 touched = x.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && x.NumberParameters >= 2 ? x.ExceptionInformation[1] : 0;
     const Step* step = current_step;
     if (step)
-        say("x2w-replay: CRASH 0x%08lx at %p while playing seq %llu (kind %u slot %u, object 0x%llx)", e->ExceptionRecord->ExceptionCode,
-            e->ExceptionRecord->ExceptionAddress, step->call.seq, step->call.kind, step->call.slot, step->call.object);
+        say("x2w-replay: CRASH (first chance) 0x%08lx at %s+0x%llx touching 0x%llx while playing seq %llu (kind %u slot %u, "
+            "object 0x%llx)", x.ExceptionCode, base, offset, touched, step->call.seq, step->call.kind, step->call.slot,
+            step->call.object);
     else
-        say("x2w-replay: CRASH 0x%08lx at %p during %s", e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress, phase);
+        say("x2w-replay: CRASH (first chance) 0x%08lx at %s+0x%llx touching 0x%llx during %s", x.ExceptionCode, base, offset,
+            touched, phase);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -448,7 +468,7 @@ int run(const Options& o)
         return 2;
     }
     SetStdHandle(STD_ERROR_HANDLE, log);
-    SetUnhandledExceptionFilter(note_crash);
+    AddVectoredExceptionHandler(1, note_crash);
     phase = "reading the recording";
     Recording r;
     if (const std::string problem = read_recording(o.recording.c_str(), r); !problem.empty()) {
@@ -461,6 +481,14 @@ int run(const Options& o)
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
+    }
+    {
+        u64 shader_bytes = 0, reserved = 0;
+        for (const ShaderFile& f : r.shader_files) shader_bytes += f.content.bytes;
+        for (const ReservedSpan& s : page_replay().spans) reserved += s.end - s.base;
+        say("x2w-replay: recording format %u, %llu bytes: %zu calls, %zu shader files (%llu bytes), %zu pages, %zu page maps; "
+            "%zu title ranges reserved (%llu bytes)", r.version, r.size, r.steps.size(), r.shader_files.size(), shader_bytes,
+            r.pages.size(), r.maps.size(), page_replay().spans.size(), reserved);
     }
     phase = "applying settings";
     apply_settings(r.settings);

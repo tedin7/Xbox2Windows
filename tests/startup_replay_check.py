@@ -108,7 +108,8 @@ def replay(player, recording, out, backend, env, presents=PRESENTS):
     code, text = run([player, recording, out, "--adapter", backend], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
-        raise AssertionError("x2w_replay exit %d\n%s\n%s" % (code, text[-2000:], log))
+        raise AssertionError("x2w_replay exit %d on %s (%d bytes)\n%s\n%s" % (code, recording.name, recording.stat().st_size,
+                                                                        text[-2000:], log))
     score = [line for line in text.splitlines() if line.startswith("x2w-replay score ")]
     assert len(score) == 1, text
     summary = json.loads((out / "replay_summary.json").read_text())
