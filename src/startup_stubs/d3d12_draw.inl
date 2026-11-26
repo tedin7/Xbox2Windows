@@ -3201,7 +3201,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (srv.source == 0 && words[0] == view_token_magic && entry) {
             // A view the title created: a constant buffer view names its memory directly; a buffer
-            // shader-resource view names a range of its resource's title memory.
+            // shader-resource view names a range of its resource.
             ViewRecord record{};
             note_lock_acquire(false);
             buffer_token_known = words[1] < view_records().size();
@@ -3223,6 +3223,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
                     bytes = std::size_t{view.Buffer.NumElements} * element;
                     strides[i] = typed_view ? element : view.Buffer.StructureByteStride;
+                } else if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource &&
+                           view_token_uav_enabled()) {
+                    const auto backing = indirect_table_buffer(self, words);
+                    if (backing.resource) {
+                        if (!backing.upload)
+                            require_state(self, backing.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        retire_hold(self, resource);
+                        strides[i] = backing.stride;
+                        buffer_view(dest, backing.resource, backing.offset, static_cast<std::size_t>(backing.bytes));
+                        continue;
+                    }
                 }
             }
         }

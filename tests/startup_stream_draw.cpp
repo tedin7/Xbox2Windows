@@ -414,7 +414,7 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 }  // namespace
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
-                      DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
+                      DXGI_FORMAT format, std::uint32_t export_word, bool two_targets, const StartupDrawTable* table)
 {
     const bool console_view = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", nullptr, 0) != 0;
     const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
@@ -451,7 +451,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
     void* vertex_resource = nullptr;
-    if (index_probe[0]) {
+    if (table) {
+        invoke(list, 32, 1, arg(&table->heap));
+        invoke(list, 36, 0, table->gpu);
+        invoke(list, 12, 3, 1);
+    } else if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
         const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;
