@@ -1453,6 +1453,17 @@ add_test(NAME startup_upload_arena_guard COMMAND startup_upload_arena_guard)
 set_tests_properties(startup_upload_arena_guard PROPERTIES SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "startup_upload_arena_guard: PASS")
 add_test(NAME startup_upload_arena_guard_own_only_control COMMAND startup_upload_arena_guard --own-only)
 set_tests_properties(startup_upload_arena_guard_own_only_control PROPERTIES SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "FAIL: ")
+
+# Record + replay page store (pure C++, no D3D): a range captured twice is rebuilt byte for byte; each mutant stream must fail.
+add_executable(startup_replay_pages tests/startup_replay_pages.cpp)
+target_compile_features(startup_replay_pages PRIVATE cxx_std_17)
+add_test(NAME startup_replay_pages COMMAND startup_replay_pages)
+set_tests_properties(startup_replay_pages PROPERTIES TIMEOUT 60)
+foreach(mutant drop-map drop-page corrupt)
+    add_test(NAME startup_replay_pages_mutant_${mutant} COMMAND startup_replay_pages ${mutant})
+    set_tests_properties(startup_replay_pages_mutant_${mutant} PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+endforeach()
+
 add_executable(startup_upload_page_reuse tests/startup_upload_page_reuse.cpp)
 target_compile_features(startup_upload_page_reuse PRIVATE cxx_std_17)
 target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
