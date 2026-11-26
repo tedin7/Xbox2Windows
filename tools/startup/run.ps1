@@ -95,6 +95,10 @@ if ($Translate -and $Render) {
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
         -RedirectStandardOutput (Join-Path $LogDir "translate.txt") -RedirectStandardError (Join-Path $LogDir "translate_err.txt")
+    # The translator and its process pool (every core but one) must never run above the title: lowered here, right after the
+    # start, the pool workers it creates later inherit BELOW_NORMAL.
+    try { $translator.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
+    catch { Write-Warning "could not lower the translator's priority: $($_.Exception.Message)" }
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }

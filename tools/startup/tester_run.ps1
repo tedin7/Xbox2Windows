@@ -157,11 +157,18 @@ $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
 if (-not $env:X2W_TRANSLATE_JOBS) { $env:X2W_TRANSLATE_JOBS = "$translateJobs" }
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
+# The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
+# gets its own priority back afterwards.
+$self = [System.Diagnostics.Process]::GetCurrentProcess()
+$ownPriority = $self.PriorityClass
 try {
+    try { $self.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { Write-Warning "could not lower the priority: $($_.Exception.Message)" }
     $seedLine = (Invoke-Native { & $python -B $pack seed-cache $cacheRoot $cache --jobs $translateJobs --json $seedFile } | Out-String).Trim()
     if (Test-Path -LiteralPath $seedFile) { $preTranslate = Get-Content -Raw -LiteralPath $seedFile | ConvertFrom-Json }
 } catch {
     $seedLine = "pre-translate: skipped ($($_.Exception.Message))"
+} finally {
+    try { $self.PriorityClass = $ownPriority } catch { }
 }
 Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue

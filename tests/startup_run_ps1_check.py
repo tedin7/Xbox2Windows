@@ -64,7 +64,21 @@ import sys
 import time
 from pathlib import Path
 
+# run.ps1 lowers the watcher to BELOW_NORMAL right after starting it; the pool workers it creates later inherit that.
+# The stub waits for it (as the real watcher does while it imports and scans) and records its class and its child's.
+import ctypes
+k32 = ctypes.windll.kernel32
+k32.GetCurrentProcess.restype = ctypes.c_void_p
+k32.GetPriorityClass.argtypes = [ctypes.c_void_p]
+k32.OpenProcess.restype = ctypes.c_void_p
+wait_until = time.monotonic() + 5
+while k32.GetPriorityClass(k32.GetCurrentProcess()) != 0x4000 and time.monotonic() < wait_until:
+    time.sleep(0.02)
 child = None if {early_exit} else subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+classes = [k32.GetPriorityClass(k32.GetCurrentProcess())]
+if child:
+    classes.append(k32.GetPriorityClass(k32.OpenProcess(0x1000, False, child.pid)))
+Path(__file__).with_name("priority.json").write_text(json.dumps(classes), encoding="utf-8")
 record = Path(__file__).with_name("watch.json")
 temp = record.with_suffix(".tmp")
 temp.write_text(json.dumps([os.getpid(), child.pid if child else None] + sys.argv[1:]), encoding="utf-8")
@@ -245,6 +259,11 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         if not started or started[2:] != ["--watch", str(root / "cache")]:
             found.append(f"-Translate: the translator received {started}, expected --watch {root / 'cache'}")
         else:
+            priority = startup / "priority.json"
+            classes = json.loads(priority.read_text(encoding="utf-8")) if priority.is_file() else None
+            want_classes = [0x4000] if started[1] is None else [0x4000, 0x4000]  # BELOW_NORMAL_PRIORITY_CLASS
+            if classes != want_classes:
+                found.append(f"-Translate: the translator and its child ran at priority classes {classes}, expected BELOW_NORMAL {want_classes}")
             for pid, what in ((started[0], "translator"), (started[1], "translator's child process")):
                 if pid is not None and alive(pid):
                     subprocess.run(["taskkill", "/T", "/PID", str(pid), "/F"], capture_output=True)
