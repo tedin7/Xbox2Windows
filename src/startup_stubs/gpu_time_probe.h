@@ -49,7 +49,7 @@ public:
         r.max_ms = max_ms_;
         r.busy_ms = busy_ms_;
         r.wall_ms = wall_ms;
-        r.idle_share = wall_ms > 0 ? std::clamp(1.0 - busy_ms_ / wall_ms, 0.0, 1.0) : 0;
+        r.idle_share = wall_ms > 0 ? (std::clamp)(1.0 - busy_ms_ / wall_ms, 0.0, 1.0) : 0;
         frames_ = 0;
         sum_ms_ = max_ms_ = busy_ms_ = 0;
         return r;
@@ -66,7 +66,7 @@ private:
     {
         ++frames_;
         sum_ms_ += b.ms;
-        max_ms_ = std::max(max_ms_, b.ms);
+        max_ms_ = (std::max)(max_ms_, b.ms);
         b = {};
     }
     Bucket buckets_[bucket_count]{};
