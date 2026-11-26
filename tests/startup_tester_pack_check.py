@@ -383,7 +383,83 @@ def check_seed_cache():
         assert json.loads((root / "seed.json").read_text())["seeded"] == 5
 
 
+def check_translator_stamp():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tools = tmp / "tools"
+        tools.mkdir()
+        (tools / "gfx2hlsl.py").write_text("import helper\nfrom deep import x\n")
+        (tools / "helper.py").write_text("VALUE = 1\n")
+        (tools / "deep.py").write_text("import leaf\nx = 1\n")
+        (tools / "leaf.py").write_text("y = 1\n")
+        (tools / "unrelated.py").write_text("z = 1\n")
+        cache = tmp / "cache"
+        translator = str(tools / "gfx2hlsl.py")
+        assert T.translator_stamp(str(cache), translator) == "new"
+        assert not cache.exists(), "reading the stamp creates nothing"
+        assert T.translator_stamp(str(cache), translator, write=True) == "new"
+        assert T.translator_stamp(str(cache), translator) == "same"
+        (tools / "unrelated.py").write_text("z = 2\n")
+        assert T.translator_stamp(str(cache), translator) == "same", "a module the translator does not import is not part of it"
+        for name in ("gfx2hlsl.py", "helper.py", "leaf.py"):  # the file, a direct import, an import of an import
+            old = (tools / name).read_text()
+            (tools / name).write_text(old + "# changed\n")
+            assert T.translator_stamp(str(cache), translator) == "changed", name
+            (tools / name).write_text(old)
+            assert T.translator_stamp(str(cache), translator) == "same", name
+        # The stamp file is not a request, a result or a key.
+        assert T.cache_stats(str(cache)) == (0, 0, 0) and T.cache_results(str(cache)) == []
+
+
+def check_skip_failed():
+    """The finish pass and the watcher's first pass must not translate a refused request again while the translator is the
+    one that refused it (X2W_SKIP_FAILED=1); without it every pass retries every refusal."""
+    import subprocess
+    import time
+    translator = str(Path(T.__file__).with_name("gfx2hlsl.py"))
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "cache"
+        cache.mkdir()
+        count = 60
+        for n in range(count):
+            for ext in ("a", "b", "root"):
+                write(cache, "req_%016x.%s" % (0x7000000000000000 + n, ext), ("garbage %d %s" % (n, ext)).encode())
+
+        def one_pass(skip):
+            env = dict(os.environ, X2W_TRANSLATE_JOBS="2")
+            env.pop("X2W_SKIP_FAILED", None)
+            if skip:
+                env["X2W_SKIP_FAILED"] = "1"
+            started = time.monotonic()
+            done = subprocess.run([sys.executable, "-B", translator, "--once", str(cache)], capture_output=True, text=True,
+                                  env=env, timeout=600)
+            assert done.returncode == 0, done.stderr[-400:]
+            return time.monotonic() - started, {n: (cache / n).stat().st_mtime_ns for n in os.listdir(cache) if n.endswith((".fail", ".txt"))}
+
+        first_s, first = one_pass(False)
+        assert len(first) == count, "every request answered (a refusal is an answer): %d" % len(first)
+        pending, requests = T.cache_stats(str(cache))[1] - T.cache_stats(str(cache))[0] - T.cache_stats(str(cache))[2], count
+        assert pending == 0, "refused requests are not pending (the 'pending' of the finish pass)"
+        time.sleep(0.05)
+        retry_s, retried = one_pass(False)
+        assert retried != first and all(retried[n] > first[n] for n in first), "without the switch every refusal is translated again"
+        time.sleep(0.05)
+        skip_s, skipped = one_pass(True)
+        assert skipped == retried, "with the switch no refusal is translated again"
+        print("fake cache, %d refused requests, 2 jobs: first pass %.1f s, pass retrying them %.1f s, pass skipping them %.1f s"
+              % (count, first_s, retry_s, skip_s))
+        # A request rewritten after its refusal is translated again even with the switch (a new request, not a retry).
+        time.sleep(0.05)
+        rewritten = "req_%016x.a" % 0x7000000000000000
+        write(cache, rewritten, b"another garbage")
+        _, after = one_pass(True)
+        changed = [n for n in after if after[n] != skipped.get(n)]
+        assert changed == ["%016x.fail" % 0x7000000000000000], changed
+
+
 if __name__ == "__main__":
+    check_translator_stamp()
+    check_skip_failed()
     check_seed_cache()
     check_cache_results()
     check_preset()

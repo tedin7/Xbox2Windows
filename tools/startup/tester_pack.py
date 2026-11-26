@@ -5,6 +5,7 @@
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
+  tester_pack.py translator-stamp <cache> <gfx2hlsl.py> [--write]  same / changed / new: did this translator write the cache's refusals?
   tester_pack.py seed-cache <cache root> <new cache> [--jobs N]  copy the old caches' requests under the new keys (pre-translation backlog)
   tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
   tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR]   write the zip, print its path and size
@@ -169,6 +170,45 @@ def cache_stats(cache_dir):
             elif os.path.isfile(os.path.join(cache_dir, match.group(1) + ".fail")):
                 failed += 1
     return ready, requests, failed
+
+
+STAMP_NAME = "translator_stamp.txt"
+IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+(\w+)", re.M)
+
+
+def translator_fingerprint(translator):
+    """Hash of gfx2hlsl.py and of the modules next to it that it imports (directly or through each other): the translator
+    code that decides whether a request is refused. The same fingerprint refuses the same request the same way."""
+    import hashlib
+    directory = os.path.dirname(os.path.abspath(translator))
+    todo, seen, digest = [os.path.abspath(translator)], set(), hashlib.sha256()
+    while todo:
+        path = todo.pop()
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        with open(path, "rb") as handle:
+            data = handle.read()
+        digest.update(os.path.basename(path).encode() + b"\0" + hashlib.sha256(data).digest())
+        for name in IMPORT_RE.findall(data.decode("utf-8", "replace")):
+            todo.append(os.path.join(directory, name + ".py"))
+    return digest.hexdigest()[:16]
+
+
+def translator_stamp(cache_dir, translator, write=False):
+    """`same` when the cache's stamp (written after a finished translation pass) equals this translator's fingerprint,
+    `changed` when it differs, `new` when the cache has none. `write` stores the fingerprint."""
+    path = os.path.join(cache_dir, STAMP_NAME)
+    now = translator_fingerprint(translator)
+    state = "new"
+    if os.path.isfile(path):
+        with open(path, "r", encoding="ascii", errors="replace") as handle:
+            state = "same" if handle.read().strip() == now else "changed"
+    if write:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write(now + "\n")
+    return state
 
 
 def request_count(cache_dir):
@@ -420,6 +460,10 @@ def main(argv):
     n.add_argument("translator")
     c = sub.add_parser("cache-stats")
     c.add_argument("cache")
+    t = sub.add_parser("translator-stamp")
+    t.add_argument("cache")
+    t.add_argument("translator")
+    t.add_argument("--write", action="store_true")
     s = sub.add_parser("seed-cache")
     s.add_argument("cache_root")
     s.add_argument("new_cache")
@@ -450,6 +494,9 @@ def main(argv):
         return 0
     if args.cmd == "cache-results":
         sys.stdout.write(format_results(cache_results(args.cache)))
+        return 0
+    if args.cmd == "translator-stamp":
+        print(translator_stamp(args.cache, args.translator, args.write))
         return 0
     if args.cmd == "seed-cache":
         result = seed_cache(args.cache_root, args.new_cache, args.jobs)

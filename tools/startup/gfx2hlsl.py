@@ -11485,15 +11485,22 @@ def main():
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
         # The first pass retries earlier failures once (the runtime never rewrites a request, so a
         # translator fix would otherwise not reach them); later passes skip failures already written.
-        skip_failed = False
+        # X2W_SKIP_FAILED=1 (tester_run.ps1: the translator is the one that wrote those failures) skips them in the first pass too.
+        skip_failed = skip_failed_requested()
         started = time.time()  # requests published after this are the running title's: they go first
         while True:
             if watch_pass(out_dir, skip_failed, started):
                 skip_failed = True
             time.sleep(interval)
-    translate_pending(out_dir)
+    translate_pending(out_dir, skip_failed=skip_failed_requested())
 
 
+
+
+def skip_failed_requested():
+    """X2W_SKIP_FAILED=1: a request that already has a .fail newer than its files is not translated again (it refuses the
+    same way with the same translator). Off by default: a pass then retries every failure."""
+    return os.environ.get("X2W_SKIP_FAILED") == "1"
 
 
 def watch_pass(out_dir, skip_failed, since=None):

@@ -174,6 +174,18 @@ try {
 }
 Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
+# A request the translator refused is refused again by the same translator. The cache's stamp names the translator (gfx2hlsl.py
+# and the modules it imports) behind its refusals; while it is unchanged the watcher's first pass and the finish pass skip
+# every request that already has a refusal (X2W_SKIP_FAILED=1). A changed or missing stamp retries them once.
+$translatorPath = Join-Path $PSScriptRoot "gfx2hlsl.py"
+$translatorState = (Invoke-Native { & $python -B $pack translator-stamp $cache $translatorPath } | Out-String).Trim()
+if ($translatorState -eq "same") {
+    $env:X2W_SKIP_FAILED = "1"
+    Write-Host "tester_run: translator unchanged since the last finished pass: requests it already refused are not translated again"
+} else {
+    Remove-Item Env:X2W_SKIP_FAILED -ErrorAction SilentlyContinue
+    Write-Host "tester_run: translator $translatorState since the last finished pass: requests it refused are retried once"
+}
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
@@ -251,23 +263,32 @@ Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
 if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send all of them." }
 
 # F1: the report is packed, now finish what the run left. One translator pass over the cache (no --watch) until nothing is
-# pending or -FinishTranslateSeconds is over, so the next run starts with every request already translated.
+# pending or -FinishTranslateSeconds is over, so the next run starts with every request already translated. Pending means no
+# result at all: a refusal is a result, and while the translator is unchanged (X2W_SKIP_FAILED=1, set above) the pass does not
+# translate refused requests again. Without anything pending and with the same translator there is no pass at all.
 if ($FinishTranslateSeconds -gt 0) {
     $before = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0])
-    $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
-    $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
-    Write-Host ("tester_run: finishing the translation: {0} request(s) pending, one pass, at most {1} s (the report above is already packed; do not close this window)" -f $pendingBefore, $FinishTranslateSeconds)
-    $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
-    $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
-        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
-    $null = $translator.Handle    # keeps the exit code readable after the process ends
-    $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
-    if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
-    $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0])
-    $note = if ($capped) { ", stopped at the cap" } elseif ($translator.ExitCode -ne 0) { ", translator exit code $($translator.ExitCode) (see $finishErr)" } else { "" }
-    Write-Host ("tester_run: finish translation done in {0:N0} s: pending before {1}, after {2}; ok {3}, refused {4} in total ({5} new){6}" -f `
-        $finishClock.Elapsed.TotalSeconds, $pendingBefore, $pendingAfter, [int]$after[0], [int]$after[2], ([int]$after[2] - [int]$before[2]), $note)
+    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0] - [int]$before[2])
+    if ($pendingBefore -eq 0 -and $translatorState -eq "same") {
+        Write-Host ("tester_run: finish translation skipped: nothing is pending ({0} refused, the translator is unchanged)" -f [int]$before[2])
+    } else {
+        $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
+        $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
+        $retry = if ($translatorState -eq "same") { "refused requests are not translated again" } else { "{0} refused request(s) are retried: the translator changed" -f [int]$before[2] }
+        Write-Host ("tester_run: finishing the translation: {0} request(s) pending, {1}; one pass, at most {2} s (the report above is already packed; do not close this window)" -f $pendingBefore, $retry, $FinishTranslateSeconds)
+        $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
+        $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
+            -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
+        $null = $translator.Handle    # keeps the exit code readable after the process ends
+        $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
+        if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
+        $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+        $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0] - [int]$after[2])
+        $note = if ($capped) { ", stopped at the cap" } elseif ($translator.ExitCode -ne 0) { ", translator exit code $($translator.ExitCode) (see $finishErr)" } else { "" }
+        Write-Host ("tester_run: finish translation done in {0:N0} s: pending before {1}, after {2}; ok {3}, refused {4} in total ({5} new){6}" -f `
+            $finishClock.Elapsed.TotalSeconds, $pendingBefore, $pendingAfter, [int]$after[0], [int]$after[2], ([int]$after[2] - [int]$before[2]), $note)
+        # A finished pass: every refusal in the cache now comes from this translator.
+        if (-not $capped -and $translator.ExitCode -eq 0) { $null = Invoke-Native { & $python -B $pack translator-stamp $cache $translatorPath --write } }
+    }
 }
 exit $exitCode
