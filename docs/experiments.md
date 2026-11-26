@@ -10341,6 +10341,25 @@ only for the mixed wave, reuses that word across its lanes, then rasterizes
 the triangles. Swapping the two waves' red values in the reference must
 change every covered pixel.
 
+#### Forward branches in the slot 57 wave-load block
+
+The forward-branch fixtures add a nested `s_cbranch_execz` after a saved EXEC
+mask and a forward `s_cbranch_vccz` or `s_cbranch_vccnz` after a compare and a
+no-op. Lane-only bodies use the per-lane EXEC bit. When the nested body
+contains a VCC branch, both tests use guest wave64 votes. A path that can
+bypass the defining compare or a backward branch in the wave-load block
+still causes a refusal.
+
+The adjacent-compare VCCNZ path retains its historical zero-test output for
+byte compatibility. Newly accepted VCCNZ branches use a nonzero test.
+
+The WARP test runs each VCC polarity with the vote inside and after nested
+EXEC, with one matching lane and with zero matching lanes. It compares the
+1,024 render-target pixels with a CPU rasterizer. For each draw, the readback
+must also reject an image with the nested green write omitted and an image
+with the VCC-controlled red selection inverted.
+Run `ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton_forward_wave_warp$' -V`.
+
 The `startup_mesh57_formatted_load_{warp,hardware}` tests use one
 `buffer_load_format_x` to set vertex red. The fixture supplies descriptor word 3
 in the constant slot published as `descword3` for SRV 0. It draws the same mesh

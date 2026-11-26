@@ -4,6 +4,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py wave_collectives <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py forward_wave <dxc> <offscreen_check> warp
        startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
@@ -364,6 +365,36 @@ INNER_VCC_ASM = NEST_SCC_ASM.replace('s_cmp_eq_u32 s43, 0\ns_cbranch_scc1 1',
                                      'v_cmp_gt_u32_e32 vcc, s43, v0\ns_cbranch_vccz 1')
 INNER_VCC_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf860001 bea8032b 7e0e02f2')
 
+# Only thread 5 passes the nested EXEC test. After restoring EXEC, the loaded
+# word names the thread that can set VCC. The branch controls red for the wave.
+FORWARD_WAVE_ASM = """s_buffer_load_dword s43, s[16:19], s41 offset:0x1e0
+s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32_e32 vcc, 5, v0
+s_and_saveexec_b64 s[46:47], vcc
+s_nop 0
+s_cbranch_execz 1
+v_mov_b32 v7, 1.0
+s_or_b64 exec, exec, s[46:47]
+v_cmp_eq_u32_e32 vcc, s43, v0
+s_nop 0
+s_cbranch_vccz 1
+s_mov_b32 s40, 1.0"""
+FORWARD_WAVE_BODY = ('f4200ac8 520001e0 bf8cc07f 7d840085 beae246a bf800000 bf880001 '
+                     '7e0e02f2 88fe2e7e 7d84002b bf800000 bf860001 bea803f2')
+
+
+def forward_wave_cases():
+    for mnemonic, opcode, nonzero in (('vccz', 'bf860001', False), ('vccnz', 'bf870001', True)):
+        asm = FORWARD_WAVE_ASM.replace('s_cbranch_vccz', 's_cbranch_' + mnemonic)
+        words = FORWARD_WAVE_BODY.replace('bf860001', opcode)
+        yield mnemonic, asm, words, nonzero, False
+        # Put the vote inside nested EXEC. Its join is now the restore, and
+        # the loaded word must name thread 5, the only lane still in EXEC.
+        restore = 's_or_b64 exec, exec, s[46:47]'
+        asm = asm.replace(restore + '\n', '').replace('s_cbranch_execz 1', 's_cbranch_execz 5') + '\n' + restore
+        words = words.replace('88fe2e7e ', '').replace('bf880001', 'bf880005') + ' 88fe2e7e'
+        yield mnemonic, asm, words, nonzero, True
+
 # The second bound alone would let wave 1 load from beyond the SRV. Keep the
 # earlier EXEC narrowing to threads 0..2 when applying this bound.
 NO_RESET_ASM = WAVE_LOAD_ASM.replace('s_mov_b32 s42, 6', 's_mov_b32 s42, 0x46').replace(
@@ -665,6 +696,23 @@ def depth_only_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
+        for mnemonic, _, words, nonzero, nested_vote in forward_wave_cases():
+            key, result = request(tmp, wave_load_mesh(body=words))
+            expect('forward EXEC and ' + mnemonic, result, 'ok')
+            if result == 'ok':
+                source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+                expect(mnemonic + ' vote polarity', re.findall(r'mesh_vote ([!=]=) 0u', source),
+                       ['=='] * nested_vote + ['!=' if nonzero else '=='])
+                expect(mnemonic + ' nested lane branch', source.count('pc = ((exec & 1) == 0) ?'), int(not nested_vote))
+                expect(mnemonic + ' guest wave votes', len(re.findall(r'uint mesh_vote_\d+ =', source)), 1 + nested_vote)
+        for what, body, refusal in (
+            ('backward nested EXEC', FORWARD_WAVE_BODY.replace('bf880001', 'bf88fffe'),
+             'slot 57 mesh: a loop outside the group-memory exchanges is not covered'),
+            ('intervening VCC write', FORWARD_WAVE_BODY.replace('7d84002b bf800000', '7d84002b beea0380'),
+             's_cbranch_vccz forward in the block'),
+        ):
+            expect(what, refusal in request(tmp, wave_load_mesh(body=body))[1], True)
+    with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
         names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
@@ -810,6 +858,8 @@ def assemble(mc, text):
 
 def binary(mc):
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
+    for mnemonic, asm, words, _, _ in forward_wave_cases():
+        expect('forward ' + mnemonic + ' words match llvm-mc', assemble(mc, asm), words.split())
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
            FORMATTED_MESH)
@@ -897,7 +947,7 @@ def rasterise(points, colours, indices, verts, prims):
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
-                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6):
+                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6, controls=()):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -931,13 +981,15 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     expect('only the mixed wave reads; the empty wave address is past the SRV',
            (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: rule(word), 64: 64}))
 
-    def reference(swap):
+    def reference(swap=False, red_override=None, green_at=green):
         rendered = list(colours)
         for tri in triangles:
             for tid in tri:
                 first, slot = tid & ~63, tid & 15
                 red = wave_red[first ^ (64 if swap else 0)]
-                rendered[slot] = (red, green(tid), *colours[slot][2:])
+                if red_override is not None and first == 0:
+                    red = red_override
+                rendered[slot] = (red, green_at(tid), *colours[slot][2:])
         return rasterise(points, rendered, triangles, 128, len(triangles))
 
     correct, swapped = reference(False), reference(True)
@@ -951,6 +1003,11 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     cases = [(label, shader, correct, 0, 0)]
     if different:
         cases.append(('swapped %s selection' % label, shader, swapped, 1, different))
+    for what, red, alternate_green in controls:
+        wrong = reference(red_override=red, green_at=alternate_green or green)
+        mismatches = sum(a != b for a, b in zip(correct, wrong))
+        expect(what + ' changes covered pixels', mismatches > 0, True)
+        cases.append((what + ' ' + label, shader, wrong, 1, mismatches))
     if dxc:
         # Lanes outside EXEC in the mixed wave keep the old red when the block is skipped per lane.
         source = base.with_suffix('.ms57.hlsl').read_text()
@@ -1027,6 +1084,29 @@ def draw_wave_collectives(dxc, renderer, adapter):
             status = draw_wave_load(tmp, renderer, adapter, mesh, label, **options)
             if status:
                 return status
+    return 0
+
+
+def draw_forward_wave(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    green = lambda tid: 255 if tid == 5 else 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for mnemonic, _, words, nonzero, nested_vote in forward_wave_cases():
+            for matching_thread in (True, False):
+                # The loaded float is interpreted as the unsigned thread ID.
+                match = struct.unpack('<f', struct.pack('<I', 5 if nested_vote else 0))[0]
+                taken = matching_thread == nonzero
+                red = 64 if taken else 255
+                label = '%s %s, vote %s nested EXEC' % (mnemonic, 'taken' if taken else 'fall-through',
+                                                       'inside' if nested_vote else 'after')
+                status = draw_wave_load(
+                    tmp, renderer, adapter, wave_load_mesh(body=words), label,
+                    word=match if matching_thread else 1.0, rule=lambda _: red, green=green,
+                    controls=(('skipped nested EXEC body', None, lambda _: 0),
+                              ('inverted VCC branch', 255 if taken else 64, None)))
+                if status:
+                    return status
     return 0
 
 
@@ -1429,6 +1509,8 @@ def main(argv):
         status = draw(*argv[2:])
     elif argv[1:2] == ['wave_collectives'] and len(argv) == 5:
         status = draw_wave_collectives(*argv[2:])
+    elif argv[1:2] == ['forward_wave'] and len(argv) == 5:
+        status = draw_forward_wave(*argv[2:])
     elif argv[1:2] == ['depth'] and len(argv) == 5:
         status = draw_depth(*argv[2:])
     elif argv[1:2] == ['killexit'] and len(argv) == 5:

@@ -1971,10 +1971,24 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
         _, must, may = scalar_effects(name, asm)
         return not any(live_at_join(reg, join) for reg in must | may)
 
-    inner_vcc = set()
+    inner_vcc = {}
+    inner_exec_votes = set()
     load_branches = {}
+    loop_latches = {latch for latch, _ in constant_trips.values()}
+
+    def previous_effect(i, start):
+        while i > start and no_effect(i):
+            i -= 1
+        return i
+
+    def fresh_vcc(first, last):
+        return (re.fullmatch(r'v_cmp_\w+_e(?:32|64) vcc(?:_lo)?, .+', ins[first][3])
+                and not targets.intersection(range(first + 1, last + 1)))
+
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
+            if source in inner_exec_votes:
+                continue
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
             if (source == first_post_count_branch and source >= b_end + 2 and target == source + 2
                     and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
@@ -1983,6 +1997,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
             if a_end <= source < target < count_at:
                 loads = [i for i in range(source + 1, target) if ins[i][2] in MESH_WAVE_BLOCK_LOADS]
                 if loads:
+                    if any(source < latch < target for latch in loop_latches):
+                        raise Unsupported(MESH_LOOP_REFUSAL)
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
@@ -1990,34 +2006,59 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                     vector_limit = re.fullmatch(r'v_cmpx_lt_u32_e32 v(\d+), v\d+', ins[compare][3])
                     # Inner forward scalar branches of the block (decided by SCC) stay inside it: the translation takes them
                     # per lane, which is the wave's decision when the SCC is wave-uniform (the emitter checks that).
-                    vcc_edges = {
-                        i for i in range(source + 2, target)
-                        if ins[i][2] in MESH_VCC_BRANCHES and i < edges[i] <= target and i not in targets
-                        and re.fullmatch(r'v_cmp_\w+_e(?:32|64) vcc(?:_lo)?, .+', ins[i - 1][3])
-                    }
+                    vcc_edges = {}
+                    for i in range(source + 2, target):
+                        if ins[i][2] not in MESH_VCC_BRANCHES or not i < edges[i] <= target:
+                            continue
+                        compare_vcc = i - 1
+                        while compare_vcc > source + 1:
+                            name, asm = ins[compare_vcc][2:]
+                            if (compare_vcc in edges or writes_exec(name, parse(asm)[1])
+                                    or scalar_effects(name, asm)[2] & VCC_KEYS):
+                                break
+                            compare_vcc -= 1
+                        if fresh_vcc(compare_vcc, i):
+                            # Previously accepted adjacent compares keep their
+                            # original emitted predicate, including for VCCNZ.
+                            vcc_edges[i] = compare_vcc == i - 1 or ins[i][2] == 's_cbranch_vccz'
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
-                    # A nested if of the block: s_and_saveexec_b64 sK:sK+1, vcc / s_cbranch_execz over a body / the restore
-                    # s_or_b64 exec, exec, sK:sK+1. Every thread holds its own EXEC bit and the saved mask is one bit per
-                    # thread, so narrowing and restoring is per lane in the one-lane model; the per-lane skip of the
-                    # branch is the generic execz rule, checked on its own edge below. The save, the branch and the
-                    # restore are not scalar instructions the wave block would run once per wave.
+                    # A nested if may narrow EXEC with saveexec and rejoin at
+                    # its matching restore. Narrowing and restoring act on
+                    # each lane's bit. The generic execz rule below checks
+                    # bodies that skip per lane.
                     nested = set()
-                    for i in range(source + 2, target):
-                        if ins[i][2] != 's_cbranch_execz' or i not in edges or not i < edges[i] < target:
+                    for i in range(source + 1, target):
+                        if ins[i][2] != 's_cbranch_execz' or not i < edges[i] <= target:
                             continue
-                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[i - 1][3])
-                        done = ins[edges[i]][3]
-                        if (not save or int(save[2]) != int(save[1]) + 1 or done != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
-                                or not ins[i - 2][2].startswith('v_cmp_')
-                                or any(writes_exec(ins[k][2], parse(ins[k][3])[1]) or re.search(r'\bs\[?%s\b|\bs%s\b' % (save[1], save[2]), ins[k][3])
-                                       for k in range(i + 1, edges[i]))
-                                or any(live_at_join(reg, edges[i] + 1) for reg in ('s' + save[1], 's' + save[2]))):
+                        join = edges[i]
+                        if all((no_effect(k) or lane_only(k)) and not writes_exec(ins[k][2], parse(ins[k][3])[1])
+                               for k in range(i + 1, join)):
+                            inner.append(i)
+                        if join == target:
                             continue
-                        nested |= {i - 1, i, edges[i]}
-                        nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
-                    inner += sorted(vcc_edges | {i for i in nested if ins[i][2] == 's_cbranch_execz'})
+                        save_at = previous_effect(i - 1, source + 1)
+                        cmp_at = previous_effect(save_at - 1, source)
+                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[save_at][3])
+                        if (not save or int(save[2]) != int(save[1]) + 1
+                                or ins[join][3] != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
+                                or not fresh_vcc(cmp_at, i)):
+                            continue
+                        saved = set(map(int, save.groups()))
+                        if (any(writes_exec(ins[k][2], parse(ins[k][3])[1])
+                                or scalar_registers(ins[k][3]) & saved for k in range(i + 1, join))
+                                or any(live_at_join('s%d' % reg, join + 1) for reg in saved)
+                                or any((save_at < d <= join and not save_at < s < join)
+                                       or (save_at < s < join and d > join) for s, d in edges.items())):
+                            continue
+                        nested |= {save_at, i, join}
+                        nested_saves[save_at], nested_restores[join] = join, save_at
+                        # A nested VCC vote must see all lanes of each guest wave
+                        # that reaches it, including those outside nested EXEC.
+                        if any(i < k < join for k in vcc_edges):
+                            inner_exec_votes.add(i)
+                    inner += sorted(set(vcc_edges) | {i for i in nested if ins[i][2] == 's_cbranch_execz'})
                     scalar = [i for i in range(source + 1, target)
                               if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
@@ -2184,7 +2225,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
             if index in inner_vcc:
-                wave_votes[off] = ('vcc', name.endswith('z'))
+                wave_votes[off] = ('vcc', inner_vcc[index])
+            elif index in inner_exec_votes:
+                wave_votes[off] = ('exec', True)
             elif name in MESH_VCC_BRANCHES:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)

@@ -98,6 +98,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | [Publish RGBA8 textures from completed archive records](docs/experiments.md#publishing-a-texture-from-each-complete-archive-record) | `ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V` |
 | [Draw each archive record through D3D12](docs/experiments.md#drawing-each-archive-record-through-d3d12) | `ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_warp$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
+| [Forward EXEC and VCC branches in a mesh wave-load block](docs/experiments.md#forward-branches-in-the-slot-57-wave-load-block) | `ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton_forward_wave_warp$' -V` |
 | [Cached indirect mesh with a depth-only pixel stage](docs/experiments.md#gpu-written-indirect-mesh-dispatch-arguments) | `ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V` |
 | [Cached mesh draw with two queue writers](docs/experiments.md#cached-mesh-draw-with-two-queue-writers) | `ctest --preset release --no-tests=error -R '^startup_indirect_mesh_lease_(warp\|hardware)_dual' -V` |
 | [Amplification plus mesh pipeline on WARP](docs/experiments.md#amplification-and-mesh-pipeline-forms) | `ctest --preset dev --no-tests=error -R '^mesh_amplified_draw_warp$' -V` |
