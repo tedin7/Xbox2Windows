@@ -18,8 +18,8 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
 
--LazyTextures (default $true, for now) sets X2W_D3D12_LAZY_TEXTURES=1: read-only slot 133 textures are created on first
-use, which keeps video memory from running out. Pass -LazyTextures $false to turn it off. The manifest records it.
+Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
+keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
 -Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
 time counts from that poll, which the title reaches late). Any other value is a raw
@@ -40,7 +40,7 @@ param(
     [int]$LimitMB = 20,
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
-    [bool]$LazyTextures = $true                 # X2W_D3D12_LAZY_TEXTURES=1 (PR #2773): defer read-only slot 133 textures; -LazyTextures $false turns it off
+    [switch]$NoLazyTextures                     # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -103,6 +103,7 @@ $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
 $env:X2W_D3D12_BUDGET = "1"
+$LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir

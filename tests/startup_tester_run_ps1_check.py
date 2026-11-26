@@ -150,8 +150,8 @@ def check_shell(shell):
         assert deep_args["TraceCalls"] and deep_args["TraceApi"] and deep_args["InputScript"] == "4@60,1@70", deep_args
         assert deep_manifest["deep"] is True and deep_args["CaptureEvery"] == 0, deep_manifest
 
-        # -LazyTextures $false leaves the variable unset and the manifest says so.
-        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-LazyTextures", "0")
+        # -NoLazyTextures leaves the variable unset and the manifest says so.
+        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoLazyTextures")
         assert plain.returncode == 0, (plain.stdout, plain.stderr)
         newest_plain = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_plain) as z:
