@@ -11624,3 +11624,10 @@ foreach(i RANGE 0 ${X2W_SLOW_TEST_COSTS_LAST} 2)
         set_tests_properties(${slow_name} PROPERTIES COST ${slow_cost})
     endif()
 endforeach()
+
+# GPU time probe (src/startup_stubs/gpu_time_probe.h): per-frame arithmetic, and the timestamp stamps on WARP.
+add_executable(gpu_time_probe_check tests/gpu_time_probe_check.cpp)
+target_include_directories(gpu_time_probe_check PRIVATE src)
+target_compile_features(gpu_time_probe_check PRIVATE cxx_std_17)
+target_link_libraries(gpu_time_probe_check PRIVATE d3d12 dxgi)
+add_test(NAME gpu_time_probe COMMAND gpu_time_probe_check)

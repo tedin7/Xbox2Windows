@@ -47,6 +47,7 @@
 #include "startup_stubs/linear_buffer_backing.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
+#include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -1514,6 +1515,18 @@ x2w_startup::DrawReadbacks& draw_dumps()
 }
 
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
+// X2W_GPU_TIME=1: GPU time per frame of the title's direct queue (gpu_time_probe.h). Frame = the present count.
+LONG gpu_time_frame;
+x2w_gpu_time::Probe& gpu_time_probe()
+{
+    static x2w_gpu_time::Probe probe;
+    return probe;
+}
+bool gpu_time_on()
+{
+    static const bool on = x2w_local::env_on("X2W_GPU_TIME");
+    return on;
+}
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
 
@@ -4204,6 +4217,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
+            const int gpu_slot = gpu_time_on() ? gpu_time_probe().before(queue, static_cast<std::uint64_t>(gpu_time_frame)) : -1;
             red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
                     const HRESULT hr = draw_dumps().execute(queue, ready_count, native_lists.data());
@@ -4212,6 +4226,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
@@ -7105,6 +7120,21 @@ void draw_overlay(LONG frame, double seconds)
     ReleaseDC(window, dc);
 }
 
+// Every 300 frames: GPU ms per frame (average and worst) and the share of the wall time the queue sat idle.
+// The probe's submit side runs under draw_lock, so the read takes it too.
+void log_gpu_time(LONG frame, ULONGLONG now_ms)
+{
+    static ULONGLONG last_ms;
+    AcquireSRWLockExclusive(&draw_lock);
+    auto& probe = gpu_time_probe();
+    probe.harvest(static_cast<std::uint64_t>(frame));
+    const auto r = probe.stats.take(last_ms ? static_cast<double>(now_ms - last_ms) : 0);
+    const unsigned skipped = probe.skipped, failed = probe.failed;
+    ReleaseSRWLockExclusive(&draw_lock);
+    last_ms = now_ms;
+    log("x2w-gpu-time frame %ld: %llu frames, avg %.2f ms, max %.2f ms, busy %.0f ms of %.0f ms, GPU idle %.0f%% (stamps skipped %u, failed %u)", frame,
+        static_cast<unsigned long long>(r.frames), r.avg_ms, r.max_ms, r.busy_ms, r.wall_ms, r.idle_share * 100.0, skipped, failed);
+}
 #include "startup_stubs/d3d12_present.inl"
 
 // Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
@@ -7330,6 +7360,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
+    gpu_time_frame = frame;
     frame_number = frame;
     draw_dump_flush();
     red_producers().flush();
@@ -7418,6 +7449,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
