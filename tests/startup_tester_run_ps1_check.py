@@ -180,9 +180,10 @@ def check_shell(shell):
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
         assert manifest["gpu_time"] is True and manifest["env"].get("X2W_GPU_TIME") == "1", manifest  # GPU time per frame on
         assert manifest["hdd_mode"] is True and manifest["env"].get("X2W_STORAGE_HDD") == "1", manifest  # HDD mode on by default
-        # The default menus script: clock-free privacy passes (up x3, one box, down to Conferma, A), see tester_pack.privacy_cycles.
-        assert args["InputScript"].startswith("40@5+1.2,40@7+1.2,40@9+1.2,80@11+1.2,80@13+1.2,4@15+1.2"), args["InputScript"]
         assert manifest["cache_repaired"] == -1, manifest  # no repair tool in the scratch tree: skipped with a warning, the run goes on
+        # The default menus script: clock-free privacy passes, a press every second held 0.8 s (tester_pack.privacy_cycles)
+        assert args["InputScript"].startswith("40@5+0.8,40@6+0.8,4@7+0.8,80@8+0.8,4@9+0.8,80@10+0.8,4@11+0.8"), args["InputScript"]
+        assert manifest["input_labels"][2] == "privacy pass 1: tick box 1" and len(manifest["input_labels"]) == len(args["InputScript"].split(",")), manifest["input_labels"][:3]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)

@@ -34,6 +34,7 @@ param(
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [int]$TraceFiles = 1,                      # 1 = the debugger lists every file open in files.txt (--trace-files 1; slow on a hard disk), 0 = only denied/redirected ones
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [double]$CaptureMenuEvery = 0,             # --capture-menu-every: pictures this often until the first loading-like picture (0 = off), then every -CaptureEvery
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
     [int]$CommitHeadroomMiB = 0,               # --commit-headroom-mib: end the run cleanly when the system commit has less than this free (0 = off)
     [int]$CommitWarnMiB = 0,                   # --commit-warn-mib: log a warning when the system commit has less than this free (0 = off)
@@ -125,6 +126,7 @@ $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
+if ($CaptureEvery -ne 0 -and $CaptureMenuEvery -ne 0) { $captureArgs += @("--capture-menu-every", "$CaptureMenuEvery") }
 if ($CommitHeadroomMiB -gt 0) { $captureArgs += @("--commit-headroom-mib", "$CommitHeadroomMiB") }
 if ($CommitWarnMiB -gt 0) { $captureArgs += @("--commit-warn-mib", "$CommitWarnMiB") }
 try {
