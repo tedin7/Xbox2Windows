@@ -66,6 +66,12 @@ def fnv(blob): return 0
 key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
+# --retry-lifted <cache> <s> --jobs N: count the .fail files and print the line gfx2hlsl.py prints, record the arguments
+if len(sys.argv) > 2 and sys.argv[1] == '--retry-lifted':
+    fails = [n for n in os.listdir(sys.argv[2]) if n.endswith('.fail')]
+    open(os.path.join(sys.argv[2], 'retry_args.txt'), 'w').write(' '.join(sys.argv[3:]))
+    print('pre-run retry: %%d keys (%%d in lifted families), ok 0, still refused %%d, 0 s' %% (len(fails), len(fails), len(fails)))
+    sys.exit(0)
 # one pass (argv: --once <cache>): publish a ready marker for every request that has none; STUB_HANG never ends (the cap)
 if len(sys.argv) > 2 and sys.argv[1] == '--once':
     if os.environ.get('STUB_HANG'):
@@ -368,15 +374,27 @@ def check_shell(shell):
         assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
         # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
         (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
+        # A cache that holds requests AND an old refusal (Run R: the re-keying said 'the new cache already holds
+        # requests' and nothing retried the stale MRTZ .fail): the pre-run retry runs, on 4 workers, before the title.
+        (fresh_cache / "req_dddddddddddddddd.a").write_bytes(b"x")
+        (fresh_cache / "dddddddddddddddd.fail").write_text("unsupported: MRTZ requires one uncompressed depth export\n")
         capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
                             extra_env={"STUB_HANG": "1"})
         assert capped.returncode == 0, (capped.stdout, capped.stderr)
         assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
+        assert "tester_run: pre-run retry: 1 keys (1 in lifted families)" in capped.stdout, capped.stdout
+        assert (fresh_cache / "retry_args.txt").read_text().split() == ["180", "--jobs", "4"], "pre-run retry arguments"
+        assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
-        assert list((tree / "out" / "tester").glob("report_*.zip"))
+        newest = max((tree / "out" / "tester").glob("report_*.zip"), key=lambda p: p.stat().st_mtime)
+        with zipfile.ZipFile(newest) as z:
+            retried = json.loads(z.read("manifest.json").decode("utf-8-sig"))["pre_run_retry"]
+        assert retried.startswith("pre-run retry: 1 keys (1 in lifted families)"), retried
+        (fresh_cache / "dddddddddddddddd.fail").unlink()
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
+        assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
