@@ -14819,6 +14819,29 @@ pixel translator with either a declared wave32 or wave64 layout. The
 lane-local byte-selection instruction `v_perm_b32` retains its ordinary
 VALU classification. [AMD RDNA 2 ISA, §12.12](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+## Compute cross-lane exchanges
+
+The compute translator uses the logical guest wave to index group-shared
+memory for low-word lane-mask scans, vector-source lane reads and paired-row
+permutations. Each exchange requires a known wave size, a whole number of
+waves, straight-line group flow and enough shared memory. A write-lane in a
+forward EXEC-zero block can use a regular vector assignment when the entry
+thread-X comparison proves singleton EXEC on the selected lane.
+
+The source-built checks exercise two wave32 waves per group. The Windows
+test runs the shaders and their mutants on WARP and compares all outputs
+against CPU references. The mutant must fail at the predicted first word.
+
+```sh
+python -B tests/startup_gfx2hlsl_s_ff1_check.py
+python -B tests/startup_uniform_lane_check.py
+python -B tests/startup_gfx2hlsl_permlane16_cs_check.py
+```
+
+The commands above passed on Linux. A comparison against the parent revision
+also found byte-identical HLSL across 33 previously accepted compute fixtures.
+WARP readback for this change is pending.
+
 ## gfx1013 VOP1 rounding, frexp and operand-free opcodes
 
 `tools/disasm_rdna2.py` named only part of the VOP1 table; eleven opcodes in two contiguous gaps printed as `v_vop1_NN`

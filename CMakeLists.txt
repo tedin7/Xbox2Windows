@@ -3573,6 +3573,22 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(runtime_startup_live_view_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    foreach(case IN ITEMS s_ff1 uniform_lane permlanex16)
+        if(case STREQUAL "s_ff1")
+            set(cross_lane_script startup_gfx2hlsl_s_ff1_check.py)
+            set(cross_lane_mode dispatch-mask)
+        elseif(case STREQUAL "uniform_lane")
+            set(cross_lane_script startup_uniform_lane_check.py)
+            set(cross_lane_mode dispatch)
+        else()
+            set(cross_lane_script startup_gfx2hlsl_permlane16_cs_check.py)
+            set(cross_lane_mode dispatch-row-exchange)
+        endif()
+        add_test(NAME startup_compute_cross_lane_${case}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/${cross_lane_script}" ${cross_lane_mode} "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" warp)
+        set_tests_properties(startup_compute_cross_lane_${case}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # NGG primitive-shader cases (#1723): identity triangle against single-change contrasts, reference model.
     add_test(NAME startup_ngg_slice COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_ngg_slice_check.py")

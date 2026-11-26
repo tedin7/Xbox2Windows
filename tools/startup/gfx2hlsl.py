@@ -2993,6 +2993,7 @@ class Stage:
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
             self.record_scalar_uniformity(n, uniform)
+        getattr(self, 'exchange_uniform_s', set()).discard(n)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'mask_high', set()).discard(n)
         getattr(self, 'float_const_s', {}).pop(n, None)
@@ -3060,6 +3061,39 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_own_lane_write(self, branch, at, into):
+        """A singleton EXEC selected by the unchanged entry X coordinate names its own lane.
+
+        WRITELANE ignores EXEC. The narrowing compare must select only the lane
+        the write addresses, and an empty wave must skip the write altogether.
+        """
+        if branch == 0 or any(i in into for i in range(at + 1)):
+            return False
+        _, test, test_mods = parse(self.ins[branch - 1][3])
+        _, write, write_mods = parse(self.ins[at][3])
+        if (self.ins[branch - 1][2] not in ('v_cmpx_eq_u32', 'v_cmpx_eq_u32_e32') or test_mods or
+                len(test) != 2 or test[1] != 'v0' or write_mods or len(write) != 3):
+            return False
+        try:
+            thread, lane = int(test[0], 0), int(write[2], 0)
+            wave, _ = self.compute_wave_layout('v_writelane_b32')
+        except (ValueError, Unsupported):
+            return False
+        x, _, _ = self.pipe.group
+        if x % wave or not 0 <= thread < x or not 0 <= lane < wave or thread % wave != lane:
+            return False
+        for index, (_, _, name, asm) in enumerate(self.ins[:at]):
+            base, ops, _ = parse(asm)
+            if name.startswith(('s_setpc', 's_swappc', 's_endpgm', 'v_movrel', 'v_swap')):
+                return False
+            if index != branch - 1 and writes_exec(name, ops):
+                return False
+            for token in destinations(base, ops):
+                reg = reg_range(token)
+                if reg and reg[0] == 'v' and reg[1] == 0:
+                    return False
+        return True
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3125,6 +3159,7 @@ class Stage:
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
         refused, into = {}, {}
+        self.execz_lane_writes = set()
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
@@ -3171,7 +3206,10 @@ class Stage:
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
                 reason = None
-                if inner.startswith(EXECZ_REFUSED):
+                if (inner in ('v_writelane_b32', 'v_writelane_b32_e64') and not entered
+                        and self.execz_own_lane_write(b, i, into)):
+                    self.execz_lane_writes.add(at)
+                elif inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
                         b < (exit_index := index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1)) <= t):
@@ -3874,6 +3912,7 @@ class Stage:
             self.uniform_v = set()
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
             self.varying_s = set()
+            self.exchange_uniform_s = set()
             self.align4_v = set()
             self.align4_s = set()
             self.scc_uniform = True
@@ -4974,7 +5013,9 @@ class Stage:
             r = reg_range(tok)
             if r and r[0] == 's':
                 getattr(self, 'mask_high', set()).difference_update(range(r[1], r[2] + 1))
-        if masks and not self.lane_mask_exact():
+        if masks and not self.lane_mask_exact() and not (
+                base == 's_ff1_i32_b32' and getattr(self, 'kind', None) == 'cs' and
+                getattr(self, 'mask_ff1_site', -1) == getattr(self, 'pc', None)):
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
         return result
@@ -8503,10 +8544,14 @@ class Stage:
             if self.kind != 'cs':
                 raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
             if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
-                raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+                if not hasattr(self, 'pipe'):
+                    raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+                return self.compute_mask_ff1(dst[1], ops[1])
             # At dispatch entry even the last partial wave starts at lane zero.
             self.set_s(dst[1], '0u', ('const', 0))
             return None
+        if self.is_lane_mask(ops[1]) and self.kind == 'cs' and hasattr(self, 'pipe'):
+            return self.compute_mask_ff1(dst[1], ops[1])
         if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
             raise Unsupported('s_ff1_i32_b32 on a lane mask')
         imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
@@ -9139,6 +9184,14 @@ class Stage:
                     raise Unsupported('%s: v%d is also used as a vector (%s)' % (name, n, op))
 
     def op_v_writelane_b32(self, ops, mods):
+        if getattr(self, 'pc', None) in getattr(self, 'execz_lane_writes', ()):
+            dst, src = map(reg_range, ops[:2])
+            if (not dst or dst[0] != 'v' or dst[1] != dst[2] or
+                    (src and (src[0] != 's' or src[1] != src[2])) or ops[1] in ('m0', 'null')):
+                raise Unsupported('v_writelane_b32 requires a single VGPR and a scalar value')
+            self.reject_lane_mask_data('v_writelane_b32', ops[1])
+            self.set_v(dst[1], self.u(ops[1]))
+            return
         n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
         mask = False
         if src is None:
@@ -9240,6 +9293,8 @@ class Stage:
         if lane and lane[0] == 's' and lane[1] == lane[2] and getattr(self, 'sym', {}).get(lane[1]) == ('first_lane',):
             self.read_first_lane(ops, mods)
             return
+        if self.compute_vector_readlane(ops, mods):
+            return
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if getattr(self, 'has_branches', False):
             sym, uniform, proven, mask = self.spill_join(n, lane)
@@ -9262,6 +9317,114 @@ class Stage:
             self.require_mask_reads_only('s%d' % dst[1])
         if getattr(self, 'descriptor_instruction_index', None) is not None:  # unit probes build a Stage without translate()
             self.__dict__.setdefault('reload_proven', {})[self.descriptor_instruction_index] = proven
+
+    def compute_wave_layout(self, name):
+        wave = self.pipe.wave_size
+        if wave is None and wave32_exec_proof(self.ins):
+            wave = 32
+        if wave not in (32, 64):
+            raise Unsupported('%s requires a proven wave size (32 or 64)' % name)
+        x, y, z = self.pipe.group
+        threads = x * y * z
+        if threads % wave:
+            raise Unsupported('%s requires a group of whole waves (%d lanes each)' % (name, wave))
+        return wave, '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+
+    def publish_compute_wave(self, name, value):
+        wave, flat = self.compute_wave_layout(name)
+        if not self.quad_flow_straight():
+            raise Unsupported('%s requires straight-line compute flow for the group barrier' % name)
+        self.uses_quad_shared = True
+        self.compute_wave_exchange = name
+        self.emit('x2w_quad[%s] = %s;' % (flat, value))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        return wave, flat
+
+    def compute_mask_ff1(self, dst, source):
+        name = 's_ff1_i32_b32'
+        reg = reg_range(source)
+        if (source not in ('exec_lo', 'vcc_lo') and
+                (not reg or reg[0] != 's' or reg[1] != reg[2] or
+                 reg[1] in self.mask_high or reg[1] in self.join_masks)):
+            raise Unsupported('%s requires a proven low lane-mask word' % name)
+        if getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s requires an exact lane mask' % name)
+        context = ('%s requires the compute entry EXEC mask or a shared scan that' % name if source == 'exec_lo'
+                   else '%s on a lane mask' % name)
+        wave, flat = self.publish_compute_wave(context, self.u(source))
+        self.mask_ff1_site = self.pc
+        base = '(%s & ~%du)' % (flat, wave - 1)
+        self.set_exchange_s(dst, '0xffffffffu', wave)
+        # B32 scans the low word of a wave64 mask as well as the whole wave32 mask.
+        self.emit('for (uint bit = 0u; bit < 32u; ++bit) {')
+        self.emit('    if (x2w_quad[%s + bit] & 1u) { s%d = bit; break; }' % (base, dst))
+        self.emit('}')
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+
+    def set_exchange_s(self, dst, value, wave):
+        x, y, z = self.pipe.group
+        # The existing uniformity proof is also used for potentially racing group stores.
+        self.set_s(dst, value, uniform=x * y * z == wave)
+        self.exchange_uniform_s.add(dst)
+
+    def compute_vector_readlane(self, ops, mods):
+        # Preserve the established spill path unless the VGPR has ordinary vector users.
+        if mods or getattr(self, 'kind', None) != 'cs' or not hasattr(self, 'pipe'):
+            return False
+        name = 'v_readlane_b32'
+        src, dst = reg_range(ops[1]), reg_range(ops[0])
+        if src[1] != src[2] or not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 103:
+            return False
+        try:
+            self.require_spill_only(src[1], name)
+        except Unsupported:
+            pass
+        else:
+            return False
+        for _, _, op, asm in self.ins:
+            if op.startswith('v_writelane') and reg_range(parse(asm)[1][0]) == src:
+                raise Unsupported('%s requires a vector source without lane-spill writes' % name)
+        lane = reg_range(ops[2])
+        if self.const_u32(ops[2]) is None and (
+                not lane or lane[0] != 's' or lane[1] != lane[2] or
+                (lane[1] not in self.exchange_uniform_s and
+                 not (self.uniform_source(ops[2]) and
+                      (lane[1] in self.defined_uniform_s or self.sym.get(lane[1], ('',))[0] == 'ud')))):
+            raise Unsupported('%s requires a constant or wave-uniform lane' % name)
+        self.reject_lane_mask_data(name, ops[2])
+        # The entry-EXEC scan folds to zero. When the existing first-lane
+        # proof applies, use it without introducing an exchange.
+        index = self.descriptor_instruction_index
+        if index and lane and self.exec_known and self.proven_uniform_v(src[1]):
+            previous, args, _ = parse(self.ins[index - 1][3])
+            if previous == 's_ff1_i32_b32' and args == [ops[2], 'exec_lo']:
+                self.op_v_readfirstlane_b32(ops[:2], mods)
+                return True
+        wave, flat = self.publish_compute_wave(name, self.u(ops[1]))
+        self.set_exchange_s(dst[1], 'x2w_quad[(%s & ~%du) | (%s & %du)]' %
+                            (flat, wave - 1, self.u(ops[2]), wave - 1), wave)
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        return True
+
+    def op_v_permlanex16_b32(self, ops, mods):
+        name = 'v_permlanex16_b32'
+        if self.kind != 'cs':
+            raise Unsupported(name)
+        if len(ops) != 4 or len(mods) > 1 or any(not re.fullmatch(r'op_sel:\[[01],[01]\]', mod) for mod in mods):
+            raise Unsupported('%s requires two VGPRs and two lane selects' % name)
+        dst, src = map(reg_range, ops[:2])
+        if not all(r and r[0] == 'v' and r[1] == r[2] for r in (dst, src)):
+            raise Unsupported('%s requires two VGPRs and two lane selects' % name)
+        fetch_inactive = bool(mods and mods[-1][8] == '1')
+        if not self.exec_known and not fetch_inactive:
+            raise Unsupported('%s requires entry EXEC or fetch-inactive' % name)
+        _, flat = self.publish_compute_wave(name, self.u(ops[1]))
+        lane = '(%s & 15u)' % flat
+        select = '(((%s < 8u ? %s : %s) >> ((%s & 7u) * 4u)) & 15u)' % (
+            lane, self.u(ops[2]), self.u(ops[3]), lane)
+        # An aligned pair of rows is contained in either supported whole-wave layout.
+        self.set_v(dst[1], 'x2w_quad[((%s ^ 16u) & ~15u) | %s]' % (flat, select))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
 
     def op_v_permlane16_b32(self, ops, mods):
         """v_permlane16_b32 vdst, vsrc0, ssrc1, ssrc2 (RDNA 2 ISA, VOP3 lane permutes; LLVM 15 gfx10): inside each row of
@@ -11826,7 +11989,7 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
+        self.wave_size = wave_size  # explicit guest wave size (32 or 64), or None to use instruction evidence
         if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
                 wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
             raise Unsupported(TG_SIZE_WAVES_REFUSAL)
@@ -11929,6 +12092,9 @@ class ComputePipeline(Pipeline):
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
+            exchange = getattr(s, 'compute_wave_exchange', None)
+            if exchange and getattr(s, 'uses_lds', False) and self.lds_words + self.group[0] * self.group[1] * self.group[2] > 8192:
+                raise Unsupported('%s exceeds the compute shared-memory limit' % exchange)
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']

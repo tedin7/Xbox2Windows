@@ -46,3 +46,56 @@ for words, args in [
     else:
         raise AssertionError("accepted an unproven readfirstlane")
 print("fixed scalar buffer value translated; five unproven reads rejected")
+
+
+def compute_controls():
+    import startup_compute_cross_lane_fixture as fixture
+
+    hlsl = fixture.translate(fixture.readlane_program())
+    assert 's46 = x2w_quad[' in hlsl and 'v43 = v42 + v41;' in hlsl
+    uniform = fixture.translate(fixture.readlane_program(selector=7))
+    assert '(s7 & 31u)' in uniform
+    first = b''.join([
+        fixture.move(41, fixture.inline(22)),
+        fixture.sop1(0x13, 48, 126),
+        fixture.readlane(48),
+        fixture.move(42, 46), fixture.store(42),
+    ])
+    hlsl = fixture.translate(first)
+    assert 's46 = v41;' in hlsl and 'GroupMemoryBarrierWithGroupSync' not in hlsl
+    fixture.refused('requires a constant or wave-uniform lane',
+                    lambda: fixture.translate(fixture.readlane_program(selector=fixture.vgpr(0))))
+    fixture.refused('requires a group of whole waves',
+                    lambda: fixture.translate(fixture.readlane_program(), group=(30, 2, 1)))
+
+    hlsl = fixture.translate(fixture.writelane_program())
+    assert 'if (exec & 1) v37 = 0x0000003bu;' in hlsl
+    fixture.refused('effect outside scalar registers',
+                    lambda: fixture.translate(fixture.writelane_program(lane=12)))
+
+
+def compute_dispatch(dxc, runner, adapter):
+    import startup_compute_cross_lane_fixture as fixture
+
+    source = [7 + 13 * index for index in range(64)]
+    broadcast = [source[5 + 32 * (index // 32)] for index in range(64)]
+    wave_zero = [source[5]] * 64
+    expected = [a + b for a, b in zip(source, broadcast)] + broadcast
+    mutant = [a + b for a, b in zip(source, wave_zero)] + wave_zero
+    rc = fixture.dispatch(dxc, runner, adapter, fixture.translate(fixture.readlane_program()),
+                          expected, source, lambda h: h.replace('& ~31u', '& 0u'), mutant)
+    if rc:
+        return rc
+    expected = [59 if lane % 32 == 11 else 17 for lane in range(64)]
+    return fixture.dispatch(dxc, runner, adapter, fixture.translate(fixture.writelane_program()),
+                            expected, [], lambda h: h.replace('v37 = 0x00000011u;', 'v37 = 0x0000003bu;'),
+                            [59] * 64)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        compute_controls()
+    elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
+        sys.exit(compute_dispatch(*sys.argv[2:]))
+    else:
+        sys.exit(__doc__)

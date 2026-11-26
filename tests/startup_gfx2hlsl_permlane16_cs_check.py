@@ -165,11 +165,45 @@ def check_dispatch(dxc, runner, adapter, control=None):
     return 0
 
 
+def row_exchange_program():
+    import startup_compute_cross_lane_fixture as fixture
+
+    low, high = 0x10ba7654, 0xefc3d289
+    program = b''.join([
+        fixture.load(), fixture.WAIT_LOAD,
+        sop1(S_MOV_B32, 33, LITERAL, low),
+        sop1(S_MOV_B32, 34, LITERAL, high),
+        fixture.vop3(0x378, 35, fixture.vgpr(41), 33, 34),
+        fixture.store(35),
+    ])
+    return fixture, program, low, high
+
+
+def check_row_exchange():
+    fixture, program, _, _ = row_exchange_program()
+    assert 'v35 = x2w_quad[' in fixture.translate(program)
+    fixture.refused('requires a group of whole waves', lambda: fixture.translate(program, group=(32, 1, 1),
+                                                                                 wave_size=64))
+
+
+def dispatch_row_exchange(dxc, runner, adapter):
+    fixture, program, low, high = row_exchange_program()
+    source = [3 + 9 * index for index in range(64)]
+    selected = [source_lane(lane, low, high) for lane in range(64)]
+    expected = [source[index ^ 16] for index in selected]
+    mutant = [source[index] for index in selected]
+    return fixture.dispatch(dxc, runner, adapter, fixture.translate(program), expected, source,
+                            lambda h: h.replace('^ 16u', '^ 0u'), mutant)
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         check_controls()
+        check_row_exchange()
     elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
         sys.exit(check_dispatch(*sys.argv[2:]))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch-row-exchange':
+        sys.exit(dispatch_row_exchange(*sys.argv[2:]))
     elif len(sys.argv) == 6 and sys.argv[1] == 'control':
         sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2]))
     else:

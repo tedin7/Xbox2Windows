@@ -392,10 +392,56 @@ def check_dispatch(dxc, runner, adapter):
     print('dispatch ok')
 
 
+def mask_fixture():
+    import startup_compute_cross_lane_fixture as fixture
+
+    program = b''.join([
+        fixture.load(), fixture.WAIT_LOAD,
+        fixture.vopc(0xc2, fixture.inline(1), 41),
+        sop1('s_ff1_i32_b32', 47, 106),
+        fixture.move(45, 47), fixture.store(45),
+    ])
+    return fixture, program
+
+
+def check_mask_translation():
+    fixture, program = mask_fixture()
+    hlsl = fixture.translate(program)
+    assert 'vcc;' in hlsl and 's47 = bit;' in hlsl
+    fixture.refused('requires a proven wave size', lambda: fixture.translate(program, wave_size=None))
+    fixture.refused('requires a group of whole waves', lambda: fixture.translate(program, group=(31, 2, 1)))
+    assert '& ~63u' in fixture.translate(program, wave_size=64)
+
+
+def dispatch_mask(dxc, runner, adapter):
+    fixture, program = mask_fixture()
+    hlsl = fixture.translate(program)
+
+    def top_bit(shader):
+        return shader.replace('uint bit = 0u; bit < 32u; ++bit', 'uint bit = 31u; bit < 32u; --bit')
+
+    for masks in ((0, 1 << 7), (1 << 31, MASK)):
+        source = [(mask >> bit) & 1 for mask in masks for bit in range(32)]
+        expected = [ff1_32(mask) for mask in masks for _ in range(32)]
+        if masks[0] == 0:
+            # The descending scan agrees for empty/singleton masks. Run the mutation
+            # against a separate pair with a dense mask to distinguish the order.
+            rc = fixture.dispatch(dxc, runner, adapter, hlsl, expected, source)
+        else:
+            mutant = [mask.bit_length() - 1 for mask in masks for _ in range(32)]
+            rc = fixture.dispatch(dxc, runner, adapter, hlsl, expected, source, top_bit, mutant)
+        if rc:
+            return rc
+    return 0
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         controls()
+        check_mask_translation()
     elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
         check_dispatch(*sys.argv[2:])
+    elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch-mask':
+        sys.exit(dispatch_mask(*sys.argv[2:]))
     else:
         sys.exit(__doc__)
