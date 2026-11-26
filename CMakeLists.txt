@@ -4720,6 +4720,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # BUF_FMT_8_8_8_8_UINT vertex fetch (#2004).
     add_test(NAME startup_gfx2hlsl_buf_8888_uint COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_buf_8888_uint_check.py")
+    # Lane-exact EXEC core (tools/startup/lane_exec.py): range restore rule and DPP16 source validity against a per-lane reference.
+    add_test(NAME startup_lane_exec COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_lane_exec_check.py")
     # The high half of an unsigned 32x32 product (#1792).
     add_test(NAME startup_gfx2hlsl_mul_hi_u32 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_u32_check.py")
