@@ -232,7 +232,7 @@ def controls():
               % (op, corrupted_hi, new_hi), corrupted_hi != new_hi)
 
     # Accepted operand forms (VGPR pair, unaligned VGPR pair, _e64 spelling, aligned SGPR pair, inline -16..64,
-    # SGPR/literal/m0/vcc_lo/exec_lo shift count) and inline sign-extension check.
+    # SGPR/literal/m0 shift count) and inline sign-extension check.
     accepted = [
         'v_lshrrev_b64 v[0:1], v2, v[4:5]',
         'v_lshrrev_b64_e64 v[1:2], v0, v[1:2]',
@@ -240,8 +240,6 @@ def controls():
         'v_ashrrev_i64 v[0:1], v2, s[4:5]',
         'v_lshrrev_b64 v[0:1], 0x80000020, v[2:3]',
         'v_lshrrev_b64 v[0:1], m0, v[2:3]',
-        'v_lshrrev_b64 v[0:1], vcc_lo, v[2:3]',
-        'v_lshrrev_b64 v[0:1], exec_lo, v[2:3]',
         'v_lshrrev_b64 v[0:1], 32, -1',
         'v_lshlrev_b64 v[0:1], 1, 64',
         'v_ashrrev_i64 v[0:1], 1, -16',
@@ -320,6 +318,8 @@ def controls():
         'v_lshrrev_b64 v[0:1]',
         'v_lshrrev_b64 v[0:1], v2',
         'v_lshrrev_b64 v[0:1], v2, v[4:5], v6',
+        'v_lshrrev_b64 v[0:1], vcc_lo, v[2:3]',  # a wave mask is not a shift count in the one-lane model
+        'v_lshrrev_b64 v[0:1], exec_lo, v[2:3]',
     ]
     check('modifiers, invalid operands and wrong counts refused (%d cases)' % len(refusals),
           all(refused(a) for a in refusals))

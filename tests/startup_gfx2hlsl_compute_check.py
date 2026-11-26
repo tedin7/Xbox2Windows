@@ -804,6 +804,140 @@ def check_mbcnt():
     assert 'uav 0 table 1 0' in translate('D').manifest()
 
 
+LANE_MASK_DATA = (
+    ('v_cvt_f32_u32 v5, vcc_lo', '6a0c0a7e'),   # the llvm.amdgcn.ballot word converted to float
+    ('v_add_nc_u32 v5, vcc_lo, v5', '6a0a0a4a'),
+)
+
+
+def check_lane_mask_data():
+    """A wave mask read as a number holds every lane's bit on hardware; the one-lane model has only its own."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    select = bytes.fromhex('800a0a02')    # v_cndmask_b32 v5, 0, v5, vcc_lo: the mask as a per-lane select
+    assert 'vcc = ' in translate('A', code=splice_words(compare, select)).hlsl_cs()
+    for _, word in LANE_MASK_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+
+
+LANE_MASK_SCALAR_DATA = (
+    ('s_cmpk_gt_u32 vcc_lo, 0x64', '6400eab5'),   # c7_ballot_cmp: the ballot word compared as a number
+    ('s_cmp_lg_u32 vcc_lo, 0', '6a8007bf'),
+    ('s_lshr_b32 s6, vcc_lo, 1', '6a810690'),
+    ('s_add_u32 s6, vcc_lo, 1', '6a810680'),
+)
+
+
+def check_lane_mask_scalar_data():
+    """A scalar op that reads a wave mask as a number sees every lane's bit on hardware; mask-only scalar ops stay."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    for _, word in LANE_MASK_SCALAR_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+    translate('A', code=splice_words(compare, bytes.fromhex('6a7e0687'))).hlsl_cs()   # s_and_b32 s6, vcc_lo, exec_lo
+
+
+def check_lane_mask_derived_word():
+    """A bitwise result of a lane mask is still a mask word: a later numeric read of it is refused."""
+    compare = bytes.fromhex('8500027d')              # v_cmp_lt_i32 vcc_lo, 5, v0
+    mask_and = bytes.fromhex('6aff0687ff000000')     # s_and_b32 s6, vcc_lo, 0xff
+    for use in ('060a887d', '060a0a4a'):   # v_cmp_gt_u32 vcc_lo, s6, v5 ; v_add_nc_u32 v5, s6, v5
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, mask_and, bytes.fromhex(use))))
+    refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex('6a0c0a7e'))))  # v_cvt_f32_u32 v5, vcc_lo
+
+
+def check_lane_mask_single_thread_group():
+    """A one-thread group has one participating lane per wave: its lane bit is the whole mask (high word 0), so the one-lane
+    model is exact and a numeric read stays lowered (dispatch case E). With two threads the same program is refused."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    cvt = bytes.fromhex('6a0c0a7e')       # v_cvt_f32_u32 v5, vcc_lo: the mask as a number
+    code = splice_words(compare, cvt)
+    assert 'v5 = ' in translate('A', code=code, group=(1, 1, 1)).hlsl_cs()
+    for group in ((2, 1, 1), (1, 2, 1), (1, 1, 2), (4, 1, 1)):
+        refused('as numeric data', lambda: translate('A', code=code, group=group))
+    xor_chunks = [bytes.fromhex(w) for w in ('000084d491000200', '8004027d', '6a008089')]
+    high = splice_words(*xor_chunks, bytes.fromhex('01020a7e'))   # v_mov_b32 v5, s1: the high word
+    assert 'v5 = ' in translate('A', code=high, group=(1, 1, 1)).hlsl_cs()
+    refused('as numeric data', lambda: translate('A', code=high, group=(2, 1, 1)))
+
+
+def check_lane_mask_high_word():
+    """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
+    chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
+                                         '8004027d',                                 # v_cmp_lt_i32 vcc, 0, v2
+                                         '6a008089')]                                # s_xor_b64 s[0:1], vcc, s[0:1]
+    for word in ('01020a7e',    # v_mov_b32 v5, s1
+                 '010a0a4a',    # v_add_nc_u32 v5, s1, v5
+                 '010c0a7e',    # v_cvt_f32_u32 v5, s1
+                 '010a0a36',    # v_and_b32 v5, s1, v5
+                 '01810780',    # s_add_u32 s7, s1, 1
+                 '018006bf',    # s_cmp_eq_u32 s1, 0
+                 '010387be'):   # s_mov_b32 s7, s1
+        refused('as numeric data', lambda: translate('A', code=splice_words(*chunks, bytes.fromhex(word))))
+    # The compare alone leaves its high word unknown: refused too (earlier, by the unknown-SGPR rule).
+    refused('s1', lambda: translate('A', code=splice_words(chunks[0], bytes.fromhex('010a0a4a'))))
+    assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
+
+
+def check_lane_mask_high_word_copy_and_overwrite():
+    """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
+    group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
+    save = bytes.fromhex('7e0494be')                      # s_mov_b64 s[20:21], exec
+    copy = bytes.fromhex('150396be')                      # s_mov_b32 s22, s21: the high word
+    use = bytes.fromhex('16821788')                       # s_or_b32 s23, s22, 2
+    cvt = bytes.fromhex('170c0a7e')                       # v_cvt_f32_u32 v5, s23
+    one = translate('A', code=splice_words(save, copy, use, cvt), group=(1, 1, 1)).hlsl_cs()
+    assert 's23 = s22 | 0x00000002u;' in one, one
+    refused('as numeric data', lambda: translate('A', code=splice_words(save, copy, use, cvt), group=(2, 1, 1)))
+    shifted = splice_words(save, bytes.fromhex('0407948f'), bytes.fromhex('15020a7e'))   # s_lshl_b64 s[20:21], s[4:5], s7 ; v_mov_b32 v5, s21
+    assert 'v5 = ' in translate('A', code=shifted, group=(4, 1, 1)).hlsl_cs()
+
+
+LANE_MASK_TAG = {
+    'zero_s1': '800381be',           # s_mov_b32 s1, 0: the high word the one-lane model holds as 0
+    'cmp_pair': '000084d491000200',  # v_cmp_gt_i32 s[0:1], 17, v0 (writes only the low word of the pair)
+    'cselect_pair': 'c1808085',      # s_cselect_b64 s[0:1], -1, 0
+    'cmp_vcc': '8004027d',           # v_cmp_lt_i32 vcc, 0, v2
+    'saveexec': '6a2480be',          # s_and_saveexec_b64 s[0:1], vcc
+    'copy_pair': '000488be',         # s_mov_b64 s[8:9], s[0:1]
+    'copy_vcc': '6a0488be',          # s_mov_b64 s[8:9], vcc
+    'copy_copy': '08048abe',         # s_mov_b64 s[10:11], s[8:9]
+    'xor_pair': '6a008089',          # s_xor_b64 s[0:1], vcc, s[0:1]
+    'clear_s9': '800389be',          # s_mov_b32 s9, 0: a plain write ends the tag
+    'read_s1': '01020a7e',           # v_mov_b32 v5, s1
+    'read_s9': '09020a7e',           # v_mov_b32 v5, s9
+    'read_s11': '0b020a7e',          # v_mov_b32 v5, s11
+    'add_s9': '09810780',            # s_add_u32 s7, s9, 1
+}
+
+
+def check_lane_mask_tag_propagation():
+    """The mask tag is set where a mask is written and moves with every copy: one case per way a tagged word is made, each
+    read back through a numeric use (a no-op tag at any of them lets a case translate)."""
+    w = {k: bytes.fromhex(v) for k, v in LANE_MASK_TAG.items()}
+    cases = [
+        ('cselect writes a pair', ['zero_s1', 'cselect_pair', 'read_s1']),
+        ('saveexec writes a pair', ['zero_s1', 'cmp_vcc', 'saveexec', 'read_s1']),
+        ('bitwise op writes a pair', ['zero_s1', 'cmp_pair', 'cmp_vcc', 'xor_pair', 'read_s1']),
+        ('b64 copy of a pair', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'read_s9']),
+        ('b64 copy of vcc', ['cmp_vcc', 'copy_vcc', 'read_s9']),
+        ('copy of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'copy_copy', 'read_s11']),
+        ('scalar use of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'add_s9']),
+    ]
+    for label, steps in cases:
+        try:
+            translate('A', code=splice_words(*[w[s] for s in steps]))
+        except G.Unsupported as reason:
+            assert 'as numeric data' in str(reason), (label, str(reason))
+        else:
+            raise AssertionError("%s accepted, expected a refusal naming as numeric data" % label)
+    # A plain write ends the tag: the copy is overwritten with a constant before the read.
+    assert 'v5 = ' in translate('A', code=splice_words(*[w[s] for s in (
+        'cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'clear_s9', 'read_s9')])).hlsl_cs()
+
+
+def splice_words(*chunks, at=STORE_A):
+    return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
+
+
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
     # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
@@ -1064,6 +1198,13 @@ def check_controls():
     check_lds()
     check_descriptor_scc()
     check_mbcnt()
+    check_lane_mask_data()
+    check_lane_mask_high_word()
+    check_lane_mask_single_thread_group()
+    check_lane_mask_high_word_copy_and_overwrite()
+    check_lane_mask_derived_word()
+    check_lane_mask_scalar_data()
+    check_lane_mask_tag_propagation()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.

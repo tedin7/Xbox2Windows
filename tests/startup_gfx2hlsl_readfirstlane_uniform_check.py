@@ -187,6 +187,9 @@ check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',
+    # The high word of a copied wave64 mask carries the mask tag: its numeric read is refused where it is lowered.
+    'overlapping 64-bit move high word': 'v_mov_b32 reads lane mask s4 as numeric data',
+    'high word of saved exec': 'v_mov_b32 reads lane mask s3 as numeric data',
     'modified move overwrite': "v_mov_b32 with ['clamp']",
     'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
     'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',
@@ -194,6 +197,14 @@ EARLIER = {
     'compare into SGPR': 'v_mov_b32 data operand s2 is a lane mask',
     'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
     'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
+    'median of three of a lane mask': 'v_med3_f32 reads lane mask s2 as numeric data',
+    'unsigned to float conversion of a mask': 'v_cvt_f32_u32 reads lane mask s2 as numeric data',
+    # A scalar op that reads a lane mask as a number is refused where it is lowered (before the read).
+    'aliased load first word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'aliased load second word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'varying scalar buffer offset': 's_buffer_load_dword reads lane mask s2 as numeric data',
+    'mask through scalar arithmetic': 's_add_u32 reads lane mask s2 as numeric data',
+    'mask through scalar condition': 's_cmp_eq_u32 reads lane mask vcc_lo as numeric data',
 }
 for label, instructions in REFUSED:
     got = run(*instructions)
@@ -306,7 +317,10 @@ for label, instructions, group in (
         ('thread id base rewritten after', (GID, 'v_add_nc_u32_e32 v0, s3, v0', WAVE, READ1), (64, 1, 1)),
         ('thread id base scaled by 32', ('v_lshl_add_u32 v0, s2, 5, v0', WAVE, READ1), (64, 1, 1))):
     got = run(*instructions, kind='cs', group=group)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    # The compare's mask in s2 is refused where v_lshl_add_u32 reads it as a number, before the read.
+    expected = ('v_lshl_add_u32 reads lane mask s2 as numeric data'
+                if label == 'thread id base from a varying scalar' else REFUSAL)
+    check(f'{label} refused', got == expected, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
