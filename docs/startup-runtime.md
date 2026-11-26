@@ -210,8 +210,8 @@ The translation is refused when:
 
 The shader cache revision is `x2w-startup-shader-19`. Revision 19 folds `s_mov_b32` from a scalar register that
 holds a plain constant, so later reads of the copy use the constant word. The matching compute
-(`x2w-startup-shader-19cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
-(`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
+(`x2w-startup-shader-19cs`) and slot 57 mesh (`x2w-startup-mesh-57-4`) keys advance because those stages use the
+shared lowering.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
 Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the

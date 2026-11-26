@@ -90,6 +90,23 @@ after = '\n'.join(joined.get(join_at, []))
 check('join: a read after a run-time rewrite on one arm uses the register', 's12' in after, repr(joined))
 check('join: the stale constant is not folded into the read', CONST_WORD not in after, after)
 
+# The pixel entry's primitive mask is a placeholder (only ever moved to m0), not a known constant: a copy of it
+# must stay a run-time value instead of folding to zero.
+entry = G.Stage.__new__(G.Stage)
+entry.pipe, entry.kind = Pipeline(), 'ps'
+entry.pipe.root, entry.sym, entry.lines = {'params': [], 'flags': 0}, {}, []
+entry.setup_entry()
+mask_regs = [r for r, v in entry.sym.items() if v[0] == 'const']
+check('pixel entry has one primitive-mask placeholder', len(mask_regs) == 1, repr(entry.sym))
+if mask_regs:
+    copy = G.Stage.__new__(G.Stage)
+    copy.pipe, copy.sym, copy.lines = Pipeline(), dict(entry.sym), []
+    copy.used_s, copy.used_v, copy.uniform_v, copy.exec_known = set(), set(), set(), True
+    copy.has_branches, copy.masks = False, set()
+    copy.one('s_mov_b32', 's_mov_b32 s12, s%d' % mask_regs[0])
+    check('a copy of the primitive-mask placeholder is not a known constant', copy.sym.get(12) != ('const', 0),
+          repr(copy.sym.get(12)))
+
 if failures:
     print('FAIL: ' + ', '.join(failures))
     sys.exit(1)

@@ -2171,7 +2171,7 @@ class Stage:
             self.sym[2] = ('ud', self.pipe.ud(('basevertex',)))
             self.sym[3] = ('ud', self.pipe.ud(('startinstance',)))
         else:
-            self.sym[reg] = ('const', 0)  # primitive mask: only ever moved to m0
+            self.sym[reg] = ('const', 0, 'primmask')  # primitive mask: a tagged placeholder, only ever moved to m0; a copy must not fold it
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
@@ -9777,7 +9777,7 @@ def read_ps_inputs(path, key):
 
 
 def mesh57_key(ms, ps, root):
-    value = fnv(b'x2w-startup-mesh-57-3')
+    value = fnv(b'x2w-startup-mesh-57-4')
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value
