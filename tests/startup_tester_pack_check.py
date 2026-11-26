@@ -32,17 +32,17 @@ def write(folder, name, data):
 def check_preset():
     script = T.input_preset("menus", 300)
     items = script.split(",")
-    assert items[:4] == ["80@5+1.5", "80@11+1.5", "4@17+1.5", "80@23+1.5"], items[:4]
+    assert items[:4] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2"], items[:4]
     times = [int(i.split("@")[1].split("+")[0]) for i in items]
-    assert times == list(range(5, 300, 6)), times
+    assert times == list(range(5, 300, 2)), times
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
     assert T.input_preset("menus", 5) == "", "no entry before the start second"
-    assert T.input_preset("menus", 420).count(",") + 1 == 70
+    assert T.input_preset("menus", 420).count(",") + 1 == len(range(5, 300, 2))
     long_menus = T.input_preset("menus", 600).split(",")
-    assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 500, 6)), "the menus preset stops at 500 s"
+    assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 300, 2)), "the menus preset stops at 300 s"
     assert len(long_menus) <= T.MAX_ENTRIES
     long_run = T.input_preset("menus", 100000).split(",")
-    assert len(long_run) == len(range(5, 500, 6)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"
