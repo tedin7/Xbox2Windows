@@ -2709,9 +2709,22 @@ UploadRingStats upload_ring_stats()
     return stats;
 }
 
+// X2W_TEST_UPLOAD_RING_MAX_KIB=<n> (fixtures only): the whole ring is at most n KiB, so one reservation can be at most a quarter of that.
+u64 upload_ring_max_bytes()
+{
+    static const u64 bytes = [] {
+        char value[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_UPLOAD_RING_MAX_KIB", value, sizeof(value));
+        const u64 kib = n && n < sizeof(value) ? std::strtoull(value, nullptr, 10) : 0;
+        return kib ? kib << 10 : max_upload_ring_bytes;
+    }();
+    return bytes;
+}
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
-    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
+    const u64 ring_max_bytes = upload_ring_max_bytes();
+    const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
@@ -2734,7 +2747,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < max_upload_ring_bytes ? max_upload_ring_bytes - total_bytes : 0;
+    const u64 remaining = total_bytes < ring_max_bytes ? ring_max_bytes - total_bytes : 0;
     if (rounded <= remaining) {
         u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
