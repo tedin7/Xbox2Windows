@@ -2467,7 +2467,9 @@ These are measured on one executable; treat them as hypotheses for others.
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
   entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
   array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
-  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  sRGB or non-colour format, a format without typed UAV store (or, for a store whose dmask selects only some
+  channels, which reads the texel back and is marked by a `uavload N` line after its `uav` line, without
+  typed UAV load; `tests/startup_pixel_uav_support_check.cpp`), and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
   written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
   draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
@@ -2612,9 +2614,9 @@ These are measured on one executable; treat them as hypotheses for others.
   offsets sequential/forward/backward/first; read failures`. A high share of the window in reads with low MB/s is a seek-bound disk (a
   hard disk); a low share means the time goes to inflating or to waiting for the title. `startup_storage_failure_counts` checks the
   counters, the read classification and the exact lines.
-- **DirectStorage HDD mode (`X2W_STORAGE_HDD=1`, off by default).** The queue's worker plans the file reads of its next 256 entries
+- **DirectStorage HDD mode (`X2W_STORAGE_HDD=1`, off by default).** The queue's worker plans the file reads of its next 1024 entries
   (`dstorage_read_plan.h`: sorted by file and offset, reads within 64 KiB merged up to 4 MiB); one prefetch thread reads those groups into a
-  cache of at most 64 MiB (`dstorage_read_cache.h`, unused entries dropped after 20 s) and the worker's own file read takes the bytes from
+  cache of at most 128 MiB (`dstorage_read_cache.h`, unused entries dropped after 20 s) and the worker's own file read takes the bytes from
   the cache first. Entries still run in order, so a cache miss only costs speed. A third line, `x2w-dstorage hdd <n> s: cache hits ... misses ...;
   prefetch groups ..., disk reads saved by merging ...`, shows what it did. `startup_dstorage_read_plan` tests the plan;
   `startup_dstorage_hdd_queue_on` / `_off` run 48 shuffled requests through the real queue and compare every byte (on: 47 cache hits, a few

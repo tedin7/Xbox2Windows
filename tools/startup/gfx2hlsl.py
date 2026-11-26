@@ -1467,8 +1467,13 @@ def check_lds_exchange(ins, group, words):
     All widths share the dword-indexed groupshared uint lds[N] array and require 4-byte alignment (natural 8/16-byte alignment is not required on GFX10/RDNA2 LDS).
     LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
     """
-    if not 0 < words <= 8192 or group[0] < 1 or group[1:] != (1, 1):
-        raise Unsupported('LDS exchange needs a 1D group and a nonzero allocation of at most 32 KiB')
+    # One reason per failed condition, with the measured value, so a refusal count says which limit the title exceeds.
+    if group[0] < 1 or group[1:] != (1, 1):
+        raise Unsupported('LDS exchange needs a 1D group (the group is %dx%dx%d)' % tuple(group))
+    if words == 0:
+        raise Unsupported('LDS exchange needs a nonzero LDS allocation (COMPUTE_PGM_RSRC2 allocates 0 bytes)')
+    if not 0 < words <= 8192:
+        raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
     published = False
     read = False
@@ -2609,6 +2614,9 @@ class Stage:
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
+            if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
+                    and not wave32_exec_proof(self.ins):
+                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -2638,13 +2646,28 @@ class Stage:
         if isinstance(self.whole_read_v, set):
             self.whole_read_v.add(reg)
 
+    def scc_refusal(self, text, path):
+        """`text` plus the path that refused and the instruction's opcode and destination class, so a census of one SCC
+        refusal says which emitting path and which instruction shape dominate. The refusal itself is unchanged."""
+        parts = getattr(self, 'current_asm', '').split(None, 1)
+        opcode = parts[0] if parts else 'unknown'
+        first = parts[1].split(',')[0].strip() if len(parts) > 1 else ''
+        reg = reg_range(first) if first else None
+        if first in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0', 'null'):
+            dest = first
+        elif reg and reg[0] in ('s', 'v'):
+            dest = {'s': 'sgpr', 'v': 'vgpr'}[reg[0]]
+        else:
+            dest = 'none'
+        return '%s [%s: %s, destination %s]' % (text, path, opcode, dest)
+
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
         if tok == 'src_scc':
             # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
             # Refuse unless a modeled writer set SCC on the reaching path in this block.
             if not getattr(self, 'scc_verified', False):
-                raise Unsupported('src_scc with unverified SCC')
+                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'operand read'))
             return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
             self.read_vcc()
@@ -4605,6 +4628,25 @@ class Stage:
         whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
         return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
 
+    def quad_exec_cause(self):
+        """Why a DPP quad read meets an EXEC that is not the entry mask or a program that is not straight-line, for the
+        refusal text (the refusal itself is unchanged): the stage when it is neither a pixel nor a compute stage, the last
+        instruction before the read that can write EXEC (writes_exec), or, for a compute program, its first branch, so a
+        tester report names the shape to lift. Empty when none applies."""
+        kind = getattr(self, 'kind', None)
+        if kind not in ('ps', 'cs'):
+            return ': %s stage' % (kind or 'unknown')
+        here = getattr(self, 'pc', None)
+        before = [(off, name, asm) for off, _n, name, asm in getattr(self, 'ins', ()) if here is None or off < here]
+        if not getattr(self, 'exec_known', False):
+            writer = next(((off, name) for off, name, asm in reversed(before) if writes_exec(name, parse(asm)[1])), None)
+            return ': EXEC written at +0x%x by %s' % writer if writer else ': EXEC not known at entry'
+        if kind == 'cs' and not self.quad_flow_straight():
+            branch = next(((off, name) for off, _n, name, _a in getattr(self, 'ins', ())
+                           if name == 's_branch' or name.startswith('s_cbranch')), None)
+            return ': branch at +0x%x (%s)' % branch if branch else ': not straight-line'
+        return ''
+
     def note_quad_flow(self, base):
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
             self.quad_flow_reads.append((self.pc, base))
@@ -4838,6 +4880,7 @@ class Stage:
         llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
         The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
         The check runs after the form's own refusals, so those keep their messages."""
+        self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
             return None
         masks = []
@@ -5143,7 +5186,7 @@ class Stage:
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
-    def dpp_broadcast(self, base, ops, mods):
+    def dpp_broadcast(self, base, ops, mods, fetch_inactive=False):
         fields, rest = {}, []
         for m in mods:
             key, _, value = m.partition(':')
@@ -5159,15 +5202,22 @@ class Stage:
                               % (base, fields.get('quad_perm', 'without quad_perm')))
         if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
-        if fields.get('bound_ctrl', '1') != '1':
-            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
         # A branch to offset zero also makes the nominal entry block re-entrant.
         # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
-        if (not getattr(self, 'exec_known', False) or
-                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
-            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
+        narrowed = False
+        if not getattr(self, 'exec_known', False):
+            if self.narrowing_proof():
+                narrowed = True
+            else:
+                raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                                  % (base, self.quad_exec_cause()))
+        elif not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))):
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                              % (base, self.quad_exec_cause()))
+        if not narrowed and fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -5190,6 +5240,9 @@ class Stage:
         rewritten = '-' + rewritten if neg else rewritten
         self.note_quad_flow(base)
         self.needs_sm6 = True
+        if narrowed:
+            return self.dpp_broadcast_narrowed(base, ops, rest, rewritten, token, lanes.group(1), fields,
+                                               fetch_inactive)
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
         if base == 'v_mov_b32':
@@ -5197,6 +5250,59 @@ class Stage:
                 raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
             return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
         return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+
+    DPP_VALID = 257  # hidden: the source lane's EXEC bit, read with the data
+
+    NARROWING_WRITERS = ('v_cmpx_', 's_and_saveexec_', 's_and_b32', 's_and_b64', 's_andn2_b32', 's_andn2_b64')
+
+    def narrowing_proof(self):
+        """Whether EXEC at this point is the whole-quad mask of an entry s_wqm narrowed only by AND-type writes, in
+        straight-line code: then every lane that is inactive here was active (helper lanes included) up to its
+        narrowing, so the guest's and the host's VGPRs of an inactive lane agree and a quad read may take them."""
+        wqm = getattr(self, 'wqm_set_at', None)
+        if (self.kind != 'ps' or wqm is None or not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)
+                or not self.quad_flow_straight()):
+            return False
+        for off, _n, name, asm in getattr(self, 'ins', ()):
+            if off >= getattr(self, 'pc', 1 << 62):
+                break
+            ops = parse(asm)[1]
+            if not writes_exec(name, ops):
+                continue
+            base = re.sub(r'_e(32|64)$', '', name)
+            if off == wqm and base in ('s_wqm_b32', 's_wqm_b64'):
+                continue
+            if off < wqm or not base.startswith(self.NARROWING_WRITERS):
+                return False
+        return True
+
+    def dpp_broadcast_narrowed(self, base, ops, rest, rewritten, token, lane, fields, fetch_inactive):
+        """A quad broadcast behind a narrowed EXEC (RDNA 2 ISA DPP16; model section 2a). Per lane the source is valid
+        when FI is set or the source lane's EXEC bit is 1; an invalid source reads 0 when BOUND_CTRL is set, and
+        otherwise leaves the destination unwritten. The quad reads are unconditional (every thread of the quad runs
+        them, as the quad intrinsics need); only the destination write is guarded by the thread's own EXEC bit."""
+        self.used_v.update((self.DPP_TEMP, self.DPP_VALID))
+        self.uniform_v.discard(self.DPP_TEMP)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(self.DPP_TEMP)
+        self.emit('v%d = QuadReadLaneAt(%s, %su);' % (self.DPP_TEMP, self.u(token), lane))
+        bound = fields.get('bound_ctrl') == '1'
+        guard = False
+        if not fetch_inactive:
+            self.emit('v%d = QuadReadLaneAt(exec & 1u, %su);' % (self.DPP_VALID, lane))
+            if bound:
+                self.emit('v%d = v%d != 0u ? v%d : 0u;' % (self.DPP_TEMP, self.DPP_VALID, self.DPP_TEMP))
+            else:
+                guard = True
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32' and (rest or len(operands) != 2):
+            raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+        if guard:
+            self.emit('if (v%d != 0u) {' % self.DPP_VALID)
+        result = self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+        if guard:
+            self.emit('}')
+        return result
 
     # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
     # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
@@ -5210,9 +5316,10 @@ class Stage:
         # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
         # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
         # source lane is disabled and it decides nothing.
+        fetch_inactive = 'fi:1' in mods
         mods = [m for m in mods if m != 'fi:1']
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
-            return self.dpp_broadcast(base, ops, mods)
+            return self.dpp_broadcast(base, ops, mods, fetch_inactive=fetch_inactive)
         perm = None
         row_ror8 = False
         for m in mods:
@@ -5266,7 +5373,7 @@ class Stage:
             self.compute_quad_gate(base, row_ror8)
         else:
             if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
             if not getattr(self, 'wqm_exec', False):
                 raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                                   'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
@@ -5303,7 +5410,7 @@ class Stage:
         if row_ror8 and x * y * z % 16:
             raise Unsupported('%s_dpp row_ror:8 in a compute program requires a group of whole rows (a multiple of 16 threads)' % base)
         if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
+            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC%s' % (base, self.quad_exec_cause()))
 
     def quad_source(self, intrinsic, source, compute):
         """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
@@ -5729,19 +5836,26 @@ class Stage:
                          else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
                          else None)
                 if other is not None and self.const_u32(other) == 0xfc0:
-                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    x, y, z = self.pipe.group
+                    if x * y * z <= 32:
+                        self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                        return None
+                    # Wave32 waves hold 32 consecutive threads in x-major order: the wave ID is the flat thread index / 32,
+                    # and differs between the waves of one group (so the register is not uniform).
+                    flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                    self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
-                raise Unsupported('src_scc with unverified SCC')
+                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
                 self.scc_verified = False
                 if self.tracks_uniformity():
                     self.scc_uniform = False
             if shift_add or word_complement or word_absdiff:
-                raise Unsupported('scc from descriptor data')
+                raise Unsupported(self.scc_refusal('scc from descriptor data', 'shift-add, complement or absdiff'))
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
             # Every path below writes the destination's symbol directly, not through set_s, or refuses. The
@@ -5756,13 +5870,13 @@ class Stage:
                 return None
             if dname == 'm0':
                 if scc:
-                    raise Unsupported('scc from descriptor data')
+                    raise Unsupported(self.scc_refusal('scc from descriptor data', 'm0 write'))
                 self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
                 return None
             if mask_dest:
                 raise Unsupported('mask from descriptor data')
             if dname == 'null':
-                raise Unsupported('scc from descriptor data' if (scc or base in SCC_UNMODELLED)
+                raise Unsupported(self.scc_refusal('scc from descriptor data', 'null destination') if (scc or base in SCC_UNMODELLED)
                                   else '%s into null on descriptor data' % base)
             if not dst or dst[0] != 's':
                 raise Unsupported('%s destination %s' % (base, ops[0]))
@@ -6704,7 +6818,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
@@ -6713,7 +6827,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
@@ -6914,7 +7028,7 @@ class Stage:
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
         terms.append(str(offset))
-        return data, self.pipe.uav(key), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -7117,10 +7231,17 @@ class Stage:
                 continue
             key = (('vbtab',), 16 * e['slot'])
             buf = self.pipe.resource(key, 'buf')
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
+
+    def srv_index(self, key):
+        """The read-only slot of a buffer descriptor, for the stride and word 3 the runtime supplies with it. A compute
+        descriptor the program also stores through has none (it is one RW view)."""
+        if key in getattr(self.pipe, 'rw_keys', ()):
+            raise Unsupported('indexed or formatted load through a read-write descriptor %s' % (key,))
+        return self.pipe.resources[key]['index']
 
     @staticmethod
     def descriptor_scalar_writes(name, ops):
@@ -7283,7 +7404,7 @@ class Stage:
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
         if self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
+        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
@@ -7494,12 +7615,16 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
+        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        if cube:
+            kinds[dim] = 'texcube'
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
-        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
+        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') or cube
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7669,6 +7794,14 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
+            elif cube:
+                # The address is S, T and the face index (RDNA 2 ISA, image_sample on a cube map; S and T come from
+                # v_cubesc / v_cubetc divided by |v_cubema| and offset by 1.5, v_cubeid is the face). The sample is
+                # taken from the TextureCube view at the direction those registers stand for (x2w_cube_dir).
+                if len(cs) != 3:
+                    raise Unsupported('image_sample on a cube map with %d address registers' % len(cs))
+                self.pipe.uses_cube_dir = True
+                uv = 'x2w_cube_dir(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             elif three:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
@@ -7905,7 +8038,7 @@ class Stage:
             raise Unsupported('%s without exactly one dim and dmask' % name)
         # Compute also stores to 1D, 2D-array and 3D images: the address is x; x, y, layer; x, y, z, and the bound
         # view is a RWTexture1D, RWTexture2DArray or RWTexture3D (a 3D view keeps the caller's W range, as an
-        # array view keeps its slices). Pixel stages store to 2D and 2D-array images.
+        # array view keeps its slices). Pixel stages store to 2D and 2D-array images (#2830); 1D and 3D stay compute-only.
         shapes = {'SQ_RSRC_IMG_2D': (2, 'tex2d', 'x and y'), 'SQ_RSRC_IMG_2D_ARRAY': (3, 'tex2da', 'x, y and layer'),
                   'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z')}
         if dims[0] not in shapes or (dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D') and self.kind != 'cs') or \
@@ -7916,12 +8049,20 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        if mask != 0xf:
+        # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
+        # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
+        channels = [i for i in range(4) if mask >> i & 1]
+        if self.kind != 'ps' and mask != 0xf:
+            # Proven by readback in the pixel stage only; a compute store keeps the refusal.
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
+        if not channels or mask > 0xf or (d16 and mask != 0xf):
+            raise Unsupported('%s with dmask %s: %s' % (
+                name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
+                else 'no channel selected or out of range'))
         data = reg_range(ops[0])
-        count = 2 if d16 else 4
+        count = 2 if d16 else len(channels)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
-            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
+            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], {1: 'one', 2: 'two', 3: 'three', 4: 'four'}[count]))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7950,7 +8091,12 @@ class Stage:
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
             index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        body = '%s[%s] = %s;' % (image, index, value)
+        if len(channels) == 4 or d16:
+            body = '%s[%s] = %s;' % (image, index, value)
+        else:
+            sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
+            body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
+            self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, native_gather=False, regs_out=None):
@@ -10966,6 +11112,7 @@ class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
     uses_gather_2d_lod = False
+    uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
@@ -11073,6 +11220,7 @@ class Pipeline:
             self.uds.append(source)
         return self.uds.index(source)
 
+
     def resource(self, key, kind):
         if key in self.stored_images():
             raise Unsupported('resource %s is both read and stored to' % (key,))
@@ -11103,7 +11251,7 @@ class Pipeline:
     def stored_images(self):
         return self.uavs or {}
 
-    def uav(self, key, kind):
+    def uav(self, key, kind, rw=False):
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
         if self.uavs is None:
@@ -11244,7 +11392,7 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
@@ -11286,6 +11434,20 @@ class Pipeline:
                 '    return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);',
                 '}',
             ))
+        if getattr(self, 'uses_cube_dir', False):
+            # The inverse of v_cubeid / v_cubesc / v_cubetc / v_cubema (LLVM ConstantFoldAMDGCNCubeIntrinsic, the same table
+            # as Stage.cube): the face index and S = sc / (2 |major|) + 1.5, T = tc / (2 |major|) + 1.5 give the direction.
+            out.extend((
+                'float3 x2w_cube_dir(float s, float t, float face) {',
+                '    float sc = 2.0f * s - 3.0f, tc = 2.0f * t - 3.0f;',
+                '    uint f = (uint)clamp(floor(face + 0.5f), 0.0f, 5.0f);',
+                '    if (f == 0u) return float3(1.0f, -tc, -sc);',
+                '    if (f == 1u) return float3(-1.0f, -tc, sc);',
+                '    if (f == 2u) return float3(sc, 1.0f, tc);',
+                '    if (f == 3u) return float3(sc, -1.0f, -tc);',
+                '    if (f == 4u) return float3(sc, -tc, 1.0f);',
+                '    return float3(-sc, -tc, -1.0f);',
+                '}'))
         if self.uses_gather_2d_lod:
             out.extend((
                 'float4 gather_2d_lod(Texture2D<float4> tex, float2 uv, float lod, uint component, float max_lod) {',
@@ -11594,6 +11756,8 @@ class Pipeline:
             if source[0] != 'table':
                 raise Unsupported('stored image through %s' % (source,))
             lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
+            if r.get('load'):
+                lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
@@ -11610,12 +11774,45 @@ class Pipeline:
         return '\n'.join(lines) + '\n'
 
 
+TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group '
+                         '(more needs whole wave32 waves and a program proved wave32)')
+
+
+def wave32_exec_proof(ins):
+    """True when the program names a wave32 exec write (a 32-bit scalar op into exec_lo, or s_*saveexec_b32) and no wave64
+    exec form (the 64-bit exec pair or a 64-bit scalar op on it). The opcodes differ between the sizes (RDNA 2 ISA, SOP1
+    S_AND_SAVEEXEC_B32 / _B64, SOP1 S_MOV_B32 / _B64), so a compiler's exec handling states the wave size; a program that
+    never touches exec states nothing, and the caller must say wave_size=32."""
+    wave32 = wave64 = False
+    for _off, _size, name, asm in ins:
+        if not name.startswith('s_'):
+            continue
+        if re.search(r'\bexec\b', asm):
+            wave64 = True
+        elif name.endswith('saveexec_b32'):
+            wave32 = True
+        elif re.search(r'\bexec_lo\b', asm) and name.endswith('_b32'):
+            ops = parse(asm)[1]
+            wave32 |= bool(ops) and ops[0] == 'exec_lo'
+    return wave32 and not wave64
+
+
+class ReadWriteBuffer(Unsupported):
+    """A compute program loads and stores through one descriptor. A raw buffer is lowered as one RWByteAddressBuffer
+    (ComputePipeline retries with the key in rw_keys); anything else keeps the refusal."""
+
+    def __init__(self, key, lowerable):
+        super().__init__('descriptor %s used for a load and a store' % (key,))
+        self.key, self.lowerable = key, lowerable
+
+
 class ComputePipeline(Pipeline):
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave=None,
+                 wave_size=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -11624,8 +11821,10 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
-            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
+                wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
+            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         # The guest wave size (32 or 64): given by the caller (the dispatch's wave mode), else shown by the
@@ -11639,21 +11838,52 @@ class ComputePipeline(Pipeline):
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
-        self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
-        self.lod_unvalidated = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
+        self.rw_keys = set()
+        self._stage_args = (cs_code, refusals, decoded)
+        self._refusals_before = len(refusals) if refusals is not None else 0
+        self._build_stage()
+
+    def _build_stage(self):
+        """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
+        part-way: translate again with that descriptor as one RW view, once per such descriptor."""
+        while True:
+            try:
+                return self._reset_stage()
+            except ReadWriteBuffer as conflict:
+                self._lower_read_write(conflict)
+
+    def _lower_read_write(self, conflict):
+        if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
+            raise conflict
+        self.rw_keys.add(conflict.key)
+
+    def _reset_stage(self):
+        """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
+        cs_code, refusals, decoded = self._stage_args
+        self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
+        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
+        self.lod_unvalidated = set()
+        if refusals is not None:
+            del refusals[self._refusals_before:]
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
+        if key in self.rw_keys and kind == 'buf':
+            return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
-            raise Unsupported('descriptor %s used for a load and a store' % (key,))
+            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
         return super().resource(key, kind)
 
-    def uav(self, key, kind='raw'):
+    def uav(self, key, kind='raw', rw=False):
+        # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
+        # atomics keep the refusal.
         if key in self.resources:
-            raise Unsupported('descriptor %s used for a load and a store' % (key,))
+            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
+        if rw:
+            self.plain_stored.add(key)
         return super().uav(key, kind)
 
     def stored_images(self):
@@ -11664,9 +11894,21 @@ class ComputePipeline(Pipeline):
         for r in self.uavs.values():
             if r['kind'] == 'raw':
                 out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
+        if self.rw_keys:
+            out.insert(1, 'uint ldu(RWByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
+                          'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }')
         return out
 
     def hlsl_cs(self):
+        # The body can also meet a buffer that is both loaded and stored: translate again with it as one RW view.
+        while True:
+            try:
+                return self._hlsl_cs()
+            except ReadWriteBuffer as conflict:
+                self._lower_read_write(conflict)
+                self._build_stage()
+
+    def _hlsl_cs(self):
         s = self.cs
         if s.exports:
             raise Unsupported('export in a compute program')

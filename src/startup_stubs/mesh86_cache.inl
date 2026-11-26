@@ -168,7 +168,7 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
     }
     std::vector<unsigned char> root_blob;
     {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         if (const auto root = root_blobs().find(request.root); root != root_blobs().end()) root_blob = root->second;
         ReleaseSRWLockShared(&note_lock);
     }

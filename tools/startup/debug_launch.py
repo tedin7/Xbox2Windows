@@ -1,6 +1,6 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--capture-menu-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -31,7 +31,7 @@ import host_cpu  # noqa: E402
 
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
-from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
+from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
@@ -144,6 +144,13 @@ def main():
         capture_every = -1
     if not (capture_every == 0 or 1 <= capture_every < float("inf")):
         print("expected --capture-every of 0 (off) or a finite number of seconds that is at least 1")
+        return 2
+    try:
+        capture_menu_every = float(opts.get("--capture-menu-every", 0))  # faster pictures in the menu phase; 0 = off
+    except ValueError:
+        capture_menu_every = -1
+    if not (capture_menu_every == 0 or 1 <= capture_menu_every < float("inf")):
+        print("expected --capture-menu-every of 0 (off) or a finite number of seconds that is at least 1")
         return 2
     try:
         headroom_mib = int(opts.get("--commit-headroom-mib", 0))  # end the run when the system commit has less free; 0 = off
@@ -833,14 +840,20 @@ def main():
     series = Series(logdir) if capture_every else None
     capture_done = threading.Event()
 
+    pace = MenuPace(capture_every, capture_menu_every)
+
     def capture_loop():
-        while not capture_done.wait(capture_every):
+        while not capture_done.wait(pace.interval()):
             try:
                 frame = grab_window()
                 if isinstance(frame, str):
                     series.miss()
                 else:
-                    series.offer(time.time() - start, frame[0], frame[1], frame[2])
+                    seconds = time.time() - start
+                    series.offer(seconds, frame[0], frame[1], frame[2])
+                    if pace.note(seconds, frame_mean(frame[0], frame[1], frame[2])):
+                        print(f"  window captures: the menu phase ended at {seconds:.0f} s (loading-like picture), "
+                              f"pictures every {capture_every:g} s from here", flush=True)
             except Exception:  # diagnostics only: the run goes on, the tick is counted
                 series.miss()
 
@@ -956,15 +969,19 @@ def main():
                             arm(base + (address - local))
             if h_file:
                 k32.CloseHandle(wt.HANDLE(h_file))
+        elif code == UNLOAD_DLL:
+            base = struct.unpack_from("<Q", event, 16)[0]
+            log(f"{time.time() - start:7.3f} unload {modules.pop(base, '?')} at {base:#x}")  # the mapping is gone: where() must not name it
         elif code == CREATE_THREAD:
-            log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} created ({len(live_threads)} live)")
             h_thread = struct.unpack_from("<Q", event, 16)[0]
             if h_thread:
                 os_handles[tid] = h_thread
             window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} exited ({len(live_threads)} live)")
             window.finish(tid)
             os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
@@ -1189,7 +1206,8 @@ def main():
     if capture_thread:
         capture_done.set()
         capture_thread.join(SHUTDOWN_STEP_SECONDS)
-        print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
+        menu_note = f", {capture_menu_every:g} s in the menu phase" if capture_menu_every else ""
+        print("  " + series.summary() + f" (every {capture_every:g} s{menu_note}, window_<sss>s.png, at most {FILE_CAP} files)")
     if final_thread is not None and exit_code is None:
         if final_result:
             print(final_result[0])

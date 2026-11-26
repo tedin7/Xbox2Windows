@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "startup"))
-from window_capture import PNG_SIGNATURE, Series, frame_hash, frame_name, pick_window, png_bytes  # noqa: E402
+from window_capture import MenuPace, PNG_SIGNATURE, Series, frame_hash, frame_mean, frame_name, pick_window, png_bytes  # noqa: E402
 
 
 def decode_png(data):
@@ -81,6 +81,25 @@ class Naming(unittest.TestCase):
         self.assertEqual(frame_hash(2, 2, pixels), frame_hash(2, 2, bytes(16)))
         self.assertNotEqual(frame_hash(2, 2, pixels), frame_hash(4, 1, pixels))
         self.assertNotEqual(frame_hash(2, 2, pixels), frame_hash(2, 2, bytes(15) + b"\x01"))
+
+
+class Pace(unittest.TestCase):
+    def test_frame_mean_is_the_channel_mean(self):
+        self.assertEqual(frame_mean(4, 4, bytes([10, 20, 30, 255]) * 16), 20.0)
+        self.assertEqual(frame_mean(1, 1, b""), 0.0)
+
+    def test_menu_pictures_come_fast_until_the_first_loading_like_picture(self):
+        pace = MenuPace(15, 5)
+        self.assertEqual(pace.interval(), 5)
+        for t, mean, ends in ((5, 3.0, False), (10, 95.0, False), (15, 90.0, False), (20, 60.0, False), (25, 30.0, True), (30, 10.0, False)):
+            self.assertEqual(pace.note(t, mean), ends, (t, mean))
+        self.assertEqual((pace.interval(), pace.loading_at), (15, 25), "back to -CaptureEvery from the loading-like picture on")
+
+    def test_a_dark_start_is_not_a_loading_screen_and_no_menu_pace_keeps_the_normal_one(self):
+        pace = MenuPace(15, 5)
+        self.assertFalse(pace.note(5, 2.0) or pace.note(10, 0.5))   # black frames before any real screen
+        self.assertEqual(pace.interval(), 5)
+        self.assertEqual(MenuPace(15, 0).interval(), 15)
 
 
 class PickWindow(unittest.TestCase):

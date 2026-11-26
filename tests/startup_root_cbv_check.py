@@ -37,10 +37,13 @@ def check(directory, consumer, backend):
         # (the new colour), not the title memory behind it (the old colour); the second case is the snapshot behaviour.
         ("placed_copy", bytes((0, 255, 255, 255)), 0),
         ("placed_copy_snapshot", bytes((255, 255, 0, 255)), 0),
+        # Neither buffer aliases title memory: the copy is made on the CPU in title memory, or (switch set) refused as before.
+        ("placed_cpu_copy", bytes((0, 255, 255, 255)), 0),
+        ("placed_cpu_copy_refused", bytes((255, 255, 0, 255)), 0),
     )
     for case, drawn, lines in cases:
-        mode = "placed_copy" if case.startswith("placed_copy") else case
-        extra = {"X2W_TEST_SNAPSHOT_PLACED_BUFFERS": "1"} if case == "placed_copy_snapshot" else None
+        mode = "placed_copy" if case.startswith("placed_copy") else "placed_cpu_copy" if case.startswith("placed_cpu_copy") else case
+        extra = {"X2W_TEST_SNAPSHOT_PLACED_BUFFERS": "1"} if case.endswith(("_snapshot", "_refused")) else None
         pixels, ignored = run(directory, consumer, backend, mode, extra, case)
         if pixels is None:
             return 77

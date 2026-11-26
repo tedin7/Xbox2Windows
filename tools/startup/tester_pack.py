@@ -31,12 +31,12 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
+MENUS_STEP_S = 1           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
 MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_UP = "40"             # GameInput button masks, hexadecimal
 DPAD_DOWN = "80"
 BUTTON_A = "4"
-MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS_HOLD_S = "0.8"       # a press is held this long (0.2 s released before the next one, a press every 1 s): at 28 fps a poll comes every 0.04 s; at 2 to 3 fps every 0.4 s, still two polls
 MENUS2_HOLD_S = "1.2"
 MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
@@ -67,29 +67,65 @@ def menus2_script():
 
 def privacy_cycles(boxes):
     """The presses for the privacy screen (`boxes` checkboxes, then a Conferma button), as passes that never need to know the
-    clock or the state of the boxes. Every pass is: D-pad up `boxes + 1` times (the focus anchors on the first box; the list
-    does not wrap), toggle at most ONE box with A, move down to Conferma and press A. A press on a box toggles it, so a
-    pass that ticked the boxes wrongly cannot be repaired by repeating the same pass; instead the passes toggle a different
-    single box each time, in Gray-code order (none, box 1, box 2, box 1 for two boxes). Whatever state the boxes are in when
-    the screen opens, one pass in each round of 2^boxes reaches Conferma with every box ticked, and Conferma then changes
-    the screen. On the legal-notice screen before it (two list items and an Avanti button) every pass only selects items and
-    ends with A on Avanti, which opens the privacy screen. Returns the list of passes, each a list of button masks."""
-    passes = []
-    toggles = [None] + [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
-    for box in toggles:
-        presses = [DPAD_UP] * (boxes + 1)
-        at_box = 0
-        if box is not None:
-            presses += [DPAD_DOWN] * box + [BUTTON_A]
-            at_box = box
-        presses += [DPAD_DOWN] * (boxes - at_box) + [BUTTON_A]
-        passes.append(presses)
-    return passes
+    clock or the state of the boxes, fast: the first pass is the one that is right when nothing is ticked yet (tick every box,
+    Conferma); if the screen is still there after it, the later passes toggle ONE box each, Gray-code style, so that over
+    the whole round the boxes pass through every state with a press of Conferma at the end of each pass (a press on a box
+    toggles it, so repeating a pass cannot repair a wrong state; whatever state the boxes have when the screen opens,
+    one pass of the round reaches Conferma with every box ticked, and Conferma then changes the screen). Every pass starts
+    with D-pad up `boxes` times: the focus anchors on the first box from any item (the list does not wrap; the
+    previous pass ended on Conferma, the last of boxes + 1 items). On the legal-notice screen before it (two list items and
+    an Avanti button) every pass only selects items and ends with A on Avanti, which opens the privacy screen.
+    Returns the passes, each a list of button masks. Two boxes: 7 + 6 + 6 + 6 presses, a press every second."""
+    def one_pass(toggles):
+        presses = [DPAD_UP] * boxes
+        at = 0
+        for box in sorted(toggles):
+            presses += [DPAD_DOWN] * (box - at) + [BUTTON_A]
+            at = box
+        presses += [DPAD_DOWN] * (boxes - at) + [BUTTON_A]
+        return presses
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    # the round starts with "tick all"; the following passes then visit the other states (the XOR of the toggles of the
+    # passes so far, starting from all toggled, runs through all 2^boxes values: all, then each Gray step)
+    return [one_pass(list(range(boxes)))] + [one_pass([b]) for b in gray]
+
+
+def privacy_labels(boxes):
+    """One label per press of privacy_cycles(boxes), in the same order: what the press is for, so a log can say
+    'privacy pass 2: toggle box 1' instead of a button mask."""
+    labels = []
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    for number, toggled in enumerate([list(range(boxes))] + [[b] for b in gray], 1):
+        head = "privacy pass %d" % number
+        verb = "tick" if number == 1 else "toggle"
+        labels += ["%s: up (anchor on box 1)" % head] * boxes
+        at = 0
+        for box in sorted(toggled):
+            labels += ["%s: down to box %d" % (head, k + 2) for k in range(at, box)]
+            labels.append("%s: %s box %d" % (head, verb, box + 1))
+            at = box
+        labels += ["%s: down to %s" % (head, "Conferma" if target == boxes else "box %d" % (target + 1))
+                   for target in range(at + 1, boxes + 1)]
+        labels.append("%s: Conferma (Avanti on the legal notice)" % head)
+    return labels
+
+
+def input_labels(spec, seconds, privacy_boxes=2):
+    """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
+    `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
+    if spec != "menus":
+        return []
+    count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
+    if privacy_boxes > 0:
+        cycle = privacy_labels(privacy_boxes)
+    else:
+        cycle = ["menu: down", "menu: down", "menu: A"]
+    return [cycle[i % len(cycle)] for i in range(count)]
 
 
 def input_preset(spec, seconds, privacy_boxes=2):
-    """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 (the default; the privacy
+    """`menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
+    `seconds` of script time, but not past 300 s, at most 256 entries (about 260 s at one press a second). With privacy_boxes > 0 (the default; the privacy
     screen has two boxes) the presses are instead privacy_cycles() repeated, which also carries the title through the
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
     if spec == "menus2":
@@ -443,6 +479,79 @@ def first_poll(logdir):
     return None
 
 
+RE_ENDED_TIMEOUT = re.compile(r"^timeout after ([0-9.]+) s", re.M)
+RE_ENDED_REQUEST = re.compile(r"^stopped by request after ([0-9.]+) s \(([^)]*)\)", re.M)
+RE_ENDED_EXIT = re.compile(r"^process exited with (0x[0-9a-fA-F]+) after ([0-9.]+) s", re.M)
+RE_ENDED_STOP = re.compile(r"^stopped at (.+?) \((0x[0-9a-fA-F]+)\) at .* after ([0-9.]+) s", re.M)
+RE_HEARTBEAT_FRAMES = re.compile(r"x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s")
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def last_milestone(logdir):
+    """The last frame count the title reported ("last present #N at S s") from its heartbeat lines, or "no present reported"."""
+    best = None
+    for name in ("stderr.txt", "stdout.txt"):
+        path = os.path.join(logdir, name)
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 262144))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for found in RE_HEARTBEAT_FRAMES.finditer(text):
+            candidate = (float(found.group(2)), int(found.group(1)))
+            best = candidate if best is None or candidate[0] > best[0] else best
+    return "last present #%d at %.0f s" % (best[1], best[0]) if best else "no present reported"
+
+
+def end_cause(logdir):
+    """Why the run ended, always one line, from the debugger's summary and the files the watchdog leaves:
+    watchdog (stall/deadlock/memory, or a hard end), timeout, stopped by request (stop file or commit headroom), title
+    exited (code 0), killed externally (a non-zero exit code and no stop file), crashed (exception code), debugger stop."""
+    stall = _read_json(os.path.join(logdir, "stall_stop.json"))
+    hard = _read_json(os.path.join(logdir, "hard_end.json"))
+    text = ""
+    for path in (os.path.join(logdir, "finished.txt"), logdir.rstrip("\\/") + ".out"):
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+            break
+    if stall:
+        cause = "watchdog at %s s: %s" % (stall.get("at_seconds"), stall.get("reason"))
+    elif hard and not text:
+        cause = "debugger did not finish: " + str(hard.get("note"))
+    elif RE_ENDED_TIMEOUT.search(text):
+        cause = "timeout after %s s (the run was not stopped early)" % RE_ENDED_TIMEOUT.search(text).group(1)
+    elif RE_ENDED_REQUEST.search(text):
+        found = RE_ENDED_REQUEST.search(text)
+        cause = "stopped by request at %s s (%s, no watchdog stop)" % (found.group(1), found.group(2))
+    elif RE_ENDED_EXIT.search(text):
+        found = RE_ENDED_EXIT.search(text)
+        code, at = int(found.group(1), 16), found.group(2)
+        if code == 0:
+            cause = "title exited by itself (code 0x0) at %s s" % at
+        elif code >= 0xC0000000 and code != 0xFFFFFFFF:
+            cause = "title crashed (exit code %s) at %s s" % (found.group(1), at)
+        else:
+            cause = "title killed externally (exit code %s, no stop file) at %s s" % (found.group(1), at)
+    elif RE_ENDED_STOP.search(text):
+        found = RE_ENDED_STOP.search(text)
+        cause = "debugger stop: %s (%s) at %s s" % (found.group(1), found.group(2), found.group(3))
+    else:
+        cause = "unknown: the debugger wrote no summary (killed, or still running)"
+    if hard and text:
+        cause += "; hard end: " + str(hard.get("note"))
+    return cause + "; " + last_milestone(logdir)
+
+
 def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
@@ -494,6 +603,10 @@ def main(argv):
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
     p.add_argument("--privacy-boxes", type=int, default=2)
+    lab = sub.add_parser("input-labels")
+    lab.add_argument("spec")
+    lab.add_argument("seconds", type=int)
+    lab.add_argument("--privacy-boxes", type=int, default=2)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -507,6 +620,8 @@ def main(argv):
     s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
+    e = sub.add_parser("end-cause")
+    e.add_argument("logdir")
     q = sub.add_parser("pack")
     q.add_argument("logdir")
     q.add_argument("manifest")
@@ -519,6 +634,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds, args.privacy_boxes))
+        return 0
+    if args.cmd == "input-labels":
+        print(json.dumps(input_labels(args.spec, args.seconds, args.privacy_boxes)))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))
@@ -538,6 +656,9 @@ def main(argv):
         if args.json:
             with open(args.json, "w", encoding="utf-8") as handle:
                 json.dump(result, handle)
+        return 0
+    if args.cmd == "end-cause":
+        print(end_cause(args.logdir))
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)
