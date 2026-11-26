@@ -1512,6 +1512,16 @@ bool stale_large_copy_mutant()
     return on;
 }
 
+// X2W_FAST_FRAME_COPY=1 turns on the shared-lock reuse path in frame_copy (default off).
+bool fast_frame_copy_enabled()
+{
+    static const bool on = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("X2W_FAST_FRAME_COPY", value, sizeof(value)) && value[0] == '1';
+    }();
+    return on;
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
@@ -1526,6 +1536,27 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
         const auto& slice = found->second.slice;
+        // X2W_FAST_FRAME_COPY=1: when this recording already holds the chunk (an earlier draw of the list reused or made a copy
+        // there), nothing is written: a shared lock finds the chunk and confirms it is the same generation, the common case of
+        // many draws of one list; only a first hold takes the exclusive lock.
+        if (fast_frame_copy_enabled()) {
+            AcquireSRWLockShared(&allocator_lock);
+            bool held = false;
+            for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+                const auto& chunk = upload_chunks[i];
+                if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
+                    held = (self->own().upload_chunks >> i) & 1;
+                    break;
+                }
+            }
+            ReleaseSRWLockShared(&allocator_lock);
+            if (held) {
+                *offset = slice.offset;
+                if (resource) *resource = slice.resource;
+                if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
+                return true;
+            }
+        }
         AcquireSRWLockExclusive(&allocator_lock);
         for (unsigned i = 0; i < upload_chunks.size(); ++i) {
             auto& chunk = upload_chunks[i];
