@@ -7275,6 +7275,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
         log_compute_census();
         log_not_drawn_causes();
+        static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
+        if (now - last_key_report >= 60000) {
+            last_key_report = now;
+            log_not_drawn_keys();
+        }
     }
     if (render_mode() && frame % 300 == 0) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
