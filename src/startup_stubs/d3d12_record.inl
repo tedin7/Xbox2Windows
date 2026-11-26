@@ -115,8 +115,11 @@ bool in_window()
 }
 void update_window()
 {
+    const bool was_prefix = prefix_open;
     window_open = in_window();
     if (window_open) prefix_open = false;
+    if (window_open && was_prefix)
+        log("x2w-replay record: window opens after a prefix of %lld calls, %llu bytes written", calls_written, bytes_written);
 }
 
 // The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
@@ -287,6 +290,12 @@ void flush_all(bool at_exit)
 // so a large cache cannot hold the exit up. file_lock held.
 void write_shader_cache(bool at_exit)
 {
+    // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
+    char shaders[8]{};
+    if (GetEnvironmentVariableA("X2W_REPLAY_SHADERS", shaders, sizeof(shaders)) && shaders[0] == '0') {
+        if (!at_exit) log("x2w-replay record: shader cache not written (X2W_REPLAY_SHADERS=0)");
+        return;
+    }
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH - 4) return;
@@ -346,9 +355,12 @@ void stop(bool at_exit)
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
-    if (!at_exit)
-        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
-            end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
+    if (at_exit) return;
+    if (prefix_open)
+        log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
+            "%.1f s, %ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, seconds_now(), presents, max_bytes >> 20);
+    log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs, end.bytes,
+        presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
