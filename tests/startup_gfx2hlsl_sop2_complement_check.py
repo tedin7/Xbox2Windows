@@ -2,6 +2,7 @@
 tools/startup/gfx2hlsl.py.
 
   (no arguments)        translation controls, pure Python
+  nand-draw <dxc> <offscreen_check>  WARP pixel readback and a missing-NOT control
   binary <llvm-mc>      assemble the decoded text of every form with llvm-mc and compare with the words built here
   decode <libLLVM>      disassemble the same words with LLVM's C API and compare with tools/disasm_rdna2.py
 
@@ -23,8 +24,9 @@ one lane's bit. Bit i of ~(S0 op S1) depends only on bit i of each source, so wi
 SGPR destination the lane's bit of the result is exact: the form is accepted and checked here on every lane of the
 edge words. SCC is set when any bit of the complemented 32-bit result is, which the other lanes decide (the bit of an
 idle lane is set); the per-lane projection cannot show that, so SCC is not emitted and a program that can read it
-before the next SCC write is refused (through branches too). A mask and a plain word mixed, a constant source, and a
-vcc_lo or exec_lo destination stay refused. The mask mark follows program order, so a mark is a proof at a branch
+before the next SCC write is refused (through branches too). NAND can take a uniform-bit immediate (all zeroes or
+all ones) alongside a lane mask. Other mixed inputs and vcc_lo or exec_lo destinations stay refused. The mask mark
+follows program order, so a mark is a proof at a branch
 target only if the register's last write dominates the target and no block on a path from that write to the target
 writes the register again; otherwise the complement is refused until the register is written again. Mutations: the
 join rule disabled and the SCC read scan disabled must each accept a refused program.
@@ -52,6 +54,7 @@ import random
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -61,8 +64,9 @@ sys.path.insert(0, str(HERE))
 import disasm_rdna2 as D  # noqa: E402
 import gfx2hlsl as G  # noqa: E402
 import pixel_aot as P  # noqa: E402
-from startup_flat_param_check import assemble  # noqa: E402
-from startup_gfx2hlsl_bit_alu_check import Expr as BitExpr  # noqa: E402
+from startup_flat_param_check import assemble, compile_hlsl, draw, root_blob  # noqa: E402
+from startup_gfx2hlsl_bit_alu_check import (  # noqa: E402
+    POST_WORDS, PRE_WORDS, Expr as BitExpr, vs_words, words_text)
 
 MASK = 0xffffffff
 OPCODE = {name: op for op, (name, _) in D.SOP2_OPS.items()}
@@ -281,8 +285,11 @@ def lane_mask_controls():
     # 2. Still refused: a constant or plain-word source next to a mask, a mask destination, a high-half mask name.
     for name in OPS:
         wrong = []
-        for operands in ('s3, s1, s9', 's3, s9, vcc_lo', 's3, s1, -1', 's3, 0, vcc_lo', 'vcc_lo, s1, s2',
-                         'exec_lo, s1, s2', 's3, s1, vcc_hi', 'm0, s1, s2'):
+        refused_forms = ('s3, s1, s9', 's3, s9, vcc_lo', 's3, s1, -2', 's3, 1, vcc_lo', 'vcc_lo, s1, s2',
+                         'exec_lo, s1, s2', 's3, s1, vcc_hi', 'm0, s1, s2')
+        if name != 's_nand_b32':
+            refused_forms += ('s3, s1, -1', 's3, 0, vcc_lo')
+        for operands in refused_forms:
             stage = Probe()
             stage.masks.update((1, 2))
             try:
@@ -353,6 +360,48 @@ def lane_mask_controls():
     finally:
         G.Stage.descriptor_scc_reads = saved
     check('mutation without the SCC read scan accepts the read', got.startswith('accepted'), got)
+
+
+def nand_draw_fixture():
+    # Two compare-derived masks and two forms reading EXEC. Select normal floats for exact MRT readback.
+    inputs = (0, 7, 0, 0)
+    values = (0x3f800000, 0x40000000)
+    vs = vs_words([(bits, *values) for bits in inputs])
+    ps = bytearray(PRE_WORDS)
+    for index in range(2):
+        # v_cmp_ne_i32_e64 s20/s21, 0, v0/v1
+        ps.extend(struct.pack('<2I', 0xd4850014 + index, 128 | ((256 + index) << 9)))
+    forms = ((20, 193, None), (LITERAL, 21, MASK), (EXEC_LO, 128, None), (193, EXEC_LO, None))
+    for index, (src0, src1, literal) in enumerate(forms):
+        ps.extend(sop2('s_nand_b32', 24 + index, src0, src1, literal))
+        # v_cndmask_b32_e64 v12..v15, v4..v7, v8..v11, s24..s27
+        ps.extend(struct.pack('<2I', 0xd501000c + index,
+                              (260 + index) | ((264 + index) << 9) | ((24 + index) << 18)))
+    pipe = G.Pipeline(vs, bytes(ps) + POST_WORDS, root_blob())
+    and_bits = (bool(inputs[0]), bool(inputs[1]), False, True)
+    correct = words_text(values[not bit] for bit in and_bits)
+    wrong = words_text(values[bit] for bit in and_bits)
+    return pipe, correct, wrong
+
+
+def nand_draw(dxc, runner):
+    pipe, correct, wrong = nand_draw_fixture()
+    shader = pipe.hlsl_ps()
+    mutant, edits = re.subn(r'(s2[4-7] = \()~', r'\1', shader)
+    assert edits == 4
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), 'nand_vs', 'vs_6_0', directory)
+        ps = compile_hlsl(dxc, 'dxc', shader, 'nand_ps', 'ps_6_0', directory)
+        run = draw(runner, 'warp', vs, ps, correct)
+        if run.returncode:
+            raise AssertionError(run.stderr)
+        ps = compile_hlsl(dxc, 'dxc', mutant, 'nand_mutant_ps', 'ps_6_0', directory)
+        run = draw(runner, 'warp', vs, ps, correct)
+        if run.returncode != 1 or f'actual={wrong}' not in run.stderr:
+            raise AssertionError(f'NAND mutant should fail readback with {wrong}: {run.stderr}')
+        print('NAND mutant rejected at the expected pixel values')
+
 
 
 def pack_controls():
@@ -688,6 +737,13 @@ def controls():
     check('%d SOP2 operations without a lowering are refused by name (%s)' % (len(missing), ', '.join(missing)),
           missing and not wrong and not set(OPS) & set(missing), str(wrong))
     lane_mask_controls()
+    pipe, expected, mutant = nand_draw_fixture()
+    hlsl = pipe.hlsl_ps()
+    check('NAND with uniform-bit literals reaches the pixel export',
+          all(f's{reg} = (~(' in hlsl for reg in range(24, 28)) and expected != mutant, hlsl)
+    got = text_refusal('s_nand_b32 s24, exec_lo, -1', 's_cselect_b32 s25, 1, 0', 's_endpgm')
+    check('NAND with a uniform-bit literal still guards a whole-word SCC read',
+          got == 'scc from a lane-mask complement in s_cselect_b32', got)
     pack_controls()
     bfe_controls()
     mul_controls()
@@ -720,7 +776,9 @@ def main():
         controls()
     else:
         mode, *args = sys.argv[1:]
-        if mode == 'binary':
+        if mode == 'nand-draw':
+            nand_draw(*args)
+        elif mode == 'binary':
             check_binary(*args)
         elif mode == 'decode':
             check_decode(*args)

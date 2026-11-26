@@ -5850,6 +5850,12 @@ class Stage:
                     r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks)
             lane_complement = (word_complement and bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
                                and all(mask_source(t) for t in srcs))
+            if (base == 's_nand_b32' and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
+                    and len(srcs) == 2 and any(mask_source(t) for t in srcs)):
+                # A uniform-bit literal supplies the same bit to every lane. Arbitrary scalar words
+                # need a guest lane index, which graphics translation does not track.
+                lane_complement |= all(mask_source(t) or (not reg_range(t) and self.const_u32(t) in (0, 0xffffffff))
+                                       for t in srcs)
             if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):
                 raise Unsupported('%s on a lane mask' % base)
             if lane_complement and any(reg_range(t) and reg_range(t)[1] in getattr(self, 'join_masks', ())
