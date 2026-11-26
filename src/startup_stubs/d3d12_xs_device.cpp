@@ -5694,6 +5694,19 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     return S_OK;
 }
 
+bool slot70_texture_alias_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_SLOT70_ALIAS_TEXTURE");
+    return enabled;
+}
+
+void note_slot133_texture(Wrapper* device, Wrapper* texture, const D3D12_RESOURCE_DESC* desc)
+{
+    const u64 span = slot70_texture_alias_enabled() && x2w_startup::gfx10::supports(*desc)
+        ? x2w_startup::gfx10::Layout(*desc).bytes() : 0;
+    note_resource(texture, desc, 0, span ? device : nullptr, span);
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -5739,7 +5752,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             }
             w->own().title_memory = address;
             w->own().lazy_slot133_texture = true;
-            note_resource(w, desc, 0);
+            note_slot133_texture(self, w, desc);
             retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
             static LONG lazy_created;
             if (first_calls(lazy_created, 6)) {
@@ -5786,7 +5799,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         w->own().budget = x2w_budget::committed(device_of(self), created, props.Type, in_system_memory);
         if (in_system_memory) log_sysmem_fallback(address, texture, "eager");
         w->own().title_memory = address;
-        note_resource(w, desc, 0);
+        note_slot133_texture(self, w, desc);
         retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
         *out = w;
         return S_OK;

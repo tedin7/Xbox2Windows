@@ -3428,7 +3428,7 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
-texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. By default, a mismatched or interior view overlapping a live resource preserves the destination descriptor.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
 the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
 textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
@@ -3486,6 +3486,38 @@ layouts"):
 
 - `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
+
+### Overlapping texture views
+
+`X2W_SLOT70_ALIAS_TEXTURE=1` lets slot 70 publish a multi-mip 2D or 2D-array
+SRV over a live slot 133 texture on the same device. The request must fit a
+single owner and map to a contiguous range of whole mips in one or more
+array slices. The layout check matches the storage format, swizzle, mip
+offsets, block row widths and mip-tail origins. Multi-slice views also need
+the same slice stride. The desktop descriptor names the matching mip and
+slice range of the existing backing, so GPU writes through other views
+are visible with normal resource transitions. A second, differently
+described placed texture cannot generally inherit these bytes under
+[D3D12's texture data inheritance rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-aliasing-and-data-inheritance).
+
+`overlapping_resource` still applies when the request crosses a resource
+boundary, meets multiple live resources, or overlaps a buffer, a lazy
+texture, or an incompatible texture. This includes offsets that miss whole
+subresources, different formats or swizzles, backing with substituted
+format or dimensions, depth resources and resources that deny SRVs.
+A 2D view requires a single-slice owner. The existing console-layout
+holds still apply. The switch defaults off.
+
+The synthetic WARP fixture publishes the alias, clears the owner's mips
+through RTVs and compares the draw's 32 pixels with a CPU reference.
+It exercises both the first slice's mip tail and the second slice's
+interior address. The disabled and misaligned cases preserve the null
+descriptor. The wrong-slice control must differ from the interior reference
+at all 32 pixels.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_slot70_texture_alias_warp$' -V
+```
 
 ## Linear buffer backing (device slot 133, opt-in)
 

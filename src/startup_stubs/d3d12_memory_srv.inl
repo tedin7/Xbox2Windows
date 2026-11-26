@@ -228,6 +228,120 @@ bool address_resource_overlap(u64 address, u64 span)
     return found;
 }
 
+// Find a whole subresource window in a live slot 133 texture. Compare the console layout
+// before referring to the desktop backing, whose physical tile layout is private to D3D12.
+bool remap_texture_alias(const ResourceInfo& info, u64 offset, const D3D12_RESOURCE_DESC& requested,
+                         const x2w_startup::gfx10::Layout& layout, D3D12_SHADER_RESOURCE_VIEW_DESC& view)
+{
+    const auto& owner = info.console;
+    if (owner.Layout != requested.Layout || owner.Format != requested.Format || owner.SampleDesc.Quality ||
+        !x2w_startup::address_view_fits(requested, view) ||
+        (owner.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)) ||
+        owner.MipLevels < requested.MipLevels || owner.DepthOrArraySize < requested.DepthOrArraySize)
+        return false;
+    const UINT last_start = owner.MipLevels - requested.MipLevels;
+    UINT first_mip = 0;
+    for (; first_mip <= last_start; ++first_mip) {
+        if ((std::max)(u64{1}, owner.Width >> first_mip) == requested.Width &&
+            (std::max)(1u, owner.Height >> first_mip) == requested.Height)
+            break;
+    }
+    if (first_mip > last_start) return false;
+
+    const x2w_startup::gfx10::Layout backing(owner);
+    const u64 first_slice = offset / backing.slice_size;
+    const u64 slice_offset = offset % backing.slice_size;
+    if (first_slice + requested.DepthOrArraySize > owner.DepthOrArraySize ||
+        layout.slice_size > backing.slice_size - slice_offset ||
+        (requested.DepthOrArraySize > 1 && layout.slice_size != backing.slice_size))
+        return false;
+    for (UINT mip = 0; mip < requested.MipLevels; ++mip) {
+        const UINT source = first_mip + mip;
+        if ((mip >= layout.first_tail) != (source >= backing.first_tail) ||
+            backing.blocks_wide[source] != layout.blocks_wide[mip] ||
+            backing.start[source] != slice_offset + layout.start[mip] ||
+            backing.origin_x[source] != layout.origin_x[mip] || backing.origin_y[source] != layout.origin_y[mip])
+            return false;
+    }
+
+    // Expand the all-mips sentinel relative to the requested description.
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+        if (owner.DepthOrArraySize != 1) return false;
+        auto& v = view.Texture2D;
+        if (v.MipLevels == UINT_MAX) v.MipLevels = requested.MipLevels - v.MostDetailedMip;
+        v.MostDetailedMip += first_mip;
+    } else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        auto& v = view.Texture2DArray;
+        if (v.MipLevels == UINT_MAX) v.MipLevels = requested.MipLevels - v.MostDetailedMip;
+        v.MostDetailedMip += first_mip;
+        v.FirstArraySlice += static_cast<UINT>(first_slice);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+Wrapper* find_texture_alias(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc,
+                            D3D12_SHADER_RESOURCE_VIEW_DESC& view, bool& overlap)
+{
+    const x2w_startup::gfx10::Layout layout(desc);
+    const u64 span = layout.bytes();
+    const Wrapper* owner = nullptr;
+    note_lock_acquire(false);
+    resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
+        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+            return false;
+        const auto& info = resource_infos().at(wrapper);
+        const auto base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        const u64 bytes = info.texture_alias_bytes ? info.texture_alias_bytes :
+            info.bytes ? info.bytes : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
+        if (!x2w_startup::address_span_touches(address, span, base, bytes)) return false;
+        if (overlap) {
+            owner = nullptr;
+            return true;
+        }
+        overlap = true;
+        if (info.texture_alias_device == device && address >= base && address - base < info.texture_alias_bytes &&
+            span <= info.texture_alias_bytes - (address - base))
+            owner = wrapper;
+        return false;
+    });
+
+    // Pin the wrapper before leaving the index lock. A concurrent final release can already
+    // have set refs to zero while waiting for the index lock in retire_placement().
+    Wrapper* retained = nullptr;
+    if (owner) {
+        auto* candidate = const_cast<Wrapper*>(owner);
+        auto& refs = candidate->own().refs;
+        LONG previous = InterlockedCompareExchange(&refs, 0, 0);
+        while (previous > 0) {
+            const LONG observed = InterlockedCompareExchange(&refs, previous + 1, previous);
+            if (observed == previous) {
+                retained = candidate;
+                break;
+            }
+            previous = observed;
+        }
+    }
+    const ResourceInfo info = retained ? resource_infos().at(retained) : ResourceInfo{};
+    ReleaseSRWLockShared(&note_lock);
+    if (!retained) return nullptr;
+
+    // Lazy and format/size-substituted resources have no verified backing for this mapping.
+    if (!retained->own().lazy_slot133_texture && retained->own().real && !retained->own().drop_levels &&
+        remap_texture_alias(info, address - reinterpret_cast<u64>(retained->own().title_memory), desc, layout, view)) {
+        const auto native = static_cast<ID3D12Resource*>(retained->own().real)->GetDesc();
+        const auto& source = info.console;
+        if (native.Width == source.Width && native.Height == source.Height && native.Format == source.Format &&
+            native.DepthOrArraySize == source.DepthOrArraySize && native.MipLevels == source.MipLevels &&
+            !(native.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && x2w_startup::address_view_fits(native, view))
+            return retained;
+    }
+    release(retained);
+    return nullptr;
+}
+
 // A live render-target, depth or UAV resource overlapping the texel is written on the desktop side, so its
 // title memory does not hold the texel. For a resource of unknown size, its base is the only known byte.
 bool gpu_written_overlap(u64 address, UINT texel_bytes)
@@ -969,8 +1083,21 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             texture = nullptr;
         } else if (!texture) {
             held = console_address_hold(self, input->address, *resource);
-            if (!held && address_resource_overlap(input->address, address_texture_bytes(self, *resource)))
+            if (!held && slot70_texture_alias_enabled() && resource->MipLevels > 1 &&
+                resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                auto adjusted = input->view;
+                bool overlap = false;
+                if (Wrapper* owner = find_texture_alias(self, input->address, *resource, adjusted, overlap)) {
+                    log_address_kind("published overlapping subresources", *resource, input->view, input->address);
+                    view_slot<18, 2>(self, reinterpret_cast<u64>(owner), reinterpret_cast<u64>(&adjusted), destination, 0);
+                    note_memory_srv_write(resource, input, destination);
+                    release(owner);
+                    return;
+                }
+                if (overlap) held = "overlapping_resource";
+            } else if (!held && address_resource_overlap(input->address, address_texture_bytes(self, *resource))) {
                 held = "overlapping_resource";
+            }
             texture = held ? nullptr : publish_tiled_texture(self, input->address, *resource);
             outcome = "published console layout";
         }
