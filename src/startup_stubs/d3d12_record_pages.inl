@@ -127,6 +127,8 @@ void page_flush_target()
     if (!page_target || page_target->bytes.empty()) return;
     AcquireSRWLockExclusive(&file_lock);
     drain(*page_target);
+    // The calls' cap check (record_call) only runs when a thread buffer fills; a scan that drains every present would skip it.
+    if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&file_lock);
 }
 void page_sink(const char* tag, const void* header, std::size_t header_bytes, const void* data, std::size_t data_bytes)
