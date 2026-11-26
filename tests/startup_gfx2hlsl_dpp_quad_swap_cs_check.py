@@ -4,7 +4,7 @@
   (no arguments)                         translation controls and refusals, pure Python
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                          translate, compile with DXC cs_6_0, dispatch and compare all 320 words
-  control <wrong-neighbour|no-exchange> <dxc> <offscreen_check> <warp|hardware>
+  control <wrong-neighbour|no-exchange|int-add-no-exchange> <dxc> <offscreen_check> <warp|hardware>
                                          mutated translation must mismatch on readback at the named word
 
 In a DPP16 `quad_perm:[a,b,c,d]` source, lane i of each aligned group of four reads lane perm[i] of that group (AMD RDNA 2
@@ -37,6 +37,7 @@ GROUP = (4, 4, 2)  # 32 threads: one wave32 or half a wave64
 RSRC2 = USER7 | TGID_X | tidig(3)
 V_CVT_F32_U32 = 0x06
 V_ADD_F32 = 0x03
+V_ADD_NC_U32 = 0x25
 INLINE_7, INLINE_1 = 128 + 7, 128 + 1
 SWAP_X, SWAP_Y, SWAP_DIAGONAL = (1, 0, 3, 2), (2, 3, 0, 1), (3, 2, 1, 0)
 
@@ -55,9 +56,16 @@ PROGRAM = b''.join([
     vop1_dpp(0x01, 8, 5, SWAP_X),
     vop1_dpp(0x01, 9, 5, SWAP_Y),
     vop2_dpp(V_ADD_F32, 10, 6, 6, SWAP_DIAGONAL),
+    vop2_dpp(V_ADD_NC_U32, 12, 5, 5, SWAP_X),
+    vop2_dpp(V_ADD_NC_U32, 13, 5, 5, SWAP_Y),
+    vop2_dpp(V_ADD_NC_U32, 14, 5, 5, SWAP_DIAGONAL),
+    vop1(V_MOV_B32, 15, 256 + 3),
     S_WAITCNT_LGKM0,
 ])
-PROGRAM_TAIL_STORE = BUFFER_STORE_X4_V8_V4_S16 + S_ENDPGM
+# A second store of v[12:15] at byte offset 512 (the first record block is 32 lanes x 16 bytes): MUBUF word 0 with offen and
+# offset 512, word 1 with vdata v12 (the same vaddr v4 and resource s[16:19] as the first store).
+BUFFER_STORE_X4_V12_V4_S16_OFFSET512 = struct.pack('<2I', 0xe0781200, 0x80040c04)
+PROGRAM_TAIL_STORE = BUFFER_STORE_X4_V8_V4_S16 + BUFFER_STORE_X4_V12_V4_S16_OFFSET512 + S_ENDPGM
 PROGRAM += PROGRAM_TAIL_STORE
 
 
@@ -66,6 +74,8 @@ def expected_words():
     for lane in range(32):
         f = struct.unpack('<I', struct.pack('<f', float((lane ^ 3) + lane)))[0]
         out[4 * lane:4 * lane + 4] = [(lane ^ 1) * 7 + 1, (lane ^ 2) * 7 + 1, f, lane]
+        own = lane * 7 + 1
+        out[128 + 4 * lane:128 + 4 * lane + 4] = [((lane ^ k) * 7 + 1 + own) for k in (1, 2, 3)] + [lane]
     return out
 
 
@@ -80,11 +90,13 @@ def check_controls():
     assert 'groupshared uint x2w_quad[32];' in hlsl, hlsl
     for k in (1, 2, 3):
         assert 'x2w_quad[%s ^ %du]' % (flat, k) in hlsl, (k, hlsl)
-    assert hlsl.count('GroupMemoryBarrierWithGroupSync();') == 6, hlsl  # one before and one after each of the 3 exchanges
+    assert hlsl.count('GroupMemoryBarrierWithGroupSync();') == 12, hlsl  # one before and one after each of the 6 exchanges
     assert 'QuadReadAcross' not in hlsl, hlsl
     asm = [a for _, _, _, a in G.decode(PROGRAM)]
     assert 'v_mov_b32_dpp v8, v5 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf' in asm, asm
     assert any(a.startswith('v_add_f32_dpp v10, v6, v6 quad_perm:[3,2,1,0]') for a in asm), asm
+    assert any(a.startswith('v_add_nc_u32_dpp v12, v5, v5 quad_perm:[1,0,3,2]') for a in asm), asm
+    assert any(a.startswith('buffer_store_dwordx4 v[12:15], v4, s[16:19], 0 offen offset:512') for a in asm), asm
 
     dpp = vop1_dpp(0x01, 8, 5, SWAP_X)
     # whole quads only
@@ -105,18 +117,24 @@ CONTROLS = {
     'wrong-neighbour': ('x2w_quad[%s ^ 1u]', 'x2w_quad[%s ^ 2u]'),
     # the diagonal exchange reads the lane's own word: v10 becomes 2 * lane
     'no-exchange': ('x2w_quad[%s ^ 3u]', 'x2w_quad[%s ^ 0u]'),
+    # the integer v_add_nc_u32_dpp X exchange (the second ^ 1u read) reads the lane's own word: lane 0 stores 2 instead of 9
+    'int-add-no-exchange': ('x2w_quad[%s ^ 1u]', 'x2w_quad[%s ^ 0u]'),
 }
 CONTROL_MISMATCH = {
     'wrong-neighbour': 'word=0 expected=00000008 actual=0000000f',
     'no-exchange': 'word=2 expected=40400000 actual=00000000',
+    'int-add-no-exchange': 'word=128 expected=00000009 actual=00000002',
 }
 
 
 def mutate(hlsl, control):
     flat = '(tid.x + 4u * (tid.y + 4u * tid.z))'
     old, new = (t % flat for t in CONTROLS[control])
-    assert hlsl.count(old) == 1, (control, hlsl)
-    return hlsl.replace(old, new)
+    occurrence = 2 if control == 'int-add-no-exchange' else 1  # which read of the exchange to break (program order)
+    assert hlsl.count(old) == 2 and old != new, (control, hlsl)
+    first = hlsl.index(old)
+    at = first if occurrence == 1 else hlsl.index(old, first + 1)
+    return hlsl[:at] + new + hlsl[at + len(old):]
 
 
 def check_dispatch(dxc, runner, adapter, control=None):
