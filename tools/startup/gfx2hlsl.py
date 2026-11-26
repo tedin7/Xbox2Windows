@@ -6066,7 +6066,10 @@ class Stage:
             n = SHIFT_ADD[base]
             carry = '(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1])
             if numeric_descriptor and 'src_scc' in srcs:
-                # The result also needs the incoming SCC after the carry assignment.
+                # The result also needs the incoming SCC after the carry assignment. The snapshot scope is
+                # closed only on the m0 and general scalar paths, so refuse the other destinations.
+                if dname != 'm0' and (mask_dest or dname == 'null' or not dst or dst[0] != 's' or dst[1] > 105):
+                    raise Unsupported('%s reads src_scc with a destination that is a special register' % base)
                 if self.tracks_uniformity():
                     result_uniform = self.scalar_expr_uniform(expr)
                 self.emit('{ uint scc_in = (scc ? 1u : 0u);')
