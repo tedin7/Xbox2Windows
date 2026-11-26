@@ -314,6 +314,7 @@ std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { 
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
+LONG64 zero_tail_bytes_saved;  // bytes of buffer bindings not copied because they were zero to the end (zero_tail.h)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
 void count_null_binding(x2w_local::NullCause cause)
@@ -3114,6 +3115,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         ID3D12Resource* chunk = nullptr;
         const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+        if (readable_range && !formatted.entry && bytes >= (64u << 10)) {
+            // A raw view reads zero past its end and unwritten title memory is zero: copy only up to the last non-zero byte.
+            // (A 16 MiB binding copied whole on every draw emptied the 256 MiB upload ring.)
+            const std::size_t used = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes);
+            if (used < bytes) {
+                InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(bytes - used));
+                bytes = used;
+            }
+        }
         bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
