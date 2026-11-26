@@ -69,6 +69,10 @@ LINES = (
     ('a.channels-field', 'uav 0 tex2d table 0 0 channels 4', None,
      'uav line refused (unexpected field after the table offset)'),
     ('a.second-view', 'uav 1 tex2d table 0 0', None, 'uav line refused (view index out of order)'),
+    # 'uavload N' (a partial-dmask store reads the texel back): a view that does not exist, a repeat or junk.
+    ('a.uavload-range', 'uav 0 tex2d table 0 0\nuavload 1', None, 'uavload line refused: uavload 1'),
+    ('a.uavload-twice', 'uav 0 tex2d table 0 0\nuavload 0\nuavload 0', None, 'uavload line refused: uavload 0'),
+    ('a.uavload-junk', 'uav 0 tex2d table 0 0\nuavload x', None, 'uavload line refused: uavload x'),
 )
 
 
