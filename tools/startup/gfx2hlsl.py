@@ -1614,6 +1614,10 @@ MASK_AWARE_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|no
                                 r'ff1|bitset[01]|setpc|getpc|swappc|branch|waitcnt|endpgm|nop)(_|$)')
 # Scalar ops whose result is a lane mask when a source is one (a copy or a bitwise combination), unlike s_ff1 or s_bitset.
 MASK_COPY_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|wqm)_b(32|64)$')
+# A 32-bit integer SALU op writes a number, never a lane mask: its destination ends the mask tag of the register (a mask that
+# reached it as a source was refused first, or the group is one thread and the number is exact).
+NUMERIC_SALU_RE = re.compile(r'^s_(add|sub|addc|subb)_[ui]32$|^s_(mul|mulk|addk)_i32$|^s_mul_hi_[ui]32$|^s_(min|max)_[ui]32$|'
+                             r'^s_(lshl|lshr|ashr)_[bi]32$|^s_bfe_[ui]32$|^s_bfm_b32$|^s_absdiff_i32$')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
@@ -4438,6 +4442,11 @@ class Stage:
                 r = reg_range(tok)
                 if r and r[0] == 's' and r[2] == r[1]:
                     self.masks.discard(r[1])
+        if NUMERIC_SALU_RE.match(base):
+            for tok in destinations(base, ops):
+                r = reg_range(tok)
+                if r and r[0] == 's':
+                    self.masks.difference_update(range(r[1], r[2] + 1))
         scalar = bool(MASK_COPY_SALU_RE.match(base)) and (low or high)
         pair_select = base.startswith('s_cselect') and base.endswith('b64')
         if not (saveexec or scalar or pair_select):

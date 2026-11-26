@@ -141,6 +141,30 @@ def main():
         run(s, 's_add_i32 s1, s0, 0')
         check('%s: a mask register overwritten by a constant is a number again' % kind, 0 not in s.masks, s.masks)
 
+    # A numeric 32-bit SALU result over a register that held a mask is a number: the tag ends there, so a later numeric read of it
+    # (here s_max_u32) is not a read of a lane mask. Mask writers keep tagging (checked above), and a mask as a SOURCE of the
+    # numeric op is still refused in a multi-thread group.
+    for kind in ('ps', 'cs'):
+        for op in ('s_bfe_u32 s6, s8, 0x40010', 's_lshr_b32 s6, s8, 3', 's_min_u32 s6, s8, s9', 's_max_u32 s6, s8, s9',
+                   's_add_u32 s6, s8, 3', 's_mul_i32 s6, s8, 3', 's_ashr_i32 s6, s8, 2'):
+            s = stage()
+            s.kind = kind
+            run(s, COMPARE, op)
+            check('%s: %s clears the mask tag of s6' % (kind, op), 6 not in s.masks, s.masks)
+            try:
+                run(s, 's_max_u32 s10, s6, s20')
+                check('%s: s_max_u32 of the result after %s is a number read' % (kind, op), True)
+            except G.Unsupported as why:
+                check('%s: s_max_u32 of the result after %s is a number read' % (kind, op), False, str(why))
+        s = stage()
+        s.kind = kind
+        run(s, COMPARE)
+        try:
+            run(s, 's_max_u32 s10, s6, s20')
+            check('%s: control: a real mask as the source of s_max_u32 is refused' % kind, False)
+        except G.Unsupported as why:
+            check('%s: control: a real mask as the source of s_max_u32 is refused' % kind, 'as numeric data' in str(why), str(why))
+
     if failures:
         print('FAILED: %d check(s)' % failures)
         return 1
