@@ -91,7 +91,7 @@ int main(int argc, char** argv)
     if (!adapter) return 77;
     DXGI_ADAPTER_DESC1 adapter_desc{};
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) std::printf("adapter=%ls\n", adapter_desc.Description);
-    ComPtr<IUnknown> guest, small_heap, big_heap;
+    ComPtr<IUnknown> guest, stale_heap, ring_heap;
     std::array<unsigned char, 64> parameters{};
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device),
                                      reinterpret_cast<void**>(guest.GetAddressOf()))))
@@ -103,7 +103,7 @@ int main(int argc, char** argv)
         } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count}, 0, 0};
         return SUCCEEDED(invoke(guest.Get(), 14, &heap_desc, &__uuidof(ID3D12DescriptorHeap), heap.GetAddressOf()));
     };
-    if (!make_heap(4, small_heap) || !make_heap(slots, big_heap)) return 3;
+    if (!make_heap(4, stale_heap) || !make_heap(slots, ring_heap)) return 3;
     const UINT stride = invoke<UINT>(guest.Get(), 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     // A constant buffer view per index: each a distinct view (the stand-in tells views apart by every description byte,
     // so the description is zeroed with memset before its fields are set).
@@ -117,8 +117,8 @@ int main(int argc, char** argv)
 
     // Stale token: view X in slot 0, its token copied by the title into slot 1 with its own memory copy (nothing tracks
     // that copy). Y and then Z replace X in slot 0; Z takes X's freed record.
-    const UINT64 small = invoke<UINT64>(small_heap.Get(), 9);
-    const UINT64 slot0 = small, slot1 = small + stride, slot2 = small + 2 * UINT64{stride};
+    const UINT64 stale_first = invoke<UINT64>(stale_heap.Get(), 9);
+    const UINT64 slot0 = stale_first, slot1 = stale_first + stride, slot2 = stale_first + 2 * UINT64{stride};
     constant_view(0, slot0);
     const auto x = probe(slot0);
     std::memcpy(reinterpret_cast<void*>(slot1), reinterpret_cast<const void*>(slot0), 32);
@@ -138,15 +138,15 @@ int main(int argc, char** argv)
     expect(again.token == 1 && again.id != z.id, "the first view created again shares the reused record");
 
     // Two million distinct views into the same 4096 slots: the table stays at about one record per slot.
-    const UINT64 big = invoke<UINT64>(big_heap.Get(), 9);
-    const auto before = probe(big);
-    for (UINT n = 0; n < views; ++n) constant_view(16 + n, big + UINT64{n % slots} * stride);
-    const auto after = probe(big);
+    const UINT64 ring_first = invoke<UINT64>(ring_heap.Get(), 9);
+    const auto before = probe(ring_first);
+    for (UINT n = 0; n < views; ++n) constant_view(16 + n, ring_first + UINT64{n % slots} * stride);
+    const auto after = probe(ring_first);
     std::printf("view records %llu -> %llu after %u views into %u slots (reused %llu, free list %llu, ids %llu)\n",
                 before.records, after.records, views, slots, after.reused, after.free_list, after.ids);
     expect(after.records <= before.records + slots + slack, "the view records grew with views rewritten into the same slots");
     expect(after.ids <= before.ids + slots + slack, "the view id map grew with views rewritten into the same slots");
-    expect(probe(big).token == 1 && probe(big + UINT64{slots - 1} * stride).token == 1,
+    expect(probe(ring_first).token == 1 && probe(ring_first + UINT64{slots - 1} * stride).token == 1,
            "the newest views in the rewritten slots do not resolve");
 
     if (failures) return 5;
