@@ -2345,7 +2345,23 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
-def mrtz_covers_every_path(ins, at):
+def mrtz_followed_by_vm(ins, at):
+    """Find the terminating valid-mask export in the same EXEC region and basic block."""
+    targets = {parse(asm)[1][0] for _, _, name, asm in ins
+               if name == 's_branch' or name.startswith('s_cbranch')}
+    for off, _, name, asm in ins:
+        if off <= at:
+            continue
+        if ('label_0x%x' % off in targets
+                or name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_endpgm', 's_trap'))
+                or writes_exec(name, parse(asm)[1])):
+            break
+        if name == 'exp' and 'done' in asm.split():
+            return 'vm' in asm.split()
+    return False
+
+
+def mrtz_covers_every_path(ins, at, *, deferred_vm=False):
     """True when every path from the first instruction to an s_endpgm either runs the depth export at offset `at` or ends in a
     `exp null ... vm` export (the early exit of a kill: it discards a lane that left EXEC), and the export cannot run twice.
 
@@ -2353,8 +2369,18 @@ def mrtz_covers_every_path(ins, at):
     way out when no lane is live, which the null export's vm flag turns into a discard; every other conditional branch is
     followed both ways. An indirect jump or a branch that leaves the program makes the answer False."""
     index = {off: i for i, (off, _s, _n, _a) in enumerate(ins)}
-    absorbing = {off for off, _s, name, asm in ins
-                 if off == at or (name == 'exp' and re.match(r'exp null\b.*\bvm\b', asm) is not None)}
+    absorbing = {at}
+    terminal_nulls = set()
+    if deferred_vm:
+        terminal_nulls = {off for i, (off, _, name, asm) in enumerate(ins[:-1])
+                          if name == 'exp' and asm == 'exp null off, off, off, off done vm'
+                          and ins[i + 1][2] == 's_endpgm'}
+        # The canonical demote exit proves EXEC zero even on its SCC edge.
+        if ins[-1][2] == 's_endpgm' and kill_exit_block(ins):
+            absorbing.add(ins[-2][0])
+    else:
+        absorbing.update(off for off, _s, name, asm in ins
+                         if name == 'exp' and re.match(r'exp null\b.*\bvm\b', asm) is not None)
     successors = []
     for i, (_off, _size, name, asm) in enumerate(ins):
         if name == 's_endpgm':
@@ -2365,22 +2391,31 @@ def mrtz_covers_every_path(ins, at):
             target = index.get(int(parse(asm)[1][0].split('_')[1], 16))
             if target is None:
                 return False
+            if deferred_vm and name != 's_branch' and i + 1 == len(ins):
+                return False
             successors.append([target] if name == 's_branch' else [i + 1, target])
         else:
             successors.append([i + 1] if i + 1 < len(ins) else [])
     if at not in index:
         return False
-    stack, seen = [0], set()
+    stack, seen = [(0, False)], set()
     while stack:
-        i = stack.pop()
-        if i in seen:
+        i, zero_exec = stack.pop()
+        if (i, zero_exec) in seen:
             continue
-        seen.add(i)
-        if ins[i][0] in absorbing:
+        seen.add((i, zero_exec))
+        off, _, name, asm = ins[i]
+        if off in absorbing or (zero_exec and off in terminal_nulls):
             continue
-        if ins[i][2] == 's_endpgm':
+        if name == 's_endpgm' or (deferred_vm and not successors[i]):
             return False  # a path ends without the depth export and without the discarding exit
-        stack += successors[i]
+        if deferred_vm:
+            zero_exec = zero_exec and not writes_exec(name, parse(asm)[1])
+            if name in ('s_cbranch_execz', 's_cbranch_execnz'):
+                fallthrough, taken = successors[i]
+                stack.extend(((fallthrough, name == 's_cbranch_execnz'), (taken, name == 's_cbranch_execz')))
+                continue
+        stack.extend((n, zero_exec) for n in successors[i])
     # The export must not be inside a loop: it would run once per pass.
     stack, seen = list(successors[index[at]]), set()
     while stack:
@@ -10232,12 +10267,17 @@ class Stage:
             plain = (self.kind == 'ps' and 'depth' not in self.exports and 'compr' not in flags and len(vals) == 4
                      and re.fullmatch(r'v\d+', vals[0]) is not None and vals[1:] == ['off', 'off', 'off'])
             straight = not (self.has_branches or self.blocks) and self.exec_known
-            # Not straight-line: the export is still one assignment of o.depth when every lane that is not discarded runs
-            # it exactly once (mrtz_covers_every_path) and a lane that left EXEC is discarded by the export's own vm flag.
-            if not plain or not (straight or ('vm' in flags and mrtz_covers_every_path(self.ins, self.pc))):
+            deferred_vm = False
+            if plain and not straight and 'vm' not in flags and 'done' not in flags:
+                deferred_vm = (sum(name == 'exp' and asm.startswith('exp mrtz ') for _, _, name, asm in self.ins) == 1
+                               and mrtz_followed_by_vm(self.ins, self.pc)
+                               and mrtz_covers_every_path(self.ins, self.pc, deferred_vm=True))
+            if not plain or not (straight or deferred_vm
+                                 or ('vm' in flags and mrtz_covers_every_path(self.ins, self.pc))):
                 raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
             self.exports['depth'] = True
-            self.emit('o.depth = %s;' % self.f(vals[0]))
+            guard = 'if (exec & 1) ' if deferred_vm and not self.exec_known else ''
+            self.emit('%so.depth = %s;' % (guard, self.f(vals[0])))
             return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
@@ -12936,6 +12976,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
