@@ -92,6 +92,33 @@ def demote_exit():
         S.expect(label + ' is refused', translate(mutant)[0], MIXES)
 
 
+def mrtz_kill_exit():
+    """A depth export behind the early exit of a kill translates (every path ends in the export or the discarding exit);
+    near misses stay refused with the MRTZ message."""
+    words = S.MRTZ_KILL_EXIT_PIXEL
+    S.expect('mrtz kill-exit words decode', [x[3] for x in S.G.decode(S.code(words))],
+             ['v_interp_mov_f32_e32 v0, p0, attr0.x', 'v_cmpx_lt_f32_e32 0.5, v0', 's_cbranch_execz label_0x1c',
+              'v_mov_b32_e32 v1, 0.5', 'exp mrtz v1, off, off, off done vm', 's_endpgm',
+              'exp null off, off, off, off done vm', 's_endpgm'])
+    result, hlsl, manifest = translate(words)
+    S.expect('mrtz kill-exit stage translates', result, 'ok')
+    S.expect('mrtz kill-exit stage writes depth and no colour', ('o.depth = F(v1);' in hlsl, 'SV_Target' in hlsl), (True, False))
+    S.expect('mrtz kill-exit stage discards in both blocks', hlsl.count('if (!(exec & 1)) discard;'), 2)
+    refused = 'unsupported: MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC'
+    branch, export = words.index('bf880004'), words.index('f8001881')
+    exit_at = words.index('f8001890')
+    for label, mutant in (
+            # The kill exit is only an s_endpgm: a lane that left EXEC takes the branch, runs no export and is not discarded.
+            ('an early exit that discards nothing', words[:exit_at] + ['bf810000'] + words[exit_at + 3:]),
+            # The depth export without vm: a lane that left EXEC would still write depth.
+            ('a depth export without vm', words[:export] + ['f8000881'] + words[export + 1:]),
+            # The depth export in a loop: a branch back over it (s_cbranch_vccnz to the s_mov) after the export.
+            ('a depth export inside a loop',
+             words[:branch] + [S.branch(0xbf88, branch, exit_at + 1)] + words[branch + 1:export + 2]
+             + [S.branch(0xbf87, export + 2, branch + 1)] + words[export + 2:])):
+        S.expect(label + ' is refused', translate(mutant)[0], refused)
+
+
 def main():
     os.environ['X2W_FXC'] = ''  # source and manifest only; no compiler needed
     S.expect('alpha-test words decode', [x[3] for x in S.G.decode(S.code(ALPHA_TEST))],
@@ -130,6 +157,7 @@ def main():
                                                                     if not p.name.startswith('req_')),
                          ['%016x.fail' % key])
     kill_exit()
+    mrtz_kill_exit()
     if S.FAILED:
         return 1
     print('ok')

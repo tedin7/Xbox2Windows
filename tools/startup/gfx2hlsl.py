@@ -2238,6 +2238,55 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
+def mrtz_covers_every_path(ins, at):
+    """True when every path from the first instruction to an s_endpgm either runs the depth export at offset `at` or ends in a
+    `exp null ... vm` export (the early exit of a kill: it discards a lane that left EXEC), and the export cannot run twice.
+
+    Instruction-level control flow of a decoded pixel program (RDNA 2 ISA, SOPP branches). A taken s_cbranch_execz is the
+    way out when no lane is live, which the null export's vm flag turns into a discard; every other conditional branch is
+    followed both ways. An indirect jump or a branch that leaves the program makes the answer False."""
+    index = {off: i for i, (off, _s, _n, _a) in enumerate(ins)}
+    absorbing = {off for off, _s, name, asm in ins
+                 if off == at or (name == 'exp' and re.match(r'exp null\b.*\bvm\b', asm) is not None)}
+    successors = []
+    for i, (_off, _size, name, asm) in enumerate(ins):
+        if name == 's_endpgm':
+            successors.append([])
+        elif name in ('s_setpc_b64', 's_swappc_b64', 's_trap'):
+            return False
+        elif name == 's_branch' or name.startswith('s_cbranch'):
+            target = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+            if target is None:
+                return False
+            successors.append([target] if name == 's_branch' else [i + 1, target])
+        else:
+            successors.append([i + 1] if i + 1 < len(ins) else [])
+    if at not in index:
+        return False
+    stack, seen = [0], set()
+    while stack:
+        i = stack.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        if ins[i][0] in absorbing:
+            continue
+        if ins[i][2] == 's_endpgm':
+            return False  # a path ends without the depth export and without the discarding exit
+        stack += successors[i]
+    # The export must not be inside a loop: it would run once per pass.
+    stack, seen = list(successors[index[at]]), set()
+    while stack:
+        i = stack.pop()
+        if i == index[at]:
+            return False
+        if i not in seen:
+            seen.add(i)
+            stack += successors[i]
+    return True
+
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -7547,7 +7596,7 @@ class Stage:
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
@@ -7562,8 +7611,17 @@ class Stage:
         dst, addr, sampler = (reg_range(ops[i]) for i in (0, 1, 3))
         if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
             raise Unsupported('%s requires four destination registers' % name)
-        if not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
+        if regs_out is not None and ops[1].startswith('['):
+            # Non-sequential address: each registers is named, in address order.
+            listed = [reg_range(c.strip()) for c in ops[1][1:-1].split(',')]
+            if (len(listed) != addr_count or not all(r and r[0] == 'v' and r[1] == r[2] and r[2] <= 255 for r in listed)):
+                raise Unsupported('%s requires %s' % (name, addr_label))
+            addr = ('v', listed[0][1], listed[-1][1])
+            regs_out.extend(r[1] for r in listed)
+        elif not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
             raise Unsupported('%s requires %s' % (name, addr_label))
+        elif regs_out is not None:
+            regs_out.extend(range(addr[1], addr[2] + 1))
         words = self.const_words(ops[3]) if sampler and sampler[0] == 's' and sampler[2] - sampler[1] == 3 else None
         if words is None:
             raise Unsupported('%s requires a constant sampler' % name)
@@ -7618,25 +7676,48 @@ class Stage:
         """image_gather4_lz_o: image_gather4_lz with a texel offset packed in the first address register.
 
         RDNA 2 MIMG address order for the _o forms is offset, then the coordinates; the offset register holds
-        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). HLSL's Gather takes
-        the offset as a literal in -8..7, so the register must be one literal move and both fields in range.
+        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). The three address
+        registers may be contiguous or the non-sequential (NSA) list `[vA, vB, vC]`.
+        A literal offset in -8..7 uses HLSL's Gather with a literal offset. Any other offset (a value computed
+        at run time, or out of that range) is emulated: the gather footprint of a bilinear fetch at mip zero is
+        the 2x2 texels from floor(uv * size - 0.5), moved by the offset and clamped into the image (the
+        sampler is validated as normalized clamp), read with Load in the gather order x, y, z, w =
+        (0,1), (1,1), (1,0), (0,0). The emulation rounds the footprint in float, not in the sampler's fixed
+        point, so a coordinate within 2^-8 of a texel centre can pick the neighbouring footprint.
         """
         name = 'image_gather4_lz_o'
-        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
-            name, ops, mods, 3, 'three contiguous address registers', mip_preclamp=True)
-        packed = self.constant_vgpr_word(addr[1], name)
-        if packed & ~0x3f3f:
-            raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
-        fields = []
-        for shift in (0, 8):
-            field = (packed >> shift) & 0x3f
-            field -= 64 if field & 0x20 else 0
-            if not -8 <= field <= 7:
-                raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
-            fields.append(field)
+        regs = []
+        dst, addr, words, (channel_name, channel_index), tex = self.gather_2d_setup(
+            name, ops, mods, 3, 'three address registers', mip_preclamp=True, regs_out=regs)
         smp = self.pipe.sampler(tuple(words))
-        u, v = (self.f('v%d' % i) for i in (addr[1] + 1, addr[1] + 2))
-        self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
+        u, v = (self.f('v%d' % i) for i in regs[1:])
+        fields = None
+        try:
+            packed = self.constant_vgpr_word(regs[0], name)
+            if packed & ~0x3f3f:
+                raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
+            fields = []
+            for shift in (0, 8):
+                field = (packed >> shift) & 0x3f
+                field -= 64 if field & 0x20 else 0
+                if not -8 <= field <= 7:
+                    raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
+                fields.append(field)
+        except Unsupported:
+            fields = None
+        if fields is not None:
+            self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
+        else:
+            off = self.u('v%d' % regs[0])
+            self.emit(('{ uint gw, gh; %s.GetDimensions(gw, gh); int2 gs = int2(gw, gh); '
+                       'int2 go = int2(asint((%s) << 26u) >> 26, asint((%s) << 18u) >> 26); '
+                       'int2 gb = int2(floor(float2(%s, %s) * float2(gs) - 0.5)) + go; '
+                       't = float4(%s.Load(int3(clamp(gb + int2(0, 1), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb + int2(1, 1), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb + int2(1, 0), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb, 0, gs - 1), 0)).%s); }')
+                      % (tex, off, off, u, v, tex, 'rgba'[channel_index], tex, 'rgba'[channel_index],
+                         tex, 'rgba'[channel_index], tex, 'rgba'[channel_index]))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
@@ -9362,9 +9443,12 @@ class Stage:
         if target == 'null':
             return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
-            if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
-                    or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
-                    or vals[1:] != ['off', 'off', 'off']):
+            plain = (self.kind == 'ps' and 'depth' not in self.exports and 'compr' not in flags and len(vals) == 4
+                     and re.fullmatch(r'v\d+', vals[0]) is not None and vals[1:] == ['off', 'off', 'off'])
+            straight = not (self.has_branches or self.blocks) and self.exec_known
+            # Not straight-line: the export is still one assignment of o.depth when every lane that is not discarded runs
+            # it exactly once (mrtz_covers_every_path) and a lane that left EXEC is discarded by the export's own vm flag.
+            if not plain or not (straight or ('vm' in flags and mrtz_covers_every_path(self.ins, self.pc))):
                 raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
             self.exports['depth'] = True
             self.emit('o.depth = %s;' % self.f(vals[0]))
