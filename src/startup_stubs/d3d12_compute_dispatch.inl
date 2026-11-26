@@ -76,7 +76,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt") || !fetch_manifest(tr.key, manifest)) {
+    if (!cache_path(path, L"", tr.key, L".txt") || !fetch_manifest(tr.key, tr.retry_manifest_at != 0, manifest)) {
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }

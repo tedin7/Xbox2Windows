@@ -246,20 +246,21 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
     };
     return io;
 }
-x2w_startup::ManifestPrefetch& manifest_prefetch()
+x2w_startup::ManifestSource& manifest_source()
 {
-    static x2w_startup::ManifestPrefetch prefetch(manifest_io());
+    static x2w_startup::ManifestSource source(manifest_io());
     static const HANDLE worker = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
         for (;;) {
-            const std::size_t loaded = manifest_prefetch().has_wanted() ? manifest_prefetch().scan() : 0;
+            const std::size_t loaded = manifest_source().prefetch().has_wanted() ? manifest_source().prefetch().scan() : 0;
             Sleep(loaded ? 50 : 250);
         }
     }, nullptr, 0, nullptr);
     (void)worker;
-    return prefetch;
+    return source;
 }
-// True and the manifest text when the background thread has read it; false (and the key is wanted) otherwise. No file access.
-bool fetch_manifest(u64 key, std::string& out) { return manifest_prefetch().fetch(key, out); }
+// draw_lock held. The first lookup of a key opens the file (once); a retry of an absent key takes what the background
+// thread has read and opens nothing.
+bool fetch_manifest(u64 key, bool retry, std::string& out) { return manifest_source().load(key, retry, out); }
 
 bool read_text(const wchar_t* path, std::string& out)
 {
@@ -329,7 +330,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
-    if (!fetch_manifest(tr.key, manifest)) {
+    if (!fetch_manifest(tr.key, tr.retry_manifest_at != 0, manifest)) {
         if (!tr.retry_manifest_at) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;

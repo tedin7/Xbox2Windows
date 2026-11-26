@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -69,14 +70,54 @@ public:
             wanted_.erase(key);
             ++loaded;
         }
+        background_reads_ += loaded;
         return loaded;
     }
 
+    long long background_reads() const { return background_reads_; }
+
 private:
+    std::atomic<long long> background_reads_{0};
     Io io_;
     mutable std::mutex mutex_;
     std::unordered_set<std::uint64_t> wanted_;
     std::unordered_map<std::uint64_t, std::string> ready_;
+};
+
+// What the draw and dispatch paths use, with draw_lock held. The FIRST lookup of a key is one synchronous open, as it always
+// was, so a translation that is already published draws on its first use. RETRIES of a key that was absent never open
+// the file: they take what the background thread has read. The two kinds of open done under the lock are counted
+// separately; `retry_opens_under_lock` must stay 0 (it is what made the lock busy: every absent key re-opened its
+// file once a second).
+class ManifestSource {
+public:
+    explicit ManifestSource(ManifestPrefetch::Io io) : io_(io), prefetch_(std::move(io)) {}
+
+    // Under draw_lock. retry: the key was looked up before and was absent.
+    bool load(std::uint64_t key, bool retry, std::string& out)
+    {
+        if (retry) return prefetch_.fetch(key, out);
+        {
+            // An open of a key that was already opened once is a retry that opened the file under the lock.
+            std::lock_guard<std::mutex> lock(opened_mutex_);
+            if (opened_.insert(key).second) ++first_opens_under_lock_;
+            else ++retry_opens_under_lock_;
+        }
+        return io_.read(key, out);
+    }
+
+    ManifestPrefetch& prefetch() { return prefetch_; }
+    long long first_opens_under_lock() const { return first_opens_under_lock_; }
+    long long retry_opens_under_lock() const { return retry_opens_under_lock_; }
+    long long background_reads() const { return prefetch_.background_reads(); }
+
+protected:
+    ManifestPrefetch::Io io_;
+    ManifestPrefetch prefetch_;
+    std::atomic<long long> first_opens_under_lock_{0};
+    std::atomic<long long> retry_opens_under_lock_{0};
+    std::mutex opened_mutex_;
+    std::unordered_set<std::uint64_t> opened_;
 };
 
 }  // namespace x2w_startup
