@@ -7177,13 +7177,13 @@ class Stage:
             pending.extend(self.descriptor_predecessors[earlier])
         return True
 
-    def formatted_pointer_copy(self, pointer, before):
-        """(source register, instruction index) of the one s_mov_b32 that is the last write to this pointer on
-        every path from the entry to this read, or None.
+    def formatted_sole_writer(self, register, before):
+        """Index of the one instruction that is the last write to this SGPR on every path from the entry to
+        instruction `before`, or None.
 
-        One writer found walking back, with no path that reaches the entry without a write, means that the copy is
-        on every path to the read and that no path from the copy to the read writes the pointer again."""
-        self.formatted_pointer_reaches(pointer, before)  # builds the predecessor tables
+        One writer found walking back, with no path that reaches the entry without a write, means that the write is
+        on every path to the read and that no path from it to the read writes the register again."""
+        self.formatted_pointer_reaches(register, before)  # builds the predecessor tables
         writers, seen, expand = set(), set(), [before]
         while expand:
             at = expand.pop()
@@ -7195,13 +7195,21 @@ class Stage:
                 seen.add(earlier)
                 _, _, name, asm = self.ins[earlier]
                 wrote = self.descriptor_writes_by_instruction[earlier] | scalar_destinations(name, asm)
-                if pointer in wrote or 'any' in wrote:
+                if register in wrote or 'any' in wrote:
                     writers.add(earlier)
                 else:
                     expand.append(earlier)
         if len(writers) != 1:
             return None
         index, = writers
+        return None if 'any' in (self.descriptor_writes_by_instruction[index] | scalar_destinations(self.ins[index][2], self.ins[index][3])) else index
+
+    def formatted_pointer_copy(self, pointer, before):
+        """(source register, instruction index) of the one s_mov_b32 that is the last write to this pointer on
+        every path from the entry to this read, or None."""
+        index = self.formatted_sole_writer(pointer, before)
+        if index is None:
+            return None
         _, _, name, asm = self.ins[index]
         _, args, _ = parse(asm)
         source = reg_range(args[1]) if name == 's_mov_b32' and len(args) == 2 else None
@@ -7263,11 +7271,33 @@ class Stage:
                 read = start + previous
                 break
             else:
-                copy = getattr(self, 'kind', None) == 'cs' and self.formatted_pointer_copy(pointer, read)
+                copy = self.formatted_pointer_copy(pointer, read)
                 if copy:
                     pointer, read = copy
             return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
-        return False
+        return self.formatted_descriptor_across_blocks(reg, first)
+
+    def formatted_descriptor_across_blocks(self, reg, first):
+        """The descriptor words were loaded in an earlier block: every word has the same one writer on every path
+        to this read, that writer is one s_load of table memory, and its base pointer is proven as in the block."""
+        end = self.descriptor_instruction_index
+        writers = {self.formatted_sole_writer(w, end) for w in range(reg[1], reg[2] + 1)}
+        if len(writers) != 1 or None in writers:
+            return False
+        at, = writers
+        _, _, name, asm = self.ins[at]
+        _, args, _ = parse(asm)
+        m = re.fullmatch(r's_load_dwordx(4|8|16)', name)
+        load, base = reg_range(args[0]), reg_range(args[1]) if len(args) > 1 else None
+        if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + reg[2] - reg[1] + 1:
+            return False
+        if not base or base[0] != 's':
+            return False
+        pointer, read = base[1], at
+        copy = self.formatted_pointer_copy(pointer, read)
+        if copy:
+            pointer, read = copy
+        return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
 
     def mubuf_format(self, ops, mods, count):
         """buffer_load_format_x/xy/xyz/xyzw: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.

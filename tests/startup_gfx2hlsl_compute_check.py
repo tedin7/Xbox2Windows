@@ -1505,8 +1505,10 @@ def check_formatted_loads():
         assert hlsl.count(' = ((ud3 >> ') == width
     # Word 3 is overwritten in an otherwise intact native descriptor.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
-    # At a branch target, there is no local descriptor load to prove.
-    refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
+    # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
+    assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end).hlsl_cs()
+    # A word rewritten after that load, with the target between, is not the loaded descriptor any more.
+    refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe000082bf') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
     check_formatted_pointer_copy()

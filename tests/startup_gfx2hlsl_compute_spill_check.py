@@ -154,10 +154,15 @@ VARIANTS = {
                   '(lane masks have their own fixtures in tests/startup_gfx2hlsl_compute_mask_spill_check.py)'),
     'wrong-lane': (SOURCE_S, [('v_readlane_b32 s13, v40, 1', 'v_readlane_b32 s13, v40, 5')],
                    'descriptor whose words were rewritten', 'word 1 of the descriptor reloaded from the lane of word 5'),
-    'unproven-descriptor': (SOURCE_S, [(S_ENTRY, ''), ('v_mov_b32 v1, 1', S_ENTRY + 'v_mov_b32 v1, 1'),
-                                       ('v_mov_b32 v1, 0', S_ENTRY + 'v_mov_b32 v1, 0')],
-                            'requires descriptor words proven in the entry block',
-                            'the read descriptor is spilled in the arms, where its load is not local'),
+    'load-skipped-on-one-path': (SOURCE_S, [('s_load_dwordx8 s[12:19], s[10:11], 0x0\ns_waitcnt lgkmcnt(0)\n',
+                                             's_cmp_lg_u32 s4, 0\ns_cbranch_scc0 Lnoload\n'
+                                             's_load_dwordx8 s[12:19], s[10:11], 0x0\ns_waitcnt lgkmcnt(0)\nLnoload:\n')],
+                                 'holds a lane mask or descriptor', 'the descriptor is loaded on one path only, so a spill of it has no single load to prove'),
+    'pointer-clobbered-on-one-path': (SOURCE_S, [('s_mov_b32 s10, s6\n',
+                                                  's_mov_b32 s24, s6\ns_cmp_lg_u32 s4, 0\ns_cbranch_scc0 Lr\ns_mov_b32 s6, 0\nLr:\n'
+                                                  's_mov_b32 s6, s24\ns_mov_b32 s10, s6\n')],
+                                      'proven in the entry block',
+                                      'the table pointer is cleared on one path before the descriptor load'),
     'written-in-region-read-outside': (SOURCE_S, [
         (S_ARM + 'v_mov_b32 v1, 1', 'v_mov_b32 v1, 1'), (S_ARM + 'v_mov_b32 v1, 0', 'v_mov_b32 v1, 0'),
         (''.join('s_mov_b32 s%d, 0\n' % r for r in range(16, 20)), ''),
@@ -170,7 +175,12 @@ VARIANTS = {
                                  's_cbranch_scc1 Lloop\n')],
                      'written later in a loop', 'a reload whose lane is written again by the loop body'),
 }
-EXPECTED_ACCEPTED = {'S': SOURCE_S, 'P': SOURCE_P}
+# The read descriptor is loaded once above the branch and spilled inside the arms: its one load reaches every use on every
+# path, so the formatted load proof accepts it although the load is not in the block of the spill.
+SOURCE_S_ARMS = (SOURCE_S.replace(S_ENTRY, '').replace('v_mov_b32 v1, 1', S_ENTRY + 'v_mov_b32 v1, 1')
+                 .replace('v_mov_b32 v1, 0', S_ENTRY + 'v_mov_b32 v1, 0'))
+assert SOURCE_S_ARMS.count('v_writelane_b32 v40, s12, 0') == 2
+EXPECTED_ACCEPTED = {'S': SOURCE_S, 'P': SOURCE_P, 'S-load-above-arms': SOURCE_S_ARMS}
 
 
 def variant_source(name):
@@ -274,7 +284,23 @@ WORDS = {
         '80038dbe80038ebe80038fbe800390be800391be800392be800393be840008347e0395be8c00887d6a03febe150088bf'
         '0c0060d7280101000d0060d7280b01000e0060d7280501000f0060d728070100100060d728090100110060d7280b0100'
         '120060d7280d0100130060d7280f010002300ce000050380703f8cbf001078e0040504801503febe000081bf'),
-    'unproven-descriptor': bytes.fromhex(
+    'load-skipped-on-one-path': bytes.fromhex(
+        '06038abe80038bbe048007bf030084bf05030cf4000000fa7fc08cbf280061d70c000100280061d70d020100280061d7'
+        '0e040100280061d70f06010004811787178007bf0a0084bf280061d710080100280061d7110a0100280061d7120c0100'
+        '280061d7130e01008102027e090082bf280061d710080100280061d7110a0100280061d7120c0100280061d7130e0100'
+        '8002027e80038cbe80038dbe80038ebe80038fbe800390be800391be800392be800393be840008347e0395be8c00887d'
+        '6a03febe150088bf0c0060d7280101000d0060d7280301000e0060d7280501000f0060d728070100100060d728090100'
+        '110060d7280b0100120060d7280d0100130060d7280f010002300ce000050380703f8cbf001078e0040504801503febe'
+        '000081bf'),
+    'pointer-clobbered-on-one-path': bytes.fromhex(
+        '060398be048007bf010084bf800386be180386be06038abe80038bbe05030cf4000000fa7fc08cbf280061d70c000100'
+        '280061d70d020100280061d70e040100280061d70f06010004811787178007bf0a0084bf280061d710080100280061d7'
+        '110a0100280061d7120c0100280061d7130e01008102027e090082bf280061d710080100280061d7110a0100280061d7'
+        '120c0100280061d7130e01008002027e80038cbe80038dbe80038ebe80038fbe800390be800391be800392be800393be'
+        '840008347e0395be8c00887d6a03febe150088bf0c0060d7280101000d0060d7280301000e0060d7280501000f0060d7'
+        '28070100100060d728090100110060d7280b0100120060d7280d0100130060d7280f010002300ce000050380703f8cbf'
+        '001078e0040504801503febe000081bf'),
+    'S-load-above-arms': bytes.fromhex(
         '06038abe80038bbe05030cf4000000fa7fc08cbf04811787178007bf120084bf280061d710080100280061d7110a0100'
         '280061d7120c0100280061d7130e0100280061d70c000100280061d70d020100280061d70e040100280061d70f060100'
         '8102027e110082bf280061d710080100280061d7110a0100280061d7120c0100280061d7130e0100280061d70c000100'
@@ -341,7 +367,7 @@ def controls(module=G, quiet=False):
         if not quiet:
             check(label, ok, detail)
 
-    for name in ('S', 'P'):
+    for name in ('S', 'P', 'S-load-above-arms'):
         reason = refusal(name, module)
         verdict('fixture %s translates (%s)' % (name, reason), reason is None)
     for name, (_, _, fragment, why) in VARIANTS.items():
