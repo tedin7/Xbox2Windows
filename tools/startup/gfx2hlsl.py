@@ -2464,6 +2464,9 @@ class Stage:
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
+            if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
+                    and not wave32_exec_proof(self.ins):
+                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -5448,7 +5451,14 @@ class Stage:
                          else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
                          else None)
                 if other is not None and self.const_u32(other) == 0xfc0:
-                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    x, y, z = self.pipe.group
+                    if x * y * z <= 32:
+                        self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                        return None
+                    # Wave32 waves hold 32 consecutive threads in x-major order: the wave ID is the flat thread index / 32,
+                    # and differs between the waves of one group (so the register is not uniform).
+                    flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                    self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
@@ -10680,12 +10690,35 @@ class Pipeline:
         return '\n'.join(lines) + '\n'
 
 
+TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group '
+                         '(more needs whole wave32 waves and a program proved wave32)')
+
+
+def wave32_exec_proof(ins):
+    """True when the program names a wave32 exec write (a 32-bit scalar op into exec_lo, or s_*saveexec_b32) and no wave64
+    exec form (the 64-bit exec pair or a 64-bit scalar op on it). The opcodes differ between the sizes (RDNA 2 ISA, SOP1
+    S_AND_SAVEEXEC_B32 / _B64, SOP1 S_MOV_B32 / _B64), so a compiler's exec handling states the wave size; a program that
+    never touches exec states nothing, and the caller must say wave_size=32."""
+    wave32 = wave64 = False
+    for _off, _size, name, asm in ins:
+        if not name.startswith('s_'):
+            continue
+        if re.search(r'\bexec\b', asm):
+            wave64 = True
+        elif name.endswith('saveexec_b32'):
+            wave32 = True
+        elif re.search(r'\bexec_lo\b', asm) and name.endswith('_b32'):
+            ops = parse(asm)[1]
+            wave32 |= bool(ops) and ops[0] == 'exec_lo'
+    return wave32 and not wave64
+
+
 class ComputePipeline(Pipeline):
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -10694,8 +10727,10 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
-            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
+                wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
+            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
