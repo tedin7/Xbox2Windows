@@ -3,12 +3,13 @@
 
 In the run the --watch pool leaves old refusals alone and the pass after the run retries them, so a translator lift
 would reach only the next run. Before the title starts tester_run translates again the old refusals (a .fail an older
-build wrote) whose reason belongs to a family this build lifts (LIFTED_REASONS), on every core, for at most 180 s:
+build wrote), on every core, for at most 180 s, in this order: the families recent builds lift (LIFTED_REASONS),
+then graphics and mesh requests before compute:
 
-  - only old refusals of a lifted family are retried: a refusal this build wrote is final, another reason waits;
+  - every old refusal is retried, lifted families first; a refusal this build wrote is final;
   - the time cap stops new requests; what is left keeps its .fail for the pass after the run;
   - the log line says how many keys, how many translate now, how many are still refused, and the seconds;
-  - the command line form rewrites the .fail of a lifted family and leaves the others untouched.
+  - the command line form rewrites every old .fail and leaves this build's refusal untouched.
 """
 import os
 import subprocess
@@ -36,6 +37,7 @@ def touch(path, data, mtime):
 
 # One refusal text per family, as an older build wrote it, and reasons outside every family.
 LIFTED = {
+    'mrtz': 'unsupported: MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC',
     'rw-buffer': "unsupported: descriptor (('table', 3), 0) used for a load and a store",
     'cube': 'unsupported: image dimension SQ_RSRC_IMG_CUBE',
     'tg-size': 'unsupported: COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 64 threads per group',
@@ -52,11 +54,12 @@ for reason in OTHER:
 
 
 def fixture(d, built):
-    """Keys 1-3: old refusals of lifted families; 4: a lifted family refused by this build; 5, 6: old, other reasons."""
+    """Keys 1-3: old refusals of lifted families; 4: a lifted family refused by this build; 5: an old compute refusal
+    and 6: an old graphics refusal, other reasons."""
     reasons = {1: LIFTED['cube'], 2: LIFTED['tg-size'], 3: LIFTED['dmask'], 4: LIFTED['rw-buffer'], 5: OTHER[0],
                6: OTHER[1]}
     for key, reason in reasons.items():
-        touch(d / ('req_%016x.rtv' % key), b'not an rtv request', built - 200)
+        touch(d / ('req_%016x.%s' % (key, 'c67' if key == 5 else 'rtv')), b'not a request', built - 200)
         touch(d / ('%016x.fail' % key), (reason + '\n').encode(), built + 50 if key == 4 else built - 100)
     return reasons
 
@@ -67,6 +70,8 @@ with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     fixture(d, built)
     expect('the old refusals of lifted families', G.lifted_failures(str(d), built), [1, 2, 3])
+    expect('retry order: lifted, then graphics, then compute', G.old_failures(str(d), built),
+           [(1, True), (2, True), (3, True), (6, False), (5, False)])
     called = []
 
     def fake(out_dir, key):
@@ -75,10 +80,11 @@ with tempfile.TemporaryDirectory() as tmp:
     G.translate_one = fake
     try:
         report = G.retry_lifted(str(d), jobs=1)
-        expect('retried keys', called, [1, 2, 3])
-        expect('counts', (report.keys, report.ok, report.refused, report.left), (3, 1, 2, 0))
+        expect('retried keys', called, [1, 2, 3, 6, 5])
+        expect('counts', (report.keys, report.lifted, report.ok, report.refused, report.left), (5, 3, 1, 4, 0))
         line = report.line()
-        expect('log line', line.startswith('pre-run retry: 3 keys, ok 1, still refused 2, ') and line.endswith(' s'), True)
+        expect('log line', line.startswith('pre-run retry: 5 keys (3 in lifted families), ok 1, still refused 4, ')
+               and line.endswith(' s'), True)
         # The time cap: no new request after it, the rest is left for the pass after the run.
         called.clear()
         now = [0.0]
@@ -88,12 +94,13 @@ with tempfile.TemporaryDirectory() as tmp:
             return now[0]
         capped = G.retry_lifted(str(d), seconds=150.0, jobs=1, clock=clock)
         expect('time cap: requests started', called, [1])
-        expect('time cap: counts', (capped.keys, capped.ok, capped.refused, capped.left), (3, 1, 0, 2))
-        expect('time cap: log line names what is left', '2 left for the pass after the run (time cap)' in capped.line(),
+        expect('time cap: counts', (capped.keys, capped.ok, capped.refused, capped.left), (5, 1, 0, 4))
+        expect('time cap: log line names what is left', '4 left for the pass after the run (time cap)' in capped.line(),
                True)
-        # Nothing to retry: no pool, an empty line still says so.
-        empty = G.retry_lifted(str(d), jobs=1, families=())
-        expect('no lifted family', (empty.keys, empty.left), (0, 0))
+        # No family table: every old refusal still goes, graphics before compute.
+        called.clear()
+        plain = G.retry_lifted(str(d), jobs=1, families=())
+        expect('no lifted family', (plain.keys, plain.lifted, called), (5, 0, [1, 2, 3, 6, 5]))
     finally:
         G.translate_one = real
 
@@ -108,16 +115,15 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('cli exit code', run.returncode, 0)
     lines = [line for line in run.stdout.splitlines() if line.strip()]
     expect('cli prints one line', len(lines), 1)
-    expect('cli line', bool(lines) and lines[0].startswith('pre-run retry: 3 keys, ok 0, still refused 3, '), True)
+    expect('cli line', bool(lines) and lines[0].startswith('pre-run retry: 5 keys (3 in lifted families), ok 0, '
+                                                           'still refused 5, '), True)
     rewritten = {key: (d / ('%016x.fail' % key)).stat().st_mtime != before[key] for key in reasons}
-    expect('cli rewrites only the old lifted refusals', rewritten,
-           {1: True, 2: True, 3: True, 4: False, 5: False, 6: False})
-    expect('the other old reasons are kept for the pass after the run', [
-        (d / ('%016x.fail' % key)).read_text().strip() for key in (5, 6)], list(OTHER))
+    expect('cli rewrites every old refusal, not this build refusal', rewritten,
+           {1: True, 2: True, 3: True, 4: False, 5: True, 6: True})
     expect('cli well under the cap', time.time() - started < 120, True)
 
 if failures:
     print('\n'.join('FAIL ' + f for f in failures))
     sys.exit(1)
-print('startup_gfx2hlsl_retry_lifted_check passed: old refusals of lifted families retried before the run, others '
-      'kept, time cap, log line, command line form')
+print('startup_gfx2hlsl_retry_lifted_check passed: every old refusal retried before the run, lifted families '
+      'first, then graphics, then compute; time cap, log line, command line form')
