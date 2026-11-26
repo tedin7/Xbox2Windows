@@ -38,6 +38,9 @@ PREFETCH = bytes.fromhex('0300a0bf')
 # DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
 # a quad are the pixels 0 1 / 2 3, row by row; lane i reads lane quad_perm[i].
 DPP_PAIR = frozenset(((1, 1, 3, 3), (0, 0, 2, 2), (2, 3, 2, 3), (0, 1, 0, 1)))
+# Exchanges projected onto one row (X difference) or one column (Y difference).
+DPP_COARSE = frozenset(((1, 0, 1, 0), (3, 2, 3, 2), (2, 2, 0, 0), (3, 3, 1, 1)))
+DPP_DERIVATIVE_OPS = frozenset(('v_mov_b32', 'v_sub_f32', 'v_subrev_f32'))
 DPP_SCRATCH = 256
 
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
@@ -3886,7 +3889,7 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
-            self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
+            self.quad_flow_reads = []     # (offset, mnemonic, allow late WQM) for DPP reads in branching code
             self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
             self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
             self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform, proven, mask) for constant-lane SGPR spills
@@ -4726,9 +4729,9 @@ class Stage:
             return ': branch at +0x%x (%s)' % branch if branch else ': not straight-line'
         return ''
 
-    def note_quad_flow(self, base):
+    def note_quad_flow(self, base, allow_late_wqm=False):
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
-            self.quad_flow_reads.append((self.pc, base))
+            self.quad_flow_reads.append((self.pc, base, allow_late_wqm))
 
     def quad_flow_refusals(self, branches, targets):
         """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
@@ -4738,7 +4741,8 @@ class Stage:
         together (same block, same pass of the dispatch loop) with the word the guest lanes hold. The guest runs
         the wave as one: its scalar branches are wave-wide, and the quad is whole when EXEC is the s_wqm mask. A
         read is kept when, on every path to it:
-        - the s_wqm exec, exec that proved whole-quad EXEC ran first: it sits before every branch and target;
+        - the s_wqm exec, exec that proved whole-quad EXEC ran first: it precedes every branch and target,
+          or dominates a derivative read reached through uniform control flow and a scalar-only prefix;
         - no other instruction that can write EXEC reaches it (so EXEC is still that mask and every VGPR write ran
           on all four lanes, helper lanes included);
         - every conditional branch that reaches it is wave-uniform (SCC proven uniform by the translator), or an
@@ -4749,7 +4753,7 @@ class Stage:
         reads = getattr(self, 'quad_flow_reads', [])
         if not reads:
             return []
-        index, block_of, succ, _dom, _writes, _reached = self.flow
+        index, block_of, succ, dom, _writes, _reached = self.flow
         after = {}
 
         def reaches(src, dst):
@@ -4771,9 +4775,29 @@ class Stage:
         writers = [off for off, _n, name, asm in self.ins if writes_exec(name, parse(asm)[1])
                    and not (re.sub(r'_e(32|64)$', '', name) in ('s_wqm_b32', 's_wqm_b64')
                             and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
+        wqm = self.wqm_set_at
+        early_wqm = wqm is not None and wqm < first
+
+        def wqm_dominates(off):
+            if wqm is None:
+                return False
+            wqm_block, block = block_of[index[wqm]], block_of[index[off]]
+            return wqm < off if wqm_block == block else wqm_block in dom[block]
+
+        # Before WQM an exact-EXEC VGPR write can leave helpers with stale data.
+        # Only extend the proof through a scalar prefix, including its branches.
+        pre_wqm_vector_write = None
+        if wqm is not None and not early_wqm:
+            pre_wqm_vector_write = next(
+                (off for off, _, name, asm in self.ins if reaches(off, wqm) and not wqm_dominates(off)
+                 and any((reg_range(dst) or (None,))[0] == 'v' for dst in destinations(name, parse(asm)[1]))),
+                None)
         out = []
-        for at, base in reads:
-            if self.wqm_set_at is None or self.wqm_set_at >= first:
+        for at, base, allow_late_wqm in reads:
+            # A derivative can also enter WQM after a uniform branch. Require that
+            # the WQM instruction dominates the read, including order within its block.
+            late_wqm = not early_wqm and allow_late_wqm and wqm_dominates(at)
+            if not (early_wqm or late_wqm):
                 out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the s_wqm exec, exec does not '
                                 'run before every branch' % (base, at)))
                 continue
@@ -4783,24 +4807,27 @@ class Stage:
                                 'it' % (base, at, writer)))
                 continue
             split = next((b for b, name in sorted(self.divergent_branches.items())
-                          if name not in ('s_cbranch_execz', 's_cbranch_execnz') and reaches(b, at)), None)
+                          if (name not in ('s_cbranch_execz', 's_cbranch_execnz')
+                              or (late_wqm and not wqm_dominates(b))) and reaches(b, at)), None)
             if split is not None:
                 out.append((at, '%s_dpp quad read at +0x%x in a program with branches: %s at +0x%x is not proven '
                                 'wave-uniform' % (base, at, self.divergent_branches[split], split)))
+            elif late_wqm and pre_wqm_vector_write is not None:
+                out.append((at, '%s_dpp quad read at +0x%x: VGPR write at +0x%x before whole-quad EXEC'
+                            % (base, at, pre_wqm_vector_write)))
         return out
 
     def dpp_pair(self, base, asm, ops, mods):
-        """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
+        """A DPP16 spelling whose SRC0 reads two selected lanes of the quad.
 
         RDNA 2 ISA section 12.19 (DPP16): lane i of a quad reads SRC0 of lane quad_perm[i] of the same quad. A pair
         broadcast ([1,1,3,3], [0,0,2,2], [2,3,2,3], [0,1,0,1]) moves one lane of every horizontal or vertical pair
-        into the other and leaves the first lane alone. The word of each of the four lanes is read with the shader
+        into the other and leaves the first lane alone. A projected exchange selects one row or column for both
+        pairs, so a subtraction can use the same edge throughout the quad. Each lane is read with the shader
         model 6.0 QuadReadLaneAt (its lane argument must be a constant, so all four reads are unconditional) and this
         lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
-        run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
-        whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
-        other control (other permutations, row_*, wave_*, a partial row or bank mask, a vertex stage) is refused by
-        name, since the single lane cannot read a neighbour."""
+        run the instruction in the same flow, with a whole-quad EXEC mask established by s_wqm exec, exec.
+        Branching code must pass quad_flow_refusals."""
         perms = [m for m in mods if m.startswith('quad_perm:')]
         rest = [m for m in mods if not m.startswith('quad_perm:')]
         if len(perms) != 1:
@@ -4810,7 +4837,7 @@ class Stage:
                 raise Unsupported('%s_dpp with %s' % (base, m))
         # With all four lanes active no source lane is disabled, so bound_ctrl has nothing to replace.
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
-        if perm not in DPP_PAIR:
+        if perm not in DPP_PAIR and not (perm in DPP_COARSE and base in DPP_DERIVATIVE_OPS):
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
         if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
                 not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
@@ -4824,7 +4851,7 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
-        self.note_quad_flow(base)
+        self.note_quad_flow(base, allow_late_wqm=base in DPP_DERIVATIVE_OPS)
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
@@ -5429,7 +5456,7 @@ class Stage:
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported('%s_dpp with row_ror:8 outside a compute program' % base)
             intrinsic = ROW_ROR8
-        elif perm in DPP_PAIR:
+        elif perm in DPP_PAIR or (perm in DPP_COARSE and base in DPP_DERIVATIVE_OPS and self.kind == 'ps'):
             return self.dpp_pair(base, '%s %s' % (base, ', '.join(ops)), ops, mods)
         else:
             intrinsic = QUAD_SWAPS.get(perm)
@@ -5470,7 +5497,8 @@ class Stage:
             if not getattr(self, 'wqm_exec', False):
                 raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                                   'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
-            self.note_quad_flow(base)
+            self.note_quad_flow(base, allow_late_wqm=base in DPP_DERIVATIVE_OPS
+                                and intrinsic in ('QuadReadAcrossX', 'QuadReadAcrossY'))
             self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
