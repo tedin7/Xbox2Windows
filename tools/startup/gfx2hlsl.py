@@ -9,6 +9,7 @@ import bisect
 from contextlib import suppress
 import functools
 import hashlib
+import itertools
 import os
 from pathlib import Path
 import re
@@ -1604,16 +1605,43 @@ def mesh_vregs(tokens):
     return out
 
 
-def mesh_run(ins, at, what, patterns, env):
-    """Match consecutive instructions; {name} in a pattern is the text an earlier (?P<name>...) bound."""
-    for k, pattern in enumerate(patterns):
-        text = ins[at + k][3] if at + k < len(ins) else ''
-        m = re.fullmatch(re.sub(r'\{(\w+)\}', lambda ref: re.escape(env[ref[1]]), pattern), text)
-        if not m:
-            raise Unsupported('slot 57 mesh %s: instruction %d of the accepted shape (%s) is absent'
-                              % (what, k + 1, pattern.split()[0]))
-        env.update(m.groupdict())
-    return at + len(patterns)
+def mesh_run(ins, at, what, patterns, env, groups, optional=()):
+    """Match straight-line groups, recording the actual instruction sites for branch validation."""
+    sites = {}
+    for group in groups:
+        optional_group = len(group) == 1 and group[0] in optional
+        first_missing = None
+        for order in itertools.permutations(group):
+            bindings = env.copy()
+            for pos, k in enumerate(order, at):
+                pattern = patterns[k]
+                asm = ins[pos][3] if pos < len(ins) else ''
+                try:
+                    expanded = re.sub(r'\{(\w+)\}', lambda ref: re.escape(bindings[ref[1]]), pattern)
+                except KeyError:
+                    expanded = None
+                match = re.fullmatch(expanded, asm) if expanded is not None else None
+                if not match:
+                    if first_missing is None:
+                        first_missing = k
+                    break
+                bindings.update(match.groupdict())
+            else:
+                sites.update((k, pos) for pos, k in enumerate(order, at))
+                env.update(bindings)
+                at += len(group)
+                break
+        else:
+            if not optional_group:
+                raise Unsupported('slot 57 mesh %s: instruction %d of the accepted shape (%s) is absent'
+                                  % (what, first_missing + 1, patterns[first_missing].split()[0]))
+    return at, sites
+
+
+def mesh_exchange_groups(length, *reordered, omit=()):
+    groups = {group[0]: group for group in reordered}
+    combined = {k for group in reordered for k in group[1:]}
+    return [groups.get(k, (k,)) for k in range(length) if k not in combined and k not in omit]
 
 
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
@@ -1661,6 +1689,7 @@ def mesh_wave_block_scalar(name, asm):
 
 MESH_TRIP_STEPS = ('s_add_u32', 's_add_i32', 's_sub_u32', 's_sub_i32')
 MESH_TRIP_MAX = 64
+MESH_RUNTIME_TRIP_MAX = 1024
 
 
 def mesh_inline_u32(tok):
@@ -1711,13 +1740,14 @@ def mesh_trip_count(init, step_name, step_imm, cmp_name, limit, latch_name, cmp_
     return None
 
 
-def mesh_constant_trip(ins, header, latch, offsets):
-    """Prove one constant-trip SCC back-edge: (trips,) or None.
+def mesh_counted_loop(ins, header, latch, offsets):
+    """Prove an SCC back-edge: an unroll count, (None,) for a runtime loop, or None for refusal.
 
     Shape (census "constant pattern", with an exact trip count): s_mov_b32 sN, C immediately before the
     header; the body changes sN only by s_add/s_sub of a constant; the last body instruction is s_cmp of sN
-    against a constant; the latch is s_cbranch_scc0/scc1 back to the header. No other branch enters or leaves
-    the body, and the body does not write EXEC, touch a barrier, LDS, sendmsg, or export.
+    against a constant or a masked scalar bound; the latch is s_cbranch_scc0/scc1 back to the header.
+    No other branch enters or leaves the body, and the body does not write EXEC, touch a barrier,
+    LDS, sendmsg, or export.
     """
     if header <= 0 or latch <= header or latch >= len(ins):
         return None
@@ -1745,8 +1775,18 @@ def mesh_constant_trip(ins, header, latch, offsets):
     else:
         return None
     limit = mesh_inline_u32(limit_tok)
-    if limit is None:
-        return None
+    runtime = limit is None
+    if runtime:
+        # A runtime bound must be clamped immediately before the counter initialization.
+        if header < 2 or not re.fullmatch(r's\d+', limit_tok):
+            return None
+        bound_op, bound_args, _ = parse(ins[header - 2][3])
+        if (bound_op != 's_and_b32' or len(bound_args) != 3 or bound_args[0] != limit_tok
+                or not re.fullmatch(r's\d+', bound_args[1])):
+            return None
+        bound_max = mesh_inline_u32(bound_args[2])
+        if bound_max is None or bound_max > MESH_RUNTIME_TRIP_MAX:
+            return None
     step = None
     for off, size, name, asm in body[:-1]:
         if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_call', 's_swappc')):
@@ -1754,6 +1794,14 @@ def mesh_constant_trip(ins, header, latch, offsets):
         if name.startswith(('ds_', 'exp')) or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
             return None
         _, ops, _ = parse(asm)
+        if runtime:
+            # Restrict loop-carried state to ordinary scalar ALU. The Stage CFG proves
+            # uniform SCC and handles the values reaching the header and exit.
+            reads, _, writes = scalar_effects(name, asm)
+            if (name not in SCA
+                    or any(reg != 'scc' and not re.fullmatch(r's\d+', reg) for reg in reads | writes)
+                    or limit_tok in writes):
+                return None
         if writes_exec(name, ops) or name.startswith('v_cmpx') or name == 's_and_saveexec_b64':
             return None
         if name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm):
@@ -1793,15 +1841,22 @@ def mesh_constant_trip(ins, header, latch, offsets):
             return None
         if header < dest <= latch and not (header <= i <= latch):
             return None
+        if runtime and dest == header - 1:
+            return None
+    if runtime:
+        if (init_imm == 0 and step == ('s_add_u32', 1) and cmp_name == 's_cmp_lt_u32'
+                and cmp_counter_left and latch_name == 's_cbranch_scc1'):
+            return (None,)
+        return None
     trips = mesh_trip_count(init_imm, step[0], step[1], cmp_name, limit, latch_name, cmp_counter_left)
     return (trips,) if trips is not None else None
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, runtime_loops):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
-    - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
+    - Exchange: exec = 1 (lane 0 of each wave), optionally saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
     - Code up to the next barrier. Its only read of the exchanged v5 may be a v_readfirstlane_b32 under exec = -1.
       Other first-lane reads require a defined source and wave-coherent control flow. Wave-load blocks can use
@@ -1810,7 +1865,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
       execz branch to that barrier. The skipped instructions only affect active lanes or dead scalars, and
       both exchange arms replace EXEC, so a per-lane skip has the same visible effects as a per-wave skip.
     - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
-      SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
+      SGPR V at byte 4 under the saved or explicitly selected lane-0 mask, waits, passes a barrier and sends one
+      allocation request with
       m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
     - Code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by one
       v_cmpx_gt_i32 V, thread; the primitive export likewise with P. thread is the v_mbcnt pair over wave << 6.
@@ -1824,20 +1880,45 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     env = {}
     first = 1 if ins and ins[0][2] == 's_inst_prefetch' else 0
     start = next((i for i in range(first, len(ins)) if ins[i][3] == 's_mov_b64 exec, 1'), first)
-    a_end = mesh_run(ins, start, 'group-index exchange', MESH_EXCHANGE, env)
+    a_end, a_sites = mesh_run(
+        ins, start, 'group-index exchange', MESH_EXCHANGE, env,
+        mesh_exchange_groups(len(MESH_EXCHANGE), (4, 5)), optional=(1,))
     count_at = next((i for i in range(a_end, len(ins)) if ins[i][2] == 's_barrier'), len(ins))
-    b_end = mesh_run(ins, count_at, 'count exchange', MESH_COUNTS, env)
+    counts = list(MESH_COUNTS)
+    if 'lane' not in env:
+        # Without a saved mask, both count arms must explicitly select lane zero.
+        counts[3] = counts[18] = r's_mov_b64 exec, 1'
+    count_env = env.copy()
+    try:
+        b_end, b_sites = mesh_run(
+            ins, count_at, 'count exchange', counts, count_env,
+            mesh_exchange_groups(len(counts), (5, 6, 7, 8, 9)), optional=(4, 19))
+    except Unsupported as original:
+        # The store address may already have been cleared just before the exchange.
+        zero = re.fullmatch(r'v_mov_b32_e32 (v\d+), 0', ins[count_at - 1][3])
+        if not zero:
+            raise
+        env['b_zero'] = zero[1]
+        try:
+            b_end, b_sites = mesh_run(
+                ins, count_at, 'count exchange', counts, env,
+                mesh_exchange_groups(len(counts), (5, 7, 8, 9), omit=(6,)), optional=(4, 19))
+        except Unsupported:
+            raise original from None
+    else:
+        env = count_env
 
     def lands(key, index, what):
-        if index >= len(ins) or int(env[key], 16) != ins[index][0]:
+        if key in env and (index >= len(ins) or int(env[key], 16) != ins[index][0]):
             raise Unsupported('slot 57 mesh %s: a branch leaves the accepted shape' % what)
-    lands('a_other', start + 10, 'group-index exchange')
+    lands('a_other', a_sites[10], 'group-index exchange')
     lands('a_join', a_end, 'group-index exchange')
-    lands('b_reader', count_at + 17, 'count exchange')
-    lands('b_wskip', count_at + 10, 'count exchange')
+    lands('b_reader', b_sites[17], 'count exchange')
+    lands('b_wskip', b_sites[10], 'count exchange')
     lands('b_join', b_end, 'count exchange')
-    lands('b_rskip', count_at + 27, 'count exchange')
-    lane = set(range(*(lambda r: (r[1], r[2] + 1))(reg_range(env['lane']))))
+    lands('b_rskip', b_sites[27], 'count exchange')
+    lane_parts = reg_range(env['lane']) if 'lane' in env else None
+    lane = set(range(lane_parts[1], lane_parts[2] + 1)) if lane_parts else set()
     a_bits = int(env['a_bits'][1:])
     sreg = {key: int(env[key][1:]) for key in ('wave', 'prims', 'verts', 'b_tmp')}
     vreg = {key: int(env[key][1:]) for key in ('a_zero', 'a_zero2', 'b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
@@ -1854,6 +1935,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     count_entry = count_entry_branch = None
     # header index -> (latch index, trip count). Constant-trip loops are unrolled below.
     constant_trips = {}
+    runtime_latches = {}
     no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
     exchange_branch_refusal = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
 
@@ -1918,17 +2000,23 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                     raise Unsupported(exchange_branch_refusal)
                 count_entry, count_entry_branch = compare, i
             if target <= off:
-                proven = mesh_constant_trip(ins, dest, i, offsets)
-                if proven is None or dest in constant_trips:
+                proven = mesh_counted_loop(ins, dest, i, offsets)
+                if proven is None or dest in constant_trips or ins[dest][0] in runtime_loops:
                     raise Unsupported(MESH_LOOP_REFUSAL)
-                constant_trips[dest] = (i, proven[0])
+                if proven[0] is None:
+                    if dest - 2 < lo:
+                        raise Unsupported(MESH_LOOP_REFUSAL)
+                    runtime_loops.add(ins[dest][0])
+                    runtime_latches[i] = dest
+                else:
+                    constant_trips[dest] = (i, proven[0])
                 continue
             if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
             edges[i] = dest
 
     targets = set(edges.values())
-    if targets & set(constant_trips):
+    if targets & (set(constant_trips) | set(runtime_latches.values())):
         raise Unsupported(MESH_LOOP_REFUSAL)
     if count_entry is not None and targets.intersection(range(count_entry, count_at)):
         raise Unsupported(exchange_branch_refusal)
@@ -2141,9 +2229,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
         if not falls:
             raise Unsupported('slot 57 mesh: unreachable code after a branch is not covered')
         if index == start:
-            out.append(span(start, start + 1) + ('x2w_mesh_lane0', 'x2w_mesh_lane0 ' + env['lane']))
-            out.append(ins[start + 2])
-            out.append(span(start + 3, a_end - 1) + ('s_nop', 's_nop 0'))
+            and_at = a_sites[2]
+            lane0 = 'x2w_mesh_lane0'
+            out.append(span(start, and_at - 1) + (lane0, lane0 + (' ' + env['lane'] if lane else '')))
+            out.append(ins[and_at])
+            out.append(span(and_at + 1, a_end - 1) + ('s_nop', 's_nop 0'))
             stale |= pending | {5, vreg['a_zero'], vreg['a_zero2']}
             pending.clear()
             mask, thread = 'lane0', None
@@ -2152,6 +2242,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                 base = None
             continue
         if index == count_at:
+            if 6 not in b_sites and (mask is not None or index in targets):
+                raise Unsupported('slot 57 mesh count exchange: the store address is not zero on every path')
             if not wave_known:
                 raise Unsupported('slot 57 mesh count exchange: the compared register is not the wave index')
             out.append(span(count_at, b_end - 2) + (
@@ -2165,6 +2257,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                 base = None
             continue
         off, size, name, asm = ins[index]
+        if index in runtime_latches:
+            out.append(ins[index])
+            continue
         after = index >= b_end
         _, ops, _ = parse(asm)
         base_name = re.sub(r'_e(32|64)$', '', name)
@@ -2441,11 +2536,12 @@ class Stage:
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
             self.mesh_wave_votes = {}
+            self.mesh_runtime_loops = set()
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
-                                     self.mesh_wave_loads, self.mesh_wave_votes)
+                                     self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_runtime_loops)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
@@ -8793,9 +8889,10 @@ class Stage:
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
         # `s_mov_b64 exec, 1` leaves lane 0 of each wave running. The saved copy of that mask is not modelled.
-        r = reg_range(ops[0])
-        for n in range(r[1], r[2] + 1):
-            self.sym[n] = ('the saved mesh lane-0 mask',)
+        if ops:
+            r = reg_range(ops[0])
+            for n in range(r[1], r[2] + 1):
+                self.sym[n] = ('the saved mesh lane-0 mask',)
         self.emit('exec = (tid & 63u) == 0u ? 1u : 0u;')
         self.exec_known = self.exec_narrow_only = False
 
@@ -10308,7 +10405,9 @@ class Stage:
         out = []
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
-        loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
+        runtime_loops = getattr(self, 'mesh_runtime_loops', ())
+        loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= off and off not in runtime_loops
+                    for off, _, t in self.blocks)
         if len(self.blocks) == 1:
             return ['    ' + line for line in self.blocks[0][1]]
 
@@ -10332,7 +10431,15 @@ class Stage:
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             if off in getattr(self, 'mesh_collect_reads', {}):
                 out.append('        uint mesh_first = mesh_first_%d;' % i)
-            out += ['        ' + line for line in lines]
+            if off in runtime_loops:
+                if not term or term[0] != 'branch' or term[2] != off:
+                    raise Unsupported(MESH_LOOP_REFUSAL)
+                out.append('        [loop] do {')
+                out += ['            ' + line for line in lines]
+                out.append('        } while (%s);' % term[1])
+                term = None
+            else:
+                out += ['        ' + line for line in lines]
             if off in getattr(self, 'mesh_collect_votes', {}):
                 word = self.mesh_collect_votes[off]
                 out += ['    }',
@@ -12945,6 +13052,9 @@ LIFTED_REASONS = (
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
     ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),
     ('mesh57-firstlane', r'^slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered'),
+    ('mesh57-loop', r'^slot 57 mesh: a loop outside the group-memory exchanges is not covered'),
+    ('mesh57-group-index', r'^slot 57 mesh group-index exchange: instruction 2 of the accepted shape .*is absent'),
+    ('mesh57-count', r'^slot 57 mesh count exchange: instruction [578] of the accepted shape .*is absent'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
