@@ -7352,7 +7352,7 @@ class Stage:
         self.tbuffer(ops, mods, 4)
 
     def image(self, ops, mods, how):
-        if getattr(self, 'kind', None) == 'cs' and 'd16' in mods:
+        if getattr(self, 'kind', None) == 'cs' and 'd16' in mods and how in ('load', 'load_mip'):
             raise Unsupported('compute d16 image load requires validated SRV formats')
         # Every image form reads vdata, an address and a descriptor, so a shorter operand list would reach
         # ops[1] or ops[2] as an index error rather than a refusal. Samplers are checked further down, where
@@ -7508,12 +7508,16 @@ class Stage:
             if not one and how in ('sample', 'lz'):
                 op_name = 'image_sample' if how == 'sample' else 'image_sample_lz'
                 packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
-                allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ())
+                # d16 returns the sampled channels as binary16 pairs (RNE): vdata is ceil(channels / 2) registers.
+                allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ('d16',))
                 for m in mods:
                     if not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                         raise Unsupported('%s modifier %s' % (op_name, m))
                 if not dmask:
                     raise Unsupported('%s with an empty dmask' % op_name)
+                if 'd16' in mods and (not dst or dst[0] != 'v' or dst[2] > 255
+                                      or dst[2] - dst[1] + 1 != (bin(dmask).count('1') + 1) // 2):
+                    raise Unsupported('%s d16 destination %s for dmask %#x' % (op_name, ops[0], dmask))
                 expected = 1 if packed_2d else (3 if three else 2)
                 if len(cs) != expected:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
@@ -7600,6 +7604,14 @@ class Stage:
             mode_arg = 'ud%d' % self.pipe.ud(('d16unorm16', res['index']))
             self.pipe.uses_pack16_rne = True
             halves = ['pack16_d16(t.%s, %s)' % (comp, mode_arg) for bit, comp in enumerate('xyzw') if dmask & (1 << bit)]
+            for i in range(0, len(halves), 2):
+                odd_tail = i + 1 == len(halves)
+                expr = halves[i] if odd_tail else '%s | (%s << 16)' % (halves[i], halves[i + 1])
+                self.set_v(dst[1] + i // 2, expr, low16_only=odd_tail)
+        elif how in ('sample', 'lz') and 'd16' in mods:
+            # The channels of the sampled texel, rounded to binary16 (RNE) and packed two to a register, lowest first.
+            self.pipe.uses_pack16_rne = True
+            halves = ['pack16_rne(t.%s)' % comp for bit, comp in enumerate('xyzw') if dmask & (1 << bit)]
             for i in range(0, len(halves), 2):
                 odd_tail = i + 1 == len(halves)
                 expr = halves[i] if odd_tail else '%s | (%s << 16)' % (halves[i], halves[i + 1])

@@ -1,4 +1,5 @@
-"""Compute image_sample_lz / image_sample_l on a cube map: translation controls, then a D3D12 readback of the six faces.
+"""Compute image_sample_lz / image_sample_l on a cube map, and image_sample_lz with d16: translation controls, then a D3D12
+readback of the six faces.
 
 usage: startup_compute_cube_check.py [--llvm-mc LLVM_MC | --dispatch DXC EXE ADAPTER]
 
@@ -9,6 +10,12 @@ every texel is distinct (face, x, y and a running tag), so a wrong face, a wrong
 the readback. The CPU reference is the face-local texel at (S - 1, T - 1), which does not use the direction table.
 Off-centre samples (the texel's 0.3 and 0.7 fractions, not its centre) are part of the set. Controls: the face order
 of the direction table swapped for two faces, and S and T swapped.
+
+The d16 form (image_sample_lz ... d16) returns the sampled channels as binary16 pairs: dmask 0xf in two registers, r in the
+low half of the first, g in the high half, b and a likewise in the second. The d16 cube has texels whose channels need
+rounding (ties between two halves, a value that is not a half, a subnormal half, values at and above the overflow
+threshold 65520); the reference rounds each channel with struct's 'e' format (to nearest even, a value of 65520 or more is
+infinity). Controls: the halves exchanged, and rounding toward zero.
 """
 import argparse
 import math
@@ -20,6 +27,7 @@ from pathlib import Path
 from startup_gfx2hlsl_compute_check import G, TGID_X, USER7, refused, root_blob, tidig
 from startup_flat_param_check import assemble
 
+CUBE_LINE_FULL = 'image_sample_lz v[8:11], v[1:3], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_CUBE'
 SOURCE = """\
 s_mov_b32 s10, s6
 s_mov_b32 s11, 0
@@ -40,6 +48,10 @@ WORDS = bytes.fromhex(
     '06038abe' '80038bbe' '05030cf4000000fa' '05060cf4400000fa' '800494be' '800496be' '84000834' '7fc08cbf'
     '00103ce004010380' '703f8cbf' '180f9cf00108a600' '703f8cbf' '001078e004080480' '000081bf')
 LZ, LOD = bytes.fromhex('180f9cf00108a600'), bytes.fromhex('180f90f00108a600')  # image_sample_lz, image_sample_l
+LZ_D16 = bytes.fromhex('180f9cf00108a680')  # image_sample_lz v[8:9], v[1:3], ... dmask:0xf dim:SQ_RSRC_IMG_CUBE d16
+STORE4, STORE2 = bytes.fromhex('001078e004080480'), bytes.fromhex('001074e004080480')  # buffer_store_dwordx4 / x2 v[8:..]
+D16_SOURCE = (SOURCE.replace(CUBE_LINE_FULL, CUBE_LINE_FULL.replace('v[8:11]', 'v[8:9]') + ' d16')
+              .replace('buffer_store_dwordx4 v[8:11]', 'buffer_store_dwordx2 v[8:9]'))
 IMPLICIT = bytes.fromhex('180f80f00108a600')  # image_sample: implicit LOD
 CUBE_LINE = 'image_sample_lz v[8:11], v[1:3], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_CUBE'
 RSRC2 = USER7 | TGID_X | tidig(1)
@@ -79,8 +91,34 @@ def reference(records):
     return out
 
 
-def faces_blob():
-    return b''.join(struct.pack('<4f', *texel(f, x, y)) for f in range(6) for y in range(SIZE) for x in range(SIZE))
+def faces_blob(texel_of=None):
+    texel_of = texel_of or texel
+    return b''.join(struct.pack('<4f', *texel_of(f, x, y)) for f in range(6) for y in range(SIZE) for x in range(SIZE))
+
+
+def d16_texel(face, x, y):
+    """Channels that need rounding to binary16: a tie (1 + odd * 2^-11), a value that is no half (n / 3), a subnormal
+    half, and values around the overflow threshold (65500 .. 65524)."""
+    i = face * 16 + y * 4 + x
+    return (1.0 + (i % 7) * 2.0 ** -11, (i + 1) / 3.0, 6.0e-5 * (1 + i % 5), 65500.0 + (i % 4) * 8.0)
+
+
+def half_bits(value):
+    """binary16 bits of `value`, rounded to nearest even (struct's 'e'); 65520 and more is infinity."""
+    try:
+        return struct.unpack('<H', struct.pack('<e', struct.unpack('<f', struct.pack('<f', value))[0]))[0]
+    except OverflowError:
+        return 0x7c00
+
+
+def d16_reference(records):
+    out = []
+    for s, t, face in records:
+        x = min(max(int(math.floor((s - 1.0) * SIZE)), 0), SIZE - 1)
+        y = min(max(int(math.floor((t - 1.0) * SIZE)), 0), SIZE - 1)
+        r, g, b, a = (half_bits(c) for c in d16_texel(int(face), x, y))
+        out.append((r | g << 16, b | a << 16))
+    return out
 
 
 def samples_blob(records):
@@ -117,9 +155,29 @@ def controls(llvm_mc):
     assert len(records) == THREADS == 6 * len(TEXELS)
     assert len({tuple(texel_) for texel_ in reference(records)}) == THREADS, 'two samples read the same texel'
     print('cube translation controls ok')
+    d16_controls(llvm_mc)
 
 
-def compile_and_run(directory, compiler, exe, adapter, source, name):
+D16_WORDS = WORDS.replace(LZ, LZ_D16).replace(STORE4, STORE2)
+
+
+def d16_controls(llvm_mc):
+    if llvm_mc:
+        assert assemble(llvm_mc, D16_SOURCE) == D16_WORDS, 'the d16 fixture words no longer match llvm-mc'
+    pipe = pipeline(D16_WORDS)
+    source = pipe.hlsl_cs()
+    assert pipe.manifest().endswith('srv 0 buf table 1 0\nsrv 1 texcube table 1 64\nuav 0 table 1 16\nsmp 0 0x0 0x0 0x0 0x0\n')
+    assert 'uint pack16_rne(float value) {' in source
+    assert source.count('pack16_rne(t.x) | (pack16_rne(t.y) << 16)') == 1, source[source.index('t = r1'):][:300]
+    assert source.count('pack16_rne(t.z) | (pack16_rne(t.w) << 16)') == 1
+    # A wrong destination width, a d16 form that is not a plain sample, and the compute d16 load keep their refusals.
+    refused('d16 destination', lambda: pipe.cs.image(['v[8:11]', 'v[1:3]', 's[24:31]', 's[20:23]'],
+                                                     ['dim:SQ_RSRC_IMG_CUBE', 'dmask:0xf', 'd16'], 'lz'))  # four registers for four halves
+    refused('modifier d16', lambda: pipeline(D16_WORDS.replace(LZ_D16, bytes.fromhex('180f90f00108a680'))))  # image_sample_l
+    print('d16 translation controls ok')
+
+
+def compile_and_run(directory, compiler, exe, adapter, source, name, words=False):
     hlsl, cso, out = (directory / (name + ext) for ext in ('.hlsl', '.cso', '.out'))
     hlsl.write_text(source, encoding='ascii')
     subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'main', '-Fo', cso, hlsl], check=True)
@@ -130,7 +188,7 @@ def compile_and_run(directory, compiler, exe, adapter, source, name):
         return None
     assert run.returncode == 0, (name, run.returncode)
     raw = out.read_bytes()
-    return [struct.unpack_from('<4f', raw, 16 * i) for i in range(THREADS)]
+    return [struct.unpack_from('<4I' if words else '<4f', raw, 16 * i) for i in range(THREADS)]
 
 
 def dispatch(directory, compiler, exe, adapter):
@@ -161,6 +219,32 @@ def dispatch(directory, compiler, exe, adapter):
         wrong = mismatches(got)
         assert len(wrong) == count, '%s: %d samples differ, expected %d' % (name, len(wrong), count)
         print('mutant %s: %d samples differ, as expected' % (name, len(wrong)))
+    return d16_dispatch(directory, compiler, exe, adapter, records)
+
+
+def d16_dispatch(directory, compiler, exe, adapter, records):
+    (directory / 'faces.bin').write_bytes(faces_blob(d16_texel))
+    expected = d16_reference(records)
+    source = pipeline(D16_WORDS).hlsl_cs()
+    assert len(set(expected)) > 12, 'the d16 texels collapse to a few values'
+
+    def mismatches(got):
+        return [i for i in range(THREADS) if (got[i][0], got[i][1]) != expected[i]]
+
+    got = compile_and_run(directory, compiler, exe, adapter, source, 'd16', words=True)
+    wrong = mismatches(got)
+    assert not wrong, 'd16 sample %d: got %08x,%08x expected %08x,%08x (%d of %d differ)' % (
+        wrong[0], got[wrong[0]][0], got[wrong[0]][1], *expected[wrong[0]], len(wrong), THREADS)
+    print('d16: all %d samples match binary16 (RNE) of the texel, including ties, subnormals and overflow' % THREADS)
+    exchanged = source.replace('pack16_rne(t.x) | (pack16_rne(t.y) << 16)', 'pack16_rne(t.y) | (pack16_rne(t.x) << 16)')
+    truncated = source.replace('    uint half_m = sig >> shift', '    uint half_m = sig >> shift; return sign | half_m;\n    uint unused_m = sig >> shift').replace(
+        '        return sign | ((shifted + 0x00000fffu + ((shifted >> 13) & 1u)) >> 13);',
+        '        return sign | (shifted >> 13);')
+    for name, text in (('halves exchanged', exchanged), ('rounding toward zero', truncated)):
+        assert text != source, name
+        got = compile_and_run(directory, compiler, exe, adapter, text, name.replace(' ', '_'), words=True)
+        assert mismatches(got), '%s: the readback still matches' % name
+        print('d16 mutant %s: %d samples differ, as expected' % (name, len(mismatches(got))))
     return 0
 
 
