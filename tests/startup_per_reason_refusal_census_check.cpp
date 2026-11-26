@@ -77,6 +77,24 @@ void check_two_reasons_per_key()
     check("key2 keeps interleaved missing_root with calls=1", contains_line(observed, exp_k2_root));
 }
 
+void check_large_census()
+{
+    x2w_startup::PerReasonRefusalCensus census("indirect-draw");
+    for (unsigned key = 1; key <= 300; ++key) census.note(key, "translation_not_ready");
+    census.note(300, "translation_not_ready");
+    check("300 distinct pairs fit with no overflow", census.entry_count() == 300 && census.overflow_calls() == 0);
+    const auto report = collect_report(census, true);
+    check("report has totals, 64 pairs and one omitted summary", report.size() == 66);
+    check("late heavy hitter is first", report.size() >= 2 &&
+          report[1] == "x2w-d3d12 indirect-draw refusal 300: key=000000000000012c reason=translation_not_ready calls=2");
+    check("omitted pairs and calls are counted",
+          contains_line(report, "x2w-d3d12 indirect-draw refusals omitted: 236 pairs, 236 calls"));
+    census.note(299, "translation_not_ready");
+    const auto delta = collect_report(census, true);
+    check("a previously omitted pair can appear in a later delta", delta.size() == 2 &&
+          delta[1] == "x2w-d3d12 indirect-draw refusal 299: key=000000000000012b reason=translation_not_ready calls=2");
+}
+
 void check_limits_and_periodic_deltas()
 {
     using namespace x2w_startup;
@@ -102,7 +120,7 @@ void check_limits_and_periodic_deltas()
     check("overflow count is two", census.overflow_calls() == 2);
 
     const auto full = collect_report(census, true);
-    check("report has summary plus max_entries lines", full.size() == 1 + PerReasonRefusalCensus::max_entries);
+    check("report has totals, 64 pairs and omitted summary", full.size() == 66);
     check("unknown normalized and merged",
           contains_line(full, "x2w-d3d12 per-reason refusal 1: key=0000000000000001 reason=unknown calls=2"));
     check("newline replaced by space",
@@ -116,7 +134,7 @@ void check_limits_and_periodic_deltas()
               delta[1] == "x2w-d3d12 per-reason refusal 1: key=0000000000000001 reason=unknown calls=3");
 
     census.note(2, "line1\nline2");
-    check("forced report prints all entries", collect_report(census, false).size() == 1 + PerReasonRefusalCensus::max_entries);
+    check("forced report is capped too", collect_report(census, false).size() == 66);
     const auto after_forced = collect_report(census, true);
     check("forced report does not hide next periodic delta",
           after_forced.size() == 2 &&
@@ -134,6 +152,7 @@ int main(int argc, char**)
 
     check_two_reasons_per_key();
     check_limits_and_periodic_deltas();
+    check_large_census();
 
     if (failures) {
         std::printf("startup_per_reason_refusal_census: FAIL (%d checks)\n", failures);

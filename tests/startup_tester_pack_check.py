@@ -736,6 +736,49 @@ def check_request_families():
         assert sum(b for c in capped for _, b in c[3]) <= 700
 
 
+def check_indirect_graphics_family_reserve():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache, run = tmp / "cache", tmp / "run"
+        cache.mkdir()
+        run.mkdir()
+        make_run(run, 1)
+        stderr = []
+        compute_size = T.REQUESTS_CAP_BYTES // 27
+        compute_families = ("unsupported branch", "unbound buffer", "unknown format", "unhandled export")
+        for n in range(30):
+            key = "c%015x" % n
+            write(cache, f"req_{key}.c67", b"C" * (compute_size - 4 * 1024))
+            write(cache, f"req_{key}.data", b"D" * (4 * 1024))
+            write(cache, f"{key}.fail", compute_families[n % 4].encode())
+            stderr.append(f"x2w-render key use compute {key} first 1.0 s last 12.0 s uses {10000 - n}")
+        reasons = ("reduction crosses a branch", "lane write spills v{}", "unhandled export mask {}")
+        expected = set()
+        for n in range(6):
+            key, variant = "a%015x" % n, "b%015x" % n
+            for ext in (".a", ".b", ".root"):
+                name = f"req_{key}{ext}"
+                write(cache, name, b"G" * 1024)
+                expected.add(f"{T.REQUESTS_DIR}/{name}")
+            rtv = f"req_{variant}.rtv"
+            write(cache, rtv, f"rtv1 {int(key, 16)} 28".encode())
+            expected.add(f"{T.REQUESTS_DIR}/{rtv}")
+            write(cache, f"{key}.fail", reasons[n // 2].format(n).encode())
+            prefix = f"x2w-d3d12 indirect-draw refusal {n + 1}: key={variant} reason="
+            stderr.extend((prefix + "translation_not_ready calls=1",
+                           prefix + f"translation_not_ready calls={20 + n}",
+                           prefix + "missing_viewport calls=999"))
+        log = "\n".join(stderr) + "\n"
+        write(run, "stderr.txt", log.encode())
+        T.pack(str(run), MANIFEST, str(tmp / "packed.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "packed.zip") as z:
+            requests = [item for item in z.infolist() if item.filename.startswith(f"{T.REQUESTS_DIR}/")]
+            assert expected <= {item.filename for item in requests}, "two complete graphics requests per family"
+            assert T.REQUESTS_CAP_BYTES - compute_size < sum(item.file_size for item in requests) <= T.REQUESTS_CAP_BYTES
+        assert T.key_weights(log) == {"b%015x" % n: 20 + n for n in range(6)}
+
+
+
 def check_combine():
     """A matrix report: three runs in one mail-ready report, run_<label>/ folders, a matrix manifest with each run's env."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -915,6 +958,7 @@ if __name__ == "__main__":
     check_mail_ready_parts()
     check_phase_table()
     check_request_families()
+    check_indirect_graphics_family_reserve()
     check_combine()
     check_part_one_has_the_small_files()
     check_preset()

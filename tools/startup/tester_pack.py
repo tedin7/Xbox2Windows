@@ -464,9 +464,14 @@ def format_results(rows, use=None):
 REQUESTS_DIR = "shader_requests"
 REQUESTS_TOP = 40                   # keys
 REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
+REQUESTS_GRAPHICS_RESERVE_BYTES = 1536 * 1024
+REQUESTS_GRAPHICS_FAMILY_KEYS = 2
 REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86", ".rtv")
 NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
 CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
+
+INDIRECT_REFUSAL_RE = re.compile(
+    r"^x2w-d3d12 indirect-draw refusal \d+: key=([0-9a-f]{16}) reason=translation_not_ready calls=(\d+)\s*$", re.M)
 
 
 def key_weights(stderr_text):
@@ -474,6 +479,9 @@ def key_weights(stderr_text):
     weights = {}
     for m in NOT_DRAWN_KEY_RE.finditer(stderr_text):
         weights[m.group(1)] = int(m.group(2))
+    indirect = {key: int(calls) for key, calls in INDIRECT_REFUSAL_RE.findall(stderr_text)}
+    for key, calls in indirect.items():
+        weights[key] = weights.get(key, 0) + calls
     for m in CENSUS_KEY_RE.finditer(stderr_text):
         weights[m.group(1)] = max(0, int(m.group(2)) - int(m.group(3)))
     return weights
@@ -495,6 +503,7 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
     .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
     without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing.
+    A reserved byte budget first samples up to two weighted keys per non-compute kind and refusal reason.
     `uses` ({key: (first s, last s, uses)}, key_use) adds a first pass per refusal family: the `families` refusal reasons
     (normal_reason, registers and numbers ignored) with the most refused keys each contribute their `family_keys` keys with the most
     uses, whatever their draw/dispatch weight, so "all keys of this wall" come back (c20 wanted the top 20 'branch out of the block')."""
@@ -524,17 +533,28 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     taken, chosen, used = [0, 0], {}, 0
     family_of = {}
 
-    def take(key, kind, weight):
+    def take(key, kind, weight, limit=cap):
         nonlocal used
         own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
         files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
         size = sum(b for _, b in files)
-        if not files or used + size > cap:
+        if not files or used + size > limit:
             return False
         used += size
         have = {os.path.splitext(n)[1] for n, _ in files}
         chosen[key] = (key, kind, weight, files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
         return True
+
+    graphics_families = {}
+    for row in groups[1]:
+        graphics_families.setdefault((row[1], normal_reason(row[3])), []).append(row)
+    for family in sorted(graphics_families, key=lambda f: (-sum(weights[r[0]] for r in graphics_families[f]), f)):
+        for key, kind, _, _ in graphics_families[family][:REQUESTS_GRAPHICS_FAMILY_KEYS]:
+            if taken[1] >= top:
+                break
+            if key not in chosen and take(key, kind, weights[key], min(cap, REQUESTS_GRAPHICS_RESERVE_BYTES)):
+                taken[1] += 1
+    reserved_keys = len(chosen)
 
     if uses:
         count = {}
@@ -548,7 +568,7 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
             for key, kind, _, _ in members[:family_keys]:
                 if key not in chosen:
                     take(key, kind, weights.get(key, 0) or uses[key][2])
-    top += len(chosen)
+    top += len(chosen) - reserved_keys
     # first pass: each family up to its quota; second pass: what is left of `top` goes to whichever family still has keys
     for round_quota in (quota, [top, top]):
         for gi, group in enumerate(groups):

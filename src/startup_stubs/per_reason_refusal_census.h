@@ -5,6 +5,7 @@
 // max_entries; calls past the table continue to advance total_ and overflow_calls_.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,7 +16,8 @@ namespace x2w_startup {
 
 class PerReasonRefusalCensus {
 public:
-    static constexpr unsigned max_entries = 128;
+    static constexpr unsigned max_entries = 1024;
+    static constexpr unsigned report_entries = 64;
     static constexpr unsigned detail_entries = 8;
     static constexpr std::size_t max_label_bytes = 32;
     static constexpr std::size_t max_reason_bytes = 64;
@@ -85,14 +87,35 @@ public:
                       static_cast<unsigned long long>(overflow_calls_));
         emit(static_cast<const char*>(line));
 
+        unsigned ranked[max_entries];
+        unsigned count = 0;
         for (unsigned i = 0; i < entry_count_; ++i) {
+            if (!only_if_changed || entries_[i].calls != entries_[i].reported_calls) ranked[count++] = i;
+        }
+        const unsigned shown = (std::min)(count, report_entries);
+        std::partial_sort(ranked, ranked + shown, ranked + count, [&](unsigned a, unsigned b) {
+            if (entries_[a].calls != entries_[b].calls) return entries_[a].calls > entries_[b].calls;
+            return a < b;
+        });
+        for (unsigned rank = 0; rank < shown; ++rank) {
+            const unsigned i = ranked[rank];
             Entry& entry = entries_[i];
-            if (only_if_changed && entry.calls == entry.reported_calls) continue;
             if (only_if_changed) entry.reported_calls = entry.calls;
             std::snprintf(line, sizeof(line),
                           "x2w-d3d12 %s refusal %u: key=%016llx reason=%s calls=%llu",
                           label_, i + 1, static_cast<unsigned long long>(entry.key), entry.reason,
                           static_cast<unsigned long long>(entry.calls));
+            emit(static_cast<const char*>(line));
+        }
+        if (count > shown) {
+            std::uint64_t omitted_calls = 0;
+            for (unsigned rank = shown; rank < count; ++rank) {
+                Entry& entry = entries_[ranked[rank]];
+                omitted_calls += entry.calls;
+                if (only_if_changed) entry.reported_calls = entry.calls;
+            }
+            std::snprintf(line, sizeof(line), "x2w-d3d12 %s refusals omitted: %u pairs, %llu calls",
+                          label_, count - shown, static_cast<unsigned long long>(omitted_calls));
             emit(static_cast<const char*>(line));
         }
         return true;

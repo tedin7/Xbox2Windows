@@ -1255,8 +1255,8 @@ void refuse_each_reason(ID3D12Device* guest, ID3D12CommandSignature* draw_indexe
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(list.Get(), 9)(list.Get()), "close refusal list");
 }
 
-// 300 empty console presents (queue slot 32) reach the render-totals heartbeat; nothing is shown.
-std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
+// Empty console presents exercise the frame-based or elapsed-time report.
+std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path, bool timed, bool skip_wait)
 {
     const D3D12_COMMAND_QUEUE_DESC desc{};
     ComPtr<IUnknown> queue;
@@ -1265,7 +1265,11 @@ std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
     using Present = HRESULT (WINAPI*)(IUnknown*, UINT, const void*, const void*);
     const std::array<unsigned char, 0x50> planes{};
     const std::array<unsigned char, 0x40> present{};
-    for (int frame = 0; frame < 300; ++frame) slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data());
+    const int presents = timed ? 2 : 300;
+    for (int frame = 0; frame < presents; ++frame) {
+        if (timed && frame == 1 && !skip_wait) Sleep(12000);
+        check(slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data()), "present for indirect totals");
+    }
     std::ifstream file(log_path, std::ios::binary);
     std::string line, found;
     while (std::getline(file, line))
@@ -1781,12 +1785,14 @@ int main(int argc, char** argv) try
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
+    const bool skip_timed_wait = argc == 3 && std::strcmp(argv[2], "timed-counts-control") == 0;
+    const bool timed_counts = skip_timed_wait || (argc == 3 && std::strcmp(argv[2], "timed-counts") == 0);
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
-    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer) return 2;
+    else if (argc != 2 && !count_control && !timed_counts && !translated_indexed && !lease_writer) return 2;
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
     const bool fixed_create_fixture = mesh && GetEnvironmentVariableA("X2W_FIXED_MESH_CREATE_FIXTURE", nullptr, 0);
@@ -2474,11 +2480,15 @@ int main(int argc, char** argv) try
     if (indexed) {
         // Forwarded: the three unrefused runs. Other reasons: the short argument range, the invalid index range and two commands.
         refuse_each_reason(guest.Get(), signature.Get());
-        const std::string line = indirect_line(guest.Get(), log_path);
+        const std::string line = indirect_line(guest.Get(), log_path, timed_counts, skip_timed_wait);
         DeleteFileW(log_path.c_str());
         const std::string expected = std::string("x2w-render indirect: forwarded: drawindexed ") + (count_control ? "4" : "3") +
             "; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; "
             "other: drawindexed 3";
+        if (timed_counts && line.empty()) {
+            std::fprintf(stderr, "indirect totals missing after two presents\n");
+            return 1;
+        }
         if (line != expected) {
             std::fprintf(stderr, "indirect line mismatch:\n  got      '%s'\n  expected '%s'\n", line.c_str(), expected.c_str());
             return 1;

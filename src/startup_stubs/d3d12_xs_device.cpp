@@ -7757,7 +7757,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_ZONE("Present");
     X2W_FRAME_MARK;
     static LONG frames;
-    static ULONGLONG started, last_report;
+    static ULONGLONG started, last_report, last_indirect_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
@@ -7814,7 +7814,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
-    if (frame == 1) started = last_report = now;
+    if (frame == 1) started = last_report = last_indirect_report = now;
     if (frame <= 2) {
         char a[3 * 0x50 + 1], b[3 * 0x40 + 1];
         hex_text(plane_parameters, 0x50, a, sizeof(a));
@@ -7918,7 +7918,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             log_not_drawn_keys();
         }
     }
-    if (render_mode() && frame % 300 == 0) {
+    if (render_mode() && (frame % 300 == 0 || now - last_indirect_report >= 10000)) {
+        last_indirect_report = now;
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
                                                "placeholder-signature", "other"};
