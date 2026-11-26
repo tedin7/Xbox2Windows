@@ -448,7 +448,6 @@ def refusals():
     yield ('branch target inside the chain', branch_program(op, True), 'branch target', None)
     yield ('branch target on the later readlane of the v_min_u32 chain', branch_into_later_readlane(),
            'branch target', None)
-    yield ('a program with branches', branch_program(op, False), 'program with branches', None)
     yield ('after s_wqm exec_lo, exec_lo', program(WQM, START_MUL, chain(op), RESULT, END), 'helper lanes', None)
     yield ('the permlane VGPR read after the chain', program(START_MUL, chain(op), RESULT, END_READS_VP),
            'read after the chain', None)
@@ -550,6 +549,11 @@ def controls():
     _source, words = program(START_MUL, chain('v_max_u32'), RESULT, KILL_VP, END_READS_VP)
     text, reason = translate(words)
     check('accepts the permlane VGPR rewritten before it is read', text is not None and 'v3 = 0' in text, str(reason))
+    # A program with an execz branch ahead of the chain: the branch is decided over the host wave (every thread reaches the
+    # chain together), the chain keeps its lowering.
+    text, reason = translate(branch_program('v_max_u32', False)[1])
+    check('a forward execz branch is a wave vote and the chain still lowers', text is not None and
+          'WaveActiveAnyTrue((exec & 1u) != 0u)' in text and 'WaveActiveMax(' in text, str(reason))
     for label, (source, words), fragment, model in refusals():
         text, reason = translate(words)
         check('refuses %s, by name' % label, text is None and reason is not None and 'wave reduction' in reason
