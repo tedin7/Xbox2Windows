@@ -239,6 +239,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool shadow_buffer = mode == "dispatch-sampled-token-buffer-shadow";
     const bool copied_buffer = mode == "dispatch-sampled-token-buffer-copied";
     const bool shadow_texture = mode == "dispatch-sampled-token-texture-shadow" || mode == "dispatch-sampled-token-mutant";
+    const bool explicit_texture = mode == "dispatch-sampled-token-texture-explicit";
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
@@ -358,7 +359,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         }
         const auto texture_entry = cpu + (mode == "dispatch-input-token" ? 0 : 64);
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), texture_entry);
-        if (shadow_texture) std::memset(reinterpret_cast<void*>(texture_entry), 0, 32);
+        if (shadow_texture || explicit_texture) std::memset(reinterpret_cast<void*>(texture_entry), 0, 32);
+        // A record the title wrote itself (not a view token) over a slot whose shadow still names the SRV.
+        if (explicit_texture) reinterpret_cast<UINT*>(texture_entry)[2] = 0x1234;
     }
     if (token_inputs) {
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},

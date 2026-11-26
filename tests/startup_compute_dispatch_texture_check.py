@@ -240,6 +240,8 @@ def input_view_tokens(directory, consumer, env, cache, key, layout, untouched, p
     refused(buffer_copied, off, 'an input is in a placed buffer that does not alias title memory')
     refused(texture_shadow, off, texture_reason)
     refused('dispatch-sampled-unbound', on, texture_reason)
+    # Title-written descriptor words take precedence over the heap shadow, which guest writes do not update.
+    refused('dispatch-sampled-token-texture-explicit', on, texture_reason)
 
     # Shifting the lookup four bytes into the very same descriptor slot must refuse it.
     manifest = cache / f'{key:016x}.txt'

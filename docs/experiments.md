@@ -16981,15 +16981,13 @@ snapshot. A tracked GPU copy on that list takes precedence for copied placements
 The synthetic fixture in `startup_compute_dispatch_texture_check.py` dispatches
 with a texture SRV and a slot 70 buffer SRV. It compares all 320 words copied to a
 D3D12 readback buffer against a CPU reference. Switch-off controls and a texture
-lookup four bytes into a slot expect a refusal and the original sentinel. A
+lookup four bytes into a slot expect a refusal and the original sentinel, and so does
+a record the title wrote itself over a slot whose shadow still names the SRV. A
 changed red channel must differ from the reference in all 288 written words.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_(texture|input)_warp$' -V
 ```
-
-The Windows WARP results for these cases are pending. The offline synthetic
-compute translator check passed with `python3 -B tests/startup_gfx2hlsl_compute_check.py`.
 
 ### Static samplers with a LOD clamp
 
