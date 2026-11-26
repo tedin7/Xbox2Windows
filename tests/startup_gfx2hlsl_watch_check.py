@@ -262,7 +262,7 @@ else:
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     # A failure an earlier translator build wrote (older than the translator files, newer than its marker): the
-    # watcher's first pass retries it once.
+    # watcher leaves it for the pass after the run (old refusals are never retried beside a running title).
     built = gfx2hlsl.translator_stamp()
     touch(d / ('req_%016x.rtv' % 8), b'not an rtv request either', mtime=built - 20)
     touch(d / ('%016x.fail' % 8), b'stale reason\n', mtime=built - 10)
@@ -281,15 +281,16 @@ with tempfile.TemporaryDirectory() as tmp:
         time.sleep(1.0)
         expect('failure left unchanged by later passes', fail.stat().st_mtime_ns if fail.exists() else None, first)
         old = (d / ('%016x.fail' % 8)).read_text().strip()
-        expect('earlier failure retried once at start', old, 'invalid RTV variant request')
+        expect('earlier failure left for the pass after the run', old, 'stale reason')
         expect('watcher still running', watch.poll(), None)
     finally:
         watch.kill()
         out, err = watch.communicate(timeout=20)
     lines = sorted(line for line in out.splitlines() if line.strip())
-    expect('watcher output (each request translated once)', [line[:16] for line in lines], ['%016x' % 7, '%016x' % 8])
-    if err.strip():
-        failures.append('watcher stderr: %r' % err.strip()[-500:])
+    expect('watcher output (the new request, once)', [line[:16] for line in lines], ['%016x' % 7])
+    noise = [line for line in err.splitlines() if line.strip() and not line.startswith('gfx2hlsl watch')]
+    if noise:
+        failures.append('watcher stderr: %r' % '\n'.join(noise)[-500:])
 
 
 # Order: the oldest published request first; under --watch the ones published after the watcher started go first.
@@ -470,6 +471,46 @@ with tempfile.TemporaryDirectory() as tmp:
     gfx2hlsl.watch_pass(str(d), False, None, gfx2hlsl.translator_stamp())
     expect('the --watch first pass keeps it final', fail.stat().st_mtime, built + 50)
     expect('the reason is unchanged', fail.read_text(), reason)
+
+# Beside a running title the --watch pool translates only the requests the title is waiting for: 30 refusals an older
+# translator build wrote stay untouched in the run and are retried by the finish pass (--pending) after it. The pool
+# keeps to at most WATCH_JOBS workers (X2W_TRANSLATE_JOBS overrides) and logs its size and commit.
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    built = gfx2hlsl.translator_stamp()
+    old_keys, new_keys = range(0x100, 0x100 + 30), range(0x200, 0x203)
+    for key in old_keys:
+        touch(d / ('req_%016x.rtv' % key), b'not an rtv request', mtime=built - 200)
+        touch(d / ('%016x.fail' % key), b'refused by an older build\n', mtime=built - 100)
+    for key in new_keys:
+        touch(d / ('req_%016x.rtv' % key), b'not an rtv request')
+    env = {k: v for k, v in os.environ.items() if k != 'X2W_TRANSLATE_JOBS'}
+    watcher = subprocess.Popen([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--watch', str(d),
+                                '0.2'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not all((d / ('%016x.fail' % k)).exists() for k in new_keys):
+        time.sleep(0.2)
+    time.sleep(1.0)  # a pass that would retry old refusals has time to start
+    watcher.terminate()
+    out, err = watcher.communicate(timeout=30)
+    expect('in-run: the 3 new requests are translated', [(d / ('%016x.fail' % k)).exists() for k in new_keys], [True] * 3)
+    expect('in-run: the 30 old refusals are untouched',
+           [(d / ('%016x.fail' % k)).stat().st_mtime == built - 100 for k in old_keys], [True] * 30)
+    expect('in-run: the translator printed only the new keys', sorted(re.findall(r'^([0-9a-f]{16}):', out, re.M)),
+           ['%016x' % k for k in new_keys])
+    expect('in-run: the pool is at most %d workers' % gfx2hlsl.WATCH_JOBS,
+           'pool of at most %d workers' % min(gfx2hlsl.WATCH_JOBS, os.cpu_count() or 1) in err, True)
+    expect('in-run: the pool logs its size and commit', 'gfx2hlsl watch pool: ' in err and ' MiB (peak ' in err, True)
+    pending_cli(d, **{'X2W_TRANSLATE_JOBS': ''})
+    expect('after the run: the finish pass retries the 30',
+           [(d / ('%016x.fail' % k)).stat().st_mtime > built - 100 for k in old_keys], [True] * 30)
+    saved_jobs = os.environ.get('X2W_TRANSLATE_JOBS')
+    os.environ['X2W_TRANSLATE_JOBS'] = '7'
+    expect('X2W_TRANSLATE_JOBS overrides the in-run pool size', gfx2hlsl.watch_jobs(), 7)
+    if saved_jobs is None:
+        del os.environ['X2W_TRANSLATE_JOBS']
+    else:
+        os.environ['X2W_TRANSLATE_JOBS'] = saved_jobs
 
 for item in failures:
     print('FAIL', item)
