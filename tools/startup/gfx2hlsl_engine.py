@@ -4473,7 +4473,8 @@ class Stage:
                 return False
             # The 64-bit forms only (see also the exec_lo destination at the call site): in wave64 a 32-bit write
             # (s_mov_b32 exec_lo, vcc_lo) keeps the old bits of lanes 32..63, while the model sets every lane.
-            if tok in ('exec', 'vcc') or sym == ('execcopy',) or (
+            if tok in ('exec', 'vcc') or (tok in ('exec_lo', 'vcc_lo') and getattr(getattr(self, 'pipe', None), 'wave', None) == 32) \
+                    or sym == ('execcopy',) or (
                     r and r[0] == 's' and r[1] in getattr(self, 'masks', ())):
                 continue
             try:
@@ -5946,7 +5947,8 @@ class Stage:
                         self.align4_v.clear()
                     return None
                 self.exec_known = False
-                if hasattr(self, 'lane_exec_breaks') and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms)):
+                if hasattr(self, 'lane_exec_breaks') and ((dname == 'exec_lo' and getattr(self.pipe, 'wave', None) != 32)
+                                                    or not self.exec_write_exact(srcs, syms)):
                     # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
                     self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
