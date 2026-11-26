@@ -125,10 +125,12 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[7], st
         p.arena_bytes += m.bytes;
         p.arena.push_back(std::move(copy));
     }
-    // Pointers between the copies: a nested ARGM's parent is the last one before it with depth one higher.
+    // Pointers between the copies: a nested ARGM's parent is the last one before it with depth one higher. An address
+    // that names a wrapper or a descriptor handle keeps the replay's value: a CPU descriptor handle is readable memory
+    // on the recorded run, so its memory was recorded too, but the call wants the handle, not a copy.
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
-        if (!copies[i]) continue;
+        if (!copies[i] || p.translate(m.address) != m.address) continue;
         if (m.arg < 0x100) {
             if (m.arg < 7) top[m.arg] = reinterpret_cast<u64>(copies[i]);
             continue;
