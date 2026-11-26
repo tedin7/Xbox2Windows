@@ -524,7 +524,7 @@ LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 // copied bytes of an uncompressed one); inflated = the bytes a compressed request wrote. Fixed counters, no allocation.
 LONG requests_enqueued;
 LONG64 bytes_read_total, bytes_inflated_total;
-constexpr unsigned enqueue_ring_size = 16384;  // a power of two
+constexpr unsigned enqueue_ring_size = 4096;  // a power of two
 volatile LONG enqueue_ring_tick[enqueue_ring_size];  // GetTickCount() at the enqueue of request number i % size
 void note_enqueued() noexcept
 {
@@ -599,8 +599,8 @@ DiskStats disk_snapshot()
 
 // HDD mode (X2W_STORAGE_HDD=1, off by default): the worker plans the file reads of its next 256 queue entries, a prefetch thread reads
 // them sorted and merged (dstorage_read_plan.h) into a bounded cache, and the worker's own file read asks the cache first. The
-// worker still runs its entries in order, so a miss only costs speed. Look-ahead: the next 1024 entries; reads within 64 KiB of
-// each other merge up to 4 MiB; at most 128 MiB cached, unused entries dropped after 20 s.
+// worker still runs its entries in order, so a miss only costs speed. Look-ahead: the next 256 entries; reads within 64 KiB of
+// each other merge up to 4 MiB; at most 64 MiB cached, unused entries dropped after 20 s.
 bool hdd_mode() noexcept
 {
     static const bool on = [] {
@@ -610,11 +610,11 @@ bool hdd_mode() noexcept
     }();
     return on;
 }
-constexpr std::size_t hdd_look_ahead_entries = 1024;  // queue entries (requests, status entries and fences) planned ahead
+constexpr std::size_t hdd_look_ahead_entries = 256;  // queue entries (requests, status entries and fences) planned ahead
 x2w_startup::ReadCache& hdd_cache()
 {
     // Never destroyed: the prefetch thread can outlive the static destructors at process exit.
-    static x2w_startup::ReadCache* const cache = new x2w_startup::ReadCache(&note_disk_read, 64 << 10, 4 << 20, 128 << 20, 20000);
+    static x2w_startup::ReadCache* const cache = new x2w_startup::ReadCache(&note_disk_read, 64 << 10, 4 << 20, 64 << 20, 20000);
     return *cache;
 }
 void hdd_forget_file(unsigned long long generation) noexcept

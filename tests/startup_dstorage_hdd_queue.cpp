@@ -28,7 +28,7 @@ namespace {
 
 constexpr DWORD completion_timeout_ms = 15000;
 constexpr unsigned piece = 4096;
-constexpr unsigned base_count = 48;
+constexpr unsigned request_count = 48;
 
 using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 using CreateStatusArrayFn = long(__stdcall*)(void*, unsigned, const char*, const void*, void**);
@@ -133,10 +133,9 @@ int check_forget()
 int main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "forget") == 0) return check_forget();
-    const bool deep = argc == 2 && std::strcmp(argv[1], "deep") == 0;  // 1500 scattered requests: the look-ahead window is deeper than 256 entries
-    const bool on = deep || (argc == 2 && std::strcmp(argv[1], "on") == 0);
+    const bool on = argc == 2 && std::strcmp(argv[1], "on") == 0;
     if (!on && !(argc == 2 && std::strcmp(argv[1], "off") == 0)) {
-        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off|deep|forget\n");
+        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off|forget\n");
         return 2;
     }
     SetEnvironmentVariableA("X2W_STORAGE_HDD", on ? "1" : nullptr);  // read once, at the first use
@@ -144,9 +143,7 @@ int main(int argc, char** argv)
     wchar_t temp_dir[MAX_PATH] = {}, data_path[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, temp_dir);
     std::swprintf(data_path, MAX_PATH, L"%lsx2w_hdd_queue_%lu.bin", temp_dir, GetCurrentProcessId());
-    const unsigned request_count = deep ? 1500 : base_count;
-    const unsigned stride = deep ? 16384 : piece;  // deep: pieces 16 KiB apart, so only a deep window merges them
-    std::vector<unsigned char> file_bytes(static_cast<std::size_t>(request_count) * stride);
+    std::vector<unsigned char> file_bytes(request_count * piece);
     for (std::size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = static_cast<unsigned char>((i * 131 + (i >> 8)) ^ 0x5a);
     {
         HANDLE out = CreateFileW(data_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -172,7 +169,7 @@ int main(int argc, char** argv)
     }
     void *status_ptr = nullptr, *queue_ptr = nullptr;
     unsigned char description[0x28] = {};
-    *reinterpret_cast<std::uint16_t*>(description + 8) = deep ? 4096 : 16;
+    *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "Hdd", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {
         std::fprintf(stderr, "cannot create the queue\n");
@@ -182,9 +179,9 @@ int main(int argc, char** argv)
     auto* queue = static_cast<Object*>(queue_ptr);
 
     // Shuffled piece numbers (a fixed permutation: 5 is coprime with 48).
-    std::vector<unsigned> slot_of(request_count);
-    for (unsigned i = 0; i < request_count; ++i) slot_of[i] = (i * (deep ? 37 : 5) + 7) % request_count;
-    std::vector<std::vector<unsigned char>> destination(request_count);
+    unsigned slot_of[request_count];
+    for (unsigned i = 0; i < request_count; ++i) slot_of[i] = (i * 5 + 7) % request_count;
+    std::vector<unsigned char> destination[request_count];
     const DiskStats disk_before = disk_snapshot();
     for (unsigned i = 0; i < request_count; ++i) {
         destination[i].assign(piece, 0xA5);
@@ -193,7 +190,7 @@ int main(int argc, char** argv)
         *reinterpret_cast<unsigned char**>(request + 0x08) = destination[i].data();
         *reinterpret_cast<unsigned*>(request + 0x18) = piece;
         *reinterpret_cast<void**>(request + 0x20) = file_ptr;
-        *reinterpret_cast<u64*>(request + 0x28) = static_cast<u64>(slot_of[i]) * stride;
+        *reinterpret_cast<u64*>(request + 0x28) = static_cast<u64>(slot_of[i]) * piece;
         *reinterpret_cast<unsigned*>(request + 0x30) = piece;
         *reinterpret_cast<unsigned*>(request + 0x38) = piece;
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
@@ -214,7 +211,7 @@ int main(int argc, char** argv)
         const bool done = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i);
         const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
         if (!done || hr != S_OK) ++bad_status;
-        if (std::memcmp(destination[i].data(), file_bytes.data() + static_cast<std::size_t>(slot_of[i]) * stride, piece) != 0) ++wrong;
+        if (std::memcmp(destination[i].data(), file_bytes.data() + static_cast<std::size_t>(slot_of[i]) * piece, piece) != 0) ++wrong;
     }
     char what[200];
     std::snprintf(what, sizeof what, "%u of %u destinations differ from the file, %u bad statuses", wrong, request_count, bad_status);
@@ -222,13 +219,7 @@ int main(int argc, char** argv)
 
     const DiskStats disk = disk_snapshot();
     const LONG reads = disk.reads - disk_before.reads;
-    if (deep) {
-        // A window of 1024 entries (about 512 requests) closes the 16 KiB gaps between scattered pieces, so the file is read in
-        // far fewer reads than requests; a window of 256 entries (about 128 requests) leaves most of them unmerged.
-        const x2w_startup::ReadCache::Counters c = hdd_cache().counters();
-        std::snprintf(what, sizeof what, "deep window: %ld file reads for %u requests (want under %u), %ld groups, failed %ld", reads, request_count, request_count / 3, c.groups, c.failed);
-        ok = expect(reads < static_cast<LONG>(request_count / 3) && c.failed == 0, what) && ok;
-    } else if (on) {
+    if (on) {
         const x2w_startup::ReadCache::Counters c = hdd_cache().counters();
         // Submit hands the worker its entries in steps, so the plan may be made in a few windows: what is fixed is that every
         // request but the first is served by the cache, the merged reads are far fewer than the requests, and every merged
