@@ -1090,6 +1090,11 @@ std::vector<SubmittedAddressUploads> submitted_address_uploads;
 
 // X2W_TEST_ADDRESS_UPLOAD_RING=1 (fixtures only): fill by-address textures from the shared upload ring,
 // without the buffers above. The control of startup_address_console_gate runs with it.
+// A CPU-written texture of at least this many bytes (a video plane) is filled from its own upload buffer, like the
+// console-layout textures above, so a burst of large uploads cannot fill the bounded shared ring and starve every
+// later draw, index copy and compute input of it.
+constexpr u64 own_upload_buffer_bytes = 1u << 20;
+
 bool address_uploads_from_ring()
 {
     static const bool on = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0) != 0;
@@ -1411,9 +1416,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
-    if (dedicated) {
+    // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
+    const bool own_buffer = !console && !tiled && !is_compact && !address_uploads_from_ring() && total >= own_upload_buffer_bytes;
+    if (dedicated || own_buffer) {
         u64 bytes = 0;
-        for (UINT i = 0; i < mips; ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        for (UINT i = 0; i < (console ? mips : plan.count); ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
@@ -1422,7 +1429,8 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         } catch (const std::bad_alloc&) {
             return false;
         }
-        std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+        // Console layouts detile into a zeroed buffer; a plain upload overwrites every byte it names.
+        if (dedicated) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1497,12 +1505,26 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     for (u64 y = 0; y < level.rows; ++y)
                         std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
                                     static_cast<std::size_t>(level.row_bytes));
+                } else if (owned.cpu) {
+                    // Own buffer: copy the level's rows from the title's memory and name that buffer in the upload.
+                    if (readable_window(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes)) < bytes) {
+                        state.done = false;
+                        return true;
+                    }
+                    offset = owned.cursor;
+                    std::memcpy(owned.cpu + offset, memory + stride * s + fp.Offset, static_cast<std::size_t>(bytes));
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                    chunk = owned.resource.Get();
                 } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
                     state.done = false;
                     return true;
                 }
                 plan.upload(list, texture, chunk, mips, slices, s, i, offset);
             }
+        if (owned.cpu) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     }
     state.hash = hash;
     state.generation = generation;
