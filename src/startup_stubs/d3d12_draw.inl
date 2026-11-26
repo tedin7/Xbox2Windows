@@ -1557,6 +1557,68 @@ bool stale_large_copy_mutant()
     return on;
 }
 
+// Large raw bindings opt in to a snapshot that stays fixed until Present. Leave the switch off
+// to debug writes between draws with the regular validation and byte comparison.
+bool bigbind_once_enabled()
+{
+    static const bool on = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_BIGBIND_ONCE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
+struct BigBinding {
+    std::size_t bytes = 0;
+    bool readable = false;
+    UploadReservation slice;
+};
+
+// Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
+// taken by command lists, so the ring cannot recycle a cached slice before Present.
+std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
+UploadChunkMask big_binding_chunks;
+struct BigBindingCounts {
+    unsigned trims = 0, copies = 0, hits = 0;
+    std::size_t copied_bytes = 0;
+};
+BigBindingCounts big_binding_counts;
+
+void finish_bigbind_frame(LONG frame)
+{
+    big_bindings.clear();
+    if (big_binding_chunks) {
+        AcquireSRWLockExclusive(&allocator_lock);
+        discard_upload_chunks(big_binding_chunks, upload_chunks.data());
+        big_binding_chunks = 0;
+        ReleaseSRWLockExclusive(&allocator_lock);
+    }
+    static const bool report = [] {
+        char mode[16]{};
+        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+        return std::strcmp(mode, "once") == 0;
+    }();
+    if (report && big_binding_counts.trims)
+        log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
+            big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    big_binding_counts = {};
+}
+
+bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+        auto& chunk = upload_chunks[i];
+        if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
+            chunk.hold(self->own().upload_chunks, i);
+            ReleaseSRWLockExclusive(&allocator_lock);
+            return true;
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return false;
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
@@ -1571,19 +1633,12 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
         const auto& slice = found->second.slice;
-        AcquireSRWLockExclusive(&allocator_lock);
-        for (unsigned i = 0; i < upload_chunks.size(); ++i) {
-            auto& chunk = upload_chunks[i];
-            if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
-                chunk.hold(self->own().upload_chunks, i);
-                ReleaseSRWLockExclusive(&allocator_lock);
-                *offset = slice.offset;
-                if (resource) *resource = slice.resource;
-                if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
-                return true;
-            }
+        if (bind_upload_slice(self, slice)) {
+            *offset = slice.offset;
+            if (resource) *resource = slice.resource;
+            if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
+            return true;
         }
-        ReleaseSRWLockExclusive(&allocator_lock);
     }
     const auto slice = reserve_upload_ring(self, bytes);
     if (!slice.mapped) return false;
@@ -3246,25 +3301,72 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         }
         ID3D12Resource* chunk = nullptr;
-        // A raw view reads zero past its end and memory the title has not written is zero: copy only the part that can hold data.
-        // Pages that are only reserved (lazy commit) are zero and are left out without being touched; a write commits them, which
-        // the next draw sees. Of the committed part, the trailing zero bytes are left out too. (A 16 MiB binding copied whole on
-        // every draw emptied the 256 MiB upload ring.)
+        // A raw view reads zero past its end. Skip reserved pages and trim the committed zero tail.
         const std::size_t full_bytes = bytes;
-        const LONG64 step_t0 = step_now_us();
-        if (address && bytes >= (64u << 10) && !formatted.entry) {
-            bool extent_ok = false;
-            const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
-            if (extent_ok) bytes = extent ? extent : 256;
+        const bool large_raw = !formatted.entry && full_bytes >= x2w_local::big_copy_bytes;
+        BigBinding* cached = nullptr;
+        bool cache_hit = false;
+        // A root address has no declared length. Its span is inferred by probing above.
+        if (address && large_raw && srv.source != 2 && bigbind_once_enabled()) {
+            try {
+                const auto [entry, inserted] = big_bindings.try_emplace({address, full_bytes});
+                cached = &entry->second;
+                cache_hit = !inserted;
+            } catch (const std::bad_alloc&) {
+                // Fall back to regular binding when the table cannot grow.
+            }
         }
-        const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
-        if (readable_range && !formatted.entry && full_bytes >= (64u << 10)) {
-            bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
-            if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
+        const LONG64 step_t0 = cache_hit ? 0 : step_now_us();
+        bool readable_range;
+        if (cache_hit) {
+            bytes = cached->bytes;
+            readable_range = cached->readable;
+            ++big_binding_counts.hits;
+        } else {
+            if (address && large_raw) {
+                bool extent_ok = false;
+                const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
+                if (extent_ok) bytes = extent ? extent : 256;
+            }
+            readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+            if (readable_range && large_raw) {
+                bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
+                if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
+            }
+            if (cached) {
+                cached->bytes = bytes;
+                cached->readable = readable_range;
+                ++big_binding_counts.trims;
+            }
         }
-        const LONG64 step_t1 = step_now_us();
-        bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
-        {
+        const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
+        bool have = false;
+        if (readable_range && cached) {
+            auto& slice = cached->slice;
+            if (slice.mapped) {
+                have = bind_upload_slice(self, slice);
+                if (have) InterlockedIncrement64(&big_copies_reused);
+            } else {
+                slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
+                if (slice.mapped) {
+                    std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
+                    ++big_binding_counts.copies;
+                    big_binding_counts.copied_bytes += bytes;
+                    InterlockedIncrement64(&big_copies_made);
+                    have = true;
+                }
+            }
+            if (have) {
+                offset = slice.offset;
+                chunk = slice.resource;
+            } else {
+                // A retry needs a fresh readability check before it can read title memory.
+                big_bindings.erase({address, full_bytes});
+            }
+        } else if (readable_range) {
+            have = frame_copy(self, address, bytes, &offset, &chunk);
+        }
+        if (!cache_hit) {
             const LONG64 step_t2 = step_now_us();
             auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
             InterlockedIncrement64(&step.calls);
@@ -3309,7 +3411,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         count_buffer(have);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
-            if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
+            if (have && !cache_hit) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
@@ -3320,7 +3422,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         static const bool constants_log = GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", nullptr, 0) != 0 ||
                                           GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", nullptr, 0) != 0;
         // The first 3 draws of a translation, then every 300th (a constant that changes later, or never does, shows in the series).
-        const bool constants_due = constants_log && have && bytes >= 16 && bytes <= 4096 &&
+        const bool constants_due = constants_log && have && !cache_hit && bytes >= 16 && bytes <= 4096 &&
                                    (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
         if (constants_due) {
             const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);

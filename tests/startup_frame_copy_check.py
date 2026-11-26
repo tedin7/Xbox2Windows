@@ -1,5 +1,6 @@
-"""A constant buffer the title rewrites between two draws of one frame reaches the second draw with its new contents."""
+"""Check title-memory snapshots for writes between draws and across frame boundaries."""
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -21,8 +22,8 @@ def run(directory, consumer, backend, mode):
     log = folder / "trap.log"
     # The cross-frame reuse is off by default: the big-* cases switch it on, the controls below leave it off or break it.
     reuse = {"X2W_BIG_COPY_REUSE": "1"} if mode.startswith("big-") else {}
-    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), **reuse},
-                          binding="srv 0 buf table 0 0")
+    modes = {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), "X2W_BIGBIND_ONCE": "0", **reuse}
+    pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf table 0 0")
     refreshed = [line for line in log.read_text(errors="replace").splitlines() if "frame copy of" in line] if log.exists() else []
     return pixels, refreshed
 
@@ -53,8 +54,8 @@ def check(directory, consumer, backend):
     ):
         folder = directory / name.replace(" ", "_").replace(",", "")
         folder.mkdir()
-        pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": "big-changed", **extra},
-                              binding="srv 0 buf table 0 0")
+        modes = {"X2W_TEST_FRAME_COPY": "big-changed", "X2W_BIGBIND_ONCE": "0", **extra}
+        pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf table 0 0")
         if pixels is None:
             return 77
         if pixels != expected:
@@ -63,6 +64,30 @@ def check(directory, consumer, backend):
     return 0
 
 
+def check_once(directory, consumer, backend):
+    shader = HLSL.replace("asfloat(constants.Load4(0))",
+                          "0.5 * (asfloat(constants.Load4(0)) + asfloat(constants.Load4(16777200)))")
+    log = directory / "trap.log"
+    pixels = draw_texture(directory, consumer, backend, shader, {
+        "X2W_TEST_FRAME_COPY": "once", "X2W_TRAP_LOG": str(log),
+        "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+    }, binding="srv 0 buf table 0 0")
+    if pixels is None:
+        return 77
+    expected = (RED * 4 + BLUE * 4) * 4
+    if pixels != expected:
+        raise AssertionError(f"once: actual {pixels.hex()} expected {expected.hex()}")
+    frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
+                        log.read_text(errors="replace"))
+    expected_frames = [(str(frame), "1", "1", "3", str(16 << 20)) for frame in (1, 2)]
+    if frames != expected_frames:
+        raise AssertionError(f"once: frame counters {frames!r}, expected {expected_frames!r}")
+    print(f"{backend} once: 32 pixels exact, 1 trim and 1 full 16 MiB copy per frame, 3 hits per frame")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
+        consumer, backend = sys.argv[1:3]
+        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        sys.exit(check_mode(Path(temporary), consumer, backend))
