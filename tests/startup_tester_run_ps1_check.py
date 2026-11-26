@@ -15,6 +15,7 @@ notice and passes, because Linux hosts cannot run the script.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,7 @@ key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
 """
+DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
 
 
@@ -79,6 +81,8 @@ def make_tree(root):
     head = git(tree, "rev-parse", "--short=8", "HEAD")
     gen = tree / "out" / "build" / "release" / "generated"
     gen.mkdir(parents=True)
+    for dll in DLLS:
+        (gen.parent / (dll + ".dll")).write_bytes(b"MZ")
     return tree, head, gen / "x2w_build_rev.cpp"
 
 
@@ -190,7 +194,75 @@ def check_shell(shell):
           % Path(shell).name)
 
 
+def check_targets():
+    """tester_run.ps1 builds the startup_runtime target, whose DLLs are the ones run.ps1 copies."""
+    script = (STARTUP / "tester_run.ps1").read_text(encoding="utf-8")
+    assert "--target startup_runtime" in script
+    dlls = re.findall(r'"([A-Za-z0-9_]+)"', re.search(r"\$runDlls = @\((.*?)\)", script).group(1))
+    run_dlls = re.findall(r'"(\w+)"', re.search(r'foreach \(\$dll in (.*?)\) \{', (STARTUP / "run.ps1").read_text(encoding="utf-8")).group(1))
+    assert dlls == run_dlls, (dlls, run_dlls)
+    assert "add_custom_target(startup_runtime)" in (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
+    print("tester_run.ps1 builds startup_runtime for the %d DLLs run.ps1 copies" % len(run_dlls))
+
+
+STUB_CMAKE = """\
+cmake_minimum_required(VERSION 3.20)
+project(stub NONE)
+file(WRITE "${CMAKE_BINARY_DIR}/rev.cmake" "execute_process(COMMAND git -C \\"${CMAKE_SOURCE_DIR}\\" rev-parse --short=8 HEAD OUTPUT_VARIABLE rev OUTPUT_STRIP_TRAILING_WHITESPACE)\\nfile(WRITE \\"${CMAKE_BINARY_DIR}/generated/x2w_build_rev.cpp\\" \\"const char x2w_build_rev[] = \\\\\\"${rev}\\\\\\";\\\\n\\")\\n")
+add_custom_target(x2w_build_rev_generate COMMAND ${CMAKE_COMMAND} -P "${CMAKE_BINARY_DIR}/rev.cmake")
+foreach(pair IN ITEMS xmem_shim:xmem d3d12_xs_shim:d3d12_xs startup_stub_acphal:AcpHal startup_stub_chad:chad
+        startup_stub_xapu:xapu startup_stub_xcrdapi:XCRDAPI startup_stub_xg_xs:xg_xs startup_stub_gameinput:GameInput)
+    string(REPLACE ":" ";" parts "${pair}")
+    list(GET parts 0 target)
+    list(GET parts 1 dll)
+    add_custom_target(${target} COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/${dll}.dll")
+    list(APPEND runtime_targets ${target})
+endforeach()
+add_custom_target(startup_runtime)
+add_dependencies(startup_runtime x2w_build_rev_generate ${runtime_targets})
+# Everything else a full build would compile: it must stay unbuilt for a run.
+add_custom_target(all_targets ALL)
+add_dependencies(all_targets startup_runtime)
+add_custom_target(decoy_test_exe ALL COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/decoy.txt")
+"""
+
+
+def check_build(shell):
+    """A configured but unbuilt build directory: tester_run.ps1 builds only the run's targets (-FullBuild: all)."""
+    if not shutil.which("cmake"):
+        print("startup_tester_run_ps1_check: no cmake on this host: build check skipped")
+        return
+    with tempfile.TemporaryDirectory() as root:
+        tree, head, _ = make_tree(root)
+        build = tree / "out" / "build" / "release"
+        shutil.rmtree(build)
+        (tree / "CMakeLists.txt").write_text(STUB_CMAKE, encoding="utf-8")
+        configured = subprocess.run(["cmake", "-S", str(tree), "-B", str(build)], capture_output=True, text=True)
+        assert configured.returncode == 0, configured.stdout + configured.stderr
+        git(tree, "add", "CMakeLists.txt")
+        git(tree, "commit", "-q", "-m", "cmake")
+        head = git(tree, "rev-parse", "--short=8", "HEAD")
+        assert not (build / "xmem.dll").exists()
+        result = run_script(shell, tree, "-CaptureEvery", "0")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "building the run's targets" in result.stdout, result.stdout
+        for dll in DLLS:
+            assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"
+        assert (build / "generated" / "x2w_build_rev.cpp").read_text().count('"%s"' % head) == 1
+        assert not (build / "decoy.txt").exists(), "a target the run does not need was built"
+        # A missing DLL is rebuilt even when the revision stamp is current.
+        (build / "GameInput.dll").unlink()
+        again = run_script(shell, tree, "-CaptureEvery", "0")
+        assert again.returncode == 0 and (build / "GameInput.dll").exists() and "GameInput.dll" in again.stdout, again.stdout
+        # -FullBuild builds the rest too (the revision is current, so a DLL has to be missing to trigger a build).
+        (build / "xmem.dll").unlink()
+        full = run_script(shell, tree, "-CaptureEvery", "0", "-FullBuild")
+        assert full.returncode == 0 and "-FullBuild" in full.stdout and (build / "decoy.txt").exists(), (full.stdout, full.stderr)
+    print("tester_run.ps1 builds only the run's targets (and everything with -FullBuild) under %s" % Path(shell).name)
+
+
 def main():
+    check_targets()
     available = shells()
     if not available or not shutil.which("git"):
         print("startup_tester_run_ps1_check: no PowerShell or no git on this host: skipped")
@@ -200,6 +272,7 @@ def main():
         return 0
     for shell in available:
         check_shell(shell)
+        check_build(shell)
     return 0
 
 
