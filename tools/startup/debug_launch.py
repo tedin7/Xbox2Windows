@@ -30,6 +30,8 @@ from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritabl
 import host_cpu  # noqa: E402
 from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
+
+SHUTDOWN_STEP_SECONDS = 8   # longest wait for one shutdown step (thread dump, window capture) before it is skipped
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 
@@ -177,7 +179,8 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
     stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at the timeout
-    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file):  # a reused run directory starts clean
+    dump_request = os.path.join(logdir, "dump_request")  # created from outside (stall watchdog): write threads_stall.txt now
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file, dump_request):  # a reused run directory starts clean
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -221,6 +224,8 @@ def main():
                               ctypes.create_unicode_buffer(block), cwd, ctypes.byref(startup), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
+    with open(os.path.join(logdir, "title.pid"), "w", encoding="ascii") as handle:  # for the stall watchdog (CPU, hard end)
+        handle.write(str(pi.dwProcessId))
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
     k32.DebugSetProcessKillOnExit(True)
     k32.ResumeThread(wt.HANDLE(pi.hThread))
@@ -378,6 +383,10 @@ def main():
         return (f"[root {root:#x}]" if root else "") + text
 
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
+    # files.txt lists every file open (one flushed line each, a hit and a held-thread step per open: slow on a hard disk)
+    # only with --trace-files 1; without it the hooks stay for offline mode and files.txt keeps what is rare (DENIED,
+    # REDIRECT, VALLOC, LOG_AT) but not the plain opens.
+    log_files = opts.get("--trace-files") == "1"
     # --trace-calls 1: also break on gaming-runtime and movie-player calls. Every hit stops the whole
     # process, so these hooks are off by default; the movie-player report (bink_report) needs them.
     # The call hooks are armed with the file hooks, so without file tracing (--trace-files 1, or offline
@@ -626,6 +635,8 @@ def main():
                     struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
                     set_ctx(thread)
                     return True
+                if not log_files:
+                    desc = None   # a plain open: nothing to log, and no return breakpoint to arm
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -702,6 +713,27 @@ def main():
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
         return lines
+
+    def limited(step, *step_args, seconds=SHUTDOWN_STEP_SECONDS):
+        """Runs one shutdown step on a thread of its own and waits at most `seconds` for it: a step that needs the title's
+        window thread (PrintWindow) or a stopped thread (GetThreadContext) can wait forever, and the run must still end.
+        Returns the step's result, or None when it failed or did not finish (the line says which)."""
+        box = []
+
+        def work():
+            try:
+                box.append(step(*step_args))
+            except Exception as error:  # diagnostics only
+                print(f"  shutdown step {step.__name__} failed: {error}")
+                box.append(None)
+        worker = threading.Thread(target=work, name="shutdown-" + step.__name__, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        if worker.is_alive():
+            print(f"  shutdown step {step.__name__} did not finish in {seconds:g} s: skipped")
+            log(f"{time.time() - start:7.3f} shutdown step {step.__name__} did not finish in {seconds:g} s: skipped")
+            return None
+        return box[0] if box else None
 
     watches = [(int(r, 16), int(n or "8", 16)) for r, _, n in
                (item.partition(":") for item in filter(None, os.environ.get("X2W_WATCH", "").split(",")))]
@@ -823,6 +855,10 @@ def main():
                 stop_requested = True
                 log(f"{time.time() - start:7.3f} stop file found: ending the run")
                 break
+            if os.path.exists(dump_request):
+                os.remove(dump_request)
+                limited(dump_threads, os.path.join(logdir, "threads_stall.txt"))
+                log(f"{time.time() - start:7.3f} threads dump requested from outside: threads_stall.txt")
             low = headroom.check(time.time())
             warning = headroom.take_warning()
             if warning:
@@ -832,7 +868,7 @@ def main():
                 log(f"{time.time() - start:7.3f} {stop_reason}: ending the run")
                 break
         if dump_at and time.time() - start >= dump_at[0]:
-            dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
+            limited(dump_threads, os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
@@ -992,7 +1028,7 @@ def main():
     window.abandon()
     elapsed = time.time() - start
     if stop and stop_at:
-        dump_threads(os.path.join(logdir, "threads_stop.txt"))
+        limited(dump_threads, os.path.join(logdir, "threads_stop.txt"))
     if stop:
         ex_code, ex_addr, tid, first, params = stop
         print(f"stopped at {NAMES.get(ex_code, hex(ex_code))} ({ex_code:#010x}) at {where(ex_addr)} after {elapsed:.2f} s "
@@ -1072,7 +1108,7 @@ def main():
     else:
         print(f"stopped by request after {elapsed:.2f} s ({stop_reason})" if stop_requested
               else f"timeout after {elapsed:.2f} s")
-        dumped = dump_threads(os.path.join(logdir, "threads.txt"))
+        dumped = limited(dump_threads, os.path.join(logdir, "threads.txt")) or []
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
             rva, _, size = item.partition(":")
             blob = read(main_base + int(rva, 16), int(size or "64", 16)) or b""
@@ -1119,14 +1155,19 @@ def main():
         print("  " + headroom.summary())
     if capture_thread:
         capture_done.set()
-        capture_thread.join(30)
+        capture_thread.join(SHUTDOWN_STEP_SECONDS)
         print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
-    if exit_code is None:
-        try:
-            capture_window()
-        except Exception as error:  # diagnostics only
-            print(f"  window capture failed: {error}")
+    window_stuck = bool(capture_thread and capture_thread.is_alive())
+    if exit_code is None and window_stuck:
+        print("  window capture: skipped (the periodic capture is still waiting on the title's window)")
+    elif exit_code is None:
+        limited(capture_window)
+    # The title ends here, whatever state its threads and window are in: the job, then the process itself.
     k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0002)
+    if k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000) != 0:
+        k32.TerminateProcess(wt.HANDLE(pi.hProcess), 0xDEAD0003)
+        if k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000) != 0:
+            print("  the title process did not end after TerminateProcess")
     for h in (out, err, pi.hThread, pi.hProcess):
         k32.CloseHandle(wt.HANDLE(h))
     events.close()
