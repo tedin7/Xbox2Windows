@@ -26,12 +26,16 @@ STARTUP = REPO / "tools" / "startup"
 STUB_RUN = r"""
 param([string]$Exe, [string]$DataDir, [string]$LogDir, [int]$Seconds, [string]$BuildDir, [string]$ShaderCache,
       [int]$ContinueAsserts, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
-      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi)
+      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi, [switch]$FreshShaderCache)
+if ($FreshShaderCache -and @(Get-ChildItem -LiteralPath $ShaderCache -Force).Count -gt 0) {
+    Move-Item -LiteralPath $ShaderCache -Destination ("{0}.old-stub" -f $ShaderCache)
+    New-Item -ItemType Directory -Force $ShaderCache | Out-Null
+}
 $seen = @(Get-ChildItem -LiteralPath $ShaderCache -Force | ForEach-Object { $_.Name })
 $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
-    GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
+    GpuMirror = [bool]$GpuMirror; Fresh = [bool]$FreshShaderCache; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
     Budget = $env:X2W_D3D12_BUDGET; CacheEntries = $seen
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
@@ -118,6 +122,7 @@ def check_shell(shell):
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert not args["CacheEntries"], "the run saw the old shader cache: %r" % (args["CacheEntries"],)
+        assert args["Fresh"], "run.ps1 was not asked for -FreshShaderCache"
         assert manifest["commit"] == head and manifest["build_commit"] == head and manifest["dirty"] is False
         assert manifest["seconds"] == 200 and manifest["deep"] is False and manifest["input_script"] == args["InputScript"]
         assert manifest["env"].get("X2W_D3D12_BUDGET") == "1" and all(k.startswith("X2W_") for k in manifest["env"])
@@ -125,6 +130,21 @@ def check_shell(shell):
         assert manifest["parts"] == 1 and "gpu" in manifest and "windows_build" in manifest
         moved = [p.name for p in cache.parent.iterdir() if p.name.startswith("shader_cache.old-")]
         assert len(moved) == 1 and (cache.parent / moved[0] / "old_request.bin").exists(), moved
+
+        # A run.ps1 without -FreshShaderCache (an older checkout) still gets a fresh cache from tester_run.ps1.
+        (cache / "second_old.bin").write_bytes(b"y")
+        old_run = (tree / "tools" / "startup" / "run.ps1")
+        full_stub = old_run.read_text(encoding="utf-8")
+        old_run.write_text(full_stub.replace(", [switch]$FreshShaderCache)", ")").replace("$FreshShaderCache -and", "$false -and")
+                           .replace("Fresh = [bool]$FreshShaderCache", "Fresh = $false"), encoding="utf-8")
+        older = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert older.returncode == 0, (shell, older.stdout, older.stderr)
+        newest_old = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_old) as z:
+            older_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+        assert not older_args["CacheEntries"] and not older_args["Fresh"], older_args
+        assert len([p for p in cache.parent.iterdir() if p.name.startswith("shader_cache.old-")]) == 2
+        old_run.write_text(full_stub, encoding="utf-8")
         assert not any(n.endswith(".bin") for n in names), "shader cache content travelled"
 
         deep = run_script(shell, tree, "-NoBuild", "-Deep", "-CaptureEvery", "0", "-Input", "4@60,1@70")

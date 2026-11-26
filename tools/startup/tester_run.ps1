@@ -5,7 +5,7 @@ One command for a tester: check the build, run the title offline with a fresh sh
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
    into generated\x2w_build_rev.cpp). If not, it builds (cmake --build) or, with -NoBuild, stops with a message.
-2. Moves the old shader cache aside and starts with an empty one.
+2. Moves the old shader cache aside and starts with an empty one (run.ps1 -FreshShaderCache).
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
@@ -73,9 +73,13 @@ if ($built -ne $wanted) {
     }
 }
 
-# A fresh shader cache: the old folder is kept beside it.
+# A fresh shader cache: run.ps1 -FreshShaderCache moves a cache that is not empty aside (shader_cache.old-<time>).
+# An older run.ps1 without that switch gets the same move from here.
 $cache = if ([System.IO.Path]::IsPathRooted($ShaderCache)) { $ShaderCache } else { Join-Path $repo $ShaderCache }
-if (Test-Path -LiteralPath $cache) {
+$runScript = Join-Path $PSScriptRoot "run.ps1"
+$runParams = (Get-Command $runScript).Parameters
+$runFresh = $runParams.ContainsKey("FreshShaderCache")
+if (-not $runFresh -and (Test-Path -LiteralPath $cache)) {
     Move-Item -LiteralPath $cache -Destination ("{0}.old-{1}" -f $cache, (Get-Date -Format "yyyyMMdd-HHmmss"))
 }
 New-Item -ItemType Directory -Force $cache | Out-Null
@@ -98,9 +102,9 @@ $runArgs = @{
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
-$runScript = Join-Path $PSScriptRoot "run.ps1"
+if ($runFresh) { $runArgs.FreshShaderCache = $true }
 if ($CaptureEvery -gt 0) {
-    if ((Get-Command $runScript).Parameters.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
+    if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
 $exitCode = 0

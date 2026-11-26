@@ -8,11 +8,11 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | Piece | Source | Head taken |
 |---|---|---|
 | `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `7e6774f0a` |
-| revision warning for the shader cache and the translator | issue #2815 (pull request not open yet) | not merged yet |
-| periodic window capture (`-CaptureEvery`) | issue #2819 (pull request not open yet) | not merged yet |
+| revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
+| periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
-Each merge into this branch is a merge commit that names the heads it took. Nothing is rebased or force-pushed.
+Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
 
 ## Run
 
@@ -26,7 +26,7 @@ What it does:
 
 1. Checks that the build in `out/build/release` was made from this checkout's current commit and builds when it was
    not (`-NoBuild` stops with a message instead).
-2. Moves the old shader cache aside (`shader_cache.old-<time>`) and starts with an empty one.
+2. Moves the old shader cache aside (`shader_cache.old-<time>`, through `run.ps1 -FreshShaderCache`) and starts with an empty one.
 3. Runs `run.ps1 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000` with `X2W_D3D12_BUDGET=1`.
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size and when the title first
    polled the pad.
