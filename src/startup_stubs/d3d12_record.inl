@@ -26,7 +26,7 @@ constexpr int record_depth = 2;  // argument memory, the memory it points at (a 
 
 void* original[kind_count][wide_slots];
 bool armed;
-bool record_arrays;  // X2W_REPLAY_RECORD_ARRAYS=1
+bool record_arrays = true;  // X2W_REPLAY_RECORD_ARRAYS=0: the 256-byte window for arrays too (a control)
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -458,7 +458,7 @@ void install()
     const DWORD n = GetEnvironmentVariableA("X2W_REPLAY_RECORD", value, sizeof(value));
     if (!n || n >= sizeof(value)) return;
     char arrays[2]{};
-    record_arrays = GetEnvironmentVariableA("X2W_REPLAY_RECORD_ARRAYS", arrays, sizeof(arrays)) == 1 && arrays[0] == '1';
+    record_arrays = !(GetEnvironmentVariableA("X2W_REPLAY_RECORD_ARRAYS", arrays, sizeof(arrays)) == 1 && arrays[0] == '0');
     if (std::strncmp(value, "slow", 4) == 0) {
         double after = slow_after_s, gap_ms = slow_gap_s * 1000, seconds = slow_seconds, fallback = slow_fallback_s;
         if (value[4] && (value[4] != ',' || std::sscanf(value + 5, "%lf,%lf,%lf,%lf", &after, &gap_ms, &seconds, &fallback) != 4 ||

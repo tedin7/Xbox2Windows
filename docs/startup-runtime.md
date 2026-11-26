@@ -1894,8 +1894,8 @@ result, or an input such as a command-list array). Memory contents are stored on
 written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
 closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
 
-`X2W_REPLAY_RECORD_ARRAYS=1` records flat input arrays at their count-derived size, limited to 4 MiB
-and the readable memory at each address. This covers ResourceBarrier (32 bytes per barrier), both
+Flat input arrays are recorded at their count-derived size, limited to 4 MiB and the readable memory at
+each address (`X2W_REPLAY_RECORD_ARRAYS=0` keeps the 256-byte window for them, a control). This covers ResourceBarrier (32 bytes per barrier), both
 CopyDescriptors start and size arrays, SetDescriptorHeaps, ExecuteCommandLists, IASetVertexBuffers,
 OMSetRenderTargets, RSSetViewports and RSSetScissorRects. OMSetRenderTargets records one handle for a
 nonempty contiguous range. The recorder uses the existing ARGM and BLOB chunks for these arrays.
