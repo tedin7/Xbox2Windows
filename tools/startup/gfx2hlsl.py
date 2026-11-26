@@ -1441,6 +1441,155 @@ LDS_EXCHANGE_OPS = {
 }
 
 
+def lds_reduction(ins, pipe):
+    """Recognize a full-group qword fill followed by disjoint, halving LDS phases.
+
+    The proof specializes integer address calculations to the local IDs. Each phase
+    reads the upper half of the previous live span and writes only the lower half.
+    Return the wave-empty branches we can erase and the entry-EXEC restores.
+    """
+    x, y, z = pipe.group
+    count = x * y
+    if (y <= 1 or z != 1 or count & (count - 1) or pipe.entry[2] < 2
+            or not 2 * count <= pipe.lds_words <= 8192):
+        return None
+    names = {name for _, _, name, _ in ins}
+    if not {'ds_write_b64', 'ds_read_b64', 's_cbranch_execz'} <= names:
+        return None
+    program = []
+    for _, _, _, asm in ins:
+        name, ops, mods = parse(asm)
+        program.append((name.removesuffix('_e32').removesuffix('_e64'), ops, mods))
+    lanes = tuple(range(count))
+    addresses = tuple(8 * lane for lane in lanes)
+    values = {'v0': tuple(lane % x for lane in lanes), 'v1': tuple(lane // x for lane in lanes)}
+    integer_ops = {
+        'v_mov_b32': (1, lambda a: a),
+        's_mov_b32': (1, lambda a: a),
+        'v_lshlrev_b32': (2, lambda a, b: b << (a & 31)),
+        'v_add_nc_u32': (2, lambda a, b: a + b),
+        'v_or_b32': (2, lambda a, b: a | b),
+        'v_and_b32': (2, lambda a, b: a & b),
+        'v_lshl_add_u32': (3, lambda a, b, c: (a << (b & 31)) + c),
+        'v_lshl_or_b32': (3, lambda a, b, c: (a << (b & 31)) | c),
+        'v_mad_u32_u24': (3, lambda a, b, c: (a & 0xffffff) * (b & 0xffffff) + c),
+        'v_add_lshl_u32': (3, lambda a, b, c: (a + b) << (c & 31)),
+    }
+
+    def value(tok):
+        if re.fullmatch(r'(?:0x[0-9a-f]+|-?[0-9]+)', tok):
+            return (int(tok, 0) & 0xffffffff,) * count
+        return values.get(tok)
+
+    def forget(name, ops):
+        for dst in (ops[:2] if name == 'v_swap_b32' else destinations(name, ops)):
+            reg = reg_range(dst)
+            if reg:
+                for n in range(reg[1], reg[2] + 1):
+                    values.pop('%s%d' % (reg[0], n), None)
+
+    def ds(i, name, width):
+        op, args, mods = program[i]
+        if op != name or len(args) != 2:
+            raise Unsupported('unexpected LDS access')
+        write = name == 'ds_write_b64'
+        addr, data = args if write else args[::-1]
+        reg = _lds_pair(data) if width == 8 else _lds_single(data)
+        if reg is None or _lds_single(addr) is None or addr not in values:
+            raise Unsupported('unproven LDS address')
+        offset, = lds_byte_offsets(name, mods)
+        return tuple((a + offset) & 0xffffffff for a in values[addr])
+
+    def wait(i):
+        name, ops, mods = program[i]
+        return name == 's_waitcnt' and 'lgkmcnt(0)' in ops + mods
+
+    def barrier(i):
+        return program[i] in [('s_barrier', args, []) for args in ([], ['0'], ['0x0'])]
+
+    skips, restores = set(), set()
+    saved = None
+    span = 0
+    i = 0
+    try:
+        while i < len(program):
+            name, ops, mods = program[i]
+            if name == 'ds_write_b64' and not span:
+                if ds(i, name, 8) != addresses or not wait(i + 1) or not barrier(i + 2):
+                    return None
+                span = count
+                i += 3
+                continue
+            if name == 'v_cmpx_gt_u32' and span > 1 and saved:
+                # The e64 form also prints its unused scalar destination.
+                args = ops[1:] if len(ops) == 3 else ops
+                half = span // 2
+                if mods or len(args) != 2 or value(args[0]) != (half,) * count or value(args[1]) != lanes:
+                    return None
+                branch, dest, branch_mods = program[i + 1]
+                if branch != 's_cbranch_execz' or branch_mods or len(dest) != 1:
+                    return None
+                i += 2
+                skips.add(ins[i - 1][0])
+                if ds(i, 'ds_read_b64', 8)[:half] != addresses[half:span] or not wait(i + 1):
+                    return None
+                forget(*program[i][:2])
+                i += 2
+                first_add = i
+                while program[i][0] == 'v_pk_add_f16':
+                    forget(*program[i][:2])
+                    i += 1
+                if i == first_add or ds(i, 'ds_write_b64', 8)[:half] != addresses[:half]:
+                    return None
+                i += 1
+                # An empty wave has no outstanding DS write from this phase.
+                before_wait = i
+                if wait(i):
+                    i += 1
+                restore = i
+                target = re.fullmatch(r'label_(?:0x)?([0-9a-f]+)', dest[0])
+                if (program[i] != ('s_mov_b64', ['exec', saved], []) or target is None
+                        or int(target[1], 16) not in (ins[before_wait][0], ins[restore][0])):
+                    return None
+                restores.add(ins[i][0])
+                i += 1
+                if wait(i):
+                    i += 1
+                elif before_wait == restore:
+                    return None
+                if not barrier(i):
+                    return None
+                span = half
+            elif name == 'ds_read_u16_d16' and span:
+                if any(a % 2 or a + 2 > count * 8 for a in ds(i, name, 2)) or not wait(i + 1):
+                    return None
+                forget(name, ops)
+            elif (name.startswith(('ds_', 's_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call',
+                                   's_subvector', 's_trap', 's_sethalt', 's_setkill', 's_barrier'))
+                  or 'rel' in name and name.startswith(('s_', 'v_'))
+                  or 'lds' in mods or writes_exec(name, ops) or name == 's_endpgm' and i + 1 < len(program)):
+                return None
+            else:
+                written = [reg_range(dst) for dst in destinations(name, ops)]
+                if saved:
+                    _, lo, hi = reg_range(saved)
+                    if any(r and r[0] == 's' and r[1] <= hi and r[2] >= lo for r in written):
+                        saved = None
+                if name == 's_mov_b64' and len(ops) == 2 and ops[1] == 'exec' and not mods:
+                    reg = reg_range(ops[0])
+                    if reg and reg[0] == 's' and reg[1] % 2 == 0 and reg[2] == reg[1] + 1 and reg[2] <= 105:
+                        saved = ops[0]
+                arity, evaluate = integer_ops.get(name, (0, None))
+                inputs = [value(tok) for tok in ops[1:]] if evaluate and not mods and len(ops) == arity + 1 else []
+                forget(name, ops)
+                if inputs and all(v is not None for v in inputs):
+                    values[ops[0]] = tuple(evaluate(*args) & 0xffffffff for args in zip(*inputs))
+            i += 1
+    except (IndexError, ValueError, Unsupported):
+        return None
+    return (skips, restores) if skips else None
+
+
 def check_lds_exchange(ins, group, words):
     """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
 
@@ -2431,6 +2580,15 @@ class Stage:
             self.ins = decode(self.raw_code)
         else:
             self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
+        if kind == 'cs':
+            reduction = lds_reduction(self.ins, pipe)
+            if reduction:
+                skips, self.lds_restores = reduction
+                # Active-lane operations keep their EXEC predicates. Erase the wave-empty
+                # skips so the restore and barrier remain on the thread group's common path.
+                self.ins = [(off, n, 's_nop', 's_nop 0') if off in skips else (off, n, name, asm)
+                            for off, n, name, asm in self.ins]
+                self.uses_lds = True
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
@@ -4999,11 +5157,25 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if getattr(self, 'lds_restores', None) and self.pc in self.lds_restores:
+            # The proof followed the saved entry EXEC pair through every scalar write.
+            self.emit('exec = 1u;')
+            self.exec_known = self.exec_narrow_only = True
+            return None
+        if base == 'ds_read_u16_d16':
+            if not getattr(self, 'lds_restores', None):
+                raise Unsupported(base)
+            dst = _lds_single(ops[0])
+            offset, = lds_byte_offsets(base, mods)
+            self.emit('a = %s + %du;' % (self.u(ops[1]), offset))
+            self.set_v(dst, '(v%d & 0xffff0000u) | ((lds[a >> 2] >> ((a & 2u) * 8u)) & 0xffffu)' % dst,
+                       low16_only=dst in self.low16_only_v)
+            return None
         if base in (*LDS_EXCHANGE_OPS, 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
-            if not hasattr(self, 'lds_error'):
+            if not getattr(self, 'lds_restores', None) and not hasattr(self, 'lds_error'):
                 self.lds_error = None
                 try:
                     if getattr(self, 'pipe', None) is None:
@@ -5012,7 +5184,7 @@ class Stage:
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
-            if self.lds_error is not None:
+            if getattr(self, 'lds_error', None) is not None:
                 raise Unsupported(self.lds_error)
             if base == 's_barrier':
                 self.emit('GroupMemoryBarrierWithGroupSync();')
@@ -5035,10 +5207,11 @@ class Stage:
                     dwords = 4 if base.endswith('_b128') else 2
                     lo = _lds_vgpr_span(ops[1 if write else 0], dwords)
                     if write:
+                        mask = 'if (exec & 1) ' if getattr(self, 'lds_restores', None) and not self.exec_known else ''
                         vals = [self.u('v%d' % (lo + k)) for k in range(dwords)]
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
                         for k, val in enumerate(vals):
-                            self.emit('lds[%s] = %s;' % ('a' if k == 0 else 'a + %du' % k, val))
+                            self.emit('%slds[%s] = %s;' % (mask, 'a' if k == 0 else 'a + %du' % k, val))
                     else:
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
                         for k in range(dwords):
@@ -9526,13 +9699,43 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
+    def op_v_fma_f16(self, ops, mods):
+        if len(ops) != 4 or _lds_single(ops[0]) is None:
+            raise Unsupported('v_fma_f16 needs a VGPR destination and three sources')
+        picks = [0, 0, 0, 0]
+        if mods:
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])(?:,([01]))?\]', mods[0])
+            if len(mods) != 1 or match is None:
+                raise Unsupported('v_fma_f16 with ' + ' '.join(mods))
+            picks = [int(bit or 0) for bit in match.groups()]
+        dst = _lds_single(ops[0])
+        args = []
+        for tok, hi in zip(ops[1:], picks):
+            reg = reg_range(tok)
+            if tok == '0':
+                word = '0u'
+            elif tok in FLOATS and not hi:
+                word = '%du' % struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+            elif (reg and reg[1] == reg[2]) or re.fullmatch(r'0x[0-9a-f]+', tok):
+                word = self.u(tok, low16_only=not hi)
+            else:
+                raise Unsupported('v_fma_f16 source %s with half select %d' % (tok, hi))
+            args.append('f16tof32((%s >> %du) & 0xffffu)' % (word, 16 * hi))
+        result = 'f16rn(fma16o(%s))' % ', '.join(args)
+        if picks[3]:
+            self.set_v(dst, '(v%d & 0xffffu) | (%s << 16)' % (dst, result))
+        else:
+            self.set_v(dst, '(v%d & 0xffff0000u) | %s' % (dst, result),
+                       low16_only=dst in self.low16_only_v)
+
     def packed_half(self, base, arity, text, ops, mods):
         """v_pk_{mul,add,fma,min,max}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR, or a literal or
-        inline float constant read through its low half in both lanes (a high-half read and inline integers are not proven).
+        Packed add can select either half of a literal dword. Other operations accept a literal only
+        when both lanes select its low half. Inline float constants also require the low half in both lanes.
+        Negation modifiers, clamp and inline integers are refused.
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -9545,18 +9748,15 @@ class Stage:
             if len(bits) != arity or any(b not in ('0', '1') for b in bits):
                 raise Unsupported('%s with %s' % (base, m))
             sel[key] = [int(b) for b in bits]
-        literal = {}   # source index -> its 32-bit literal, read through its LOW half only (see below)
+        literal = {}   # source index -> encoded literal word
         for i, tok in enumerate(ops):
             r = reg_range(tok)
             if r and r[0] == 'v' and r[1] == r[2] and tok == 'v%d' % r[1]:
                 continue
             if i >= 1 and re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
-                # A literal is one dword and each lane picks a half of it by op_sel / op_sel_hi. Only a source whose two lanes both
-                # read the low half is accepted: that is the plain binary16 constant (LLVM prints `0x7bef op_sel_hi:[1,0]`); a read of
-                # the high half of a literal, and an inline constant (how it reaches each half is not proven), stay refused.
-                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                if base != 'v_pk_add_f16' and (sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]):
                     raise Unsupported('%s literal source %s read through its high half' % (base, tok))
-                literal[i - 1] = int(tok, 16) & 0xffff
+                literal[i - 1] = int(tok, 16)
                 continue
             if i >= 1 and tok in PK_INLINE_F16:
                 # Inline float constants (0.5, 1.0, 2.0, 4.0 and negatives) are the binary16 value in the low half; accepted on the same
@@ -9571,7 +9771,7 @@ class Stage:
             args = []
             for n, (tok, hi, both) in enumerate(zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi']))):
                 if n in literal:
-                    args.append('f16tof32(0x%xu)' % literal[n])
+                    args.append('f16tof32(0x%xu)' % ((literal[n] >> (16 * hi)) & 0xffff))
                     continue
                 word = self.u(tok, low16_only=not any(both))
                 args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
@@ -10632,6 +10832,7 @@ LDS_UNUSED_W1_MASK = {
     'ds_write2_b32': 0xff000000,
     'ds_write2st64_b32': 0xff000000,
     'ds_read2st64_b32': 0x00ffff00,
+    'ds_read_u16_d16': 0x00ffff00,
     **{op: (0x00ff0000 if has_rtn else 0xffff0000) for op, (_, has_rtn) in LDS_ATOMIC_OPS.items()},
 }
 

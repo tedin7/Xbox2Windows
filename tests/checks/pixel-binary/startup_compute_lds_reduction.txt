@@ -1,0 +1,1 @@
+tests/startup_compute_lds_reduction_check.py binary llvm-mc-15
