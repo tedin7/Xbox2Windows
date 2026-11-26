@@ -35,7 +35,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
+-Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s (input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",

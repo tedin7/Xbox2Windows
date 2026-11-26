@@ -29,12 +29,12 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
+MENUS_STEP_S = 1           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
 MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_UP = "40"             # GameInput button masks, hexadecimal
 DPAD_DOWN = "80"
 BUTTON_A = "4"
-MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS_HOLD_S = "0.8"       # a press is held this long (0.2 s released before the next one, a press every 1 s): at 28 fps a poll comes every 0.04 s; at 2 to 3 fps every 0.4 s, still two polls
 MENUS2_HOLD_S = "1.2"
 MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
@@ -65,29 +65,32 @@ def menus2_script():
 
 def privacy_cycles(boxes):
     """The presses for the privacy screen (`boxes` checkboxes, then a Conferma button), as passes that never need to know the
-    clock or the state of the boxes. Every pass is: D-pad up `boxes + 1` times (the focus anchors on the first box; the list
-    does not wrap), toggle at most ONE box with A, move down to Conferma and press A. A press on a box toggles it, so a
-    pass that ticked the boxes wrongly cannot be repaired by repeating the same pass; instead the passes toggle a different
-    single box each time, in Gray-code order (none, box 1, box 2, box 1 for two boxes). Whatever state the boxes are in when
-    the screen opens, one pass in each round of 2^boxes reaches Conferma with every box ticked, and Conferma then changes
-    the screen. On the legal-notice screen before it (two list items and an Avanti button) every pass only selects items and
-    ends with A on Avanti, which opens the privacy screen. Returns the list of passes, each a list of button masks."""
-    passes = []
-    toggles = [None] + [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
-    for box in toggles:
-        presses = [DPAD_UP] * (boxes + 1)
-        at_box = 0
-        if box is not None:
-            presses += [DPAD_DOWN] * box + [BUTTON_A]
-            at_box = box
-        presses += [DPAD_DOWN] * (boxes - at_box) + [BUTTON_A]
-        passes.append(presses)
-    return passes
+    clock or the state of the boxes, fast: the first pass is the one that is right when nothing is ticked yet (tick every box,
+    Conferma); if the screen is still there after it, the later passes toggle ONE box each, Gray-code style, so that over
+    the whole round the boxes pass through every state with a press of Conferma at the end of each pass (a press on a box
+    toggles it, so repeating a pass cannot repair a wrong state; whatever state the boxes have when the screen opens,
+    one pass of the round reaches Conferma with every box ticked, and Conferma then changes the screen). Every pass starts
+    with D-pad up `boxes` times: the focus anchors on the first box from any item (the list does not wrap; the
+    previous pass ended on Conferma, the last of boxes + 1 items). On the legal-notice screen before it (two list items and
+    an Avanti button) every pass only selects items and ends with A on Avanti, which opens the privacy screen.
+    Returns the passes, each a list of button masks. Two boxes: 7 + 6 + 6 + 6 presses, a press every second."""
+    def one_pass(toggles):
+        presses = [DPAD_UP] * boxes
+        at = 0
+        for box in sorted(toggles):
+            presses += [DPAD_DOWN] * (box - at) + [BUTTON_A]
+            at = box
+        presses += [DPAD_DOWN] * (boxes - at) + [BUTTON_A]
+        return presses
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    # the round starts with "tick all"; the following passes then visit the other states (the XOR of the toggles of the
+    # passes so far, starting from all toggled, runs through all 2^boxes values: all, then each Gray step)
+    return [one_pass(list(range(boxes)))] + [one_pass([b]) for b in gray]
 
 
 def input_preset(spec, seconds, privacy_boxes=2):
-    """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 (the default; the privacy
+    """`menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
+    `seconds` of script time, but not past 300 s, at most 256 entries (about 260 s at one press a second). With privacy_boxes > 0 (the default; the privacy
     screen has two boxes) the presses are instead privacy_cycles() repeated, which also carries the title through the
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
     if spec == "menus2":
