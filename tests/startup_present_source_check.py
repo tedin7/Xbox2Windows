@@ -19,7 +19,8 @@ def check(directory, consumer, backend):
     vs.write_bytes(vertex())
     ps.write_bytes(pixel(False))
     args = [consumer, vs, ps, root]
-    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1", X2W_SHADER_CACHE=str(cache))
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1", X2W_SHADER_CACHE=str(cache),
+               X2W_TEST_PIXEL_HISTORY="1")  # the fixture mode with presents (draw_pixel_history)
     env.setdefault("X2W_D3D12_DEBUG", "0")
     subprocess.run(args, env=env, check=True)  # publishes the request
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)

@@ -263,7 +263,7 @@ int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char
     invoke(list, 22, 1, arg(&scissor));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
-    // X2W_TEST_PRESENT_SOURCE=draw|clear: the `x2w-render present source` line (the read-back happens at present 6). `clear` leaves the
+    // (with X2W_TEST_PIXEL_HISTORY=1) X2W_TEST_PRESENT_SOURCE=draw|clear: the `x2w-render present source` line (the read-back happens at present 6). `clear` leaves the
     // target with its clear colour only: no translated draw writes the presented surface.
     char present_source[16] = "";
     GetEnvironmentVariableA("X2W_TEST_PRESENT_SOURCE", present_source, sizeof(present_source));
