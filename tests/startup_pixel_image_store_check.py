@@ -45,12 +45,38 @@ exp mrt0 v4, v5, v6, v7 done vm
 s_endpgm
 """
 STORE = bytes.fromhex('080f20f000040400')
+ARRAY_STORE = bytes.fromhex('280f20f000040400')
 PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f4020a7e' 'ff020c7e00004040'
                        'f6020e7e' '7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
+# a16: x and y share v0 (x low half, y high half). v0 = 1 | (2 << 16) addresses the same texel (1, 2); v1 holds a
+# sentinel that must not be read as part of the address.
+A16_STORE = bytes.fromhex('080f20f000040440')
+A16_PREFIX = PREFIX.replace(bytes.fromhex('8102007e' '8202027e'), bytes.fromhex('ff02007e' '01000200' '8202027e'))
+A16_WORDS = A16_PREFIX + A16_STORE + SUFFIX
+A16_LINE = 'w0[uint2(v0 & 0xffffu, v0 >> 16)] = asfloat(uint4(v4, v5, v6, v7));'
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
+ARRAY_SOURCE = SOURCE.replace(
+    'image_store v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',
+    'v_mov_b32 v2, 1\nimage_store v[4:7], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY',
+)
+ARRAY_STORE_LINE = 'w0[uint3(v0, v1, v2)] = asfloat(uint4(v4, v5, v6, v7));'
+ARRAY_GUARDED_LINE = 'if (exec & 1) ' + ARRAY_STORE_LINE
+
+
+def mov_v2_inline(constant):
+    """v_mov_b32_e32 v2, <constant>: VOP1 opcode 0x01, vdst=2, inline integer 0..64 (0x80 + n)."""
+    return struct.pack('<I', 0x7e040280 + constant)
+
+
+def array_program(layer):
+    return PREFIX + mov_v2_inline(layer) + ARRAY_STORE + SUFFIX
+
+
+ARRAY_WORDS = array_program(1)
+ARRAY_WORDS_LAST = array_program(3)
 
 
 def cmpx_eq(constant):
@@ -61,6 +87,8 @@ def cmpx_eq(constant):
 
 EXEC_ON = PREFIX + cmpx_eq(1) + STORE + SUFFIX   # v0 is 1: the lane stays active
 EXEC_OFF = PREFIX + cmpx_eq(2) + STORE + SUFFIX  # v0 is 1: every lane is turned off before the store
+ARRAY_EXEC_ON = PREFIX + mov_v2_inline(1) + cmpx_eq(1) + ARRAY_STORE + SUFFIX
+ARRAY_EXEC_OFF = PREFIX + mov_v2_inline(1) + cmpx_eq(2) + ARRAY_STORE + SUFFIX
 
 
 def translate(words):
@@ -106,18 +134,60 @@ def controls():
         assert STORE_LINE in translate(with_store(store)).hlsl_ps(), name
     print('glc, slc, dlc and unorm accepted')
 
+    # 2D-array pixel store (#2742): three address registers, RWTexture2DArray<float4>, manifest tex2da.
+    array_text = D.decode_instruction(ARRAY_STORE, 0)[2]
+    assert array_text == 'image_store v[4:7], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY', array_text
+    array_pipe = translate(ARRAY_WORDS)
+    array_ps, array_manifest = array_pipe.hlsl_ps(), array_pipe.manifest()
+    assert 'RWTexture2DArray<float4> w0 : register(u0);' in array_ps, array_ps
+    assert '    ' + ARRAY_STORE_LINE in array_ps, array_ps
+    assert 'register(t' not in array_ps, array_ps
+    assert 'uav 0 tex2da table 0 0' in array_manifest and 'srv ' not in array_manifest, array_manifest
+    assert array_manifest.startswith('x2w-manifest 2\n'), array_manifest
+    print('array store: %s manifest uav 0 tex2da table 0 0' % ARRAY_STORE_LINE)
+
     # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
     # a partial channel mask and other image dimensions.
-    cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
+    # a16: x and y packed in v0 is lowered; other dimensions would pack a second register and stay refused.
+    decoded = D.decode_instruction(A16_STORE, 0)[2]
+    assert decoded == 'image_store v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16', decoded
+    a16_ps = translate(A16_WORDS).hlsl_ps()
+    assert '    ' + A16_LINE in a16_ps and STORE_LINE not in a16_ps, a16_ps
+    print('a16 store: %s' % A16_LINE)
+    for name, store in (('a16 3D', bytes.fromhex('100f20f000040440')), ('a16 2D array', bytes.fromhex('280f20f000040440')),
+                        ('a16 1D', bytes.fromhex('000f20f000040440'))):
+        print('refused %-20s %s' % (name + ':', refused(with_store(store), 'a16 only on a 2D image')))
+    try:
+        pipe_a16 = translate(A16_WORDS)
+        pipe_a16.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'a16'])
+    except G.Unsupported as error:
+        assert 'one packed register' in str(error), error
+    else:
+        raise AssertionError('a16 with two address registers was accepted')
+    cases = (('d16', patched(7, 0x80)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
-             ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
+             ('SQ_RSRC_IMG_CUBE', bytes.fromhex('180f20f000040400')),
              ('SQ_RSRC_IMG_1D', bytes.fromhex('000f20f000040400')))
     for name, store in cases:
         decoded = D.decode_instruction(store, 0)[2]
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
+    # 2D-array requires three address registers and still refuses pixel d16.
+    try:
+        array_pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY'])
+    except G.Unsupported as error:
+        assert 'x, y and layer expected' in str(error), error
+    else:
+        raise AssertionError('2D-array store with two address registers was accepted')
+    try:
+        array_pipe.ps.op_image_store(['v[4:5]', 'v[0:2]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY', 'd16'])
+    except G.Unsupported as error:
+        assert 'modifier d16' in str(error), error
+    else:
+        raise AssertionError('pixel 2D-array d16 store was accepted')
+    print('refused 2D-array with two address registers and pixel d16')
     # A partial channel mask, encoded: the decoder sizes VDATA from the mask (v[4:6], v4), so each must be
     # refused for the mask itself, which the translator checks before the data registers.
     for mask, data in ((0x7, 'v[4:6]'), (0x1, 'v4')):
@@ -177,6 +247,12 @@ def controls():
         assert ps.count(STORE_LINE) == 1, ps
     # With exec known (the entry mask) the store is not guarded.
     assert GUARDED_LINE not in translate(WORDS).hlsl_ps()
+    for constant, words in ((1, ARRAY_EXEC_ON), (2, ARRAY_EXEC_OFF)):
+        ps = translate(words).hlsl_ps()
+        assert '    exec = ((0x%08xu == v0) ? 1u : 0u);' % constant in ps, ps
+        assert '    ' + ARRAY_GUARDED_LINE in ps, ps
+        assert ps.count(ARRAY_STORE_LINE) == 1, ps
+    assert ARRAY_GUARDED_LINE not in array_ps
     print('exec after v_cmpx: %s' % GUARDED_LINE)
 
     # Negative control: without the lowering the program is refused as before.
@@ -190,9 +266,10 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    built = assemble(llvm_mc, SOURCE)
-    if built != WORDS:
-        raise AssertionError('assembled %s, recorded %s' % (built.hex(), WORDS.hex()))
+    for label, src, expected in (('2d', SOURCE, WORDS), ('2d_array', ARRAY_SOURCE, ARRAY_WORDS)):
+        built = assemble(llvm_mc, src)
+        if built != expected:
+            raise AssertionError('%s: assembled %s, recorded %s' % (label, built.hex(), expected.hex()))
     print('fixture words match llvm-mc')
 
 
@@ -225,6 +302,23 @@ def check_draw(dxc, renderer, adapter):
                 ('store deleted', source.replace(STORE_LINE, ''), 'x=1 y=2 expected=%s %s' % (expected, untouched)),
                 ('x and y exchanged', source.replace('w0[uint2(v0, v1)]', 'w0[uint2(v1, v0)]'), 'x=2 y=1')):
             assert text != source, label
+            run = draw(text, label.replace(' ', '_'))
+            if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
+                raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
+            print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
+
+        # a16: v0 = 1 | (2 << 16) must reach the same texel (1, 2). Controls: ignoring the high half writes (1, 0);
+        # exchanging the halves writes (2, 1). The readback scans row by row, so the first wrong texel is the one reported.
+        a16_source = translate(A16_WORDS).hlsl_ps()
+        run = draw(a16_source, 'a16_store')
+        if run.returncode:
+            raise AssertionError('a16 store draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw a16: texel (1, 2) = %s, all other texels untouched' % expected)
+        for label, text, needle in (
+                ('a16 high half ignored', a16_source.replace('v0 >> 16', '0u'), 'x=1 y=0'),
+                ('a16 halves exchanged', a16_source.replace('uint2(v0 & 0xffffu, v0 >> 16)', 'uint2(v0 >> 16, v0 & 0xffffu)'),
+                 'x=2 y=1')):
+            assert text != a16_source, label
             run = draw(text, label.replace(' ', '_'))
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))

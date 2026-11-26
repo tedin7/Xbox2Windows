@@ -11270,6 +11270,10 @@ def check_sdwa_int_extra_controls():
         elif name == "mul24":
             for helper in ("mul24_u32(", "mul24_i32(", "mul24_hi_u32(", "mul24_hi_i32("):
                 assert helper in hlsl, (helper, hlsl)
+        elif name == "co_ci":
+            add = next(i for i, line in enumerate(prog) if line.startswith("v_add_co_ci_u32_sdwa "))
+            sub = next(i for i, line in enumerate(prog) if line.startswith("v_sub_co_ci_u32_sdwa "))
+            assert f"uint co{sub} = cmp{add} ? ~(sb{sub} - sa{sub}) : cp{sub};" in hlsl
         for old, new in SDWA_INT_EXTRA_MUTATIONS[name]:
             mutated = [line.replace(old, new) for line in prog]
             assert mutated != prog, (name, old)

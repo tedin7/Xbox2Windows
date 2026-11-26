@@ -14,7 +14,9 @@ translate, translate_err, window*.png, bink_luma.png ...), the debugger summary 
 Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
 `shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
 of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason. Never
-shader code or binaries. Nothing is dropped: past the size limit
+shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
+`d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
+d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
 """
 import argparse
@@ -29,10 +31,10 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-PRIVACY_START_S = 90       # script second the privacy screen is reached (Run L pictures: legal notice at process 90 s, privacy screen at 105 s, process = script + 8 s)
 MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
 MENUS_END_S = 300          # the preset stops here however long the run is
-DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
+DPAD_UP = "40"             # GameInput button masks, hexadecimal
+DPAD_DOWN = "80"
 BUTTON_A = "4"
 MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
 MENUS2_HOLD_S = "1.2"
@@ -63,30 +65,33 @@ def menus2_script():
     return ",".join(items)
 
 
-def privacy_items(boxes, start, skip_down=0):
-    """The privacy screen (two checkboxes and a Conferma button): `skip_down` D-pad downs to reach the first checkbox, then A on each box with D-pad down to
-    the next one, D-pad down onto the confirm button after the last box and A to confirm. One press every
-    MENUS_STEP_S. Returns (items, time of the next free step). The layout (how many boxes, where the focus starts) is
-    a parameter until a run's pictures show it."""
-    items, at = [], start
-    def press(mask):
-        nonlocal at
-        items.append("%s@%d+%s" % (mask, at, MENUS_HOLD_S))
-        at += MENUS_STEP_S
-    for _ in range(skip_down):
-        press(DPAD_DOWN)
-    for _ in range(boxes):
-        press(BUTTON_A)
-        press(DPAD_DOWN)
-    press(BUTTON_A)   # confirm
-    return items, at
+def privacy_cycles(boxes):
+    """The presses for the privacy screen (`boxes` checkboxes, then a Conferma button), as passes that never need to know the
+    clock or the state of the boxes. Every pass is: D-pad up `boxes + 1` times (the focus anchors on the first box; the list
+    does not wrap), toggle at most ONE box with A, move down to Conferma and press A. A press on a box toggles it, so a
+    pass that ticked the boxes wrongly cannot be repaired by repeating the same pass; instead the passes toggle a different
+    single box each time, in Gray-code order (none, box 1, box 2, box 1 for two boxes). Whatever state the boxes are in when
+    the screen opens, one pass in each round of 2^boxes reaches Conferma with every box ticked, and Conferma then changes
+    the screen. On the legal-notice screen before it (two list items and an Avanti button) every pass only selects items and
+    ends with A on Avanti, which opens the privacy screen. Returns the list of passes, each a list of button masks."""
+    passes = []
+    toggles = [None] + [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    for box in toggles:
+        presses = [DPAD_UP] * (boxes + 1)
+        at_box = 0
+        if box is not None:
+            presses += [DPAD_DOWN] * box + [BUTTON_A]
+            at_box = box
+        presses += [DPAD_DOWN] * (boxes - at_box) + [BUTTON_A]
+        passes.append(presses)
+    return passes
 
 
-def input_preset(spec, seconds, privacy_boxes=0, privacy_start=PRIVACY_START_S, privacy_skip_down=0):
+def input_preset(spec, seconds, privacy_boxes=2):
     """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 the privacy screen comes
-    at privacy_start (privacy_items, instead of the pattern presses from that second), then the pattern starts over.
-    Anything else is a raw script."""
+    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 (the default; the privacy
+    screen has two boxes) the presses are instead privacy_cycles() repeated, which also carries the title through the
+    screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
@@ -95,16 +100,11 @@ def input_preset(spec, seconds, privacy_boxes=0, privacy_start=PRIVACY_START_S, 
         if len([item for item in spec.split(",") if item.strip()]) > MAX_ENTRIES:
             raise ValueError("input script has more than %d entries" % MAX_ENTRIES)
         return spec
+    cycle = ([m for one in privacy_cycles(privacy_boxes) for m in one] if privacy_boxes > 0
+             else [DPAD_DOWN, DPAD_DOWN, BUTTON_A])
     items, press, at = [], 0, MENUS_START_S
-    block_done = privacy_boxes <= 0
     while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
-        if not block_done and at >= privacy_start:
-            # the privacy screen: its own presses, then the pattern starts over with DOWN
-            block, at = privacy_items(privacy_boxes, at, privacy_skip_down)
-            items.extend(block)
-            block_done, press = True, 0
-            continue
-        items.append("%s@%d+%s" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at, MENUS_HOLD_S))
+        items.append("%s@%d+%s" % (cycle[press % len(cycle)], at, MENUS_HOLD_S))
         press += 1
         at += MENUS_STEP_S
     return ",".join(items)
@@ -353,6 +353,49 @@ def format_results(rows):
     return "\n".join(lines) + "\n"
 
 
+SYMBOLS_NAME = "d3d12_xs.symbols.txt"
+MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
+MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
+NM_SYMBOL = re.compile(r"^([0-9a-fA-F]{8,16})\s+[TtWw]\s+(\S+)\s*$")
+
+
+def parse_symbols(text):
+    """RVA and name of every function in a linker map of OUR OWN DLL: the MSVC /MAP file (the tester's build; only entries
+    flagged `f`, RVA = address - preferred load address) or `nm -n` text (address, type T/t/W/w, name; addresses taken as RVAs).
+    Sorted by RVA, one name per RVA. Raises ValueError on text of neither kind."""
+    base = MSVC_BASE.search(text)
+    rows = {}
+    if base:
+        base = int(base.group(1), 16)
+        for line in text.splitlines():
+            m = MSVC_SYMBOL.match(line)
+            if m and m.group(3) == "f":
+                rows.setdefault(int(m.group(2), 16) - base, m.group(1))
+    else:
+        for line in text.splitlines():
+            m = NM_SYMBOL.match(line)
+            if m:
+                rows.setdefault(int(m.group(1), 16), m.group(2))
+    if not rows:
+        raise ValueError("no function symbols in the map (expected an MSVC /MAP file or nm -n text)")
+    return sorted(rows.items())
+
+
+def format_symbols(rows):
+    """Compact table, one `RVA name` line per function (hex RVA, no 0x): symbols of our DLL, never game files."""
+    return "".join("%x %s\n" % row for row in rows)
+
+
+def load_symbols(text):
+    """Reads a table written by format_symbols back into sorted (rva, name) rows."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            rows.append((int(parts[0], 16), parts[1].strip()))
+    return sorted(rows)
+
+
 def log_files(logdir):
     """(archive name, path) of every file the run wrote: the run folder's own files and the debugger summary
     `<logdir>.out` beside it. Sub-folders (a shader cache), memory dumps and anything that is not a regular file stay out."""
@@ -400,7 +443,7 @@ def first_poll(logdir):
     return None
 
 
-def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None):
+def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
     manifest = validate_manifest(dict(manifest_in))
@@ -425,6 +468,11 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
         add(RESULTS_NAME, format_results(rows).encode("utf-8"))
+    if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
+        with open(map_file, encoding="utf-8", errors="replace") as handle:
+            rows = parse_symbols(handle.read())
+        manifest["symbols"] = len(rows)
+        add(SYMBOLS_NAME, format_symbols(rows).encode("utf-8"))
     stem, ext = os.path.splitext(zip_path)
     count = len(members)
     for index, group in enumerate(members, 1):
@@ -445,9 +493,7 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
-    p.add_argument("--privacy-boxes", type=int, default=0)
-    p.add_argument("--privacy-start", type=int, default=PRIVACY_START_S)
-    p.add_argument("--privacy-skip-down", type=int, default=0)
+    p.add_argument("--privacy-boxes", type=int, default=2)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -467,11 +513,12 @@ def main(argv):
     q.add_argument("zip")
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
+    q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
-        print(input_preset(args.spec, args.seconds, args.privacy_boxes, args.privacy_start, args.privacy_skip_down))
+        print(input_preset(args.spec, args.seconds, args.privacy_boxes))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))
@@ -499,7 +546,7 @@ def main(argv):
         return 0
     with open(args.manifest, encoding="utf-8-sig") as handle:
         manifest_in = json.load(handle)
-    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache):
+    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache, map_file=args.map):
         print("%s %d" % (path, size))
     return 0
 
