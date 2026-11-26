@@ -350,9 +350,10 @@ if ($Record) {
     $freeMiB = [math]::Floor((Get-PSDrive -Name ((Split-Path -Qualifier $recordDir).TrimEnd(":"))).Free / 1MB)
     if ($freeMiB -lt 2 * $RecordMaxMiB) { throw ("tester_run: -Record needs twice the cap free ({0} MiB), the disk has {1} MiB: free space or lower -RecordMaxMiB" -f (2 * $RecordMaxMiB), $freeMiB) }
     $env:X2W_REPLAY_RECORD = $recordSpec; $env:X2W_REPLAY_DIR = $recordDir; $env:X2W_REPLAY_MAX_MIB = [string]$RecordMaxMiB
+    $env:X2W_REPLAY_COUNTS = "1"   # per-kind call counts and chunk bytes in the recording's end chunk and stderr (a Record run only)
     Write-Host ("tester_run: recording {0} into {1} (cap {2} MiB, {3} MiB free): the run is slower while it records" -f $recordSpec, $recordDir, $RecordMaxMiB, $freeMiB)
 } else {
-    Remove-Item Env:X2W_REPLAY_RECORD, Env:X2W_REPLAY_DIR, Env:X2W_REPLAY_MAX_MIB -ErrorAction SilentlyContinue
+    Remove-Item Env:X2W_REPLAY_RECORD, Env:X2W_REPLAY_DIR, Env:X2W_REPLAY_MAX_MIB, Env:X2W_REPLAY_COUNTS -ErrorAction SilentlyContinue
 }
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
