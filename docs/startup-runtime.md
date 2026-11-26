@@ -1942,6 +1942,17 @@ be had stops the replay with exit 3 and its address), and every `MAP` is written
 sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
 span's final image hash. Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
+The player checks each CALL header against its format (104 bytes in v2,
+136 in v3). Format 2 supplies zero for argument words 7 through 10. The
+Windows x64 bridge forwards all eleven integer or pointer words.
+
+Run the synthetic CALL compatibility and bridge checks together with the replay
+scenes on Windows after building Release:
+
+```powershell
+ctest --preset release --no-tests=error -R '^(startup_replay_(call_formats|invoke|warp|hardware))$'
+```
+
 Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
 in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
 recorder keeps format 3 and stores the switch in `XENV`. The player reads

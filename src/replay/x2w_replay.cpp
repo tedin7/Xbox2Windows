@@ -44,6 +44,8 @@
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
+extern "C" std::uint64_t x2w_replay_invoke(void* target, std::uint64_t rcx, const std::uint64_t* args);
+
 namespace x2w_replay {
 namespace {
 
@@ -110,27 +112,32 @@ struct Played {
     u64 self = 0;
     bool buffer_first = false;
     u64 top[top_slots]{};
-    u64 before[top_slots]{};  // the first word of each argument copy before the call
+    u64 before[call_args]{};  // the first word of each argument copy before the call
+    bool sampled[call_args]{};
     u64 ret = 0;
+
+    bool read_output(std::uint32_t arg, u64& word) const
+    {
+        return arg < call_args && top[arg] &&
+               ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(top[arg]), &word, sizeof(word), nullptr);
+    }
 
     // The call wrote a new value into argument `arg`'s copy: what an output is. A stack word past the slot's own
     // arguments can point at the same variable as the real output; its copy is never written.
     bool wrote(std::uint32_t arg, u64& now) const
     {
-        if (arg >= static_cast<std::uint32_t>(top_slots) || !top[arg]) return false;
-        std::memcpy(&now, reinterpret_cast<const void*>(top[arg]), 8);
-        return now != before[arg];
+        return arg < call_args && sampled[arg] && read_output(arg, now) && now != before[arg];
     }
 };
 
-using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+static_assert(call_args == 11, "replay_invoke.asm argument count");
 
 // Calls `slot` of `object`'s table with `rcx` as the first register (the object itself, or a struct-return buffer
 // when the title passed the buffer first and the object second).
 u64 call_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[call_args])
 {
     const auto table = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<Slot>(table[slot])(rcx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]);
+    return x2w_replay_invoke(table[slot], rcx, a);
 }
 u64 call_slot(u64 object, std::uint16_t slot, const u64 (&a)[call_args])
 {
@@ -329,8 +336,9 @@ bool play(Player& p, const Recording& r, const Step& step)
     apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
-    for (int i = 0; i < top_slots; ++i)
-        if (call.top[i] && i != static_cast<int>(rcx_arg)) std::memcpy(&call.before[i], reinterpret_cast<const void*>(call.top[i]), 8);
+    for (const Output& output : step.outputs)
+        if (output.arg < call_args)
+            call.sampled[output.arg] = call.read_output(output.arg, call.before[output.arg]);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     u64 rcx = call.self;
