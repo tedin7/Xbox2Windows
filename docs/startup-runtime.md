@@ -1900,6 +1900,13 @@ File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version
 `XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
 Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
 and anything past 512 MiB in total are left out and counted in the log).
+
+`X2W_REPLAY_COUNTS=1` puts one ASCII counter line in the `XEND` payload and writes the same line to the log.
+`call.<kind>.<slot>=<count>` counts serialized calls, including the state-making prefix.
+`bytes.<tag>=<bytes>` counts complete chunks, including their 16-byte framing, headers and payloads.
+The `MAP ` tag appears as `bytes.MAP`. Missing entries are zero. The `bytes.XEND` field includes the
+counter payload and uses 20 decimal digits. The legacy `XEND` header stays 32 bytes and its byte total
+still ends immediately before `XEND`. Formats 2 and 3 use the same reader with or without this payload.
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven

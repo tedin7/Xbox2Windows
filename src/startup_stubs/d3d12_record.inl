@@ -14,6 +14,8 @@
 // output argument holds after the call), PRES (seq, present), XEND (calls, blobs, bytes, dropped).
 #include "startup_stubs/replay_pages.h"
 
+#include <map>
+
 namespace replay_record {
 
 constexpr int wide_slots = 256;   // device and command-list slots wrapped
@@ -36,6 +38,9 @@ HANDLE file = INVALID_HANDLE_VALUE;
 SRWLOCK file_lock = SRWLOCK_INIT, blob_lock = SRWLOCK_INIT, buffers_lock = SRWLOCK_INIT;
 LONG64 volatile calls_written, blobs_stored;
 u64 bytes_written;
+bool count_chunks;
+u64 slot_calls[kind_count][wide_slots];  // file_lock
+std::map<std::string, u64> chunk_bytes;  // file_lock
 LONG volatile stopped, stop_requested, cap_reached;
 u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the file is this large
 // Read by every wrapped slot before it calls the real one: a plain load, so nothing touches the xmm registers that carry
@@ -68,10 +73,17 @@ void write_raw(const void* data, std::size_t bytes)
         bytes_written += written;
     }
 }
+struct ChunkHeader {
+    char tag[4];
+    std::uint32_t header_bytes;
+    u64 data_bytes;
+};
+static_assert(sizeof(ChunkHeader) == 16);
+
 void append_chunk(std::vector<unsigned char>& out, const char* tag, const void* header, std::size_t header_bytes,
                   const void* data, u64 data_bytes)
 {
-    struct { char tag[4]; std::uint32_t header_bytes; u64 data_bytes; } head{};
+    ChunkHeader head{};
     std::memcpy(head.tag, tag, 4);
     head.header_bytes = static_cast<std::uint32_t>(header_bytes);
     head.data_bytes = data_bytes;
@@ -80,10 +92,12 @@ void append_chunk(std::vector<unsigned char>& out, const char* tag, const void* 
     if (header_bytes) out.insert(out.end(), static_cast<const unsigned char*>(header), static_cast<const unsigned char*>(header) + header_bytes);
     if (data_bytes) out.insert(out.end(), static_cast<const unsigned char*>(data), static_cast<const unsigned char*>(data) + data_bytes);
 }
+void write_chunks(const std::vector<unsigned char>& bytes);
+
 // Writes a buffer's chunks; file_lock held.
 void drain(ThreadBuffer& b)
 {
-    write_raw(b.bytes.data(), b.bytes.size());
+    write_chunks(b.bytes);
     b.bytes.clear();
 }
 
@@ -191,6 +205,29 @@ struct Call {
     double seconds;
     std::int32_t present, pad;
 };
+
+// Count complete chunks at the writer so skipped thread buffers and unwritten bytes never enter the census.
+// The caller owns file_lock, or is still writing the recording header before installing the wrappers.
+void write_chunks(const std::vector<unsigned char>& bytes)
+{
+    const u64 before = bytes_written;
+    write_raw(bytes.data(), bytes.size());
+    if (!count_chunks) return;
+    const u64 written = bytes_written - before;
+    for (u64 at = 0; written - at >= sizeof(ChunkHeader);) {
+        ChunkHeader chunk;
+        std::memcpy(&chunk, bytes.data() + at, sizeof(chunk));
+        const u64 size = sizeof(chunk) + chunk.header_bytes + chunk.data_bytes;
+        if (size > written - at) break;
+        chunk_bytes[std::string(chunk.tag, sizeof(chunk.tag))] += size;
+        if (std::memcmp(chunk.tag, "CALL", 4) == 0) {
+            Call call;
+            std::memcpy(&call, bytes.data() + at + sizeof(chunk), sizeof(call));
+            ++slot_calls[call.kind][call.slot];
+        }
+        at += size;
+    }
+}
 
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
@@ -344,13 +381,39 @@ void write_shader_cache(bool at_exit)
         if (!read || name_bytes <= 0) continue;
         chunk.clear();
         append_chunk(chunk, "SHDR", name, static_cast<std::size_t>(name_bytes), bytes.data(), size);
-        write_raw(chunk.data(), chunk.size());
+        write_chunks(chunk);
         ++files;
         total += size;
     } while (FindNextFileW(find, &found));
     FindClose(find);
     if (!at_exit)
         log("x2w-replay record: shader cache %llu files, %llu bytes, %llu left out", files, total, left_out);
+}
+
+// Use the same text for the XEND payload and the counter log line.
+std::string counter_line(u64& calls, std::size_t end_header_bytes)
+{
+    std::string line = "x2w-replay record: counts";
+    calls = 0;
+    for (int kind = 0; kind < kind_count; ++kind) {
+        for (int slot = 0; slot < wide_slots; ++slot) {
+            const u64 count = slot_calls[kind][slot];
+            if (!count) continue;
+            calls += count;
+            line += " call." + std::to_string(kind) + "." + std::to_string(slot) + "=" + std::to_string(count);
+        }
+    }
+    for (const auto& [tag, bytes] : chunk_bytes) {
+        // Keep spaces out of the tokens (the MAP tag has a trailing space).
+        line += " bytes." + tag.substr(0, tag.find(' ')) + "=" + std::to_string(bytes);
+    }
+    line += " bytes.XEND=";
+    // Reserve a fixed-width decimal field so XEND can include its payload in its own byte count.
+    constexpr std::size_t digits = 20;
+    const auto total = std::to_string(sizeof(ChunkHeader) + end_header_bytes + line.size() + digits);
+    line.append(digits - total.size(), '0');
+    line += total;
+    return line;
 }
 
 // Ends the recording: every buffer is written, then the end chunk with the totals. Called once.
@@ -364,12 +427,20 @@ void stop(bool at_exit)
     write_shader_cache(at_exit);
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
-    append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
+    std::string counters;
+    if (count_chunks) counters = counter_line(end.calls, sizeof(end));
+    append_chunk(tail, "XEND", &end, sizeof(end), counters.data(), counters.size());
     write_raw(tail.data(), tail.size());
     FlushFileBuffers(file);
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
+    if (count_chunks) {
+        counters += "\r\n";
+        const auto length = static_cast<DWORD>(counters.size());
+        x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), counters.data(), length);
+        x2w_trap::append_log(counters.data(), length, false);
+    }
     if (!at_exit)
         log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
             end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
@@ -489,7 +560,9 @@ void install()
         FreeEnvironmentStringsW(block);
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
-    write_raw(head.data(), head.size());
+    char counts[2]{};
+    count_chunks = GetEnvironmentVariableA("X2W_REPLAY_COUNTS", counts, sizeof(counts)) == 1 && counts[0] == '1';
+    write_chunks(head);
     armed = true;
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
