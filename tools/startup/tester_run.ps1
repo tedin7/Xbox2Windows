@@ -25,6 +25,7 @@ commit passes the cap dies with error 1455. -MemoryGiB overrides it; the summary
 
 Lazy memory commit is ON by default (run.ps1 -LazyMemory): physical pages and the large startup blocks are committed on
 first touch, which cuts the section commit. -NoLazyMemory turns it off. The manifest records it.
+The shader cache is repaired once before the run (tools/startup/shader_cache_repair_packed.py: translations made before the packed-position derivation are withdrawn so the translator redoes them, no revision bump); the console says "repaired N packed-position translations" and the manifest records cache_repaired (-1 = skipped). -NoCacheRepair skips it.
 
 When the report is packed the script finishes the translation: one translator pass over the shader cache (no --watch), until
 nothing is pending or -FinishTranslateSeconds (default 900, 0 = skip) is over, then prints "pending before/after, ok, refused".
@@ -66,6 +67,7 @@ param(
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
     [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
+    [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
@@ -172,6 +174,24 @@ $cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRo
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
 New-Item -ItemType Directory -Force $cache | Out-Null
+# Repair first (before the translator and before the counts below): results translated before the packed-position derivation
+# are withdrawn so the translator makes them again (tools/startup/shader_cache_repair_packed.py; no revision bump, so the rest of the
+# warm cache stays). -NoCacheRepair skips it. repaired = -1 in the manifest when skipped or when the tool failed.
+$cacheRepaired = -1
+if (-not $NoCacheRepair) {
+    try {
+        $repairTool = Join-Path $PSScriptRoot "shader_cache_repair_packed.py"
+        $repairLine = (Invoke-Native { & $python -B $repairTool $cache } | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $repairLine -match '(\d+) stale results withdrawn') {
+            $cacheRepaired = [int]$Matches[1]
+            Write-Host "tester_run: repaired $cacheRepaired packed-position translations"
+        } else {
+            Write-Warning "tester_run: the cache repair tool gave no usable answer, cache left as it was: $repairLine"
+        }
+    } catch {
+        Write-Warning "tester_run: cache repair skipped ($($_.Exception.Message))"
+    }
+}
 $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
 # Pre-translation: after a revision bump the new cache folder is empty and the title would be black until the --watch
 # translator caught up. The requests of the older shader_cache_* folders are copied under the new keys first (the translator
@@ -272,7 +292,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
-    pretranslate = $preTranslate
+    pretranslate = $preTranslate; cache_repaired = $cacheRepaired
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
