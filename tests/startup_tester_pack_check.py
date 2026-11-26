@@ -700,6 +700,40 @@ def check_request_families():
         assert sum(b for c in capped for _, b in c[3]) <= 700
 
 
+def check_combine():
+    """A matrix report: three runs in one mail-ready report, run_<label>/ folders, a matrix manifest with each run's env."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        runs = []
+        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "0"})):
+            run = tmp / ("run_" + label)
+            run.mkdir()
+            make_run(run, 2)
+            write(run, "stderr.txt", ("stderr of " + label + "\n").encode() + os.urandom(3 * 1024 * 1024))
+            manifest = dict(MANIFEST, seconds=240, env=dict(MANIFEST["env"], **extra_env), end_cause="timeout", exit_code=0)
+            parts = T.pack(str(run), manifest, str(tmp / ("report_" + label + ".zip")))
+            runs.append((label, [p for p, _ in parts]))
+        out = T.combine(str(tmp / "matrix.zip"), runs, 9 * 1024 * 1024, "gray")
+        assert len(out) >= 2 and all(size <= 9 * 1024 * 1024 for _, size in out), out
+        seen = {}
+        for index, (path, _) in enumerate(out, 1):
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    assert name not in seen, name
+                    seen[name] = z.read(name)
+                assert ("part_%02d_of_%02d.txt" % (index, len(out))) in z.namelist()
+                if index == 1:
+                    assert "matrix_manifest.json" in z.namelist() and "run_a/manifest.json" in z.namelist() and "run_c/events.txt" in z.namelist()
+        top = json.loads(seen["matrix_manifest.json"])
+        assert top["matrix"] == "gray" and sorted(top["runs"]) == ["a", "b", "c"] and top["parts"] == len(out), top
+        assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and top["runs"]["b"]["env"]["X2W_TEST_ADDRESS_UPLOAD_RING"] == "1"
+        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "0" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
+        for label in "abc":
+            assert seen["run_%s/stderr.txt" % label].startswith(("stderr of " + label).encode()), label
+            assert json.loads(seen["run_%s/manifest.json" % label])["env"] == top["runs"][label]["env"]
+        assert all(top["files"][n]["part"] == 1 for n in top["files"] if n.endswith("manifest.json") and n.startswith("run_")), "manifests in part 1"
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -844,6 +878,7 @@ if __name__ == "__main__":
     check_mail_ready_parts()
     check_phase_table()
     check_request_families()
+    check_combine()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
