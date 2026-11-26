@@ -69,9 +69,32 @@ def translator_cases(directory):
     print("control: a branch that does not land after the first exit is refused")
     refused("Unreachable code or unverified alternate exit", two_exit_pixel(entry=0xbf800000), decode)
     print("control: a second exit nothing branches over is refused")
+    refused("Expected termination followed by code padding", two_exit_pixel(words=two_exit_words() + [0xbf800000]), decode)
+    print("control: code after the last s_endpgm is refused")
     vertex = S.container(1, S.vertex_words() + [0xbf810000], S.VS_BASE, [], {0x29c: struct.pack("<I", 0)})
     refused("Unverified multi-exit program", vertex, decode, stage=1)
     print("control: a vertex stage with two exits is refused")
+    return 0
+
+
+S_MOV_EXEC_ZERO = 0xbefe0480                    # s_mov_b64 exec, 0: every lane is killed before the branch
+
+
+def kill_path_draw(directory, consumer, backend):
+    """The discard path: exec is cleared, s_cbranch_execz takes the kill exit, so the whole target keeps the clear colour."""
+    original = S.pixel
+    S.pixel = lambda *args, **kwargs: two_exit_pixel(words=[S_MOV_EXEC_ZERO, *two_exit_words()])
+    try:
+        pixels = S.draw(directory / "kill", consumer, backend, False)
+    finally:
+        S.pixel = original
+    if pixels is None:
+        return 77
+    for y in range(S.HEIGHT):
+        for x in range(S.WIDTH):
+            got = tuple(pixels[(y * S.WIDTH + x) * 4:(y * S.WIDTH + x) * 4 + 4])
+            assert got == (0, 0, 255, 255), "pixel (%d, %d) is %s: the killed lanes must keep the clear" % (x, y, got)
+    print(f"{backend} draw: the kill path leaves every pixel at the clear colour")
     return 0
 
 
@@ -79,9 +102,10 @@ def draw_cases(directory, consumer, backend):
     original = S.pixel
     S.pixel = lambda *args, **kwargs: two_exit_pixel()
     try:
-        return S.check(directory, consumer, backend)
+        result = S.check(directory, consumer, backend)
     finally:
         S.pixel = original
+    return result or kill_path_draw(directory, consumer, backend)
 
 
 if __name__ == "__main__":
