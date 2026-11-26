@@ -117,7 +117,7 @@ VARIANTS = {
     'exec-source': (SOURCE_M, [('v_writelane_b32 v40, s26, 1\n', 'v_writelane_b32 v40, exec_lo, 1\n')],
                     'source exec_lo is a lane mask or m0', 'exec is refused as a spill source'),
     'vcc-hi-source': (SOURCE_M, [('v_writelane_b32 v40, vcc_lo, 0\n', 'v_writelane_b32 v40, vcc_hi, 0\n')],
-                      'source vcc_hi is a lane mask or m0', 'vcc_hi is not the wave32 mask'),
+                      'requires one VGPR and one plain SGPR', 'vcc_hi is an ordinary scalar register in wave32 (renamed above s103), not a spillable mask'),
     'numeric-use': (SOURCE_M, [(M_RELOAD, M_RELOAD + 'v_add_nc_u32 v9, s25, v5\n')], 'reads as data',
                     'the reloaded mask is read as numeric data'),
     'numeric-use-vcc': (SOURCE_V, [('Lskip:\n', 'Lskip:\nv_add_nc_u32 v9, vcc_lo, v5\n')], 'reads as data',

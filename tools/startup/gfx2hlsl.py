@@ -2412,9 +2412,10 @@ class Stage:
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
-        elif kind == 'cs':
-            # A compute program also gets the rename, and a program proven wave32 (the caller says so, or its exec writes
-            # are all 32-bit forms) gets it even where a VALU instruction reads vcc_lo as a lane mask.
+        elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
+            # A compute program also gets the rename, unless the caller says it is wave64. A program proven wave32 (the
+            # caller says so, or its exec writes are all 32-bit forms) gets it even where a VALU instruction reads vcc_lo
+            # as a lane mask.
             pipe = getattr(self, 'pipe', None)
             self.ins = wave32_vcc_hi(self.ins, wave32=getattr(pipe, 'wave_size', None) == 32 or wave32_exec_proof(self.ins))
         if kind == 'ps':
