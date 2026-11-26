@@ -41,6 +41,9 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
 foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log", "threads.txt",
                   "translate.txt", "translate_err.txt") {
+    # a real debugger writes finished.txt last: in stall mode the stub writes it only after it was told to stop (written
+    # and removed again, a busy host let the watchdog see it and stop watching)
+    if ($env:STUB_STALL -and $name -eq "finished.txt") { continue }
     Set-Content -LiteralPath (Join-Path $LogDir $name) -Value "stub $name"
 }
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window.png"), [byte[]](1, 2, 3))
@@ -49,8 +52,6 @@ Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input scri
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_KILL_SELF) { Stop-Process -Id $PID -Force }   # the tester pressed Ctrl-C / closed the window: nothing after this runs
 if ($env:STUB_STALL) {
-    # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
-    Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
     $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 120 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
@@ -241,6 +242,14 @@ def check_shell(shell):
         assert mem_manifest["end_cause"].startswith("unknown: the debugger wrote no summary"), mem_manifest["end_cause"]  # the stub writes no summary
         # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
         # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
+        # The folders a run started this minute or the next would take already hold a finished run (as after a run
+        # moments ago): the stalled run must get its own folder, or the watchdog sees that finished.txt and stops.
+        now = time.time()
+        for at in (now, now + 60):
+            taken = tree / "out" / "tester" / ("run_" + time.strftime("%Y%m%d-%H%M", time.localtime(at)))
+            taken.mkdir(parents=True, exist_ok=True)
+            for name in ("finished.txt", "events.txt", "taken_marker.txt"):
+                (taken / name).write_text("an earlier run\n", encoding="ascii")
         stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
                              "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
         assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
@@ -249,6 +258,7 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_stall) as z:
             stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             assert "stall_stop.json" in z.namelist(), z.namelist()
+            assert "taken_marker.txt" not in z.namelist(), "the stalled run reused an earlier run's folder"
             # Not a wall-clock limit (a loaded VM with a release build running beside took 130 s for the whole test): the stub says
             # whether the stop file or its own deadline ended its wait.
             assert z.read("wait_ended.txt").decode("utf-8-sig").strip() == "stop file", "the run did not end through the stop file"

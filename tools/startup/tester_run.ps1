@@ -266,6 +266,9 @@ try {
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
+# A second run within the same minute gets its own folder: a reused one hands the stall watchdog the last run's
+# finished.txt (it stops watching at once), its stop file and stall_stop.json, and packs the last run's files again.
+if (Test-Path -LiteralPath (Join-Path $outRoot "run_$stamp")) { $stamp = Get-Date -Format "yyyyMMdd-HHmmss" }
 $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
