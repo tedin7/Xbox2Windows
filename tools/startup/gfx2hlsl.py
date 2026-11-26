@@ -12007,7 +12007,7 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
-        if s.uses_mask_ballot:
+        if getattr(s, 'uses_mask_ballot', False):
             shared.extend([
                 'uint x2w_ballot(uint bit, uint lane) {',
                 '    uint word = 0u;',
