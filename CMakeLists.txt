@@ -1372,7 +1372,8 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp
 
 # Replay (docs/startup-runtime.md#d3d12-replay-record): the player, next to the stand-in it loads, and the scene the
 # replay test records (tests/cmake/startup_replay.cmake).
-add_executable(x2w_replay src/replay/x2w_replay.cpp)
+enable_language(ASM_MASM)
+add_executable(x2w_replay src/replay/x2w_replay.cpp src/replay/replay_invoke.asm)
 target_compile_features(x2w_replay PRIVATE cxx_std_17)
 # Delay-loaded: the recording's settings (XENV) are in the environment before the stand-in reads any.
 target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp)
@@ -5432,7 +5433,6 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Outside a Git checkout, such as a source archive, the tracked-path check cannot run.
     set_tests_properties(docs_links PROPERTIES SKIP_RETURN_CODE 77)
 
-    enable_language(ASM_MASM)
     function(cpu_asm_fixture image source)
         if(ARGC GREATER 2)
             set(exports "${ARGV2}")

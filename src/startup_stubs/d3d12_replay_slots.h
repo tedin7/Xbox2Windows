@@ -7,6 +7,7 @@
 namespace x2w_replay_slots {
 
 inline constexpr char setting[] = "X2W_REPLAY_SLOT_LAYOUTS";
+inline constexpr int slot_count = 512;
 inline constexpr int device = 0, list = 4;
 
 struct Layout {

@@ -1950,6 +1950,24 @@ The recorder uses the layouts in [d3d12_replay_slots.h](../src/startup_stubs/d3d
 for device slots 70, 73, 80 and 86. It keeps format 3. The player reads formats 2 and 3.
 With `X2W_REPLAY_SLOT_LAYOUTS=1` stored in `XENV`, the player also maps the CPU
 pointer returned by list slot 148 over the requested range. As with other memory-backed views, replay of slot
+
+The player checks each CALL header against its format (104 bytes in v2,
+136 in v3). Format 2 supplies zero for argument words 7 through 10. The
+Windows x64 bridge forwards all eleven integer or pointer words.
+
+Run the synthetic CALL compatibility and bridge checks together with the replay
+scenes on Windows after building Release:
+
+```powershell
+ctest --preset release --no-tests=error -R '^(startup_replay_(call_formats|invoke|warp|hardware))$'
+```
+
+Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
+in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
+recorder keeps format 3 and stores the switch in `XENV`. The player reads
+formats 2 and 3. The switch bounds argument copies for device slots 70, 73,
+80 and 86, and the player maps the CPU pointer returned by list slot 148
+over the requested range. As with other memory-backed views, replay of slot
 70 needs the backing address to be available through replayed pages or a
 translated range. Tracking the slot 148 pointer alone does not record writes
 made through it.

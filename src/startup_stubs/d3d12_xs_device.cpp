@@ -125,7 +125,7 @@ extern "C" std::uint32_t x2w_no_stripped_root_flags(const void*, std::size_t) { 
 namespace {
 
 using u64 = std::uint64_t;
-constexpr int slot_count = 512;
+constexpr int slot_count = x2w_replay_slots::slot_count;
 // Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
