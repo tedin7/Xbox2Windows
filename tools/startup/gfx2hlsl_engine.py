@@ -8684,6 +8684,12 @@ class Stage:
         ws = getattr(getattr(self, 'pipe', None), 'wavesync', None)
         if getattr(self, 'kind', None) != 'cs' or ws is None or not getattr(self, 'uniform_cf', False):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        breaks = getattr(self, 'lane_exec_breaks', None)
+        if breaks:
+            # A mask built from a number (exec_lo = 0xaaaaaaaa) selects guest lanes the one-lane model cannot tell apart:
+            # the lane's `exec & 1` is no longer the guest's bit, so the lowest enabled lane would be the wrong one.
+            raise Unsupported('v_readfirstlane_b32 after an EXEC write the lane model does not hold exactly (at +0x%x: %s)'
+                              % breaks[0])
         self.first_lane_reads = self.uses_wavesync = True
         _, value, lines = ws.gather_first('(exec & 1) != 0u', self.u(ops[1]))
         for line in lines:

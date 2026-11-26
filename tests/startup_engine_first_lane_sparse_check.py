@@ -32,21 +32,27 @@ PROLOGUE = 's_mov_b32 s10, s6\ns_mov_b32 s11, 0\ns_load_dwordx8 s[12:19], s[10:1
 BODY = ('v_lshlrev_b32 v4, 2, v0\nbuffer_load_dword v2, v4, s[12:15], 0 offen\ns_waitcnt vmcnt(0)\n'
         'v_readfirstlane_b32 s20, v2\n%sv_xor_b32 v3, s20, v2\nbuffer_store_dword v3, v4, s[16:19], 0 offen\ns_endpgm\n')
 
-# name -> (EXEC set before the read, EXEC restored before the store, recorded words, group, guest wave size)
+# name -> (EXEC set before the read, EXEC restored before the store, recorded words, group, guest wave size). The masks come
+# from lane compares, which the lane model holds exactly; a mask built from a number is refused (LITERAL below).
 VARIANTS = {
-    'sparse32': ('s_mov_b32 exec_lo, 0xaaaaaaaa\n', '',
-                 '06038abe80038bbe05030cf4000000fa7fc08cbfff03febeaaaaaaaa82000834001030e004020380703f8cbf'
-                 '0205287e1404063a001070e004030480000081bf', (40, 1, 1), 32),
-    'none32': ('s_mov_b32 exec_lo, 0x80000000\n', 's_mov_b32 exec_lo, -1\n',
-               '06038abe80038bbe05030cf4000000fa7fc08cbfff03febe0000008082000834001030e004020380703f8cbf'
-               '0205287ec103febe1404063a001070e004030480000081bf', (40, 1, 1), 32),
-    'sparse64': ('s_mov_b32 s26, 0xffffffe0\ns_mov_b32 s27, -1\ns_mov_b64 exec, s[26:27]\n', '',
-                 '06038abe80038bbe05030cf4000000fa7fc08cbfff039abee0ffffffc1039bbe1a04febe82000834'
+    'sparse32': ('v_and_b32 v1, 1, v0\nv_cmp_eq_u32 vcc_lo, 1, v1\ns_mov_b32 exec_lo, vcc_lo\n', '',
+                 '06038abe80038bbe05030cf4000000fa7fc08cbf810002368102847d6a03febe82000834001030e0'
+                 '04020380703f8cbf0205287e1404063a001070e004030480000081bf', (40, 1, 1), 32),
+    'none32': ('v_and_b32 v1, 31, v0\nv_cmp_eq_u32 vcc_lo, 31, v1\ns_mov_b32 exec_lo, vcc_lo\n', 's_mov_b32 exec_lo, -1\n',
+                 '06038abe80038bbe05030cf4000000fa7fc08cbf9f0002369f02847d6a03febe82000834001030e0'
+                 '04020380703f8cbf0205287ec103febe1404063a001070e004030480000081bf', (40, 1, 1), 32),
+    'sparse64': ('v_and_b32 v1, 63, v0\nv_cmp_lt_u32_e64 s[26:27], 4, v1\ns_mov_b64 exec, s[26:27]\n', '',
+                 '06038abe80038bbe05030cf4000000fa7fc08cbfbf0002361a00c1d4840202001a04febe82000834'
                  '001030e004020380703f8cbf0205287e1404063a001070e004030480000081bf', (96, 1, 1), 64),
-    'none64': ('s_mov_b32 s26, 0\ns_mov_b32 s27, 0x100\ns_mov_b64 exec, s[26:27]\n', 's_mov_b64 exec, -1\n',
-               '06038abe80038bbe05030cf4000000fa7fc08cbf80039abeff039bbe000100001a04febe82000834'
-               '001030e004020380703f8cbf0205287ec104febe1404063a001070e004030480000081bf', (96, 1, 1), 64),
+    'none64': ('v_and_b32 v1, 63, v0\nv_cmp_eq_u32_e64 s[26:27], 40, v1\ns_mov_b64 exec, s[26:27]\n', 's_mov_b64 exec, -1\n',
+                 '06038abe80038bbe05030cf4000000fa7fc08cbfbf0002361a00c2d4a80202001a04febe82000834'
+                 '001030e004020380703f8cbf0205287ec104febe1404063a001070e004030480000081bf', (96, 1, 1), 64),
 }
+# An EXEC mask built from a number selects guest lanes the one-lane model cannot tell apart (exec = (0xaaaaaaaa) & 1 gives every
+# thread bit 0): the first-lane read after it is refused, never answered from the wrong lane.
+LITERAL_WORDS = bytes.fromhex(
+                 '06038abe80038bbe05030cf4000000fa7fc08cbfff03febeaaaaaaaa82000834001030e004020380'
+                 '703f8cbf0205287e1404063a001070e004030480000081bf')
 SIZES = {'sparse32': ('odd', 32), 'none32': ('top', 32), 'sparse64': ('from5', 64), 'none64': ('lane40', 64)}
 
 
@@ -112,6 +118,8 @@ def check_controls():
             assert mutate(hlsl, old, new) != hlsl, (name, control)
         # The expected words are not the lane-0 answer: every case tells the controls apart.
         assert len(set(expected(name))) > 3, name
+    E.refused('EXEC write the lane model does not hold exactly',
+              lambda: E.translate('N', code=LITERAL_WORDS, group=(40, 1, 1), wave=32))
     print('first-lane sparse translation and expectation checks passed')
 
 
@@ -120,6 +128,8 @@ def check_binary(llvm_mc):
     for name in VARIANTS:
         built = assemble(llvm_mc, source(name))
         assert built == words(name), '%s: assembled %s, recorded %s' % (name, built.hex(), words(name).hex())
+    literal = assemble(llvm_mc, PROLOGUE + 's_mov_b32 exec_lo, 0xaaaaaaaa\n' + BODY % '')
+    assert literal == LITERAL_WORDS, literal.hex()
     print('first-lane sparse fixture words match llvm-mc')
 
 
