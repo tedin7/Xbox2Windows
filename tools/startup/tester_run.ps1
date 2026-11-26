@@ -4,7 +4,10 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
-   into generated\x2w_build_rev.cpp). If not, or a DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
+   into generated\x2w_build_rev.cpp). A build from another commit is used as it is when the runtime sources (src, cmake,
+   CMakeLists.txt, CMakePresets.json) are the same there and here, so a commit that changes only tools, tests or docs needs
+   no rebuild; the summary says why (runtime_sources.py) and the manifest records it as build_check. Otherwise, or when a
+   DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
    revision stamp; -FullBuild builds everything) or, with -NoBuild, stops with a message.
 2. Uses one shader cache folder per shader revision (out\startup\shader_cache_<rev>, from the x2w-startup-shader-N
    strings of gfx2hlsl.py): kept across runs and across branch updates that do not bump the revision. The --watch translator needs minutes to catch up, so an emptied cache would leave
@@ -103,11 +106,23 @@ function Get-MissingDlls {
     return @($runDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $buildRoot "$_.dll")) })
 }
 
+$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
+$pack = Join-Path $PSScriptRoot "tester_pack.py"
+
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }
 $built = Get-BuildRevision
 $missing = Get-MissingDlls
-if ($built -ne $wanted -or $missing.Count -gt 0) {
+# A build from another commit is used as it is when the runtime sources (src, cmake, CMakeLists.txt, CMakePresets.json)
+# are the same there and here: a commit that changes only tools, tests or docs needs no rebuild (runtime_sources.py).
+$buildCheck = if ($built -eq $wanted) { "same commit" } else { $null }
+if ($built -and $built -ne $wanted -and $missing.Count -eq 0) {
+    $why = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "runtime_sources.py") $repo $built } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) { $buildCheck = $why; Write-Host "tester_run: using the build: $why" }
+    elseif ($why) { Write-Host "tester_run: $why" }
+}
+if (-not $buildCheck -or $missing.Count -gt 0) {
     $have = if ($built) { $built } else { "no build" }
     if ($built -eq $wanted) { $have = "$built without " + ($missing -join ", ") + ".dll" }
     if ($NoBuild) {
@@ -134,6 +149,7 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
     if ($built -ne $wanted) {
         throw "tester_run: after the build the revision is $built, expected $wanted"
     }
+    $buildCheck = "built here"
 }
 
 # One shader cache folder per shader revision (the x2w-startup-shader-N strings of gfx2hlsl.py), kept across runs and across
@@ -142,10 +158,6 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
 $runScript = Join-Path $PSScriptRoot "run.ps1"
 $runParams = (Get-Command $runScript).Parameters
 $cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCacheRoot } else { Join-Path $repo $ShaderCacheRoot }
-
-$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
-$pack = Join-Path $PSScriptRoot "tester_pack.py"
 $cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py") } | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
@@ -226,7 +238,7 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
 $manifest = [ordered]@{
-    commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds
+    commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
