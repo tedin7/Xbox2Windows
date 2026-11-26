@@ -8878,8 +8878,11 @@ class Stage:
         if mods or len(ops) != 3:
             raise Unsupported('%s requires three unmodified operands' % name)
         x, y, z = self.pipe.group
-        if x * y * z > 32:
-            raise Unsupported('%s requires at most 32 threads per group' % name)
+        multi_wave = x * y * z > 32
+        if multi_wave:
+            wave = self.pipe.wave_size
+            if wave != 32 and (wave is not None or not wave32_exec_proof(self.ins)):
+                raise Unsupported('%s in a larger group requires a proven wave32 program' % name)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
             raise Unsupported('%s destination %s' % (name, ops[0]))
@@ -8892,10 +8895,14 @@ class Stage:
         if not base_is_vgpr and self.const_u32(ops[2]) is None:
             raise Unsupported('%s requires a VGPR or known base' % name)
         result = self.u(ops[2])
-        # RDNA 2 V_MBCNT counts mask bits strictly below the lane. All threads of
-        # this group fit in the low half of either guest wave size, including lane 31.
+        # RDNA 2 V_MBCNT counts mask bits strictly below the lane. A small group
+        # fits in the low half of either guest wave size, including lane 31.
         if not high:
             lane = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+            if multi_wave:
+                # The packed mask already supplies every lane's bit. Compute its prefix
+                # directly in guest lane order, independent of host wave size and active lanes.
+                lane = '(%s & 31u)' % lane
             result = '(countbits(0x%08xu & ((1u << %s) - 1u)) + %s)' % (mask, lane, result)
         self.set_v(dst[1], result)
 
