@@ -7,6 +7,8 @@ duplicate) and a zero run, then a later MAP that changes page 1 to C. Checked:
   - control: without the second MAP the image is A, B, A, zeros (each MAP is applied, in order);
   - a range that cannot be reserved at its address (kernel space) stops the replay with exit 3 and the address.
 
+A call-only recording checks that a Release for a missing resource cannot use a stale argument as its receiver.
+
 usage: startup_replay_pages_play_check.py <x2w_replay>
 """
 import json
@@ -64,6 +66,27 @@ def play(player, recording_path, out):
     return result.returncode, result.stdout + result.stderr
 
 
+def check_missing_release(player, directory):
+    device, missing_resource = 0x10000000, 0x20000000
+    call = struct.Struct("<QIHHQ11QQdii")
+    data = chunk(b"XREC", struct.pack("<IIQ", 3, call.size, 10000000)) + chunk(b"XENV", data=SETTINGS)
+    # Seed the device mapping with AddRef and balance it with Release. The third call models a Release whose
+    # resource creation produced no replay mapping and whose unused RDX still names the device.
+    for seq, kind, slot, obj, rdx, ret in (
+        (1, 0, 1, device, 0, 2),
+        (2, 0, 2, device, 0, 1),
+        (3, 7, 2, missing_resource, device, 0),
+    ):
+        data += chunk(b"CALL", call.pack(seq, 1, kind, slot, obj, rdx, *([0] * 10), ret, 0.0, 0, 0))
+    path = directory / "missing_release.x2wr"
+    path.write_bytes(data + chunk(b"XEND", struct.pack("<QQQQ", 3, 0, len(data), 0)))
+    out = directory / "missing_release"
+    code, text = play(player, path, out)
+    assert code == 0, "missing resource Release: exit %d\n%s" % (code, text[-2000:])
+    summary = json.loads((out / "replay_summary.json").read_text())
+    assert (summary["calls"], summary["played"], summary["unknown_object"]) == (3, 2, 1), summary
+
+
 def main(player):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
@@ -85,8 +108,10 @@ def main(player):
         recording(directory / "taken.x2wr", 0xFFFF800000000000)
         code, text = play(player, directory / "taken.x2wr", directory / "taken")
         assert code == 3 and "0xffff800000000000" in text, (code, text[-2000:])
+        check_missing_release(player, directory)
         print("replay pages: image A,C,A,zeros at 0x%x; first map only A,B,A; a range that cannot be had stops with exit 3"
               % BASE)
+        print("replay Release: known device calls played; missing resource with a stale RDX skipped")
     return 0
 
 
