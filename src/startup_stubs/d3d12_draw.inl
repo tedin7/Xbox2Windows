@@ -493,7 +493,7 @@ bool read_text(const wchar_t* path, std::string& out)
 namespace shader_cache {
 constexpr char revision[] = "x2w-startup-shader-28";
 constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup/gfx2hlsl.py compute_key
-constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
+constexpr char mesh57_revision[] = "x2w-startup-mesh-57-4";
 }  // namespace shader_cache
 
 // Once per process, before its first request: <X2W_SHADER_CACHE>\revision.txt names this runtime's revisions, so

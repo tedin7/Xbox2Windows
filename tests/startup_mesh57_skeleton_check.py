@@ -364,6 +364,9 @@ WAVE_BLOCK_REFUSALS = (
 INNER_VCC_ASM = NEST_SCC_ASM.replace('s_cmp_eq_u32 s43, 0\ns_cbranch_scc1 1',
                                      'v_cmp_gt_u32_e32 vcc, s43, v0\ns_cbranch_vccz 1')
 INNER_VCC_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf860001 bea8032b 7e0e02f2')
+# The same block with s_cbranch_vccnz right after its compare: the wave skips the write when any lane sets VCC.
+INNER_VCCNZ_ASM = INNER_VCC_ASM.replace('s_cbranch_vccz 1', 's_cbranch_vccnz 1')
+INNER_VCCNZ_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf870001 bea8032b 7e0e02f2')
 
 # Only thread 5 passes the nested EXEC test. After restoring EXEC, the loaded
 # word names the thread that can set VCC. The branch controls red for the wave.
@@ -413,6 +416,7 @@ FIRST_LANE_MESH = wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', '7d820080 
 
 WAVE_COLLECTIVES = (
     ('inner VCC branch', INNER_VCC_ASM, INNER_VCC_MESH),
+    ('inner VCCNZ branch', INNER_VCCNZ_ASM, INNER_VCCNZ_MESH),
     ('no full EXEC reset', NO_RESET_ASM, NO_RESET_MESH),
     ('readfirstlane broadcast', FIRST_LANE_ASM, FIRST_LANE_MESH),
 )
@@ -712,6 +716,13 @@ def controls():
              's_cbranch_vccz forward in the block'),
         ):
             expect(what, refusal in request(tmp, wave_load_mesh(body=body))[1], True)
+        # A compare right before the branch: VCCZ branches when no lane in EXEC sets VCC, VCCNZ when one does.
+        for what, mesh, polarity in (('adjacent vccz', INNER_VCC_MESH, '=='), ('adjacent vccnz', INNER_VCCNZ_MESH, '!=')):
+            key, result = request(tmp, mesh)
+            expect(what + ' translates', result, 'ok')
+            if result == 'ok':
+                source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+                expect(what + ' vote polarity', re.findall(r'mesh_vote ([!=]=) 0u', source), [polarity])
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
@@ -1075,6 +1086,8 @@ def draw_wave_collectives(dxc, renderer, adapter):
     cases = (
         (INNER_VCC_MESH, 'inner VCC branch falls through', {}),
         (INNER_VCC_MESH, 'inner VCC branch taken', {'word': 0.0, 'rule': lambda _: 64}),
+        (INNER_VCCNZ_MESH, 'inner VCCNZ branch taken', {'rule': lambda _: 64}),
+        (INNER_VCCNZ_MESH, 'inner VCCNZ branch falls through', {'word': 0.0}),
         (NO_RESET_MESH, 'no full EXEC reset', {'bound': 3}),
         (FIRST_LANE_MESH, 'readfirstlane broadcast',
          {'word': 0.25, 'rule': lambda _: 255, 'green': lambda tid: 255 if 0 < tid < 6 else 0}),

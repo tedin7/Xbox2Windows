@@ -2018,9 +2018,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                                 break
                             compare_vcc -= 1
                         if fresh_vcc(compare_vcc, i):
-                            # Previously accepted adjacent compares keep their
-                            # original emitted predicate, including for VCCNZ.
-                            vcc_edges[i] = compare_vcc == i - 1 or ins[i][2] == 's_cbranch_vccz'
+                            # The vote is whether any lane in EXEC sets VCC: VCCZ branches when none does.
+                            vcc_edges[i] = ins[i][2] == 's_cbranch_vccz'
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
@@ -12531,7 +12530,7 @@ def read_ps_inputs(path, key):
 
 
 def mesh57_key(ms, ps, root):
-    value = fnv(b'x2w-startup-mesh-57-3')
+    value = fnv(b'x2w-startup-mesh-57-4')
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value

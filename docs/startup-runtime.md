@@ -219,7 +219,10 @@ loop iteration after an EXEC write. The two cache keys advance together.
 Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).
 Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch.
 Revision 19 folds `s_mov_b32` from a scalar register that holds a plain constant, so later reads of the copy use the constant word. The fixed slot 57 mesh
-(`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
+(`x2w-startup-mesh-57-3`) key stayed then, because that shader is not translated from guest code.
+The slot 57 mesh key `x2w-startup-mesh-57-4` invalidates translated meshes whose inner wave-uniform
+`s_cbranch_vccnz`, right after its VCC compare, branched when no lane set VCC. It now branches when any
+lane in EXEC sets VCC. Graphics and compute revisions do not change.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
 Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the
