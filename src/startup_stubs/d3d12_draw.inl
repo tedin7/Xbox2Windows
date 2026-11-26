@@ -1716,7 +1716,7 @@ ID3D12Resource* full_buffer_snapshot(Wrapper* self, u64 address, std::size_t byt
     ++big_binding_counts.copies;
     big_binding_counts.copied_bytes += bytes;
     InterlockedIncrement64(&big_copies_made);
-    offset = binding->slice.offset;
+    offset = binding->committed ? 0 : binding->slice.offset;
     if (binding->committed)
         return retain_with_recording(self, binding->committed, true) ? binding->committed.Get() : nullptr;
     return binding->slice.resource;
