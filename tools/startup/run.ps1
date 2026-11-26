@@ -99,10 +99,26 @@ if ($Translate -and $Render) {
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
         -RedirectStandardOutput (Join-Path $LogDir "translate.txt") -RedirectStandardError (Join-Path $LogDir "translate_err.txt")
-    # The translator and its process pool (every core but one) must never run above the title: lowered here, right after the
-    # start, the pool workers it creates later inherit BELOW_NORMAL.
-    try { $translator.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
-    catch { Write-Warning "could not lower the translator's priority: $($_.Exception.Message)" }
+    # The translator and its process pool (every core but one) must never run above the title. A venv or launcher python is a
+    # process tree (launcher + real interpreter), so the class is set on the root and on every descendant, for about two
+    # seconds so a child that appears a little later is caught; the pool workers the interpreter creates later inherit it.
+    $lowerTree = {
+        param([int]$RootId)
+        $ids = @($RootId)
+        for ($i = 0; $i -lt $ids.Count; $i++) {
+            foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($ids[$i])" -ErrorAction SilentlyContinue)) {
+                if ($ids -notcontains [int]$child.ProcessId) { $ids += [int]$child.ProcessId }
+            }
+        }
+        foreach ($id in $ids) {
+            try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
+        }
+        return $ids.Count
+    }
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(2)
+        do { $null = & $lowerTree $translator.Id; Start-Sleep -Milliseconds 250 } while ([DateTime]::UtcNow -lt $deadline -and -not $translator.HasExited)
+    } catch { Write-Warning "could not lower the translator's priority: $($_.Exception.Message)" }
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
