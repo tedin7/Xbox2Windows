@@ -16,6 +16,7 @@ usage: startup_replay_titlemem_check.py <startup_replay_titlemem> <x2w_replay> <
 """
 from collections import Counter
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -112,7 +113,9 @@ def main(scene, player, backend):
             differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt"))
 
         data = recording.read_bytes()
-        assert pages_log, "the recorder never ran its page scan (no 'x2w-replay pages:' line)"
+        ranges = re.search(r"ranges (\d+)", pages_log[0]) if pages_log else None
+        assert ranges and int(ranges.group(1)) >= 1, "the page scan found no title-memory range: " + (pages_log[0] if pages_log else "no log")
+        assert pages_log, "the recorder never ran its page scan (no 'x2w-replay pages:' line):\n" + text[-1500:]
         assert data.count(b"PAGE") >= 1 and data.count(b"MAP ") >= 1, "the recording holds no PAGE/MAP chunk"
         note = "page control skipped (page bytes not stored by value)"
         last = struct.pack("<4f", *colour_of(PRESENTS - 1))

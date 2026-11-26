@@ -32,6 +32,7 @@ constexpr UINT width = 64, height = 32;
 struct Scene {
     void* target = nullptr;
     void* rtv_heap = nullptr;
+    void* title_buffer = nullptr;   // a placed buffer over the title's page (device slot 133): the recorder knows the range
     void* queue = nullptr;
     void* allocator = nullptr;
     void* list = nullptr;
@@ -69,7 +70,15 @@ int create_scene(void* device, Scene& s)
         return 23;
     // One 64 KiB page of the title's own memory, 64 KiB aligned, so the descriptor's address is a page the recorder tracks.
     s.memory = static_cast<float*>(VirtualAlloc(nullptr, 1u << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    return s.memory ? 0 : 24;
+    if (!s.memory) return 24;
+    // The buffer is placed over that page once, before the window; the title never names the page again except as the
+    // constant buffer address, so what a replay restores comes from the recorder's page scan of this resource.
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 1u << 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(s.memory), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                           arg(&__uuidof(ID3D12Resource)), arg(&s.title_buffer)))) || !s.title_buffer)
+        return 25;
+    return 0;
 }
 
 int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
