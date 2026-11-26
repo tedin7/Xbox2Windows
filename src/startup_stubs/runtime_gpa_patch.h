@@ -17,7 +17,7 @@
 namespace x2w_runtime_patch {
 
 // registry: one of the registry imports named by console_mode.h (classified by its own caller).
-enum class Kind : unsigned char { get_proc_address = 1, query_api_impl = 2, registry = 3 };
+enum class Kind : unsigned char { get_proc_address = 1, query_api_impl = 2, registry = 3, movie = 4 };
 
 struct Hit {
     Kind kind;
