@@ -354,14 +354,16 @@ int main(int argc, char** argv)
     // The status-line counters (#2816). This mixed run finished one raw copy and one zlib request and
     // failed the rest: completed is raw + inflated + bcpack-blank, a failure is not in it, and the
     // "inflated=%ld failed=%ld" text that tools/startup/live_view.py parses is unchanged.
-    char counts[160], want_counts[160];
+    // The heartbeat check above added one more failure (count_failure(C::other)) after the totals were sampled.
+    const LONG failed_now = expected_failed + 1;
+        char counts[160], want_counts[160];
     format_request_counts(counts, sizeof counts, requests_done, requests_compressed, requests_failed,
                           requests_bcpack_blank);
-    std::snprintf(want_counts, sizeof want_counts, "raw=1 inflated=1 failed=%ld bcpack-blank=0 completed=2", expected_failed);
+    std::snprintf(want_counts, sizeof want_counts, "raw=1 inflated=1 failed=%ld bcpack-blank=0 completed=2", failed_now);
     std::snprintf(what, sizeof what, "mixed run counts \"%s\", expected \"%s\"", counts, want_counts);
     ok = expect(std::strcmp(counts, want_counts) == 0, what) && ok;
     char parsed_tail[64];
-    std::snprintf(parsed_tail, sizeof parsed_tail, "inflated=1 failed=%ld", expected_failed);
+    std::snprintf(parsed_tail, sizeof parsed_tail, "inflated=1 failed=%ld", failed_now);
     ok = expect(std::strstr(counts, parsed_tail) != nullptr, "the inflated=N failed=N text live_view.py parses changed") && ok;
 
     // A run whose requests are all zlib: nothing is counted raw, yet completed equals the finished requests,
