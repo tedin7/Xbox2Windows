@@ -10,6 +10,7 @@ emits `Store*` for the `off` form, and writes a `uav <slot> table <param> <byte 
 Instruction bytes are constructed from the MUBUF field layout the checked-in decoder reads; the root
 signature is built field by field. Nothing comes from an archive.
 """
+import argparse
 import os
 import struct
 import sys
@@ -21,6 +22,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from startup_compute_buffer_atomics_check import HEAD, SENTINEL, WORDS, cs_pipe, mubuf, run_case, v_mov_imm, vop2  # noqa: E402
+from startup_gfx2hlsl_compute_check import refused as expect_refusal  # noqa: E402
 
 MUBUF_LOAD_DWORD = 0x0c
 STORE_OPS = {'dword': 0x1c, 'dwordx2': 0x1d, 'dwordx4': 0x1e, 'dwordx3': 0x1f}
@@ -79,7 +82,86 @@ def fail_reason(name):
     return path.read_text().strip() if path.exists() else ''
 
 
+def edited_store(*, entry=False, edit_format=False, carry=False, atomic=False, replace_count=False, indexed=True):
+    # Lanes write their own record index. The edited descriptor exposes only records 0..3.
+    base = sop2(SOP2['s_add_u32'], 16, 16, 4 if entry else 160)
+    count = sop2(0x07, 18, 18, 5 if entry else 132)  # s_min_u32
+    if replace_count:
+        count = struct.pack('<I', 0xbe920300 | (5 if entry else 132))  # s_mov_b32 s18, limit
+    if carry:
+        base += sop2(0x04, 17, 17, 128)  # s_addc_u32 s17, s17, 0
+    fmt = sop2(SOP2['s_or_b32'], 19, 19, 255, 0x1000) if edit_format else b''
+    if atomic or not indexed:
+        # Form the 12-byte record address explicitly to exercise edited descriptors on the offen path.
+        address = vop2(0x25, 10, 256, 0) + vop2(0x25, 10, 256, 10) + vop2(0x1a, 10, 130, 10)
+        if atomic:
+            store = address + v_mov_imm(11, 9) + mubuf(0x32, 11, 10, 16, 128)
+        else:
+            store = address + encode_mubuf(STORE_OPS['dword'], offen=1, vaddr=10, vdata=0, srsrc=16)
+    else:
+        store = encode_mubuf(STORE_OPS['dword'], idxen=1, vdata=0, srsrc=16)
+    return cs_pipe(HEAD + base + count + fmt + store + struct.pack('<I', 0xbf810000), group=(8, 1, 1))
+
+
+def dispatch(compiler, renderer, adapter):
+    wanted = [SENTINEL] * WORDS
+    for lane in range(8):
+        if lane < 4:
+            wanted[(32 + lane * 12) // 4] = lane
+    entry = {('uav_stride', 0): 12, ('uav_numrecords', 0): 16, ('uav_base_lo', 0): 0x8000, ('uav_descword3', 0): 0,
+             ('rootconst', 0, 0): 32, ('rootconst', 0, 1): 4}
+    out = HERE.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        for dynamic, carry, replace in ((False, False, False), (True, False, True), (False, True, False)):
+            pipe = edited_store(entry=dynamic, carry=carry, replace_count=replace, indexed=not replace)
+            hlsl = pipe.hlsl_cs()
+            constants = [entry[source] for source in pipe.uds]
+            result = run_case(Path(tmp), compiler, renderer, adapter, f'advanced_{dynamic}_{carry}', hlsl, (1, 1, 1),
+                              wanted, constants=constants)
+            if result.returncode == 77:
+                return 77
+            assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (
+                result.stdout, result.stderr)
+
+        pipe = edited_store(entry=True, atomic=True)
+        constants = [entry[source] for source in pipe.uds]
+        atomic_wanted = [SENTINEL] * WORDS
+        for i in range(4):
+            atomic_wanted[8 + i * 3] += 9
+        hlsl = pipe.hlsl_cs()
+        result = run_case(Path(tmp), compiler, renderer, adapter, 'advanced_atomic', hlsl, (1, 1, 1),
+                          atomic_wanted, constants=constants)
+        assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (
+            result.stdout, result.stderr)
+        advance = f'write_address = write_offset + ud{pipe.uds.index(("rootconst", 0, 0))};'
+        assert hlsl.count(advance) == 1
+        mutant = hlsl.replace(advance, 'write_address = write_offset;')
+        result = run_case(Path(tmp), compiler, renderer, adapter, 'ignored_atomic_advance', mutant, (1, 1, 1),
+                          atomic_wanted, constants=constants)
+        assert result.returncode == 1 and f'word=0 expected={SENTINEL:08x} actual={SENTINEL + 9:08x}' in result.stderr, (
+            result.stdout, result.stderr)
+
+        pipe = edited_store()
+        constants = [entry[source] for source in pipe.uds]
+        hlsl = pipe.hlsl_cs()
+        original = 'write_address = write_offset + 32u;'
+        assert hlsl.count(original) == 1
+        mutant = hlsl.replace(original, 'write_address = write_offset;')
+        result = run_case(Path(tmp), compiler, renderer, adapter, 'ignored_advance', mutant, (1, 1, 1),
+                          wanted, constants=constants)
+        assert result.returncode == 1 and f'word=0 expected={SENTINEL:08x} actual=00000000' in result.stderr, (
+            result.stdout, result.stderr)
+    return 0
+
+
 def main():
+    edited_store().hlsl_cs()
+    edited_store(entry=True).hlsl_cs()
+    edited_store(carry=True).hlsl_cs()
+    edited_store(entry=True, replace_count=True, indexed=False).hlsl_cs()
+    edited_store(entry=True, atomic=True).hlsl_cs()
+    expect_refusal('buffer store through a modified descriptor (word 3)', lambda: edited_store(edit_format=True))
     with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'X2W_FXC': ''}):
         folder = Path(temp)
 
@@ -222,4 +304,8 @@ def main():
     return 0
 
 
-sys.exit(main())
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
+    args = parser.parse_args()
+    sys.exit(dispatch(*args.dispatch) if args.dispatch else main())
