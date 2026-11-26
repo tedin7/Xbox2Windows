@@ -21,7 +21,7 @@ def check(directory, consumer, backend):
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
     # Isolate table publication from instruction lowering. Keep the fixture's generated
     # screen triangle and replace its constant-colour PS with a single bound buffer read.
-    manifest, = cache.glob("*.txt")
+    manifest, = (path for path in cache.glob("*.txt") if path.name != "revision.txt")
     with manifest.open("a", encoding="ascii") as file:
         file.write("\nsrv 0 buffer table 0 0\n")
     shader = manifest.with_suffix(".ps.hlsl")

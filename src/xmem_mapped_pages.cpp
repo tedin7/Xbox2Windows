@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/profile_zone.h"
 
@@ -920,6 +921,18 @@ void log_apply_failure(const char* what, const MapFailure& failure, ULONG_PTR co
                     static_cast<unsigned long long>(failure.region.RegionSize),
                     static_cast<unsigned long>(failure.region.State), static_cast<unsigned long>(failure.region.Protect),
                     static_cast<unsigned long>(failure.region.Type));
+    // A failed commit (1455 = system commit limit, 8 = not enough memory): say how full the system commit and the pool
+    // are. The caller holds memory.mutex. The first three failures are reported.
+    if (x2w_local::is_commit_failure(failure.error)) {
+        static volatile LONG reported = 0;
+        if (InterlockedIncrement(&reported) <= 3) {
+            char line[384];
+            x2w_local::format_exhausted(line, sizeof(line), what, static_cast<unsigned long>(failure.error),
+                                        x2w_local::system_commit(), x2w_local::job_memory(), memory.backings.size(),
+                                        memory.slots.slab_count(), memory.slots.slots_in_use(), memory.slots.slots_free());
+            x2w_local::logf("%s", line);
+        }
+    }
 }
 
 void log_failed_ranges(const char* what, const char* operation, const std::vector<ULONG_PTR>& addresses)

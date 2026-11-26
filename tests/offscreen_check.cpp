@@ -1674,7 +1674,10 @@ constexpr CapabilityGate kGateSm66MinLod{
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
 // remain inside the handlers and report OutcomeKind::skip.
+OperationResult run_serve(const OperationContext& ctx);
+
 const OperationSpec kOperations[] = {
+    {"--serve", 3, 3, nullptr, kNoGate, run_serve},
     {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
     {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_batch},
     {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
@@ -1954,6 +1957,60 @@ int run_operation_spec(const OperationSpec& spec, const OperationContext& ctx, D
         return 1;
     }
     return 1;
+}
+
+// --serve: any other operation, case after case, on this one device. A test that checks hundreds of shader pairs starts one
+// process and creates the D3D12 device once instead of once per case. After the banner it prints the marker pair for case -1 (the banner text), then
+// reads one case per stdin line: the operation and its operands separated by tabs, exactly the arguments that follow the
+// adapter name in a one-shot call. Each case runs through the same argument validation, capability gate, debug-layer check
+// and exit-code mapping as a one-shot call (0 pass, 1 failure, 77 skip, 2 bad arguments); its stdout and stderr text is
+// whatever the one-shot call prints. Both streams end the case with a marker line ("X2WEND <index>" on stderr, then
+// "X2WCASE <index> <exit code>" on stdout) so the client can split the text per case. The line "--end" or closing stdin ends the loop; a removed
+// device ends it with exit code 1 after answering, and the client starts a new process.
+OperationResult run_serve(const OperationContext& ctx)
+{
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "X2WEND -1\n");           // the banner printed so far; the client repeats it in front of every case, as a one-shot call prints it
+    std::printf("X2WCASE -1 0\n");
+    std::fflush(stdout);
+    std::vector<char> buffer(65536);
+    for (int index = 0; std::fgets(buffer.data(), int(buffer.size()), stdin); ++index) {
+        std::string line(buffer.data());
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line == "--end") break;                 // an explicit end: not every launcher (a Wine wrapper) passes the end of stdin on
+        std::vector<std::string> field{ctx.argv[0], std::string(ctx.mode)};
+        for (std::size_t start = 0;;) {
+            const auto tab = line.find('\t', start);
+            field.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+            if (tab == std::string::npos) break;
+            start = tab + 1;
+        }
+        std::vector<char*> argv;
+        for (auto& f : field) argv.push_back(f.data());
+        int code = 2;
+        const bool nested = field.size() >= 3 && field[2] != "--serve";
+        if (nested) {
+            const CliResolution cli = resolve_cli(int(argv.size()), argv.data());
+            if (cli.action == CliAction::operation) {
+                const OperationContext inner{ctx.device, ctx.messages, ctx.caps, ctx.mode, int(argv.size()), argv.data(), nullptr};
+                code = run_operation_spec(*cli.spec, inner);
+            }
+        } else {
+            std::fprintf(stderr, "--serve takes an operation and its operands, one case per line\n");
+        }
+        if (ctx.messages) ctx.messages->ClearStoredMessages();
+        const bool removed = FAILED(ctx.device->GetDeviceRemovedReason());
+        if (removed) {
+            std::fprintf(stderr, "device removed during case %d\n", index);
+            code = 1;
+        }
+        std::fflush(stdout);
+        std::fprintf(stderr, "X2WEND %d\n", index);
+        std::printf("X2WCASE %d %d\n", index, code);
+        std::fflush(stdout);
+        if (removed) return {OutcomeKind::fail, "device removed"};
+    }
+    return {OutcomeKind::pass, nullptr};
 }
 
 int run_self_test()

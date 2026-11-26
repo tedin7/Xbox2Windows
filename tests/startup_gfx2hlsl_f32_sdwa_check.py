@@ -47,6 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import startup_gfx2hlsl_f32_lg_check as L  # noqa: E402
+import gpu_case_runner  # noqa: E402
 import startup_gfx2hlsl_f32_nan_check as N  # noqa: E402
 import startup_gfx2hlsl_vopc_sdwa_check as S  # noqa: E402
 from startup_image_3d_check import CompileQueue  # noqa: E402
@@ -618,8 +619,7 @@ def check_decode(library):
 
 
 def draw(renderer, adapter, vs, ps, expected):
-    run = subprocess.run([renderer, adapter, '--startup-pixel-words', str(vs), str(ps), str(WIDTH), str(HEIGHT),
-                          str(expected)], capture_output=True, text=True)
+    run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-words', vs, ps, WIDTH, HEIGHT, expected])
     if run.returncode == 77:
         print(run.stdout + run.stderr)
         sys.exit(1 if failures else 77)

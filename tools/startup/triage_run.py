@@ -50,6 +50,9 @@ SLOT70_REASONS = {
     "as_wrong_state",
     "buffer_unavailable",
     "texture_unavailable",
+    "texture_no_resource",
+    "texture_unreadable",
+    "texture_over_64mib",
     # the partial-tile holds of device_memory_srv
     "partial_tile_xg_rows",
     "partial_tile_beyond_xg_size",
@@ -89,6 +92,10 @@ RE_GPU_BUDGET = re.compile(
     rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
     + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
     + rf" unmeasured={BUDGET_DECIMAL}"
+    # Added with the system commit and pool counters (absent in older logs): commit=<used>/<limit> avail=<free> in MiB.
+    + rf"(?: commit=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a) avail=(?:{BUDGET_DECIMAL}|n/a)"
+    + rf" sections=(?:{BUDGET_DECIMAL}|n/a) slabs=(?:{BUDGET_DECIMAL}|n/a) slots=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
+    + rf" job_peak=(?:{BUDGET_DECIMAL}|n/a) job_limit=(?:{BUDGET_DECIMAL}|none|n/a))?"
 )
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")

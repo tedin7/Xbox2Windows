@@ -1,4 +1,4 @@
-"""Read back a gfx1013 compute image_gather4_lz through the startup translator."""
+"""Read back a gfx1013 compute image_gather4_lz and image_gather4_lz_o through the startup translator."""
 
 import argparse
 from pathlib import Path
@@ -32,6 +32,24 @@ PREFIX = bytes.fromhex('06038abe80038bbe05040cf4000000fa050708f4200000fa'
                        'f002007ef002027e8002047e7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf001078e002040780000081bf')
 CHANNELS = ('Red', 'Green', 'Blue', 'Alpha')
+
+# image_gather4_lz_o: v0 holds the packed texel offset (signed X in bits 5:0, signed Y in bits 13:8), v1 and v2 the
+# coordinates; the output offset moves to v8 because v2 is now an address register.
+SOURCE_O = SOURCE.replace('v_mov_b32 v0, 0.5\nv_mov_b32 v1, 0.5\nv_mov_b32 v2, 0\n',
+                          'v_mov_b32 v0, {packed:#x}\nv_mov_b32 v1, 0.5\nv_mov_b32 v2, 0.5\nv_mov_b32 v8, 0\n'
+                          ).replace('image_gather4_lz v[4:7], v[0:1]', 'image_gather4_lz_o v[4:7], v[0:2]'
+                                    ).replace('v[4:7], v2, s[28:31]', 'v[4:7], v8, s[28:31]')
+PREFIX_O = PREFIX[:-16]
+SUFFIX_O = SUFFIX.replace(bytes.fromhex('02040780'), bytes.fromhex('08040780'))
+
+
+def pack_offset(x, y):
+    return (x & 0x3f) | ((y & 0x3f) << 8)
+
+
+def shader_o(mask, packed, prefix=PREFIX_O, op=0xf15c0008):
+    movs = bytes.fromhex('ff02007e') + struct.pack('<I', packed) + bytes.fromhex('f002027ef002047e8002107e7fc08cbf')
+    return prefix + movs + struct.pack('<II', op | (mask << 8), 0x00c40400) + SUFFIX_O
 
 
 def shader(mask, prefix=PREFIX):
@@ -99,6 +117,61 @@ def check_image_provenance(llvm_mc):
     assert 'srv 0 tex2d table 1 32' in manifest and 'uav 0 table 1 64' in manifest, manifest
 
 
+def controls_o(llvm_mc):
+    for channel, name in enumerate(CHANNELS):
+        packed = pack_offset(1, -2)
+        code = shader_o(1 << channel, packed)
+        if llvm_mc:
+            assert code == assemble(llvm_mc, SOURCE_O.format(mask=1 << channel, packed=packed)), name
+        pipe = pipeline(code)
+        assert f'r0.Gather{name}(q0, float2(F(v1), F(v2)), int2(1, -2))' in pipe.hlsl_cs()
+        assert pipe.manifest().splitlines()[-3:] == [
+            'srv 0 tex2d table 1 0', 'uav 0 table 1 32', 'smp 0 0x12 0x0 0x4500000 0x0']
+    refused('outside the HLSL gather range', lambda: pipeline(shader_o(2, pack_offset(8, 0))))
+    refused('outside the HLSL gather range', lambda: pipeline(shader_o(2, pack_offset(0, -9))))
+    refused('bits outside the X and Y fields', lambda: pipeline(shader_o(2, 0x10000)))
+    refused('one-hot dmask', lambda: pipeline(shader_o(3, 0)))
+    # The offset register must be exactly one literal move: no move, or a second write, is refused.
+    no_move = shader_o(2, 0).replace(bytes.fromhex('ff02007e00000000'), b'')
+    refused('never written', lambda: pipeline(no_move))
+    twice = shader_o(2, 0).replace(bytes.fromhex('f002027e'), bytes.fromhex('f002027e8002007e'))
+    refused('not one literal move', lambda: pipeline(twice))
+    print('image_gather4_lz_o offset forms and refusals passed')
+
+
+def reference_o(level, channel, ox, oy):
+    # The footprint of (0.5, 0.5) moved by the texel offset; the sampler clamps addresses to the mip.
+    width, height = WIDTH >> level, HEIGHT >> level
+    x, y = width // 2 - 1 + ox, height // 2 - 1 + oy
+    taps = [texel(level, min(max(x + dx, 0), width - 1), min(max(y + dy, 0), height - 1), channel)
+            for dx, dy in ORDER]
+    return taps + [SENTINEL] * (WORDS - len(taps))
+
+
+def dispatch_o(directory, compiler, renderer, adapter):
+    for level, channel, ox, oy in ((0, 1, 1, -2), (0, 0, -3, 2), (1, 2, 2, 1), (0, 3, 7, 7), (0, 1, -8, -8)):
+        packed = pack_offset(ox, oy)
+        source = pipeline(shader_o(1 << channel, packed)).hlsl_cs()
+        result = run_case(directory, compiler, renderer, adapter, f'o_mip{level}_{channel}_{ox}_{oy}', source,
+                          reference_o(level, channel, ox, oy), level)
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout
+
+    want = reference_o(0, 1, 1, -2)
+    source = pipeline(shader_o(2, pack_offset(1, -2))).hlsl_cs()
+    for name, text, actual in (
+        ('o_dropped_offset', source.replace('int2(1, -2)', 'int2(0, 0)'), reference_o(0, 1, 0, 0)),
+        ('o_swapped_axes', source.replace('int2(1, -2)', 'int2(-2, 1)'), reference_o(0, 1, -2, 1)),
+        ('o_wrong_sign', source.replace('int2(1, -2)', 'int2(-1, 2)'), reference_o(0, 1, -1, 2)),
+    ):
+        result = run_case(directory, compiler, renderer, adapter, name, text, want, 0)
+        mismatches = sum(a != b for a, b in zip(want, actual))
+        assert mismatches and result.returncode == 1 and first_mismatch(want, actual) in result.stderr, name
+        assert f'compared_words={WORDS} mismatches={mismatches}' in result.stdout, name
+    return 0
+
+
 def reference(level, channel):
     # At (0.5, 0.5) the footprint straddles the four center texels of the visible mip.
     x, y = (WIDTH >> level) // 2 - 1, (HEIGHT >> level) // 2 - 1
@@ -144,5 +217,7 @@ if __name__ == '__main__':
         out = Path(__file__).resolve().parents[1] / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
-            raise SystemExit(dispatch(Path(tmp), *args.dispatch))
+            code = dispatch(Path(tmp), *args.dispatch) or dispatch_o(Path(tmp), *args.dispatch)
+            raise SystemExit(code)
     controls(args.llvm_mc)
+    controls_o(args.llvm_mc)

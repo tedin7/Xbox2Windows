@@ -174,6 +174,13 @@ add_test(NAME era_physical_owns_last_page_control COMMAND era_physical_last_page
 set_tests_properties(era_physical_owns_last_page_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: owns: last page")
 
+# Device-free rules of the placed acceleration-structure build (#870): standard C++17 only.
+add_executable(placed_build_causes_check tests/placed_build_causes_check.cpp)
+target_include_directories(placed_build_causes_check PRIVATE src)
+target_compile_features(placed_build_causes_check PRIVATE cxx_std_17)
+add_test(NAME placed_build_causes COMMAND placed_build_causes_check)
+set_tests_properties(placed_build_causes PROPERTIES TIMEOUT 30)
+
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
@@ -562,6 +569,10 @@ target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_bu
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Exactly what tools/startup/run.ps1 copies next to the title (xmem, d3d12_xs, AcpHal, XCRDAPI, chad, xapu, xg_xs and
+# GameInput .dll) and the build revision stamp, without the test executables: `cmake --build --preset runtime`.
+add_custom_target(startup_runtime)
+add_dependencies(startup_runtime xmem_shim d3d12_xs_shim ${startup_stub_targets} x2w_build_rev_generate)
 # Developer-only measurement build: Tracy zones and memory pools in the stand-ins (src/startup_stubs/profile_zone.h).
 # One shared TracyClient.dll serves every instrumented DLL. Off (the default), nothing is fetched, defined or linked.
 # On, Tracy (BSD-3-Clause, see docs/startup-runtime.md) is fetched at the pinned commit below, or taken from an existing
@@ -1226,6 +1237,11 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
+# Text of the x2w-budget commit fields and the commit-exhausted line (src/startup_stubs/commit_state.h).
+add_executable(startup_commit_state_check tests/startup_commit_state_check.cpp)
+target_compile_features(startup_commit_state_check PRIVATE cxx_std_17)
+target_include_directories(startup_commit_state_check PRIVATE src)
+add_test(NAME startup_commit_state COMMAND startup_commit_state_check)
 # WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint. The sink is
 # compiled once for this check and the pacing control below.
 add_library(startup_audio_sink_obj OBJECT src/startup_stubs/audio_sink.cpp)
@@ -1411,6 +1427,27 @@ foreach(backend IN ITEMS warp hardware)
             PASS_REGULAR_EXPRESSION "FAIL: inline-control missed Release left buffer above baseline")
     endforeach()
 endforeach()
+
+# Texture residency decision rules (src/startup_stubs/texture_residency.h, X2W_D3D12_RESIDENCY=1): pure logic, no GPU.
+# Each mutant switches one rule off and its case must then report the failure.
+add_executable(startup_texture_residency tests/startup_texture_residency.cpp)
+target_include_directories(startup_texture_residency PRIVATE src)
+target_compile_features(startup_texture_residency PRIVATE cxx_std_17)
+add_test(NAME startup_texture_residency COMMAND startup_texture_residency)
+foreach(mutant IN ITEMS ignore-in-flight ignore-unsafe no-pin early-complete)
+    add_test(NAME startup_texture_residency_mutant_${mutant} COMMAND startup_texture_residency ${mutant})
+    set_tests_properties(startup_texture_residency_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+
+# Readback after Evict / MakeResident (the calls of src/startup_stubs/d3d12_residency.inl): contents must survive; the control compares a changed reference.
+add_executable(startup_texture_residency_warp tests/startup_texture_residency_warp.cpp)
+target_compile_features(startup_texture_residency_warp PRIVATE cxx_std_17)
+target_link_libraries(startup_texture_residency_warp PRIVATE d3d12 dxgi)
+add_test(NAME startup_texture_residency_warp COMMAND startup_texture_residency_warp warp)
+add_test(NAME startup_texture_residency_warp_control COMMAND startup_texture_residency_warp warp wrong-reference)
+add_test(NAME startup_texture_residency_hardware COMMAND startup_texture_residency_warp hardware)
+set_tests_properties(startup_texture_residency_warp startup_texture_residency_warp_control startup_texture_residency_hardware PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+set_tests_properties(startup_texture_residency_warp_control PROPERTIES WILL_FAIL TRUE)
 
 # X2W_D3D12_RELEASE_RETIRED=1 frees the desktop object of a committed 2D texture only when no recorded list, no submission
 # and no release-time fence still refers to it (docs/startup-runtime.md#d3d12-resource-budget). The `off` case runs
@@ -2059,6 +2096,10 @@ foreach(mutation IN ITEMS no-limit no-state no-root-args no-pairing no-bound)
     add_test(NAME startup_list_dispatch_${mutation}_control COMMAND startup_list_dispatch_check --mutate ${mutation})
     set_tests_properties(startup_list_dispatch_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+add_executable(upload_reservation_check tests/upload_reservation_check.cpp)
+target_include_directories(upload_reservation_check PRIVATE src)
+target_compile_features(upload_reservation_check PRIVATE cxx_std_17)
+add_test(NAME upload_reservation COMMAND upload_reservation_check)
 # The same slot driven through the stand-in on a desktop device: one refusal line per refused case, and the
 # forwarded calls counted by a pipeline-statistics query on the desktop list.
 add_executable(startup_list_dispatch_native tests/startup_list_dispatch_native.cpp)
@@ -2154,6 +2195,15 @@ add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
 foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+# Negative cache of refused buffer memory SRVs (src/startup_stubs/srv_refusal_cache.h); the mutated runs are negative controls.
+add_executable(startup_srv_refusal_cache_check tests/startup_srv_refusal_cache_check.cpp)
+target_include_directories(startup_srv_refusal_cache_check PRIVATE src)
+target_compile_features(startup_srv_refusal_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_srv_refusal_cache COMMAND startup_srv_refusal_cache_check)
+foreach(mutation IN ITEMS generation witness stamp key device age hits unproven)
+    add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
+    set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
 # Descriptor word 3 for formatted buffer loads (src/startup_stubs/buffer_format_word3.h); the mutated run must fail.
 add_executable(startup_buffer_format_word3_check tests/startup_buffer_format_word3_check.cpp)
@@ -3295,6 +3345,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
+    # `cmake --build --preset runtime` builds the eight DLLs run.ps1 copies and no executable.
+    add_test(NAME startup_runtime_target COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_target_check.py" "${CMAKE_COMMAND}" "${CMAKE_BINARY_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/startup/run.ps1"
+        "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>"
+        "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
+        "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>")
+    set_tests_properties(startup_runtime_target PROPERTIES TIMEOUT 300)
     add_test(NAME startup_storage_directory_batch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_storage_directory_batch.py" "$<TARGET_FILE:startup_stub_consumer>")
     set_tests_properties(startup_storage_directory_batch PROPERTIES TIMEOUT 30)
@@ -4288,6 +4346,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).
     add_test(NAME startup_gfx2hlsl_compute_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py")
+    # The shared one-device case runner of the GPU draw checks (tests/gpu_case_runner.py, issue #448).
+    add_test(NAME gpu_case_runner COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/gpu_case_runner_check.py")
+    set_tests_properties(gpu_case_runner PROPERTIES TIMEOUT 120)
     # The GPU check package replays these cases on a contributor's adapter (tools/record_gpu_cases.py).
     add_test(NAME gpu_case_recorder COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/gpu_case_recorder_check.py" "${DXC_EXECUTABLE}")
@@ -4383,6 +4444,22 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})
             set_tests_properties(startup_compute_tg_size_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
+    # gfx2hlsl DPP16 quad swaps in a straight-line compute program, exchanged through groupshared memory.
+    add_test(NAME startup_compute_dpp_quad_swap_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_cs_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_dpp_quad_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_cs_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_dpp_quad_swap_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wrong-neighbour no-exchange)
+            add_test(NAME startup_compute_dpp_quad_swap_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_cs_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_dpp_quad_swap_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
@@ -4555,6 +4632,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    # The debugger's function hooks and concurrent calls (#1281): the step window's bookkeeping, then two
+    # threads through one hooked function with the other thread held for each step, and without.
+    add_test(NAME startup_hook_window COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py")
+    add_test(NAME startup_hook_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_hook_window PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_hook_overlap PROPERTIES TIMEOUT 600)
     find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
@@ -4933,6 +5017,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME runtime_startup_triage_run_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_cli_check.py")
     set_tests_properties(runtime_startup_triage_run_cli_check PROPERTIES TIMEOUT 60)
+    # Sanitized decoder of the MSVC C++ exception record (0xE06D7363) from synthetic memory (#1758).
+    add_test(NAME startup_msvc_throw_info COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_msvc_throw_info_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
@@ -9868,6 +9955,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(bcpack_symbols_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME bcpack_tables COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bcpack_tables_check.py")
+    # The class of a failed BCPack request from the synthetic streams (src/startup_stubs/bcpack_inspect.h, #1198);
+    # the collapse control reports every failure as one class and must fail.
+    add_executable(bcpack_inspect_check tests/bcpack_inspect_check.cpp)
+    target_compile_features(bcpack_inspect_check PRIVATE cxx_std_17)
+    target_include_directories(bcpack_inspect_check PRIVATE src)
+    add_test(NAME bcpack_inspect COMMAND bcpack_inspect_check)
+    add_test(NAME bcpack_inspect_collapse_control COMMAND bcpack_inspect_check --mutate collapse)
+    set_tests_properties(bcpack_inspect_collapse_control PROPERTIES WILL_FAIL TRUE)
     add_test(NAME bcpack_probe_cli COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bcpack_probe_cli_check.py")
     add_test(NAME bc7_block_reference COMMAND "${INTAKE_PYTHON}" -B
@@ -9997,6 +10092,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" depth "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_mesh57_skeleton_depth_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        # A slot 57 colour pair whose pixel stage leaves a kill through the early-exit null export (#2413).
+        add_test(NAME startup_mesh57_skeleton_kill_exit_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" killexit "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_mesh57_skeleton_kill_exit_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_formatted_load_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" formatted "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

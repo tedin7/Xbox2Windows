@@ -28,6 +28,45 @@ class PROCESS_INFORMATION(ctypes.Structure):
     _fields_ = [("hProcess", wt.HANDLE), ("hThread", wt.HANDLE), ("dwProcessId", wt.DWORD), ("dwThreadId", wt.DWORD)]
 
 
+class STARTUPINFOEXW(ctypes.Structure):
+    _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+
+# X2W_LOW_ADDRESSES=1: the title starts with bottom-up ASLR always off, so its VirtualAlloc blocks come from the low end of the
+# address space instead of a random point above 2^40. The package acceleration-structure builder refuses a destination address
+# with bits set above bit 39 (#1758). Source: Microsoft documentation of UpdateProcThreadAttribute,
+# PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY and PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF.
+PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = 0x00020007
+PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF = 0x2 << 16
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+
+
+def low_addresses_requested(env=None):
+    return (os.environ if env is None else env).get("X2W_LOW_ADDRESSES") == "1"
+
+
+def startup_for_create(si, env=None):
+    """(structure to pass, extra creation flags, objects to keep alive, note) for CreateProcessW.
+
+    Without X2W_LOW_ADDRESSES=1, or when the attribute list cannot be built, `si` is passed unchanged."""
+    if not low_addresses_requested(env) or k32 is None:
+        return si, 0, None, None
+    size = ctypes.c_size_t()
+    k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    buffer = ctypes.create_string_buffer(size.value)
+    if not k32.InitializeProcThreadAttributeList(buffer, 1, 0, ctypes.byref(size)):
+        return si, 0, None, f"X2W_LOW_ADDRESSES: attribute list unavailable (error {ctypes.get_last_error()})"
+    policy = ctypes.c_uint64(PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF)
+    if not k32.UpdateProcThreadAttribute(buffer, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, ctypes.byref(policy),
+                                         ctypes.sizeof(policy), None, None):
+        return si, 0, None, f"X2W_LOW_ADDRESSES: mitigation policy refused (error {ctypes.get_last_error()})"
+    extended = STARTUPINFOEXW()
+    extended.StartupInfo = si
+    extended.StartupInfo.cb = ctypes.sizeof(extended)
+    extended.lpAttributeList = ctypes.cast(buffer, ctypes.c_void_p)
+    return extended, EXTENDED_STARTUPINFO_PRESENT, (buffer, policy), "X2W_LOW_ADDRESSES: bottom-up ASLR off for the title"
+
+
 class IO_COUNTERS(ctypes.Structure):
     _fields_ = [(n, ctypes.c_ulonglong) for n in ("r", "w", "o", "rb", "wb", "ob")]
 
@@ -255,8 +294,12 @@ def main(argv=None):
         cmdline = ctypes.create_unicode_buffer(" ".join(quote_argument(a) for a in [exe, *extra]))
         pi = PROCESS_INFORMATION()
         flags = 0x4 | 0x400  # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+        startup, extra_flags, startup_keep, startup_note = startup_for_create(si, env)
+        if startup_note:
+            print(startup_note)
+        flags |= extra_flags
         if not k32.CreateProcessW(exe, cmdline, None, None, True, flags, ctypes.create_unicode_buffer(block),
-                                  cwd, ctypes.byref(si), ctypes.byref(pi)):
+                                  cwd, ctypes.byref(startup), ctypes.byref(pi)):
             print(f"CreateProcess failed: error {ctypes.get_last_error()}")
             return 2
         process_handle = pi.hProcess

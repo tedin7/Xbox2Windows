@@ -29,7 +29,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
+sys.path.insert(0, str(HERE.parent / 'tools'))
 import gfx2hlsl as G  # noqa: E402
+import dxc_cache  # noqa: E402
+import gpu_case_runner  # noqa: E402
 
 VS_SOURCE = """\
 v_mov_b32 v3, 0x40400000
@@ -216,13 +219,14 @@ def compile_hlsl(compiler, kind, source, out, profile, directory):
         args = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', str(directory / ('%s.cso' % out)), str(path)]
     else:
         args = [compiler, '-T', profile, '-E', 'main', '-Fo', str(directory / ('%s.cso' % out)), str(path)]
-    subprocess.run(args, check=True, capture_output=True, text=True)
+    # DXC compiles go through the opt-in X2W_DXC_CACHE cache (tools/dxc_cache.py); FXC compiles and everything else are untouched.
+    dxc_cache.with_dxc_cache(subprocess).run(args, check=True, capture_output=True, text=True)
     return directory / ('%s.cso' % out)
 
 
 def draw(renderer, adapter, vs, ps, expected):
-    run = subprocess.run([renderer, adapter, '--startup-flat-param', str(vs), str(ps), expected],
-                         capture_output=True, text=True)
+    # One long-lived offscreen_check per test (one D3D12 device); the one-shot call stays as the fallback.
+    run = gpu_case_runner.run(renderer, adapter, ['--startup-flat-param', vs, ps, expected])
     sys.stdout.write(run.stdout)
     if run.returncode == 77:
         print(run.stdout + run.stderr)

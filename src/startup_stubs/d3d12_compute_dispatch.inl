@@ -24,6 +24,8 @@ struct ComputeTranslation {
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
         bool array = false;
+        // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
+        int dimension = 0;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -131,6 +133,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().array = true;
         }
+        else if (std::sscanf(line.c_str(), "uav %u tex1d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().dimension = 1;
+        }
+        else if (std::sscanf(line.c_str(), "uav %u tex3d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().dimension = 3;
+        }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
@@ -142,7 +154,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D/2D-array float texture"
+                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
@@ -314,6 +326,20 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                          a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
                          !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
                     reason = "an output texture array view is outside the resource";
+            } else if (slot.dimension == 1) {
+                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE1D)
+                    reason = "an output texture view is not 1D";
+                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Texture1D.MipSlice >= resource.MipLevels)
+                    reason = "an output texture view is outside the resource";
+            } else if (slot.dimension == 3) {
+                // The W coordinate in HLSL is relative to FirstWSlice: retain the caller's complete view.
+                const auto& v = desc.Texture3D;
+                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D)
+                    reason = "an output texture view is not 3D";
+                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || v.MipSlice >= resource.MipLevels ||
+                         !v.WSize || v.FirstWSlice >= (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) ||
+                         (v.WSize != 0xffffffffu && v.WSize > (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) - v.FirstWSlice))
+                    reason = "an output texture view is outside the resource";
             } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";

@@ -59,6 +59,73 @@ s_endpgm
 """
 
 
+# 1D and 3D stores (c22): same data constants as the array case. The 1D store takes x in v8, the 3D store x, y and a
+# constant slice z in v8-v10. Words assembled with llvm-mc-19 (the --llvm-mc check compares them again).
+HEAD = ARRAY_PROLOGUE[:24]  # s_mov s12, s7; s_mov s13, 0; s_load_dwordx8 s[24:31]; v_lshl_add_u32 v8, s10, 2, v0
+STORE_1D = bytes.fromhex('000f20f0080e0600')  # image_store v[14:17], v8, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_1D
+STORE_3D = bytes.fromhex('100f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
+LINE_1D = 'w0[v8] = asfloat(uint4(v14, v15, v16, v17));'
+LINE_3D = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
+TEXTURE_1D_FLAG = 1 << 23  # tests/compute_check.cpp texture_1d_flag
+VOLUME_FLAG = (1 << 31) | (1 << 30)  # texture_volume_flag: RWTexture3D, RGBA32 float
+SOURCE_1D = HEAD_SOURCE = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+v_lshl_add_u32 v8, s10, 2, v0
+"""
+SOURCE_3D_Z = """\
+v_lshl_add_u32 v9, s11, 1, v1
+v_mov_b32_e32 v10, {z}
+"""
+SOURCE_DATA = ARRAY_SOURCE.split('v_mov_b32_e32 v10, {layer}\n')[1].split('image_store')[0]
+
+
+def program_1d():
+    return HEAD + ARRAY_DATA + STORE_1D + ARRAY_END
+
+
+def program_3d(z):
+    return ARRAY_PROLOGUE + ARRAY_SLICE.get(z, bytes.fromhex('8102147e' if z == 1 else '8302147e')) + ARRAY_DATA + STORE_3D + ARRAY_END
+
+
+def pipeline_1d():
+    return G.ComputePipeline(program_1d(), root_blob(3), RSRC2, fixture.GROUP)
+
+
+def pipeline_3d(z):
+    return G.ComputePipeline(program_3d(z), root_blob(3), RSRC2, fixture.GROUP)
+
+
+def sentinel(mip, z, y, x, c):
+    return 0xbf000000 | mip << 16 | z << 12 | y << 7 | x << 2 | c
+
+
+def reference_1d():
+    """Initial then expected words of a three-mip 1D image; only mip zero x < 8 is stored to."""
+    initial, expected = [], []
+    for mip in range(3):
+        for x in range(32 >> mip):
+            sentinels = [sentinel(mip, 0, 0, x, c) for c in range(4)]
+            initial.extend(sentinels)
+            expected.extend(ARRAY_VALUES if mip == 0 and x < 4 * fixture.GROUPS else sentinels)
+    return initial, expected
+
+
+def reference_3d(z):
+    """Initial then expected words of a three-mip volume (depth 4, 2, 1); only mip zero slice z, x < 8, y < 2 is stored to."""
+    initial, expected = [], []
+    for mip in range(3):
+        for slice_ in range(4 >> mip):
+            for y in range(8 >> mip):
+                for x in range(32 >> mip):
+                    sentinels = [sentinel(mip, slice_, y, x, c) for c in range(4)]
+                    initial.extend(sentinels)
+                    hit = mip == 0 and slice_ == z and x < 4 * fixture.GROUPS and y < 2
+                    expected.extend(ARRAY_VALUES if hit else sentinels)
+    return initial, expected
+
+
 def pipeline(body):
     return G.ComputePipeline(PREFIX + body + END, root_blob(3), RSRC2, fixture.GROUP)
 
@@ -101,6 +168,10 @@ def controls(llvm_mc):
         assert assemble(llvm_mc, 'v_cmpx_eq_u32_e32 0, v1\n') == MASK
         for layer in (1, 3):
             assert assemble(llvm_mc, ARRAY_SOURCE.format(layer=layer)) == array_program(layer), layer
+        assert assemble(llvm_mc, SOURCE_1D + SOURCE_DATA + 'image_store v[14:17], v8, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_1D\ns_endpgm\n') == program_1d()
+        for z in (1, 3):
+            assert assemble(llvm_mc, SOURCE_1D + SOURCE_3D_Z.format(z=z) + SOURCE_DATA +
+                            'image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D\ns_endpgm\n') == program_3d(z), z
 
     pipe = pipeline(STORE)
     assert pipe.manifest().splitlines()[-2:] == [
@@ -140,6 +211,31 @@ def controls(llvm_mc):
         refused('x, y and layer expected',
                 lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], array_mods))
 
+    # 1D (x) and 3D (x, y, z): RWTexture1D and RWTexture3D bound as tex1d and tex3d.
+    one = pipeline_1d()
+    assert 'uav 0 tex1d float table 1 64 channels 4' in one.manifest().splitlines(), one.manifest()
+    assert 'RWTexture1D<float4> w0 : register(u0);' in one.hlsl_cs() and LINE_1D in one.hlsl_cs(), one.hlsl_cs()
+    for z in (1, 3):
+        volume = pipeline_3d(z)
+        assert 'uav 0 tex3d float table 1 64 channels 4' in volume.manifest().splitlines(), volume.manifest()
+        assert 'RWTexture3D<float4> w0 : register(u0);' in volume.hlsl_cs() and LINE_3D in volume.hlsl_cs(), volume.hlsl_cs()
+        assert f'v10 = 0x{z:08x}u;' in volume.hlsl_cs(), volume.hlsl_cs()
+        initial, expected = reference_3d(z)
+        assert len(initial) == len(expected) == (32 * 8 * 4 + 16 * 4 * 2 + 8 * 2) * 4
+        assert sum(a != b for a, b in zip(initial, expected)) == 16 * 4, z
+    initial, expected = reference_1d()
+    assert len(initial) == (32 + 16 + 8) * 4 and sum(a != b for a, b in zip(initial, expected)) == 8 * 4
+    assert not set(ARRAY_VALUES) & set(G.D.INLINE_FLOAT_LITERALS)
+    # The address count is exact: 1D takes x only, 3D takes x, y and z, and a 1D array, cube or 2D MSAA is still refused.
+    for address in ('v[8:9]', 'v[8:10]'):
+        refused('x expected', lambda: one.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_1D']))
+    for address in ('v[8:9]', 'v[8:11]'):
+        refused('x, y and z expected',
+                lambda: one.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_3D']))
+    for dim in ('SQ_RSRC_IMG_1D_ARRAY', 'SQ_RSRC_IMG_CUBE', 'SQ_RSRC_IMG_2D_MSAA'):
+        refused('only 2D images', lambda: one.cs.op_image_store(['v[14:17]', 'v[8:10]', 's[24:31]'], ['dmask:0xf', 'dim:' + dim]))
+    # A pixel stage keeps the 2D-only contract.
+
     mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'unorm']
     for data in ('v14', 'v[14:15]', 'v[14:16]', 'v[253:256]'):
         refused('four VGPRs expected', lambda: pipe.cs.op_image_store([data, 'v[8:9]', 's[24:31]'], mods))
@@ -150,17 +246,10 @@ def controls(llvm_mc):
         (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
          '080320f0080e0600', 'typed UAV store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
-        (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
-         '100f20f0080e0600', 'only 2D images'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
 
-    # 1D, 3D and cube keep the same refusal with the address count their form would take.
-    for dim, address in (('SQ_RSRC_IMG_1D', 'v8'), ('SQ_RSRC_IMG_3D', 'v[8:10]'),
-                         ('SQ_RSRC_IMG_CUBE', 'v[8:10]')):
-        refused('only 2D images',
-                lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:' + dim]))
 
     wait = encoded('s_waitcnt lgkmcnt(0)', '7fc08cbf')
     changed = encoded('s_mov_b32 s26, 0', '80039abe')
@@ -186,7 +275,7 @@ def controls(llvm_mc):
         if offset == 64:
             for body in (read + STORE, STORE + read):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
-    print('Compute 32-bit float image_store, unorm, 2D array, EXEC, raw/texture binding order, alias and '
+    print('Compute 32-bit float image_store, unorm, 1D, 2D array, 3D, EXEC, raw/texture binding order, alias and '
           'refusal checks passed')
 
 
@@ -261,6 +350,39 @@ def dispatch(directory, compiler, renderer, adapter):
         )
         if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
                       selector=fixture.GROUPS | ARRAY_FLAG, compared=len(initial)) == 77:
+            return 77
+    # 1D: x only, so a mutant that stores one texel off or omits the store changes the readback. The renderer's 1D case
+    # carries a third block (the SRV image), which this program does not read.
+    initial, expected = reference_1d()
+    source = pipeline_1d().hlsl_cs()
+    assert source.count(LINE_1D) == 1
+    cases = (
+        ('1D, full EXEC', source, 0, None),
+        ('1D, omit store', source.replace(LINE_1D, ''), 32, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
+        ('1D, one texel off', source.replace('w0[v8]', 'w0[v8 + 1]'), 8, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
+    )
+    if draw_cases(directory, compiler, renderer, adapter, initial + expected + [0] * len(initial), cases,
+                  selector=fixture.GROUPS | TEXTURE_1D_FLAG, compared=len(initial)) == 77:
+        return 77
+    # 3D: slice 1 is inside the depth range and slice 3 is its last entry; one slice off must change both slices.
+    for z, shift in ((1, '+ 1'), (3, '- 1')):
+        initial, expected = reference_3d(z)
+        source = pipeline_3d(z).hlsl_cs()
+        assert source.count(LINE_3D) == 1
+        first = z * 32 * 8 * 4  # the slice's first word in mip zero
+        wrong = z + (1 if shift == '+ 1' else -1)
+        cases = (
+            ('3D slice %d, full EXEC' % z, source, 0, None),
+            ('3D slice %d, omit store' % z, source.replace(LINE_3D, ''), 64,
+             'mip=0 word=%d expected=3f400000 actual=%08x' % (first, sentinel(0, z, 0, 0, 0))),
+            ('3D slice %d, one slice off' % z, source.replace('uint3(v8, v9, v10)', 'uint3(v8, v9, v10 %s)' % shift), 128,
+             'mip=0 word=%d expected=%08x actual=%08x' % (min(z, wrong) * 1024, 0x3f400000 if z < wrong else sentinel(0, wrong, 0, 0, 0),
+                                                           sentinel(0, z, 0, 0, 0) if z < wrong else 0x3f400000)),
+            ('3D slice %d, x and y swapped' % z, source.replace('uint3(v8, v9, v10)', 'uint3(v9, v8, v10)'), 96,
+             'mip=0 word=%d expected=3f400000 actual=%08x' % (first + 8, sentinel(0, z, 0, 2, 0))),
+        )
+        if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                      selector=fixture.GROUPS | VOLUME_FLAG, compared=len(initial)) == 77:
             return 77
     return 0
 
