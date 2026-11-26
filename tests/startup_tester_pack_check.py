@@ -421,6 +421,56 @@ def check_cache_results():
             assert manifest["cache_keys"] == 12 and manifest["files"][T.RESULTS_NAME]["bytes"] == len(text.encode())
 
 
+def check_request_files():
+    """The request files of the worst refused keys travel in their own zip folder: ranked by draws not drawn / dispatches
+    without a translation, refused keys only, whole keys within the byte cap, listed in the manifest."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        write(cache, "req_1000000000000003.root", b"R" * 1000)
+        write(cache, "req_2000000000000001.root", b"S" * 2000)
+        write(cache, "req_2000000000000001.sa", b"T" * 500)
+        write(cache, "req_2000000000000001.txt", b"not a request file")
+        stderr = (b"x2w-render not drawn key 1000000000000002: 500 (translation_not_ready)\n"
+                  b"x2w-render not drawn key 1000000000000003: 900 (translation_not_ready)\n"
+                  b"x2w-render not drawn key 0000000000000001: 99999 (an ok key is never picked)\n"
+                  b"x2w-render compute census key 2000000000000001: 1000 dispatches, 100 translated, first refusal: x\n"
+                  b"x2w-render compute census key 2000000000000001: 7000 dispatches, 100 translated, first refusal: x\n"
+                  b"x2w-render compute census key 2000000000000003: 50 dispatches, 50 translated, first refusal: none\n"
+                  b"x2w-render compute census key 3000000000000002: 0 dispatches, 0 translated, first refusal: none\n")
+        weights = T.key_weights(stderr.decode())
+        assert weights["2000000000000001"] == 6900 and weights["1000000000000003"] == 900, weights
+        rows = T.cache_results(str(cache))
+        chosen = T.select_requests(str(cache), rows, weights)
+        assert [c[0] for c in chosen] == ["2000000000000001", "1000000000000003", "1000000000000002"], [c[0] for c in chosen]
+        assert [n for n, _ in chosen[0][3]] == ["req_2000000000000001.c67", "req_2000000000000001.root", "req_2000000000000001.sa"]
+        assert len(T.select_requests(str(cache), rows, weights, top=2)) == 2, "top N keys"
+        assert [c[0] for c in T.select_requests(str(cache), rows, weights, cap=1500)] == ["1000000000000003", "1000000000000002"], \
+            "a key that does not fit whole is skipped, the next one still goes in"
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", stderr)
+        T.pack(str(run), MANIFEST, str(tmp / "with.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "with.zip") as z:
+            names = z.namelist()
+            folder = sorted(n for n in names if n.startswith(T.REQUESTS_DIR + "/"))
+            assert folder == sorted(T.REQUESTS_DIR + "/" + n for c in chosen for n, _ in c[3]), folder
+            assert not [n for n in names if n.startswith("req_")] and T.RESULTS_NAME in names
+            assert z.read(T.REQUESTS_DIR + "/req_1000000000000003.root") == b"R" * 1000
+            listed = json.loads(z.read("manifest.json"))["request_files"]
+            assert listed["keys"] == 3 and listed["files"] == len(folder) and listed["folder"] == T.REQUESTS_DIR
+            assert listed["bytes"] == sum(b for c in chosen for _, b in c[3]) <= T.REQUESTS_CAP_BYTES
+            assert [r["key"] for r in listed["ranked"]] == [c[0] for c in chosen] and listed["ranked"][0]["weight"] == 6900
+        # no stderr or no counters: no request files, still a valid zip
+        write(run, "stderr.txt", b"err\n")
+        T.pack(str(run), MANIFEST, str(tmp / "none.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "none.zip") as z:
+            assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -559,6 +609,7 @@ if __name__ == "__main__":
     check_symbols()
     check_seed_cache()
     check_cache_results()
+    check_request_files()
     check_preset()
     check_privacy_screen()
     check_manifest()
