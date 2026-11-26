@@ -7921,6 +7921,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (dispatch_phase_line(line, sizeof(line))) log("%s", line);
         }
         {
+            char line[500];
+            if (draw_phase_line(line, sizeof(line))) log("%s", line);
+        }
+        {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
             char text[512];

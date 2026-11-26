@@ -308,6 +308,50 @@ inline bool dispatch_phase_line(char* out, std::size_t size)
                   maxima[2] / per_ms, ticks[3] / per_ms, maxima[3] / per_ms, ticks[4] / per_ms, maxima[4] / per_ms);
     return true;
 }
+// Where a translated Draw spends its time under draw_lock (microsecond scoreboard for the speed work): 0 translation lookup and
+// readiness checks, 1 indirect checks, descriptor slots and vertex/index setup, 2 the binding walk (buffers, views, samplers),
+// 3 writable texture views, 4 state and recording. Ends in the destructor, so every early return is counted.
+volatile LONG64 draw_phase_ticks[5], draw_phase_max[5];
+volatile LONG64 draw_phase_calls;
+struct DrawPhases {
+    LARGE_INTEGER last;
+    int current = 0;
+    DrawPhases() { QueryPerformanceCounter(&last); }
+    void to(int next)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const LONG64 took = now.QuadPart - last.QuadPart;
+        InterlockedAdd64(&draw_phase_ticks[current], took);
+        draw_lock_note_max(draw_phase_max[current], took);
+        current = next;
+        last = now;
+    }
+    ~DrawPhases()
+    {
+        to(current);
+        InterlockedIncrement64(&draw_phase_calls);
+    }
+};
+inline bool draw_phase_line(char* out, std::size_t size)
+{
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    const double per_us = frequency.QuadPart / 1e6;
+    const LONG64 calls = InterlockedExchange64(&draw_phase_calls, 0);
+    LONG64 ticks[5], maxima[5];
+    for (int k = 0; k < 5; ++k) {
+        ticks[k] = InterlockedExchange64(&draw_phase_ticks[k], 0);
+        maxima[k] = InterlockedExchange64(&draw_phase_max[k], 0);
+    }
+    if (!calls) return false;
+    std::snprintf(out, size, "x2w-render translated draw under draw_lock, %lld draws, us per draw (max us): lookup %.1f (%.0f), setup %.1f (%.0f), "
+                  "binding walk %.1f (%.0f), writable views %.1f (%.0f), state and record %.1f (%.0f)",
+                  static_cast<long long>(calls), ticks[0] / per_us / calls, maxima[0] / per_us, ticks[1] / per_us / calls, maxima[1] / per_us,
+                  ticks[2] / per_us / calls, maxima[2] / per_us, ticks[3] / per_us / calls, maxima[3] / per_us, ticks[4] / per_us / calls,
+                  maxima[4] / per_us);
+    return true;
+}
 // One line for the heartbeat; resets the counters. Empty when the lock was never taken.
 inline bool draw_lock_stats_line(char* out, std::size_t size)
 {
@@ -2743,6 +2787,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) return not_drawn(0);
     draw_lock_acquire_exclusive();
+    DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
     if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
@@ -2830,6 +2875,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
+    phases.to(1);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
     if (first + views > draw_heap_size) {
         first = 0;
@@ -2893,6 +2939,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
+    phases.to(2);
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
@@ -3296,6 +3343,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 holder.reject, recorded_copy, indirect_copy_ranges());
         }
     }
+    phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3325,6 +3373,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
             : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
     }
+    phases.to(4);
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
         const D3D12_RESOURCE_DESC target = pass.target0->GetDesc();
