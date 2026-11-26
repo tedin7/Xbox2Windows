@@ -47,7 +47,7 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     std::sort(wanted.begin(), wanted.end(), [](const ReservedSpan& a, const ReservedSpan& b) { return a.base < b.base; });
     std::vector<ReservedSpan>& spans = page_replay().spans;
     for (const ReservedSpan& s : wanted) {
-        if (!spans.empty() && s.base <= spans.back().end) spans.back().end = std::max(spans.back().end, s.end);
+        if (!spans.empty() && s.base <= spans.back().end) spans.back().end = (std::max)(spans.back().end, s.end);
         else spans.push_back(s);
     }
     for (const ReservedSpan& s : spans) {
