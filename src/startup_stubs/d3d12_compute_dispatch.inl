@@ -37,6 +37,7 @@ struct ComputeTranslation {
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
+    KeyUse use;                            // when a Dispatch first and last had this key bound
     const char* first_refusal = nullptr;   // reason of the first refused call
     bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
@@ -236,6 +237,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     ComputeTranslation* const tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
+    tr->use.note(process_ms());
     std::uint32_t words[8] = {};
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
     else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
@@ -604,5 +606,32 @@ void log_compute_census()
             keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
 }
 
+// One line per pipeline key (graphics and compute) whose use count changed since the last line: first and last use in
+// seconds since the process started. The report script keeps the earliest first and the latest last per key.
+void log_key_use_census()
+{
+    struct Row { const char* kind; u64 key; KeyUse use; };
+    std::vector<Row> rows;
+    AcquireSRWLockExclusive(&draw_lock);
+    for (auto& item : compute_translations())
+        if (item.second.use.uses != item.second.use.reported_uses) {
+            rows.push_back({"compute", item.second.key, item.second.use});
+            item.second.use.reported_uses = item.second.use.uses;
+        }
+    for (auto& item : translation_by_key())
+        if (item.second && item.second->use.uses != item.second->use.reported_uses) {
+            rows.push_back({"graphics", item.second->key, item.second->use});
+            item.second->use.reported_uses = item.second->use.uses;
+        }
+    ReleaseSRWLockExclusive(&draw_lock);
+    for (const Row& row : rows)
+        log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
+            row.use.last_ms / 1000.0, row.use.uses);
+}
+
 // Fixtures: the census without waiting for the frame that logs it.
-extern "C" __declspec(dllexport) void x2w_d3d12_compute_census() { log_compute_census(); }
+extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
+{
+    log_compute_census();
+    log_key_use_census();
+}

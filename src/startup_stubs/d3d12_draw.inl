@@ -135,11 +135,26 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     return nullptr;
 }
 
+// Milliseconds since this process started (its creation time), for KeyUse. One read of the tick count after the first call.
+std::uint64_t process_ms()
+{
+    static const std::uint64_t base = [] {
+        FILETIME created{}, exited{}, kernel{}, user{}, now{};
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+        GetSystemTimeAsFileTime(&now);
+        const auto value = [](const FILETIME& t) { return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+        const std::uint64_t age_ms = value(now) > value(created) ? (value(now) - value(created)) / 10000 : 0;
+        return GetTickCount64() - age_ms;
+    }();
+    return GetTickCount64() - base;
+}
+
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
@@ -2669,6 +2684,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         (rect && indexed && !indexed_rect)) return not_drawn(0);
     draw_lock_acquire_exclusive();
     BoundPipeline* bound = translation_for(pass.pipeline);
+    if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;

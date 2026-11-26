@@ -13,7 +13,8 @@ The zip holds every file the run wrote in its log folder (stdout, stderr, events
 translate, translate_err, window*.png, bink_luma.png ...), the debugger summary (`<logdir>.out`) and manifest.json.
 Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
 `shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
-of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason. Never
+of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason, and for a key the
+run used its first and last use in seconds since the process started (the refused keys used latest are listed first). Never
 shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
 `d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
 d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
@@ -372,8 +373,33 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-def format_results(rows):
-    """Text for the zip: totals, the refusals ranked by normalized reason, then one line per key."""
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+LATEST_USED_KEYS = 40
+
+
+def key_use(logdir):
+    """{key: (first_seconds, last_seconds, uses)} from the runtime's 'x2w-render key use' lines in stderr.txt: the earliest
+    first, the latest last and the largest count of each key (a line is printed again only when the count grew)."""
+    found = {}
+    path = os.path.join(logdir, "stderr.txt") if logdir else None
+    if not path or not os.path.isfile(path):
+        return found
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.startswith("x2w-render key use "):
+                continue
+            match = KEY_USE_RE.match(line)
+            if match:
+                first, last, uses = float(match.group(3)), float(match.group(4)), int(match.group(5))
+                old = found.get(match.group(2))
+                found[match.group(2)] = (min(first, old[0]), max(last, old[1]), max(uses, old[2])) if old else (first, last, uses)
+    return found
+
+
+def format_results(rows, use=None):
+    """Text for the zip: totals, the refusals ranked by normalized reason, the refused keys used latest, then one line per
+    key. use is key_use(): a key a draw or Dispatch used carries first=, last= (seconds since the process started) and uses=."""
+    use = use or {}
     kinds = {}
     for _, kind, _, _ in rows:
         kinds[kind] = kinds.get(kind, 0) + 1
@@ -390,8 +416,13 @@ def format_results(rows):
             entry[kind] = entry.get(kind, 0) + 1
     for reason, by_kind in sorted(ranked.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:TOP_REASONS]:
         lines.append("%5d  %s   [%s]" % (sum(by_kind.values()), reason, ", ".join("%s %d" % i for i in sorted(by_kind.items()))))
-    lines += ["", "## keys: key kind status reason"]
-    lines += ["%s %s %s%s" % (key, kind, status, " " + reason if reason else "") for key, kind, status, reason in rows]
+    if use:
+        latest = sorted(((use[key][1], key, kind, reason) for key, kind, status, reason in rows if status == "refused" and key in use), reverse=True)
+        lines += ["", "## refused keys used latest: last use, first use, uses, key kind reason"]
+        lines += ["%8.1f %8.1f %7d %s %s %s" % (last, use[key][0], use[key][2], key, kind, reason) for last, key, kind, reason in latest[:LATEST_USED_KEYS]]
+    lines += ["", "## keys: key kind status reason [first= last= uses= seconds since the process started]"]
+    lines += ["%s %s %s%s%s" % (key, kind, status, " " + reason if reason else "",
+                              " first=%.1fs last=%.1fs uses=%d" % use[key] if key in use else "") for key, kind, status, reason in rows]
     return "\n".join(lines) + "\n"
 
 
@@ -582,7 +613,7 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
-        add(RESULTS_NAME, format_results(rows).encode("utf-8"))
+        add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             rows = parse_symbols(handle.read())

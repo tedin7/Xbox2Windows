@@ -377,6 +377,41 @@ def make_cache(folder):
     write(folder, "req_5000000000000001.fail", b"unsupported: " + b"x" * 500 + b"\n")
 
 
+def check_key_use():
+    """The runtime's 'x2w-render key use' lines give each key its first and last use in shader_results.txt."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        (run / "stderr.txt").write_text(
+            "x2w-render key use compute 2000000000000001 first 12.5 s last 30.0 s uses 4\n"
+            "x2w-render key use compute 2000000000000001 first 12.5 s last 250.5 s uses 900\n"  # printed again: the count grew
+            "x2w-render key use graphics 1000000000000002 first 241.0 s last 242.0 s uses 3\n"
+            "x2w-render key use graphics 0000000000000001 first 1.0 s last 2.0 s uses 7\n"  # ok key: only on its own line
+            "x2w-render key use compute zzzz first 1 s last 2 s uses 1\n"  # malformed: ignored
+            "x2w-render compute census: 3 keys dispatched\n", encoding="utf-8")
+        use = T.key_use(str(run))
+        assert use == {"2000000000000001": (12.5, 250.5, 900), "1000000000000002": (241.0, 242.0, 3), "0000000000000001": (1.0, 2.0, 7)}, use
+        assert T.key_use(str(tmp / "missing")) == {} and T.key_use(None) == {}
+        text = T.format_results(T.cache_results(str(cache)), use)
+        assert "2000000000000001 compute refused image_store on SQ_RSRC_IMG_3D: only 2D images are lowered first=12.5s last=250.5s uses=900\n" in text, text
+        assert "0000000000000001 graphics ok first=1.0s last=2.0s uses=7\n" in text
+        assert not [l for l in text.splitlines() if l.startswith("1000000000000003 ") and "first=" in l], "a key never used has no use"
+        # the refused keys used latest come first, latest last use on top; an ok key is not listed there
+        section = text.split("## refused keys used latest")[1].split("## keys")[0].splitlines()[1:]
+        keys = [line.split()[3] for line in section if line.strip()]
+        assert keys == ["2000000000000001", "1000000000000002"], keys
+        assert T.format_results(T.cache_results(str(cache))) == T.format_results(T.cache_results(str(cache)), {}), "no use lines: unchanged"
+        assert "refused keys used latest" not in T.format_results(T.cache_results(str(cache))) and "first=1" not in T.format_results(T.cache_results(str(cache)))
+        # packed with the cache, the zip's shader_results.txt carries the use
+        T.pack(str(run), MANIFEST, str(tmp / "use.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "use.zip") as z:
+            assert "uses=900" in z.read(T.RESULTS_NAME).decode()
+
+
 def check_cache_results():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -559,6 +594,7 @@ if __name__ == "__main__":
     check_symbols()
     check_seed_cache()
     check_cache_results()
+    check_key_use()
     check_preset()
     check_privacy_screen()
     check_manifest()
