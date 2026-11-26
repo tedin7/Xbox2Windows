@@ -36,6 +36,9 @@ void page_flush_target()
     if (!page_target || page_target->bytes.empty()) return;
     AcquireSRWLockExclusive(&file_lock);
     drain(*page_target);
+    // The size cap is checked where buffers are written; a scan that empties the buffer every present must check it too,
+    // or the call path (which only checks a full buffer) never sees the cap.
+    if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&file_lock);
 }
 void page_sink(const char* tag, const void* header, std::size_t header_bytes, const void* data, std::size_t data_bytes)
