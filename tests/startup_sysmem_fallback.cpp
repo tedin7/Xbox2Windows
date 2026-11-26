@@ -98,10 +98,11 @@ std::array<UINT8, 4> texel(UINT x, UINT y)
 }
 
 const char* shader_source = R"hlsl(
-[RootSignature("DescriptorTable(SRV(t0), UAV(u0)), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)")]
+
 Texture2D<float4> source : register(t0);
 RWBuffer<uint> result : register(u0);
 SamplerState point_sampler : register(s0);
+[RootSignature("DescriptorTable(SRV(t0), UAV(u0)), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)")]
 [numthreads(16, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
