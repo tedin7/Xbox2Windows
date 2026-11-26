@@ -24,7 +24,7 @@ STEP = 5
 
 
 def healthy_loading(t):
-    return {"commit_percent": 40.0 + t / 100, "present": 0, "storage": 1000 * t, "translator": 0, "picture": "black"}
+    return {"commit_percent": 40.0 + t / 100, "present": 0, "storage": 1000 * t, "translator": 0, "picture": "black", "cpu": t * 1.5}
 
 
 def memory_climb(t):
@@ -110,10 +110,26 @@ class Decision(unittest.TestCase):
         self.assertIsNone(watch.decide(500, {"commit_percent": None}))
 
 
+    def test_a_deadlock_is_told_from_loading_by_the_cpu(self):
+        def deadlocked(t):
+            frozen = min(t, 300)
+            return {"commit_percent": 60.0, "present": frozen, "storage": 10 * frozen, "translator": frozen, "picture": "same",
+                    "cpu": 100.0 + min(t, 300) * 0.002}
+        at, reason = first_stop(deadlocked)
+        self.assertEqual(at, 390)
+        self.assertTrue(reason.startswith("deadlock: no frame presented for 90 s and the title used 0.0 s of CPU"), reason)
+
+        def busy(t):  # nothing presented either, but the title works: loading, not a deadlock
+            sample = deadlocked(t)
+            sample["cpu"], sample["storage"] = t * 1.5, 1000 * t
+            return sample
+        self.assertEqual(first_stop(busy), (None, None))
+
+
 class Process(unittest.TestCase):
     def run_watchdog(self, logdir, *extra, timeout=30):
         command = [sys.executable, "-B", str(HERE.parent / "tools" / "startup" / "stall_watchdog.py"), str(logdir),
-                   "--parent", str(os.getpid()), "--every", "0.2", *extra]
+                   "--parent", str(os.getpid()), "--every", "0.2", "--hard-grace", "0", *extra]
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
     def test_a_frozen_run_gets_the_stop_file_and_the_reason(self):
@@ -136,7 +152,7 @@ class Process(unittest.TestCase):
             (logdir / "events.txt").write_text("start\n")
             parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
             command = [sys.executable, "-B", str(HERE.parent / "tools" / "startup" / "stall_watchdog.py"), str(logdir),
-                       "--parent", str(parent.pid), "--every", "0.2", "--min-seconds", "0", "--stall-seconds", "2",
+                       "--parent", str(parent.pid), "--every", "0.2", "--hard-grace", "0", "--min-seconds", "0", "--stall-seconds", "2",
                        "--memory-percent", "0"]
             watcher = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
             frames = 0
@@ -148,6 +164,48 @@ class Process(unittest.TestCase):
             parent.wait()
             self.assertEqual(out, "")
             self.assertFalse((logdir / "stop").exists())
+
+    def test_a_debugger_that_will_not_end_is_ended_with_its_title(self):
+        # A fake debugger (debug_launch.py in its command line, the run folder as argument) that ignores the stop file and
+        # SIGTERM, with a fake title below it: after --seconds + --hard-grace both are ended, hard_end.json says so.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            logdir = tmp / "run"
+            logdir.mkdir()
+            (logdir / "events.txt").write_text("start\n")
+            fake_title = ("import os, signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                          "open(sys.argv[1] + '/title.pid', 'w').write(str(os.getpid()))\ntime.sleep(300)\n")
+            (tmp / "title.py").write_text(fake_title)
+            (tmp / "debug_launch.py").write_text(
+                "import signal, subprocess, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "subprocess.Popen([sys.executable, sys.argv[2], sys.argv[1]])\ntime.sleep(300)\n")
+            debugger = subprocess.Popen([sys.executable, str(tmp / "debug_launch.py"), str(logdir), str(tmp / "title.py")])
+            for _ in range(50):
+                if (logdir / "title.pid").exists():
+                    break
+                time.sleep(0.1)
+            title = int((logdir / "title.pid").read_text())
+            started = time.monotonic()
+            try:
+                result = self.run_watchdog(logdir, "--seconds", "2", "--min-seconds", "1000", "--hard-grace", "2", "--memory-percent", "0")
+                debugger.wait(timeout=10)   # reaped: a killed child is a zombie until then
+            finally:
+                debugger.kill()
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertIn("tester_run: HARD END at ", result.stdout)
+            note = json.loads((logdir / "hard_end.json").read_text())
+            self.assertTrue(note["title_gone"], note)
+            self.assertFalse(stall_watchdog.pid_alive(title), "the title must be gone")
+            self.assertFalse(stall_watchdog.pid_alive(debugger.pid))
+
+    def test_a_run_that_finished_by_itself_is_not_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logdir = Path(tmp)
+            (logdir / "events.txt").write_text("start\n")
+            (logdir / "finished.txt").write_text("done\n")
+            result = self.run_watchdog(logdir, "--seconds", "1", "--hard-grace", "1", "--min-seconds", "1000")
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((logdir / "hard_end.json").exists())
 
     def test_bad_numbers_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
