@@ -152,7 +152,7 @@ def check_shell(shell):
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
-                                "args.json", "debugger_summary.out", "manifest.json"]), names
+                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
