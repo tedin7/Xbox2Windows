@@ -2897,6 +2897,8 @@ class Stage:
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
+        if getattr(self, 'firstlane_cfg', False):
+            self.firstlane_v.discard(n)
         if isinstance(self.align4_v, set):
             if align4 and not low16_only and (self.exec_known or n in self.align4_v):
                 self.align4_v.add(n)
@@ -3836,6 +3838,10 @@ class Stage:
         init_entry = [r for r in set(init_sym) | init_used_s if isinstance(r, int)]
         init_written = set(range(max(init_entry + [-1 if getattr(self, 'kind', None) == 'cs' else 15]) + 1)) | {'m0'}
 
+        # Forward, wave-uniform branches can choose different values on each edge
+        # while still selecting the same value for every lane at a join.
+        self.firstlane_cfg = (getattr(getattr(self, 'pipe', None), 'retry_firstlane', False)
+                              and not back_targets)
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
             self.address_carry_reader = None
@@ -3872,6 +3878,8 @@ class Stage:
             self.uses_pos = False
             self.fetched = False
             self.uniform_v = set()
+            self.firstlane_v = set()
+            firstlane_edges = {}
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
             self.varying_s = set()
             self.align4_v = set()
@@ -4022,6 +4030,21 @@ class Stage:
                             (v[0] == 'const' and len(v) == 2) or v[0] in ('ud', 'fixed_buffer_word')
                         )
                     }
+                if self.firstlane_cfg and self.uniform_cf:
+                    if off in targets:
+                        paths = firstlane_edges.get(off, [])
+                        if falls:
+                            paths = paths + [(self.firstlane_v, pre_uniform)]
+                        if paths:
+                            self.firstlane_v = set.intersection(*(v for v, _ in paths))
+                            scalar_phi = set.intersection(*(u for _, u in paths))
+                            self.since_join.update(scalar_phi)
+                            self.defined_uniform_s.update(scalar_phi)
+                            self.varying_s.difference_update(scalar_phi)
+                        else:
+                            self.firstlane_v.clear()
+                    elif not falls:
+                        self.firstlane_v.clear()
                 if off in targets and self.exec_keep and name.startswith('s_'):
                     # The join instruction itself runs with exec == 0 on the taken edge: a scalar read of a kept word ends it here.
                     self.end_exec_keep_scalar_read(name, asm)
@@ -4037,6 +4060,10 @@ class Stage:
                     if b_target > off:
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
                         scc_in.setdefault(b_target, []).append(self.scc_def)
+                        if self.firstlane_cfg and self.uniform_cf:
+                            scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
+                            firstlane_edges.setdefault(b_target, []).append(
+                                (self.firstlane_v.copy(), scalar_facts - self.varying_s - self.masks))
                     else:
                         for reg in there & written:
                             back, sym = self.sym.get(reg), kept.get(b_target, {}).get(reg)
@@ -4641,6 +4668,25 @@ class Stage:
                 dst = candidate[1]
             else:
                 shifted = None
+        extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
+        extra_regs = ()
+        if extra_proof and self.uniform_entry_exec():
+            # Table-driven VALU operations use only their explicit operands and, for the
+            # accumulator forms, the old destination. No lane selectors or mask operands.
+            if base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU:
+                dst_reg = reg_range(ops[0]) if ops else None
+                inputs = ops if base in ('v_fmac_f32', 'v_mac_f32') else ops[1:]
+                if (dst_reg and dst_reg[0] == 'v' and dst_reg[1] == dst_reg[2] and inputs
+                        and all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods)
+                        and all(self.firstlane_source(tok, base) for tok in inputs)):
+                    extra_regs = (dst_reg[1],)
+            elif base in UNIFORM_LOADS and len(ops) == 4:
+                data = reg_range(ops[0])
+                if (data and data[0] == 'v' and data[2] - data[1] + 1 == UNIFORM_LOAD_WORDS[base]
+                        and (ops[1] == 'off' or self.firstlane_source(ops[1], base))
+                        and self.firstlane_source(ops[3], base)
+                        and not self.pipe.rw_keys):
+                    extra_regs = range(data[1], data[2] + 1)
         if recomputed:
             # Read before the load can overwrite its own address register.
             self.uniform_vaddr = '(%s)' % exprs[vaddr[1]] if vaddr and vaddr[1] in exprs else None
@@ -4656,6 +4702,12 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if extra_proof:
+            for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops):
+                reg = reg_range(token)
+                if reg and reg[0] == 'v':
+                    self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
+            self.firstlane_v.update(extra_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
                 reg = reg_range(token)
@@ -8912,7 +8964,35 @@ class Stage:
             return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
         return self.uniform_entry_exec()
 
+    def firstlane_source(self, token, base):
+        if base in VEC_F:
+            token = re.sub(r'^-(?=[^\d.])', '', token).strip('|')
+        reg = reg_range(token)
+        if reg and reg[0] == 'v':
+            return all(n in self.firstlane_v for n in range(reg[1], reg[2] + 1))
+        return self.uniform_source(token) and (
+            not reg or reg[1] in self.defined_uniform_s or
+            (self.sym.get(reg[1]) or ('',))[0] in ('const', 'ud', 'fixed_buffer_word'))
+
+    def firstlane_wave_allowed(self, src):
+        # SM 6 waves have at least four lanes. A group this small fits in one wave
+        # on both guest widths and does not need a host wave-size attribute.
+        x, y, z = self.pipe.group
+        if x * y * z > 4 or self.has_branches or self.blocks:
+            return False
+        for off, _, name, asm in self.ins:
+            if off >= self.pc:
+                break
+            args = parse(asm)[1]
+            if writes_exec(name, args) and not name.startswith('v_cmpx'):
+                return False
+            if name.startswith('v_writelane') and reg_range(args[0]) == src:
+                return False
+        return True
+
     def op_v_readfirstlane_b32(self, ops, mods):
+        if len(ops) != 2:
+            raise Unsupported(READFIRSTLANE_UNIFORM)
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
         waterfalls = getattr(self, 'waterfall_reads', {})
@@ -8927,7 +9007,25 @@ class Stage:
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not uniform):
+                not src or src[0] != 'v' or src[1] != src[2]):
+            raise Unsupported(READFIRSTLANE_UNIFORM)
+        if not uniform:
+            if getattr(getattr(self, 'pipe', None), 'retry_firstlane', False):
+                if self.firstlane_cfg and self.uniform_cf and src[1] in self.firstlane_v:
+                    self.set_s(dst[1], self.u(ops[1]), uniform=True)
+                    return
+                if self.firstlane_wave_allowed(src):
+                    x, y, _ = self.pipe.group
+                    # Elect by guest lane order. The winning host lane supplies its value
+                    # even when host lane numbering differs or guest EXEC is empty.
+                    self.emit('{ uint lane = tid.x + %du * (tid.y + %du * tid.z);' % (x, y))
+                    self.emit('  uint first = WaveActiveMin((exec & 1u) != 0u ? lane : 0xffffffffu);')
+                    self.emit('  uint value = 0u;')
+                    self.emit('  [branch] if (lane == (first == 0xffffffffu ? 0u : first))'
+                              ' value = WaveReadLaneFirst(%s);' % self.u(ops[1]))
+                    self.set_s(dst[1], 'WaveActiveBitOr(value)', uniform=True)
+                    self.emit('}')
+                    return
             raise Unsupported(READFIRSTLANE_UNIFORM)
         if past_entry and not direct:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
@@ -11843,6 +11941,7 @@ class ComputePipeline(Pipeline):
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
         self.retry_entry_exec = False
+        self.retry_firstlane = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -11850,23 +11949,30 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
+        A readfirstlane refusal retries the existing EXEC proof before trying the wider proof and wave lowering."""
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if (not self.retry_entry_exec and refusals is not None
-                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
-                    self.retry_entry_exec = True
+                if (refusals is not None and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]
+                        and self.retry_readfirstlane()):
                     continue
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                if str(reason) != READFIRSTLANE_UNIFORM or not self.retry_readfirstlane():
                     raise
-                # Keep the original lowering for every shader that already translates.
-                self.retry_entry_exec = True
+
+    def retry_readfirstlane(self):
+        # Keep both existing lowerings ahead of the new proof and wave path.
+        if not self.retry_entry_exec:
+            self.retry_entry_exec = True
+        elif not self.retry_firstlane:
+            self.retry_firstlane = True
+        else:
+            return False
+        return True
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
