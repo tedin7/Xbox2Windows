@@ -2427,9 +2427,11 @@ class Stage:
     raw_code = b''
     address_carry_pairs = ()
     address_carry_reader = None
+    retry_scc = False
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
+        self.retry_scc = getattr(pipe, 'retry_scc', False)
         self.refusals = refusals
         self.raw_code = strip_header(code)
         if refusals is None:
@@ -5249,13 +5251,19 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args), align4=align4)
         if base in SCA:
             return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
-        if base == 's_addc_u32':
-            # Only the high word of an advanced descriptor pointer; the carry is not modelled.
-            hi = reg_range(ops[1]) if len(ops) == 3 else None
-            if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
-                self.scc_uniform = False
-            if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
-                return None
+        if base in ('s_addc_u32', 's_subb_u32'):
+            # Keep the symbolic high word of an advanced descriptor pointer.
+            if base == 's_addc_u32':
+                hi = reg_range(ops[1]) if len(ops) == 3 else None
+                if not self.retry_scc:
+                    if self.tracks_uniformity():
+                        self.scc_uniform = False
+                if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
+                    if self.tracks_uniformity():
+                        self.scc_uniform = False
+                    return None
+            if self.retry_scc:
+                return self.scalar(base, ops, mods)
             raise Unsupported(base)
         if base == 's_getpc_b64':
             # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
@@ -5803,6 +5811,33 @@ class Stage:
                 return i
         return None
 
+    def descriptor_salu_word(self, sym):
+        """Materialize a proven table word, or a supported transformation of one."""
+        if sym[0] == 'descnum' and len(sym) == 3:
+            word = self.descriptor_salu_word(sym[2])
+            if word is not None:
+                stride = '((%s >> 16u) & 0x3fffu)' % word
+                return 'max(%s, 1u)' % stride if sym[1] == 'stride_min1' else stride
+        if sym[0] != 'desc' or sym[1][0] != 'table':
+            return None
+        _, (_, param), offset, index, *tags = sym
+        if offset is None or offset % 4 or offset + 4 * index > 0x7ffffffc:
+            return None
+        if tags and isinstance(tags[0], int):
+            if tags.pop(0) != -1:  # only an unchanged table pointer with a known zero high word
+                return None
+        recipe = tuple(tags)
+        if recipe not in ((), ('stride0',), ('oob0',), ('oob3',)):
+            return None
+        word = 'ud%d' % self.pipe.ud(('table_word', param, offset, index))
+        if recipe == ('stride0',):
+            return '(%s & 0xc000ffffu)' % word
+        if recipe == ('oob0',):
+            return '(%s & 0xcfffffffu)' % word
+        if recipe == ('oob3',):
+            return '((%s & 0xcfffffffu) | 0x30000000u)' % word
+        return word
+
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -5811,7 +5846,12 @@ class Stage:
             raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
-        text, scc = SCA[base]
+        carry_in = base in ('s_addc_u32', 's_subb_u32')
+        if carry_in and len(ops) != 3:
+            raise Unsupported('%s with %d operands, expected 3' % (base, len(ops)))
+        text, scc = (('{0} + {1}' if base == 's_addc_u32' else '{0} - {1}', None)
+                     if carry_in else SCA[base])
+        retry_scc = self.retry_scc
         dst = reg_range(ops[0])
         if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
             if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
@@ -5908,7 +5948,21 @@ class Stage:
                     self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
-        if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+        symbolic = [i for i, sym in enumerate(syms) if sym and sym[0] in ('desc', 'descnum', 'ptr', 'ptrhi')]
+        numeric = {}
+        raw = None
+        if (symbolic and retry_scc and not pair and (scc or shift_add or base in SCC_UNMODELLED or carry_in)
+                and not any(self.is_lane_mask(t) for t in srcs)):
+            # Keep the recognized descriptor rewrites symbolic for later resource binding.
+            raw = raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs]) if len(srcs) == 2 else None
+            ud_count = len(self.pipe.uds)
+            numeric = {i: self.descriptor_salu_word(syms[i]) for i in symbolic}
+            if None in numeric.values():
+                del self.pipe.uds[ud_count:]
+                numeric.clear()
+        if symbolic and not numeric:
+            if carry_in:
+                raise Unsupported('%s on unverified descriptor data' % base)
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
@@ -5997,9 +6051,23 @@ class Stage:
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
-        values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
+        values = [numeric[i] if i in numeric else t if i == absorbed else self.u(t)
+                  for i, t in enumerate(srcs)]
         expr = text.format(*values)
-        if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
+        result_uniform = None
+        if carry_in:
+            incoming = self.u('src_scc')
+            partial = expr
+            adding = base == 's_addc_u32'
+            expr = '(%s) %s %s' % (partial, '+' if adding else '-', incoming)
+            a, b = values
+            scc_text = ('((%s) < (%s)) || ((%s) < (%s))' % (partial, a, expr, partial) if adding else
+                        '((%s) < (%s)) || ((%s) < %s)' % (a, b, partial, incoming))
+        elif base in SCC_UNMODELLED:
+            scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
+
+        if (base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs
+                and not (retry_scc and 'src_scc' in srcs)):
             for tok in srcs:
                 self.reject_lane_mask_data(base, tok)
                 r = reg_range(tok)
@@ -6008,17 +6076,26 @@ class Stage:
             # Compute carry before writing the low register, which can also be an addend.
             self.set_scc('(%s) < %s' % (expr, values[0]))
             self.address_carry_reader = self.address_carry_pairs[self.pc]
-        elif base in SCC_UNMODELLED:
-            scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
+        elif base in SCC_UNMODELLED or carry_in:
             if re.search(r'\bscc\b', scc_text):
-                # An operand is the incoming SCC (src_scc): the destination must read it before this instruction's own
-                # SCC replaces it, so the destination is written first and the SCC after, from sources it did not change.
-                if dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
-                        reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
-                        for t in srcs):
-                    raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
-                                      % base)
-                deferred_scc = scc_text
+                # Both outputs use the incoming SCC. Compute the data result into a temporary if the
+                # destination write could clobber a source used to calculate the outgoing flag.
+                aliases = dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
+                    reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
+                    for t in srcs)
+                if aliases or carry_in:
+                    if not retry_scc:
+                        raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
+                                          % base)
+                    for tok in srcs:
+                        self.reject_lane_mask_data(base, tok)
+                    result_uniform = self.scalar_expr_uniform(expr) if self.tracks_uniformity() else None
+                    temp = 'salu_result_%x' % self.pc
+                    self.emit('uint %s = %s;' % (temp, expr))
+                    self.set_scc(scc_text)
+                    expr = temp
+                else:
+                    deferred_scc = scc_text
             else:
                 # From the sources, before the destination is written (it can be a source).
                 self.set_scc(scc_text)
@@ -6125,8 +6202,15 @@ class Stage:
             high_source = 's%d' % high if high is not None else srcs[0]
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
+        if raw is not None:
+            self.set_s(d, expr, sym=raw)
+            if raw[0] == 'desc':
+                self.pipe.modified.add(desc_key(raw))
+            if scc:
+                self.set_scc(scc.replace('$', '(%s)' % expr))
+            return None
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
-        self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        self.set_s(d, expr, scc=None if lane_complement else scc, uniform=result_uniform, align4=salu_align4)
         if deferred_scc is not None:
             self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
@@ -11843,6 +11927,7 @@ class ComputePipeline(Pipeline):
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
         self.retry_entry_exec = False
+        self.retry_scc = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -11850,23 +11935,31 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
+        Retry relevant refusals with the CFG or extended SCC proof. Successful legacy passes keep their HLSL."""
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if (not self.retry_entry_exec and refusals is not None
-                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
-                    self.retry_entry_exec = True
-                    continue
-                return
+                if refusals is None or not self._retry_stage(
+                        [reason for reason, _ in refusals[self._refusals_before:]]):
+                    return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                if not self._retry_stage([str(reason)]):
                     raise
-                # Keep the original lowering for every shader that already translates.
-                self.retry_entry_exec = True
+
+    def _retry_stage(self, reasons):
+        if not self.retry_entry_exec and READFIRSTLANE_UNIFORM in reasons:
+            self.retry_entry_exec = True
+            return True
+        if not self.retry_scc and any(
+                reason.startswith(('src_scc with unverified SCC', 'scc from descriptor data [shift-add,'))
+                or 'reads src_scc with a destination that is also a source or a special register' in reason
+                or reason in ('s_addc_u32', 's_subb_u32') for reason in reasons):
+            self.retry_scc = True
+            return True
+        return False
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:

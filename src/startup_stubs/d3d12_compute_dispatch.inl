@@ -6,7 +6,8 @@
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
-// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
+// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). A `table_word` supplies a raw
+// dword from a logical table independently of view binding. Any other manifest line makes the translation
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
@@ -16,7 +17,7 @@ struct ComputeTranslation {
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
     // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
-    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records, table_word };
     struct Slot {
         int a, b;
         bool texture, heap;
@@ -27,6 +28,7 @@ struct ComputeTranslation {
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
+        unsigned table_word_index = 0;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -154,6 +156,13 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
             tr.uds.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "udsrc %u table_word %d %d %u%n", &i, &a, &b, &x, &used) == 4 &&
+                 whole() && i == tr.uds.size() && a >= 0 &&
+                 static_cast<unsigned>(a) < x2w_startup::ComputeTables::max_parameters && b >= 0 && b % 4 == 0 && x < 16) {
+            tr.uds.push_back({a, b});
+            tr.uds.back().source = ComputeTranslation::table_word;
+            tr.uds.back().table_word_index = x;
+        }
         else if (std::sscanf(line.c_str(), "udsrc %u %15s %d%n", &i, name, &a, &used) == 3 && whole() && i == tr.uds.size() &&
                  source() != ComputeTranslation::root_constant)
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
@@ -216,6 +225,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
+        if (ud.source == ComputeTranslation::table_word) continue;
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
@@ -510,6 +520,27 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
+        if (ud.source == ComputeTranslation::table_word) {
+            const std::size_t bytes = 4 * (ud.table_word_index + 1);
+            const u64 entry = pass.compute_tables.table(ud.a).record(static_cast<u64>(ud.b), bytes);
+            const auto* data = reinterpret_cast<const void*>(entry);
+            if (!entry || !x2w_local::readable(data, bytes)) {
+                reason = "a scalar descriptor word is outside the bound table";
+                break;
+            }
+            std::uint32_t raw[16];
+            std::memcpy(raw, data, bytes);
+            // A synthetic view token does not contain the guest's numeric descriptor words.
+            for (unsigned word = 0; word <= ud.table_word_index; word += 4) {
+                if (raw[word] == view_token_magic) {
+                    reason = "a scalar descriptor word is backed by a view token";
+                    break;
+                }
+            }
+            if (reason) break;
+            values[i] = raw[ud.table_word_index];
+            continue;
+        }
         const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
@@ -526,6 +557,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
+        case ComputeTranslation::table_word: break;  // resolved above
         }
     }
     phases.to(3);
