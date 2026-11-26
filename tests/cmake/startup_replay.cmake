@@ -16,3 +16,14 @@ if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:x2w_replay>")
     set_tests_properties(startup_replay_pages_play PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
+
+# The stream draw scenes (tests/startup_stream_draw.cpp: plain, packed-target modes) replay to the pictures they were recorded with
+# (tests/startup_replay_draw_scenes_check.py).
+if(TARGET startup_stream_consumer AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
+    foreach(backend IN ITEMS warp hardware)
+        add_test(NAME startup_replay_draw_scenes_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_draw_scenes_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:x2w_replay>" "${backend}")
+        set_tests_properties(startup_replay_draw_scenes_${backend} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
