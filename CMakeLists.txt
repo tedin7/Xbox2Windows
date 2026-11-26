@@ -1207,6 +1207,10 @@ endif()
 # Input for tests/startup_host_cpu_debug_check.py.
 add_executable(startup_host_cpu_probe tests/startup_host_cpu_probe.cpp)
 target_compile_features(startup_host_cpu_probe PRIVATE cxx_std_17)
+# Samples a TextureCube from one translated compute shader (tests/startup_compute_cube_check.py drives it).
+add_executable(startup_cube_sample_check tests/startup_cube_sample_check.cpp)
+target_compile_features(startup_cube_sample_check PRIVATE cxx_std_17)
+target_link_libraries(startup_cube_sample_check PRIVATE d3d12 dxgi)
 # Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
 add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
 target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
@@ -3475,6 +3479,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_check.py")
     add_test(NAME startup_compute_image_store_d16 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
+    add_test(NAME startup_compute_cube COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_cube_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
@@ -11323,6 +11329,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_image_store_d16_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_cube_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_cube_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:startup_cube_sample_check>" ${adapter})
+        set_tests_properties(startup_compute_cube_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_compute_readfirstlane_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
