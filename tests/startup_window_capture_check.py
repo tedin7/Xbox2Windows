@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "startup"))
-from window_capture import PNG_SIGNATURE, Series, frame_hash, frame_name, png_bytes  # noqa: E402
+from window_capture import PNG_SIGNATURE, Series, frame_hash, frame_name, pick_window, png_bytes  # noqa: E402
 
 
 def decode_png(data):
@@ -81,6 +81,16 @@ class Naming(unittest.TestCase):
         self.assertEqual(frame_hash(2, 2, pixels), frame_hash(2, 2, bytes(16)))
         self.assertNotEqual(frame_hash(2, 2, pixels), frame_hash(4, 1, pixels))
         self.assertNotEqual(frame_hash(2, 2, pixels), frame_hash(2, 2, bytes(15) + b"\x01"))
+
+
+class PickWindow(unittest.TestCase):
+    def test_the_output_window_wins_over_the_titles_own_window(self):
+        windows = [(11, "Game"), (22, "Xbox2Windows abc1234 - output"), (33, "")]
+        self.assertEqual(pick_window(windows), 22)
+        self.assertEqual(pick_window(list(reversed(windows))), 22)
+
+    def test_without_an_output_window_the_first_visible_one_is_used(self):
+        self.assertEqual(pick_window([(11, "Game"), (33, "")]), 11)
 
 
 class Frames(unittest.TestCase):

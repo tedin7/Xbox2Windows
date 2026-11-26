@@ -28,7 +28,7 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
-from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
+from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
@@ -732,13 +732,15 @@ def main():
             owner = wt.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
             if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
+                text = ctypes.create_unicode_buffer(128)
+                user32.GetWindowTextW(wt.HWND(hwnd), text, 128)
+                found.append((hwnd, text.value))
             return True
 
         user32.EnumWindows(proto(visit), 0)
         if not found:
             return "no visible window"
-        hwnd = found[0]
+        hwnd = pick_window(found)
         rect = wt.RECT()
         user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
         width, height = min(rect.right, 1920), min(rect.bottom, 1080)

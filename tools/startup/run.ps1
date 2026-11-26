@@ -30,6 +30,7 @@ param(
     [switch]$FreshShaderCache,                 # with -Render: move a shader cache that is not empty aside first
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
     [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
+    [switch]$NoNullIdentity,                   # with -Render: do not set X2W_DRAW_NULL_IDENTITY (an empty buffer slot then keeps its real address in the log)
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
@@ -76,7 +77,8 @@ if ($Render) {
         & $python -B $revisionTool $cachePath --fresh | ForEach-Object { Write-Host $_ }
     }
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
-    $env:X2W_D3D12_RENDER = "1"; $env:X2W_DRAW_NULL_IDENTITY = "1"
+    $env:X2W_D3D12_RENDER = "1"
+    if ($NoNullIdentity) { Remove-Item Env:X2W_DRAW_NULL_IDENTITY -ErrorAction SilentlyContinue } else { $env:X2W_DRAW_NULL_IDENTITY = "1" }
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
