@@ -424,7 +424,7 @@ x2w_startup::ManifestSource& manifest_source()
 bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
 {
     x2w_startup::ManifestSource& source = manifest_source();
-    if (retry || !source.claim_first(key)) return source.load_retry(key, out, GetTickCount64());
+    if (retry || !source.claim_first(key)) return source.load_retry(key, out);
     if (!may_unlock) return source.read_first(key, out);
     draw_lock_release_exclusive();
     const bool read = source.read_first(key, out);
