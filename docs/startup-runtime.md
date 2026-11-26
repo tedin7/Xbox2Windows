@@ -1912,6 +1912,19 @@ Submissions and Presents share the change-only page store and its `X2W_REPLAY_PA
 use the same round-robin `X2W_REPLAY_SCAN_MS` limit as Present rescans (default 250 ms). A submit MAP carries the
 submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
 
+`X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
+(up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of
+descriptor heaps, including supplied memory and stand-in allocations whose CPU start the title has queried.
+The recorder scans before root setters, draws, dispatch, indirect execution, resource and descriptor copies, and queue
+submission. Each snapshot uses the preceding sequence number, so the player applies it before the call that
+can read the bytes. In this mode call-time scans also collect placed ranges within the window. Prefix descriptor
+copies can capture named ranges before the window opens. The regular page and scan budgets still apply, and
+`X2W_REPLAY_PAGES=0` disables page recording. The switch reuses format 3 `PAGE` and `MAP` chunks.
+
+`startup_replay_title_ranges_warp` uses an 8 KiB constant buffer in a plain allocation and alternates the colour
+at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
+must match the original pictures with the switch enabled and differ when the switch is off.
+
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
 GPU round trip per present. A recorded run and its replay write the same names.

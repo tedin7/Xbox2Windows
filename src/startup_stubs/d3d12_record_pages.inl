@@ -8,6 +8,7 @@
 // X2W_REPLAY_SCAN_MS (default 250) continues round-robin and writes only pages that changed since this recording last saw
 // them. By default a MAP read at present N is stamped with the mark of present N-1.
 // X2W_REPLAY_PAGES_AT_SUBMIT=1 also scans before each submission inside the window.
+// X2W_REPLAY_TITLE_RANGES=1 adds named title memory and scans in call order before the stand-in reads it.
 // The size cap is X2W_REPLAY_MAX_MIB as for calls. X2W_REPLAY_PAGES=0 leaves the pages out.
 // One line of counters after the base image and about every 20th scan:
 //   x2w-replay pages: ranges N (M MiB), pages seen S, distinct D, zero Z, unchanged U, written W MiB, skipped (no size) K,
@@ -18,6 +19,7 @@ struct PageRange { u64 address, bytes; };
 x2w_replay::PageWriter* page_writer;  // created lazily by the first page hook; never freed
 bool page_writer_tried;
 ThreadBuffer* page_target;            // the buffer the running scan appends to (its lock is held by the caller)
+bool page_base_done;                  // the base image of all ranges was written (pages_lock)
 u64 page_last_submit;                 // latest scanned ExecuteCommandLists call (pages_lock)
 u64 page_prev_mark;                   // the previous present's mark, the stamp of the next scan
 SRWLOCK pages_lock = SRWLOCK_INIT;   // one scan at a time; held for the whole scan
@@ -31,6 +33,93 @@ std::vector<PageRange> page_ranges;   // pages_lock
 std::size_t page_cursor_range;        // pages_lock
 u64 page_cursor_offset;               // pages_lock
 u64 page_unreadable, page_skipped_no_size, page_scans;
+
+struct NamedPageRange {
+    u64 bytes, allocation;
+};
+std::unordered_map<u64, NamedPageRange> named_page_ranges;  // pages_lock
+
+void remember_page_range(u64 address, u64 bytes, bool heap)
+{
+    if (!address || !bytes) return;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
+        info.State != MEM_COMMIT || (!heap && info.Type != MEM_PRIVATE)) return;
+    if (!heap) {
+        ULONG_PTR low, high;
+        GetCurrentThreadStackLimits(&low, &high);
+        if (address >= low && address < high) return;
+    }
+    const u64 allocation = reinterpret_cast<u64>(info.AllocationBase);
+    auto& range = named_page_ranges[address];
+    if (range.allocation != allocation) range = {};
+    range = {(std::max)(range.bytes, bytes), allocation};
+}
+
+void remember_heap_pages(u64 address, u64 bytes)
+{
+    if (!extra_title_pages) return;
+    AcquireSRWLockExclusive(&pages_lock);
+    remember_page_range(address, bytes, true);
+    ReleaseSRWLockExclusive(&pages_lock);
+}
+
+// A stand-in allocation can move on replay. Wait until the CPU-start call is recorded so the
+// player learns the translation before a MAP can address this heap.
+void remember_heap_start(u64 object, u64 second)
+{
+    void* result = nullptr;
+    const Wrapper* heap = receiver(reinterpret_cast<void*>(object), reinterpret_cast<void*>(second), &result,
+                                   "replay descriptor heap CPU start");
+    const u64 address = heap->own().title_cpu;
+    if (!address) return;
+    u64 bytes = 0;
+    AcquireSRWLockShared(&descriptor_lock);
+    for (const auto& range : descriptor_ranges)
+        if (range.title == address) bytes = range.bytes;
+    ReleaseSRWLockShared(&descriptor_lock);
+    remember_heap_pages(address, bytes);
+}
+
+void remember_cbv_pages(u64 desc)
+{
+    D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(desc), &view, sizeof(view), &got) ||
+        got != sizeof(view)) return;
+    AcquireSRWLockExclusive(&pages_lock);
+    remember_page_range(view.BufferLocation, view.SizeInBytes, false);
+    ReleaseSRWLockExclusive(&pages_lock);
+}
+
+// A root descriptor has no size. Its translation reads at most 64 KiB. Each named range is
+// clipped to its allocation and split at protection boundaries, without committing title pages.
+void gather_named_pages(std::vector<PageRange>& raw, u64& big)
+{
+    constexpr u64 mask = x2w_replay::page_bytes - 1;
+    for (auto it = named_page_ranges.begin(); it != named_page_ranges.end();) {
+        const u64 address = it->first;
+        const NamedPageRange range = it->second;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
+            reinterpret_cast<u64>(info.AllocationBase) != range.allocation) {
+            it = named_page_ranges.erase(it);
+            continue;
+        }
+        ++it;
+        if (range.bytes > page_range_limit) { ++big; continue; }
+        const u64 end = (address + range.bytes + mask) & ~mask;
+        u64 at = address & ~mask;
+        while (at < end && reinterpret_cast<u64>(info.AllocationBase) == range.allocation) {
+            const u64 region_end = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
+            const u64 next = (std::min)(end, region_end);
+            if (info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                raw.push_back({at, next - at});
+            at = next;
+            if (at == end || !VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) break;
+        }
+    }
+}
 
 // The writer's sink: the chunk is appended to the calling thread's buffer, written out when that is large.
 void page_flush_target()
@@ -48,22 +137,25 @@ void page_sink(const char* tag, const void* header, std::size_t header_bytes, co
     if (page_target->bytes.size() >= (1u << 20)) page_flush_target();
 }
 
-// The merged, page-aligned ranges of every resource with title memory and a known size. note_lock is taken shared.
-void page_gather_ranges()
+// Merge page-aligned resource ranges and any enabled named title ranges.
+void page_gather_ranges(bool placed)
 {
     std::vector<PageRange> raw;
     u64 unsized = 0, big = 0;
-    note_lock_acquire(false);
-    for (const auto& item : resource_infos()) {
-        const void* memory = item.first->own().title_memory;
-        if (!memory) continue;
-        if (!item.second.bytes) { ++unsized; continue; }
-        if (item.second.bytes > page_range_limit) { ++big; continue; }
-        const u64 start = reinterpret_cast<u64>(memory) & ~u64{x2w_replay::page_bytes - 1};
-        const u64 end = (reinterpret_cast<u64>(memory) + item.second.bytes + x2w_replay::page_bytes - 1) & ~u64{x2w_replay::page_bytes - 1};
-        raw.push_back({start, end - start});
+    if (placed) {
+        note_lock_acquire(false);
+        for (const auto& item : resource_infos()) {
+            const void* memory = item.first->own().title_memory;
+            if (!memory) continue;
+            if (!item.second.bytes) { ++unsized; continue; }
+            if (item.second.bytes > page_range_limit) { ++big; continue; }
+            const u64 start = reinterpret_cast<u64>(memory) & ~u64{x2w_replay::page_bytes - 1};
+            const u64 end = (reinterpret_cast<u64>(memory) + item.second.bytes + x2w_replay::page_bytes - 1) & ~u64{x2w_replay::page_bytes - 1};
+            raw.push_back({start, end - start});
+        }
+        ReleaseSRWLockShared(&note_lock);
     }
-    ReleaseSRWLockShared(&note_lock);
+    if (extra_title_pages) gather_named_pages(raw, big);
     std::sort(raw.begin(), raw.end(), [](const PageRange& a, const PageRange& b) { return a.address < b.address; });
     page_ranges.clear();
     for (const PageRange& r : raw) {
@@ -83,13 +175,13 @@ void page_gather_ranges()
 }
 
 // One pass: all ranges (the base image), or from the cursor until the time budget is used. pages_lock held.
-void page_scan(bool everything, u64 stamp)
+void page_scan(bool everything, u64 stamp, bool placed = true)
 {
     if (!page_writer) return;
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
-    page_gather_ranges();
-    if (everything) { page_cursor_range = 0; page_cursor_offset = 0; }
+    page_gather_ranges(placed);
+    if (everything) { page_cursor_range = 0; page_cursor_offset = 0; if (placed) page_base_done = true; }
     std::vector<unsigned char> buffer(page_slab_bytes);
     std::size_t visited = 0;
     bool stopped_early = false;
@@ -169,11 +261,11 @@ void init_page_writer()
     }
 }
 
-void scan_pages_into(ThreadBuffer& b, bool everything, u64 stamp)
+void scan_pages_into(ThreadBuffer& b, bool everything, u64 stamp, bool placed = true)
 {
     if (!page_writer) return;
     page_target = &b;
-    page_scan(everything, stamp);
+    page_scan(everything, stamp, placed);
     page_target = nullptr;
 }
 
@@ -195,18 +287,26 @@ inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
     const u64 stamp = page_prev_mark ? page_prev_mark : seq;
     page_prev_mark = seq;
     if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
-    scan_pages_into(b, false, (std::max)(stamp, page_last_submit));
+    init_page_writer();  // a window that was open from the start never calls pages_at_window_open
+    scan_pages_into(b, !page_base_done, (std::max)(stamp, page_last_submit));
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
-// seq is one less than ExecuteCommandLists' sequence. The player applies the MAP before that call.
-inline void pages_at_submit(ThreadBuffer& b, u64 seq)
+// Take the snapshot in sequence order, so PageWriter's deltas are applied in the order it saw them. A submit scan
+// (X2W_REPLAY_PAGES_AT_SUBMIT) keeps the stamp of later Present scans after the submission.
+u64 pages_before_call(bool root, u64 address, bool submit)
 {
-    if (stop_requested || stopped || !TryAcquireSRWLockExclusive(&pages_lock)) return;
+    ThreadBuffer& b = my_buffer();
+    AcquireSRWLockExclusive(&b.lock);
+    AcquireSRWLockExclusive(&pages_lock);
+    const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    if (root) remember_page_range(address, 0x10000, false);
     init_page_writer();
     if (page_writer && !page_budget_reached && !stop_requested && !stopped) {
-        scan_pages_into(b, false, seq);
-        page_last_submit = (std::max)(page_last_submit, seq + 1);
+        scan_pages_into(b, window_open && !page_base_done, seq - 1, window_open);
+        if (submit) page_last_submit = (std::max)(page_last_submit, seq);
     }
     ReleaseSRWLockExclusive(&pages_lock);
+    ReleaseSRWLockExclusive(&b.lock);
+    return seq;
 }
