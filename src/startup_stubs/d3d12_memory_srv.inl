@@ -266,6 +266,7 @@ struct UnplacedBufferEntry {
     u64 page_start = 0;
     u64 page_span = 0;
     bool is_upload = false;
+    bool exact = false;  // starts at the view address (a structured view whose stride does not divide the page offset)
     x2w_startup::ComPtr<ID3D12Resource> resource;
     Wrapper* wrapper = nullptr;
 };
@@ -293,7 +294,8 @@ void clear_unplaced_buffers(Wrapper* device)
     }
 }
 
-Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc)
+Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
+                                u64 elem_bytes)
 {
     if (address_resource_overlap(address, span_bytes)) return nullptr;
     u64 page_start = 0, page_span = 0;
@@ -308,12 +310,21 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     const auto nearby = placed_buffer_range(device, page_start, page_span, true);
     if (nearby.reject || nearby.owner) return nullptr;
 
+    // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
+    // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
+    // starts at the address itself (checked above to lie inside memory the title owns).
+    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    if (exact) {
+        page_start = address;
+        page_span = span_bytes;
+    }
+
     auto* desktop = device_of(device);
     if (!desktop) return nullptr;
 
     std::lock_guard lock(unplaced_buffer_mutex);
     for (auto& entry : unplaced_buffers) {
-        if (entry.device == device && entry.allocation_base == memory.base &&
+        if (entry.device == device && entry.allocation_base == memory.base && entry.exact == exact &&
             x2w_startup::unplaced_buffer_covers(entry.page_start, entry.page_span, address, span_bytes)) {
             x2w_startup::PlacedBufferRange verify{};
             if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(entry.page_start), entry.page_span, verify) ||
@@ -342,7 +353,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &existing_support, sizeof(existing_support))) &&
         existing_support.Supported;
 
-    if (existing_heaps_supported && memory.type == MEM_PRIVATE) {
+    if (existing_heaps_supported && memory.type == MEM_PRIVATE && !exact) {
         std::lock_guard placed_lock(placed_mutex);
         for (const auto& [known, h] : existing_heaps) {
             if (known == memory.base) {
@@ -434,7 +445,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         w->own().budget = x2w_budget::committed(desktop, native_resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     }
 
-    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, native_resource, w});
+    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, exact, native_resource, w});
     return w;
 }
 
@@ -704,7 +715,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes);
         }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
