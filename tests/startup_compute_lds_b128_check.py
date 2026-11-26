@@ -561,6 +561,8 @@ def check_control_flow():
     for old, new, reason in (
         ('040082bf88000a4a', '060082bf88000a4a', 'barrier reached by the whole group'),
         ('050085bf91000a4a', '090085bf91000a4a', 'completed fill'),
+        # The second compare reads an SGPR the program never proves uniform (s30 instead of the group ID in s7).
+        ('00008abf078006bf', '00008abf1e8006bf', 'proven uniform condition'),
     ):
         refused(reason, lambda: translate_case('scc', code=patch(WORDS_SCC, old, new)))
 
