@@ -135,6 +135,25 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     return nullptr;
 }
 
+// The base pipeline key of every RTV variant, so a log line about a variant key (which has no shader_results row of its
+// own) can name the key that has one. Its own lock: written under draw_lock, read by log lines that hold no other lock.
+SRWLOCK variant_base_lock = SRWLOCK_INIT;
+std::unordered_map<u64, u64>& variant_bases() { static std::unordered_map<u64, u64> m; return m; }
+void note_variant_base(u64 variant, u64 base)
+{
+    AcquireSRWLockExclusive(&variant_base_lock);
+    variant_bases()[variant] = base;
+    ReleaseSRWLockExclusive(&variant_base_lock);
+}
+u64 variant_base_of(u64 key)
+{
+    AcquireSRWLockShared(&variant_base_lock);
+    const auto found = variant_bases().find(key);
+    const u64 base = found == variant_bases().end() ? 0 : found->second;
+    ReleaseSRWLockShared(&variant_base_lock);
+    return base;
+}
+
 // Milliseconds since this process started (its creation time), for KeyUse. One read of the tick count after the first call.
 std::uint64_t process_ms()
 {
@@ -1138,6 +1157,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (!entry) {
         entry = new Translation;
         entry->key = key;
+        note_variant_base(key, base->key);
         load_translation(*entry, request);
         if (entry->state != 1) {
             publish_shader_request(key, L".rtv", request.data(), request.size());
@@ -2634,6 +2654,8 @@ std::vector<std::string> not_drawn_key_lines()
         std::sort(order, order + not_drawn_sites, [&](int a, int b) { return entry.by_site[a] > entry.by_site[b]; });
         char causes[256];
         int used = 0;
+        if (const u64 base = variant_base_of(keys[k].first))
+            used += snprintf(causes, sizeof(causes), "RTV variant of %016llx; ", base);
         for (int i = 0; i < 3 && entry.by_site[order[i]] && used < static_cast<int>(sizeof(causes)) - 64; ++i)
             used += snprintf(causes + used, sizeof(causes) - used, "%s%s %ld", i ? ", " : "", not_drawn_names[order[i]], entry.by_site[order[i]]);
         causes[used > 0 ? used : 0] = 0;

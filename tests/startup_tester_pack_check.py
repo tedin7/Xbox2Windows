@@ -391,10 +391,11 @@ def check_key_use():
             "x2w-render key use compute 2000000000000001 first 12.5 s last 250.5 s uses 900\n"  # printed again: the count grew
             "x2w-render key use graphics 1000000000000002 first 241.0 s last 242.0 s uses 3\n"
             "x2w-render key use graphics 0000000000000001 first 1.0 s last 2.0 s uses 7\n"  # ok key: only on its own line
+            "x2w-render key use graphics 6000000000000009 first 5.0 s last 300.0 s uses 10 base 1000000000000002\n"  # an RTV variant: counts for its base
             "x2w-render key use compute zzzz first 1 s last 2 s uses 1\n"  # malformed: ignored
             "x2w-render compute census: 3 keys dispatched\n", encoding="utf-8")
         use = T.key_use(str(run))
-        assert use == {"2000000000000001": (12.5, 250.5, 900), "1000000000000002": (241.0, 242.0, 3), "0000000000000001": (1.0, 2.0, 7)}, use
+        assert use == {"2000000000000001": (12.5, 250.5, 900), "1000000000000002": (5.0, 300.0, 10), "0000000000000001": (1.0, 2.0, 7)}, use
         assert T.key_use(str(tmp / "missing")) == {} and T.key_use(None) == {}
         text = T.format_results(T.cache_results(str(cache)), use)
         assert "2000000000000001 compute refused image_store on SQ_RSRC_IMG_3D: only 2D images are lowered first=12.5s last=250.5s uses=900\n" in text, text
@@ -403,7 +404,7 @@ def check_key_use():
         # the refused keys used latest come first, latest last use on top; an ok key is not listed there
         section = text.split("## refused keys used latest")[1].split("## keys")[0].splitlines()[1:]
         keys = [line.split()[3] for line in section if line.strip()]
-        assert keys == ["2000000000000001", "1000000000000002"], keys
+        assert keys == ["1000000000000002", "2000000000000001"], keys
         assert T.format_results(T.cache_results(str(cache))) == T.format_results(T.cache_results(str(cache)), {}), "no use lines: unchanged"
         assert "refused keys used latest" not in T.format_results(T.cache_results(str(cache))) and "first=1" not in T.format_results(T.cache_results(str(cache)))
         # packed with the cache, the zip's shader_results.txt carries the use
