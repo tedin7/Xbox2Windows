@@ -740,6 +740,25 @@ def check_combine():
         assert all(top["files"][n]["part"] == 1 for n in top["files"] if n.endswith("manifest.json") and n.startswith("run_")), "manifests in part 1"
 
 
+def check_record_spec():
+    """-Record values for the replay recorder and the size report of a recording folder."""
+    assert T.parse_record_spec("140,60") == {"spec": "140,60", "by": "time", "start": 140, "length": 60}
+    assert T.parse_record_spec(" F4000,24 ")["spec"] == "f4000,24" and T.parse_record_spec("f4000,24")["by"] == "frame"
+    for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1"):
+        try:
+            T.parse_record_spec(bad)
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % bad)
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), "a.bin", b"x" * 1000)
+        (Path(tmp) / "sub").mkdir()
+        write(Path(tmp) / "sub", "b.bin", b"y" * 5000)
+        report = T.folder_report(tmp)
+        assert report["files"] == 2 and report["bytes"] == 6000 and report["largest"][0] == ("sub/b.bin", 5000), report
+        assert T.folder_report(str(Path(tmp) / "none")) == {"files": 0, "bytes": 0, "largest": []}
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -885,6 +904,7 @@ if __name__ == "__main__":
     check_phase_table()
     check_request_families()
     check_combine()
+    check_record_spec()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()

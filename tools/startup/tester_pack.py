@@ -867,6 +867,38 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     return parts
 
 
+RECORD_RE = re.compile(r"^(f)?(\d+),(\d+)$")
+RECORD_MAX_SECONDS = 120
+RECORD_MAX_FRAMES = 2000
+
+
+def parse_record_spec(spec):
+    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `<start s>,<seconds>` (e.g. 140,60) or `f<first frame>,<frames>`.
+    Returns {"spec": normalized text, "by": "time"|"frame", "start", "length"}. Raises ValueError for anything else, a window longer
+    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder) or an empty window."""
+    match = RECORD_RE.match(spec.strip().lower())
+    if not match:
+        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60) or f<first frame>,<frames> (e.g. f4000,24), got %r" % spec)
+    by = "frame" if match.group(1) else "time"
+    start, length = int(match.group(2)), int(match.group(3))
+    if length < 1 or length > (RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS):
+        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds",
+                                                                      RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS))
+    return {"spec": ("f" if by == "frame" else "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
+
+
+def folder_report(folder):
+    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console)."""
+    sizes = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                sizes.append((os.path.relpath(path, folder).replace(os.sep, "/"), os.path.getsize(path)))
+    sizes.sort(key=lambda item: -item[1])
+    return {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+
+
 def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
     """One report from several runs of a matrix (tester_run -Matrix gray). `runs` is [(label, [part zip paths in order])]; every
     member of run <label> goes in as run_<label>/<name>, its manifest.json too. Part 1 also holds matrix_manifest.json (per run:
@@ -948,6 +980,10 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    rs = sub.add_parser("record-spec")
+    rs.add_argument("spec")
+    rr = sub.add_parser("record-report")
+    rr.add_argument("folder")
     cb = sub.add_parser("combine")
     cb.add_argument("zip")
     cb.add_argument("--matrix", default="matrix")
@@ -956,6 +992,16 @@ def main(argv):
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
+    if args.cmd == "record-spec":
+        try:
+            print(parse_record_spec(args.spec)["spec"])
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
+        return 0
+    if args.cmd == "record-report":
+        print(json.dumps(folder_report(args.folder)))
+        return 0
     if args.cmd == "combine":
         runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]
         for path, size in combine(args.zip, runs, int(args.limit_mb * 1024 * 1024), args.matrix):

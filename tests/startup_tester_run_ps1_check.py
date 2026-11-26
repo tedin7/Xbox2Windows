@@ -38,6 +38,7 @@ $record = [ordered]@{
     Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; Sysmem = $env:X2W_D3D12_SYSMEM_FALLBACK; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
+if ($env:X2W_REPLAY_DIR) { [System.IO.File]::WriteAllBytes((Join-Path $env:X2W_REPLAY_DIR "replay.x2wr"), (New-Object byte[] 70000)); Set-Content -LiteralPath (Join-Path $env:X2W_REPLAY_DIR "creation.log") -Value "stub" }
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
 foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log", "threads.txt",
                   "translate.txt", "translate_err.txt") {
@@ -377,6 +378,30 @@ def check_shell(shell):
         assert list((tree / "out" / "tester").glob("report_*.zip"))
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
+        # -Record: spec validated, disk guard, env for the runtime, size report in the manifest, chunked upload list without a synced Drive folder
+        bad = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "soon")
+        assert bad.returncode != 0 and "-Record" in (bad.stdout + bad.stderr), (bad.stdout[-500:], bad.stderr[-500:])
+        huge = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "900000000")
+        assert huge.returncode != 0 and "needs twice the cap free" in (huge.stdout + huge.stderr), (huge.stdout[-500:], huge.stderr[-500:])
+        both = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-Matrix", "gray")
+        assert both.returncode != 0 and "own run" in (both.stdout + both.stderr), (both.stdout[-500:], both.stderr[-500:])
+        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64", "-Upload")
+        assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])
+        assert "recording: 2 files" in rec.stdout and "(cap 64 MiB)" in rec.stdout, rec.stdout[-1500:]
+        newest_rec = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_rec) as z:
+            rec_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+            rec_names = z.namelist()
+        assert rec_manifest["env"]["X2W_REPLAY_RECORD"] == "140,60" and rec_manifest["env"]["X2W_REPLAY_MAX_MIB"] == "64", rec_manifest["env"]
+        assert rec_manifest["record"]["files"] == 2 and rec_manifest["record"]["bytes"] >= 70000 and rec_manifest["record"]["spec"] == "140,60", rec_manifest["record"]
+        assert not [n for n in rec_names if "replay.x2wr" in n], "the recording never travels inside the mail zip"
+        uploads = list((tree / "out" / "tester").glob("record_*_upload"))
+        assert uploads and list(uploads[-1].glob("record_*_0001.part")) and (uploads[-1] / "record_%s.json" % uploads[-1].name.split("_")[1]).is_file(), uploads
+        assert ("recording" in rec.stdout and ("uploaded to the shared Drive folder" in rec.stdout or "UPLOAD_THESE_FILES.txt" in rec.stdout)), rec.stdout[-1500:]
+        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        newest_plain2 = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_plain2) as z:
+            assert "X2W_REPLAY_RECORD" not in json.loads(z.read("manifest.json").decode("utf-8-sig"))["env"], "a run without -Record carries no recorder switch"
         # -Matrix gray: three runs back to back (child processes), one combined report, each leg with its own env switch
         matrix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "gray", "-Seconds", "200")
         assert matrix.returncode == 0, (matrix.stdout[-2000:], matrix.stderr[-1000:])
