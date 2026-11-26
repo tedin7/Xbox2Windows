@@ -109,6 +109,11 @@ def main(consumer, dxc, adapter):
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert len(lines(result, 'comes from zeros for an empty descriptor (16 bytes)')) == 1, result.stderr[-3000:]
         assert got != expected and got != untouched, 'an empty input must read zeros, not the expected words'
+        # An output behind a buffer view token (the token names the placed output buffer and a raw range) is bound as
+        # the descriptor would be: all 320 words are written.
+        got, result = dispatch(directory, consumer, env, 'dispatch-output-token')
+        assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), \
+            result.stderr[-3000:]
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')

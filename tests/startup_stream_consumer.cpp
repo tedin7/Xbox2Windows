@@ -210,7 +210,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // word 3 zero) and runs on zeros, dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-null (all four words zero, an unbound buffer) also reads zeros;
-// dispatch-input-token writes the token of a texture view where the input descriptor was.
+// dispatch-input-token writes the token of a texture view where the input descriptor was; dispatch-output-token the
+// token of a raw buffer view of the output buffer where the output descriptor was.
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
@@ -293,6 +294,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(descriptors[1], alias, sizeof(alias));
     }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    if (mode == "dispatch-output-token") {
+        // The output descriptor is replaced by the token of a raw buffer view (device slot 19) of the output buffer.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+        view.Buffer.NumElements = words;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        invoke(device, 19, word(placed[1]), 0, word(&view), cpu + sizeof(descriptors[0]));
+    }
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})
