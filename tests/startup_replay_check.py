@@ -141,12 +141,12 @@ def check_timing(summary, recording, progress):
     assert calls <= summary["played"] and presents <= summary["presents"], progress
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False):
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=()):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     if timing:
         env["X2W_REPLAY_TIMING"] = "1"
-    code, text = run([player, recording, out, "--adapter", backend], env)
+    code, text = run([player, recording, out, "--adapter", backend, *extra], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
         raise AssertionError("x2w_replay exit %d on %s (%d bytes)\n%s\n%s" % (code, recording.name, recording.stat().st_size,
@@ -349,9 +349,33 @@ def main(scene, player, backend, mode=None):
         _score, wide_played = replay(player, wide, directory / "wide_replayed", backend, env)
         differ = [n for n in names if wide_played.get(n) != wide_recorded[n]]
         assert not differ, "slot-127 replay differs at %s" % differ
+        # Shaders travel in the recording (SHDR): a recording made on a cache whose requests were never translated
+        # replays on a machine with no title files, and the translator of THIS machine (--translator) translates the
+        # requests before the first call. Without it the shaders stay untranslated and the pictures differ.
+        fresh = directory / "cache_untranslated"
+        fresh.mkdir()
+        raw_dir, raw = directory / "raw_recorded", directory / "raw.x2wr"
+        raw_dir.mkdir()
+        code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                         dict(env, X2W_SHADER_CACHE=str(fresh), X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(raw),
+                              X2W_PRESENT_PICTURES=str(raw_dir)))
+        assert code == 0, text[-3000:]
+        translator = '"%s" -B "%s"' % (sys.executable, gfx2hlsl.__file__)
+        nothing = '"%s" -c pass' % sys.executable
+        results = {}
+        for label, extra in (("none", ()), ("noop", ("--translator", nothing)), ("real", ("--translator", translator))):
+            _score, shown = replay(player, raw, directory / ("shdr_" + label), backend, env, extra=extra)
+            summary = json.loads((directory / ("shdr_" + label) / "replay_summary.json").read_text())["shaders"]
+            results[label] = (shown, summary)
+        none, noop, real = results["none"][1], results["noop"][1], results["real"][1]
+        assert none["requests"] >= 2 and none["untranslated_before"] >= 1 and none["untranslated_after"] == none["untranslated_before"], none
+        assert noop["translator_exit"] == 0 and noop["untranslated_after"] == noop["untranslated_before"], noop
+        assert real["translator_exit"] == 0 and real["untranslated_before"] >= 1 and real["untranslated_after"] == 0, real
+        assert all(results["real"][0][n] == recorded[n] for n in names), "translated replay differs from the translated run"
+        assert any(results["none"][0][n] != recorded[n] for n in names), "an untranslated replay drew the translated picture"
+        assert any(results["noop"][0][n] != recorded[n] for n in names), "a translator that did nothing changed the pictures"
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
-              "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
-              (PRESENTS, score))
+              "window f6,6 replays presents 7-12 equal; untranslated shader requests in a recording are translated by the replay machine (%d to %d); %s" % (PRESENTS, real["untranslated_before"], real["untranslated_after"], score))
     return 0
 
 
