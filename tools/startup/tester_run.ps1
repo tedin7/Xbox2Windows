@@ -36,7 +36,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input none (the default, also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input start (the default): ONLY the Start button, one 0.3 s press every 3 s from 10 s after the first pad poll, never D-pad or A; each press waits for the picture to change, and once it has changed (and stays) the pressing stops for good (150 s at the latest), so Start never opens a pause menu in the game. -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -55,7 +55,7 @@ param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
-    [Alias("Input")] [string]$InputMode = "none",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [Alias("Input")] [string]$InputMode = "start",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
     [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",

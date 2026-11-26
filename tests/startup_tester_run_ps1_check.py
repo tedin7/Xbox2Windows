@@ -251,8 +251,10 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_snap) as z:
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
-        # No -Input given: the default is no automatic presses (an empty script, no labels), so the tester's own clicks are not fought
-        assert snap_manifest["input_script"] in ("", None) and not snap_manifest["input_labels"], snap_manifest["input_script"]
+        # No -Input given:
+        # The default input is `start`: only the Start button (mask 1), never D-pad or A, labelled per press
+        assert snap_manifest["input_script"].startswith("group,1@10+0.3,wait=0.5/3/go,wait=3000/3000/stop,end,group,1@+0+0.3,"), snap_manifest["input_script"]
+        assert snap_manifest["input_labels"][:2] == ["press Start #1", "press Start #2"] and len(snap_manifest["input_labels"]) == 50
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)

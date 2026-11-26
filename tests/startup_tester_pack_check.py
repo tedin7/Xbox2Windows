@@ -65,6 +65,17 @@ def check_preset():
     for n, item in enumerate(items2[1:]):
         assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
+    start = T.input_preset("start", 600)
+    items = start.split(",")
+    presses = [i for i in items if "@" in i and not i.startswith("wait")]
+    assert presses[0] == "1@10+0.3" and set(presses[1:]) == {"1@+0+0.3"}, "only the Start button (mask 1), 0.3 s, first at 10 s"
+    assert len(presses) == T.START_CAP_S // T.START_EVERY_S == 50 and len(items) <= T.MAX_ENTRIES and len(start) <= T.MAX_SCRIPT_CHARS
+    assert not {"40", "80", "4"} & {i.split("@")[0] for i in presses}, "no D-pad, no A"
+    # one press per group: a wait for the picture that times out after 3 s (the next press follows), then the wait that never completes
+    # (reached only when the picture changed: no more presses for good)
+    assert items[:5] == ["group", "1@10+0.3", "wait=0.5/3/go", "wait=3000/3000/stop", "end"], items[:5]
+    assert start == T.input_preset("start", 20), "the run length does not change the script (the cap is 150 s)"
+    assert T.input_labels("start", 600) == ["press Start #%d" % n for n in range(1, 51)], "one label per press entry"
     for none in ("none", "off", "OFF", ""):
         assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"

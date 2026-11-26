@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
-  tester_pack.py input-preset <none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py input-preset <start|none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
@@ -52,6 +52,28 @@ MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
+
+
+START_MASK = "1"         # GameInput Menu = the Start button
+START_FIRST_S = 10       # first press, seconds after the first pad poll
+START_EVERY_S = 3        # one press (0.3 s) every 3 s while the picture has not changed
+START_HOLD_S = "0.3"
+START_CAP_S = 150        # the script ends here whatever happens (50 presses)
+START_SETTLE_S = 0.5     # the picture must stay unchanged this long after it changed (a change in the last half second of a window is caught by the next window)
+START_BLOCK_S = 3000     # the blocking wait that ends the pressing for good: longer than any run
+
+
+def start_script():
+    """`start`: ONLY the Start button, one press (0.3 s) every 3 s from 10 s. Each press sits in a group with a wait for the
+    presented picture: when the picture does NOT change within 3 s the wait times out and the rest of the group is skipped,
+    so the next press follows; when it changes (and stays unchanged for 0.5 s) the rest of the group runs, which is one wait
+    that never completes in a run, so there are no more presses for good and Start never opens a pause menu in the game.
+    Ends at 150 s at the latest (50 presses). Needs render mode, which tester_run.ps1 always uses."""
+    items = []
+    for n in range(START_CAP_S // START_EVERY_S):
+        first = "%s@%d+%s" % (START_MASK, START_FIRST_S, START_HOLD_S) if n == 0 else "%s@+0+%s" % (START_MASK, START_HOLD_S)
+        items += ["group", first, "wait=%g/%d/go" % (START_SETTLE_S, START_EVERY_S), "wait=%d/%d/stop" % (START_BLOCK_S, START_BLOCK_S), "end"]
+    return ",".join(items)
 
 
 def menus2_script():
@@ -120,6 +142,8 @@ NO_INPUT = ("none", "off", "")  # input presets that press nothing
 def input_labels(spec, seconds, privacy_boxes=2):
     """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
     `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
+    if spec == "start":  # one label per press entry (the log's `item N` counts press entries only)
+        return ["press Start #%d" % (n + 1) for n in range(START_CAP_S // START_EVERY_S)]
     if spec != "menus":  # none, off, menus2 and raw scripts have no labelled passes
         return []
     count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
@@ -138,6 +162,8 @@ def input_preset(spec, seconds, privacy_boxes=2):
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
     if spec.strip().lower() in NO_INPUT:
         return ""
+    if spec == "start":
+        return start_script()
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
