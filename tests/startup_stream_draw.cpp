@@ -552,6 +552,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0)) {
         extern int draw_formatted_buffer(void*, void*);
         if (const int result = draw_formatted_buffer(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_SRV", nullptr, 0)) {
+        extern int draw_cube_address_srv(ID3D12Device*, void*, void*);
+        if (const int result = draw_cube_address_srv(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_VOLUME_SRV", nullptr, 0)) {
         extern int draw_volume_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_volume_address_srvs(desktop.Get(), guest, list)) return result;

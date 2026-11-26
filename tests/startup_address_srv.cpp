@@ -1101,3 +1101,69 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
 
     return 0;
 }
+
+int draw_cube_address_srv(ID3D12Device* desktop, void* guest, void* list)
+{
+    const bool array = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_ARRAY", nullptr, 0) != 0;
+    const bool tiled = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_TILED", nullptr, 0) != 0;
+    const bool swap_faces = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_SWAP", nullptr, 0) != 0;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1,
+        static_cast<UINT16>(array ? 18 : 6), 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        tiled ? static_cast<D3D12_TEXTURE_LAYOUT>(0x101) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_RESOURCE_FLAG_NONE};
+
+    // A 1x1 face at (0,0) starts its own 256-byte standard block in layout 0x101.
+    UINT64 stride = 256;
+    if (!tiled) {
+        UINT64 face_bytes = 0;
+        desktop->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &face_bytes);
+        if (face_bytes < 4 || face_bytes == ~UINT64{0}) return 50;
+        // Slot 133's desktop-row backing rounds each slice's mip chain to 64 KiB.
+        stride = (face_bytes + 0xffff) & ~UINT64{0xffff};
+    }
+    static std::vector<unsigned char> backing;
+    backing.assign(static_cast<std::size_t>(stride * desc.DepthOrArraySize), 0);
+    for (UINT slice = 0; slice < desc.DepthOrArraySize; ++slice) {
+        const UINT face = slice % 6;
+        const UINT value_slice = swap_faces && face < 2 ? slice - face + (1 - face) : slice;
+        auto* pixel = backing.data() + slice * stride;
+        pixel[0] = static_cast<unsigned char>(16 + 11 * value_slice);
+        pixel[3] = 255;
+    }
+
+    void* placed = nullptr;
+    if (!tiled && FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&desc),
+                                           D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&placed)))))
+        return 51;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    ViewAt view{};
+    view.address = ptr(backing.data());
+    view.view.Format = desc.Format;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (array) {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        view.view.TextureCubeArray = {0, 1, 6, 2, 0};
+    } else {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        view.view.TextureCube = {0, 1, 0};
+    }
+    invoke(guest, 18, 0, ptr(&view.view), cpu);
+    const auto* descriptor = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), descriptor, previous.size());
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+    std::printf("slot 70 cube descriptor_changed=%d\n",
+                std::memcmp(previous.data(), descriptor, previous.size()) != 0);
+
+    if (array) {
+        std::memcpy(previous.data(), descriptor, previous.size());
+        view.view.TextureCubeArray.NumCubes = 3;
+        invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+        if (std::memcmp(previous.data(), descriptor, previous.size()) != 0) return 52;
+    }
+    invoke(list, 12, 3, 1);
+    return 0;
+}

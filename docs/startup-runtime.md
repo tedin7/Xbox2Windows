@@ -3430,9 +3430,27 @@ The description must be two-dimensional, at most 16384 texels a side, with 1 to 
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
-textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+the linear mode `0x100` without a live texture, multisampled textures, the XOR swizzle modes and
+every other layout value. The texels must be readable and span
 at most 64 MiB.
+
+With `X2W_SLOT70_MEMORY_CUBE=1`, slot 70 also accepts `TextureCube` and
+`TextureCubeArray` views of square, single-sample 2D textures with six slices per
+cube, including 1×1 faces. It uses a matching live texture for layout 0 or the
+existing publication path for supported console layouts. Slice order is +X, -X,
++Y, -Y, +Z, -Z. Cube-array views must fit the resource from the first face, and
+both view types must fit the mip range. The switch defaults to off.
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_address_cube_srv_warp$' -V
+```
+
+The WARP fixture samples all six directions for a placed cube and for a
+two-cube view starting at slice six. It repeats those checks on synthetic
+256-byte tiled backing. It compares all 32 RGBA pixels per draw with the CPU
+reference, checks that switch-off and out-of-range calls preserve the
+descriptor, and requires the swapped +X/-X face data to fail the original
+comparison for each backing and view type.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
 partial-tile BC view is held for. `console_layout_xg_rows`: the latest XG stand-in copy announced
