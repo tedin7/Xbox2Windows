@@ -484,12 +484,20 @@ REQUESTS_COMPUTE_SHARE = 25  # of REQUESTS_TOP: compute keys are ranked by dispa
                              # so one shared ranking would never pick a graphics key; each family gets its own ranking, slack goes over
 
 
-def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE):
+REQUESTS_FAMILIES = 4      # the refusal families with the most refused keys ...
+REQUESTS_FAMILY_KEYS = 20  # ... each get their top 20 keys by uses first (on top of `top`; the byte cap still holds)
+
+
+def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE,
+                    uses=None, families=REQUESTS_FAMILIES, family_keys=REQUESTS_FAMILY_KEYS):
     """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys: compute keys ranked by dispatches
     without a translation, the other kinds by draws not drawn, `compute_share` of `top` for compute and the rest for the others
     (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
     .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
-    without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing."""
+    without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing.
+    `uses` ({key: (first s, last s, uses)}, key_use) adds a first pass per refusal family: the `families` refusal reasons
+    (normal_reason, registers and numbers ignored) with the most refused keys each contribute their `family_keys` keys with the most
+    uses, whatever their draw/dispatch weight, so "all keys of this wall" come back (c20 wanted the top 20 'branch out of the block')."""
     names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
     # An RTV variant (req_<variant>.rtv, text "rtv1 <base key in decimal> <formats>") has no code of its own: its draws count on its
     # base key, and the variant's request file travels with the base's files (Run R: be7c1a1a / ca7cec3b were never picked because
@@ -510,6 +518,33 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     groups = [[r for r in ranked if r[1] == "compute"], [r for r in ranked if r[1] != "compute"]]
     quota = [min(compute_share, top), top - min(compute_share, top)]
     taken, chosen, used = [0, 0], {}, 0
+    family_of = {}
+
+    def take(key, kind, weight):
+        nonlocal used
+        own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
+        files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
+        size = sum(b for _, b in files)
+        if not files or used + size > cap:
+            return False
+        used += size
+        have = {os.path.splitext(n)[1] for n, _ in files}
+        chosen[key] = (key, kind, weight, files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
+        return True
+
+    if uses:
+        count = {}
+        for key, kind, status, reason in rows:
+            if status == "refused":
+                family_of[key] = normal_reason(reason)
+                count[family_of[key]] = count.get(family_of[key], 0) + 1
+        for family in sorted(count, key=lambda f: (-count[f], f))[:families]:
+            members = sorted((r for r in rows if r[2] == "refused" and family_of.get(r[0]) == family and r[0] in uses),
+                             key=lambda r: (-uses[r[0]][2], r[0]))
+            for key, kind, _, _ in members[:family_keys]:
+                if key not in chosen:
+                    take(key, kind, weights.get(key, 0) or uses[key][2])
+    top += len(chosen)
     # first pass: each family up to its quota; second pass: what is left of `top` goes to whichever family still has keys
     for round_quota in (quota, [top, top]):
         for gi, group in enumerate(groups):
@@ -518,15 +553,8 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
                     continue
                 if taken[gi] >= round_quota[gi] or len(chosen) >= top:
                     break
-                own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
-                files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
-                size = sum(b for _, b in files)
-                if not files or used + size > cap:
-                    continue
-                have = {os.path.splitext(n)[1] for n, _ in files}
-                used += size
-                taken[gi] += 1
-                chosen[key] = (key, kind, weights[key], files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
+                if take(key, kind, weights[key]):
+                    taken[gi] += 1
     return sorted(chosen.values(), key=lambda c: (-c[2] if c[1] == "compute" else 0, -c[2], c[0]))
 
 
@@ -781,7 +809,7 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         if os.path.isfile(stderr_path):
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
                 weights = key_weights(handle.read())
-        chosen = select_requests(cache_dir, rows, weights)
+        chosen = select_requests(cache_dir, rows, weights, uses=key_use(logdir))
         for key, kind, weight, files_of_key, _missing in chosen:
             for name, _ in files_of_key:
                 with open(os.path.join(cache_dir, name), "rb") as handle:

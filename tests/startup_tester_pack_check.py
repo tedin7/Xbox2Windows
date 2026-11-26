@@ -670,6 +670,36 @@ def check_phase_table():
             assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
 
 
+def check_request_families():
+    """The top refusal families each bring their 20 keys with the most uses, whatever their dispatch/draw weight (c20: the code of
+    the top 20 'branch out of the block' keys), on top of the weight ranking; the byte cap still holds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "cache"
+        cache.mkdir()
+        uses = {}
+        for n in range(30):   # 30 keys of one wall, no census weight at all
+            key = "d%015x" % n
+            for ext in (".c67", ".data", ".root"):
+                write(cache, "req_%s%s" % (key, ext), b"B" * 50)
+            write(cache, "%s.fail" % key, ("branch out of the block %d is not covered\n" % n).encode())
+            uses[key] = (1.0, 2.0, 100 + n)
+        for n in range(5):    # a small other wall
+            key = "e%015x" % n
+            write(cache, "req_%s.c67" % key, b"E" * 50)
+            write(cache, "%s.fail" % key, b"v_readfirstlane_b32 requires a proven uniform source\n")
+            uses[key] = (1.0, 2.0, 5)
+        rows = T.cache_results(str(cache))
+        assert T.select_requests(str(cache), rows, {}) == [], "without uses nothing is ranked (no weights)"
+        chosen = T.select_requests(str(cache), rows, {}, uses=uses)
+        wall = [c[0] for c in chosen if c[0].startswith("d")]
+        assert sorted(wall) == sorted("d%015x" % n for n in range(10, 30)), "the 20 most used keys of the wall: %r" % wall
+        assert all(any(n.endswith(".c67") for n, _ in c[3]) and any(n.endswith(".data") for n, _ in c[3]) for c in chosen if c[0].startswith("d"))
+        assert len([c for c in chosen if c[0].startswith("e")]) == 5, "a second wall brings its keys too"
+        assert len(T.select_requests(str(cache), rows, {}, uses=uses, cap=700)) < len(chosen), "the byte cap still holds"
+        capped = T.select_requests(str(cache), rows, {}, uses=uses, cap=700)
+        assert sum(b for c in capped for _, b in c[3]) <= 700
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -813,6 +843,7 @@ if __name__ == "__main__":
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
+    check_request_families()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
