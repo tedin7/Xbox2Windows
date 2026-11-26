@@ -200,7 +200,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // dispatch-heap-outside sets the constant to 0x07ffffff, whose record is past any heap.
 // dispatch-heap-word runs the program of startup_gfx2hlsl_heap_word_check.py: the constant is 1 and picks the word
 // of the upload buffer at table byte 96 that holds the index, 2. dispatch-heap-word-outside makes that word
-// 0x07ffffff, dispatch-heap-word-past ends the buffer at that word, and dispatch-heap-word-placed names the placed
+// 0x07ffffff, dispatch-heap-word-null leaves the descriptor of that buffer null (the word reads 0, record 0 is the input),
+// dispatch-heap-word-past ends the buffer at that word, and dispatch-heap-word-placed names the placed
 // input buffer instead of upload memory.
 // Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
@@ -295,8 +296,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
-        for (const UINT at : {0u, 32u, 64u})
-            std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64], sizeof(descriptors[0]));
+        for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
+            std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
+                        sizeof(descriptors[0]));
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
     const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
@@ -360,7 +362,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         bind();
     }
     if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
-    if (heap_word) {
+    if (mode == "dispatch-heap-word-null")
+        std::memset(reinterpret_cast<void*>(cpu + 96), 0, 16);  // the index buffer's descriptor stays null: the word reads as 0
+    else if (heap_word) {
         // The index buffer of table byte 96, in this recording's upload memory (list slot 148). Byte 288 + 336 * 1
         // holds the index, 2; every other word names record 0 or 1, the output's descriptor.
         constexpr UINT bytes = 0x400, at = 0x270;
