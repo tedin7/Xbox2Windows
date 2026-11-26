@@ -1969,7 +1969,11 @@ be had stops the replay with exit 3 and its address), and every `MAP` is written
 sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
 span's final image hash. Set `X2W_REPLAY_DUMP_MAP_RANGES=1` in the player environment to write
 `map_<sequence>.bin` for an explicit, nonempty buffer Map read range, when the call succeeds and writes its
-output. Wait for GPU completion before Map in the recorded workload. Not replayed yet: float arguments passed by value, one thread per recorded thread.
+output. For an output buffer that aliases title memory, record with
+`X2W_REPLAY_TITLE_RANGES=1` and `X2W_REPLAY_PAGES_AT_SUBMIT=1` to capture raw heap descriptors and placed buffers.
+Play with `--dump HEX_ADDRESS:BYTES` to write up to 64 MiB of a reserved title range to `dump.bin` after the recorded calls
+and before trailing page updates. Wait for GPU completion in the recorded workload before either readback.
+Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
 Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
 in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
