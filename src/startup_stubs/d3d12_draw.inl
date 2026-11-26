@@ -1754,13 +1754,15 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
     const auto* original = resource_info(resource);
-    const bool tiled_address = resource->own().tiled_address_srv;
+    const bool placed_1d = resource->own().tiled_address_srv && original &&
+                           original->console.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    const bool tiled_address = resource->own().tiled_address_srv && !placed_1d;
     const bool console = tiled_address && original && console_layout_srv(original->console);
     const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
-    const bool single = resource->own().tiled_address_srv && x2w_startup::single_element_bytes(desc) != 0;
+    const bool single = tiled_address && x2w_startup::single_element_bytes(desc) != 0;
     const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || single ||
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || single || placed_1d ||
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
     {
         static LONG reasons;
@@ -1805,6 +1807,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
         written = found->second;
     ReleaseSRWLockShared(&written_lock);
+    if (placed_1d && written.bc7_width) return false;
     const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
     // Any other texture slot 70 publishes holds its texels in the console layout its description names
     // (gfx10_layout.h, address_texture.h).
@@ -1858,7 +1861,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
-        if (console) return false;
+        if (console || placed_1d) return false;
         state.done = true;
         state.staged = false;
         state.generation = generation;

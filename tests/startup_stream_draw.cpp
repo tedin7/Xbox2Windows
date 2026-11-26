@@ -525,6 +525,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
         if (const int result = draw_1d_srvs(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_UNREGISTERED_1D_SRV", nullptr, 0)) {
+        extern int draw_unregistered_1d_address_srv(void*, void*);
+        if (const int result = draw_unregistered_1d_address_srv(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV_1D", nullptr, 0)) {
         extern int draw_1d_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_1d_address_srvs(desktop.Get(), guest, list)) return result;

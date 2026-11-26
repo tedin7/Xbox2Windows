@@ -68,6 +68,12 @@ bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOUR
     return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
 }
 
+bool placed_1d_texture_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_PLACED_1D_TEXTURE");
+    return enabled;
+}
+
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -75,7 +81,7 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
         static const bool enabled = x2w_local::env_on("X2W_PLACED_SRV_1D");
         const auto format = desktop_format(r.Format);
-        if (!enabled || !r.Width || r.Height != 1 || !r.DepthOrArraySize ||
+        if ((!enabled && !placed_1d_texture_enabled()) || !r.Width || r.Height != 1 || !r.DepthOrArraySize ||
             r.SampleDesc.Count != 1 || r.SampleDesc.Quality != 0 ||
             (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             v.Format != r.Format || format == DXGI_FORMAT_UNKNOWN ||
@@ -638,6 +644,84 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
     return "texture_unavailable";  // publication failed for another reason (no wrapper)
 }
 
+// Publish a plain CPU footprint, distinct from the tiled address sources below.
+Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& title,
+                                   D3D12_SHADER_RESOURCE_VIEW_DESC& view, const char*& refusal)
+{
+    refusal = "unsupported_desktop_format";
+    constexpr UINT gpu_writes = static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
+                                static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) |
+                                static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || (title.Flags & gpu_writes) ||
+        title.Width > D3D12_REQ_TEXTURE1D_U_DIMENSION ||
+        title.DepthOrArraySize > D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION)
+        return nullptr;
+    if (!title.MipLevels || title.MipLevels > x2w_startup::SliceFootprints::max_mips ||
+        (title.Width >> (title.MipLevels - 1)) == 0) return nullptr;
+
+    auto desc = sanitized(title);
+    desc.Alignment = 0;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    view.Format = desc.Format;
+    if (!desktop_address_view_supported(device, desc, view)) {
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        if (!desktop_address_view_supported(device, desc, view)) return nullptr;
+        // The view must agree with the desktop resource and the consuming shader declaration.
+        if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D) {
+            const auto one = view.Texture1D;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D = {one.MostDetailedMip, one.MipLevels, 0, one.ResourceMinLODClamp};
+        } else {
+            const auto one = view.Texture1DArray;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {one.MostDetailedMip, one.MipLevels, one.FirstArraySlice, one.ArraySize,
+                                   0, one.ResourceMinLODClamp};
+        }
+    }
+
+    auto* const desktop = device_of(device);
+    const x2w_startup::SliceFootprints plan(desktop, desc, desc.MipLevels);
+    if (!plan.size || plan.size == UINT64_MAX) return nullptr;
+    const u64 stride = (plan.size + 0xFFFF) & ~u64{0xFFFF};
+    const u64 bytes = stride * (desc.DepthOrArraySize - 1) + plan.size;
+    refusal = "texture_over_64mib";
+    if (bytes > max_published_texture_bytes) return nullptr;
+    refusal = "overlapping_resource";
+    if (address_resource_overlap(address, bytes)) return nullptr;
+    refusal = "texture_unreadable";
+    if (!texture_range_readable(address, bytes)) return nullptr;
+
+    std::lock_guard lock(tiled_srv_mutex);
+    const auto [first, last] = tiled_srv_addresses.equal_range(address);
+    for (auto it = first; it != last; ++it) {
+        const auto& known = tiled_srv_textures.at(it->second);
+        if (known.device == device && same_texture_description(known.desc, title)) {
+            AcquireSRWLockExclusive(&written_lock);
+            ++written_textures()[address].generation;
+            ReleaseSRWLockExclusive(&written_lock);
+            return known.resource;
+        }
+    }
+
+    refusal = "texture_unavailable";
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    x2w_startup::ComPtr<ID3D12Resource> real;
+    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, IID_PPV_ARGS(&real))))
+        return nullptr;
+    Wrapper* resource = wrap(real.Get(), resource_kind);
+    if (!resource) return nullptr;
+    auto* const backing = real.Detach();
+    resource->own().title_memory = reinterpret_cast<void*>(address);
+    resource->own().tiled_address_srv = true;
+    resource->own().budget = x2w_budget::committed(desktop, backing, D3D12_HEAP_TYPE_DEFAULT);
+    note_resource(resource, &title, bytes);
+    tiled_srv_textures.emplace(resource, TiledAddressTexture{device, resource, title, {}});
+    tiled_srv_addresses.emplace(address, resource);
+    x2w_startup::note_placement_change();
+    return resource;
+}
+
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = address_texture_bytes(device, desc);
@@ -692,6 +776,8 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
+    if (sampled.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+        return static_cast<ID3D12Resource*>(resource->own().real);
     // An already-published token can outlive a write in a different layout.
     if ((partial_tiled_bc(sampled.desc) || console_layout_srv(sampled.desc)) &&
         latest_texture_write_is_rows(reinterpret_cast<u64>(resource->own().title_memory)))
@@ -960,6 +1046,20 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
+    if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled()) {
+        auto view = input->view;
+        const char* refusal = nullptr;
+        texture = publish_placed_1d_texture(self, input->address, *resource, view, refusal);
+        log_address_kind(texture ? "published placed 1D texture" : refusal, *resource, input->view, input->address);
+        if (!texture) {
+            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", refusal, resource, input,
+                              destination);
+            return;
+        }
+        view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&view), destination, 0);
+        note_memory_srv_write(resource, input, destination);
+        return;
+    }
     // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
     if (console_layout_srv(*resource)) {
