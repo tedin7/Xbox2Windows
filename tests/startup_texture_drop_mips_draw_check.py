@@ -54,6 +54,13 @@ CASES = (
     ("threshold above the size", SAMPLE_PS, "srvuse 0 sample\nsmp 0 0 0 0 0\n",
      {"X2W_D3D12_TEXTURE_DROP_MIPS": "1", "X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES": "16777216"}, 0, False),
     ("two levels", SAMPLE_PS, "srvuse 0 sample\nsmp 0 0 0 0 0\n", {"X2W_D3D12_TEXTURE_DROP_MIPS": "2"}, 2, True),
+    # The same draws with the resolved-view cache on (X2W_VIEW_CACHE): the view is built into the cache slot and copied,
+    # so the pixels and the dropped levels must not change.
+    ("view cache, drop on", SAMPLE_PS, "srvuse 0 sample\nsmp 0 0 0 0 0\n",
+     {"X2W_D3D12_TEXTURE_DROP_MIPS": "1", "X2W_VIEW_CACHE": "1"}, 1, True),
+    ("view cache, drop off", SAMPLE_PS, "srvuse 0 sample\nsmp 0 0 0 0 0\n", {"X2W_VIEW_CACHE": "1"}, 0, False),
+    ("view cache, two levels", SAMPLE_PS, "srvuse 0 sample\nsmp 0 0 0 0 0\n",
+     {"X2W_D3D12_TEXTURE_DROP_MIPS": "2", "X2W_VIEW_CACHE": "1"}, 2, True),
 )
 
 

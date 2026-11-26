@@ -1301,6 +1301,45 @@ bool ensure_draw_heap(Wrapper* device)
     return true;
 }
 
+// X2W_VIEW_CACHE (default off): a texture SRV is built once into a slot of a persistent CPU-only heap and copied to the draw's
+// descriptor on later draws, as long as the cache says the entry still names the same view over the same texture (view_cache.h).
+// draw_lock held. The stamp folds in what else decides the descriptor: the desktop texture, its dropped mip levels, the dimension.
+ID3D12DescriptorHeap* view_cache_heap;
+Wrapper* view_cache_heap_device;
+inline D3D12_CPU_DESCRIPTOR_HANDLE view_cache_slot(std::uint32_t id)
+{
+    if (!view_cache_heap || view_cache_heap_device != the_device) {
+        if (view_cache_heap) view_cache_heap->Release();
+        view_cache_heap = nullptr;
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, x2w_view_cache::view_cache().slot_count(),
+                                              D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&view_cache_heap)))) return {};
+        view_cache_heap_device = the_device;
+        x2w_view_cache::view_cache().note_flush();  // entries of an older heap name slots that no longer exist
+    }
+    return {view_cache_heap->GetCPUDescriptorHandleForHeapStart().ptr +
+            SIZE_T{x2w_view_cache::view_cache().slot_of(id)} * draw_heap_increment};
+}
+inline std::uint64_t view_cache_stamp(const ID3D12Resource* texture, UINT dropped_levels, D3D12_SRV_DIMENSION dimension)
+{
+    return reinterpret_cast<std::uint64_t>(texture) ^ (std::uint64_t{dropped_levels} << 48) ^ (std::uint64_t{static_cast<UINT>(dimension)} << 56);
+}
+// Binds the view of `texture` into `dest`: from the cache on a hit, built into the cache slot and copied on a miss.
+void bind_cached_srv(const ViewRecord& record, const x2w_view_cache::Cache::Ticket& ticket, std::uint64_t stamp, ID3D12Resource* texture,
+                     const D3D12_SHADER_RESOURCE_VIEW_DESC& desc, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    auto& cache = x2w_view_cache::view_cache();
+    const D3D12_CPU_DESCRIPTOR_HANDLE slot = view_cache_slot(record.id);
+    if (!slot.ptr) {
+        device_of(the_device)->CreateShaderResourceView(texture, &desc, dest);
+        return;
+    }
+    const bool hit = cache.lookup(record.id, record.resource, x2w_view_cache::Kind::srv, stamp);
+    if (!hit) device_of(the_device)->CreateShaderResourceView(texture, &desc, slot);
+    device_of(the_device)->CopyDescriptorsSimple(1, dest, slot, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!hit) cache.publish(record.id, record.resource, x2w_view_cache::Kind::srv, stamp, ticket);
+}
+
 // A recorded table is immutable. Keep it alive until its submission completes,
 // including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
@@ -2988,6 +3027,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 ReleaseSRWLockShared(&note_lock);
             }
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+            // Taken before the texture is read or built over: a release landing during the build must make the entry miss.
+            const x2w_view_cache::Cache::Ticket cache_ticket = x2w_view_cache::Cache::enabled() && known
+                ? x2w_view_cache::view_cache().begin(record.resource) : x2w_view_cache::Cache::Ticket{};
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             desc.ViewDimension = dimension;
@@ -3092,7 +3134,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
-            device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            if (x2w_view_cache::Cache::enabled() && texture && known && record.desc_bytes >= 40 && !mismatched)
+                bind_cached_srv(record, cache_ticket,
+                                view_cache_stamp(texture, resource ? resource->own().drop_levels : 0, desc.ViewDimension), texture, desc, dest);
+            else
+                device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }
         if (indirect) {
