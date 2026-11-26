@@ -227,6 +227,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
 }
 
 void stop(bool at_exit);
+inline void pages_at_submit(ThreadBuffer& b, u64 seq);  // d3d12_record_pages.inl
 
 template <int K, int N>
 __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6,
@@ -240,6 +241,15 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     // Nothing but the sequence number (an interlocked instruction) before the real call.
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    // ExecuteCommandLists takes no float arguments, so the page scan may run before it.
+    if constexpr (K == queue_kind && N == 10) {
+        if (window_open) {
+            ThreadBuffer& b = my_buffer();
+            AcquireSRWLockExclusive(&b.lock);
+            pages_at_submit(b, seq - 1);
+            ReleaseSRWLockExclusive(&b.lock);
+        }
+    }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
     record_call(K, N, seq, rcx, args, ret);

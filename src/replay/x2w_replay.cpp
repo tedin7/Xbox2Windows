@@ -74,7 +74,21 @@ struct Player {
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
+    mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     void* device = nullptr;
+
+    // A recorded byte range inside a translated range: the replay's address, `bytes` clipped to that range.
+    u64 page_target(u64 address, u64& bytes) const
+    {
+        auto above = handles.upper_bound(address);
+        if (above == handles.begin()) return address;
+        --above;
+        const u64 offset = address - above->first;
+        if (offset >= above->second.span) return address;
+        if (bytes > above->second.span - offset) bytes = above->second.span - offset;
+        ++page_translated;
+        return above->second.to + offset;
+    }
 
     u64 translate(u64 value) const
     {
@@ -261,7 +275,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.unknown_object;
         return false;
     }
-    apply_pages_before(r, c.seq);
+    apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
     u64 a[call_args];
@@ -463,7 +477,8 @@ int run(const Options& o)
         }
         play(p, r, s);
     }
-    if (!stopped) apply_pages_before(r, ~0ull);  // the pages recorded after the last call
+    if (!stopped)  // the pages recorded after the last call
+        apply_pages_before(r, ~0ull, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     const double wall = elapsed();
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",

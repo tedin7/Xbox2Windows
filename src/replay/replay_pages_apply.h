@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,7 +67,19 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
 }
 
 // Writes one MAP's runs into the reserved memory.
-inline void apply_map(const Recording& r, const PageMap& m)
+// Where a recorded page is on the replay: its address there, with `bytes` clipped to the translated range. The
+// recorded address itself when the page is not in a translated range.
+using PageTarget = std::function<u64(u64 address, u64& bytes)>;
+
+inline void write_page(const PageTarget& target, u64 at, const unsigned char* data)
+{
+    u64 bytes = page_bytes;
+    auto* to = reinterpret_cast<unsigned char*>(target ? target(at, bytes) : at);
+    if (data) std::memcpy(to, data, static_cast<std::size_t>(bytes));
+    else std::memset(to, 0, static_cast<std::size_t>(bytes));
+}
+
+inline void apply_map(const Recording& r, const PageMap& m, const PageTarget& target)
 {
     PageReplay& state = page_replay();
     const unsigned char* p = m.data;
@@ -84,9 +97,9 @@ inline void apply_map(const Recording& r, const PageMap& m)
             return;
         }
         for (std::uint32_t i = 0; i < run.pages; ++i) {
-            auto* page = reinterpret_cast<unsigned char*>(m.address + (u64{run.first} + i) * page_bytes);
+            const u64 page = m.address + (u64{run.first} + i) * page_bytes;
             if (run.kind == 1) {
-                std::memset(page, 0, page_bytes);
+                write_page(target, page, nullptr);
                 ++state.zero_pages;
                 continue;
             }
@@ -102,7 +115,7 @@ inline void apply_map(const Recording& r, const PageMap& m)
                 ++state.missing_pages;
                 continue;
             }
-            std::memcpy(page, found->second, page_bytes);
+            write_page(target, page, found->second);
             ++state.pages_written;
         }
     }
@@ -110,10 +123,10 @@ inline void apply_map(const Recording& r, const PageMap& m)
 }
 
 // Before the call with sequence number `seq`: every MAP recorded below it that is not written yet.
-inline void apply_pages_before(const Recording& r, u64 seq)
+inline void apply_pages_before(const Recording& r, u64 seq, const PageTarget& target = {})
 {
     PageReplay& state = page_replay();
-    while (state.next_map < r.maps.size() && r.maps[state.next_map].seq < seq) apply_map(r, r.maps[state.next_map++]);
+    while (state.next_map < r.maps.size() && r.maps[state.next_map].seq < seq) apply_map(r, r.maps[state.next_map++], target);
 }
 
 // FNV-1a of a reserved span's bytes, for the summary (a replay's image can be compared with the recorded one).

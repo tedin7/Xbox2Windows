@@ -186,3 +186,11 @@ inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
     page_target = nullptr;
     ReleaseSRWLockExclusive(&pages_lock);
 }
+
+// Before an ExecuteCommandLists inside the window (queue slot 10; a compute-only stretch has no present): the pages
+// changed since the last capture. `seq` is the Execute call's sequence number minus one, so a replay writes them before
+// that call. Empty until the page store fills it.
+inline void pages_at_submit(ThreadBuffer& b, u64 seq)
+{
+    (void)b, (void)seq;
+}
