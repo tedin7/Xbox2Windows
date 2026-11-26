@@ -53,9 +53,16 @@ def explain(expected, actual, log):
     def row(picture):
         (width, _height), raw = picture
         return [tuple(raw[1 + x * 4:5 + x * 4]) for x in range(0, width, max(1, width // 8))]
-    tail = log.read_text(errors="replace")[-2500:] if log.exists() else "(no replay log)"
-    return "recorded %s row %s\nreplayed %s row %s\nreplay log tail:\n%s" % (
-        expected[0], row(expected), actual[0], row(actual), tail)
+    text = log.read_text(errors="replace") if log.exists() else "(no replay log)"
+    shader = [line for line in text.splitlines() if any(w in line for w in ("translat", "manifest", "shader", "not drawn"))]
+    return "recorded %s row %s\nreplayed %s row %s\nreplay log, shader lines:\n%s\nreplay log tail:\n%s" % (
+        expected[0], row(expected), actual[0], row(actual), "\n".join(shader[:25]), text[-1500:])
+
+
+def explain_log(name, log):
+    text = log.read_text(errors="replace") if log.exists() else ""
+    shader = [line for line in text.splitlines() if any(w in line for w in ("translat", "manifest", "shader", "not drawn"))]
+    return "%s, shader lines:\n%s" % (name, "\n".join(shader[:25]))
 
 
 def chunks(data):
@@ -130,6 +137,7 @@ def main(scene, player, backend):
                          dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
                               X2W_PRESENT_PICTURES=str(recorded_dir)))
         assert code == 0, text[-3000:]
+        (directory / "recorded.txt").write_text(text)
         recorded = pictures(recorded_dir)
         names = ["present_%04d.png" % n for n in range(1, PRESENTS + 1)]
         assert sorted(recorded) == names, sorted(recorded)
@@ -138,8 +146,9 @@ def main(scene, player, backend):
         score, replayed = replay(player, recording, directory / "replayed", backend, env)
         assert sorted(replayed) == names, sorted(replayed)
         differ = [n for n in names if replayed[n] != recorded[n]]
-        assert not differ, "replayed pictures differ from the recorded run: %s\n%s" % (
-            differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt"))
+        assert not differ, "replayed pictures differ from the recorded run: %s\n%s\n%s" % (
+            differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt"),
+            explain_log("recorded run", directory / "recorded.txt"))
 
         changed = directory / "changed.x2wr"
         change_last_clear(recording, changed)
