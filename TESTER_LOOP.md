@@ -16,6 +16,10 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | causes of a refused placed build, PERFORM_UPDATE with a source structure | PR #1943 | `5a79addf7` |
 | hold other threads while a hook steps over its byte | PR #1408 | `08f0f4e9f` |
 | `startup_runtime` target and `runtime` build preset (`cmake --build --preset runtime`) | PR #2827 (branch `x2w-startup-runtime-target`) | `eb82f1d39` |
+| sampler_x linear tolerance (one 8-bit weight step) | PR #2794 | `6ceb980ba` |
+| refusal cache for SRV buffer requests | PR #2782 | `a4eeb366d` |
+| fast draw path | PR #2766 | `619ae7009` |
+| `-Input menus2` (waits for a new picture after each confirm) | fork branch `c24-menus2`, gate PASS | `43a382c7b` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
