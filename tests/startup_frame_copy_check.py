@@ -83,6 +83,28 @@ def check_once(directory, consumer, backend):
     if frames != expected_frames:
         raise AssertionError(f"once: frame counters {frames!r}, expected {expected_frames!r}")
     print(f"{backend} once: 32 pixels exact, 1 trim and 1 full 16 MiB copy per frame, 3 hits per frame")
+    # Two views of ONE address with different lengths in one frame: the cache key must include the length. The 64 KiB view reads the
+    # zero head and nothing past its end (pixels 0); the 16 MiB view also reads the red words at its end.
+    keys_shader = HLSL.replace("asfloat(constants.Load4(0))",
+                               "(asfloat(constants.Load4(0)) + asfloat(constants.Load4(16777200)))")
+    ZERO = bytes(4)
+    expected_keys = b"".join((ZERO * 2 if column % 2 == 0 else RED * 2) for column in range(4)) * 4
+    for name, extra, expected in (("keys", {}, expected_keys),
+                                  ("keys, address-only key (mutant)", {"X2W_TEST_BIGBIND_KEY_ADDRESS": "1"}, None)):
+        folder = directory / name.split(",")[0].replace(" ", "_")
+        if extra:
+            folder = directory / "keys_mutant"
+        folder.mkdir()
+        pixels = draw_texture(folder, consumer, backend, keys_shader, {
+            "X2W_TEST_FRAME_COPY": "once-keys", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", **extra,
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        if expected is not None and pixels != expected:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {expected.hex()}")
+        if expected is None and pixels == expected_keys:
+            raise AssertionError(f"{name}: the mutant still drew the right picture, the control proves nothing")
+        print(f"{backend} {name}: " + ("32 pixels exact, small and large view of one address read their own bytes" if expected else "wrong picture, as the control expects"))
     # Control: with the reset at Present broken, the second frame reuses the first frame's snapshot and must show the old colour
     # (red in all eight columns), which proves the check above catches a cache that outlives its frame.
     folder = directory / "no_reset"

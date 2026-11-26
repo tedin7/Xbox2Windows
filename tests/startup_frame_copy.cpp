@@ -26,12 +26,17 @@ static void* create_present_queue(void* guest)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
+//   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
+//            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
+//            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
+//            the second view the first view's bytes.
 int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width, UINT height)
 {
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
     const bool big = !std::strncmp(mode, "big-", 4);
-    const bool once = !std::strcmp(mode, "once");
+    const bool keys = !std::strcmp(mode, "once-keys");
+    const bool once = keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
     if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
@@ -40,7 +45,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     if (big)
         for (int i = 4; i < 16384; ++i) constants[i] = 0.5f;
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const UINT entries = (32 + increment - 1) / increment;
+    const UINT entries = keys ? 2 : (32 + increment - 1) / increment;
     static std::vector<unsigned char> views;
     views.assign(static_cast<std::size_t>(entries) * increment, 0);
     const struct {
@@ -60,18 +65,38 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;
-        std::memcpy(large, constants, 4 * sizeof(float));
+        if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
         std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
     }
     const auto* memory = once ? large : constants;
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory),
         once ? large_bytes : big ? static_cast<UINT>(sizeof(constants)) : 256u};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
+    if (keys) {
+        // The second view: the same address, 64 KiB long.
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC small_view{reinterpret_cast<std::uintptr_t>(memory), 64u << 10};
+        invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&small_view), cpu + increment);
+    }
     const StreamWord table = invoke(heap, 10);
     if (!table) return 43;
 
     invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));  // SetDescriptorHeaps
     invoke(list, 36, 0, table);                                    // SetGraphicsRootDescriptorTable
+    if (keys) {
+        const StreamWord large_table = table, small_table = table + increment;
+        for (UINT draw = 0; draw < 4; ++draw) {
+            invoke(list, 36, 0, draw % 2 ? large_table : small_table);  // SetGraphicsRootDescriptorTable
+            const LONG x = static_cast<LONG>(draw * width / 4), end = static_cast<LONG>((draw + 1) * width / 4);
+            const D3D12_RECT column{x, 0, end, static_cast<LONG>(height)};
+            invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&column));
+            invoke(list, 12, 3, 1);
+        }
+        void* queue = create_present_queue(guest);
+        if (!queue) return 44;
+        invoke(queue, 32, 0, 0, 0);
+        VirtualFree(large, 0, MEM_RELEASE);
+        return 0;
+    }
     if (once) {
         void* queue = create_present_queue(guest);
         if (!queue) return 44;

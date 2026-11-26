@@ -1592,6 +1592,18 @@ bool bigbind_no_reset_mutant()
     return on;
 }
 
+// X2W_TEST_BIGBIND_KEY_ADDRESS=1 (fixtures only): the cache is keyed by address alone. The control of startup_frame_copy_once
+// (once-keys): two views of one address with different lengths must then read each other's bytes.
+bool bigbind_key_address_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_BIGBIND_KEY_ADDRESS", nullptr, 0) != 0;
+    return on;
+}
+std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
+{
+    return {address, bigbind_key_address_mutant() ? 0 : full_bytes};
+}
+
 void finish_bigbind_frame(LONG frame)
 {
     if (!bigbind_no_reset_mutant()) big_bindings.clear();
@@ -1604,7 +1616,7 @@ void finish_bigbind_frame(LONG frame)
     static const bool report = [] {
         char mode[16]{};
         GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
-        return std::strcmp(mode, "once") == 0;
+        return std::strncmp(mode, "once", 4) == 0;
     }();
     if (report && big_binding_counts.trims)
         log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
@@ -3317,7 +3329,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // A root address has no declared length. Its span is inferred by probing above.
         if (address && large_raw && srv.source != 2 && bigbind_once_enabled()) {
             try {
-                const auto [entry, inserted] = big_bindings.try_emplace({address, full_bytes});
+                const auto [entry, inserted] = big_bindings.try_emplace(bigbind_key(address, full_bytes));
                 cached = &entry->second;
                 cache_hit = !inserted;
             } catch (const std::bad_alloc&) {
@@ -3369,7 +3381,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 chunk = slice.resource;
             } else {
                 // A retry needs a fresh readability check before it can read title memory.
-                big_bindings.erase({address, full_bytes});
+                big_bindings.erase(bigbind_key(address, full_bytes));
             }
         } else if (readable_range) {
             have = frame_copy(self, address, bytes, &offset, &chunk);
