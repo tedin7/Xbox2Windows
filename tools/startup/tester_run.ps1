@@ -22,7 +22,10 @@ Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-on
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
 -Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
-time counts from that poll, which the title reaches late). Any other value is a raw
+time counts from that poll, which the title reaches late).
+-Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
+still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
+Any other value is a raw
 X2W_INPUT_SCRIPT (docs/startup-runtime.md, "Input script").
 
 .EXAMPLE
