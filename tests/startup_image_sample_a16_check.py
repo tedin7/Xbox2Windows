@@ -311,9 +311,16 @@ def controls():
     # Unmodeled modifiers, empty dmask, 3D/array A16, fake NSA and reserved bits are refused for both ops.
     for prefix, op, op_name in (('sample', IMG_SAMPLE, 'image_sample'),
                                 ('lz', IMG_SAMPLE_LZ, 'image_sample_lz')):
-        for mod in ('unorm', 'tfe', 'lwe', 'd16', 'r128'):
+        for mod in ('unorm', 'tfe', 'lwe', 'r128'):
             expect_refused(lambda b=MIMG_LLVM_MC[f'{prefix}_{mod}'][1]: translate(b),
                            f'{op_name} modifier {mod}', f'{op_name} {mod}')
+        # d16 is not a layout change of the address: it returns the sampled channels as binary16 pairs (RNE), two per
+        # register, so the sample translates (tests/startup_compute_cube_check.py reads the rounding back in compute and
+        # check_draw below reads this pixel stage's plain 2D d16 sample back). d16 together with a16 is a second modifier
+        # on the same instruction and keeps both halves of the semantics: packed address, packed data.
+        d16_text = translate(MIMG_LLVM_MC[f'{prefix}_d16'][1]).hlsl_ps()
+        assert 'pack16_rne(t.x) | (pack16_rne(t.y) << 16)' in d16_text, d16_text
+        assert 'pack16_rne(t.z) | (pack16_rne(t.w) << 16)' in d16_text, d16_text
         expect_refused(lambda o=op: translate(encode_mimg(o, a16=1, nsa=1, extra_addrs=(1,))),
                        f'{op_name} modifier invalid_nsa', f'{op_name} invalid_nsa')
         for dim_label, dim in (('3D', DIM_3D), ('2D_ARRAY', DIM_2D_ARRAY)):
@@ -430,6 +437,29 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 run_draw_case(renderer, adapter, vs, ps_mut, packed_word, expected_rgba,
                               expect_fail=True, actual_rgba=actual_rgba)
                 print(f'{kind} negative control ({label}): rejected as expected ({actual_rgba})', flush=True)
+
+            # d16 sample (plain 2D, the case this check used to refuse): v4 holds the red and green halves, v5 the blue and
+            # alpha halves; v6 and v7 stay 0. Every texel channel here is exact in binary16, so the words are the halves.
+            d16_hlsl = translate(MIMG_LLVM_MC['sample_d16'][1]).hlsl_ps()
+            d16_ps = compile_hlsl(compiler, kind, d16_hlsl, f'sample_d16_{kind}', ps_profile, directory)
+
+            def halves(x, y):
+                f = (struct.unpack('<f', struct.pack('<I', int(w, 16)))[0] for w in texel(x, y, 0).split(','))
+                h = [struct.unpack('<H', struct.pack('<e', c))[0] for c in f]
+                return ','.join('%08x' % w for w in (h[0] | h[1] << 16, h[2] | h[3] << 16, 0, 0))
+
+            for label, packed_word, x, y in (('quadrant (0, 0)', pack_f16_pair(0x3400, 0x3400), 0, 0),
+                                             ('quadrant (1, 0)', pack_f16_pair(0x3a00, 0x3400), 1, 0),
+                                             ('quadrant (0, 1)', pack_f16_pair(0x3400, 0x3a00), 0, 1),
+                                             ('quadrant (1, 1)', pack_f16_pair(0x3a00, 0x3a00), 1, 1)):
+                run_draw_case(renderer, adapter, vs, d16_ps, packed_word, halves(x, y))
+            print(f'{kind} sample_d16: all 4 texels read back as binary16 pairs', flush=True)
+            swapped = d16_hlsl.replace('pack16_rne(t.x) | (pack16_rne(t.y) << 16)', 'pack16_rne(t.y) | (pack16_rne(t.x) << 16)')
+            assert swapped != d16_hlsl
+            d16_mut = compile_hlsl(compiler, kind, swapped, f'mut_d16_{kind}', ps_profile, directory)
+            run_draw_case(renderer, adapter, vs, d16_mut, pack_f16_pair(0x3a00, 0x3400), halves(1, 0),
+                          expect_fail=True)
+            print(f'{kind} negative control (d16 halves exchanged): rejected as expected', flush=True)
 
             # Register-selection negative control: reading v0 instead of v2 on lz_v2_cache must read v0=0x3f400000
             # (u = f16(0x0000) = 0.0 -> col 0, v = f16(0x3f40) = 1.8125 -> wraps to 0.8125 -> row 1).
