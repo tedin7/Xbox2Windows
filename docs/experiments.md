@@ -16987,6 +16987,8 @@ Local observation, one run, counts only, from the four descriptor words the cens
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_input_" -V
 ```
 
+`X2W_NULL_TOKEN_ZERO=1` lets translated compute bind a native null buffer SRV when a buffer view token names no resource. The switch defaults off. An input descriptor of the form `[n,0,0,0]` with nonzero `n` still refuses the dispatch and logs `unfilled heap slot <n-1> key <key>` once per compute key with either switch setting. The synthetic fixture checks the unchanged output when the switch is off, all 320 words against the CPU reference when it is on, and one slot diagnostic across two refusals.
+
 ## Startup compute dual-offset/stride-64 LDS ops and 32-bit LDS atomics
 
 [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) (`lds_dual`, `lds_atomic`, `_lds_general_barrier_ok`, refs `#1541`, `#2274`) lowers the remaining 32-bit RDNA 2 DS dual-offset/stride-64 and unsigned/bitwise atomic instructions onto `groupshared uint lds[N]` (`COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE`, nonzero and `<= 32 KiB` / 8192 dwords):

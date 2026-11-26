@@ -39,6 +39,7 @@ struct ComputeTranslation {
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     KeyUse use;                            // when a Dispatch first and last had this key bound
     const char* first_refusal = nullptr;   // reason of the first refused call
+    bool unfilled_heap_slot_logged = false;
     bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
@@ -399,6 +400,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
             const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
+                tr->unfilled_heap_slot_logged = true;
+                log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
+            }
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
             if (view.source == 2) {
                 InterlockedIncrement(&compute_inputs_snapshot);
@@ -413,7 +418,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
                     slot.heap ? "heap" : "table", slot.a, slot.b, entry);
-            views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            // buffer_view creates a native null SRV when the token has no resource.
+            views[i] = {view.resource, view.offset, view.bytes, !view.upload && !view.null_token};
             views[i].stride = view.stride;
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;

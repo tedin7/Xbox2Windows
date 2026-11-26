@@ -2370,7 +2370,13 @@ struct IndirectBufferView {
     UINT stride = 0;
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
+    bool null_token = false;
 };
+
+bool unfilled_heap_slot(const std::uint32_t* words)
+{
+    return words[0] && !words[1] && !words[2] && !words[3];
+}
 
 // X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
 // (a committed default buffer that holds zeros) is read from title memory, snapshotted into the upload ring.
@@ -2386,7 +2392,7 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool allow_title_snapshot = false)
+                                         bool compute_input = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2397,6 +2403,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
+    if (unfilled_heap_slot(words)) return refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         note_lock_acquire(false);
@@ -2410,6 +2417,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         } else if (record.slot == 18 && record.desc_bytes >= 40) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
             std::memcpy(&view, record.desc, 40);
+            if (compute_input && !record.resource && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                static const bool enabled = x2w_local::env_on("X2W_NULL_TOKEN_ZERO");
+                if (enabled) return {nullptr, 0, 0, 0, false, 0, true};
+            }
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
                 view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
@@ -2446,7 +2457,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     }
     // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
     // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
-    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+    if (!bytes && compute_input && !words[0] && !words[1] && !words[2] && !words[3]) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
@@ -2489,7 +2500,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (!placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
-            } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+            } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
                 // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
                 // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
                 // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
