@@ -19,6 +19,7 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
@@ -3498,7 +3499,7 @@ class Stage:
         # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
         # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
-                          and (self.holds_wave_reduction() or self.skipped_scalar_read_later(branches)))
+                          and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.loads_after_exec_write = set()
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
@@ -3558,6 +3559,7 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
+            self.wave_unsound = None
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
@@ -3796,9 +3798,6 @@ class Stage:
                             self.wave_voted_branches.add(off)
                             self.uniform_branches.add(off)
                             cond_uniform = True
-                        elif self.wave_exec and not cond_uniform:
-                            raise Unsupported('wave reduction in a program with a branch (%s) that is neither '
-                                              'wave-uniform nor an EXEC / VCC vote' % name)
                         elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
                                 and self.uniform_cf and not self.lane_exec_breaks
                                 and self.skipped_block_vector_only(off, int(parse(asm)[1][0].split('_')[1], 16))):
@@ -3808,6 +3807,12 @@ class Stage:
                             # still follows the guest's.
                             self.voted_branches.add(off)
                             cond_uniform = True
+                        if self.wave_exec and not cond_uniform and self.wave_unsound is None:
+                            # A branch that is neither wave-uniform nor a vote parts the host wave, so no wave intrinsic
+                            # can be trusted to see every lane. Refused at the end of the pass, so that an earlier
+                            # refusal of the program keeps its own reason.
+                            self.wave_unsound = Unsupported('wave-wide read in a program with a branch (%s) that is '
+                                                            'neither wave-uniform nor an EXEC / VCC vote' % name)
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -3873,6 +3878,10 @@ class Stage:
                 if refusals is not None:
                     del refusals[first_refusal:]
                 continue
+            if raised_unsupported is None and self.wave_unsound is not None:
+                if refusals is None:
+                    raise self.wave_unsound
+                refusals.append((str(self.wave_unsound), self.kind))
             if raised_unsupported is not None:
                 raise raised_unsupported
             break
@@ -9618,7 +9627,10 @@ class Stage:
             written = set()
             for off, _n, name, asm in ins:
                 if pc < off < target:
-                    written |= {w for w in scalar_effects(name, asm)[1] if re.fullmatch(r's\d+', w)}
+                    reads, writes, _may = scalar_effects(name, asm)
+                    if reads & {'exec', 'vcc'} or name.startswith('v_cmp'):
+                        continue   # mask arithmetic: one bit per thread already, no wave-wide value
+                    written |= {w for w in writes if re.fullmatch(r's\d+', w)}
             if written and any(off >= target and written & scalar_effects(name, asm)[0] for off, _n, name, asm in ins):
                 return True
         return False
