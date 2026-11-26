@@ -14,6 +14,7 @@ the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very lar
 """
 import argparse
 import re
+import struct
 import json
 import os
 import sys
@@ -64,8 +65,7 @@ def validate_manifest(manifest):
     return manifest
 
 
-READY_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:ms57\.)?txt$")
-REQUEST_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:a|rtv|c67|m57)$")
+REQUEST_RE = re.compile(r"^req_([0-9a-f]{16})\.(a|rtv|c67|m57)$")
 
 
 MEMORY_FRACTION = 0.75     # of physical RAM: the launcher's job memory cap (debug_launch --memory-gib)
@@ -91,17 +91,58 @@ def cache_tag(translator):
     return "-".join(numbers)
 
 
+def _non_empty(path):
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _complete_dxbc(path):
+    """A DXContainer whose header length matches the file (gfx2hlsl.py has_complete_mesh57_bytecode)."""
+    try:
+        with open(path, "rb") as shader:
+            header = shader.read(32)
+            if len(header) != 32 or header[:4] != b"DXBC":
+                return False
+            size, parts = struct.unpack_from("<II", header, 24)
+            return size == os.fstat(shader.fileno()).st_size and 0 < parts <= (size - 32) // 4
+    except OSError:
+        return False
+
+
+def _translated(cache_dir, key, kind):
+    """The translator's own test for a finished request (gfx2hlsl.py pending_keys): the result manifest
+    `<key>.txt` (`<key>.ms57.txt` for a mesh pipeline) is published and the bytecode it describes is on disk, non-empty:
+    `.vs.cso` + `.ps.cso` (pixel pipelines), `.cs.cso` (compute), `.ms57.cso` + `.ps57.cso`, both complete DXContainers (mesh; a pixel stage the
+    manifest says is `ps none` needs no `.ps57.cso`). The request file itself is `req_<key>.<kind>`."""
+    base = os.path.join(cache_dir, key)
+    if kind == "m57":
+        manifest = base + ".ms57.txt"
+        if not (os.path.isfile(manifest) and _complete_dxbc(base + ".ms57.cso")):
+            return False
+        if _complete_dxbc(base + ".ps57.cso"):
+            return True
+        with open(manifest, "rb") as handle:
+            return b"ps none" in handle.read().splitlines()
+    stages = (".cs.cso",) if kind == "c67" else (".vs.cso", ".ps.cso")
+    return os.path.isfile(base + ".txt") and all(_non_empty(base + stage) for stage in stages)
+
+
 def cache_stats(cache_dir):
-    """(translations ready, requests, failures) in a shader cache folder: a request is translated once its
-    ready marker req_<key>.txt (or .ms57.txt for a mesh pipeline) is published."""
+    """(translations ready, requests, failures) in a shader cache folder, counted per request file req_<key>.<kind>:
+    ready = the translator's finished-request test passes (manifest + bytecode, see _translated); failed = not ready and
+    `<key>.fail` exists (a refusal or compiler error; the next pass retries it). The rest is pending."""
     ready = requests = failed = 0
     if os.path.isdir(cache_dir):
         for name in os.listdir(cache_dir):
-            if READY_RE.match(name):
+            match = REQUEST_RE.match(name)
+            if not match:
+                continue
+            requests += 1
+            if _translated(cache_dir, match.group(1), match.group(2)):
                 ready += 1
-            elif REQUEST_RE.match(name):
-                requests += 1
-            elif name.endswith(".fail"):
+            elif os.path.isfile(os.path.join(cache_dir, match.group(1) + ".fail")):
                 failed += 1
     return ready, requests, failed
 

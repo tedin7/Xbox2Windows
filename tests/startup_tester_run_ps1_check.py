@@ -60,9 +60,10 @@ if len(sys.argv) > 2 and sys.argv[1] == '--once':
         time.sleep(600)
     for name in sorted(os.listdir(sys.argv[2])):
         if name.startswith('req_') and name.endswith('.a'):
-            marker = os.path.join(sys.argv[2], name[:-2] + '.txt')
-            if not os.path.exists(marker):
-                open(marker, 'wb').write(b'ok')
+            base = os.path.join(sys.argv[2], name[4:-2])      # req_<key>.a -> <key>.txt + the two bytecode files
+            if not os.path.exists(base + '.txt'):
+                for suffix in ('.txt', '.vs.cso', '.ps.cso'):
+                    open(base + suffix, 'wb').write(b'ok')
 """
 DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
@@ -123,15 +124,18 @@ def check_shell(shell):
         tree, head, rev_file = make_tree(root)
         cache = tree / "out" / "startup" / "shader_cache_28-28-7"
         cache.mkdir(parents=True)
-        for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_1123456789abcdef.a", "revision.txt"):
+        # A warm cache as the translator leaves it: one finished request (manifest <key>.txt + both bytecode files), one
+        # pending, one refused (<key>.fail), and the revision stamp.
+        warm = ["req_0123456789abcdef.a", "0123456789abcdef.txt", "0123456789abcdef.vs.cso", "0123456789abcdef.ps.cso",
+                "req_1123456789abcdef.a", "req_4123456789abcdef.a", "4123456789abcdef.fail", "revision.txt"]
+        for name in warm:
             (cache / name).write_bytes(b"x")
 
         rev_file.write_text(REV_CPP % "00000000", encoding="ascii")
         stale = run_script(shell, tree, "-NoBuild")
         assert stale.returncode != 0 and "00000000" in stale.stdout + stale.stderr and head in stale.stdout + stale.stderr, \
             (shell, "a build from another commit was not refused", stale.stdout, stale.stderr)
-        assert sorted(os.listdir(cache)) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
-                                                     "req_1123456789abcdef.a", "revision.txt"]), "the cache was touched"
+        assert sorted(os.listdir(cache)) == sorted(warm), "the cache was touched"
         assert not list((tree / "out" / "tester").glob("*.zip")) if (tree / "out" / "tester").exists() else True
 
         rev_file.write_text(REV_CPP % head, encoding="ascii")
@@ -157,10 +161,9 @@ def check_shell(shell):
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
-        assert sorted(args["CacheEntries"]) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
-                                                                  "req_1123456789abcdef.a", "revision.txt"]), \
+        assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
-        assert "1 translations were already present at start (2 requests, 0 failed)" in ok.stdout, ok.stdout
+        assert "1 translations were already present at start (3 requests, 1 failed)" in ok.stdout, ok.stdout
         assert manifest["commit"] == head and manifest["build_commit"] == head and manifest["dirty"] is False
         assert manifest["seconds"] == 200 and manifest["deep"] is False and manifest["input_script"] == args["InputScript"]
         assert manifest["env"].get("X2W_D3D12_BUDGET") == "1" and all(k.startswith("X2W_") for k in manifest["env"])
@@ -204,7 +207,8 @@ def check_shell(shell):
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
-        (cache / "req_2123456789abcdef.txt").write_bytes(b"x")
+        for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):
+            (cache / name).write_bytes(b"x")
         again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
 
@@ -228,18 +232,19 @@ def check_shell(shell):
         rev_file.write_text(REV_CPP % git(tree, "rev-parse", "--short=8", "HEAD"), encoding="ascii")
         fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert fresh.returncode == 0 and "0 translations were already present at start" in fresh.stdout, fresh.stdout
-        assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("req_*.txt"))) == 2
+        assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("????????????????.txt"))) == 2
 
         # F1: after the zip is packed, one translator pass finishes the pending requests (cap: -FinishTranslateSeconds).
         fresh_cache = cache.parent / "shader_cache_29-29-7"
         (fresh_cache / "req_aaaaaaaaaaaaaaaa.a").write_bytes(b"x")
         (fresh_cache / "req_bbbbbbbbbbbbbbbb.a").write_bytes(b"x")
-        (fresh_cache / "req_bbbbbbbbbbbbbbbb.txt").write_bytes(b"x")
+        for suffix in (".txt", ".vs.cso", ".ps.cso"):
+            (fresh_cache / ("bbbbbbbbbbbbbbbb" + suffix)).write_bytes(b"x")
         finished = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "60")
         assert finished.returncode == 0, (finished.stdout, finished.stderr)
         assert "finishing the translation: 1 request(s) pending" in finished.stdout, finished.stdout
         assert "pending before 1, after 0; ok 2, refused 0 in total (0 new)" in finished.stdout, finished.stdout
-        assert (fresh_cache / "req_aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
+        assert (fresh_cache / "aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
         assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
         # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
         (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
@@ -247,7 +252,7 @@ def check_shell(shell):
                             extra_env={"STUB_HANG": "1"})
         assert capped.returncode == 0, (capped.stdout, capped.stderr)
         assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
-        assert not (fresh_cache / "req_cccccccccccccccc.txt").exists()
+        assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
         assert list((tree / "out" / "tester").glob("report_*.zip"))
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
