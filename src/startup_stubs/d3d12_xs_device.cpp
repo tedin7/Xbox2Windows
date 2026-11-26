@@ -171,6 +171,8 @@ enum class RetireNever : std::uint8_t { slot, none, buffer, dimension, msaa, rt_
                                         aliased, reserved, count };
 enum class RetireLeft : std::uint8_t { none, view, view_copy, residency, present, hold_missed, count };
 
+struct ComputeManifest;
+
 struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
@@ -208,6 +210,7 @@ struct alignas(16) WrapperOwn {
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    ComputeManifest* compute_manifest; // PipelineState: shared manifest state for its request key
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
@@ -7231,8 +7234,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
         Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
-            static_cast<Wrapper*>(*out)->own().compute_request_key = key;
-            static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+            auto& pipeline = static_cast<Wrapper*>(*out)->own();
+            pipeline.compute_request_key = key;
+            pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+            if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
