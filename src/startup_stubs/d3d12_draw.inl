@@ -251,7 +251,7 @@ inline void draw_lock_acquire_exclusive()
     draw_lock_note_max(draw_lock_stats.wait_max, waited);
     if (waited * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.wait_over_5ms);
 }
-inline void draw_lock_release_exclusive()
+inline LONG64 draw_lock_release_exclusive()
 {
     LARGE_INTEGER now, frequency;
     QueryPerformanceCounter(&now);
@@ -262,7 +262,74 @@ inline void draw_lock_release_exclusive()
     draw_lock_note_max(draw_lock_stats.hold_max, held);
     if (held * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.hold_over_5ms);
     ReleaseSRWLockExclusive(&draw_lock);
+    return held;
 }
+bool draw_walk_shared_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_DRAW_WALK_SHARED");
+    return enabled;
+}
+
+class DrawWalkLock {
+    bool shared_, held_ = false;
+
+    void acquire()
+    {
+        if (shared_) AcquireSRWLockShared(&draw_lock);
+        else draw_lock_acquire_exclusive();
+        held_ = true;
+    }
+
+public:
+    LONG64 exclusive_ticks = 0;
+    explicit DrawWalkLock(bool shared) : shared_(shared) { acquire(); }
+    ~DrawWalkLock() { release(); }
+    DrawWalkLock(const DrawWalkLock&) = delete;
+    DrawWalkLock& operator=(const DrawWalkLock&) = delete;
+    bool shared() const { return shared_; }
+    void release()
+    {
+        if (!held_) return;
+        if (shared_) ReleaseSRWLockShared(&draw_lock);
+        else exclusive_ticks += draw_lock_release_exclusive();
+        held_ = false;
+    }
+    void change_mode(bool shared)
+    {
+        release();
+        shared_ = shared;
+        acquire();
+    }
+};
+
+// Other users of these containers already hold draw_lock exclusively. These
+// locks synchronize recording threads that hold it shared, in this order:
+// draw_lock, then one container lock, then allocator_lock or note_lock.
+SRWLOCK draw_pipeline_lock = SRWLOCK_INIT;
+SRWLOCK draw_descriptor_lock = SRWLOCK_INIT;
+SRWLOCK draw_texture_lock = SRWLOCK_INIT;
+SRWLOCK draw_sampler_lock = SRWLOCK_INIT;
+SRWLOCK draw_use_lock = SRWLOCK_INIT;
+SRWLOCK big_binding_lock = SRWLOCK_INIT;
+SRWLOCK frame_copy_lock = SRWLOCK_INIT;
+
+class DrawContainerWrite {
+    SRWLOCK* lock_;
+public:
+    explicit DrawContainerWrite(SRWLOCK* lock) : lock_(lock)
+    {
+        if (lock_) AcquireSRWLockExclusive(lock_);
+    }
+    ~DrawContainerWrite() { release(); }
+    void release()
+    {
+        if (lock_) ReleaseSRWLockExclusive(lock_);
+        lock_ = nullptr;
+    }
+    DrawContainerWrite(const DrawContainerWrite&) = delete;
+    DrawContainerWrite& operator=(const DrawContainerWrite&) = delete;
+};
+
 // Where a translated Dispatch spends its time under draw_lock: 0 translation lookup and checks, 1 the descriptor walk, 2 entry values,
 // 3 texture sync, 4 descriptor writes and recording. Started after the lock is held, ended when it is released.
 volatile LONG64 dispatch_phase_ticks[5], dispatch_phase_max[5];
@@ -314,10 +381,19 @@ inline bool dispatch_phase_line(char* out, std::size_t size)
 // 3 writable texture views, 4 state and recording. Ends in the destructor, so every early return is counted.
 volatile LONG64 draw_phase_ticks[5], draw_phase_max[5];
 volatile LONG64 draw_phase_calls;
+volatile LONG64 draw_exclusive_ticks, fixture_draw_exclusive_ticks, fixture_draw_calls;
+
+bool draw_walk_fixture()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TEST_DRAW_WALK");
+    return enabled;
+}
+
 struct DrawPhases {
     LARGE_INTEGER last;
     int current = 0;
-    DrawPhases() { QueryPerformanceCounter(&last); }
+    const DrawWalkLock& lock;
+    explicit DrawPhases(const DrawWalkLock& draw) : lock(draw) { QueryPerformanceCounter(&last); }
     void to(int next)
     {
         LARGE_INTEGER now;
@@ -331,6 +407,11 @@ struct DrawPhases {
     ~DrawPhases()
     {
         to(current);
+        if (draw_walk_shared_enabled()) InterlockedAdd64(&draw_exclusive_ticks, lock.exclusive_ticks);
+        if (draw_walk_fixture()) {
+            InterlockedAdd64(&fixture_draw_exclusive_ticks, lock.exclusive_ticks);
+            InterlockedIncrement64(&fixture_draw_calls);
+        }
         InterlockedIncrement64(&draw_phase_calls);
     }
 };
@@ -351,6 +432,11 @@ inline bool draw_phase_line(char* out, std::size_t size)
                   static_cast<long long>(calls), ticks[0] / per_us / calls, maxima[0] / per_us, ticks[1] / per_us / calls, maxima[1] / per_us,
                   ticks[2] / per_us / calls, maxima[2] / per_us, ticks[3] / per_us / calls, maxima[3] / per_us, ticks[4] / per_us / calls,
                   maxima[4] / per_us);
+    if (draw_walk_shared_enabled()) {
+        const auto used = std::strlen(out);
+        std::snprintf(out + used, size - used, ", exclusive hold %.2f us per draw",
+                      InterlockedExchange64(&draw_exclusive_ticks, 0) / per_us / calls);
+    }
     return true;
 }
 // One line for the heartbeat; resets the counters. Empty when the lock was never taken.
@@ -1185,11 +1271,11 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
-Translation* translation_for_targets(Translation* base, const Pass& pass)
+Translation* translation_for_targets(Translation* base, const Pass& pass, bool lookup_only = false)
 {
     if (!base) return nullptr;
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+        if (!lookup_only && base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
         return base;
     }
@@ -1197,6 +1283,11 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     for (UINT i = 0; i < pass.target_count; ++i)
         request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
     const u64 key = fnv_bytes(request.data(), request.size());
+    if (lookup_only) {
+        const auto& entries = translation_by_key();
+        const auto known = entries.find(key);
+        return known == entries.end() ? nullptr : known->second;
+    }
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
@@ -1218,7 +1309,7 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect, bool shared = false)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
@@ -1229,6 +1320,15 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    if (shared) {
+        AcquireSRWLockShared(&draw_pipeline_lock);
+        const auto found = bound.pipelines.find(key);
+        auto* cached = found == bound.pipelines.end() ? nullptr : found->second;
+        ReleaseSRWLockShared(&draw_pipeline_lock);
+        // The cache owns this PSO for the lifetime of the translation.
+        if (cached) return cached;
+    }
+    DrawContainerWrite lock(shared ? &draw_pipeline_lock : nullptr);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -1292,11 +1392,18 @@ Wrapper* draw_heap_device;
 UINT draw_heap_increment;
 volatile LONG draw_heap_cursor;
 
-bool ensure_draw_heap(Wrapper* device)
+bool ensure_draw_heap(Wrapper* device, bool shared = false)
 {
     // The translated pipeline and upload ring are scoped to the current
     // startup render device. A list from another device cannot use this heap.
     if (!device || device != the_device) return false;
+    if (shared) {
+        AcquireSRWLockShared(&draw_pipeline_lock);
+        const bool ready = draw_heap && device == draw_heap_device;
+        ReleaseSRWLockShared(&draw_pipeline_lock);
+        if (ready) return true;
+    }
+    DrawContainerWrite lock(shared ? &draw_pipeline_lock : nullptr);
     if (draw_heap) return device == draw_heap_device;
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
@@ -1498,7 +1605,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
 }
 
 // draw_lock held.
-bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
+bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback, bool shared)
 {
     auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
     if (pass.sampler_snapshot && *pass.sampler_snapshot == snapshot) return true;
@@ -1515,7 +1622,10 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    recorded_draw_sampler_heaps[list].push_back(heap);
+    {
+        DrawContainerWrite lock(shared ? &draw_sampler_lock : nullptr);
+        recorded_draw_sampler_heaps[list].push_back(heap);
+    }
     pass.sampler_heap = std::move(heap);
     pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
     return true;
@@ -1644,26 +1754,49 @@ bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
 }
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
-bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource, bool shared)
 {
+    const u64 key = address * 1099511628211ull ^ bytes;
+    const auto* title = reinterpret_cast<const unsigned char*>(address);
+    const auto bind_cached = [&](bool& known) {
+        const auto found = frame_copies().find(key);
+        known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
+        if (!known || (!(bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) &&
+                       std::memcmp(found->second.content.data(), title, bytes) != 0)) return false;
+        const auto slice = found->second.slice;
+        if (!bind_upload_slice(self, slice)) return false;
+        *offset = slice.offset;
+        if (resource) *resource = slice.resource;
+        if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
+        return true;
+    };
+    bool known = false;
+    if (shared) {
+        AcquireSRWLockShared(&frame_copy_lock);
+        const bool hit = frame_copies_frame == frame_number && bind_cached(known);
+        ReleaseSRWLockShared(&frame_copy_lock);
+        if (hit) return true;
+        // The fixture lines up four cold readers of its first small range.
+        // The deadline lets a refused fixture draw fail without hanging the test.
+        static const bool race = draw_walk_fixture() && x2w_local::env_on("X2W_TEST_DRAW_WALK_RACE");
+        if (race && frame_number == 1 && bytes == 4096) {
+            static volatile LONG arrivals;
+            if (InterlockedIncrement(&arrivals) < 4) {
+                const auto deadline = GetTickCount64() + 10000;
+                while (InterlockedCompareExchange(&arrivals, 0, 0) < 4 && GetTickCount64() < deadline) Sleep(1);
+            }
+        }
+    }
+    DrawContainerWrite lock(shared ? &frame_copy_lock : nullptr);
     if (frame_copies_frame != frame_number) {
         frame_copies_frame = frame_number;
         if (big_copy_reuse_enabled()) x2w_local::trim_frame_copies(frame_copies());
         else frame_copies().clear();
     }
-    const u64 key = address * 1099511628211ull ^ bytes;
-    const auto* title = reinterpret_cast<const unsigned char*>(address);
-    const auto found = frame_copies().find(key);
-    const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
-        const auto& slice = found->second.slice;
-        if (bind_upload_slice(self, slice)) {
-            *offset = slice.offset;
-            if (resource) *resource = slice.resource;
-            if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
-            return true;
-        }
-    }
+    // A competing writer may have published a matching snapshot after the
+    // shared lookup. The fixture mutant deliberately drops this re-check.
+    static const bool skip_recheck = draw_walk_fixture() && x2w_local::env_on("X2W_TEST_DRAW_WALK_NO_RECHECK");
+    if ((!shared || !skip_recheck) && bind_cached(known)) return true;
     const auto slice = reserve_upload_ring(self, bytes);
     if (!slice.mapped) return false;
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
@@ -1677,6 +1810,8 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
     std::memcpy(slice.mapped, source, bytes);
+    if (draw_walk_fixture())
+        log("x2w-draw fixture frame copy made: %ld %llx %zu", frame_number, address, bytes);
     if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_made);
     if (known) {
         static LONG refreshed;
@@ -2894,43 +3029,72 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool indexed_rect = rect && indexed && indirect;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) return not_drawn(0);
-    draw_lock_acquire_exclusive();
-    DrawPhases phases;
-    BoundPipeline* bound = translation_for(pass.pipeline);
-    if (bound && bound->translation) bound->translation->use.note(process_ms());
-    Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    const bool allow_shared = draw_walk_shared_enabled() && !indirect &&
+                              !draw_dump_frame() && !red_producers().enabled();
+    DrawWalkLock walk(allow_shared);
+    DrawPhases phases(walk);
+    BoundPipeline* bound = nullptr;
+    Translation* tr = nullptr;
+    const auto lookup_ready_draw = [&] {
+        const auto& entries = translation_by_pipeline();
+        const auto found = entries.find(pass.pipeline);
+        bound = found == entries.end() ? nullptr : found->second;
+        tr = bound ? translation_for_targets(bound->translation, pass, true) : nullptr;
+        return tr && tr->state == 1;
+    };
+    if (walk.shared() && lookup_ready_draw()) {
+        DrawContainerWrite lock(&draw_use_lock);
+        bound->translation->use.note(process_ms());
+    } else {
+        if (walk.shared()) walk.change_mode(false);
+        // Repeat the lookup under exclusive ownership. Another recorder
+        // may have populated either translation map while we waited.
+        bound = translation_for(pass.pipeline);
+        if (bound && bound->translation) bound->translation->use.note(process_ms());
+        tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+        if (allow_shared && tr && tr->state == 1) {
+            walk.change_mode(true);
+            // Ready translations and bound pipelines are retained for the
+            // process. Read them again under the new lock mode.
+            lookup_ready_draw();
+        }
+    }
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;
-    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
+    const bool d16_ok = [&] {
+        if (!translation_ok) return false;
+        DrawContainerWrite lock(walk.shared() && tr->d16_srvs.any() ? &draw_texture_lock : nullptr);
+        return d16_srvs_ready(*tr, pass, d16_unorm16);
+    }();
     const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
     if (!formatted_ok) {
         if (indirect && tr)
             indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
                                      : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
-        draw_lock_release_exclusive();
+        walk.release();
         return not_drawn(1);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
             indirect->set_refusal("translated draw requires the guest pipeline's root signature",
                                   indirect_refusal_code::missing_guest_root);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(2);
         }
         if (indexed && pass.compute_pipeline) {
             indirect->set_refusal("indexed validation cannot replace a live guest compute pipeline",
                                   indirect_refusal_code::live_compute_pipeline);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(3);
         }
         if (!tr->uavs.empty()) {
             indirect->set_refusal("translated draw with a writable texture is not bound for indirect draws",
                                   indirect_refusal_code::unsupported_resource_or_entry);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(4);
         }
         auto& entry = indexed ? tr->indexed_indirect_entry : tr->independent_indirect_entry;
@@ -2952,7 +3116,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (!*entry || tr->samplers.heap) {
             indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
                                   indirect_refusal_code::unsupported_resource_or_entry);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(5);
         }
         if (bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
@@ -2960,25 +3124,25 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
              (bound->depth_stencil.StencilEnable && bound->depth_stencil.StencilWriteMask != 0))) {
             indirect->set_refusal("translated draw writes depth or stencil to a read-only depth view",
                                   indirect_refusal_code::read_only_depth_write);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(6);
         }
     }
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device, walk.shared()) ? pipeline_for(*bound, *tr, pass, indexed_rect, walk.shared()) : nullptr;
     if (indirect && indexed_rect && !pipeline) {
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
     }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback, walk.shared()))) {
         if (indirect && !(indexed_rect && !pipeline))
             indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
                                                : indirect_refusal_code::sampler_heap_unavailable;
-        draw_lock_release_exclusive();
+        walk.release();
         return not_drawn(7);
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
     if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {
-        draw_lock_release_exclusive();
+        walk.release();
         return not_drawn(8);
     }
     const bool trace_inputs = red_producers().onset();
@@ -2990,11 +3154,23 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
+    DrawContainerWrite descriptor_lock(walk.shared() ? &draw_descriptor_lock : nullptr);
+    if (walk.shared() && views) {
+        const auto cursor = static_cast<UINT>(InterlockedCompareExchange(&draw_heap_cursor, 0, 0));
+        const UINT slot = cursor % draw_heap_size;
+        if ((cursor && slot == 0) || slot + views > draw_heap_size) {
+            // Drain active descriptor writers before reusing slots at the
+            // front. The reservation below reads the cursor again.
+            descriptor_lock.release();
+            walk.change_mode(false);
+        }
+    }
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
     if (first + views > draw_heap_size) {
         first = 0;
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
     }
+    descriptor_lock.release();
     std::uint32_t strides[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
@@ -3117,6 +3293,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             drop_view.min_lod_clamp = title_view.Texture2D.ResourceMinLODClamp;
             const x2w_startup::drop_mips::Use drop_use = srv.kind == 1 && static_cast<std::size_t>(i) < tr->srv_use.size()
                 ? tr->srv_use[i] : x2w_startup::drop_mips::Use::unknown;
+            // Materialization and upload mutate texture caches. Queue, copy
+            // and dispatch callers still protect those caches with draw_lock.
+            DrawContainerWrite texture_lock(walk.shared() && resource ? &draw_texture_lock : nullptr);
             ID3D12Resource* texture = nullptr;
             {
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
@@ -3155,7 +3334,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (indirect && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
-                draw_lock_release_exclusive();
+                walk.release();
                 return not_drawn(9);
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
@@ -3185,7 +3364,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (indirect && !texture) {
                 indirect->set_refusal("translated draw could not bind its sampled texture",
                                       indirect_refusal_code::sampled_texture_unbindable);
-                draw_lock_release_exclusive();
+                walk.release();
                 return not_drawn(10);
             }
             x2w_local::BindingFacts facts;
@@ -3206,6 +3385,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
+            texture_lock.release();
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
@@ -3230,7 +3410,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                     : "translated draw requires a complete GPU-backed table buffer range",
                     srv.source == 1 ? indirect_refusal_code::incomplete_vertex_stream
                                     : indirect_refusal_code::incomplete_table_buffer);
-                draw_lock_release_exclusive();
+                walk.release();
                 return not_drawn(11);
             }
             if (!view.upload)
@@ -3280,7 +3460,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-draw %016llx srv %u: formatted buffer refused (buffer larger than the 16 MiB draw copy)", tr->key, i);
-                draw_lock_release_exclusive();
+                walk.release();
                 return not_drawn(12);
             }
         }
@@ -3312,7 +3492,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (first_calls(copy_refused, 6))
                     log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
                 count_null_binding(x2w_local::NullCause::ring_full);
-                draw_lock_release_exclusive();
+                walk.release();
                 return not_drawn(buffer_copy_failed_site);
             }
             if (target) {
@@ -3366,7 +3546,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         BigBinding* cached = nullptr;
         bool cache_hit = false;
         // A root address has no declared length. Its span is inferred by probing above.
-        if (address && large_raw && srv.source != 2 && bigbind_once_enabled()) {
+        const bool remember_large = address && large_raw && srv.source != 2 && bigbind_once_enabled();
+        DrawContainerWrite big_lock(remember_large && walk.shared() ? &big_binding_lock : nullptr);
+        if (remember_large) {
             try {
                 const auto [entry, inserted] = big_bindings.try_emplace(bigbind_key(address, full_bytes));
                 cached = &entry->second;
@@ -3400,7 +3582,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
         bool have = false;
-        if (readable_range && cached) {
+        const bool use_big_cache = cached != nullptr;
+        if (readable_range && use_big_cache) {
             auto& slice = cached->slice;
             if (slice.mapped) {
                 have = bind_upload_slice(self, slice);
@@ -3422,9 +3605,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 // A retry needs a fresh readability check before it can read title memory.
                 big_bindings.erase(bigbind_key(address, full_bytes));
             }
-        } else if (readable_range) {
-            have = frame_copy(self, address, bytes, &offset, &chunk);
         }
+        big_lock.release();
+        if (readable_range && !use_big_cache)
+            have = frame_copy(self, address, bytes, &offset, &chunk, walk.shared());
         if (!cache_hit) {
             const LONG64 step_t2 = step_now_us();
             auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
@@ -3433,7 +3617,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             InterlockedAdd64(&step.copy_us, step_t2 - step_t1);
             InterlockedAdd64(&step.bytes, static_cast<LONG64>(bytes));
             if (step_t2 - step_t1 > 1000) InterlockedIncrement64(&step.copy_over_1ms);
-            if (step_t2 - step_t1 > step.copy_max_us) step.copy_max_us = step_t2 - step_t1;
+            if (walk.shared()) draw_lock_note_max(step.copy_max_us, step_t2 - step_t1);
+            else if (step_t2 - step_t1 > step.copy_max_us) step.copy_max_us = step_t2 - step_t1;
         }
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
@@ -3446,7 +3631,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             static LONG refused;
             if (first_calls(refused, 6))
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(13);
         }
         if (readable_range && !have) {
@@ -3456,15 +3641,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(copy_refused, 6))
                 log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
             count_null_binding(x2w_local::NullCause::ring_full);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(buffer_copy_failed_site);
         }
         if (!have && identity_for_null) {
-            static float identity[64];
-            for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
-            address = reinterpret_cast<u64>(identity);
+            static const auto identity = [] {
+                std::array<float, 64> values{};
+                for (int k = 0; k < 64; ++k) values[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
+                return values;
+            }();
+            address = reinterpret_cast<u64>(identity.data());
             bytes = sizeof(identity);
-            have = frame_copy(self, address, bytes, &offset, &chunk);
+            have = frame_copy(self, address, bytes, &offset, &chunk, walk.shared());
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
@@ -3482,7 +3670,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                           GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", nullptr, 0) != 0;
         // The first 3 draws of a translation, then every 300th (a constant that changes later, or never does, shows in the series).
         const bool constants_due = constants_log && have && !cache_hit && bytes >= 16 && bytes <= 4096 &&
-                                   (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
+                                   (first_calls(tr->logged_constants, 3) || InterlockedIncrement(&tr->constants_seen) % 300 == 0);
         if (constants_due) {
             const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);
             const std::size_t shown = (std::min<std::size_t>)(bytes / 4, 52);
@@ -3559,7 +3747,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (!validated) {
             indirect->set_refusal("translated indexed argument validation could not be recorded",
                                   indirect_refusal_code::indexed_validation_failed);
-            draw_lock_release_exclusive();
+            walk.release();
             return not_drawn(14);
         }
     }
@@ -3604,7 +3792,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         auto view = live_indices;
         if (live_index_resource) {
             require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
-        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
+        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk, walk.shared()) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         }
@@ -3632,7 +3820,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
-    draw_lock_release_exclusive();
+    walk.release();
     if (indirect) return drawn;
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";

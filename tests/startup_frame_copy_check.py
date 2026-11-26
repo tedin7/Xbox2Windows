@@ -1,4 +1,5 @@
 """Check title-memory snapshots for writes between draws and across frame boundaries."""
+from collections import Counter
 from pathlib import Path
 import re
 import sys
@@ -118,8 +119,87 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+WALK_HLSL = """
+ByteAddressBuffer small_range : register(t0);
+ByteAddressBuffer large_range : register(t1);
+float4 main() : SV_Target {
+    return float4(asfloat(small_range.Load2(0)),
+                  asfloat(large_range.Load(16777208)), 0.0);
+}
+"""
+
+
+def walk_reference():
+    def rgba(color):
+        return bytes((255 if color & 1 else 0, 255 if color & 2 else 0,
+                      255 if color & 4 else 0, 0))
+
+    return b"".join((rgba(shared) + rgba(worker + 2)) * 500
+                    for worker in range(4) for shared in (1, 6))
+
+
+def walk_copy_counts(log):
+    return Counter((int(frame), address, int(size)) for frame, address, size in
+                   re.findall(r"fixture frame copy made: ([12]) ([0-9a-f]+) (\d+)", log))
+
+
+def check_walk_copies(counts):
+    for frame in (1, 2):
+        for size in (4096, 16 << 20):
+            made = {address: count for (epoch, address, length), count in counts.items()
+                    if epoch == frame and length == size}
+            if sorted(made.values()) != [1] * 5:
+                raise AssertionError(f"frame {frame}, {size}-byte ranges: copies per range {made}, expected five single copies")
+
+
+def check_shared_walk(directory, consumer, backend):
+    expected = walk_reference()
+    results = {}
+    for name, shared, serial, mutant in (("exclusive", False, False, False),
+                                         ("serial", True, True, False),
+                                         ("shared", True, False, False),
+                                         ("missing_recheck", True, False, True)):
+        folder = directory / name
+        folder.mkdir()
+        trap = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, WALK_HLSL, {
+            "X2W_TEST_FRAME_COPY": "shared-walk", "X2W_TRAP_LOG": str(trap),
+            "X2W_DRAW_WALK_SHARED": str(int(shared)), "X2W_TEST_DRAW_WALK": "1",
+            "X2W_TEST_DRAW_WALK_SERIAL": str(int(serial)),
+            "X2W_TEST_DRAW_WALK_RACE": str(int(shared and not serial)),
+            "X2W_TEST_DRAW_WALK_NO_RECHECK": str(int(mutant)),
+            "X2W_BIGBIND_ONCE": "0", "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0\nsrv 1 buf table 0 32")
+        if pixels is None:
+            return 77
+        if pixels != expected:
+            first = next((i for i, (actual, wanted) in enumerate(zip(pixels, expected))
+                          if actual != wanted), min(len(pixels), len(expected)))
+            raise AssertionError(f"{name}: first difference at byte {first}, sizes {len(pixels)} and {len(expected)}")
+        log = trap.read_text(errors="replace")
+        counts = walk_copy_counts(log)
+        timings = [(int(frame), int(calls), int(ticks)) for frame, calls, ticks in
+                   re.findall(r"fixture exclusive hold: ([12]) (\d+) (\d+)", log)]
+        if [(frame, calls) for frame, calls, _ in timings] != [(1, 4000), (2, 4000)]:
+            raise AssertionError(f"{name}: expected 4000 timed draws per frame, got {timings}")
+        results[name] = sum(ticks for _, _, ticks in timings)
+        if mutant:
+            repeated = [(frame, size, count) for (frame, _, size), count in counts.items() if count > 1]
+            if (1, 4096, 4) not in repeated:
+                raise AssertionError(f"missing re-check did not duplicate all four small snapshots: {repeated}")
+            print(f"{backend} {name}: shared small range copied four times, as the negative control expects")
+        else:
+            check_walk_copies(counts)
+            print(f"{backend} {name}: {len(expected) // 4} exact pixels, one copy per range per frame, "
+                  f"{results[name]} exclusive ticks over 8000 draws")
+    if results["exclusive"] <= 0 or 5 * results["shared"] >= results["exclusive"]:
+        raise AssertionError(f"shared exclusive hold must be under 20% of exclusive control: {results}")
+    print(f"{backend}: shared exclusive hold {100 * results['shared'] / results['exclusive']:.2f}% of control")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "shared-walk": check_shared_walk}.get(next(iter(sys.argv[3:]), ""), check)
         sys.exit(check_mode(Path(temporary), consumer, backend))

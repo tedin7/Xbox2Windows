@@ -3,6 +3,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_setup.h"
@@ -132,4 +135,131 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&right));  // RSSetScissorRects
     invoke(list, 12, 3, 1);                                         // draw into the right half
     return 0;
+}
+
+int draw_frame_copy_threads(ID3D12Device* desktop, void* guest, void* pso, const char* pixels)
+{
+    constexpr UINT workers = 4, draws = 1000, frames = 2;
+    constexpr UINT small_bytes = 4096, large_bytes = 16u << 20;
+    const auto arg = [](const void* pointer) { return reinterpret_cast<StreamWord>(pointer); };
+    const auto failed = [](StreamWord result) { return FAILED(static_cast<HRESULT>(result)); };
+    struct Ranges {
+        float* small = static_cast<float*>(VirtualAlloc(nullptr, small_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        float* large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        ~Ranges()
+        {
+            if (small) VirtualFree(small, 0, MEM_RELEASE);
+            if (large) VirtualFree(large, 0, MEM_RELEASE);
+        }
+        bool write(unsigned color) const
+        {
+            if (!small || !large) return false;
+            small[0] = (color & 1) ? 1.0f : 0.0f;
+            small[1] = (color & 2) ? 1.0f : 0.0f;
+            large[large_bytes / sizeof(float) - 2] = (color & 4) ? 1.0f : 0.0f;
+            large[large_bytes / sizeof(float) - 1] = 1.0f;
+            return true;
+        }
+    };
+    std::array<Ranges, workers + 1> ranges;
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // The manifest's two records are at byte offsets 0 and 32 from a table base.
+    if (increment != 32) return 81;
+    alignas(32) std::array<unsigned char, (workers + 1) * 64> descriptors{};
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        StreamWord backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * (workers + 1), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                arg(descriptors.data()), descriptors.size()};
+    void* heap = nullptr;
+    if (failed(invoke(guest, 14, arg(&heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heap)))) return 82;
+    const auto cpu = invoke(heap, 9);
+    const auto gpu = invoke(heap, 10);
+    if (!gpu || cpu != arg(descriptors.data())) return 83;
+    for (UINT pair = 0; pair <= workers; ++pair) {
+        if (!ranges[pair].write(pair + 1)) return 84;
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC small{arg(ranges[pair].small), small_bytes};
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC large{arg(ranges[pair].large), large_bytes};
+        invoke(guest, 17, arg(&small), cpu + pair * 64);
+        invoke(guest, 17, arg(&large), cpu + pair * 64 + 32);
+    }
+
+    std::array<StreamTarget, workers> targets;
+    std::array<void*, workers> lists{};
+    for (UINT worker = 0; worker < workers; ++worker) {
+        if (const int rc = open_stream_target(desktop, guest, pso, draws, frames, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                              draws, targets[worker])) return rc;
+        lists[worker] = targets[worker].list;
+    }
+    auto& main = targets.front();
+    const auto execute = [&](UINT count, UINT64 epoch) {
+        invoke(main.queue, 10, count, arg(lists.data()));
+        if (failed(invoke(main.queue, 14, arg(main.fence), epoch))) return false;
+        const auto deadline = GetTickCount64() + 60000;
+        while (invoke(main.fence, 8) < epoch && GetTickCount64() < deadline) Sleep(1);
+        return invoke(main.fence, 8) == epoch;
+    };
+    const auto reset = [&](StreamTarget& target) {
+        if (failed(invoke(target.allocator, 8)) || failed(invoke(target.list, 139, arg(target.allocator)))) return false;
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(target.rtv_heap, 9))};
+        const D3D12_VIEWPORT viewport{0, 0, float(draws), float(frames), 0, 1};
+        invoke(target.list, 50, 1, arg(&rtv));
+        invoke(target.list, 21, 1, arg(&viewport));
+        invoke(target.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(target.list, 25, arg(pso));
+        return true;
+    };
+    const auto bind_heap = [&](void* list) { invoke(list, 32, 1, arg(&heap)); };
+    // Warm the translation and the PSO before the synchronized first cache
+    // miss. An empty scissor leaves every measured pixel for the real draws.
+    bind_heap(main.list);
+    const D3D12_RECT empty{};
+    invoke(main.list, 22, 1, arg(&empty));
+    invoke(main.list, 36, 0, gpu + 64);
+    invoke(main.list, 12, 3, 1);
+    if (failed(invoke(main.list, 9)) || !execute(1, 1)) return 85;
+    invoke(main.queue, 32, 0, 0, 0);
+    if (!reset(main)) return 86;
+
+    char serial_mode[2]{};
+    const bool serial = GetEnvironmentVariableA("X2W_TEST_DRAW_WALK_SERIAL", serial_mode, sizeof(serial_mode)) == 1 &&
+                        serial_mode[0] == '1';
+    for (UINT frame = 0; frame < frames; ++frame) {
+        const auto record = [&](UINT worker) {
+            void* list = lists[worker];
+            bind_heap(list);
+            for (UINT draw = 0; draw < draws; ++draw) {
+                const LONG x = static_cast<LONG>(draw), y = static_cast<LONG>(frame);
+                const D3D12_RECT pixel{x, y, x + 1, y + 1};
+                invoke(list, 22, 1, arg(&pixel));
+                invoke(list, 36, 0, gpu + (draw % 2 ? (worker + 1) * 64 : 0));
+                invoke(list, 12, 3, 1);
+            }
+        };
+        if (serial) {
+            for (UINT worker = 0; worker < workers; ++worker) record(worker);
+        } else {
+            std::array<std::thread, workers> threads;
+            for (UINT worker = 0; worker < workers; ++worker) threads[worker] = std::thread(record, worker);
+            for (auto& thread : threads) thread.join();
+        }
+        for (auto* list : lists)
+            if (failed(invoke(list, 9))) return 87;
+        if (!execute(workers, frame + 2)) return 88;
+        invoke(main.queue, 32, 0, 0, 0);
+        if (frame + 1 < frames) {
+            ranges[0].write(6);
+            for (auto& target : targets)
+                if (!reset(target)) return 89;
+        }
+    }
+
+    std::ofstream combined(pixels, std::ios::binary);
+    for (UINT worker = 0; worker < workers; ++worker) {
+        const std::string part = std::string(pixels) + "." + std::to_string(worker);
+        if (const int rc = read_stream_target(desktop, targets[worker], part.c_str())) return rc;
+        std::ifstream input(part, std::ios::binary);
+        combined << input.rdbuf();
+    }
+    return combined ? 0 : 90;
 }

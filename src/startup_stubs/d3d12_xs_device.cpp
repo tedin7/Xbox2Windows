@@ -2858,12 +2858,14 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
         }
     }
 
+    const u64 refused_capacity = total_bytes;
+    const std::size_t refused_chunks = chunks.size();
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity (asked %zu bytes, ring %llu MiB in %zu chunks, %ld reservations, %ld recycled so far)",
-            bytes, static_cast<unsigned long long>(total_bytes >> 20), chunks.size(), static_cast<long>(upload_ring_reservations),
+            bytes, static_cast<unsigned long long>(refused_capacity >> 20), refused_chunks, static_cast<long>(upload_ring_reservations),
             static_cast<long>(upload_ring_recycled));
     return reservation;
 }
@@ -7759,13 +7761,17 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
-    if (reuse_large_bindings) draw_lock_acquire_exclusive();
+    const bool synchronize_draw_frame = reuse_large_bindings || draw_walk_shared_enabled();
+    if (synchronize_draw_frame) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;
-    if (reuse_large_bindings) {
-        finish_bigbind_frame(frame);
-        draw_lock_release_exclusive();
+    if (reuse_large_bindings) finish_bigbind_frame(frame);
+    if (synchronize_draw_frame) draw_lock_release_exclusive();
+    if (draw_walk_fixture()) {
+        const auto calls = InterlockedExchange64(&fixture_draw_calls, 0);
+        const auto ticks = InterlockedExchange64(&fixture_draw_exclusive_ticks, 0);
+        log("x2w-draw fixture exclusive hold: %ld %lld %lld", frame - 1, calls, ticks);
     }
     draw_dump_flush();
     red_producers().flush();

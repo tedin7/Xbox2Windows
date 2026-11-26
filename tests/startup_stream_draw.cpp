@@ -431,6 +431,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
         return draw_pixel_history(desktop.Get(), guest, pso, pixels);
+    char frame_copy_mode[16]{};
+    GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", frame_copy_mode, sizeof(frame_copy_mode));
+    if (std::strcmp(frame_copy_mode, "shared-walk") == 0) {
+        extern int draw_frame_copy_threads(ID3D12Device*, void*, void*, const char*);
+        return draw_frame_copy_threads(desktop.Get(), guest, pso, pixels);
+    }
     Bc7Binding binding;
     if (bc7 && bc7->packed) {
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
