@@ -3614,6 +3614,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers v_fma_mix_f32 and selects binary16 source halves on all three mixed-precision FMAs.
     add_test(NAME startup_gfx2hlsl_fma_mix COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py")
+    # gfx2hlsl lowers the lane-local DPP spellings of VOP2 operations and refuses every control that reads another lane.
+    add_test(NAME startup_gfx2hlsl_dpp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
@@ -4259,6 +4262,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_dpp_quad_swap_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl lane-local DPP forms of v_add_f32, v_sub_f32, v_or_b32 and v_add_nc_u32: the translated pair is drawn
+    # on WARP and hardware (FXC 5_1 and DXC 6_0) and read back against a plain float32/integer reference, with a
+    # mutation that must read a different word.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_warp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_dpp_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl lowers constant-lane SGPR spills (v_writelane_b32 / v_readlane_b32) in a pixel stage to scalar slots (#2125 item E).
     add_test(NAME startup_gfx2hlsl_sgpr_spill_controls COMMAND "${INTAKE_PYTHON}" -B
