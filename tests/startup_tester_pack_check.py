@@ -30,26 +30,27 @@ def write(folder, name, data):
 
 
 def check_preset():
-    script = T.input_preset("menus", 300)
+    script = T.input_preset("menus", 300, 0)
     items = script.split(",")
     assert items[:4] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2"], items[:4]
     times = [int(i.split("@")[1].split("+")[0]) for i in items]
     assert times == list(range(5, 300, 2)), times
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
-    assert T.input_preset("menus", 5) == "", "no entry before the start second"
-    assert T.input_preset("menus", 420).count(",") + 1 == len(range(5, 300, 2))
-    long_menus = T.input_preset("menus", 600).split(",")
+    assert T.input_preset("menus", 5, 0) == "", "no entry before the start second"
+    assert T.input_preset("menus", 420, 0).count(",") + 1 == len(range(5, 300, 2))
+    long_menus = T.input_preset("menus", 600, 0).split(",")
     assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 300, 2)), "the menus preset stops at 300 s"
     assert len(long_menus) <= T.MAX_ENTRIES
-    long_run = T.input_preset("menus", 100000).split(",")
+    long_run = T.input_preset("menus", 100000, 0).split(",")
     assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
-    privacy = T.input_preset("menus", 120, 2, 21, 1).split(",")
-    assert privacy[:8] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2", "80@13+1.2", "4@15+1.2", "80@17+1.2", "80@19+1.2"], "the pattern runs until the privacy start"
-    assert privacy[8:14] == ["80@21+1.2", "4@23+1.2", "80@25+1.2", "4@27+1.2", "80@29+1.2", "4@31+1.2"], "skip, box 1, down, box 2, down, confirm"
-    assert privacy[14:17] == ["80@33+1.2", "80@35+1.2", "4@37+1.2"], "then the pattern starts over with DOWN"
-    assert T.input_preset("menus", 60, 0) == T.input_preset("menus", 60), "no boxes = the plain menus script"
-    default = T.input_preset("menus", 200, 2).split(",")
-    assert default[default.index("80@89+1.2") + 1:][:5] == ["4@91+1.2", "80@93+1.2", "4@95+1.2", "80@97+1.2", "4@99+1.2"], "default start 90: A, down, A, down, A (confirm)"
+    passes = T.privacy_cycles(2)
+    assert passes == [["40", "40", "40", "80", "80", "4"],
+                      ["40", "40", "40", "4", "80", "80", "4"],
+                      ["40", "40", "40", "80", "4", "80", "4"],
+                      ["40", "40", "40", "4", "80", "80", "4"]], "none, box 1, box 2, box 1; each pass ends on Conferma"
+    flat = [i.split("@")[0] for i in T.input_preset("menus", 300).split(",")]
+    assert flat[:len(sum(passes, []))] == sum(passes, []), "the menus script is those passes in order"
+    assert T.input_preset("menus", 60, 0).startswith("80@5+1.2,80@7+1.2,4@9+1.2"), "0 boxes = the plain pattern"
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"
@@ -65,6 +66,60 @@ def check_preset():
         except ValueError:
             continue
         raise AssertionError("an oversized raw script was accepted")
+
+
+def run_ui(script, arrival_delay, start, legal_focus=0, boxes_at_start=(False, False)):
+    """A model of the screens the title shows before loading (Run L pictures): navigation and brightness (A continues), the
+    legal notice (two list items and Avanti), the privacy screen (two boxes and Conferma) and loading. Lists clamp at both
+    ends. A press only counts once its screen has arrived. Returns (screen at the end, boxes ticked, time loading began)."""
+    presses = []
+    for item in script.split(","):
+        mask, rest = item.split("@")
+        presses.append((int(rest.split("+")[0]), int(mask, 16)))
+    order = ["nav", "bright", "legal", "privacy", "loading"]
+    screen, active_at = 0, start
+    focus = {"legal": legal_focus, "privacy": 0}
+    boxes = list(boxes_at_start)
+    for at, mask in presses:
+        name = order[screen]
+        if name == "loading":
+            break
+        if at < active_at:
+            continue
+        moved = False
+        if name in ("nav", "bright"):
+            moved = mask == 4
+        else:
+            if mask == 0x40:
+                focus[name] = max(0, focus[name] - 1)
+            elif mask == 0x80:
+                focus[name] = min(2, focus[name] + 1)
+            elif mask == 4:
+                if name == "legal":
+                    moved = focus[name] == 2
+                elif focus[name] < 2:
+                    boxes[focus[name]] = not boxes[focus[name]]
+                else:
+                    moved = all(boxes)
+        if moved:
+            screen += 1
+            active_at = at + arrival_delay
+    return order[screen], boxes, active_at - arrival_delay if order[screen] == "loading" else None
+
+
+def check_privacy_screen():
+    script = T.input_preset("menus", 300)
+    for delay in (0, 3, 7, 15, 30):
+        for start in (0, 12, 33, 70):
+            for legal_focus in (0, 1):
+                for ticked in ((False, False), (True, False), (False, True), (True, True)):
+                    end, boxes, when = run_ui(script, delay, start, legal_focus, ticked)
+                    assert end == "loading" and boxes == [True, True] and when < 300, (delay, start, legal_focus, ticked, end, boxes, when)
+    # control: the old pattern walks down to Conferma without ticking both boxes and is stuck on the privacy screen
+    plain = T.input_preset("menus", 300, 0)
+    for delay in (0, 15):
+        end, boxes, _ = run_ui(plain, delay, 0)
+        assert end == "privacy", (delay, end, boxes)   # never gets through: it cannot tick both boxes and confirm
 
 
 def make_run(folder, captures, same_picture=False, events_bytes=1000):
@@ -394,6 +449,7 @@ if __name__ == "__main__":
     check_seed_cache()
     check_cache_results()
     check_preset()
+    check_privacy_screen()
     check_manifest()
     check_first_poll()
     check_cache_stats()

@@ -65,7 +65,7 @@ What it does:
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
    already in the shader cache at start, and when the title first polled the pad.
 
-`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input Default privacy step: from script second 90 it ticks the two privacy boxes seen in Run L (A, down, A, down to Conferma, A), then the pattern starts over (-PrivacyBoxes 0 turns it off).
+`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input Default (-PrivacyBoxes 2): the presses are clock-free passes for the privacy screen (up x3, toggle at most one box, down to Conferma, A; a different single box each pass, Gray-code order), repeated until the screen changes; -PrivacyBoxes 0 gives the plain pattern.
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 `-Input menus2` presses the same buttons, but after every A it waits until the presented picture has changed and stayed still for 2 s (at most 90 s) before the next press, so nothing is pressed blind while a screen loads. It needs render mode, which the script always uses.
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
