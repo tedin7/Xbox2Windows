@@ -16940,9 +16940,10 @@ ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
 
 ### GPU-written indirect Dispatch
 
-For a translated slot 67 pipeline with fixed-table raw buffers, command-list slot 61 accepts one rootless
-Dispatch record in a placed argument buffer. It binds the same translated pipeline and descriptors as direct
-Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
+By default, command-list slot 61 accepts one rootless Dispatch record in a placed argument buffer for a
+translated slot 67 pipeline with fixed-table raw buffers. It binds the same translated pipeline and
+descriptors as direct Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`.
+The GPU reads the group counts.
 
 The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
 After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
@@ -16951,9 +16952,23 @@ the same outputs. Omitting the producer leaves the zero record and the output se
 translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
 buffer, an out-of-range record and an argument buffer also bound as shader output.
 
+Set `X2W_TRANSLATED_INDIRECT_BATCH=1` to allow multiple records and a count buffer with a rootless
+signature. Both buffers must support COMMON state tracking and must be distinct from bound shader
+resources. The argument range must hold the maximum number of records. With
+`X2W_SPLIT_INDIRECT_DISPATCH=1`, the runtime rewrites the arguments into scratch storage and rebinds the
+translated PSO and root before recording single-command calls.
+
+The WARP fixture uses an atomic append shader with two threads per group. It compares the explicit GPU
+readback against a CPU reference for 6, 5 and 0 groups, with the split off and on. It also checks the
+default-off refusal, argument range and both output aliases. A first-command-only control appends 4 records
+and must fail the full-batch comparison against 12. To run the runtime mutant, apply
+[`startup_indirect_batch_mutant.patch`](../tests/startup_indirect_batch_mutant.patch) with
+`git apply tests/startup_indirect_batch_mutant.patch`, rebuild the same targets and run the WARP fixture.
+The uncounted case must fail with `append counter 4, expected 12`.
+
 ```powershell
-cmake --build --preset release --target startup_stream_consumer
-ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
+cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
+ctest --preset release --no-tests=error -j 1 -R '^startup_(slot67_indirect_dispatch|indirect_count(_split)?)_warp$' -V
 python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
 

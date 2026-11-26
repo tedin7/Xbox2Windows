@@ -502,9 +502,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
     timer.resolved();
-    if (dispatch.argument)
-        for (std::size_t i = 0; i < count && !reason; ++i)
-            if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
+    if (dispatch.argument) {
+        for (std::size_t i = 0; i < count && !reason; ++i) {
+            if (views[i].resource == dispatch.argument)
+                reason = dispatch.batch_enabled && i >= inputs ? "the indirect argument buffer is also a dispatch output"
+                                                                 : "the indirect argument buffer is also a bound shader resource";
+            else if (dispatch.counts && views[i].resource == dispatch.counts)
+                reason = i >= inputs ? "the indirect count buffer is also a dispatch output"
+                                     : "the indirect count buffer is also a bound shader resource";
+        }
+    }
     phases.to(2);
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
     std::uint32_t values[32] = {};
@@ -536,6 +543,22 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    Microsoft::WRL::ComPtr<ID3D12Resource> rewritten;
+    if (!reason && dispatch.split) {
+        constexpr UINT stride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        rewritten = x2w_startup::SplitIndirectDispatch::make_scratch(device_of(self->own().list_device),
+                                                                    dispatch.commands, stride);
+        if (!rewritten || !retain_with_recording(self, rewritten)) {
+            reason = "split translated indirect Dispatch has no scratch buffer";
+        } else {
+            require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (dispatch.counts && dispatch.counts != dispatch.argument)
+                require_state(self, dispatch.counts, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (!x2w_startup::split_indirect_dispatch().rewrite(list, dispatch.argument, dispatch.offset,
+                    dispatch.commands, stride, dispatch.counts, dispatch.count_offset, rewritten.Get()))
+                reason = "split translated indirect Dispatch rewrite is unavailable";
+        }
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -599,18 +622,33 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
-    if (dispatch.signature) {
+    const auto order_outputs = [&] {
+        for (std::size_t i = inputs; i < count; ++i) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = views[i].resource;
+            list->ResourceBarrier(1, &barrier);
+        }
+    };
+    if (rewritten) {
+        // The translated root, pipeline and views above replace the rewrite's compute state.
+        constexpr UINT stride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        const auto start = x2w_startup::SplitIndirectDispatch::rewritten_offset(dispatch.commands, stride);
+        for (UINT i = 0; i < dispatch.commands; ++i) {
+            if (i) order_outputs();
+            list->ExecuteIndirect(dispatch.signature, 1, rewritten.Get(), start + u64{i} * stride, nullptr, 0);
+        }
+        x2w_startup::SplitIndirectDispatch::finish(list, rewritten.Get());
+    } else if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
+        if (dispatch.counts && dispatch.counts != dispatch.argument)
+            require_state(self, dispatch.counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ExecuteIndirect(dispatch.signature, dispatch.commands, dispatch.argument, dispatch.offset,
+                              dispatch.counts, dispatch.count_offset);
     } else {
         list->Dispatch(x, y, z);
     }
-    for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        barrier.UAV.pResource = views[i].resource;
-        list->ResourceBarrier(1, &barrier);
-    }
+    order_outputs();  // a later dispatch on this list reads what this one wrote
     // The translated root replaced the desktop compute root of the title and its arguments.
     if (pass.desktop_compute_root) {
         list->SetComputeRootSignature(pass.desktop_compute_root.Get());

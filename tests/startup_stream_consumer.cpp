@@ -235,14 +235,17 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool batch = mode.rfind("dispatch-indirect-batch", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, batch ? 0x40000 : indirect ? 0x30000 : 0x20000,
+                                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
     for (UINT i = 0; i < words; ++i) {
         buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
         buffers[1][i] = 0xc5c5c5c5u;
     }
+    if (batch) buffers[1][0] = 0;  // append counter
     UINT fields[2][3] = {{4, words, 0}, {4, words, 0}};
     const auto from_file = [](const char* variable, void* data, std::streamsize bytes) {
         char path[MAX_PATH];
@@ -304,9 +307,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
-    if (mode == "dispatch-indirect-output-alias") {
+    const bool batch_argument_alias = mode == "dispatch-indirect-batch-argument-output";
+    if (mode == "dispatch-indirect-output-alias" || batch_argument_alias) {
         const UINT64 address = reinterpret_cast<UINT64>(memory) + 0x20000;
-        const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 5, 0};
+        const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), batch_argument_alias ? 12u : 5u, 0};
         std::memcpy(descriptors[1], alias, sizeof(alias));
     }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
@@ -325,7 +329,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    const UINT batch_count = mode == "dispatch-indirect-batch-zero" ? 0 : 2;
+    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), batch ? batch_count : groups,
+                                 batch ? memory + 0x30000 / sizeof(UINT) : nullptr);
     bind(list);
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
@@ -403,7 +409,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+    if (batch) {
+        const bool counted = mode == "dispatch-indirect-batch-counted" || mode == "dispatch-indirect-batch-zero" ||
+                             mode == "dispatch-indirect-batch-short";
+        record.execute_batch(list, counted, mode == "dispatch-indirect-batch-count-output" ? placed[1] : nullptr,
+                             mode == "dispatch-indirect-batch-first-only", mode == "dispatch-indirect-batch-short");
+    } else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
@@ -511,19 +522,22 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
+    if (batch) record.copy_batch_output(adapter, device, queue, placed[1], words * sizeof(UINT));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
     for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
         if (GetTickCount64() >= deadline) return 78;
         Sleep(1);
     }
-    if (indirect && !record.check_record(groups)) return 80;
+    if (indirect && !(batch ? record.check_batch(batch_count) : record.check_record(groups))) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
-    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
+    UINT readback[words];
+    if (batch) record.read_batch_output(readback, sizeof(readback));
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(batch ? readback : buffers[1]), sizeof(readback));
     return 0;
 }
 

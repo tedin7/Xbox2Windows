@@ -3446,6 +3446,11 @@ struct TranslatedDispatch {
     ID3D12CommandSignature* signature = nullptr;
     ID3D12Resource* argument = nullptr;
     u64 offset = 0;
+    UINT commands = 1;
+    ID3D12Resource* counts = nullptr;
+    u64 count_offset = 0;
+    bool batch_enabled = false;
+    bool split = false;
 };
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch);
 u64 known_pipeline_key(Wrapper* pipeline);
@@ -3492,7 +3497,7 @@ constexpr const char* count_not_common_state = "count_not_common_state";
 constexpr const char* unknown = "unknown";
 }  // namespace indirect_other_refusal_code
 
-// Opt-in (X2W_SPLIT_INDIRECT_DISPATCH=1): a batched or counted indirect Dispatch with a desktop compute pipeline is
+// Opt-in (X2W_SPLIT_INDIRECT_DISPATCH=1): a batched or counted indirect Dispatch is
 // split into single-command calls (split_indirect_dispatch.h). Without it the native call runs on every adapter.
 bool split_indirect_dispatch_enabled()
 {
@@ -3541,7 +3546,6 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list", indirect_other, indirect_other_refusal_code::invalid_list_type);
-    // Only a desktop Dispatch signature runs more than one command or reads a count buffer here.
     constexpr UINT max_dispatch_commands = 1u << 16;
     if (!count || count > max_dispatch_commands)
         return refuse("command count is zero or above the supported maximum", indirect_other, indirect_other_refusal_code::invalid_command_count);
@@ -3571,6 +3575,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
+    const bool translated_batch = translated_compute && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_BATCH");
     const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
@@ -3668,7 +3673,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
         }
     } else if (translated_compute) {
-        if (count != 1 || count_buffer || sig->own().signature_root)
+        if (sig->own().signature_root ||
+            ((count != 1 || count_buffer) && !translated_batch))
             return refuse("translated Dispatch requires one rootless command and no count buffer", indirect_compute_pipeline);
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
@@ -3696,8 +3702,27 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::argument_not_common_state);
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
+    ID3D12Resource* counts = nullptr;
+    if (count_buffer) {
+        // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
+        Wrapper* count_wrapper = as_wrapper(count_buffer);
+        if (!count_wrapper || count_wrapper->own().kind != resource_kind || !count_wrapper->own().real)
+            return refuse("count buffer has no desktop resource", indirect_other, indirect_other_refusal_code::count_missing_resource);
+        const auto count_base = reinterpret_cast<u64>(count_wrapper->own().title_memory);
+        if (!count_base || (count_offset & 3) || count_offset > ~u64{} - count_base - sizeof(UINT))
+            return refuse("invalid count offset or unmapped count buffer", indirect_other, indirect_other_refusal_code::count_invalid_offset);
+        const auto count_found = placed_buffer_range(device, count_base + count_offset, sizeof(UINT));
+        if (count_found.reject || count_found.owner != count_wrapper)
+            return refuse("count word is outside a unique placed buffer", indirect_other, indirect_other_refusal_code::count_outside_placed_buffer);
+        const auto* count_info = resource_info(count_wrapper);
+        if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+            return refuse("count buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::count_not_common_state);
+        counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
+    }
     if (translated_compute) {
-        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset};
+        const bool split = (count > 1 || counts) && split_indirect_dispatch_enabled();
+        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset,
+                                          count, counts, count_offset, translated_batch, split};
         if (const char* failure = record_translated_dispatch(self, dispatch)) return refuse(failure, indirect_compute_pipeline);
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
         return;
@@ -3820,25 +3845,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     // here with a count above one or a count buffer; graphics and mesh signatures are refused above.
     const bool split = command == IndirectCommand::dispatch && pass.compute_pipeline && pass.compute_root &&
         (count > 1 || count_buffer) && split_indirect_dispatch_enabled();
-    ID3D12Resource* counts = nullptr;
-    if (count_buffer) {
-        // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
-        Wrapper* count_wrapper = as_wrapper(count_buffer);
-        if (!count_wrapper || count_wrapper->own().kind != resource_kind || !count_wrapper->own().real)
-            return refuse("count buffer has no desktop resource", indirect_other, indirect_other_refusal_code::count_missing_resource);
-        const auto count_base = reinterpret_cast<u64>(count_wrapper->own().title_memory);
-        if (!count_base || (count_offset & 3) || count_offset > ~u64{} - count_base - sizeof(UINT))
-            return refuse("invalid count offset or unmapped count buffer", indirect_other, indirect_other_refusal_code::count_invalid_offset);
-        const auto count_found = placed_buffer_range(device, count_base + count_offset, sizeof(UINT));
-        if (count_found.reject || count_found.owner != count_wrapper)
-            return refuse("count word is outside a unique placed buffer", indirect_other, indirect_other_refusal_code::count_outside_placed_buffer);
-        const auto* count_info = resource_info(count_wrapper);
-        if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-            return refuse("count buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::count_not_common_state);
-        counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
-        if (counts != resource)
-            require_state(self, counts, split ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    }
+    if (counts && counts != resource)
+        require_state(self, counts, split ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     if (split) {
         // The rewrite reads the title's records and count word by copies only, then replaces the compute root and
         // pipeline. The compute state the title can set on the desktop list is the pipeline (slot 25), the root

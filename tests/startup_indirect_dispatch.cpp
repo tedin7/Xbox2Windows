@@ -487,6 +487,13 @@ int main(int argc, char** argv) try
                        !verify(writer.Get(), record, Rejection::rooted_count_buffer, signature.Get()) ||
                        !verify(writer.Get(), record, Rejection::partial_record, signature.Get()) ||
                        !verify(writer.Get(), record, Rejection::padded_stride, padded.Get()))))) return 1;
+    if (counted) {
+        // The translated opt-in must preserve native count-buffer forwarding and validation.
+        if (!SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_BATCH", "1")) return 1;
+        const Words records{2, 2, 1, 1, 1, 2, 1, 1, 1, 3};
+        if (!verify(writer.Get(), records, Rejection::none, signature.Get()) ||
+            !verify(writer.Get(), records, Rejection::count_outside, signature.Get())) return 1;
+    }
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;

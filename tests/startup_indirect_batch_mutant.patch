@@ -1,0 +1,7 @@
+--- a/src/startup_stubs/d3d12_compute_dispatch.inl
++++ b/src/startup_stubs/d3d12_compute_dispatch.inl
+@@ -645,3 +645,3 @@
+             require_state(self, dispatch.counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+-        list->ExecuteIndirect(dispatch.signature, dispatch.commands, dispatch.argument, dispatch.offset,
++        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset,
+                               dispatch.counts, dispatch.count_offset);
