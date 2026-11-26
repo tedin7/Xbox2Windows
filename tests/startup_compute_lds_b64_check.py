@@ -120,9 +120,59 @@ WORDS_B = bytes.fromhex(
     '001078e00d080480000081bf'
 )
 
+# Each lane fills a 16-byte slot and reads both qwords from the other half of the group.
+SOURCE_SLOT = PREAMBLE + """\
+v_add_nc_u32 v5, 11, v0
+v_xor_b32 v6, 23, v0
+v_add_nc_u32 v7, 35, v0
+v_xor_b32 v8, 49, v0
+v_lshlrev_b32 v4, 4, v0
+ds_write_b64 v4, v[5:6]
+ds_write_b64 v4, v[7:8] offset:8
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v10, 0x200, v4
+v_and_b32 v10, 0x3f0, v10
+ds_read_b128 v[12:15], v10
+s_waitcnt lgkmcnt(0)
+buffer_store_dwordx4 v[12:15], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_SLOT = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf8b000a4a97000c3aa3000e4ab100103a'
+    '84000834000034d904050000080034d9040700007fc08cbf00008abfff08143a00020000'
+    'ff141436f00300000000fcdb0a00000c7fc08cbf001078e0040c0480000081bf'
+)
+
+SOURCE_RTZ = PREAMBLE + """\
+v_mov_b32 v2, 0x3f803fff
+v_mov_b32 v3, 0xb3800001
+v_mov_b32 v4, 0xabcd4321
+v_cvt_pkrtz_f16_f32_sdwa v5, v2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+v_cvt_pkrtz_f16_f32_sdwa v4, v2, v3 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:BYTE_2
+v_cvt_pkrtz_f16_f32_sdwa v6, v2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:WORD_1
+v_mov_b32 v7, 0x47800000
+v_cvt_pkrtz_f16_f32_sdwa v7, v7, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+v_lshlrev_b32 v8, 4, v0
+buffer_store_dwordx4 v[4:7], v8, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_RTZ = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbfff02047eff3f803fff02067e010080b3'
+    'ff02087e2143cdabf9060a5e02060606f906085e02150602f9060c5e02060105ff020e7e'
+    '00008047f9060e5e0706060684001034001078e008040480000081bf'
+)
+
+# Set SRC1_SEXT explicitly on the WORD_1 case. The assembler models this opcode's
+# sources as float and does not expose that bit.
+RTZ_WORD_SELECT = 'f9060c5e02060105'
+RTZ_SIGN_EXTEND = 'f9060c5e0206010d'
+
 CASES = {
     'P': (SOURCE_P, WORDS_P, USER7 | TGID_X | (2 << 15), (64, 1, 1), (2, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | (1 << 15), (64, 1, 1), (1, 1, 1)),
+    'slot': (SOURCE_SLOT, WORDS_SLOT, USER7 | (2 << 15), (64, 1, 1), (1, 1, 1)),
+    'rtz': (SOURCE_RTZ, WORDS_RTZ, USER7, (64, 1, 1), (1, 1, 1)),
 }
 
 VERIFIED_SNIPPETS = {
@@ -135,6 +185,20 @@ VERIFIED_SNIPPETS = {
 
 WORDS = 320
 SENTINEL = 0xc5c5c5c5
+
+
+def half_rtz(bits):
+    value = struct.unpack('<f', struct.pack('<I', bits))[0]
+    magnitude = abs(value)
+    sign = (bits >> 16) & 0x8000
+    if magnitude != magnitude:
+        return sign | 0x7e00
+    if magnitude == float('inf'):
+        return sign | 0x7c00
+    # Use the host's nearest half then move back one representable value on overshoot.
+    rounded = struct.pack('<e', min(magnitude, 65504))
+    half = int.from_bytes(rounded, 'little')
+    return sign | (half - (struct.unpack('<e', rounded)[0] > magnitude))
 
 
 def expected_words(name):
@@ -156,6 +220,17 @@ def expected_words(name):
             out[idx + 1] = peer ^ 0x5a5a0000
             out[idx + 2] = b0
             out[idx + 3] = b1
+    elif name == 'slot':
+        for lane in range(64):
+            peer = lane ^ 32
+            out[4 * lane:4 * lane + 4] = [peer + 11, peer ^ 23, peer + 35, peer ^ 49]
+    elif name == 'rtz':
+        normal = half_rtz(0x3f803fff)
+        tiny = half_rtz(0xb3800001)
+        sext_word = int.from_bytes(bytes.fromhex('80b3'), 'little', signed=True) & 0xffffffff
+        value = [(normal << 16) | 0x4321, (tiny << 16) | normal,
+                 half_rtz(sext_word) << 16, (tiny << 16) | half_rtz(0x47800000)]
+        out[:256] = value * 64
     else:
         raise KeyError(name)
     return out
@@ -163,6 +238,8 @@ def expected_words(name):
 
 def translate_case(name, code=None, rsrc2=None, group=None):
     _, words, default_rsrc2, local, _groups = CASES[name]
+    if name == 'rtz':
+        words = patch(words, RTZ_WORD_SELECT, RTZ_SIGN_EXTEND)
     return G.ComputePipeline(words if code is None else code, root_blob(),
                              default_rsrc2 if rsrc2 is None else rsrc2, local if group is None else group)
 
@@ -265,7 +342,29 @@ def check_controls():
     bare.pipe = None
     refused('metadata', lambda: bare.lower('ds_write_b64', 'ds_write_b64 v4, v[5:6]', ['v4', 'v[5:6]'], []))
 
-    print('bounded 64-bit LDS exchange sizing, pair validation, aligned masks, bounds and refusals pass')
+    slot = translate_case('slot').hlsl_cs()
+    assert 'a = (v4 + 8u) >> 2;' in slot
+    assert 'v15 = lds[a + 3u];' in slot
+    refused('one bounded qword', lambda: translate_case('slot', rsrc2=USER7 | (1 << 15)))
+    refused('one bounded qword', lambda: translate_case(
+        'slot', code=patch(WORDS_SLOT, '080034d904070000', '040034d904070000')))
+    refused('initialized span', lambda: translate_case(
+        'slot', code=patch(WORDS_SLOT, '080034d904070000', '000080bf000080bf')))
+    # Sparse slots still allow an aligned mask that selects only filled fields.
+    sparse = patch(WORDS_SLOT, '84000834', '85000834')
+    sparse = patch(sparse, 'f0030000', 'e0070000')
+    assert 'v15 = lds[a + 3u];' in translate_case(
+        'slot', code=sparse, rsrc2=USER7 | (4 << 15)).hlsl_cs()
+    refused('initialized span', lambda: translate_case(
+        'slot', code=patch(sparse, 'e0070000', 'f0070000'), rsrc2=USER7 | (4 << 15)))
+    rtz = translate_case('rtz').hlsl_cs()
+    assert 'x2w_f16rtz(asuint(asint(v3 << 0u) >> 16u))' in rtz
+    assert 'x2w_f16rtz(((v2 >> 8u) & 0xffu))' in rtz
+    assert 'asuint(v4) & 0xffffu' in rtz
+    for control_name in ('slot-same-lane', 'rtz-nearest', 'rtz-zero-extend'):
+        mutate(slot if control_name.startswith('slot-') else rtz, control_name)
+
+    print('bounded and pitched LDS exchange, SDWA RTZ lowering, and control construction pass')
 
 
 def assemble(llvm_mc, source):
@@ -284,6 +383,10 @@ def check_binary(llvm_mc):
 
 
 CONTROLS = {
+    'slot-same-lane': ('slot', '    v10 = 0x00000200u ^ v4;', '    v10 = v4;'),
+    'rtz-nearest': ('rtz', 'x2w_f16rtz(v2) | (x2w_f16rtz(v3) << 16u)',
+                    'f16rn(asfloat(v2)) | (x2w_f16rtz(v3) << 16u)'),
+    'rtz-zero-extend': ('rtz', 'asuint(asint(v3 << 0u) >> 16u)', '((v3 >> 16u) & 0xffffu)'),
     'p-same-lane': ('P', '    v8 = 0x00000100u ^ v4;\n', '    v8 = v4;\n'),
     'p-swap-dwords': ('P', '    a = (v8 + 16u) >> 2;\n    v8 = lds[a];\n    v9 = lds[a + 1u];\n',
                       '    a = (v8 + 16u) >> 2;\n    v8 = lds[a + 1u];\n    v9 = lds[a];\n'),

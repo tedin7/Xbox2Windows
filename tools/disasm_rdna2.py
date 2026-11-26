@@ -1524,8 +1524,13 @@ def _decode_vop2_sdwa(w1: int, vdst: int, vsrc1: int, op: int, op_name: str, com
             or (src1_sgpr and vsrc1 in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)):
         return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>",
                 "VOP2 SDWA scalar operand outside the supported LLVM 15 decoder subset")
+    # Packed RTZ can sign-extend a selected raw subword before interpreting it as float.
+    if op == 0x2f and src0_sext and not (src0_neg or src0_abs):
+        src0_is_float = False
     if (src0_is_float and src0_sext) or (not src0_is_float and (src0_neg or src0_abs)):
         return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA src0 modifier")
+    if op == 0x2f and src1_sext and not (src1_neg or src1_abs):
+        src1_is_float = False
     if (src1_is_float and src1_sext) or (not src1_is_float and (src1_neg or src1_abs)):
         return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA src1 modifier")
 

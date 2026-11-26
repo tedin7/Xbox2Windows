@@ -1447,7 +1447,7 @@ LDS_EXCHANGE_OPS = {
 
 
 def check_lds_exchange(ins, group, words):
-    """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
+    """Prove race-free LDS fills, one uniform barrier, then reads of initialized dwords.
 
     RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
     ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4), and
@@ -1463,6 +1463,9 @@ def check_lds_exchange(ins, group, words):
     if not 0 < words <= 8192:
         raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
+    stride = 0
+    slot_fields = []
+    initialized = set()
     published = False
     read = False
     prev = (None, [], [])
@@ -1476,6 +1479,8 @@ def check_lds_exchange(ins, group, words):
             if (not fill_spans or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
+            if stride > 4:
+                initialized = {word for start, end in fill_spans for word in range(start, end, 4)}
             published = True
         elif base in LDS_EXCHANGE_OPS:
             write, width, shift, unit_name = LDS_EXCHANGE_OPS[base]
@@ -1495,24 +1500,42 @@ def check_lds_exchange(ins, group, words):
             producer, args, modifiers = prev
             if write:
                 offset, = offsets
-                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
-                # 8-byte / 16-byte alignment is not required for LDS dword-addressed writes.
-                end = offset + group[0] * width
-                if (offset % 4 or end > words * 4 or published
-                        or fill_spans and (base != 'ds_write_b32' or producer != 'ds_write_b32')):
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
-                if fill_spans:
-                    if len(fill_spans) != 1:
-                        raise Unsupported('LDS exchange allows at most two consecutive bounded dword fills')
-                    # Consecutive DS writes preserve the proven address VGPR.
-                    if addr_op != args[0]:
+                bounded = 'LDS exchange needs one bounded %s per local X ID' % unit_name
+                if offset % 4 or published:
+                    raise Unsupported(bounded)
+                if not slot_fields:
+                    # The prefix preserves entry v0. Prove base = local X ID * stride.
+                    if (producer != 'v_lshlrev_b32' or len(args) != 3
+                            or args[0] != addr_op or args[2] != 'v0' or modifiers
+                            or not re.fullmatch(r'[0-9]{1,2}', args[1])
+                            or not int(shift) <= int(args[1]) <= 15):
+                        raise Unsupported(bounded)
+                    stride = 1 << int(args[1])
+                elif producer not in ('ds_write_b32', 'ds_write_b64', 'ds_write_b128') or addr_op != args[0]:
+                    if stride == 4 and base == producer == 'ds_write_b32':
                         raise Unsupported('LDS dword fills must use the same byte address VGPR')
-                    start0, end0 = fill_spans[0]
-                    if offset < end0 and start0 < end:
+                    raise Unsupported(bounded)
+
+                end = offset + (group[0] - 1) * stride + width
+                if end > words * 4:
+                    raise Unsupported(bounded)
+                if stride == 4:
+                    # Keep the original two-bank dword layout.
+                    if len(slot_fields) == 2:
+                        raise Unsupported('LDS exchange allows at most two consecutive bounded dword fills')
+                    if width != 4:
+                        raise Unsupported(bounded)
+                    if any(offset < stop and start < end for start, stop in fill_spans):
                         raise Unsupported('LDS dword fills must be disjoint')
-                elif producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0'] or modifiers:
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
-                fill_spans.append((offset, end))
+                    fill_spans.append((offset, end))
+                else:
+                    if (any(max(offset + width, stop) - min(offset, start) > stride
+                            or (offset < stop and start < offset + width) for start, stop in slot_fields)):
+                        raise Unsupported(bounded)
+                    # Record only initialized bytes; a wider stride can leave holes.
+                    fill_spans.extend((offset + lane * stride, offset + lane * stride + width)
+                                      for lane in range(group[0]))
+                slot_fields.append((offset, offset + width))
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
                     raise Unsupported('LDS read needs a bounded address after the fill barrier')
@@ -1523,11 +1546,26 @@ def check_lds_exchange(ins, group, words):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
-                # Each read must fit entirely within one initialized span, even when the banks have a gap.
-                if (low % 4 or high % 4
-                        or any(offset % 4 or not any(start <= low + offset and high + offset + width <= end
-                                                     for start, end in fill_spans)
-                               for offset in offsets)):
+                aligned = not (low % 4 or high % 4 or any(offset % 4 for offset in offsets))
+                if aligned and stride == 4:
+                    # Keep the original bank boundary for the two-dword layout.
+                    covered = all(any(start <= low + offset and high + offset + width <= end
+                                      for start, end in fill_spans) for offset in offsets)
+                elif aligned and high + max(offsets) + width <= words * 4:
+                    # A mask permits only its submasks. Check just those addresses in pitched slots.
+                    covered = True
+                    address = high
+                    while True:
+                        if any(address + offset + byte not in initialized
+                               for offset in offsets for byte in range(0, width, 4)):
+                            covered = False
+                            break
+                        if address == low:
+                            break
+                        address = (address - 1) & high
+                else:
+                    covered = False
+                if not covered:
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
@@ -5638,7 +5676,11 @@ class Stage:
                     fields[key] = value
                 else:
                     raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if float_result:
+        if base == 'v_cvt_pkrtz_f16_f32' and self.kind == 'cs':
+            if len(ops) != 3:
+                raise Unsupported('%s SDWA needs two sources' % base)
+            arity, text = 2, 'x2w_f16rtz({0}) | (x2w_f16rtz({1}) << 16u)'
+        elif float_result:
             arity, text = VEC_U_TO_F[base]
         elif base in VEC_U:
             arity, text = VEC_U[base]
@@ -5684,6 +5726,8 @@ class Stage:
         keep_low16 = (unused == 'UNUSED_PRESERVE' and select not in ('DWORD', 'WORD_1') and
                       destination in self.low16_only_v)
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
+        if base == 'v_cvt_pkrtz_f16_f32':
+            self.uses_f16rtz = True
 
     def pointer_add(self, base, dname, srcs, syms):
         """Propagate a descriptor pointer through s_add_u32 sD, sP, <literal> / s_addc_u32 sD+1, sP+1, 0.
@@ -11930,6 +11974,20 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if getattr(s, 'uses_f16rtz', False):
+            shared.extend([
+                'uint x2w_f16rtz(uint bits) {',
+                '    uint sign = (bits >> 16u) & 0x8000u;',
+                '    uint mag = bits & 0x7fffffffu;',
+                '    if (mag >= 0x7f800000u) return sign | (mag == 0x7f800000u ? 0x7c00u : 0x7e00u);',
+                '    if (mag >= 0x47800000u) return sign | 0x7bffu;',
+                '    if (mag < 0x33800000u) return sign;',
+                # Drop the low mantissa bits, shifting the implicit leading bit for half subnormals.
+                '    if (mag < 0x38800000u)',
+                '        return sign | (((mag & 0x7fffffu) | 0x800000u) >> (126u - (mag >> 23u)));',
+                '    return sign | ((mag - 0x38000000u) >> 13u);',
+                '}',
+            ])
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
