@@ -43,8 +43,10 @@ def main(argv):
         with open(note_path, "a", encoding="utf-8") as handle:
             handle.write("%s %s\n" % (time.strftime("%H:%M:%S"), text))
 
+    note("janitor started, waiting for tester_run (pid %d)" % args.parent)
     while W.parent_alive(args.parent):
         time.sleep(args.poll)
+    note("tester_run (pid %d) has ended" % args.parent)
     packed = os.path.exists(os.path.join(args.logdir, "pack_done"))
     if not packed:
         note("tester_run ended before it packed the report (Ctrl-C, or its window was closed): ending the run and packing it")
