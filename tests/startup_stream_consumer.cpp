@@ -183,6 +183,40 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
     return SUCCEEDED(hr) ? resource : nullptr;
 }
 
+static int draw_placed_token(IDXGIAdapter* adapter, void* device, void* pso, void* buffer, UINT offset)
+{
+    ComPtr<ID3D12Device> desktop;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    StreamTarget frame;
+    if (const int rc = open_stream_target(desktop.Get(), device, pso, 8, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 8, frame))
+        return rc;
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&heap)))))
+        return 86;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Buffer = {offset / 4, 4, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    invoke(device, 18, word(buffer), word(&srv), invoke(heap, 9));
+    invoke(frame.list, 32, 1, word(&heap));
+    invoke(frame.list, 36, 0, invoke(heap, 10));
+    invoke(frame.list, 12, 3, 1);
+    if (FAILED(static_cast<HRESULT>(invoke(frame.list, 9)))) return 75;
+    invoke(frame.queue, 10, 1, word(&frame.list));
+    if (FAILED(static_cast<HRESULT>(invoke(frame.queue, 14, word(frame.fence), 1)))) return 76;
+    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(frame.fence, 8) < 1;) {
+        if (GetTickCount64() >= deadline) return 78;
+        Sleep(1);
+    }
+    char path[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
+    return n && n < MAX_PATH ? read_stream_target(desktop.Get(), frame, path) : 2;
+}
+
 // Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (word 0 by slot
 // 37, word 1 by slot 39; a slot 40 call with other words in between must not reach them), a
 // table (slot 35) of two 16-byte hardware buffer descriptors written into the title heap's memory, and Dispatch
@@ -215,12 +249,16 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
-static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
+static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode, void* graphics_pso = nullptr)
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const bool placed_token = mode == "dispatch-view-token-placed";
-    const bool token_pair = mode == "dispatch-view-token-srv" || mode == "dispatch-view-token-uav" || placed_token;
+    const bool placed_draw = mode == "dispatch-view-token-placed-draw";
+    const bool raw_tail = mode == "dispatch-view-token-raw-tail";
+    const bool token_pair = mode == "dispatch-view-token-srv" || mode == "dispatch-view-token-uav" || placed_token || raw_tail;
+    constexpr UINT raw_words = 3 * 2 * 2 * 2 * 3 * 4;
+    constexpr UINT quarter_words = raw_words / 4;
     constexpr UINT view_offset = 16, buffer_bytes = words * sizeof(UINT);
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -302,44 +340,52 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     void* readback = nullptr;
     void* later_copy = nullptr;
     StreamWord read_token = 0;
-    if (token_pair) {
+    if (token_pair || placed_draw) {
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, buffer_bytes + view_offset, 1, 1, 1,
             DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
-        if (placed_token) {
-            // Both buffers are placed (device slot 133) over memory the desktop cannot alias, so each keeps a desktop copy and
-            // title memory that is stale; the title memory of the token's buffer holds a sentinel the GPU never wrote.
-            auto* const stale = reinterpret_cast<UINT*>(reinterpret_cast<UINT64>(memory) + 0x8000);
+        if (placed_token || placed_draw) {
+            // The 32 KiB offset forces copied placement. Keep the draw's title
+            // memory at the sentinel and let only the dispatch write the desktop buffer.
+            auto* const stale = memory + 0x8000 / sizeof(UINT);
             for (UINT i = 0; i < (buffer_bytes + view_offset) / sizeof(UINT); ++i) stale[i] = 0xdddddddd;
-            D3D12_RESOURCE_DESC plain = desc;
-            plain.Flags = D3D12_RESOURCE_FLAG_NONE;
             if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(stale), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
-                    word(&__uuidof(ID3D12Resource)), word(&intermediate)))) ||
-                FAILED(static_cast<HRESULT>(invoke(device, 133, word(reinterpret_cast<void*>(reinterpret_cast<UINT64>(memory) + 0xc000)),
-                    word(&plain), D3D12_RESOURCE_STATE_COMMON, 0, word(&__uuidof(ID3D12Resource)), word(&later_copy))))) return 85;
+                    word(&__uuidof(ID3D12Resource)), word(&intermediate))))) return 85;
+            if (placed_token) {
+                D3D12_RESOURCE_DESC plain = desc;
+                plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+                if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(memory + 0xc000 / sizeof(UINT)), word(&plain),
+                        D3D12_RESOURCE_STATE_COMMON, 0, word(&__uuidof(ID3D12Resource)), word(&later_copy))))) return 85;
+            }
         } else {
             intermediate = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
         }
-        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
-        readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
-        void* mapped = nullptr;
-        if (!intermediate || !readback || !upload ||
-            FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&mapped)))) || !mapped) return 82;
-        std::memset(mapped, 0, buffer_bytes + view_offset);
-        invoke(upload, 9, 0, 0);
+        if (!intermediate) return 82;
+        if (token_pair) {
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+            readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+            void* mapped = nullptr;
+            if (!readback || !upload ||
+                FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&mapped)))) || !mapped) return 82;
+            std::memset(mapped, 0, buffer_bytes + view_offset);
+            invoke(upload, 9, 0, 0);
+        }
         const StreamWord increment = invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         if (increment < 32) return 73;
         const StreamWord uav_slot = cpu + 2 * increment, srv_slot = cpu + 3 * increment;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-        uav.Buffer = {view_offset / 4, words, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        uav.Buffer = {view_offset / 4, raw_tail ? raw_words : words, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
         invoke(device, 19, word(intermediate), 0, word(&uav), uav_slot);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
-            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-        srv.Buffer = {view_offset / 4, words, 0, D3D12_BUFFER_SRV_FLAG_RAW};
-        invoke(device, 18, word(intermediate), word(&srv), srv_slot);
+        if (token_pair) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            srv.Buffer = {view_offset / 4 + (raw_tail ? 3 * quarter_words : 0),
+                raw_tail ? quarter_words : words, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+            invoke(device, 18, word(intermediate), word(&srv), srv_slot);
+        }
         // The fixed table uses 16-byte hardware descriptors. Copy the token prefix from the 32-byte heap entry.
         std::memcpy(reinterpret_cast<void*>(cpu + 16), reinterpret_cast<const void*>(uav_slot), 16);
-        read_token = mode == "dispatch-view-token-srv" ? srv_slot : uav_slot;
+        read_token = (raw_tail || mode == "dispatch-view-token-srv") ? srv_slot : uav_slot;
     }
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
@@ -441,7 +487,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (token_pair) {
         std::memcpy(reinterpret_cast<void*>(cpu), reinterpret_cast<const void*>(read_token), 16);
         std::memcpy(reinterpret_cast<void*>(cpu + 16), descriptors[1], sizeof(descriptors[1]));
-        invoke(list, 14, 3, 2, 2);
+        invoke(list, 14, 3, raw_tail ? 1 : 2, raw_tail ? 1 : 2);
         if (placed_token) {
             // A later copy of the token's buffer must carry what the dispatch wrote, not the stale title memory.
             invoke(list, 15, word(later_copy), 0, word(intermediate), 0, buffer_bytes + view_offset);
@@ -463,6 +509,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();
+    if (placed_draw) {
+        const auto* stale = memory + 0x8000 / sizeof(UINT);
+        for (UINT i = 0; i < (buffer_bytes + view_offset) / sizeof(UINT); ++i)
+            if (stale[i] != 0xdddddddd) return 87;
+        return draw_placed_token(adapter, device, graphics_pso, intermediate, view_offset);
+    }
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
@@ -773,7 +825,8 @@ int main(int argc, char** argv)
     void* pso = nullptr;
     const bool hardware = (draw && std::strcmp(argv[4], "hardware") == 0) ||
                           GetEnvironmentVariableW(L"X2W_TEST_DISPATCH_HARDWARE", nullptr, 0) != 0;
-    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
+    const bool textured = GetEnvironmentVariableW(L"X2W_TEST_PLACED_TOKEN_DRAW", nullptr, 0) != 0 ||
+                          bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0 ||
@@ -790,7 +843,7 @@ int main(int argc, char** argv)
             std::fflush(stdout);
             if (std::getchar() != '\n') return 2;
         }
-        return dispatch_slot67(adapter.Get(), device, argv[8]);
+        return dispatch_slot67(adapter.Get(), device, argv[8], pso);
     }
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "texture", 7) == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(device, argv[8]) : 10;

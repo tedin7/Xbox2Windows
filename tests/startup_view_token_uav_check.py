@@ -67,7 +67,7 @@ def main(consumer, dxc):
         plain = lines(dispatch(directory, consumer, env, 'dispatch')[1], 'is not on a descriptor slot boundary')
         assert not plain, plain
 
-        # Case I clears the stride before it stores: the token's raw output then counts records in bytes (1280), not words.
+        # Case I clears the stride before it stores. The raw-tail regression separately exercises the record count.
         raw_directory = directory / 'raw'
         raw_directory.mkdir()
         raw_cache, raw_env = prepare_case(raw_directory, 'warp', 'I')
@@ -78,9 +78,7 @@ def main(consumer, dxc):
         mismatch = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b), None)
         assert mismatch is None, f'raw token output: first differing word {mismatch}\n{result.stderr[-3000:]}'
 
-        # The token's buffer is placed over title memory the desktop cannot alias. A later list copy of it must carry the GPU's
-        # bytes, never the stale title memory: the stand-in refuses the copy. Without note_placed_gpu_write it copies the stale
-        # 0xdddddddd words in title memory instead.
+        # Retain the copy refusal check. The placed-draw regression observes the GPU-written bytes.
         got, result = dispatch(directory, consumer, dict(env, X2W_VIEW_TOKEN_UAV='1'), 'dispatch-view-token-placed')
         copies = lines(result, 'CopyBufferRegion from a placed buffer without title backing')
         assert copies and copies[0].endswith('1296 bytes -> refused'), f'copy of a GPU-written placed buffer: {copies}\n{result.stderr[-3000:]}'
