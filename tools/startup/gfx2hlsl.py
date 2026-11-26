@@ -7046,33 +7046,34 @@ class Stage:
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
-    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
+    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_index=False,
                             raw_conversion_ok=False, uniform_off=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
+        offen = 'offen' in mods
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
                 offset += int(m[7:], 0)
             elif m == 'glc' and allow_glc:
                 glc = True
+            elif m == 'idxen' and allow_index and not offen:
+                continue
             elif m != 'offen':
                 raise Unsupported('%s modifier %s' % (kind_label, m))
-        offen = 'offen' in mods
-        if len(ops) != 4 or not (offen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
+        idxen = 'idxen' in mods
+        if len(ops) != 4 or not (offen or idxen or (uniform_off and ops[1] == 'off')):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
             raise Unsupported('%s data %s' % (kind_label, ops[0]))
-        if offen:
+        if offen or idxen:
             vaddr = reg_range(ops[1])
             if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
-                raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
-        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
+                raise Unsupported('%s vaddr %s for %s' % (kind_label, ops[1], 'offen' if offen else 'idxen'))
+        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=not idxen, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            if not offen and not uniform_off:
-                raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
             sreg = reg_range(ops[3])
@@ -7081,8 +7082,13 @@ class Stage:
             terms.append(self.S(sreg[1]))
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
+        uav = self.pipe.uav(key, rw=kind_label == 'buffer store')
+        if idxen:
+            # The raw UAV view starts at the descriptor base. Its entry constant carries DW1[31:16].
+            stride = self.pipe.ud(('uav_stride', self.pipe.uavs[key]['index']))
+            terms.insert(0, '%s * (ud%d & 0x3fffu)' % (self.u(ops[1]), stride))
         terms.append(str(offset))
-        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        return data, uav, '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -7113,7 +7119,7 @@ class Stage:
             raise Unsupported(name)
         method, signed, is_sub, data_count = MUBUF_ATOMIC_OPS[name]
         data, uav, address, glc = self.raw_table_uav_store(
-            'buffer atomic', ops, mods, data_count, allow_glc=True, allow_scalar_address=name == 'buffer_atomic_add')
+            'buffer atomic', ops, mods, data_count, allow_glc=True, allow_index=True, uniform_off=True)
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         self.emit('a = %s;' % address)
         if not isinstance(getattr(self, 'used_atomic', None), set):
