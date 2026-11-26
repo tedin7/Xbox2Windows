@@ -7271,8 +7271,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     if (render_mode() && frame % 300 == 0) {
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
-            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
+            compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
