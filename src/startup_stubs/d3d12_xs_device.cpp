@@ -364,9 +364,12 @@ Wrapper* the_device;
 
 // Time spent inside the stand-in per entry-point family, reported with the heartbeat.
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
-       time_pipeline, time_heap, time_copy, time_count };
+       time_pipeline, time_heap, time_copy,
+       // Parts of the pipeline-creation entry points (inside the "pipeline" total, which they overlap): waiting for note_lock,
+       // probing the title's descriptor memory, publishing a request, dumping.
+       time_pipe_lock, time_pipe_probe, time_pipe_publish, time_pipe_dump, time_count };
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
-                                            "pipeline", "heap", "copy"};
+                                            "pipeline", "heap", "copy", "pipe-lock", "pipe-probe", "pipe-publish", "pipe-dump"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
@@ -6967,7 +6970,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
-    dump_pipeline("pipeline", N, desc, 0x300);
+    {
+        Timed dump_timed(time_pipe_dump);
+        dump_pipeline("pipeline", N, desc, 0x300);
+    }
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     if constexpr (N == 57) {
         if (x2w_local::env_on("X2W_REFUSE_FIXED_MESH") && is_fixed_mesh57_descriptor(desc)) {
@@ -6987,6 +6993,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (!*out) return E_OUTOFMEMORY;
     if constexpr (N == 67) {
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
+        Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
             static_cast<Wrapper*>(*out)->own().compute_request_key = key;
             static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));

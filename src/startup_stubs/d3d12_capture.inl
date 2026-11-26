@@ -207,17 +207,23 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     info.stream_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
-    const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
-    if (have) info.desc.assign(static_cast<const unsigned char*>(desc), static_cast<const unsigned char*>(desc) + have);
-    if (path == 57 && have >= 0x28) {
-        u64 words[5];
-        std::memcpy(words, desc, sizeof(words));
-        if (words[2] && words[2] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[1]), words[2]))
-            info.state_a.assign(reinterpret_cast<const unsigned char*>(words[1]), reinterpret_cast<const unsigned char*>(words[1]) + words[2]);
-        if (words[4] && words[4] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[3]), words[4]))
-            info.state_b.assign(reinterpret_cast<const unsigned char*>(words[3]), reinterpret_cast<const unsigned char*>(words[3]) + words[4]);
+    {
+        Timed probe_timed(time_pipe_probe);
+        const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
+        if (have) info.desc.assign(static_cast<const unsigned char*>(desc), static_cast<const unsigned char*>(desc) + have);
+        if (path == 57 && have >= 0x28) {
+            u64 words[5];
+            std::memcpy(words, desc, sizeof(words));
+            if (words[2] && words[2] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[1]), words[2]))
+                info.state_a.assign(reinterpret_cast<const unsigned char*>(words[1]), reinterpret_cast<const unsigned char*>(words[1]) + words[2]);
+            if (words[4] && words[4] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[3]), words[4]))
+                info.state_b.assign(reinterpret_cast<const unsigned char*>(words[3]), reinterpret_cast<const unsigned char*>(words[3]) + words[4]);
+        }
     }
-    AcquireSRWLockExclusive(&note_lock);
+    {
+        Timed lock_timed(time_pipe_lock);  // the wait for note_lock: the guard ends once the lock is held
+        AcquireSRWLockExclusive(&note_lock);
+    }
     pipeline_infos()[w] = std::move(info);
     ReleaseSRWLockExclusive(&note_lock);
 }
