@@ -35,6 +35,7 @@ struct ComputeTranslation {
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    x2w_startup::PipelineCreation creation;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     KeyUse use;                            // when a Dispatch first and last had this key bound
@@ -111,7 +112,7 @@ bool compute_manifest_missing(ComputeManifest& manifest, u64 key)
 }
 
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
-const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* prefetched)
+const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* prefetched, PipelineLockGap& gap)
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
@@ -230,11 +231,29 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
     desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    if (FAILED(device_of(the_device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(&tr.pipeline))))
-        return "pipeline creation failed";
-    tr.state = 1;
-    log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
-        tr.srvs.size(), tr.uavs.size());
+    const u64 key = tr.key;
+    const bool unlocked = pipeline_creation_unlocked();
+    auto* device = device_of(the_device);
+    x2w_startup::ComPtr<ID3D12Device> device_hold;
+    x2w_startup::ComPtr<ID3D12RootSignature> root_hold;
+    if (unlocked) {
+        device_hold = device;
+        root_hold = tr.root;
+    }
+    x2w_startup::ComPtr<ID3D12PipelineState> result;
+    const HRESULT hr = x2w_startup::create_pipeline(tr.creation, unlocked, pipeline_creation_totals,
+        [&] { gap.release(); }, [&] { gap.acquire(); },
+        [&] { return device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&result)); });
+    auto& current = compute_translations().at(key);
+    if (SUCCEEDED(hr)) {
+        current.pipeline = std::move(result);
+        current.state = 1;
+        log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", key, current.uds.size(),
+            current.srvs.size(), current.uavs.size());
+    }
+    // The caller records the refusal reason before releasing draw_lock, so waiters see it too.
+    if (unlocked) current.creation.finish();
+    if (FAILED(hr)) return "pipeline creation failed";
     return nullptr;
 }
 
@@ -285,7 +304,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     draw_lock_acquire_exclusive();
     timer.got_lock();
     DispatchPhases phases;
-    ComputeTranslation* const tr = &compute_translations()[key];
+    ComputeTranslation* tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
     tr->use.note(process_ms());
@@ -296,10 +315,20 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
+        PipelineLockGap gap;
+        if (tr->creation.pending) {
+            gap.wait(tr->creation);
+            tr = &compute_translations().at(key);
+        }
         if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            tr->unmodelled = load_compute_translation(*tr, manifest);
+            const char* failure = load_compute_translation(*tr, manifest, gap);
+            tr = &compute_translations().at(key);
+            tr->unmodelled = failure;
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
+        phases.last.QuadPart += gap.ticks;
+        timer.t_lock += gap.ticks;
+        timer.t_start += gap.ticks;
         if (tr->state != 1) {
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
             reason = tr->unmodelled ? tr->unmodelled : "no translation";

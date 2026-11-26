@@ -2519,6 +2519,16 @@ add_test(NAME startup_state_block_blend COMMAND startup_state_block_blend_check)
 add_executable(startup_pipeline_state_check tests/startup_pipeline_state_check.cpp)
 target_include_directories(startup_pipeline_state_check PRIVATE src)
 target_compile_features(startup_pipeline_state_check PRIVATE cxx_std_17)
+target_link_libraries(startup_pipeline_state_check PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_pipeline_state_creation_warp COMMAND startup_pipeline_state_check --creation-warp)
+add_test(NAME startup_pipeline_state_creation_locked_warp COMMAND startup_pipeline_state_check --creation-warp)
+add_test(NAME startup_pipeline_state_creation_duplicate_control_warp COMMAND startup_pipeline_state_check --creation-mutant-warp)
+set_tests_properties(startup_pipeline_state_creation_warp startup_pipeline_state_creation_duplicate_control_warp
+    PROPERTIES ENVIRONMENT "X2W_PIPELINE_CREATE_UNLOCKED=1" TIMEOUT 90)
+set_tests_properties(startup_pipeline_state_creation_locked_warp
+    PROPERTIES ENVIRONMENT "X2W_PIPELINE_CREATE_UNLOCKED=0" TIMEOUT 90)
+set_tests_properties(startup_pipeline_state_creation_duplicate_control_warp
+    PROPERTIES PASS_REGULAR_EXPRESSION "duplicate graphics pipeline creation")
 add_test(NAME startup_pipeline_state COMMAND startup_pipeline_state_check)
 add_test(NAME startup_pipeline_state_offset_control COMMAND startup_pipeline_state_check --mutate offset)
 set_tests_properties(startup_pipeline_state_offset_control PROPERTIES WILL_FAIL TRUE)
@@ -5062,6 +5072,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
         "${DXC_EXECUTABLE}" warp --nolock)
     set_tests_properties(startup_compute_nolock_refuse_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_pipeline_state_creation_translated_draw_warp COMMAND
+        "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+        "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
+        "$<TARGET_FILE:startup_stream_rasterizer>" warp)
+    add_test(NAME startup_pipeline_state_creation_translated_dispatch_warp COMMAND
+        "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py"
+        "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" warp)
+    set_tests_properties(startup_pipeline_state_creation_translated_draw_warp
+        startup_pipeline_state_creation_translated_dispatch_warp
+        PROPERTIES ENVIRONMENT "X2W_PIPELINE_CREATE_UNLOCKED=1" TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
         "$<TARGET_FILE:startup_stream_rasterizer>" hardware filter)

@@ -16,6 +16,7 @@
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
 #include "startup_stubs/commit_state.h"
+#include "startup_stubs/pipeline_creation.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/committed_range.h"
 #include "startup_stubs/zero_tail.h"
@@ -7962,6 +7963,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[400];
             if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+            if (pipeline_creation_line(line, sizeof(line))) log("%s", line);
         }
         {
             char line[500];

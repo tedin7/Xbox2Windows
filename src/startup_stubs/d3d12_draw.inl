@@ -177,6 +177,11 @@ struct Translation {
     LONG logged_draws = 0, logged_bindings = 0, logged_constants = 0, constants_seen = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
+struct GraphicsPipelineEntry {
+    x2w_startup::PipelineCreation creation;
+    ID3D12PipelineState* pipeline = nullptr;
+};
+
 // Per title pipeline: its translation and the blend state found in its state block (if any).
 struct BoundPipeline {
     Translation* translation = nullptr;
@@ -192,7 +197,7 @@ struct BoundPipeline {
     bool has_rasterizer = false;
     D3D12_RASTERIZER_DESC rasterizer{};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
-    std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
+    std::unordered_map<u64, GraphicsPipelineEntry> pipelines;  // by target formats
 };
 
 // Looks for a desktop-layout D3D12_BLEND_DESC inside a state block: two flags, then eight render
@@ -251,7 +256,7 @@ inline void draw_lock_acquire_exclusive()
     draw_lock_note_max(draw_lock_stats.wait_max, waited);
     if (waited * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.wait_over_5ms);
 }
-inline void draw_lock_release_exclusive()
+inline void draw_lock_end_hold()
 {
     LARGE_INTEGER now, frequency;
     QueryPerformanceCounter(&now);
@@ -261,7 +266,71 @@ inline void draw_lock_release_exclusive()
     InterlockedAdd64(&draw_lock_stats.hold_ticks, held);
     draw_lock_note_max(draw_lock_stats.hold_max, held);
     if (held * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.hold_over_5ms);
+}
+inline void draw_lock_release_exclusive()
+{
+    draw_lock_end_hold();
     ReleaseSRWLockExclusive(&draw_lock);
+}
+LONG64 draw_lock_wait_for_pipeline(CONDITION_VARIABLE& ready)
+{
+    LARGE_INTEGER start;
+    QueryPerformanceCounter(&start);
+    draw_lock_end_hold();
+    SleepConditionVariableSRW(&ready, &draw_lock, INFINITE, 0);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    draw_lock_held_since = now.QuadPart;
+    return now.QuadPart - start.QuadPart;
+}
+
+struct PipelineLockGap {
+    bool crossed = false;
+    LONG64 ticks = 0;
+
+    void wait(x2w_startup::PipelineCreation& creation)
+    {
+        creation.wait([&](CONDITION_VARIABLE& ready) {
+            crossed = true;
+            ticks += draw_lock_wait_for_pipeline(ready);
+        });
+    }
+
+    void release()
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        crossed = true;
+        ticks -= now.QuadPart;
+        draw_lock_release_exclusive();
+    }
+
+    void acquire()
+    {
+        draw_lock_acquire_exclusive();
+        ticks += draw_lock_held_since;
+    }
+};
+
+x2w_startup::PipelineCreationTotals pipeline_creation_totals;
+bool pipeline_creation_unlocked()
+{
+    static const bool enabled = x2w_local::env_on("X2W_PIPELINE_CREATE_UNLOCKED");
+    return enabled;
+}
+
+bool pipeline_creation_line(char* out, std::size_t size)
+{
+    AcquireSRWLockShared(&draw_lock);
+    const auto totals = pipeline_creation_totals;
+    ReleaseSRWLockShared(&draw_lock);
+    if (!totals.created && !totals.failed) return false;
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    const double per_ms = frequency.QuadPart / 1000.0;
+    std::snprintf(out, size, "x2w-render translated pipelines created %lld, failed %lld, creation ms total %.3f max %.3f, outside the lock %lld",
+                  totals.created, totals.failed, totals.ticks / per_ms, totals.max_ticks / per_ms, totals.outside);
+    return true;
 }
 // Where a translated Dispatch spends its time under draw_lock: 0 translation lookup and checks, 1 the descriptor walk, 2 entry values,
 // 3 texture sync, 4 descriptor writes and recording. Started after the lock is held, ended when it is released.
@@ -1218,7 +1287,8 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect,
+                                 PipelineLockGap& gap)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
@@ -1230,7 +1300,14 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
     const auto found = bound.pipelines.find(key);
-    if (found != bound.pipelines.end()) return found->second;
+    if (found != bound.pipelines.end()) {
+        auto& entry = found->second;
+        if (entry.creation.pending) {
+            gap.wait(entry.creation);
+            return nullptr;  // Look up the bound pipeline and translation again.
+        }
+        if (entry.creation.finished) return entry.pipeline;
+    }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
@@ -1257,7 +1334,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     // Channels the translated exports leave unwritten stay out of the write mask (#1674).
     if (!x2w_startup::apply_export_write_masks(desc.BlendState, tr.write_masks, pass.target_count)) {
         log("x2w-draw export write masks incompatible with shared logic op for %016llx", tr.key);
-        bound.pipelines[key] = nullptr;
+        bound.pipelines.try_emplace(key).first->second.creation.finish();
         return nullptr;
     }
     if (use_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
@@ -1276,12 +1353,30 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     X2W_ZONE("desktop pipeline creation");
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
-        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+    auto* device = device_of(the_device);
+    const u64 translation_key = tr.key;
+    const bool unlocked = pipeline_creation_unlocked();
+    x2w_startup::ComPtr<ID3D12Device> device_hold;
+    x2w_startup::ComPtr<ID3D12RootSignature> root_hold;
+    x2w_startup::ComPtr<ID3DBlob> vs_hold, ps_hold, gs_hold;
+    if (unlocked) {
+        device_hold = device;
+        root_hold = tr.root;
+        vs_hold = tr.vs;
+        ps_hold = tr.ps;
+        if (indexed_rect) gs_hold = tr.indexed_rect_geometry;
+    }
+    // Bound records are process-lived, and the map keeps entries stable during rehash.
+    auto& entry = bound.pipelines.try_emplace(key).first->second;
+    const HRESULT hr = x2w_startup::create_pipeline(entry.creation, unlocked, pipeline_creation_totals,
+        [&] { gap.release(); }, [&] { gap.acquire(); },
+        [&] { return device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)); });
+    entry.pipeline = pipeline;
+    entry.creation.finish();
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", translation_key,
+        desc.NumRenderTargets, desc.RTVFormats[0], static_cast<unsigned long>(hr),
         static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
     check_device("translated CreateGraphicsPipelineState", 0);
-    bound.pipelines[key] = pipeline;
     return pipeline;
 }
 
@@ -2896,8 +2991,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         (rect && indexed && !indexed_rect)) return not_drawn(0);
     draw_lock_acquire_exclusive();
     DrawPhases phases;
+    bool noted_use = false;
+retry_pipeline_lookup:
     BoundPipeline* bound = translation_for(pass.pipeline);
-    if (bound && bound->translation) bound->translation->use.note(process_ms());
+    if (!noted_use && bound && bound->translation) bound->translation->use.note(process_ms());
+    noted_use = true;
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
@@ -2964,7 +3062,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return not_drawn(6);
         }
     }
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
+    PipelineLockGap gap;
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device)
+        ? pipeline_for(*bound, *tr, pass, indexed_rect, gap) : nullptr;
+    if (gap.crossed) {
+        phases.last.QuadPart += gap.ticks;
+        goto retry_pipeline_lookup;
+    }
     if (indirect && indexed_rect && !pipeline) {
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);

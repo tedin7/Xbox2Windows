@@ -1,10 +1,11 @@
-// Checks src/startup_stubs/pipeline_state_decode.h without a device: hand-built DB_DEPTH_CONTROL,
-// DB_STENCIL_CONTROL and DB_STENCILREFMASK(_BF) words (field layouts of Mesa's gfx10.json) decoded to
+// Checks src/startup_stubs/pipeline_state_decode.h by default: hand-built DB_DEPTH_CONTROL,
+// DB_STENCIL_CONTROL and DB_STENCILREFMASK(_BF) words decoded to
 // D3D12_DEPTH_STENCIL_DESC, the refusals, and a synthetic slot 57 state block.
 //
 // --mutate offset: expects the words one word later in the block (the check must then fail).
 // --mutate mesh-shift: puts a mesh block's words at the vertex offsets (the check must then fail).
 #include "startup_stubs/pipeline_state_decode.h"
+#include "startup_pipeline_creation_warp.h"
 
 #include <cstdio>
 #include <cstring>
@@ -176,6 +177,10 @@ void layout_cases()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--creation-warp") == 0)
+        return pipeline_creation_warp::run(false);
+    if (argc == 2 && std::strcmp(argv[1], "--creation-mutant-warp") == 0)
+        return pipeline_creation_warp::run(true);
     if (argc > 2 && std::strcmp(argv[1], "--mutate") == 0) {
         mutate_offset = std::strcmp(argv[2], "offset") == 0;
         mutate_shift = std::strcmp(argv[2], "mesh-shift") == 0;
@@ -184,7 +189,7 @@ int main(int argc, char** argv)
             return 2;
         }
     } else if (argc > 1) {
-        std::printf("usage: startup_pipeline_state_check [--mutate offset|mesh-shift]\n");
+        std::printf("usage: startup_pipeline_state_check [--mutate offset|mesh-shift | --creation-warp | --creation-mutant-warp]\n");
         return 2;
     }
     depth_stencil_cases();
