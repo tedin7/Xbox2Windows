@@ -288,6 +288,32 @@ bool cpu_handle_inside_slot(std::uint64_t handle)
     return inside;
 }
 
+// Start of the descriptor slot that holds `handle` (the handle itself when it is outside every title heap).
+std::uint64_t cpu_handle_slot_start(std::uint64_t handle)
+{
+    std::uint64_t start = handle;
+    AcquireSRWLockShared(&descriptor_lock);
+    for (const auto& r : descriptor_ranges) {
+        if (handle < r.title || handle - r.title >= r.bytes) continue;
+        if (r.title_stride) start = handle - (handle - r.title) % r.title_stride;
+        break;
+    }
+    ReleaseSRWLockShared(&descriptor_lock);
+    return start;
+}
+
+// X2W_VIEW_SLOT_ALIGN=round: a view destination inside a slot is rounded down to its slot instead of refused.
+// Default off (refuse, as before).
+bool view_slot_round_mode()
+{
+    static const bool round = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_VIEW_SLOT_ALIGN", value, sizeof(value));
+        return n && n < sizeof(value) && std::strcmp(value, "round") == 0;
+    }();
+    return round;
+}
+
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
 {
     std::uint64_t result = handle;
@@ -5051,11 +5077,20 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const u64 title_dest = args[D];
     // A handle inside a descriptor slot is not a descriptor: a driver that tags handle bits (vkd3d-proton) reads wild memory.
     if (cpu_handle_inside_slot(title_dest)) {
-        static LONG refused;
-        if (InterlockedIncrement(&refused) <= 4)
-            log("x2w-d3d12 view slot %d: destination 0x%llx is not on a descriptor slot boundary, refused", N,
-                static_cast<unsigned long long>(title_dest));
-        args[D] = 0;
+        static LONG misaligned;  // counts every misaligned destination, refused or rounded
+        const LONG count = InterlockedIncrement(&misaligned);
+        if (view_slot_round_mode()) {
+            const u64 start = cpu_handle_slot_start(title_dest);
+            if (count <= 4)
+                log("x2w-d3d12 view slot %d: destination 0x%llx is not on a descriptor slot boundary, rounded to 0x%llx (count %ld)", N,
+                    static_cast<unsigned long long>(title_dest), static_cast<unsigned long long>(start), count);
+            args[D] = desktop_cpu_handle(start);
+        } else {
+            if (count <= 4)
+                log("x2w-d3d12 view slot %d: destination 0x%llx is not on a descriptor slot boundary, refused (count %ld)", N,
+                    static_cast<unsigned long long>(title_dest), count);
+            args[D] = 0;
+        }
     } else {
         args[D] = desktop_cpu_handle(args[D]);
     }

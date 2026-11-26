@@ -182,6 +182,12 @@ def main(consumer, dxc):
         assert len(lines(result, 'is not on a descriptor slot boundary, refused')) == 1, result.stderr[-3000:]
         plain = lines(dispatch(directory, consumer, env, 'dispatch')[1], 'is not on a descriptor slot boundary')
         assert not plain, plain
+        # Switch X2W_VIEW_SLOT_ALIGN=round (default off = the refusal above): the destination is rounded down to its slot, counted.
+        # The dispatch result is not asserted: the view now lands on slot 0.
+        _, rounded = dispatch(directory, consumer, dict(env, X2W_VIEW_SLOT_ALIGN='round'), 'dispatch-view-misaligned')
+        assert len(lines(rounded, 'slot boundary, rounded to 0x')) == 1, rounded.stderr[-3000:]
+        assert '(count 1)' in lines(rounded, 'slot boundary, rounded to 0x')[0], rounded.stderr[-3000:]
+        assert not lines(rounded, 'slot boundary, refused'), rounded.stderr[-3000:]
 
         check_raw_token(directory / 'raw', consumer, dxc, expected)
 
