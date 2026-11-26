@@ -277,13 +277,16 @@ $anyFailure = Get-ChildItem -LiteralPath $cache -Filter "*.fail" -File -ErrorAct
 # cache holds a .fail, and its line goes into the manifest as pre_run_retry.
 $preRunRetry = "pre-run retry skipped: no refusal in the cache"
 if ($anyFailure) { try {
-    # The last run's stderr.txt ranks the retry by draws/dispatches (the per-key census lines), when there is one.
     $runsRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
-    $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | ForEach-Object { Join-Path $_.FullName "stderr.txt" } |
-        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     $retryArgs = @("--retry-lifted", $cache, "180", "--jobs", "$backgroundJobs")
-    if ($lastStderr) { $retryArgs += @("--weights", $lastStderr) }
+    if ($env:X2W_PRE_RUN_FAMILY_RETRY -eq "1") {
+        $retryArgs += @("--weights", $runsRoot)
+    } else {
+        $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | ForEach-Object { Join-Path $_.FullName "stderr.txt" } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($lastStderr) { $retryArgs += @("--weights", $lastStderr) }
+    }
     $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") @retryArgs } | Out-String).Trim()
     $preRunRetry = if ($retryLine) { $retryLine } else { "pre-run retry: no output (translator exit code $LASTEXITCODE)" }
 } catch {

@@ -8,7 +8,9 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 import bisect
 from contextlib import suppress
 import functools
+import hashlib
 import os
+from pathlib import Path
 import re
 import struct
 import sys
@@ -11936,7 +11938,7 @@ def translate_compute(out_dir, key):
         hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
     except Unsupported as reason:
         reason = fail_reason(reason)
-        open(name + '.fail', 'w').write(reason + '\n')
+        write_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
@@ -11944,7 +11946,7 @@ def translate_compute(out_dir, key):
         compiler = find_dxc()
         if compiler is None:
             message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
-            open(name + '.fail', 'w').write(message + '\n')
+            write_failure(name + '.fail', message)
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
@@ -11955,7 +11957,7 @@ def translate_compute(out_dir, key):
                 # DXC names the source path; keep only the diagnostic after it.
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                 detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
-                open(name + '.fail', 'w').write('dxc cs: %s\n' % detail[:500])
+                write_failure(name + '.fail', 'dxc cs: %s' % detail[:500])
                 return 'dxc cs failed: %s' % detail[:500]
             os.replace(bytecode, name + '.cs.cso')
     temporary = '%s.txt.%d.tmp' % (name, os.getpid())
@@ -12053,7 +12055,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             manifest += rtv_request + '\n'
     except Unsupported as reason:
         reason = fail_reason(reason)
-        open(name + '.fail', 'w').write(reason + '\n')
+        write_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
@@ -12061,7 +12063,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     fxc = find_fxc() if check else ''
     if fxc is None:
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
-        open(name + '.fail', 'w').write(message + '\n')
+        write_failure(name + '.fail', message)
         return message
     manifest_path = name + '.txt'
     write_manifest = True
@@ -12071,7 +12073,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         compiler = find_dxc()
         if compiler is None:
             message = 'dxc not found (X2W_DXC=%s): a DPP quad read needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
-            open(name + '.fail', 'w').write(message + '\n')
+            write_failure(name + '.fail', message)
             return message
         profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))
     else:
@@ -12089,7 +12091,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
-                    open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
+                    write_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
                     return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
             with suppress(FileNotFoundError, UnicodeError):
                 with open(manifest_path) as existing:
@@ -12140,7 +12142,6 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     name = os.path.join(out_dir, 'req_%016x' % base)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     if pair_info is not None and not request:
-        import hashlib
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
@@ -12372,7 +12373,7 @@ def translate_request(out_dir, key):
         try:
             return translate_mesh57(out_dir, key)
         except (Unsupported, OSError, UnicodeError, struct.error) as reason:
-            open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
+            write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
             return 'unsupported: %s' % reason
     try:
         try:
@@ -12389,10 +12390,10 @@ def translate_request(out_dir, key):
                 os.remove(os.path.join(out_dir, '%016x.txt' % key))
             raise
     except (Unsupported, OSError, UnicodeError) as reason:
-        open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
-        open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), 'stages %s' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
                           vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
@@ -12619,8 +12620,7 @@ def main():
             print('pso %x -> request %016x' % (w & 0xffffff, key))
     jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <last run's stderr.txt>]: before the title starts, the
-        # old refusals (lifted families first, then what the last run used most)
+        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <stderr.txt or runs directory>]
         given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
         seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
         at = sys.argv.index('--weights') if '--weights' in sys.argv[3:] else None
@@ -12643,7 +12643,11 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True, clock=clock)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+    if family_retry_enabled():
+        build = None if os.environ.get('X2W_RETRY_FAILED') == '1' else translator_version()
+    else:
+        build = translator_stamp()
+    translate_pending(out_dir, since_translator=build, jobs=jobs)
 
 
 def jobs_argument(args):
@@ -12738,6 +12742,73 @@ def lifted_family(reason, families=LIFTED_REASONS):
     return next((name for name, pattern in families if re.search(pattern, reason)), None)
 
 
+def family_retry_enabled():
+    return os.environ.get('X2W_PRE_RUN_FAMILY_RETRY') == '1'
+
+
+@functools.lru_cache(maxsize=1)
+def translator_version():
+    """Content fingerprint of the translator and its shader input and lowering modules."""
+    script = Path(__file__).resolve()
+    tools = script.parent.parent
+    sources = (script, script.with_name('lane_exec.py'), script.with_name('ps_input_scan.py'),
+               *(tools / (name + '.py') for name in (
+                   'disasm_rdna2', 'pixel_aot', 'resource_inventory', 'verify_build',
+                   'shader_minmax', 'compute_store_aot', 'mesh_param_link')))
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.name.encode('ascii') + b'\0')
+        digest.update(source.read_bytes().replace(b'\r\n', b'\n') + b'\0')
+    return digest.hexdigest()
+
+
+def refusal_family(reason):
+    from tester_pack import normal_reason
+
+    known = lifted_family(reason)
+    if known:
+        return known
+    normalized = normal_reason(reason.removeprefix('unsupported: ').strip())
+    return 'reason-' + hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+
+FAILURE_METADATA = re.compile(r'x2w-refusal-v1 ([0-9a-f]{64}) ([a-z0-9-]+)')
+
+
+def write_failure(path, reason, *, version=None):
+    if not family_retry_enabled():
+        with open(path, 'w') as handle:
+            handle.write(reason + '\n')
+        return
+    family = refusal_family(reason.split('\n', 1)[0])
+    version = version or translator_version()
+    atomic_retry_text(path, '%s\nx2w-refusal-v1 %s %s\n' % (reason, version, family))
+
+
+def atomic_retry_text(path, content):
+    handle = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(path) or '.',
+                                         prefix='.retry-', delete=False)
+    temporary = handle.name
+    try:
+        with handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
+
+
+def read_failure(path):
+    with open(path, encoding='utf-8', errors='replace') as handle:
+        reason = handle.readline()
+        metadata = None
+        for line in handle:
+            metadata = FAILURE_METADATA.fullmatch(line.rstrip())
+    if metadata:
+        return reason, metadata[2], metadata[1]
+    return reason, refusal_family(reason), None
+
+
 def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
     """Keys of the requests an older build refused (a .fail older than since_translator, still pending) for a reason
     of a lifted family, oldest request first."""
@@ -12796,6 +12867,8 @@ def note_retried(out_dir, stamp, keys):
 def run_weights(path):
     """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
     key's newest cumulative line; {} when the file cannot be read."""
+    if family_retry_enabled():
+        return scene_weights(Path(path))
     weights = {}
     try:
         with open(path, encoding='utf-8', errors='replace') as handle:
@@ -12812,15 +12885,50 @@ def run_weights(path):
     return weights
 
 
+def scene_weights(path):
+    from tester_pack import KEY_USE_RE
+
+    if path.is_dir():
+        candidates = []
+        for run in path.glob('run_*'):
+            with suppress(OSError):
+                if run.is_dir():
+                    candidates.append((run.stat().st_mtime_ns, run))
+        for _, run in sorted(candidates, reverse=True):
+            weights = scene_weights(run / 'stderr.txt')
+            if weights:
+                return weights
+        return {}
+
+    census = False
+    weights = {}
+    try:
+        with path.open(encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if (line.startswith(('x2w-render scene census', 'x2w-render compute census:',
+                                     'x2w-render not drawn by pipeline key:'))
+                        or CENSUS_LINE.match(line) or NOT_DRAWN_LINE.match(line)):
+                    census = True
+                match = KEY_USE_RE.fullmatch(line)
+                if match:
+                    key, count = int(match[2], 16), int(match[5])
+                    weights[key] = max(count, weights.get(key, 0))
+    except OSError:
+        return {}
+    return weights if census else {}
+
+
 class RetryReport:
-    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0):
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0, skipped=0):
         self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
-        self.lifted, self.used = lifted, used
+        self.lifted, self.used, self.skipped = lifted, used, skipped
 
     def line(self):
         """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
         the pass after the run."""
         left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
+        if self.skipped:
+            left += ', %d skipped after family probes' % self.skipped
         used = ', %d used in the last run' % self.used if self.used else ''
         return 'pre-run retry: %d keys (%d in lifted families%s), ok %d, still refused %d%s, %.0f s' % (
             self.keys, self.lifted, used, self.ok, self.refused, left, self.seconds)
@@ -12831,11 +12939,23 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
     """Translate again the old refusals (old_failures: lifted families first, then by the last run's use `weights`)
     before the title starts. No new request is started after `seconds`; what is left keeps its .fail for the pass after
     the run. What this build retried and still refuses is recorded (RETRIED_NAME) and not retried again by it."""
+    if family_retry_enabled():
+        return retry_families(out_dir, seconds, jobs, clock, weights or {})
     start = clock()
     stamp = translator_stamp()
     already = retried_by_build(out_dir, stamp)
     rows = old_failures(out_dir, stamp, families, already, weights)
     keys = [key for key, _lifted in rows]
+    results = retry_batch(out_dir, keys, jobs, clock, start, seconds)
+    clear_successful_failures(out_dir, results)
+    if results:
+        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
+    ok = sum(1 for result in results.values() if result == 'ok')
+    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
+                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
+
+
+def retry_batch(out_dir, keys, jobs, clock, start, seconds):
     results = {}
     if keys:
         jobs = max(1, min(jobs or translation_jobs(), len(keys)))
@@ -12857,15 +12977,64 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    return results
+
+
+def clear_successful_failures(out_dir, results):
     for key, result in results.items():
-        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+        if result == 'ok':
             with suppress(OSError):
                 os.remove(os.path.join(out_dir, '%016x.fail' % key))
-    if results:
-        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
-    ok = sum(1 for result in results.values() if result == 'ok')
-    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
-                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
+
+
+FAMILY_PROBES = 8
+FAMILY_CURSOR = 'pre_run_family_cursor.txt'
+
+
+def retry_families(out_dir, seconds, jobs, clock, weights):
+    start = clock()
+    version = translator_version()
+    force = os.environ.get('X2W_RETRY_FAILED') == '1'
+    groups = {}
+    keys = sorted(set(pending_keys(out_dir, False)), key=lambda key: (-weights.get(key, 0), key))
+    lifted = 0
+    for key in keys:
+        try:
+            reason, family, written_by = read_failure(os.path.join(out_dir, '%016x.fail' % key))
+        except OSError:
+            continue
+        if not force and written_by == version:
+            continue
+        groups.setdefault(family, []).append(key)
+        lifted += lifted_family(reason) is not None
+
+    # Interleave families so an expensive graphics family cannot occupy every probe slot.
+    families = list(groups)
+    cursor_path = Path(out_dir) / FAMILY_CURSOR
+    with suppress(OSError, ValueError):
+        offset = families.index(cursor_path.read_text(encoding='utf-8').strip()) + 1
+        families = families[offset:] + families[:offset]
+    probes = [(family, groups[family][index]) for index in range(FAMILY_PROBES)
+              for family in families if index < len(groups[family])]
+    results = retry_batch(out_dir, [key for _, key in probes], jobs, clock, start, seconds)
+    for family, key in reversed(probes):
+        if key in results:
+            with suppress(OSError):
+                atomic_retry_text(cursor_path, family + '\n')
+            break
+
+    passing_families = {family for family, key in probes if results.get(key) == 'ok'}
+    incomplete = {family for family, key in probes if key not in results}
+    rest = sorted((key for family in passing_families - incomplete for key in groups[family][FAMILY_PROBES:]),
+                  key=lambda key: (-weights.get(key, 0), key))
+    skipped = sum(max(0, len(groups[family]) - FAMILY_PROBES)
+                  for family in groups.keys() - passing_families - incomplete)
+    results.update(retry_batch(out_dir, rest, jobs, clock, start, seconds))
+    clear_successful_failures(out_dir, results)
+    total = sum(map(len, groups.values()))
+    ok = sum(result == 'ok' for result in results.values())
+    return RetryReport(total, ok, len(results) - ok, total - len(results) - skipped, clock() - start, lifted,
+                       sum(bool(weights.get(key)) for group in groups.values() for key in group), skipped)
 
 
 def translate_one(out_dir, key):
@@ -12879,8 +13048,7 @@ def translate_one(out_dir, key):
         frame = raise_site(error)
         if frame:
             reason += ' (in %s, %s line %d)' % (frame.name, os.path.basename(frame.filename), frame.lineno)
-        with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
-            fail.write(reason + '\n')
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), reason)
         return reason
 
 
@@ -13078,9 +13246,10 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
 
 def pending_keys(out_dir, skip_failed, since_translator=None):
     """Keys whose request has no finished result. A key with a .fail is skipped when the .fail is newer than its
-    request and stream description and, unless skip_failed, also newer than since_translator (translator_stamp:
-    the translator files themselves). Without either, every failure is tried again."""
+    request and stream description. Outside watch mode it must also match the translator content fingerprint,
+    or postdate the legacy translator timestamp. With neither cutoff, every failure is tried again."""
     keys = []
+    version = since_translator if isinstance(since_translator, str) and not skip_failed else None
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
@@ -13119,9 +13288,12 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         # the manifest-only path leaves in place.
         recheck = lost and os.path.isfile(manifest)
         inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
-        cutoff = inputs if skip_failed else None if since_translator is None else max(inputs, since_translator)
-        if cutoff is not None and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= cutoff:
-            continue
+        cutoff = inputs if skip_failed or version else (
+            None if since_translator is None else max(inputs, since_translator))
+        if cutoff is not None and not recheck:
+            with suppress(OSError):
+                if os.path.getmtime(fail) >= cutoff and (version is None or read_failure(fail)[2] == version):
+                    continue
         keys.append(key)
     return keys
 

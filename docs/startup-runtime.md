@@ -1257,6 +1257,13 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
+Set `X2W_PRE_RUN_FAMILY_RETRY=1` before running `tester_run.ps1` to enable the versioned pre-run retry.
+Refusals retain their reason text and record the reason family and translator content fingerprint.
+The pre-run pass samples up to eight stale refusals per family, interleaves families, and continues a
+family when a sample translates. The cache records where probing stopped so a capped pass can resume
+with the next family. The newest run with both render census and per-key use records supplies the
+weights. The switch defaults to off.
+
 **Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies graphics, RTV variant, slot 67 compute and slot 57 mesh requests under their current keys. It uses `pipeline_key`, `compute_key` and `mesh57_key` from the adjacent `gfx2hlsl.py` and updates each RTV variant with its new graphics key. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
 
 ```powershell
