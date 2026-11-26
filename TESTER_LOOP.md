@@ -104,7 +104,8 @@ Send the zip it printed. If the zip is over 20 MB it is split into `report_..._p
 send every part (mail limit). The zip holds every file the run wrote in its log folder (stdout, stderr, events,
 finished, threads, files, trap.log, translate, translate_err, the window captures, the debugger summary) and
 `manifest.json` (commit, build commit, dirty flag, seconds, input script, `X2W_*` variables, graphics card and driver,
-Windows build, wall time). It holds no game files, no shader cache and no memory dumps.
+Windows build, wall time), and `memory.txt`: every 30 s the PC's committed memory and the 8 programs holding most of it
+(program names and GiB only, no paths or window titles). It holds no game files, no shader cache and no memory dumps.
 
 ## Waiting for a fix on their own branch (conflict with this branch)
 

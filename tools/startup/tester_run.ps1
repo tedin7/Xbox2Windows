@@ -15,7 +15,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
-   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png ...), the debugger
+   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
    files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
@@ -224,6 +224,15 @@ if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
+# memory.txt in the run folder (so in the zip): every 30 s the system commit and the 8 processes holding the most of it,
+# names and GiB only (memory_top.py), then one "end" line after the run. Never stops the run.
+$memoryTop = Join-Path $PSScriptRoot "memory_top.py"
+$memoryFile = Join-Path $logDir "memory.txt"
+$memorySampler = $null
+try {
+    $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
+        -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
+} catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
 $exitCode = 0
 try {
     & $runScript @runArgs
@@ -232,6 +241,8 @@ try {
     Write-Warning "tester_run: the run stopped with an error: $($_.Exception.Message)"
     $exitCode = 1
 }
+if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
+Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 
 # Manifest input: X2W_* variables only; the user's profile path is masked.
 $envSet = [ordered]@{}
