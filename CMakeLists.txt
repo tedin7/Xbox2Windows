@@ -2347,6 +2347,16 @@ foreach(mutation IN ITEMS generation witness stamp key device age hits unproven)
     add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
     set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Validity stamps of the translate-once view cache (src/startup_stubs/view_stamps.h): which events drop a cached translation; the
+# mutated runs break one rule each and are negative controls.
+add_executable(startup_view_stamps_check tests/startup_view_stamps_check.cpp)
+target_include_directories(startup_view_stamps_check PRIVATE src)
+target_compile_features(startup_view_stamps_check PRIVATE cxx_std_17)
+add_test(NAME startup_view_stamps COMMAND startup_view_stamps_check)
+foreach(mutation IN ITEMS write copy heap serial resource epoch copy_stale)
+    add_test(NAME startup_view_stamps_${mutation}_control COMMAND startup_view_stamps_check --mutate ${mutation})
+    set_tests_properties(startup_view_stamps_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Opt-in drop of the top mip level of big sampled textures (src/startup_stubs/texture_drop_mips.h); the mutated runs
 # are negative controls.
 add_executable(startup_texture_drop_mips_check tests/startup_texture_drop_mips_check.cpp)
