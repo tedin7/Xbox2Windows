@@ -83,6 +83,29 @@ def check_snapshot():
             len(processes), min(mine, key=lambda s: abs(s - counters.private)) / 1048576.0, counters.private / 1048576.0))
 
 
+def check_left():
+    first = "    0 s commit 30.3/48.9 GiB | claude.exe x3 2.09 | unattributed 11.19"
+    after = "10 s after exit commit 31.1/48.9 GiB | claude.exe x3 2.10 | unattributed 11.93 (3 processes unreadable)"
+    assert M.left_text(first, after) == "memory left after exit: +0.80 GB (unattributed +0.74 GB)", M.left_text(first, after)
+    # Lines of runs before the label change still compare; a line without commit gives nothing.
+    old = "    0 s commit 30.3/48.9 GiB | not in any process 11.19"
+    assert M.left_text(old, after) == "memory left after exit: +0.80 GB (unattributed +0.74 GB)"
+    assert M.left_text("end commit n/a | x.exe 1.00", after) is None
+    assert M.left_text(first, "end commit 29.0/48.9 GiB") == "memory left after exit: -1.30 GB"
+    # The --once --left form appends the line and returns the comparison (a fake reader, any host).
+    with tempfile.TemporaryDirectory() as root:
+        out = os.path.join(root, "memory.txt")
+        Path(out).write_text(first + "\n", encoding="utf-8")
+
+        def read():
+            return (int(31.1 * GIB), int(48.9 * GIB)), [("x.exe", int(19.17 * GIB))], 0
+        left = M.append_once(out, "10 s after exit", read, 8, left=True)
+        lines = Path(out).read_text(encoding="utf-8").splitlines()
+        assert M.append_once(out + ".2", "end", read, 8) is None  # without --left nothing is compared
+    assert len(lines) == 2 and lines[1].startswith("10 s after exit commit 31.1/48.9 GiB"), lines
+    assert left == "memory left after exit: +0.80 GB (unattributed +0.74 GB)", left
+
+
 def check_loop():
     now = [0.0]
     reads = []
@@ -106,6 +129,7 @@ def check_loop():
 def main():
     check_lines()
     check_snapshot()
+    check_left()
     check_loop()
     print("startup_memory_top_check: top processes by commit grouped by name, rest and outside-process commit, one line "
           "every 30 s until tester_run ends")

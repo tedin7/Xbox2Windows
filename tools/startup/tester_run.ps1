@@ -66,6 +66,7 @@ param(
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
+    [int]$MemoryLeftSeconds = 10,              # after the title exits: wait this long, then log the memory left (memory_left_after_exit)
     [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
     [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
@@ -324,6 +325,14 @@ $endCause = ((Invoke-Native { & $python -B $pack end-cause $logDir }) -join " ")
 Write-Host "tester_run: the run ended: $endCause"
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
 Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
+# What our run leaves behind: -MemoryLeftSeconds (10) after the title exits, the system commit and the commit no process
+# holds against the run's first memory.txt line (a leak until reboot shows here run after run).
+$memoryLeft = $null
+try {
+    if ($MemoryLeftSeconds -gt 0) { Start-Sleep -Seconds $MemoryLeftSeconds }
+    $memoryLeft = (Invoke-Native { & $python -B $memoryTop $memoryFile --once "$MemoryLeftSeconds s after exit" --top 8 --left } | Out-String).Trim()
+    if ($memoryLeft) { Write-Host "tester_run: $memoryLeft" }
+} catch { Write-Warning "tester_run: memory left after exit not measured ($($_.Exception.Message))" }
 
 # Manifest input: X2W_* variables only; the user's profile path is masked.
 $envSet = [ordered]@{}
@@ -354,6 +363,7 @@ $manifest = [ordered]@{
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
     pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    memory_left_after_exit = $memoryLeft
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"

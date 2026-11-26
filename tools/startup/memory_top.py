@@ -4,6 +4,9 @@
   memory_top.py <memory.txt> [--every S] [--top N] [--parent PID]   append one line every S seconds (default 30) until
                                                                      the process PID (tester_run) has ended
   memory_top.py <memory.txt> --once <label> [--top N]                 append one line now, labelled <label>
+  memory_top.py <memory.txt> --once <label> --left                    the same, and print the system commit and the
+                                                                     unattributed commit left compared with the file's
+                                                                     first line (tester_run: 10 s after the title exits)
 
 One line per sample: the system commit (used / limit), then the N processes with the most committed private memory,
 processes of the same name summed (`python.exe x16 6.20` = 16 processes, 6.20 GiB together), then the rest, then the
@@ -183,6 +186,41 @@ def windows_reader():
     return read, alive
 
 
+def line_totals(line):
+    """(commit used GiB, unattributed GiB or None) of a memory.txt line, or None when it carries no commit."""
+    import re
+    commit = re.search(r"commit (\d+(?:\.\d+)?)/", line)
+    if not commit:
+        return None
+    outside = re.search(r"(?:unattributed|not in any process) (\d+(?:\.\d+)?)", line)
+    return float(commit.group(1)), float(outside.group(1)) if outside else None
+
+
+def left_text(first, last):
+    """'memory left after exit: +X GB (unattributed +Y GB)': the last line's totals against the first line's (the run's
+    start), or None when either has no commit."""
+    start, now = line_totals(first or ""), line_totals(last or "")
+    if not start or not now:
+        return None
+    text = "memory left after exit: %+.2f GB" % (now[0] - start[0])
+    if start[1] is not None and now[1] is not None:
+        text += " (unattributed %+.2f GB)" % (now[1] - start[1])
+    return text
+
+
+def append_once(path, label, read, top, left=False):
+    """Append one line labelled `label` to memory.txt; with `left`, return left_text against the file's first line."""
+    commit, processes, unreadable = read()
+    line = format_line(label, commit, processes, top, unreadable)
+    first = None
+    if left and os.path.isfile(path):
+        with open(path, encoding="utf-8") as existing:
+            first = existing.readline()
+    with open(path, "a", encoding="utf-8") as out:
+        out.write(line + "\n")
+    return (left_text(first, line) or "memory left after exit: n/a") if left else None
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out")
@@ -190,6 +228,7 @@ def main(argv):
     parser.add_argument("--top", type=int, default=DEFAULT_TOP)
     parser.add_argument("--parent", type=int, default=0, help="stop when this process has ended (0: run until killed)")
     parser.add_argument("--once", default=None, help="append one line with this label and exit")
+    parser.add_argument("--left", action="store_true", help="with --once: print what is left against the first line")
     args = parser.parse_args(argv)
     if args.every < 1 or args.top < 1:
         parser.error("--every must be at least 1 s and --top at least 1")
@@ -198,9 +237,9 @@ def main(argv):
         return 0
     read, alive = windows_reader()
     if args.once is not None:
-        commit, processes, unreadable = read()
-        with open(args.out, "a", encoding="utf-8") as out:
-            out.write(format_line(args.once, commit, processes, args.top, unreadable) + "\n")
+        left = append_once(args.out, args.once, read, args.top, args.left)
+        if left:
+            print(left)
         return 0
     sample_loop(args.out, read, args.every, args.top, (lambda: alive(args.parent)) if args.parent else (lambda: True))
     return 0
