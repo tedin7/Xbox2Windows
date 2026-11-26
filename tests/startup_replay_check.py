@@ -8,7 +8,8 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
     writes the same picture names, every one equal to the recorded run's, every call played on an
     object it knows, and one "x2w-replay score" line;
   - a window in the middle (f6,6: frames 7-12) replays to the same pictures, every object known
-    (the state-making calls before the window are recorded too);
+    (the state-making calls before the window are recorded too). A prefix-only ranged descriptor copy
+    supplies the render target. Changing the last destination handle in the exact arrays (DARR) leaves the fallback clear visible;
   - a target made through device slot 127 (ten argument words) replays equal (format 3 records eleven);
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
@@ -208,7 +209,8 @@ def main(scene, player, backend, mode=None):
         env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
-        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES", "X2W_REPLAY_SLOT_LAYOUTS"):
+        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES", "X2W_REPLAY_SLOT_LAYOUTS",
+                     "X2W_TEST_REPLAY_DESCRIPTOR_WINDOW"):
             env.pop(name, None)
         code, text = run([scene, vs, ps, root, backend, 1], env)
         if code == 77 and backend == "hardware":
@@ -252,6 +254,7 @@ def main(scene, player, backend, mode=None):
         window_dir.mkdir()
         code, text = run([scene, vs, ps, root, backend, PRESENTS],
                          dict(env, X2W_REPLAY_RECORD="f6,6", X2W_REPLAY_RECORD_FILE=str(windowed),
+                              X2W_TEST_REPLAY_DESCRIPTOR_WINDOW="1",
                               X2W_PRESENT_PICTURES=str(window_dir)))
         assert code == 0, text[-3000:]
         whole = pictures(window_dir)
@@ -262,6 +265,34 @@ def main(scene, player, backend, mode=None):
         assert not differ, "window replay differs from the recorded run at %s\n%s" % (
             differ, explain(whole[differ[0]], played["present_%04d.png" % (int(differ[0][8:12]) - 6)],
                             directory / "window_replayed" / "stderr.txt"))
+        data = windowed.read_bytes()
+        arrays, source_calls = [], []
+        control = bytearray()
+        for tag, header, _hb, payload, size in chunks(data):
+            if tag == b"DARR":
+                arrays.append((struct.unpack_from("<Q", data, header)[0], size))
+                # The control points the last destination handle at the one before it in the exact arrays: the replay runs the
+                # copy from them, so the descriptor the frames draw through is never written.
+                swapped = bytearray(data[payload:payload + size])
+                swapped[39 * 8:40 * 8] = swapped[38 * 8:39 * 8]
+                control.extend(data[header - 16:payload])
+                control.extend(swapped)
+                continue
+            if tag == b"CALL":
+                seq, _tid, kind, slot = struct.unpack_from("<QIHH", data, header)
+                if kind == 0 and slot in (20, 23):
+                    source_calls.append(seq)
+            control.extend(data[header - 16:payload + size])
+        assert len(arrays) == 1 and arrays[0][1] == 40 * 8 + 8 + 4, arrays
+        assert len(source_calls) == 41 and arrays[0][0] == source_calls[-1], (len(source_calls), arrays)
+        missing = directory / "window_without_snapshot.x2wr"
+        missing.write_bytes(control)
+        _score, without_snapshot = replay(player, missing, directory / "window_without_snapshot", backend, env, presents=6)
+        for a, b in pairs:
+            assert without_snapshot[a] != whole[b], "changing the exact descriptor arrays did not change " + b
+            (width, _height), pixels = without_snapshot[a]
+            last_pixel = 1 + 4 * (width - 1)
+            assert pixels[last_pixel:last_pixel + 4] == bytes((255, 255, 0, 255)), "fallback clear missing in " + a
         # The target made through device slot 127 (ten arguments: its output is the tenth): replays equal too.
         wide_dir, wide = directory / "wide_recorded", directory / "wide.x2wr"
         wide_dir.mkdir()
@@ -274,7 +305,8 @@ def main(scene, player, backend, mode=None):
         differ = [n for n in names if wide_played.get(n) != wide_recorded[n]]
         assert not differ, "slot-127 replay differs at %s" % differ
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
-              "window f6,6 replays presents 7-12 equal; %s" % (PRESENTS, score))
+              "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
+              (PRESENTS, score))
     return 0
 
 

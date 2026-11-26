@@ -31,7 +31,7 @@ struct Scene {
     void* allocator = nullptr;
     void* list = nullptr;
     void* fence = nullptr;
-    SIZE_T rtv = 0;
+    SIZE_T rtv = 0, fallback_rtv = 0;
 };
 
 int create_scene(void* device, Scene& s)
@@ -55,11 +55,13 @@ int create_scene(void* device, Scene& s)
                                                   arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
     }
+    const bool descriptor_window = GetEnvironmentVariableA("X2W_TEST_REPLAY_DESCRIPTOR_WINDOW", nullptr, 0) != 0;
+    constexpr UINT ranges = 40;  // handle array is larger than the recorder's generic 256-byte argument capture
     // The title's heap descriptor: the desktop one, then a title CPU address and its size (none here).
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
-    } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+    } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, descriptor_window ? 2 * ranges : 1u}, 0, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&rtv_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.rtv_heap)))))
         return 22;
     // The heap start read as a title compiled for struct returns reads it: (return buffer, object).
@@ -67,7 +69,22 @@ int create_scene(void* device, Scene& s)
     const auto start = reinterpret_cast<Start>((*static_cast<void***>(s.rtv_heap))[9]);
     if (start(&s.rtv, s.rtv_heap) != &s.rtv || !s.rtv) return 24;
     const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
-    invoke(device, 20, arg(s.target), arg(&view), s.rtv);
+    if (descriptor_window) {
+        const auto type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        const Word stride = invoke(device, 15, type);
+        if (!stride) return 25;
+        Word destinations[ranges];
+        for (UINT i = 0; i < ranges; ++i) {
+            invoke(device, 20, arg(s.target), arg(&view), s.rtv + i * stride);
+            destinations[i] = s.rtv + (ranges + i) * stride;
+        }
+        const UINT source_size = ranges;
+        invoke(device, 23, ranges, arg(destinations), 0, 1, arg(&s.rtv), arg(&source_size), type);
+        s.fallback_rtv = s.rtv;
+        s.rtv = destinations[ranges - 1];
+    } else {
+        invoke(device, 20, arg(s.target), arg(&view), s.rtv);
+    }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&s.queue)))) ||
@@ -105,6 +122,10 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         } memory_view{{}, upload};
         // Exercise the argument layout using a null destination, which refuses the descriptor write.
         invoke(device, 70, arg(&resource), arg(&memory_view), 0);
+    }
+    if (s.fallback_rtv) {
+        const float fallback[] = {1.0f, 1.0f, 0.0f, 1.0f};
+        invoke(s.list, 52, s.fallback_rtv, arg(fallback));
     }
     invoke(s.list, 52, s.rtv, arg(colour));
     invoke(s.list, 50, 1, arg(&s.rtv));

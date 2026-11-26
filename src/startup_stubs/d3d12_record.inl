@@ -244,9 +244,30 @@ void record_arguments(ThreadBuffer& b, const Call& call)
     }
 }
 
+// Exact CopyDescriptors inputs. The prefix already contains heap and view creation, simple
+// copies, and object lifetimes. This supplies the counted arrays that generic ARGM can truncate.
+bool record_descriptor_arrays(ThreadBuffer& b, u64 seq, const u64* args)
+{
+    std::vector<unsigned char> arrays;
+    for (const unsigned arg : {1u, 2u, 4u, 5u}) {
+        const u64 count = static_cast<std::uint32_t>(args[arg < 3 ? 0 : 3]);
+        const u64 bytes = count * ((arg == 1 || arg == 4) ? sizeof(u64) : sizeof(UINT));
+        if (!args[arg] || !bytes) continue;
+        const auto start = arrays.size();
+        if (bytes > max_bytes || start > max_bytes - bytes) return false;
+        arrays.resize(start + static_cast<std::size_t>(bytes));
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(args[arg]),
+                               arrays.data() + start, static_cast<SIZE_T>(bytes), &got) || got != bytes)
+            return false;
+    }
+    append_chunk(b.bytes, "DARR", &seq, sizeof(seq), arrays.data(), arrays.size());
+    return true;
+}
+
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
-void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret)
+void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
@@ -254,6 +275,14 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
+    // The generic argument memory is recorded as well: a file without the DARR chunk still replays the copy, cut short.
+    const bool typed_arrays = descriptor_copy && record_descriptor_arrays(b, seq, args);
+    if (descriptor_copy && !typed_arrays) {
+        static LONG unrecorded;
+        if (InterlockedIncrement(&unrecorded) <= 8)
+            log("x2w-replay record: CopyDescriptors arrays of call %llu not recorded exactly (unreadable or over the size cap); "
+                "the replay of that copy may be cut short", static_cast<unsigned long long>(seq));
+    }
     record_arguments(b, call);
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
@@ -278,7 +307,8 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
     if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    // Nothing but the sequence number (an interlocked instruction) before the real call.
+    // CopyDescriptors takes no float arguments, so its counted arrays are read from the call's own registers.
+    constexpr bool descriptor_copy = K == device_kind && N == 23;
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     // ExecuteCommandLists takes no float arguments, so the page scan may run before it.
     if constexpr (K == queue_kind && N == 10) {
@@ -291,7 +321,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
-    record_call(K, N, seq, rcx, args, ret);
+    record_call(K, N, seq, rcx, args, ret, descriptor_copy);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
     return ret;
 }

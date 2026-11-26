@@ -343,6 +343,37 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
+    // A CopyDescriptors call whose arrays were recorded exactly (DARR) runs from them, in the prefix and in the window.
+    if (const auto* arrays = step.descriptor_arrays) {
+        std::vector<u64> handles[2];
+        std::vector<std::uint32_t> sizes[2];
+        for (unsigned side = 0; side < 2; ++side) {
+            const unsigned base = side * 3;
+            const auto count = static_cast<std::uint32_t>(c.args[base]);
+            a[base + 1] = a[base + 2] = 0;
+            if (count && c.args[base + 1]) {
+                auto& translated = handles[side];
+                translated.resize(count);
+                for (u64& handle : translated) {
+                    std::memcpy(&handle, arrays, sizeof(handle));
+                    arrays += sizeof(handle);
+                    handle = p.translate(handle);
+                }
+                a[base + 1] = reinterpret_cast<u64>(translated.data());
+            }
+            if (count && c.args[base + 2]) {
+                auto& lengths = sizes[side];
+                lengths.resize(count);
+                const auto bytes = lengths.size() * sizeof(lengths[0]);
+                std::memcpy(lengths.data(), arrays, bytes);
+                arrays += bytes;
+                a[base + 2] = reinterpret_cast<u64>(lengths.data());
+            }
+        }
+        call_slot(call.self, rcx, c.slot, a);
+        ++p.played;
+        return true;
+    }
     const auto* layout = p.use_slot_layouts ? x2w_replay_slots::find(c.kind, c.slot) : nullptr;
     const bool wait = layout && c.kind == device_kind && c.slot == 80;
     const bool barrier_noop = layout && c.kind == x2w_replay_slots::list && c.slot == 146;
