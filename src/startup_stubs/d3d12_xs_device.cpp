@@ -3573,7 +3573,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
     const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
-    const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+    // Pass records the guest PSO and root at this command's position on this list.
+    // A console PSO can lack a desktop object until the translated draw path
+    // resolves it for the bound attachments and validates the guest root.
+    const bool translated = graphics_draw_candidate &&
+        (x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW") || x2w_local::env_on("X2W_INDIRECT_PIPE_LATE"));
     const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))

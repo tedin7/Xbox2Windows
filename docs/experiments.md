@@ -158,6 +158,21 @@ view by one element makes the pixel read zero although the resource still contai
 The shim binds the existing GPU range directly and checks the complete range against its
 backing and the D3D12 raw-view element limit.
 
+#### Pipeline resolution at indirect recording
+
+With `X2W_INDIRECT_PIPE_LATE=1`, indirect Draw and DrawIndexed can use the
+translated path when the direct list's current guest pipeline has no desktop
+PSO. The path resolves the cached shader translation, checks the recorded
+guest root against the pipeline, and creates the desktop PSO and root as
+needed. Supported graphics command signatures carry no root arguments.
+
+`ctest --preset release --no-tests=error -R '^startup_indirect_pipe_late(_off)?_warp$'`
+runs the WARP fixture. It switches from a synthetic shader that requires an
+unsupported indirect entry value to a compatible shader immediately before
+the indirect draw. The CPU reference expects red for the compatible draw and
+clear pixels for the wrong-root case and the switch-off control. Both refused
+cases also check their diagnostic counts. Windows execution is pending.
+
 ### Index views backed by a recording upload
 
 Under `X2W_TRANSLATED_INDIRECT_DRAW=1`, a translated indexed draw can bind

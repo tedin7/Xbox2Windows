@@ -601,7 +601,8 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute,
+                     late_pipeline_disabled };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -756,7 +757,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
+         IUnknown* previous_graphics = nullptr)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -951,7 +953,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
         slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
     }
-    slot<Bind>(wrapped, 25)(wrapped, graphics);
+    slot<Bind>(wrapped, 25)(wrapped, previous_graphics ? previous_graphics : graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
     if (leased) {
         using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
@@ -1075,6 +1077,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
+    if (previous_graphics) slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
                                external_arguments ? leased->argument_offset : offset, nullptr, 0);
     if (restore_compute) {
@@ -1778,7 +1781,9 @@ int main(int argc, char** argv) try
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool late_pipeline_off = argc == 3 && std::strcmp(argv[2], "pipe-late-off") == 0;
+    const bool late_pipeline = late_pipeline_off || (argc == 3 && std::strcmp(argv[2], "pipe-late") == 0);
+    const bool translated = late_pipeline || root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2163,7 +2168,8 @@ int main(int argc, char** argv) try
         if (alias_index)
             check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS", alias_disabled ? "0" : "1"),
                 "set existing heap alias control");
-        check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable fixture path");
+        check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", late_pipeline ? nullptr : "1")
+            ? S_OK : E_FAIL, "set legacy translated indirect path");
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_COPY_RANGES", copy_on ? "1" : "0") ? S_OK : E_FAIL,
               "set copy-range provenance control");
         const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
@@ -2247,6 +2253,26 @@ int main(int argc, char** argv) try
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
         const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+        if (late_pipeline) {
+            check(SetEnvironmentVariableA("X2W_INDIRECT_PIPE_LATE", late_pipeline_off ? nullptr : "1")
+                ? S_OK : E_FAIL, "set late indirect pipeline switch");
+            const auto verify_late = [&](Refusal refusal, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), pso.Get(),
+                    signature.Get(), DrawKind::vertices, false, refusal, label, &red_binding, false, nullptr,
+                    false, false, 0, false, false, nullptr, nullptr, false, start_pso.Get());
+            };
+            const bool pixels_ok = late_pipeline_off
+                ? verify_late(Refusal::late_pipeline_disabled, "late PSO disabled, clear pixels")
+                : verify_late(Refusal::none, "late PSO draws with the newly bound pipeline") &&
+                  verify_late(Refusal::wrong_root, "late PSO refuses a different guest root");
+            std::string census(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+            x2w_d3d12_census_report(census.data(), census.size());
+            const bool refusal_ok = census.find(late_pipeline_off ? "reason=draw switch off calls=1\n"
+                                                                 : "reason=draw root mismatch calls=1\n") != std::string::npos;
+            if (!refusal_ok) std::fprintf(stderr, "unexpected late indirect refusal census:\n%s", census.c_str());
+            std::filesystem::remove_all(cache);
+            return pixels_ok && refusal_ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         if (root_fix) {
             check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", "1") ? S_OK : E_FAIL, "enable indirect root fix");
             if (root_fix_control)
