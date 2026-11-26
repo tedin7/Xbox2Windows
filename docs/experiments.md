@@ -9892,6 +9892,9 @@ dispatch cases in Release on WARP and an RTX 4060 Laptop, four passes with no sk
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45478647954)
 [Maintainer's adapter results](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7143863805)
 
+See [plain-memory index views](experiments/indirect-index-copy.md) for the
+opt-in staging path and its WARP fixture.
+
 #### GPU-written indirect draw arguments
 
 Slot 61 also accepts a single rootless desktop `DRAW` record with the exact
