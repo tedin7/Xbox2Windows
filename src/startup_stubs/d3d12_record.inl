@@ -204,14 +204,18 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
 void stop(bool at_exit);
 
 template <int K, int N>
-__declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
+__declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6,
+                               u64 s7)
 {
-    using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
+    // Eleven arguments after rcx reach the real slot (D3D12's longest, UpdateTileMappings, has ten): stack words past
+    // the caller's own arguments are read and passed on unused, which the x64 convention allows (the caller reserves
+    // the home area; a slot reads only what it declares). The first seven are recorded.
+    using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
-    if (!window_open) return call(rcx, rdx, r8, r9, s0, s1, s2, s3);
+    if (!window_open) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     // Nothing but the sequence number (an interlocked instruction) before the real call.
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
-    const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3);
+    const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     const u64 args[7] = {rdx, r8, r9, s0, s1, s2, s3};
     record_call(K, N, seq, rcx, args, ret);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
@@ -312,7 +316,7 @@ void stop(bool at_exit)
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
-    write_shader_cache(at_exit);
+    if (!at_exit) write_shader_cache(false);  // never inside DllMain: thousands of file reads under the loader lock
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
@@ -327,17 +331,22 @@ void stop(bool at_exit)
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
+#include "startup_stubs/d3d12_record_pages.inl"
+
 void present()
 {
     if (!armed || stopped) return;
     const LONG present = InterlockedIncrement(&presents);
+    const bool was_open = window_open;
     update_window();
     if (window_open || present == first_present) {
         ThreadBuffer& b = my_buffer();
         AcquireSRWLockExclusive(&b.lock);
-        struct { u64 seq; std::int32_t present, pad; double seconds; } mark{static_cast<u64>(InterlockedIncrement64(&next_seq)),
-                                                                            present, 0, seconds_now()};
+        const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+        struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
+        if (window_open && !was_open) pages_at_window_open(b, seq, present);
+        else if (window_open) pages_at_present(b, seq, present);
         ReleaseSRWLockExclusive(&b.lock);
     }
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
@@ -391,6 +400,14 @@ void install()
     }
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&started);
+    // Window times count from process start (as the tester's times do), not from when the stand-in made its tables.
+    FILETIME created{}, unused{}, now{};
+    if (GetProcessTimes(GetCurrentProcess(), &created, &unused, &unused, &unused)) {
+        GetSystemTimePreciseAsFileTime(&now);
+        const auto ticks = [](const FILETIME& f) { return (static_cast<u64>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+        const u64 alive = ticks(now) > ticks(created) ? ticks(now) - ticks(created) : 0;  // 100 ns units
+        started.QuadPart -= static_cast<LONGLONG>(alive / 10000 * static_cast<u64>(frequency.QuadPart) / 1000);
+    }
     std::vector<unsigned char> head;
     struct { std::uint32_t version, call_bytes; u64 frequency; } header{2, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);
