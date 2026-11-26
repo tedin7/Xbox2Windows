@@ -6841,7 +6841,7 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods):
+    def buffer_address(self, ops, mods, formatted=False):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -6855,7 +6855,7 @@ class Stage:
         if len(ops) != 4:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         key = self.descriptor(ops[2])
-        buf = self.pipe.resource(key, 'buf')
+        buf = (self.pipe.resource(key, 'buf', formatted=True) if formatted else self.pipe.resource(key, 'buf'))
         soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -6881,7 +6881,9 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.srv_index(key)))
+            source = (('uav_stride', self.pipe.uavs[key]['index']) if formatted and key in self.pipe.rw_keys
+                      else ('stride', self.srv_index(key)))
+            stride = self.pipe.ud(source)
             terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
@@ -7473,7 +7475,10 @@ class Stage:
         For compute, the caller must validate the native descriptor and reachable byte addresses, and bind the
         SRV and entry constants from that same descriptor snapshot.
         """
-        buf, address = self.buffer_address(ops, mods)
+        # The shared view models a structured element at its start, with no extra byte offset.
+        formatted = (self.kind == 'cs' and 'idxen' in mods and 'offen' not in mods and len(ops) == 4
+                     and ops[3] in ('0', '0x0') and not any(m.startswith('offset:') for m in mods))
+        buf, address = self.buffer_address(ops, mods, formatted)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
@@ -7488,9 +7493,19 @@ class Stage:
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
         if self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
+        key = self.descriptor(ops[2])
+        shared = formatted and key in self.pipe.rw_keys
+        if shared:
+            slot = self.pipe.uavs[key]['index']
+            word3 = 'ud%d' % self.pipe.ud(('uav_rw_word3', slot))
+            records = self.pipe.ud(('uav_numrecords', slot))
+        else:
+            word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
+        if shared:
+            self.emit('bool in_range = %s < ud%d;' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), records))
+            self.emit('if (in_range) {')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
         for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
             load, comps = FETCH_FORMATS[fmt]
@@ -7500,10 +7515,13 @@ class Stage:
                 body.append('one = 1u;')
             self.emit('case %du: %s break;' % (code, ' '.join(body)))
         self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
+        if shared:
+            self.emit('}')
         pick = ('((%s >> %d) & 7u)' % (word3, 3 * i) for i in range(count))
         for i, sel in enumerate(pick):
-            self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
-                       % (sel, sel, sel, sel, sel))
+            value = ('%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
+                     % (sel, sel, sel, sel, sel))
+            self.set_v(dst[1] + i, 'in_range ? (%s) : 0u' % value if shared else value)
         self.emit('}')
 
     def op_buffer_load_format_x(self, ops, mods):
@@ -7661,9 +7679,10 @@ class Stage:
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
         idx = self.u(ops[1])
         data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
-        uav = self.pipe.uav(key, 'raw')
+        uav = self.pipe.uav(key, 'raw', formatted=True)
         uav_index = self.pipe.uavs[key]['index']
-        word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
+        source = 'uav_rw_word3' if key in self.pipe.rw_formatted else 'uav_descword3'
+        word3 = 'ud%d' % self.pipe.ud((source, uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
         num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
@@ -11804,12 +11823,12 @@ def wave32_exec_proof(ins):
 
 
 class ReadWriteBuffer(Unsupported):
-    """A compute program loads and stores through one descriptor. A raw buffer is lowered as one RWByteAddressBuffer
+    """A compute program loads and stores through one descriptor. An eligible buffer is lowered as one RWByteAddressBuffer
     (ComputePipeline retries with the key in rw_keys); anything else keeps the refusal."""
 
-    def __init__(self, key, lowerable):
+    def __init__(self, key, lowerable, formatted=False):
         super().__init__('descriptor %s used for a load and a store' % (key,))
-        self.key, self.lowerable = key, lowerable
+        self.key, self.lowerable, self.formatted = key, lowerable, formatted
 
 
 class ComputePipeline(Pipeline):
@@ -11842,6 +11861,7 @@ class ComputePipeline(Pipeline):
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
+        self.rw_formatted = set()
         self.retry_entry_exec = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
@@ -11872,11 +11892,14 @@ class ComputePipeline(Pipeline):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
             raise conflict
         self.rw_keys.add(conflict.key)
+        if conflict.formatted:
+            self.rw_formatted.add(conflict.key)
 
     def _reset_stage(self):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.load_modes, self.store_modes = {}, {}
         self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
@@ -11884,18 +11907,30 @@ class ComputePipeline(Pipeline):
             del refusals[self._refusals_before:]
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
-    def resource(self, key, kind):
+    def resource(self, key, kind, formatted=False):
+        loads = self.load_modes.setdefault(key, set())
+        loads.add(formatted)
         if key in self.rw_keys and kind == 'buf':
-            return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
+            if formatted != (key in self.rw_formatted):
+                raise ReadWriteBuffer(key, False)
+            return Pipeline.uav(self, key, 'raw')
         if key in self.uavs:
-            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
+            shared_format = kind == 'buf' and loads == {True} and self.store_modes.get(key) == {True}
+            raise ReadWriteBuffer(key, shared_format or (
+                not formatted and key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf'),
+                formatted=shared_format)
         return super().resource(key, kind)
 
-    def uav(self, key, kind='raw', rw=False):
-        # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
-        # atomics keep the refusal.
+    def uav(self, key, kind='raw', rw=False, formatted=False):
+        stores = self.store_modes.setdefault(key, set())
+        stores.add(formatted)
+        if key in self.rw_formatted and not formatted:
+            raise ReadWriteBuffer(key, False)
         if key in self.resources:
-            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
+            shared_format = (kind == 'raw' and self.resources[key]['kind'] == 'buf'
+                             and stores == {True} and self.load_modes[key] == {True})
+            raise ReadWriteBuffer(key, shared_format or (rw and self.resources[key]['kind'] == 'buf'),
+                                  formatted=shared_format)
         if rw:
             self.plain_stored.add(key)
         return super().uav(key, kind)
@@ -12937,7 +12972,7 @@ def raise_site(error):
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
-    ('rw-buffer', r'used for a load and a store'),
+    ('rw-buffer', r'used for a load and a store|indexed or formatted load through a read-write descriptor'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
     ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),

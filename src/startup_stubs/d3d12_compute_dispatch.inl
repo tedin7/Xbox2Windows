@@ -6,17 +6,43 @@
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
-// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
+// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). A shared formatted output uses
+// `uav_rw_word3` instead, with a validated unified FORMAT. Any other manifest line makes the translation
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
+
+// Both operations consume this word. Convert the supported legacy four-channel formats to the unified
+// encoding used by the load decoder. Require whole aligned elements so a load never touches another record.
+static bool compute_rw_format_word3(const std::uint32_t* words, std::uint32_t& word3)
+{
+    const std::uint32_t original = words[3];
+    const std::uint32_t stride = words[1] >> 16;
+    if ((original & 0xfef80000u) || (original & 0xfffu) != 0xfacu || stride > 0x3fffu || stride % 4)
+        return false;  // structured OOB mode, identity DST_SEL, and no swizzle or unsupported flags
+    std::uint32_t format = x2w_startup::formatted_buffer_code(original);
+    if (!(original & (1u << 24))) {
+        switch (format) {
+        case 72: format = 50; break;  // 2_10_10_10 UNORM
+        case 80: format = 56; break;  // 8_8_8_8 UNORM
+        case 103: format = 71; break;  // 16_16_16_16 FLOAT
+        case 119: format = 77; break;  // 32_32_32_32 FLOAT
+        default: return false;
+        }
+    }
+    // Intersection of the existing formatted load and xyzw store decoders.
+    const std::uint32_t element = format == 50 || format == 56 ? 4 : format == 71 ? 8 : format == 77 ? 16 : 0;
+    if (!element || stride < element) return false;
+    word3 = (1u << 24) | (format << 12) | 0xfacu;
+    return true;
+}
 
 struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
     // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
-    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records, rw_output_word3 };
     struct Slot {
         int a, b;
         bool texture, heap;
@@ -145,8 +171,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
         // The manifest names of the Source values after root_constant, in their order.
         const auto source = [&] {
-            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords"};
-            for (int s = 0; s < 5; ++s)
+            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords", "uav_rw_word3"};
+            for (int s = 0; s < static_cast<int>(std::size(names)); ++s)
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
@@ -216,6 +242,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
+        if (ud.source == ComputeTranslation::rw_output_word3 && !x2w_local::env_on("X2W_COMPUTE_RW_FORMATTED"))
+            return "shared formatted compute buffers require X2W_COMPUTE_RW_FORMATTED=1";
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
@@ -524,6 +552,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             values[i] = word[3];
             break;
         case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
+        case ComputeTranslation::rw_output_word3:
+            if (!compute_rw_format_word3(view.words, values[i])) {
+                reason = "a shared formatted output has an unsupported descriptor layout";
+                std::memcpy(words, view.words, sizeof(view.words));
+            }
+            break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
         }

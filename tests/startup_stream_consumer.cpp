@@ -230,7 +230,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
-// record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// record count (word 2) and word 3, which are otherwise 4, 320 and 0. X2W_TEST_DISPATCH_INITIAL
+// replaces the initial output words. The dispatch-rw-once/twice modes use one group per dispatch.
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -250,6 +251,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         return !n || (n < MAX_PATH && std::ifstream(path, std::ios::binary).read(static_cast<char*>(data), bytes).gcount() == bytes);
     };
     if (!from_file("X2W_TEST_DISPATCH_IN", buffers[0], words * sizeof(UINT)) ||
+        !from_file("X2W_TEST_DISPATCH_INITIAL", buffers[1], words * sizeof(UINT)) ||
         !from_file("X2W_TEST_DISPATCH_FIELDS", fields, sizeof(fields))) return 2;
     UINT input[words];
     std::memcpy(input, buffers[0], sizeof(input));
@@ -407,7 +409,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
-    else if (mode == "dispatch-nolock-burst") {
+    else if (mode == "dispatch-rw-once" || mode == "dispatch-rw-twice") {
+        invoke(list, 14, 1, 1, 1);
+        if (mode == "dispatch-rw-twice") invoke(list, 14, 1, 1, 1);
+    } else if (mode == "dispatch-nolock-burst") {
         const auto before = compute_refusal_stats();
         for (UINT i = 0; i < 10000; ++i) {
             if (i == 5000) Sleep(300);  // Cross the legacy retry interval.

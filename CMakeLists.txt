@@ -5042,6 +5042,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_entry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_entry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_compute_rw_formatted_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_rw_buffer_check.py" --runtime-dispatch
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_compute_rw_formatted_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         set_tests_properties(startup_compute_dispatch_${adapter} startup_compute_dispatch_texture_${adapter}
             startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
             startup_compute_live_retry_${adapter} startup_compute_dispatch_entry_${adapter}
