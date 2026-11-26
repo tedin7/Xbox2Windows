@@ -2,7 +2,7 @@
 // Pure code: no D3D12 calls and no locks. The caller (d3d12_xs_device.cpp / d3d12_draw.inl) fills the facts and
 // performs the Evict / MakeResident calls named by the result. Public docs: ID3D12Device::Evict and MakeResident.
 //
-// Rules (docs: pilot plan "residency_plan.md", fork only):
+// Rules:
 //  - a texture is a candidate only when the caller says it is safe: read-only, written by no GPU copy,
 //    never named by the title's own Evict/MakeResident, not being materialized;
 //  - a texture named by a submission whose fence has not completed is never a candidate (evicting a resource
