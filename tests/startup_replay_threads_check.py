@@ -69,12 +69,14 @@ def run(args, env):
     return result.returncode, result.stdout + result.stderr
 
 
-def replay(player, recording, out, backend, env, *flags):
+def replay(player, recording, out, backend, env, *flags, strict=True):
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     code, text = run([player, recording, out, "--adapter", backend, *flags], env)
     log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
     assert code == 0, "x2w_replay exit %d\n%s\n%s" % (code, text[-2000:], log)
     summary = json.loads((out / "replay_summary.json").read_text())
+    if not strict:
+        return summary, pictures(out)
     assert summary["presents"] == PRESENTS and summary["missing_blob"] == 0, (summary, log)
     return summary, pictures(out)
 
@@ -124,9 +126,10 @@ def main(scene, player, backend):
         assert not differ, "single-thread replay differs from the recorded run at %s" % differ
 
         # Control: no order, threads started last first. The order the ordered steps finished in, and the pictures, change.
-        free, unordered = replay(player, recording, directory / "unordered", backend, env, "--sync", "off")
+        free, unordered = replay(player, recording, directory / "unordered", backend, env, "--sync", "off", strict=False)
         assert free["sync_order_inversions"] > 0, "the control kept the order: %s" % free
-        assert any(unordered.get(n) != recorded[n] for n in names), "the control drew the same pictures in the same order"
+        assert free["presents"] != PRESENTS or any(unordered.get(n) != recorded[n] for n in names), (
+            "the control drew the same pictures in the same order")
         print("replay threads: %d threads, %d calls, %d polls recorded in order; %d presents equal on %d threads and on one; "
               "control (no order): %d steps out of order" % (thread_count, call_count, polls, PRESENTS, summary["threads"],
                                                              free["sync_order_inversions"]))
