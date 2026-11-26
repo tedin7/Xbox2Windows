@@ -43,8 +43,13 @@ struct Output {
     u64 value;  // the wrapper the argument's memory held after the call
 };
 
+struct HeapPlacement {
+    u64 id, base, bytes, offset;
+};
+
 struct Step {
     CallRecord call;
+    HeapPlacement placement{};
     std::vector<ArgMemory> memory;  // in the order written: a parent before what it points at
     std::vector<Output> outputs;
     const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
@@ -75,6 +80,7 @@ struct Recording {
     u64 size = 0;
     std::uint32_t version = 0;
     u64 frequency = 0;
+    std::unordered_map<u64, HeapPlacement> placement_heaps;  // HPLC heap ID -> allocation bounds
     std::vector<Step> steps;  // sorted by seq
     std::unordered_map<u64, Blob> blobs;
     std::vector<std::string> settings;
@@ -150,6 +156,26 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             const auto found = by_seq.find(seq);
             if (found == by_seq.end()) return "ARGM before its CALL at " + std::to_string(at);
             out.steps[found->second].memory.push_back(m);
+        } else if (name == "HPLC") {
+            u64 seq;
+            HeapPlacement placement;
+            if (header_bytes != sizeof(seq) + sizeof(placement) || data_bytes)
+                return "invalid HPLC size at " + std::to_string(at);
+            std::memcpy(&seq, h, sizeof(seq));
+            std::memcpy(&placement, h + sizeof(seq), sizeof(placement));
+            const auto found = by_seq.find(seq);
+            if (found == by_seq.end()) return "HPLC before its CALL at " + std::to_string(at);
+            Step& step = out.steps[found->second];
+            constexpr u64 granule = 0x10000, address_limit = 1ull << 47;
+            if (step.call.kind != 0 || step.call.slot != 133 || step.placement.id || !placement.id ||
+                !placement.base || placement.base >= address_limit || (placement.base & (granule - 1)) ||
+                placement.bytes > address_limit - placement.base || placement.offset >= placement.bytes ||
+                (placement.offset & (granule - 1)))
+                return "invalid HPLC placement at " + std::to_string(at);
+            const auto& heap = out.placement_heaps.emplace(placement.id, placement).first->second;
+            if (heap.base != placement.base || heap.bytes != placement.bytes)
+                return "inconsistent HPLC heap at " + std::to_string(at);
+            step.placement = placement;
         } else if (name == "DARR" && header_bytes == 8) {
             u64 seq;
             std::memcpy(&seq, h, 8);

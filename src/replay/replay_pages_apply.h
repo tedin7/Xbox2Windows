@@ -61,10 +61,32 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     for (const PageMap& m : r.maps)
         if (m.bytes) state.map_spans.push_back(aligned(m.address, m.bytes));
     merge_spans(state.map_spans);
-    state.spans = state.map_spans;
+    std::vector<ReservedSpan> wanted = state.map_spans;
     for (const Step& step : r.steps)
-        if (step.descriptor_bytes) state.spans.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
-    merge_spans(state.spans);
+        if (step.descriptor_bytes) wanted.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
+    // Reserve whole recorded allocations, even when only interior pages were captured.
+    std::vector<u64> boundaries;
+    for (const auto& entry : r.placement_heaps) {
+        const HeapPlacement& heap = entry.second;
+        const u64 end = (heap.base + heap.bytes + granule - 1) & ~(granule - 1);
+        wanted.push_back({heap.base, end});
+        boundaries.push_back(heap.base);
+        boundaries.push_back(end);
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    merge_spans(wanted);
+    // Do not let adjacent page ranges merge two different recorded heaps into one allocation.
+    state.spans.clear();
+    for (const ReservedSpan& s : wanted) {
+        u64 base = s.base;
+        for (auto cut = std::upper_bound(boundaries.begin(), boundaries.end(), base);
+             cut != boundaries.end() && *cut < s.end; ++cut) {
+            state.spans.push_back({base, *cut});
+            base = *cut;
+        }
+        state.spans.push_back({base, s.end});
+    }
     for (const ReservedSpan& s : state.spans) {
         void* const at = VirtualAlloc(reinterpret_cast<void*>(s.base), static_cast<SIZE_T>(s.end - s.base), MEM_RESERVE | MEM_COMMIT,
                                       PAGE_READWRITE);

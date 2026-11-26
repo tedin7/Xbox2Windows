@@ -1937,6 +1937,11 @@ commits that range through the same allocator as `MAP` before playing any calls.
 to heap creation and uses that address for descriptor writes. `DHPM` carries no memory contents and is recorded even
 with `X2W_REPLAY_PAGES=0`. Older recordings without `DHPM` still use generic argument relocation.
 
+For slot 133 buffers placed on the default path's existing heaps, an optional `HPLC` header holds five u64 words:
+call sequence, creation-order heap ID, allocation base, heap size and byte offset. Replay reserves the recorded
+allocation and opens one heap per ID. Each placement uses that heap and its recorded offset. Recordings without
+`HPLC` still use the address-based call.
+
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
 GPU round trip per present. A recorded run and its replay write the same names.

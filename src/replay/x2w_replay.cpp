@@ -44,6 +44,9 @@
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
+extern "C" __declspec(dllimport) HRESULT x2w_d3d12_replay_place(
+    void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state, ID3D12Heap** heap, void** out);
+
 namespace x2w_replay {
 namespace {
 
@@ -73,6 +76,7 @@ struct Player {
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
     std::vector<ReservedSpan> descriptor_backings;  // exact ranges of heaps created so far
+    std::unordered_map<u64, Microsoft::WRL::ComPtr<ID3D12Heap>> placement_heaps;
     std::map<u64, Range> handles;              // recorded handle / mapped / GPU address start -> replay start, span
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
@@ -420,7 +424,19 @@ bool play(Player& p, const Recording& r, const Step& step)
         heap_desc.bytes = step.descriptor_bytes;
         a[0] = reinterpret_cast<u64>(&heap_desc);
     }
-    call.ret = call_slot(call.self, rcx, c.slot, a);
+    if (const auto& placement = step.placement; placement.id) {
+        auto& heap = p.placement_heaps[placement.id];
+        const HRESULT hr = x2w_d3d12_replay_place(
+            reinterpret_cast<void*>(call.self), reinterpret_cast<void*>(placement.base), placement.offset,
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(call.top[1]), static_cast<UINT>(c.args[2]), heap.GetAddressOf(),
+            reinterpret_cast<void**>(call.top[5]));
+        call.ret = static_cast<u64>(hr);
+        say("x2w-replay: slot 133 seq %llu heap id %llu offset 0x%llx hr=0x%08lx",
+            c.seq, placement.id, placement.offset, static_cast<unsigned long>(hr));
+        if (FAILED(hr)) ++p.slot_result_mismatches;
+    } else {
+        call.ret = call_slot(call.self, rcx, c.slot, a);
+    }
     if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
         p.descriptor_backings.push_back({step.descriptor_address, step.descriptor_address + step.descriptor_bytes});
         merge_spans(p.descriptor_backings);

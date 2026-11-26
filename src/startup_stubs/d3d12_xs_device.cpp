@@ -5614,6 +5614,14 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     return S_OK;
 }
 
+D3D12_RESOURCE_DESC existing_heap_buffer_desc(const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_RESOURCE_DESC copy = desc;
+    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return copy;
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -5764,6 +5772,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                           static_cast<unsigned long>(linear.feature_hr), static_cast<unsigned long>(linear.share_hr));
     }
     ID3D12Heap* heap = nullptr;
+    u64 heap_id = 0;
     x2w_budget::Ticket* backing_budget = nullptr;
     HRESULT hr = S_OK;
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
@@ -5797,10 +5806,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
-        for (const auto& [known, h] : existing_heaps) {
+        for (std::size_t i = 0; i < existing_heaps.size(); ++i) {
+            const auto& [known, h] = existing_heaps[i];
             if (known == base) {
                 heap = h.real;
                 backing_budget = h.budget;
+                heap_id = i + 1;
             }
         }
         if (!heap) {
@@ -5814,12 +5825,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             if (SUCCEEDED(hr)) {
                 backing_budget = x2w_budget::backing_heap(heap, 0);
                 existing_heaps.emplace_back(base, ExistingHeap{heap, backing_budget});
+                heap_id = existing_heaps.size();
             }
         }
     }
-    D3D12_RESOURCE_DESC copy = *desc;
-    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
-                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
         hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
@@ -5839,6 +5849,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx%s", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull, linear_note);
     if (FAILED(hr)) return hr;
+    if (aliased && replay_record::active_placement) {
+        const auto bytes = heap->GetDesc().SizeInBytes;
+        *replay_record::active_placement = {heap_id, reinterpret_cast<u64>(base), bytes, offset};
+    }
     if (linear.path == x2w_startup::LinearBuffers::kept_default_path) linear_buffers().kept_default(resource, linear);
     return publish_placed_buffer(self, address, desc, initial_state, resource, aliased, backing_budget, out);
 }
@@ -8086,6 +8100,44 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+
+// The offline player owns these heap references and keys them by recorded creation ID.
+extern "C" __declspec(dllexport) HRESULT x2w_d3d12_replay_place(
+    void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state,
+    ID3D12Heap** heap, void** out)
+{
+    auto* self = static_cast<Wrapper*>(device);
+    if (!desc || !out || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;
+    *out = nullptr;
+    x2w_budget::Ticket* backing_budget = nullptr;
+    if (!*heap) {
+        Microsoft::WRL::ComPtr<ID3D12Device3> device3;
+        HRESULT hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
+        if (FAILED(hr)) return hr;
+        Microsoft::WRL::ComPtr<ID3D12Heap> opened;
+        hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&opened));
+        if (FAILED(hr)) return hr;
+        // Keep the page-alias resolver and resource budgeting on the ordinary slot 133 heap registry.
+        std::lock_guard lock(placed_mutex);
+        backing_budget = x2w_budget::backing_heap(opened.Get(), 0);
+        existing_heaps.emplace_back(base, ExistingHeap{opened.Get(), backing_budget});
+        opened->AddRef();  // registry lifetime, independent of the player's cache
+        *heap = opened.Detach();
+    } else {
+        std::lock_guard lock(placed_mutex);
+        const auto known = std::find_if(existing_heaps.begin(), existing_heaps.end(),
+            [&](const auto& entry) { return entry.second.real == *heap; });
+        if (known != existing_heaps.end()) backing_budget = known->second.budget;
+    }
+    const auto initial_state = state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
+    const HRESULT hr = device_of(self)->CreatePlacedResource(*heap, offset, &copy, initial_state, nullptr,
+                                                             IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return hr;
+    return publish_placed_buffer(self, static_cast<char*>(base) + offset, desc, initial_state, resource, true, backing_budget, out);
+}
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

@@ -268,7 +268,13 @@ bool record_descriptor_arrays(ThreadBuffer& b, u64 seq, const u64* args)
 
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
-void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy)
+// HPLC describes the desktop heap used by a successful slot 133 placement.
+struct HeapPlacement {
+    u64 id, base, bytes, offset;
+};
+thread_local HeapPlacement* active_placement = nullptr;
+
+void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy, const HeapPlacement& placement)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
@@ -298,7 +304,16 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
             log("x2w-replay record: CopyDescriptors arrays of call %llu not recorded exactly (unreadable or over the size cap); "
                 "the replay of that copy may be cut short", static_cast<unsigned long long>(seq));
     }
-    record_arguments(b, call);
+    if (placement.id && SUCCEEDED(static_cast<HRESULT>(ret))) {
+        const struct { u64 seq; HeapPlacement placement; } header{seq, placement};
+        append_chunk(b.bytes, "HPLC", &header, sizeof(header), nullptr, 0);
+        record_memory(b, seq, 1, args[1], sizeof(D3D12_RESOURCE_DESC), 0, true);
+        record_memory(b, seq, 4, args[4], sizeof(GUID), 0, true);
+        record_memory(b, seq, 5, args[5], sizeof(void*), 0, true);
+        record_wrapper_output(b, seq, 5, args[5]);
+    } else {
+        record_arguments(b, call);
+    }
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
@@ -341,9 +356,16 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
         seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     if constexpr (K == device_kind && N == 17)
         if (extra_title_pages) remember_cbv_pages(rdx);
+    HeapPlacement placement{};
+    HeapPlacement* previous = nullptr;
+    if constexpr (K == device_kind && N == 133) {
+        previous = active_placement;
+        active_placement = &placement;
+    }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    if constexpr (K == device_kind && N == 133) active_placement = previous;
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
-    record_call(K, N, seq, rcx, args, ret, descriptor_copy);
+    record_call(K, N, seq, rcx, args, ret, descriptor_copy, placement);
     if constexpr (K == descriptor_heap_kind && N == 9)
         if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
