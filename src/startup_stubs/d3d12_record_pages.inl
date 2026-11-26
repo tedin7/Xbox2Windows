@@ -178,8 +178,13 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
 {
     // X2W_REPLAY_RECORD=all opens its window when the recorder starts, so no present sees the window open: the first one
-    // writes the base image.
-    if (!page_writer_tried) { pages_at_window_open(b, seq, present); return; }
+    // writes the base image. The title's memory at this present is what the first frame's calls (all before this mark) read,
+    // so the base image is stamped 0: a replay writes it before the first call.
+    if (!page_writer_tried) {
+        pages_at_window_open(b, 0, present);
+        page_prev_mark = seq;
+        return;
+    }
     (void)present;
     const u64 stamp = page_prev_mark ? page_prev_mark : seq;
     page_prev_mark = seq;
