@@ -655,6 +655,12 @@ def check_phase_table():
     assert rows[2].split() == ["0", "30", "900", "30.0", "0.0"], rows[2]
     assert rows[3].split() == ["30", "60", "100", "3.3", "36.0"], rows[3]
     assert rows[4].split() == ["60", "90", "10", "0.3", "-"], rows[4]
+    assert rows[-1].startswith("# credits movie: no window pictures after 250 s"), rows[-1]
+    late = timeline + "  300.0 s  picture window_300s.png mean 0.0  unchanged\n  384.0 s  picture window_384s.png mean 72.3  changed\n  400.0 s  picture window_400s.png mean 0.0  changed\n"
+    note = T.movie_note(late)
+    assert note.startswith("# credits movie: content in 1 of 3 of OUR pictures after 250 s (384 s mean 72); capture interval 50 s"), note
+    black = T.movie_note("  300.0 s  picture window_300s.png mean 0.0  first\n  315.0 s  picture window_315s.png mean 1.0  unchanged\n")
+    assert black.startswith("# credits movie: NOT seen in our 2 pictures after 250 s") and "tester's own captures" in black, black
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "run"
         run.mkdir()

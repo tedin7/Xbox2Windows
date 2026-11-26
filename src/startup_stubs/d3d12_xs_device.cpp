@@ -2141,6 +2141,25 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
+std::uint64_t process_ms();  // d3d12_draw.inl
+
+// Which translated draw last wrote each render target, for the `x2w-render present source` line: direct-mapped by resource pointer,
+// written under the draw lock, read without a lock by the present thread (a torn read only blurs a diagnostic).
+struct TargetWriter {
+    const void* resource;
+    u64 key, draws;
+    unsigned slot, format;
+};
+TargetWriter target_writers[256];
+void note_target_writer(const void* resource, u64 key, unsigned slot, unsigned format)
+{
+    TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(resource) >> 6) & 255];
+    if (w.resource != resource) w = TargetWriter{resource, 0, 0, 0, 0};
+    w.key = key;
+    w.slot = slot;
+    w.format = format;
+    ++w.draws;
+}
 // raw_plane < 0: the baseline capture of the presented surface (plane 0), reduced for the window and
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
@@ -2294,6 +2313,19 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     const bool periodic = (count > 0 && count <= 3) || count % 40 == 0;
     const bool moved = std::fabs(mean_level - last_logged_mean) > 2 && change_lines < 300;
     if (periodic || moved) {
+        {
+            // What produced this picture: the translated draw that last wrote this surface (key, target slot, format, draws into it
+            // since it was first seen as a target), or "no translated draw", then the picture is a copy/clear/other writer.
+            const TargetWriter& w = target_writers[(reinterpret_cast<std::uintptr_t>(surface) >> 6) & 255];
+            if (!raw && (periodic || moved)) {
+                if (w.resource == surface)
+                    log("x2w-render present source at %.1f s: last translated draw into the presented surface key %016llx (target %u, format %u, %llu draws into it); mean level %.2f/255",
+                        process_ms() / 1000.0, static_cast<unsigned long long>(w.key), w.slot, w.format, static_cast<unsigned long long>(w.draws), sum / (3.0 * shown_width * shown_height));
+                else
+                    log("x2w-render present source at %.1f s: no translated draw wrote the presented surface (copy, clear or untranslated writer); mean level %.2f/255",
+                        process_ms() / 1000.0, sum / (3.0 * shown_width * shown_height));
+            }
+        }
         if (moved && !periodic) {
             ++change_lines;
             log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);

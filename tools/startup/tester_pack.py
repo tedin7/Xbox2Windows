@@ -559,9 +559,29 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
 
 
 PHASES_NAME = "phases.txt"
+MOVIE_AFTER_S = 250      # Run O's credits movie showed at 384 and 446 s; before this the loading art and intros are on screen
+MOVIE_MIN_MEAN = 20.0    # a picture with at least this mean level is content, not black
 PHASE_WINDOW_S = 30
 HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
 PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
+
+
+def movie_note(timeline_text, after=MOVIE_AFTER_S):
+    """One line for the end of phases.txt: did OUR window captures show content (mean >= 20) after 250 s, when the credits movie
+    plays in the tester's own captures? Says how many pictures, when, and that a movie shorter than the capture interval can be
+    missed, so 'not seen' means 'not in our pictures', not 'did not play'."""
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    late = [(t, m) for t, m in pictures if t > after]
+    if not late:
+        return "# credits movie: no window pictures after %d s, cannot tell" % after
+    gaps = [b[0] - a[0] for a, b in zip(late, late[1:])]
+    step = "%.0f s" % (sum(gaps) / len(gaps)) if gaps else "one picture"
+    seen = [(t, m) for t, m in late if m >= MOVIE_MIN_MEAN]
+    if seen:
+        return "# credits movie: content in %d of %d of OUR pictures after %d s (%s); capture interval %s" % (
+            len(seen), len(late), after, ", ".join("%.0f s mean %.0f" % tm for tm in seen[:8]), step)
+    return ("# credits movie: NOT seen in our %d pictures after %d s (all mean < %d); capture interval %s, a movie shorter than that can be "
+            "missed: compare with the tester's own captures" % (len(late), after, MOVIE_MIN_MEAN, step))
 
 
 def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
@@ -586,6 +606,7 @@ def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
             presents, fps = "-", "-"
         lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
         start = stop
+    lines.append(movie_note(timeline_text))
     return "\n".join(lines) + "\n"
 
 
