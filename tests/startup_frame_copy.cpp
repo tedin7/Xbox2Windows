@@ -139,8 +139,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 
 int draw_frame_copy_threads(ID3D12Device* desktop, void* guest, void* pso, const char* pixels)
 {
-    constexpr UINT workers = 4, draws = 1000, frames = 2;
-    constexpr UINT small_bytes = 4096, large_bytes = 16u << 20;
+    static constexpr UINT workers = 4, draws = 1000, frames = 2;
+    static constexpr UINT small_bytes = 4096, large_bytes = 16u << 20;
     const auto arg = [](const void* pointer) { return reinterpret_cast<StreamWord>(pointer); };
     const auto failed = [](StreamWord result) { return FAILED(static_cast<HRESULT>(result)); };
     struct Ranges {
