@@ -1,8 +1,8 @@
 // Checks src/startup_stubs/manifest_prefetch.h without a device: translation manifests are read by a background pass, and the
 // call the draw path makes with draw_lock held never waits for a file (a fake file system whose every access takes 50 ms).
 // --mutate open-under-lock: the draw-path call opens the file itself (the old behaviour); the lock-hold measurement must fail.
-// --mutate retry-under-lock: retries of an absent key open the file too (every key re-opened once a second under draw_lock);
-// the count of opens under the lock must fail.
+// --mutate retry-under-lock: retries of an absent key read the file too, with the lock held (every key re-opened once a second under
+// draw_lock); the read counts must fail.
 #include "startup_stubs/manifest_prefetch.h"
 
 #include <atomic>
@@ -162,33 +162,61 @@ int main(int argc, char** argv)
         return n == 0 && other.has_wanted();
     }());
 
-    // The path the draw takes (the policy of load_translation: the first lookup, then a retry when its time has come, every
-    // 250 ms): 1000 draws of a key that has no manifest, 3 ms apart. Only the first lookup may open the file under the lock.
+    // The path the draw takes (the policy of lookup_manifest): the first lookup of a key is claimed by one caller who reads the
+    // file with the "draw lock" released; retries (every 250 ms) take the background thread's copy. 1000 draws of a key that
+    // has no manifest, 3 ms apart. The fake lock is a flag: a file access made while it is set is an open under draw_lock.
     {
         constexpr std::uint64_t retry_ms = 250;
-        x2w_startup::ManifestSource source(fake_fast_io());
+        std::atomic<int> opens_while_locked{0};
+        bool draw_lock_held = false;
+        ManifestPrefetch::Io counted = fake_fast_io();
+        const auto plain_read = counted.read;
+        counted.read = [&](std::uint64_t key, std::string& text) {
+            if (draw_lock_held) ++opens_while_locked;
+            return plain_read(key, text);
+        };
+        x2w_startup::ManifestSource source(counted);
         std::uint64_t now = 1000, retry_at = 0;
         bool tried = false;
         std::string out;
         for (int draw = 0; draw < 1000; ++draw, now += 3) {
+            draw_lock_held = true;  // the recording thread holds draw_lock while it decides
             if (!tried || (retry_at && now >= retry_at)) {
-                const bool retry = tried && !mutate_retry;  // the mutant asks for a retry as if it were a first lookup
-                const bool ready = source.load(77, retry, out);
+                const bool retry = tried;
+                bool ready;
+                if (mutate_retry) {
+                    ready = source.read_first(77, out);  // the mutant reads the file on every retry, lock held
+                } else if (retry || !source.claim_first(77)) {
+                    ready = source.load_retry(77, out);
+                } else {
+                    draw_lock_held = false;  // released around the read
+                    ready = source.read_first(77, out);
+                    draw_lock_held = true;
+                }
                 tried = true;
                 if (!ready) retry_at = now + retry_ms;
             }
+            draw_lock_held = false;
         }
-        check("1000 draws of an absent key open its file at most once under the lock", source.first_opens_under_lock() + source.retry_opens_under_lock() <= 1);
-        check("no retry opened a file under the lock", source.retry_opens_under_lock() == 0);
-        check("and the first lookup did open it", source.first_opens_under_lock() == 1);
-        // A key published meanwhile is handed over to the retry by the background pass and draws without any further open.
+        check("1000 draws of an absent key read its file at most once", source.first_opens() + source.retry_opens() <= 1);
+        check("no read of a key already read", source.retry_opens() == 0);
+        check("the first lookup did read it", source.first_opens() == 1);
+        check("no file read was made with the lock held", opens_while_locked == 0);
+        // A key published meanwhile is handed over to the retry by the background pass.
         {
             std::lock_guard<std::mutex> lock(fs_mutex);
             files.insert(77);
         }
         source.prefetch().scan();
         std::string text77;
-        check("the retry then gets the published manifest from the background pass", source.load(77, true, text77) && !text77.empty());
+        check("the retry then gets the published manifest from the background pass", source.load_retry(77, text77) && !text77.empty());
+        // Two recording threads asking for the same new key: exactly one claims it.
+        x2w_startup::ManifestSource contested(fake_fast_io());
+        int claims = 0;
+        std::thread other([&] { claims += contested.claim_first(5) ? 1 : 0; });
+        claims += contested.claim_first(5) ? 1 : 0;
+        other.join();
+        check("a new key is claimed by exactly one thread", claims == 1);
     }
 
     if (failures) {

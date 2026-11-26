@@ -18,6 +18,7 @@
 #include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/committed_range.h"
+#include "startup_stubs/zero_tail.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -51,6 +52,8 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/gpu_time_probe.h"
+#include "startup_stubs/dispatch_phases.h"
+#include "startup_stubs/dsv_planes.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -78,6 +81,7 @@
 #include "descriptor_heap_type.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
+#include "key_use.h"
 #include "root_constant_store.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -1536,6 +1540,9 @@ bool gpu_time_on()
 }
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
+// OMSetRenderTargets refused for a depth stencil view with one read-only plane (depth read-only, stencil writable or the
+// reverse): nothing is bound, so every later draw of that pass is 'state_not_ready'. Counted by flags (index: DSV flags 0..3).
+LONG render_target_mixed_dsv[4];
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
@@ -1579,6 +1586,19 @@ LONG64 arenas_recycled_early;  // arenas recycled before their allocator's Reset
 
 // X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse (fixtures only): the list upload pages are not reused before their
 // allocator's Reset, as before the reuse; startup_upload_page_reuse must then fail.
+// X2W_UPLOAD_PAGE_REUSE=1: list upload pages go to a free pool for the next recordings (at the allocator's Reset, or
+// once a retired recording's submits passed), and a destroyed list stops pinning its allocator. Off by default since
+// Run P (a movie drew white with it on; the suspect is a GPU read of the memory by a list of another allocator, which
+// that allocator's submits do not cover): the pages are then released at the allocator's Reset, as before.
+bool upload_page_reuse()
+{
+    static const bool on = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_UPLOAD_PAGE_REUSE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
 bool upload_reuse_mutant()
 {
     static const bool on = [] {
@@ -1602,7 +1622,8 @@ void retire_list_arena(Wrapper* list)
 // submits) goes back to the free pages.
 void recycle_arenas(DesktopAllocator& allocator)
 {
-    for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
+    if (upload_page_reuse())
+        for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
     allocator.uploads.clear();
 }
 
@@ -1611,7 +1632,7 @@ void recycle_arenas(DesktopAllocator& allocator)
 // finished on the GPU are recycled now.
 void reclaim_finished_arenas(DesktopAllocator& allocator)
 {
-    if (upload_reuse_mutant()) return;
+    if (!upload_page_reuse() || upload_reuse_mutant()) return;
     auto& arenas = allocator.uploads;
     for (auto it = arenas.begin(); it != arenas.end();) {
         if (!(*it)->finished()) {
@@ -1630,7 +1651,7 @@ void release_upload_recording(Wrapper* list)
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
     retire_list_arena(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
+    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
         if (found->second) --found->second->lists;
         list_recordings.erase(found);
     }
@@ -1675,7 +1696,7 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
                 state.list_uploads = found->second->uploads.back().get();
             }
             allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment,
-                                                          upload_reuse_mutant() ? nullptr : &free_upload_pages);
+                                                          !upload_page_reuse() || upload_reuse_mutant() ? nullptr : &free_upload_pages);
         } catch (const std::bad_alloc&) {
             // Refuse the allocation without invalidating any range already recorded.
         }
@@ -2844,6 +2865,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
+    std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
@@ -2984,6 +3006,18 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
+        if (it->resource != resource) continue;
+        // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
+        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
+            x2w_dsv::move_plane(list, *it, 0, state);
+            return;
+        }
+        // Anything else wants one state for the whole resource: bring both planes back to COMMON first.
+        x2w_dsv::release(list, *it);
+        pass.mixed.erase(it);
+        break;
+    }
     for (auto& known : pass.states) {
         if (known.first != resource) continue;
         if (known.second != state) {
@@ -2998,6 +3032,9 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 // State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
 D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 {
+    for (const auto& planes : pass_of(self).mixed)
+        if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
+            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     for (const auto& known : pass_of(self).states)
         if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -3014,6 +3051,7 @@ void release_targets(Wrapper* self)
     Pass& pass = pass_of(self);
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
     pass = Pass{};
 }
 
@@ -3024,7 +3062,10 @@ void retire_drop_recording(Wrapper* list)
 {
     residency_discard_list(list);
     if (!release_retired_enabled()) return;
-    if (list->own().pass) pass_of(list).states.clear();
+    if (list->own().pass) {
+        pass_of(list).states.clear();
+        pass_of(list).mixed.clear();
+    }
     retire_discard_holds(list);
 }
 
@@ -4088,6 +4129,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bool mixed_planes = false;  // a view with one read-only plane: dsv_state is the depth plane's, the stencil plane gets the other
+    D3D12_RESOURCE_STATES stencil_plane_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
         if (!resolved) {
@@ -4111,8 +4154,11 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             // A format without a stencil plane has no second plane to disagree with.
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
-                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
-                return;
+                // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
+                mixed_planes = true;
+                InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
+                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets: depth stencil view with one read-only plane (flags 0x%x) bound with per-plane states", view.dsv_flags);
+                stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
@@ -4129,7 +4175,24 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         pass.target_formats[i] = formats[i];
         if (i == 0) pass.target0 = targets[i];
     }
-    if (dsv_target) require_state(self, dsv_target, dsv_state);
+    if (dsv_target && mixed_planes) {
+        // A whole-resource state it was in is dropped to COMMON first; then each plane moves to its own state.
+        for (auto it = pass.states.begin(); it != pass.states.end(); ++it)
+            if (it->first == dsv_target) {
+                transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), dsv_target, it->second, D3D12_RESOURCE_STATE_COMMON);
+                pass.states.erase(it);
+                break;
+            }
+        auto found = std::find_if(pass.mixed.begin(), pass.mixed.end(), [&](const x2w_dsv::Planes& p) { return p.resource == dsv_target; });
+        if (found == pass.mixed.end()) {
+            pass.mixed.push_back(x2w_dsv::planes_of(dsv_target));
+            found = pass.mixed.end() - 1;
+        }
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
+    } else if (dsv_target) {
+        require_state(self, dsv_target, dsv_state);
+    }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
     pass.bound_depth = dsv_target;
@@ -4370,7 +4433,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         // recorded either before this submission's user value or after it, as the desktop queue gets them.
         auto order = linear_queue_order(queue, false);
         // Pin the closed recording and its allocator through submission bookkeeping.
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         AcquireSRWLockExclusive(&allocator_lock);
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
@@ -4421,7 +4484,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         }
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
         order.release();
         check_device("CommandQueue execute", 35);
         return;
@@ -6301,9 +6364,9 @@ void drain_retired_resources()
             lazy_textures().erase(drop.wrapper);
         }
         if (drop.resource) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             texture_uploads().erase(drop.resource);
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             drop.resource->Release();
             const LONG64 total = InterlockedIncrement64(&retire_freed);
             if (total <= 8 || total % 1000 == 0) log("x2w-d3d12 retire: %lld desktop references dropped", total);
@@ -6590,9 +6653,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
         out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
         if (auto* real = static_cast<ID3D12Resource*>(r->own().real)) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             AcquireSRWLockShared(&target_lock);
             for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
             ReleaseSRWLockShared(&target_lock);
@@ -6807,9 +6870,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resou
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_texture_upload_probe(void* desktop_resource)
 {
     if (!desktop_resource) return FALSE;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     const bool cached = texture_uploads().count(static_cast<ID3D12Resource*>(desktop_resource)) != 0;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     return cached ? TRUE : FALSE;
 }
 
@@ -7323,12 +7386,12 @@ void draw_overlay(LONG frame, double seconds)
 void log_gpu_time(LONG frame, ULONGLONG now_ms)
 {
     static ULONGLONG last_ms;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     auto& probe = gpu_time_probe();
     probe.harvest(static_cast<std::uint64_t>(frame));
     const auto r = probe.stats.take(last_ms ? static_cast<double>(now_ms - last_ms) : 0);
     const unsigned skipped = probe.skipped, failed = probe.failed;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     last_ms = now_ms;
     log("x2w-gpu-time frame %ld: %llu frames, avg %.2f ms, max %.2f ms, busy %.0f ms of %.0f ms, GPU idle %.0f%% (stamps skipped %u, failed %u)", frame,
         static_cast<unsigned long long>(r.frames), r.avg_ms, r.max_ms, r.busy_ms, r.wall_ms, r.idle_share * 100.0, skipped, failed);
@@ -7654,10 +7717,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
     }
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
@@ -7680,12 +7743,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
-        log("x2w-render manifest lookups: file opens under draw_lock, first lookups %lld, retries %lld (must be 0); manifests read by the background thread %lld",
-            manifest_source().first_opens_under_lock(), manifest_source().retry_opens_under_lock(), manifest_source().background_reads());
+        log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+        log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
+            manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
+        log_key_use_census();
+        log_dispatch_phases();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
         if (now - last_key_report >= 60000) {
@@ -7733,6 +7799,14 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[400];
             if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[400];
+            if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[500];
+            if (dispatch_phase_line(line, sizeof(line))) log("%s", line);
         }
         {
             LARGE_INTEGER frequency;

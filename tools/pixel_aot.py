@@ -192,10 +192,22 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", d
         if markers == 1:
             return code
         mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
+        if decoder is not None and stage == 0:
+            # A word equal to s_endpgm can be a literal or half of another instruction. Count the decoded exits: one
+            # (the last instruction) is the ordinary program, two take the reachability check, more are not verified.
+            exits = [pc for pc, line in decoder(code) if line == "s_endpgm"]
+            if len(exits) == 1 and exits[0] + 4 == len(code):
+                return code
+            if len(exits) != 2:
+                raise ValueError("Unverified multi-exit program (%d end-program words, %d decoded exits)"
+                                 % (markers, len(exits)))
         if (stage in (0, 5) or mesh) and markers == 2 and (llvm is not None or decoder is not None):
             _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, decoder=decoder)
             return code
-        raise ValueError("Unverified multi-exit program")
+        if decoder is not None and stage == 0 and markers > 2:
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, decoder=decoder)   # two decoded exits among literals
+            return code
+        raise ValueError("Unverified multi-exit program (%d end-program words, stage %d)" % (markers, stage))
     # Older fixtures lack the section extent; preserve their unique-marker rule.
     if stage != 0:
         raise ValueError("Compute requires a bounded FSSM section")

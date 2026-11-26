@@ -36,7 +36,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input none (the default, also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input accept (the default): ONLY the A button (mask 4), 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -55,7 +55,7 @@ param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
-    [Alias("Input")] [string]$InputMode = "none",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [Alias("Input")] [string]$InputMode = "accept",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
     [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
@@ -209,6 +209,16 @@ $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-S
 # but one; the --watch pool beside the title keeps to 4 workers and leaves old refusals alone (gfx2hlsl.py watch_jobs),
 # and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+# The --watch pool beside the title leaves old refusals for the pass after the run, so a translator lift would reach
+# only the next run: every old refusal (a .fail an older build wrote) is translated again now, on every core, for at
+# most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
+# Never blocks the run.
+try {
+    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 } | Out-String).Trim()
+    if ($retryLine) { Write-Host "tester_run: $retryLine" }
+} catch {
+    Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"
+}
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process

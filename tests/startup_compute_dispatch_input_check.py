@@ -67,6 +67,8 @@ def main(consumer, dxc, adapter):
 
         got, result = dispatch(directory, consumer, env, 'dispatch')
         assert got == expected and not lines(result, 'refused'), result.stderr[-3000:]
+        used = lines(result, f'x2w-render key use compute {key:016x} first ')
+        assert len(used) == 1 and used[0].endswith(' uses 1') and ' last ' in used[0], (used, result.stderr[-3000:])
         layer = lines(result, 'x2w-d3d12 debug layer: ')
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
@@ -106,6 +108,18 @@ def main(consumer, dxc, adapter):
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert len(lines(result, 'comes from zeros for a null descriptor (16 bytes)')) == 1, result.stderr[-3000:]
         assert got != expected and got != untouched, 'a null input must read zeros, not the expected words'
+        # A manifest whose first input is out of order is not bound, and the log names the line: the pipeline key, the
+        # line number, the reason and the line itself.
+        manifest = cache / f'{key:016x}.txt'
+        original = manifest.read_text()
+        assert 'srv 0 ' in original, original
+        manifest.write_text(original.replace('srv 0 ', 'srv 3 ', 1))
+        got, result = dispatch(directory, consumer, env, 'dispatch')
+        manifest.write_text(original)
+        first = next(l for l in original.splitlines() if l.startswith('srv 0 ')).replace('srv 0 ', 'srv 3 ', 1)
+        rejected = lines(result, f'x2w-draw compute pipeline {key:016x} manifest line ')
+        assert got == untouched and len(rejected) == 1 and ' rejected (a resource that is not a raw table buffer' in rejected[0] \
+            and rejected[0].endswith(': ' + first[:120]), result.stderr[-3000:]
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')

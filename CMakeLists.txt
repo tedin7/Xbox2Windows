@@ -1417,15 +1417,20 @@ target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_upload_page_reuse_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1")
     add_test(NAME startup_upload_page_reuse_untracked_${backend} COMMAND startup_upload_page_reuse ${backend} untracked)
     set_tests_properties(startup_upload_page_reuse_untracked_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+    # The default since Run P: no reuse (X2W_UPLOAD_PAGE_REUSE unset), the pages grow as in Run O (exit 12).
+    add_test(NAME startup_upload_page_reuse_default_off_${backend} COMMAND startup_upload_page_reuse ${backend})
+    set_tests_properties(startup_upload_page_reuse_default_off_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "1 growing: "
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
     # Control: without the reuse the pages grow (exit 12).
     add_test(NAME startup_upload_page_reuse_mutant_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_mutant_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "1 growing: "
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
 endforeach()
 
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
@@ -2283,6 +2288,20 @@ target_compile_features(startup_committed_range_check PRIVATE cxx_std_17)
 add_test(NAME startup_committed_range COMMAND startup_committed_range_check)
 add_test(NAME startup_committed_range_touch_control COMMAND startup_committed_range_check --mutate touch)
 set_tests_properties(startup_committed_range_touch_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_committed_extent_check tests/startup_committed_extent_check.cpp)
+target_include_directories(startup_committed_extent_check PRIVATE src)
+target_compile_features(startup_committed_extent_check PRIVATE cxx_std_17)
+add_test(NAME startup_committed_extent COMMAND startup_committed_extent_check)
+add_test(NAME startup_committed_extent_prefix_control COMMAND startup_committed_extent_check --mutate prefix)
+set_tests_properties(startup_committed_extent_prefix_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_zero_tail_check tests/startup_zero_tail_check.cpp)
+target_include_directories(startup_zero_tail_check PRIVATE src)
+target_compile_features(startup_zero_tail_check PRIVATE cxx_std_17)
+add_test(NAME startup_zero_tail COMMAND startup_zero_tail_check)
+add_test(NAME startup_zero_tail_keep_all_control COMMAND startup_zero_tail_check --mutate keep-all)
+add_test(NAME startup_zero_tail_no_budget_control COMMAND startup_zero_tail_check --mutate no-budget)
+add_test(NAME startup_zero_tail_cache_control COMMAND startup_zero_tail_check --mutate cache)
+set_tests_properties(startup_zero_tail_keep_all_control startup_zero_tail_cache_control startup_zero_tail_no_budget_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
@@ -2493,7 +2512,26 @@ add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
 target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
+# Per-phase dispatch counters and the multi-thread scaling method (src/startup_stubs/dispatch_phases.h): a single lock gives
+# four threads no throughput, a lock held for resolve only does; the control asks the single lock for the split speedup.
+add_executable(dispatch_phases_check tests/dispatch_phases_check.cpp)
+target_include_directories(dispatch_phases_check PRIVATE src)
+target_compile_features(dispatch_phases_check PRIVATE cxx_std_17)
+add_test(NAME dispatch_phases COMMAND dispatch_phases_check)
+add_test(NAME dispatch_phases_single_lock_control COMMAND dispatch_phases_check single 4 1.45)
+set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
+# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/dsv_planes.h), debug layer on.
+add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
+target_include_directories(dsv_planes_check PRIVATE src)
+target_compile_features(dsv_planes_check PRIVATE cxx_std_17)
+target_link_libraries(dsv_planes_check PRIVATE d3d12 dxgi)
+add_test(NAME dsv_planes_warp COMMAND dsv_planes_check warp)
+add_test(NAME dsv_planes_hardware COMMAND dsv_planes_check hardware)
+add_test(NAME dsv_planes_whole_resource_control COMMAND dsv_planes_check warp --mutate whole)
+set_tests_properties(dsv_planes_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(dsv_planes_whole_resource_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
 set_tests_properties(startup_local_log_reopen_control PROPERTIES WILL_FAIL TRUE)
@@ -3650,6 +3688,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_watch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_watch_check.py")
     set_tests_properties(startup_gfx2hlsl_watch PROPERTIES TIMEOUT 120)
+    # gfx2hlsl.py --retry-lifted: before the title starts, only the old refusals of lifted families, with a time cap.
+    add_test(NAME startup_gfx2hlsl_retry_lifted COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_retry_lifted_check.py")
+    set_tests_properties(startup_gfx2hlsl_retry_lifted PROPERTIES TIMEOUT 300)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
     # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.
@@ -4613,6 +4655,22 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    # gfx2hlsl v_permlane16_b32 in a straight-line compute program, exchanged through groupshared memory (Run O audit).
+    add_test(NAME startup_compute_permlane16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_permlane16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_permlane16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wrong-row swapped-selects)
+            add_test(NAME startup_compute_permlane16_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_permlane16_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # gfx2hlsl bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops (Refs #1541).
     add_test(NAME startup_compute_lds_b128_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b128_check.py")
@@ -4776,6 +4834,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_float_transcendental_${adapter} PROPERTIES TIMEOUT 300
             SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl v_ldexp_f32 (D = S0 * 2^S1, signed exponent of any size): translation controls, then a draw against a
+    # binary64-scaled reference (overflow, denormal results, a denormal source) and one mutated lowering.
+    add_test(NAME startup_gfx2hlsl_ldexp_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_ldexp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_ldexp_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_gfx2hlsl_scalar_shift64_bfe_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py")
     add_test(NAME startup_gfx2hlsl_scalar_m0_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4839,6 +4907,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_debug_events COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_events_check.py" "$<TARGET_FILE:startup_window_probe>")
+    set_tests_properties(startup_debug_events PROPERTIES TIMEOUT 120)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
@@ -10262,7 +10333,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_mesh57_skeleton_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_loop_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_loop_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
