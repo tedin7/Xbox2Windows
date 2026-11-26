@@ -16751,15 +16751,6 @@ This shows that these shaders produce the same bits on two Vulkan drivers for th
 ```bash
 python3 -B tests/pixel_aot_check.py draw-core-vulkan /path/to/dxc Intel
 python3 -B tests/vk_offscreen.py
-
-
-## Startup single root constants
-
-Command-list slot 38 (`SetGraphicsRoot32BitConstant`) stores one root constant word for a translated shader. The cases are in `tests/startup_mrt_check.py`, which sets the slot through `draw_root_constant` in `tests/startup_root_cbv.cpp` and reads the word back through a rewritten `rootconst` manifest entry: set, overwrite, offset 3 read at offset 3 and at offset 0, preserving offset 0 written through slot 40 while writing offset 3 through slot 38, the corner (15, 7), parameter 16, parameter 0xffffffff, offset 8 and offset 0xffffffff dropped, the same root signature again (word kept), a switched one (word cleared) and no call. The fixture is synthetic only and the slot number is derived from the desktop order plus the console shift, not seen in a title log. Details are in [startup-runtime.md](startup-runtime.md#single-root-constants).
-
-```powershell
-cmake --build --preset dev --target startup_stream_consumer
-ctest --preset dev --no-tests=error -R "^startup_mrt_" -V
 ```
 
 ## SAL (/6) lifting in cpu_switch_aot

@@ -721,18 +721,6 @@ These slots have not been seen in a title log yet. Slot 16 is described in [Comm
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
 resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
 
-## Single root constants
-
-Command-list slot 38 (desktop `SetGraphicsRoot32BitConstant` plus four) takes `(parameter, value, offset)` and stores one
-word in the same per-list table as slot 40, which a translated shader reads through a `rootconst` manifest entry. A parameter
-of 16 or more or an offset of 8 or more has no storage and the call is dropped without a log line. Nothing is forwarded
-to the desktop list. Setting the graphics root signature to a different signature clears every stored constant, as it
-clears the root addresses; setting the same one again keeps them (this also applies to slot 40). The slot number is derived
-from the desktop order and the console shift, not yet seen in a title log. The
-`startup_mrt_{fxc,dxc}_{warp,hardware}` tests drive it with eleven cases: set, overwrite, an offset that is and is not the one
-the shader reads, preserving an offset written through slot 40 while writing another through slot 38, the last stored slot
-(15, 7), four out-of-range calls, the same root signature again, a switched one and no call.
-
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
