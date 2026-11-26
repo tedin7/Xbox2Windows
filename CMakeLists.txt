@@ -4608,6 +4608,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_engine_first_lane_sparse_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # The engine compute fixtures dispatched on a device (join, first-lane, load cases and their controls).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_engine_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_engine_compute_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_engine_compute_dispatch_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_engine_wavesync_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_engine_wavesync_check.py")
     foreach(adapter IN ITEMS warp hardware)
