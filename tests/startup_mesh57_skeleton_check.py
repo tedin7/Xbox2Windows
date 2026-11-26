@@ -285,6 +285,35 @@ NEST_REFUSALS = (
     ('inner branch out of the block', [w if w != 'bf850001' else 'bf850003' for w in NEST_SCC_MESH]),
 )
 
+# A nested if inside the wave-load block, the shape of most real slot 57 bodies: a per-lane compare into VCC, s_and_saveexec_b64,
+# s_cbranch_execz over a body of lane writes, then the restore s_or_b64 exec, exec, <saved>. Lanes with a thread id below 3 take
+# the body (v7 = 1.0), the others keep v7 = 0; every thread holds its own EXEC bit and the saved mask is one bit per thread.
+NEST_EXECZ_ASM = """s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 8
+s_mov_b32 s42, 6
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cbranch_execz 8
+s_buffer_load_dword s43, s[16:19], s41 offset:0x1e0
+s_waitcnt lgkmcnt(0)
+v_cmp_gt_u32_e32 vcc, 3, v0
+s_and_saveexec_b64 s[44:45], vcc
+s_cbranch_execz 1
+v_mov_b32 v7, 1.0
+s_or_b64 exec, exec, s[44:45]
+s_mov_b64 exec, -1"""
+NEST_EXECZ_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_EXECZ_ACCEPTED = (('nested if (compare, saveexec, execz, restore) in the wave block', NEST_EXECZ_MESH),)
+# Same block with one thing wrong each; every one is refused (assembled with llvm-mc from the same text with the change).
+NEST_EXECZ_REFUSALS = (
+    ('nested restore of another register pair', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2e7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('a scalar write in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'bea8032b', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('a nested saveexec without its compare', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', 'bf800000', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('EXEC written in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'befe04c1', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+)
+
 # Two scalar buffer loads (the second at an offset computed in the block), a dead table load, a dead per-lane VCC compare and a scalar
 # write between the EXEC reset and the compare. The second load reads the same word as WAVE_LOAD_ASM
 # (s45 + 0x1dc = s41 + 0x1e0); the first reads the next word and is dead after the join.
@@ -654,9 +683,9 @@ def controls():
         live = masked_vertex_red(MASKED_DEAD_SCALAR.replace('befe04c1', 'befe04c1 7e100232'))
         expect('scalar write in a skipped block read after the join', refusal_head(request(tmp, live)[1]),
                'unsupported: ' + WAVE_LOAD_REFUSAL)
-        for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS + NEST_REFUSALS:
+        for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS + NEST_REFUSALS + NEST_EXECZ_REFUSALS:
             expect(what, refusal_head(request(tmp, mesh)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
-        for what, mesh in WAVE_LOAD_ACCEPTED + NEST_ACCEPTED:
+        for what, mesh in WAVE_LOAD_ACCEPTED + NEST_ACCEPTED + NEST_EXECZ_ACCEPTED:
             expect(what + ' translates', request(tmp, mesh)[1], 'ok')
         for what, mesh, reason in WAVE_LOAD_OTHER_REFUSALS + (NEST_LOOP, NEST_MASK):
             expect(what, request(tmp, mesh)[1], 'unsupported: ' + reason)
@@ -765,6 +794,9 @@ def binary(mc):
     nest = mesh.replace('s_mov_b32 s13, s8', NEST_SCC_ASM + '\ns_mov_b32 s13, s8')
     nest = nest.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('nested wave block words match llvm-mc', assemble(mc, nest), NEST_SCC_MESH)
+    nest_execz = mesh.replace('s_mov_b32 s13, s8', NEST_EXECZ_ASM + '\ns_mov_b32 s13, s8')
+    nest_execz = nest_execz.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+    expect('nested if wave block words match llvm-mc', assemble(mc, nest_execz), NEST_EXECZ_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -827,7 +859,7 @@ def rasterise(points, colours, indices, verts, prims):
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
-                   inner_mutant=None):
+                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -849,6 +881,7 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
         struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
 
     bound, old = 6, 64
+    green = green or (lambda tid: 255 if tid < bound else 0)   # the green a thread ends with (v7 exported)
     wave_red = {}
     reads = []
     for first in range(0, 128, 64):
@@ -866,7 +899,7 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
             for tid in tri:
                 first, slot = tid & ~63, tid & 15
                 red = wave_red[first ^ (64 if swap else 0)]
-                rendered[slot] = (red, 255 if tid < bound else 0, *colours[slot][2:])
+                rendered[slot] = (red, green(tid), *colours[slot][2:])
         return rasterise(points, rendered, triangles, 128, len(triangles))
 
     correct, swapped = reference(False), reference(True)
@@ -882,17 +915,36 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
         cases.append(('swapped %s selection' % label, shader, swapped, 1, different))
     if dxc:
         # Lanes outside EXEC in the mixed wave keep the old red when the block is skipped per lane.
-        per_lane = reference_per_lane(points, colours, triangles, bound, old, wave_red)
-        lanes = sum(a != b for a, b in zip(correct, per_lane))
         source = base.with_suffix('.ms57.hlsl').read_text()
         expect('one wave predicate on the block branch', source.count('pc = (!wave_any) ?'), 1)
-        mutated = Path(directory) / 'per-lane.hlsl'
-        mutated.write_text(source.replace('pc = (!wave_any) ?', 'pc = ((exec & 1) == 0) ?'))
-        mutant = Path(directory) / 'per-lane.cso'
-        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True, capture_output=True)
-        if lanes:   # a word that leaves the old red in place cannot tell the per-lane block from the wave block
-            cases += [('per-lane %s against the wave image' % label, mutant, correct, 1, lanes),
-                      ('per-lane %s against its own image' % label, mutant, per_lane, 0, 0)]
+        if wave_mutants:
+            per_lane = reference_per_lane(points, colours, triangles, bound, old, wave_red)
+            lanes = sum(a != b for a, b in zip(correct, per_lane))
+            mutated = Path(directory) / 'per-lane.hlsl'
+            mutated.write_text(source.replace('pc = (!wave_any) ?', 'pc = ((exec & 1) == 0) ?'))
+            mutant = Path(directory) / 'per-lane.cso'
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True, capture_output=True)
+            if lanes:   # a word that leaves the old red in place cannot tell the per-lane block from the wave block
+                cases += [('per-lane %s against the wave image' % label, mutant, correct, 1, lanes),
+                          ('per-lane %s against its own image' % label, mutant, per_lane, 0, 0)]
+        if nest_mutant:
+            # The nested narrowing is dropped: every lane of the block takes the body.
+            drop, keep, wrong_green = nest_mutant
+            expect('one nested narrowing', source.count(drop), 1)
+            nested_hlsl = Path(directory) / 'nested.hlsl'
+            nested_hlsl.write_text(source.replace(drop, keep))
+            nested_cso = Path(directory) / 'nested.cso'
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', nested_cso, nested_hlsl], check=True, capture_output=True)
+            rendered = list(colours)
+            for tri in triangles:
+                for tid in tri:
+                    first, slot = tid & ~63, tid & 15
+                    rendered[slot] = (wave_red[first], wrong_green(tid), *colours[slot][2:])
+            wrong_image = rasterise(points, rendered, triangles, 128, len(triangles))
+            dropped = sum(a != b for a, b in zip(correct, wrong_image))
+            expect('the dropped narrowing changes covered pixels', dropped > 0, True)
+            cases += [('dropped nested narrowing %s against the correct image' % label, nested_cso, correct, 1, dropped),
+                      ('dropped nested narrowing %s against its own image' % label, nested_cso, wrong_image, 0, 0)]
         if inner_mutant:
             # The inner branch is dropped: every wave that runs the block takes the loaded word.
             expect('one inner SCC branch', source.count('pc = (scc) ? 3 : 2;'), 1)
@@ -1058,6 +1110,13 @@ def draw(dxc, renderer, adapter, publisher=None):
                                         word=word, rule=nest, inner_mutant=lambda value: round(value * 255))
                 if status:
                     return status
+            # The nested if: threads below 3 run the body (v7 = 1.0), threads 3..5 of the same block keep v7 = 0.
+            nested_green = lambda tid: 255 if tid < 3 else 0
+            status = draw_wave_load(tmp, renderer, adapter, NEST_EXECZ_MESH, 'nested if block', dxc, green=nested_green,
+                                    wave_mutants=False,
+                                    nest_mutant=('exec = (exec & vcc) & 1;', 'exec = exec & 1;', lambda tid: 255 if tid < 6 else 0))
+            if status:
+                return status
             return 0
     return 0
 

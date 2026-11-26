@@ -1922,6 +1922,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
+    nested_saves, nested_restores = {}, {}  # nested if of a wave block: save index -> restore index, and back
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
     def live_at_join(reg, join):
@@ -1976,7 +1977,28 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
-                    scalar = [i for i in range(source + 1, target) if i not in inner and not (no_effect(i) or lane_only(i))]
+                    # A nested if of the block: s_and_saveexec_b64 sK:sK+1, vcc / s_cbranch_execz over a body / the restore
+                    # s_or_b64 exec, exec, sK:sK+1. Every thread holds its own EXEC bit and the saved mask is one bit per
+                    # thread, so narrowing and restoring is per lane in the one-lane model; the per-lane skip of the
+                    # branch is the generic execz rule, checked on its own edge below. The save, the branch and the
+                    # restore are not scalar instructions the wave block would run once per wave.
+                    nested = set()
+                    for i in range(source + 2, target):
+                        if ins[i][2] != 's_cbranch_execz' or i not in edges or not i < edges[i] < target:
+                            continue
+                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[i - 1][3])
+                        done = ins[edges[i]][3]
+                        if (not save or int(save[2]) != int(save[1]) + 1 or done != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
+                                or not ins[i - 2][2].startswith('v_cmp_')
+                                or any(writes_exec(ins[k][2], parse(ins[k][3])[1]) or re.search(r'\bs\[?%s\b|\bs%s\b' % (save[1], save[2]), ins[k][3])
+                                       for k in range(i + 1, edges[i]))
+                                or any(live_at_join(reg, edges[i] + 1) for reg in ('s' + save[1], 's' + save[2]))):
+                            continue
+                        nested |= {i - 1, i, edges[i]}
+                        nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
+                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    scalar = [i for i in range(source + 1, target)
+                              if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
                     # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
                     # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
@@ -2124,7 +2146,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         base_name = re.sub(r'_e(32|64)$', '', name)
         complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
                       and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
-        if name != 's_and_saveexec_b64' and not complement and scalar_registers(asm) & saved_masks:
+        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores
+                and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
             if scc_stale and reads_scc(name, asm):
@@ -2194,6 +2217,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             mask = None
             stale |= pending
             pending.clear()
+        elif index in nested_saves and mask == 'wave_load':
+            mask, scc_stale = ('nest', index), True
+        elif index in nested_restores and mask == ('nest', nested_restores[index]):
+            mask = 'wave_load'
         elif (name == 's_and_saveexec_b64' and mask is None and index > 0 and index not in targets
               and re.fullmatch(r's_and_saveexec_b64 s\[\d+:\d+\], vcc', asm)
               and ins[index - 1][2].startswith('v_cmp_')
