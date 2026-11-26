@@ -11053,7 +11053,8 @@ class Pipeline:
         if getattr(self, 'uses_ldexp', False):
             out.extend((
                 'float x2w_ldexp(float x, int n) {',
-                '    float y = x;',
+                '    // precise: the steps must not be reassociated (2^-102 * 2^-102 folds to zero).',
+                '    precise float y = x;',
                 '    if (n > 127) {',
                 '        y *= asfloat(0x7f000000u); n -= 127;',
                 '        if (n > 127) { y *= asfloat(0x7f000000u); n -= 127; if (n > 127) n = 127; }',
@@ -11061,7 +11062,8 @@ class Pipeline:
                 '        y *= asfloat(0x0c800000u); n += 102;',
                 '        if (n < -126) { y *= asfloat(0x0c800000u); n += 102; if (n < -126) n = -126; }',
                 '    }',
-                '    uint bits = asuint(y * asfloat(uint(0x7f + n) << 23));',
+                '    precise float z = y * asfloat(uint(0x7f + n) << 23);',
+                '    uint bits = asuint(z);',
                 '    // A zero result keeps the sign of the source, as the product does; decided on the bits because',
                 '    // some compilers fold a float zero without its sign.',
                 '    return asfloat((bits & 0x7fffffffu) == 0u ? (asuint(x) & 0x80000000u) : bits);',
