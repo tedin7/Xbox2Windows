@@ -1242,6 +1242,14 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
     return true;
 }
 
+// X2W_TEST_SNAPSHOT_PLACED_BUFFERS=1 (fixtures only): constants in a placed buffer that a recorded copy wrote are read from
+// title memory like any other range, which is the behaviour the placed-buffer path replaces.
+bool snapshot_placed_buffers_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_SNAPSHOT_PLACED_BUFFERS", nullptr, 0) != 0;
+    return on;
+}
+
 // Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
 // address between two draws of one frame (a dynamic constant buffer, a reused vertex or index range), so an
 // entry keeps the bytes it was made from and is reused only while the title's memory still matches them. The
@@ -2825,6 +2833,24 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
+        }
+        // A range in a placed buffer that does not alias title memory and that a recorded copy has written: the title's memory
+        // does not hold those bytes, the buffer's own desktop copy does, so bind that instead of a snapshot of the memory.
+        if (!placed.alias && address && bytes && bytes % 4 == 0 && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 &&
+            !snapshot_placed_buffers_mutant()) {
+            const auto holder = placed_buffer_range(self->own().list_device, address, bytes);
+            auto* native = holder.owner && !holder.alias && !holder.reject ? static_cast<ID3D12Resource*>(holder.owner->own().real) : nullptr;
+            const u64 inside = native ? address - reinterpret_cast<u64>(holder.owner->own().title_memory) : 0;
+            if (native && InterlockedCompareExchange(&holder.owner->own().refs, 0, 0) && placed_gpu_written(const_cast<Wrapper*>(holder.owner), inside, bytes)) {
+                require_state(self, native, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                buffer_view(dest, native, inside, bytes);
+                static LONG bound_from_copy;
+                if (first_calls(bound_from_copy, 8))
+                    log("x2w-draw   %016llx srv %u constants bound from the placed buffer's own copy (a recorded copy wrote it): address 0x%llx, %zu bytes",
+                        tr->key, i, address, bytes);
+                count_buffer(true);
+                continue;
+            }
         }
         ID3D12Resource* chunk = nullptr;
         const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
