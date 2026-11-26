@@ -12134,6 +12134,11 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    if sys.argv[1] == '--retry-lifted':
+        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
+        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
+        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
@@ -12201,6 +12206,86 @@ def raise_site(error):
         if not os.path.normcase(os.path.abspath(frame.filename)).startswith(tuple(roots)):
             return frame
     return frames[-1] if frames else None
+
+
+# Refusal families this round's translator lifts or narrows, by the reason an older build wrote (the first line of its
+# .fail). In the run the --watch pool leaves old refusals alone and the pass after the run retries them, so a lift
+# would reach only the next run: tester_run retries the old refusals of these families before the title starts
+# (--retry-lifted). Every lift adds the reason it removes here. A family this build does not lift is only refused
+# again, within PRE_RUN_RETRY_SECONDS.
+LIFTED_REASONS = (
+    ('rw-buffer', r'used for a load and a store'),
+    ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
+    ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
+    ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
+    ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
+    ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
+)
+PRE_RUN_RETRY_SECONDS = 180.0
+
+
+def lifted_family(reason, families=LIFTED_REASONS):
+    """The LIFTED_REASONS family whose pattern the refusal text contains, or None."""
+    return next((name for name, pattern in families if re.search(pattern, reason)), None)
+
+
+def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
+    """Keys of the requests an older build refused (a .fail older than since_translator, still pending) for a reason
+    of a lifted family, oldest request first."""
+    keys = []
+    for key in pending_keys(out_dir, False, since_translator):
+        fail = os.path.join(out_dir, '%016x.fail' % key)
+        try:
+            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
+                continue
+            with open(fail, encoding='utf-8', errors='replace') as handle:
+                reason = handle.readline()
+        except OSError:
+            continue
+        if lifted_family(reason, families):
+            keys.append(key)
+    return keys
+
+
+class RetryReport:
+    def __init__(self, keys, ok, refused, left, seconds):
+        self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
+
+    def line(self):
+        """tester_run's log line: requests retried, translated, still refused, left for the pass after the run."""
+        left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
+        return 'pre-run retry: %d keys, ok %d, still refused %d%s, %.0f s' % (
+            self.keys, self.ok, self.refused, left, self.seconds)
+
+
+def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic):
+    """Translate again, on every core, the old refusals of the lifted families (lifted_failures) before the title starts.
+    No new request is started after `seconds`; what is left keeps its .fail for the pass after the run."""
+    start = clock()
+    keys = lifted_failures(out_dir, translator_stamp(), families)
+    results = {}
+    if keys:
+        jobs = max(1, min(jobs or translation_jobs(), len(keys)))
+        if jobs == 1:
+            for key in keys:
+                if clock() - start >= seconds:
+                    break
+                results[key] = translate_one(out_dir, key)
+        else:
+            from concurrent.futures import FIRST_COMPLETED, wait
+            queue, running = list(keys), {}
+            with new_pool(jobs) as pool:
+                while queue or running:
+                    while queue and len(running) < jobs and clock() - start < seconds:
+                        key = queue.pop(0)
+                        running[pool.submit(translate_one, out_dir, key)] = key
+                    if not running:
+                        break
+                    done, _ = wait(running, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        results[running.pop(future)] = future.result()
+    ok = sum(1 for result in results.values() if result == 'ok')
+    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start)
 
 
 def translate_one(out_dir, key):
