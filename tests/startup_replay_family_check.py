@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 
-from startup_replay_check import chunks, pictures, run
+from startup_replay_check import CALL, chunks, pictures, run
 
 
 def scrub(env):
@@ -28,6 +28,20 @@ def scrub(env):
     for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_DIR", "X2W_PRESENT_PICTURES"):
         env.pop(name, None)
     return env
+
+
+def call_list(recording, limit=60):
+    """The first recorded calls as 'seq kind.slot arg0 arg1 arg2' lines, for a failure message (what the player met)."""
+    out = []
+    data = recording.read_bytes()
+    for tag, header, _hb, _payload, _size in chunks(data):
+        if tag != b"CALL":
+            continue
+        seq, _thread, kind, slot, obj, *rest = CALL.unpack_from(data, header)
+        out.append("%d k%d.s%d obj %x a %s ret %x" % (seq, kind, slot, obj, " ".join("%x" % a for a in rest[:4]), rest[7]))
+        if len(out) >= limit:
+            break
+    return "\n".join(out)
 
 
 def main(argv):
@@ -69,7 +83,8 @@ def main(argv):
         code, text, summary, replayed = replay(recording, directory / "replayed")
         log = directory / "replayed" / "stderr.txt"
         tail = log.read_text(errors="replace")[-2500:] if log.exists() else ""
-        assert code == 0, "GAP x2w_replay exit %d for %s\n%s\n%s" % (code, name, text[-1500:], tail)
+        assert code == 0, "GAP x2w_replay exit %d for %s\n%s\n%s\nrecorded calls:\n%s" % (
+            code, name, text[-800:], tail[-1200:], call_list(recording))
         assert summary.get("unknown_object") == 0 and summary.get("missing_blob") == 0 and summary.get("fence_timeouts") == 0, \
             "GAP %s: %s\n%s" % (name, summary, tail)
         assert summary.get("calls") == calls and summary.get("played") == calls, \
