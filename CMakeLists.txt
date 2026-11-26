@@ -4946,7 +4946,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
         # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
-        foreach(gate IN ITEMS gate gate-ring)
+        foreach(gate IN ITEMS gate gate-ring gate-ring-reuse)
             string(REPLACE "-" "_" gate_name "${gate}")
             add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
