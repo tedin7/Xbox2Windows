@@ -8299,6 +8299,14 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         ID3D12Debug* layer = nullptr;
         const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&layer));
         if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
+        char gpu_validation[4]{};  // X2W_D3D12_GBV=1: GPU-based validation of states and descriptors (slow, test runs only)
+        ID3D12Debug1* layer1 = nullptr;
+        if (SUCCEEDED(debug_hr) && GetEnvironmentVariableA("X2W_D3D12_GBV", gpu_validation, sizeof(gpu_validation)) &&
+            gpu_validation[0] == '1' && SUCCEEDED(layer->QueryInterface(IID_PPV_ARGS(&layer1)))) {
+            layer1->SetEnableGPUBasedValidation(TRUE);
+            layer1->Release();
+            log("x2w-d3d12 GPU-based validation enabled");
+        }
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
     }

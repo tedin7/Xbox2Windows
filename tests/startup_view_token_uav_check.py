@@ -41,7 +41,7 @@ def main(consumer, dxc):
             (True, srv_mode, expected, 2),
             (True, uav_mode, expected, 2),
         ):
-            run_env = dict(env, X2W_VIEW_TOKEN_UAV='1') if enabled else env
+            run_env = dict(env, X2W_VIEW_TOKEN_UAV='1', X2W_D3D12_GBV='1') if enabled else env
             got, result = dispatch(directory, consumer, run_env, mode)
             context = f'{mode}, switch={int(enabled)}\n{result.stderr[-3000:]}'
             mismatch = next((i for i, (a, b) in enumerate(zip(got, reference)) if a != b), None)
@@ -53,6 +53,8 @@ def main(consumer, dxc):
                 assert refusals[0].endswith('an output is a view token, not a buffer descriptor'), context
                 if mode == uav_mode:
                     assert refusals[1].endswith('an input view token is not a buffer view of a desktop resource'), context
+            if enabled:
+                assert lines(result, 'GPU-based validation enabled'), context
             errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
             assert not errors, errors
         print(f'WARP: {C.WORDS} words match for SRV and slot-19 reads, including switch-off controls')
