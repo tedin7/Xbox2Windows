@@ -47,6 +47,24 @@ def pack_offset(x, y):
     return (x & 0x3f) | ((y & 0x3f) << 8)
 
 
+def shader_x(mask, movs, nsa=False, prefix=PREFIX_O):
+    """image_gather4_lz_o after `movs`; nsa lists the coordinate registers v1 and v9 in the non-sequential form."""
+    word = struct.pack('<II', 0xf15c0008 | (mask << 8) | (2 if nsa else 0), 0x00c40400)
+    return prefix + movs + word + (bytes.fromhex('01090000') if nsa else b'') + SUFFIX_O
+
+
+MOV_V1, MOV_V2, MOV_V8, MOV_V9 = (bytes.fromhex(x) for x in ('f002027e', 'f002047e', '8002107e', 'f002127e'))
+WAIT = bytes.fromhex('7fc08cbf')
+
+
+def literal_move(value):
+    return bytes.fromhex('ff02007e') + struct.pack('<I', value)
+
+
+def add_literal(value):  # v_add_nc_u32 v0, <literal>, v0
+    return bytes.fromhex('ff00004a') + struct.pack('<I', value)
+
+
 def shader_o(mask, packed, prefix=PREFIX_O, op=0xf15c0008):
     movs = bytes.fromhex('ff02007e') + struct.pack('<I', packed) + bytes.fromhex('f002027ef002047e8002107e7fc08cbf')
     return prefix + movs + struct.pack('<II', op | (mask << 8), 0x00c40400) + SUFFIX_O
@@ -127,15 +145,19 @@ def controls_o(llvm_mc):
         assert f'r0.Gather{name}(q0, float2(F(v1), F(v2)), int2(1, -2))' in pipe.hlsl_cs()
         assert pipe.manifest().splitlines()[-3:] == [
             'srv 0 tex2d table 1 0', 'uav 0 table 1 32', 'smp 0 0x12 0x0 0x4500000 0x0']
-    refused('outside the HLSL gather range', lambda: pipeline(shader_o(2, pack_offset(8, 0))))
-    refused('outside the HLSL gather range', lambda: pipeline(shader_o(2, pack_offset(0, -9))))
-    refused('bits outside the X and Y fields', lambda: pipeline(shader_o(2, 0x10000)))
     refused('one-hot dmask', lambda: pipeline(shader_o(3, 0)))
-    # The offset register must be exactly one literal move: no move, or a second write, is refused.
-    no_move = shader_o(2, 0).replace(bytes.fromhex('ff02007e00000000'), b'')
-    refused('never written', lambda: pipeline(no_move))
-    twice = shader_o(2, 0).replace(bytes.fromhex('f002027e'), bytes.fromhex('f002027e8002007e'))
-    refused('not one literal move', lambda: pipeline(twice))
+    # Offsets the literal Gather cannot take are emulated with Load: out of range, set outside X and Y,
+    # not written by one literal move, or written twice.
+    for text, code in (
+            ('out of range', shader_o(2, pack_offset(8, 0))),
+            ('bits outside X and Y', shader_o(2, 0x10000)),
+            ('never written', shader_o(2, 0).replace(bytes.fromhex('ff02007e00000000'), b'')),
+            ('written twice', shader_x(2, literal_move(0x100) + add_literal(0x3) + MOV_V1 + MOV_V2 + MOV_V8 + WAIT))):
+        source = pipeline(code).hlsl_cs()
+        assert 'GetDimensions' in source and '.Gather' not in source, text
+    # Non-sequential address: the offset and both coordinates are named, in order.
+    source = pipeline(shader_x(2, literal_move(pack_offset(1, -2)) + MOV_V1 + MOV_V9 + MOV_V8 + WAIT, True)).hlsl_cs()
+    assert 'GatherGreen(q0, float2(F(v1), F(v9)), int2(1, -2))' in source, source
     print('image_gather4_lz_o offset forms and refusals passed')
 
 
@@ -158,13 +180,37 @@ def dispatch_o(directory, compiler, renderer, adapter):
             return 77
         assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout
 
+    movs = MOV_V1 + MOV_V2 + MOV_V8 + WAIT
+    for level, channel, ox, oy, code in (
+            # Out of the literal range, still one literal move.
+            (0, 1, 9, -5, shader_x(2, literal_move(pack_offset(9, -5)) + movs)),
+            (0, 0, -12, 10, shader_x(1, literal_move(pack_offset(-12, 10)) + movs)),
+            # Computed at run time: written twice (0x100 + 0x203 = X 3, Y 3).
+            (0, 2, 3, 3, shader_x(4, literal_move(0x100) + add_literal(0x203) + movs)),
+            (1, 3, -2, 1, shader_x(8, literal_move(pack_offset(-3, 1)) + add_literal(1) + movs)),
+            # Non-sequential address [v0, v1, v9]; v2 is left unset, so a contiguous read finds v = 0.
+            (0, 1, 1, -2, shader_x(2, literal_move(pack_offset(1, -2)) + MOV_V1 + MOV_V9 + MOV_V8 + WAIT, True))):
+        result = run_case(directory, compiler, renderer, adapter, f'o_dyn_{level}_{channel}_{ox}_{oy}',
+                          pipeline(code).hlsl_cs(), reference_o(level, channel, ox, oy), level)
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout, (ox, oy)
+
     want = reference_o(0, 1, 1, -2)
     source = pipeline(shader_o(2, pack_offset(1, -2))).hlsl_cs()
+    emulated = pipeline(shader_x(2, literal_move(0x100) + add_literal(pack_offset(1, -2) - 0x100) + movs)).hlsl_cs()
+    assert 'GetDimensions' in emulated
     for name, text, actual in (
         ('o_dropped_offset', source.replace('int2(1, -2)', 'int2(0, 0)'), reference_o(0, 1, 0, 0)),
         ('o_swapped_axes', source.replace('int2(1, -2)', 'int2(-2, 1)'), reference_o(0, 1, -2, 1)),
         ('o_wrong_sign', source.replace('int2(1, -2)', 'int2(-1, 2)'), reference_o(0, 1, -1, 2)),
+        ('o_emulated_no_offset', emulated.replace('+ go;', ';'), reference_o(0, 1, 0, 0)),
+        ('o_emulated_swapped_rows', emulated.replace('gb + int2(0, 1)', 'gb + int2(0, 0)', 1).replace(
+            'clamp(gb, 0, gs - 1)', 'clamp(gb + int2(0, 1), 0, gs - 1)'), None),
     ):
+        if actual is None:
+            actual = want.copy()
+            actual[0], actual[3] = want[3], want[0]
         result = run_case(directory, compiler, renderer, adapter, name, text, want, 0)
         mismatches = sum(a != b for a, b in zip(want, actual))
         assert mismatches and result.returncode == 1 and first_mismatch(want, actual) in result.stderr, name

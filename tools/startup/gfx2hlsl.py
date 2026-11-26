@@ -7547,7 +7547,7 @@ class Stage:
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
@@ -7562,8 +7562,17 @@ class Stage:
         dst, addr, sampler = (reg_range(ops[i]) for i in (0, 1, 3))
         if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
             raise Unsupported('%s requires four destination registers' % name)
-        if not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
+        if regs_out is not None and ops[1].startswith('['):
+            # Non-sequential address: each registers is named, in address order.
+            listed = [reg_range(c.strip()) for c in ops[1][1:-1].split(',')]
+            if (len(listed) != addr_count or not all(r and r[0] == 'v' and r[1] == r[2] and r[2] <= 255 for r in listed)):
+                raise Unsupported('%s requires %s' % (name, addr_label))
+            addr = ('v', listed[0][1], listed[-1][1])
+            regs_out.extend(r[1] for r in listed)
+        elif not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
             raise Unsupported('%s requires %s' % (name, addr_label))
+        elif regs_out is not None:
+            regs_out.extend(range(addr[1], addr[2] + 1))
         words = self.const_words(ops[3]) if sampler and sampler[0] == 's' and sampler[2] - sampler[1] == 3 else None
         if words is None:
             raise Unsupported('%s requires a constant sampler' % name)
@@ -7618,25 +7627,48 @@ class Stage:
         """image_gather4_lz_o: image_gather4_lz with a texel offset packed in the first address register.
 
         RDNA 2 MIMG address order for the _o forms is offset, then the coordinates; the offset register holds
-        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). HLSL's Gather takes
-        the offset as a literal in -8..7, so the register must be one literal move and both fields in range.
+        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). The three address
+        registers may be contiguous or the non-sequential (NSA) list `[vA, vB, vC]`.
+        A literal offset in -8..7 uses HLSL's Gather with a literal offset. Any other offset (a value computed
+        at run time, or out of that range) is emulated: the gather footprint of a bilinear fetch at mip zero is
+        the 2x2 texels from floor(uv * size - 0.5), moved by the offset and clamped into the image (the
+        sampler is validated as normalized clamp), read with Load in the gather order x, y, z, w =
+        (0,1), (1,1), (1,0), (0,0). The emulation rounds the footprint in float, not in the sampler's fixed
+        point, so a coordinate within 2^-8 of a texel centre can pick the neighbouring footprint.
         """
         name = 'image_gather4_lz_o'
-        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
-            name, ops, mods, 3, 'three contiguous address registers', mip_preclamp=True)
-        packed = self.constant_vgpr_word(addr[1], name)
-        if packed & ~0x3f3f:
-            raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
-        fields = []
-        for shift in (0, 8):
-            field = (packed >> shift) & 0x3f
-            field -= 64 if field & 0x20 else 0
-            if not -8 <= field <= 7:
-                raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
-            fields.append(field)
+        regs = []
+        dst, addr, words, (channel_name, channel_index), tex = self.gather_2d_setup(
+            name, ops, mods, 3, 'three address registers', mip_preclamp=True, regs_out=regs)
         smp = self.pipe.sampler(tuple(words))
-        u, v = (self.f('v%d' % i) for i in (addr[1] + 1, addr[1] + 2))
-        self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
+        u, v = (self.f('v%d' % i) for i in regs[1:])
+        fields = None
+        try:
+            packed = self.constant_vgpr_word(regs[0], name)
+            if packed & ~0x3f3f:
+                raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
+            fields = []
+            for shift in (0, 8):
+                field = (packed >> shift) & 0x3f
+                field -= 64 if field & 0x20 else 0
+                if not -8 <= field <= 7:
+                    raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
+                fields.append(field)
+        except Unsupported:
+            fields = None
+        if fields is not None:
+            self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
+        else:
+            off = self.u('v%d' % regs[0])
+            self.emit(('{ uint gw, gh; %s.GetDimensions(gw, gh); int2 gs = int2(gw, gh); '
+                       'int2 go = int2(asint((%s) << 26u) >> 26, asint((%s) << 18u) >> 26); '
+                       'int2 gb = int2(floor(float2(%s, %s) * float2(gs) - 0.5)) + go; '
+                       't = float4(%s.Load(int3(clamp(gb + int2(0, 1), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb + int2(1, 1), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb + int2(1, 0), 0, gs - 1), 0)).%s, '
+                       '%s.Load(int3(clamp(gb, 0, gs - 1), 0)).%s); }')
+                      % (tex, off, off, u, v, tex, 'rgba'[channel_index], tex, 'rgba'[channel_index],
+                         tex, 'rgba'[channel_index], tex, 'rgba'[channel_index]))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
