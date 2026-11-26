@@ -262,7 +262,7 @@ else:
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     # A failure an earlier translator build wrote (older than the translator files, newer than its marker): the
-    # watcher's first pass retries it once.
+    # watcher leaves it for the pass after the run (old refusals are never retried beside a running title).
     built = gfx2hlsl.translator_stamp()
     touch(d / ('req_%016x.rtv' % 8), b'not an rtv request either', mtime=built - 20)
     touch(d / ('%016x.fail' % 8), b'stale reason\n', mtime=built - 10)
@@ -281,15 +281,16 @@ with tempfile.TemporaryDirectory() as tmp:
         time.sleep(1.0)
         expect('failure left unchanged by later passes', fail.stat().st_mtime_ns if fail.exists() else None, first)
         old = (d / ('%016x.fail' % 8)).read_text().strip()
-        expect('earlier failure retried once at start', old, 'invalid RTV variant request')
+        expect('earlier failure left for the pass after the run', old, 'stale reason')
         expect('watcher still running', watch.poll(), None)
     finally:
         watch.kill()
         out, err = watch.communicate(timeout=20)
     lines = sorted(line for line in out.splitlines() if line.strip())
-    expect('watcher output (each request translated once)', [line[:16] for line in lines], ['%016x' % 7, '%016x' % 8])
-    if err.strip():
-        failures.append('watcher stderr: %r' % err.strip()[-500:])
+    expect('watcher output (the new request, once)', [line[:16] for line in lines], ['%016x' % 7])
+    noise = [line for line in err.splitlines() if line.strip() and not line.startswith('gfx2hlsl watch')]
+    if noise:
+        failures.append('watcher stderr: %r' % '\n'.join(noise)[-500:])
 
 
 # Order: the oldest published request first; under --watch the ones published after the watcher started go first.
