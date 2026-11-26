@@ -957,13 +957,13 @@ def check_refusals():
     expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, a16=1, d16=1, nsa=1, extra_addrs=(1,))), 'invalid_nsa', 'a16+d16 fake NSA')
 
     sample_pre = PRE_WORDS + bytes.fromhex('800398be800399be80039abe80039bbe')
+    # A d16 sample returns binary16 pairs, rounded to nearest even (tests/startup_compute_cube_check.py reads them back);
+    # only the loads need the exact SRV formats of this check.
     for name, op in (('image_sample', IMG_SAMPLE), ('image_sample_lz', IMG_SAMPLE_LZ)):
-        expect_refused(
-            lambda o=op: G.Pipeline(VS_WORDS, sample_pre + encode_mimg(o, ssamp=24, d16=1) + POST_WORDS,
-                                    root_blob(), ps_hw_inputs=PACKED_INPUT),
-            f'{name} modifier d16',
-            f'{name} d16',
-        )
+        text = G.Pipeline(VS_WORDS, sample_pre + encode_mimg(op, ssamp=24, d16=1) + POST_WORDS,
+                          root_blob(), ps_hw_inputs=PACKED_INPUT).hlsl_ps()
+        assert 'pack16_rne(t.x)' in text, (name, 'a d16 sample packs binary16 halves')
+        print(f'ok   {name} d16 translates to binary16 pairs')
 
     pipe = G.Pipeline(VS_WORDS, PS_WORDS_A, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
     expect_refused(
