@@ -561,6 +561,8 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
+    // The title wrote this view: a cached descriptor built for the id before the write is dropped (X2W_VIEW_CACHE).
+    if (x2w_view_cache::Cache::enabled()) x2w_view_cache::view_cache().note_write(record.id);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
         x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {

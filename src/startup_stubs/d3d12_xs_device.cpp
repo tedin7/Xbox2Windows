@@ -1135,7 +1135,11 @@ ULONG __stdcall release(Wrapper* self)
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
-        if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
+        if (self->own().kind == descriptor_heap_kind) {
+            retire_drop_heap_views(self);
+            // A destroyed heap: its slots may be reused by new descriptors at the same title address (X2W_VIEW_CACHE).
+            if (x2w_view_cache::Cache::enabled()) x2w_view_cache::view_cache().note_flush();
+        }
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
             // The last release ends the resource for existing_memory_buffer and address_resource_overlap (they skip
@@ -5171,6 +5175,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const bool created = SUCCEEDED(removed);
     record_view(created);
     if (!created) {
+        if (x2w_view_cache::Cache::enabled()) x2w_view_cache::view_cache().note_flush();  // a removed device: nothing cached is real
         static LONG failed;
         if (first_calls(failed, 6))
             log("x2w-d3d12 Device::slot%d view not created: device removed, reason 0x%08lx", N,
@@ -5972,6 +5977,8 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
             InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&w->own().real), created);
         }
 
+        // Views cached while this resource had no desktop object (X2W_VIEW_CACHE) describe nothing real: drop them.
+        if (x2w_view_cache::Cache::enabled()) x2w_view_cache::view_cache().note_resource_change(reinterpret_cast<u64>(w));
         x2w_startup::mark_packed_stand_in(created, record.desktop_format);
         x2w_budget::Ticket* const ticket = x2w_budget::committed(device, created, props.Type, in_system_memory);
         if (in_system_memory) log_sysmem_fallback(w->own().title_memory, record.desc, "lazy");
