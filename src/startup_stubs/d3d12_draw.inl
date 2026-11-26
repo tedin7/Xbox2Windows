@@ -2216,9 +2216,14 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         return {zero_ring, zero_offset, 16, 0, true, 3};
     }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
-    if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
-        ? "an input buffer range is over 16 MiB or not whole dwords"
-        : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
+    if (bytes > limit || bytes % 4) {
+        static LONG size_logged;
+        if (first_calls(size_logged, 16))
+            log("x2w-draw an input buffer descriptor has %llu bytes (stride %u, limit %llu)", static_cast<unsigned long long>(bytes), stride,
+                static_cast<unsigned long long>(limit));
+        if (bytes % 4) return refuse("an input buffer range is not a whole number of dwords");
+        return refuse(limit == (16u << 20) ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
+    }
     ID3D12Resource* native = nullptr;
     bool upload = false;
     int input_source = 0;
