@@ -552,6 +552,8 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
 ID3D12Resource* sampled_address_texture(Wrapper* resource)
 {
     if (!resource || resource->own().kind != resource_kind) return nullptr;
+    if (resource->own().lazy_slot133_texture && !resource->own().real)
+        return materialize_lazy_texture(resource);
     if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);

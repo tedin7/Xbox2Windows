@@ -1489,6 +1489,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_LAZY_TEXTURES=1` | opt-in ([#2764](https://github.com/R0Y00/Xbox2Windows/issues/2764), [#2379](https://github.com/R0Y00/Xbox2Windows/issues/2379)): defers desktop `CreateCommittedResource` for read-only textures placed through device slot 133 (`CreatePlacedResourceX`, without `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL` or `ALLOW_UNORDERED_ACCESS`) until first real copy, CPU-real access or translated draw/compute bind; `slot 18` SRVs receive a null placeholder descriptor and refresh in place when the texture materializes ([details](#lazy-slot-133-textures-opt-in)). Unset or `0`, textures commit immediately |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
@@ -1744,6 +1745,16 @@ exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot refe
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
+
+### Lazy slot 133 textures (opt-in)
+
+With `X2W_D3D12_LAZY_TEXTURES=1`, read-only textures placed at a title address through device slot 133 (`CreatePlacedResourceX`, without `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET`, `D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL`, or `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`) defer their desktop `CreateCommittedResource` and `x2w_budget` ticket until first materialization. Until then:
+- `Resource::GetDesc` (slot 10), `view_slot` validation, and capture metadata read the sanitized desktop `D3D12_RESOURCE_DESC` from the side record under `lazy_texture_mutex`, and `ID3D12Object::SetName` returns `S_OK` without materializing.
+- `view_slot<18>` (SRV) creates a null `R8G8B8A8_UNORM` placeholder descriptor of the requested dimension and records the view normally in `HeapInfo::shadow` and `title_memory` (`X2WV` token) under `lazy_texture_mutex -> note_lock`.
+- First real use (`CopyTextureRegion` subresource side, `CopyResource`, `ResolveSubresource`, `sampled_address_texture` in translated graphics/compute draws, `Resource::Map` without `title_memory`, or `WriteToSubresource`/`ReadFromSubresource`/`GetHeapProperties`) materializes the desktop resource once under `lazy_texture_mutex` (lock order `draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock`), attaches its budget ticket, and refreshes every live tracked `slot 18` descriptor in `HeapInfo::shadow` (including `CopyDescriptors*` copies), revalidating heap membership and `HeapInfo::shadow` slot identity under `note_lock` so concurrent slot overwrites or heap retirement are not clobbered; `dispatch_translated` also records `retire_hold` so in-flight compute uses after final guest `Release()` stay live behind their fence.
+- Untouched textures remain at 0 desktop bytes and clean up their side records and `resource_address_index` entries on final guest `Release()` (immediately when no live view remains, or via `drain_retired_resources()` under `X2W_D3D12_RELEASE_RETIRED=1` once tracked `slot 18` descriptor references and release-time fences clear).
+
+Fixture: `startup_slot133_lazy_textures_{warp,hardware}_{debug0,debug1}` plus `noretire` and `off` controls (`tests/startup_slot133_lazy_textures_check.cpp`).
 
 ## D3D12 view census
 

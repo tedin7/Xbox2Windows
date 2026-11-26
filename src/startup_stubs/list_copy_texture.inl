@@ -24,7 +24,10 @@ bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resour
                        DXGI_FORMAT& format, bool& bad_subresource)
 {
     Wrapper* w = location && x2w_local::readable(location, sizeof(*location)) ? as_wrapper(location->pResource) : nullptr;
-    if (!w || w->own().kind != resource_kind || !w->own().real) return false;
+    if (!w || w->own().kind != resource_kind) return false;
+    if (location->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && w->own().lazy_slot133_texture && !w->own().real)
+        materialize_lazy_texture(w);
+    if (!w->own().real) return false;
     real = static_cast<ID3D12Resource*>(w->own().real);
     const D3D12_RESOURCE_DESC desc = real->GetDesc();
     side = {};

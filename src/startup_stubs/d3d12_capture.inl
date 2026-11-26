@@ -417,6 +417,10 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
             view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
         }
     }
+    if (slot == 18 && resource && materialized) {
+        if (Wrapper* res_w = as_wrapper(reinterpret_cast<const void*>(resource)); res_w && res_w->own().kind == resource_kind)
+            res_w->own().lazy_view_created = true;
+    }
     if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
         const std::uint32_t prev = *slot_ptr;
         *slot_ptr = record.id + 1;
@@ -608,6 +612,8 @@ void object(Wrapper* w)
         if (w->own().real) {
             header.desktop = static_cast<ID3D12Resource*>(w->own().real)->GetDesc();
             if (header.desktop.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) header.gpu = static_cast<ID3D12Resource*>(w->own().real)->GetGPUVirtualAddress();
+        } else {
+            lazy_texture_desc(w, header.desktop);
         }
         chunk("RES ", &header, sizeof(header), nullptr, 0);
     } else if (w->own().kind == descriptor_heap_kind) {

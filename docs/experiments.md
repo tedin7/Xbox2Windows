@@ -17433,3 +17433,13 @@ python -B tests/docs_links_check.py
 
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
+
+## Opt-in lazy materialization of slot-133 read-only textures
+
+With `X2W_D3D12_LAZY_TEXTURES=1` (Refs #2764, #2379, #1199), device slot 133 (`CreatePlacedResourceX`) defers desktop `CreateCommittedResource` for read-only textures (without `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL`, or `ALLOW_UNORDERED_ACCESS`), keeping `Resource::GetDesc` and `slot 18` SRV tracking active via null placeholder descriptors until first real use (`CopyTextureRegion`, `CopyResource`, `ResolveSubresource`, `sampled_address_texture` in translated draws/dispatches, or non-title-backed `Map`). On materialization (under lock order `draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock`), all tracked `slot 18` descriptors in `HeapInfo::shadow` (including `CopyDescriptorsSimple` copies) refresh in place; untouched textures retire their side records cleanly on guest `Release()`.
+
+[`tests/startup_slot133_lazy_textures_check.cpp`](../tests/startup_slot133_lazy_textures_check.cpp) creates 16 `512x512` `R8G8B8A8_UNORM` read-only 2D textures (`16 MiB` total) over pre-committed guest memory, checks `x2w-budget` (`0/0` texture vs `16777216/16` in the `off` control), `PagefileUsage` delta (`20480` B on Microsoft Basic Render Driver and `40960` B on NVIDIA GeForce GTX 1660 SUPER vs `16936960` B and `16973824` B in the `off` controls), pre-materialization null SRV readback (`0`), selective `CopyTextureRegion` materialization (`2/16` with full `1 MiB` byte-for-byte readbacks), in-place SRV refresh sampled by a compute shader in both the original CPU heap and copied shader-visible heap, and clean retirement (`lazy_texture_count == 0`, budget back to `0/0` with `X2W_D3D12_RELEASE_RETIRED=1`). `debug1` cases skipped (`77`) without D3D12 SDK Layers installed on the host. Three fail-first mutants on `startup_slot133_lazy_textures_warp_debug0` failed as expected: skipping `CopyTextureRegion` materialization (`CopyTextureRegion refused: unknown_resource`, `1045504` mismatched bytes), eager materialization at slot 133 (`live=16777216/16`), and skipping SRV refresh (`texel(0,0)[0]=0.00000 expected=0.49020`).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_slot133_lazy_textures_' -V
+```

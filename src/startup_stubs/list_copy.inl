@@ -17,11 +17,13 @@ struct CopyEndpoint {
 
 // The desktop resource behind a copy argument; empty for a null value, or a wrapper that is not a resource.
 // A value that is no wrapper is taken as a desktop resource, as the view slots do.
-CopyEndpoint copy_endpoint(u64 value)
+CopyEndpoint copy_endpoint(u64 value, bool materialize = true)
 {
     if (!value) return {};
     if (Wrapper* w = as_wrapper(reinterpret_cast<const void*>(value))) {
         if (w->own().kind != resource_kind) return {};
+        if (materialize && w->own().lazy_slot133_texture && !w->own().real)
+            materialize_lazy_texture(w);
         return {static_cast<ID3D12Resource*>(w->own().real), w};
     }
     return {x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(void*)) ? reinterpret_cast<ID3D12Resource*>(value) : nullptr,
@@ -216,8 +218,8 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                                        u64 bytes)
 {
     if (!self->own().list_open) return;
-    const CopyEndpoint to = copy_endpoint(destination);
-    const CopyEndpoint from = copy_endpoint(source);
+    const CopyEndpoint to = copy_endpoint(destination, false);
+    const CopyEndpoint from = copy_endpoint(source, false);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
     if (to.resource) to_desc = to.resource->GetDesc();
     if (from.resource) from_desc = from.resource->GetDesc();
