@@ -61,6 +61,7 @@ param(
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
+    [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
     [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
@@ -255,6 +256,9 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
 if ($MemoryGiB -le 0) { $MemoryGiB = [int](Invoke-Native { & $python -B $pack memory-gib $physicalBytes }) }
 Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
+# Periodic thread snapshots (debug_launch X2W_DUMP_AT): the title is stopped for a moment at each one, so 4 by default, not one a minute.
+$dumpAt = if ($ThreadSnapshotEvery -gt 0) { @(1..([math]::Floor(480 / $ThreadSnapshotEvery)) | ForEach-Object { $_ * $ThreadSnapshotEvery }) -join "," } else { "" }
+if ($dumpAt) { $env:X2W_DUMP_AT = $dumpAt } else { Remove-Item Env:X2W_DUMP_AT -ErrorAction SilentlyContinue }
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
@@ -360,7 +364,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
-    pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    thread_snapshots = $dumpAt; pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
