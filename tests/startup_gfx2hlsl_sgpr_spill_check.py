@@ -165,7 +165,9 @@ def controls():
         ('read of a lane nothing wrote', ['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 s1, v10, 4']),
         ('read of another VGPR at the written lane', ['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 s1, v11, 3']),
         ('lane chosen by an SGPR', ['v_writelane_b32 v10, s0, s2', 'v_readlane_b32 s1, v10, 3']),
-        ('lane 32', ['v_writelane_b32 v10, s0, 32']),
+        ('lane 64', ['v_writelane_b32 v10, s0, 64']),
+        ('lanes 8 and 40 of one VGPR (one slot in wave32, two in wave64)',
+         ['v_writelane_b32 v10, s0, 8', 'v_writelane_b32 v10, s1, 40', 'v_readlane_b32 s2, v10, 8']),
         ('lane mask value (vcc_lo)', ['v_writelane_b32 v10, vcc_lo, 3']),
         ('lane mask value (exec_lo)', ['v_writelane_b32 v10, exec_lo, 3']),
         ('destination outside the plain SGPRs', ['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 vcc_lo, v10, 3']),
@@ -178,7 +180,10 @@ def controls():
     for label, program in cases:
         reason = refused(program)
         check('refused: %s (%s)' % (label, reason), reason is not None)
-    check('refused: vertex stage (%s)' % refused(ok, kind='vs'), refused(ok, kind='vs') is not None)
+    check('a vertex stage is accepted', refused(ok, kind='vs') is None, str(refused(ok, kind='vs')))
+    check('refused: compute stage (%s)' % refused(ok, kind='cs'), refused(ok, kind='cs') is not None)
+    wave64 = ['v_writelane_b32 v10, s0, 40', 'v_writelane_b32 v10, s1, 63', 'v_readlane_b32 s2, v10, 40']
+    check('wave64 lanes 40 and 63 are accepted', refused(wave64) is None, str(refused(wave64)))
     check('refused: a shader with branches (%s)' % refused(ok, branches=True), refused(ok, branches=True) is not None)
 
     # 5. The reload keeps the constant the write stored, so later scalar folding sees the same word.

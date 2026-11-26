@@ -93,6 +93,18 @@ def controls():
             expect('reload feeds the SGPR', 's40 = sp30_3' in text, True)
             expect('spill VGPR is not a vector temporary', not re.search(r'\bv30\b', text), True)
 
+    # Slot 57 mesh is always wave64: lanes 3 and 35 of one VGPR are two slots there (the k / k + 32 pair rule of the
+    # pixel and vertex stages, whose wave size is unknown, must not refuse them).
+    with tempfile.TemporaryDirectory() as tmp:
+        pair = (MESH[:POST_COUNT] + ['bea803f2'] + writelane(30, 40, 3) + ['bea80380']
+                + ['bea90391'] + writelane(30, 41, 35) + ['bea90380'] + readlane(41, 30, 35)
+                + readlane(40, 30, 3) + ['7e0e0228'] + MESH[POST_COUNT:])
+        key, result = request(tmp, pair)
+        expect('mesh lanes 3 and 35 of one VGPR are two slots', result, 'ok')
+        if result == 'ok':
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('both slots are declared', 'sp30_3' in text and 'sp30_35' in text, True)
+
     refusals = (
         ('unwritten spill slot',
          MESH[:POST_COUNT] + ['bea803f2'] + writelane(30, 40, 3) + ['bea80380']
