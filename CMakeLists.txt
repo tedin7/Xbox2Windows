@@ -4471,6 +4471,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad64_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_mad64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # Opt-in engine (X2W_ENGINE): WaveSync wave-wide gathers (first active lane, any lane, one lane) read back on a plain device: guest waves of 32 and
     # 64, groups of 32 to 1024 threads, a short last wave, an empty-mask wave; three wrong-value controls must be rejected.
     add_test(NAME startup_engine_wavesync_controls COMMAND "${INTAKE_PYTHON}" -B
