@@ -11,6 +11,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
 | periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
 | opt-in lazy slot 133 textures (`X2W_D3D12_LAZY_TEXTURES=1`): external PR #2773, opt-in; its conflict with main is resolved on this branch only | PR #2773 (triggered02) | `92db6d4eb` |
+| opt-in drop of the top mip of big sampled textures (`X2W_D3D12_TEXTURE_DROP_MIPS=<levels>`), with the manifest hint `srvuse` | this branch (branch `c7-s4-dropmips`) | its own tests: `startup_texture_drop_mips`, `startup_srvuse_manifest`, `startup_texture_drop_mips_draw_*` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
@@ -43,6 +44,20 @@ Lazy slot 133 textures are on for now: the script sets `X2W_D3D12_LAZY_TEXTURES=
 on first use and video memory does not run out. `-NoLazyTextures` turns it off; the manifest records the choice.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
+
+## Drop the top mip (opt-in, off by default)
+
+`X2W_D3D12_TEXTURE_DROP_MIPS=1` (1 to 4 levels) and `X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES` (default 4 MiB; needs `X2W_D3D12_LAZY_TEXTURES=1`):
+a read-only slot 133 texture above the threshold is created without its top mip level(s) the first time a translated draw binds it for
+plain sampling. The picture gets softer; nothing is read at a wrong place. A texture keeps every level when the shader loads texels,
+asks for the size or the level of detail, when a copy, a compute view or a map comes first, when a view starts below the top level, or
+when the translated pipeline carries no hint. The heartbeat line `x2w-drop-mips` counts the dropped textures, the estimated MiB saved and
+every reason a texture kept its levels.
+
+The hint is a manifest line `srvuse N sample|texel|lod` that `tools/startup/gfx2hlsl.py` writes next to `srv N ...` (metadata only,
+the emitted HLSL is the same). No line means unknown, and unknown never drops. **Before this can go upstream**, R0Y00's C++ frontend
+would need to write the same hint for its pipelines, and the translator change would go through the translator review; on this
+branch it is a fork-only addition.
 
 ## What to send
 

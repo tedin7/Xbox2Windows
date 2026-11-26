@@ -549,12 +549,27 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     return resource;
 }
 
+// A texture that lost mip levels (texture_drop_mips.h) goes only to a bind that said it samples it; every other reader
+// (a compute view, a bind of a texel-addressed shader) gets no texture and the refusal is counted.
+ID3D12Resource* texture_for_reader(Wrapper* resource, ID3D12Resource* texture)
+{
+    namespace dm = x2w_startup::drop_mips;
+    if (!texture || !resource->own().drop_levels || dm::may_receive_dropped(dm::current_hint)) return texture;
+    dm::counters.conflicts.fetch_add(1, std::memory_order_relaxed);
+    static LONG shown;
+    if (first_calls(shown, 6))
+        log("x2w-d3d12 texture %p lost %u mip level(s) and is asked for by a reader that does not only sample it: refused",
+            static_cast<void*>(resource), static_cast<unsigned>(resource->own().drop_levels));
+    return nullptr;
+}
+
 ID3D12Resource* sampled_address_texture(Wrapper* resource)
 {
     if (!resource || resource->own().kind != resource_kind) return nullptr;
     if (resource->own().lazy_slot133_texture && !resource->own().real)
-        return materialize_lazy_texture(resource);
-    if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
+        return texture_for_reader(resource, materialize_lazy_texture(resource));
+    if (!resource->own().tiled_address_srv)
+        return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
     // An already-published token can outlive a write in a different layout.

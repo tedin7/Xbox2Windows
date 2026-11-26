@@ -57,6 +57,7 @@
 #include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
@@ -173,6 +174,7 @@ struct alignas(16) WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
     bool lazy_view_created;    // Resource: at least one materialized view was created referencing this wrapper.
+    std::uint8_t drop_levels;  // Lazy texture: top mip levels left out of the desktop texture (texture_drop_mips.h), 0 = all kept.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
     bool retire_hold_missed;  // Resource: retire_hold could not record a use (no desktop object or no room), so the
@@ -1050,6 +1052,17 @@ bool lazy_textures_enabled()
 {
     static const bool on = x2w_local::env_on("X2W_D3D12_LAZY_TEXTURES");
     return on;
+}
+// X2W_D3D12_TEXTURE_DROP_MIPS=<levels> (1 to 4, default off), X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES (default 4 MiB).
+const x2w_startup::drop_mips::Config& drop_mips_config()
+{
+    static const x2w_startup::drop_mips::Config config = [] {
+        char levels[16]{}, bytes[24]{};
+        GetEnvironmentVariableA("X2W_D3D12_TEXTURE_DROP_MIPS", levels, sizeof(levels));
+        GetEnvironmentVariableA("X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES", bytes, sizeof(bytes));
+        return x2w_startup::drop_mips::parse_config(levels, bytes);
+    }();
+    return config;
 }
 struct LazyTextureRecord {
     Wrapper* device{};
@@ -4347,6 +4360,7 @@ void* __stdcall resource_get_desc(void* a, void* b)
     if (!self || !result) return result;
     if (self->own().real) {
         *static_cast<D3D12_RESOURCE_DESC*>(result) = static_cast<ID3D12Resource*>(self->own().real)->GetDesc();
+        if (self->own().drop_levels) lazy_texture_desc(self, *static_cast<D3D12_RESOURCE_DESC*>(result));  // the title's size
     } else if (!lazy_texture_desc(self, *static_cast<D3D12_RESOURCE_DESC*>(result))) {
         return result;
     }
@@ -5421,8 +5435,23 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         if (!device) return nullptr;
 
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+        // Opt-in: a texture a translated draw binds for plain sampling may lose its top mip levels. Every other first
+        // use (copy, compute view, map) has no hint and keeps all levels; the reason is counted by name.
+        D3D12_RESOURCE_DESC create_desc = record.desc;
+        unsigned dropped = 0;
+        {
+            namespace dm = x2w_startup::drop_mips;
+            const dm::Hint hint = dm::current_hint;
+            const dm::Decision decision = dm::decide(record.desc, drop_mips_config(), hint.use, hint.view);
+            if (decision.levels) {
+                dropped = decision.levels;
+                create_desc = dm::reduced_desc(record.desc, dropped);
+            } else if (drop_mips_config().levels) {
+                dm::counters.keep(hint.draw ? decision.reason : dm::Reason::copy_or_other);
+            }
+        }
         const HRESULT hr = device->CreateCommittedResource(
-            &props, D3D12_HEAP_FLAG_NONE, &record.desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+            &props, D3D12_HEAP_FLAG_NONE, &create_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
         static LONG materialized, failures;
         if (first_calls(materialized, 8) || (FAILED(hr) && first_calls(failures, 8))) {
             log("x2w-d3d12 lazy texture materialize wrapper=%p address=%p dim=%d %llux%ux%u mips=%u fmt=%d -> 0x%08lx",
@@ -5432,6 +5461,19 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                 static_cast<unsigned long>(hr));
         }
         if (FAILED(hr) || !created) return nullptr;
+        if (dropped) {
+            namespace dm = x2w_startup::drop_mips;
+            w->own().drop_levels = static_cast<std::uint8_t>(dropped);
+            dm::counters.dropped.fetch_add(1, std::memory_order_relaxed);
+            dm::counters.saved_bytes.fetch_add(dm::saved_estimate(dm::chain_estimate(record.desc), dropped),
+                                               std::memory_order_relaxed);
+            static LONG shown;
+            if (first_calls(shown, 6))
+                log("x2w-d3d12 texture drop-mips wrapper=%p %llux%u mips=%u -> %llux%u mips=%u (top %u level(s) left out)",
+                    static_cast<void*>(w), static_cast<unsigned long long>(record.desc.Width), record.desc.Height,
+                    record.desc.MipLevels, static_cast<unsigned long long>(create_desc.Width), create_desc.Height,
+                    create_desc.MipLevels, dropped);
+        }
 
         if (release_retired_enabled()) {
             AcquireSRWLockExclusive(&retire_lock);
@@ -5521,6 +5563,18 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                 continue;
             }
             srv_desc.Format = desktop_format(srv_desc.Format);
+            if (const unsigned dropped_levels = w->own().drop_levels) {
+                // A view that starts below the top level or clamps the LOD names levels that are gone: leave it unbound.
+                // The others lose the same count of levels the texture lost.
+                const bool array = srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                if ((srv_desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D && !array) ||
+                    srv_desc.Texture2D.MostDetailedMip != 0 || (!array && srv_desc.Texture2D.ResourceMinLODClamp != 0.0f)) {
+                    x2w_startup::drop_mips::counters.keep(x2w_startup::drop_mips::Reason::view_clamp);
+                    continue;
+                }
+                srv_desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(srv_desc.Texture2D.MipLevels,
+                                                                                       dropped_levels);
+            }
             if (x2w_startup::packed_target_format(srv_desc.Format)) {
                 const auto verdict = x2w_startup::packed_view(
                     srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
@@ -6908,6 +6962,29 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
                                 : "x2w-present picture signature: setup failed, no samples");
 }
 
+// One line with the heartbeat while X2W_D3D12_TEXTURE_DROP_MIPS is set: how many textures lost levels, the estimated
+// bytes saved, and every reason a texture kept all of them (counted once per first use).
+void report_drop_mips()
+{
+    namespace dm = x2w_startup::drop_mips;
+    if (!drop_mips_config().levels) return;
+    char reasons[320]{};
+    std::size_t used = 0;
+    for (unsigned r = 1; r < static_cast<unsigned>(dm::Reason::count); ++r) {
+        const auto n = dm::counters.kept[r].load(std::memory_order_relaxed);
+        if (!n || used + 40 >= sizeof(reasons)) continue;
+        used += static_cast<std::size_t>(std::snprintf(reasons + used, sizeof(reasons) - used, " %s=%llu",
+                                                       dm::reason_name(static_cast<dm::Reason>(r)),
+                                                       static_cast<unsigned long long>(n)));
+    }
+    log("x2w-drop-mips levels=%u min_bytes=%llu dropped=%llu saved_mib=%llu conflicts=%llu upload_unsupported=%llu no_drop:%s",
+        drop_mips_config().levels, static_cast<unsigned long long>(drop_mips_config().min_bytes),
+        static_cast<unsigned long long>(dm::counters.dropped.load()),
+        static_cast<unsigned long long>(dm::counters.saved_bytes.load() >> 20),
+        static_cast<unsigned long long>(dm::counters.conflicts.load()),
+        static_cast<unsigned long long>(dm::counters.upload_unsupported.load()), used ? reasons : " none");
+}
+
 void report_budget(ID3D12CommandQueue* queue)
 {
     using Microsoft::WRL::ComPtr;
@@ -7206,6 +7283,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
         if (x2w_budget::enabled()) report_budget(static_cast<ID3D12CommandQueue*>(self->own().real));
+        report_drop_mips();
         if (retire_reasons_enabled()) {
             char line[1536];
             if (retire_reasons_line(line, sizeof(line))) log("%s", line);

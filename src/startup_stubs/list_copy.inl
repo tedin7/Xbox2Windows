@@ -24,6 +24,10 @@ CopyEndpoint copy_endpoint(u64 value, bool materialize = true)
         if (w->own().kind != resource_kind) return {};
         if (materialize && w->own().lazy_slot133_texture && !w->own().real)
             materialize_lazy_texture(w);
+        if (w->own().drop_levels) {  // a texture that lost mip levels is not a copy endpoint (texture_drop_mips.h)
+            x2w_startup::drop_mips::counters.conflicts.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
         return {static_cast<ID3D12Resource*>(w->own().real), w};
     }
     return {x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(void*)) ? reinterpret_cast<ID3D12Resource*>(value) : nullptr,

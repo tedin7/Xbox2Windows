@@ -121,6 +121,7 @@ struct Translation {
     int state = 0;                           // 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
+    std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
@@ -328,6 +329,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (std::sscanf(line.c_str(), "srvuse %d %15s", &i, kind) == 2) {
+            if (i >= 0 && i < 32) {
+                if (tr.srv_use.size() <= static_cast<std::size_t>(i)) tr.srv_use.resize(static_cast<std::size_t>(i) + 1);
+                tr.srv_use[static_cast<std::size_t>(i)] = x2w_startup::drop_mips::parse_use(kind);
+            }
         } else if (line.compare(0, 6, "wmask ") == 0) {
             if (!tr.write_masks.read_manifest_line(line)) {
                 log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
@@ -1345,7 +1351,14 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const UINT slices = (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || !desc.DepthOrArraySize) ? 1 : desc.DepthOrArraySize;
     if (mips > 15) return !console;
     const x2w_startup::SliceFootprints plan(device_of(the_device), desc, mips);
-    const UINT64 slice_total = plan.size;
+    // A texture that lost its top `drop` mip levels (texture_drop_mips.h) is read from the title's full chain: the
+    // layout of the memory is the one of the title's description, the upload copies only the levels that are left.
+    const UINT drop = resource ? resource->own().drop_levels : 0;
+    D3D12_RESOURCE_DESC title_desc = desc;
+    if (drop && !lazy_texture_desc(resource, title_desc)) return !console;
+    const x2w_startup::SliceFootprints full_plan(device_of(the_device), drop ? title_desc : desc, drop ? (title_desc.MipLevels ? title_desc.MipLevels : 1u) : mips);
+    const x2w_startup::SliceFootprints& memory_plan = drop ? full_plan : plan;
+    const UINT64 slice_total = memory_plan.size;
     if (slice_total == ~0ull || !slice_total) return !console;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     TextureUpload* cached;
@@ -1396,6 +1409,12 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         for (UINT i = 0; rows_match && i < plan.count; ++i)
             rows_match = compact.level[i].rows == plan.rows[i] && compact.level[i].row_bytes == plan.row_bytes[i];
         if (!rows_match) return true;
+    }
+    if (drop && (console || tiled_chain || tiled || is_compact || single || plan.count + drop != full_plan.count)) {
+        // Only the plain row layout is read from a shifted level; every other layout keeps all its levels (decide() cannot
+        // see them), so this texture cannot be uploaded and the bind gets no texture.
+        x2w_startup::drop_mips::counters.upload_unsupported.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
     const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->bytes()
         : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
@@ -1495,7 +1514,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
-                const auto& fp = plan.placed[i];
+                const auto& fp = memory_plan.placed[i + drop];  // where the title keeps this level
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
                 ID3D12Resource* chunk = nullptr;
@@ -2341,7 +2360,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // shared MostDetailedMip and MipLevels in all supported texture views
             if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
-            ID3D12Resource* texture = sampled_address_texture(resource);
+            // What the shader does with this view (manifest srvuse; absent = unknown) and the view the title made decide
+            // whether the texture may lose its top mip levels when it is materialized by this bind (texture_drop_mips.h).
+            D3D12_SHADER_RESOURCE_VIEW_DESC title_view{};
+            if (record.desc_bytes >= 40) std::memcpy(&title_view, record.desc, 40);
+            x2w_startup::drop_mips::ViewFacts drop_view;
+            drop_view.most_detailed_mip = title_view.Texture2D.MostDetailedMip;
+            drop_view.min_lod_clamp = title_view.Texture2D.ResourceMinLODClamp;
+            const x2w_startup::drop_mips::Use drop_use = srv.kind == 1 && static_cast<std::size_t>(i) < tr->srv_use.size()
+                ? tr->srv_use[i] : x2w_startup::drop_mips::Use::unknown;
+            ID3D12Resource* texture = nullptr;
+            {
+                const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
+                texture = sampled_address_texture(resource);
+            }
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
@@ -2422,6 +2454,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
                 log("%s", line);
             }
+            if (texture && resource && resource->own().drop_levels && desc.ViewDimension == dimension &&
+                (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
+                desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
+                                                                                    resource->own().drop_levels);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }

@@ -17,6 +17,9 @@ struct StartupBc7Input {
     // holds mip 0 then mip 1 as tight rows; both go through XG slot 8 into memory of exactly the size XG slot 2
     // reports, followed by a no-access guard page. The target is 48x32: mip 0 at the left, mip 1 top right.
     bool small4k = false;
+    // A 256x256 R8G8B8A8 texture with 9 mips, every mip one solid colour, in the title's row layout: placed through slot 133
+    // and sampled at level 0 by a translated draw (tests/startup_texture_drop_mips_draw_check.py).
+    bool dropmips = false;
 };
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,
