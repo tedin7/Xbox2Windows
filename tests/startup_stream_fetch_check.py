@@ -223,7 +223,7 @@ def check(directory, consumer, backend):
 # Translator-only cases: no consumer, no device, no shader compiler.
 NO_LAYOUT = "vertex stage calls a fetch routine and the pipeline declares no input layout"
 UNDEFINED = "vertex stage reads v12, which neither the fetch nor an unconditional write before the first branch defines"
-EXEC_LO_0, EXEC_LO_ALL, BRANCH_OVER_ONE = 0xbefe0380, 0xbefe03c1, 0xbf820001  # s_mov_b32 exec_lo, 0 / -1; s_branch +1
+EXEC_LO_0, EXEC_LO_ALL, BRANCH_OVER_ONE = 0xbefe0380, 0xbefe03c1, 0xbf840001  # s_mov_b32 exec_lo, 0 / -1; s_cbranch_scc0 +1
 WQM_EXEC_LO_0, WQM_EXEC_EXEC, EXEC_HI_0 = 0xbefe0980, 0xbefe0a7e, 0xbeff0380  # s_wqm_b32 exec_lo, 0; s_wqm_b64 exec, exec; s_mov_b32 exec_hi, 0
 V7_ONE, V12_ONE = vop1(1, 7, 242), vop1(1, 12, 242)                         # v_mov_b32 v7 / v12, 1.0
 EXPORTS_V12 = [0xf80008cf, 0x07060504, 0xf800020f, 0x070c0c0c, ENDPGM]      # pos0 v4-v7; param0 v12, v12, v12, v7
