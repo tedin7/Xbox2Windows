@@ -72,6 +72,33 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
 {
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return x2w_startup::supports_buffer_memory_srv(r, v);
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        static const bool enabled = x2w_local::env_on("X2W_PLACED_SRV_1D");
+        const auto format = desktop_format(r.Format);
+        if (!enabled || !r.Width || r.Height != 1 || !r.DepthOrArraySize ||
+            r.SampleDesc.Count != 1 || r.SampleDesc.Quality != 0 ||
+            (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+            v.Format != r.Format || format == DXGI_FORMAT_UNKNOWN ||
+            x2w_view_dimension::typeless(format) || x2w_view_dimension::depth_format(format) ||
+            v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
+            return false;
+        const auto mip_range_fits = [&](UINT first, UINT count) {
+            return first < r.MipLevels && count &&
+                   (count == UINT_MAX || count <= r.MipLevels - first);
+        };
+        if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D) {
+            const auto& t = v.Texture1D;
+            return r.DepthOrArraySize == 1 && mip_range_fits(t.MostDetailedMip, t.MipLevels) &&
+                   t.ResourceMinLODClamp == 0;
+        }
+        if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) {
+            const auto& t = v.Texture1DArray;
+            return t.FirstArraySlice < r.DepthOrArraySize && t.ArraySize &&
+                   t.ArraySize <= r.DepthOrArraySize - t.FirstArraySlice &&
+                   mip_range_fits(t.MostDetailedMip, t.MipLevels) && t.ResourceMinLODClamp == 0;
+        }
+        return false;
+    }
     if (x2w_startup::bc64::supports(r)) {
         if (v.Format != r.Format || v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
             return false;

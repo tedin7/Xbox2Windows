@@ -16144,6 +16144,17 @@ each. Two 2×2 source-built textures have different values in both rows. The tes
 between their addresses, compares an ordinary resource-object SRV, and tries zero,
 interior, and mismatched addresses after a successful publication.
 
+With `X2W_PLACED_SRV_1D=1`, slot 70 also accepts matching typed 1D and
+1D-array views of live textures placed at the supplied address. The view uses the
+default component mapping, zero minimum LOD clamp and mip and slice ranges within
+the resource. The switch defaults to off.
+
+The WARP case also samples eight synthetic R8 ramp texels at their centers with
+`Texture1D.SampleLevel` and compares all 32 RGBA pixels with a CPU reference.
+With the switch unset, both view shapes are refused and the draw reads zeros from
+the seeded null descriptor. The enabled case also checks 1D-array descriptor
+publication and verifies that an out-of-range slice update preserves it.
+
 ```powershell
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
