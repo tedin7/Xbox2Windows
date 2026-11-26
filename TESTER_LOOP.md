@@ -37,6 +37,7 @@ What it does:
 
 `-Input menus` presses D-pad down, D-pad down, A, one press every 6 s, starting 5 s after the first pad poll and up to 500 s. The input
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
+`-Input menus2` presses the same buttons, but after every A it waits until the presented picture has changed and stayed still for 2 s (at most 90 s) before the next press, so nothing is pressed blind while a screen loads. It needs render mode, which the script always uses.
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
 
 Lazy slot 133 textures are on for now: the script sets `X2W_D3D12_LAZY_TEXTURES=1` so read-only slot 133 textures are created
