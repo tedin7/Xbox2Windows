@@ -174,6 +174,9 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
     const Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object,
                     {args[0], args[1], args[2], args[3], args[4], args[5], args[6]}, ret, seconds_now(), presents, 0};
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
+    // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
+    // memory after the call is the returned value; ARGM argument 7.
+    if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, 7, object, 0, 0);
     for (std::uint32_t i = 0; i < 7; ++i) {
         const u64 value = args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;

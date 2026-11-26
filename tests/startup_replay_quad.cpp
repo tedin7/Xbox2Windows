@@ -50,7 +50,10 @@ int create_scene(void* device, Scene& s)
     } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&rtv_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.rtv_heap)))))
         return 22;
-    s.rtv = static_cast<SIZE_T>(invoke(s.rtv_heap, 9));
+    // The heap start read as a title compiled for struct returns reads it: (return buffer, object).
+    using Start = SIZE_T* (*)(SIZE_T*, void*);
+    const auto start = reinterpret_cast<Start>((*static_cast<void***>(s.rtv_heap))[9]);
+    if (start(&s.rtv, s.rtv_heap) != &s.rtv || !s.rtv) return 24;
     const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     invoke(device, 20, arg(s.target), arg(&view), s.rtv);
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};

@@ -1897,7 +1897,8 @@ File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version
 `CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
 `OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
-parent is the last `ARGM` of the same call with a depth one higher.
+parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
+passed first, the object second), its memory after the call is `ARGM` argument 7.
 Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
@@ -1916,8 +1917,10 @@ accepted and ignored in this version.
 Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
 memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
 heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
-completed value is waited for until it reaches the recorded one (10 s at most). Not replayed yet: memory written through
-mapped pointers, GPU virtual addresses, float arguments passed by value, one thread per recorded thread.
+completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
+map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
+with a buffer of the replayer's. Not replayed yet: memory written through mapped pointers or into placed-resource
+memory, float arguments passed by value, one thread per recorded thread.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
