@@ -283,15 +283,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const std::uint32_t at = slot.at + index * slot.times;
             const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
             const UINT stride = (words[1] >> 16) & 0x3fff;
-            if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
-                reason = "a heap index word is not in the list's upload memory";
-                break;
+            if (!(words[0] | words[1] | words[2] | words[3])) {
+                // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
+                // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
+                index = 0;
+            } else {
+                if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                    reason = "a heap index word is not in the list's upload memory";
+                    break;
+                }
+                if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                    reason = "a heap index word is outside its table buffer";
+                    break;
+                }
+                std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
             }
-            if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
-                reason = "a heap index word is outside its table buffer";
-                break;
-            }
-            std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
         }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.

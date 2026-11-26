@@ -84,6 +84,13 @@ def main(consumer, dxc, adapter):
             census = lines(result, 'x2w-render compute census')
             assert len(refused) == 1 and reason in refused[0], '%s:\n%s' % (mode, result.stderr[-3000:])
             assert len(census) == 3 and census[1].endswith(f'reason "{reason}": 1 keys, 1 dispatches'), (mode, census)
+        # A null descriptor for the index buffer (all words zero) reads as 0: the dispatch runs and reads heap record 0,
+        # which this run makes the input, so every word equals the expectation. The Run S refusal was this case.
+        got, result = dispatch(directory, consumer, env, 'dispatch-heap-word-null')
+        wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+        assert not wrong, 'null index buffer: word=%d got=%08x expected=%08x\n%s' % (
+            wrong[0], got[wrong[0]], expected[wrong[0]], result.stderr[-3000:])
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused'), result.stderr[-3000:]
         print(f'startup_compute_dispatch_heap_word: PASS on {adapter} (all {C.WORDS} words match through the index word; '
               f'untouched before translation and for {len(CONTROLS)} refused controls)')
 
