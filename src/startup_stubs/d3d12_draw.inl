@@ -315,6 +315,19 @@ std::unordered_map<u64, Translation*>& translation_by_key() { static std::unorde
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
+// Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
+// trim = committed extent + readable probe + zero-tail scan; copy = frame_copy (compare with the cached snapshot, ring copy).
+struct BufferStepStats {
+    LONG64 calls, trim_us, copy_us, copy_over_1ms, copy_max_us, bytes;
+};
+BufferStepStats buffer_step_stats[2];
+inline LONG64 step_now_us()
+{
+    static const double per_us = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return static_cast<double>(f.QuadPart) / 1e6; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<LONG64>(static_cast<double>(t.QuadPart) / per_us);
+}
 LONG64 zero_tail_bytes_saved;  // bytes of buffer bindings not copied because they were zero to the end (zero_tail.h)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
@@ -3120,6 +3133,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // the next draw sees. Of the committed part, the trailing zero bytes are left out too. (A 16 MiB binding copied whole on
         // every draw emptied the 256 MiB upload ring.)
         const std::size_t full_bytes = bytes;
+        const LONG64 step_t0 = step_now_us();
         if (address && bytes >= (64u << 10) && !formatted.entry) {
             bool extent_ok = false;
             const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
@@ -3130,7 +3144,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
             if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
         }
+        const LONG64 step_t1 = step_now_us();
         bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
+        {
+            const LONG64 step_t2 = step_now_us();
+            auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
+            InterlockedIncrement64(&step.calls);
+            InterlockedAdd64(&step.trim_us, step_t1 - step_t0);
+            InterlockedAdd64(&step.copy_us, step_t2 - step_t1);
+            InterlockedAdd64(&step.bytes, static_cast<LONG64>(bytes));
+            if (step_t2 - step_t1 > 1000) InterlockedIncrement64(&step.copy_over_1ms);
+            if (step_t2 - step_t1 > step.copy_max_us) step.copy_max_us = step_t2 - step_t1;
+        }
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.

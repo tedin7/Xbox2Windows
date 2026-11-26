@@ -7568,6 +7568,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+        for (int size_class = 0; size_class < 2; ++size_class) {
+            const auto& step = buffer_step_stats[size_class];
+            log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
+                size_class ? "64 KiB and larger" : "under 64 KiB", step.calls, step.bytes >> 20, step.trim_us / 1000, step.copy_us / 1000,
+                step.copy_over_1ms, step.copy_max_us / 1000);
+        }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
