@@ -396,7 +396,7 @@ def check_shell(shell):
         assert rec_manifest["record"]["files"] == 2 and rec_manifest["record"]["bytes"] >= 70000 and rec_manifest["record"]["spec"] == "140,60", rec_manifest["record"]
         assert not [n for n in rec_names if "replay.x2wr" in n], "the recording never travels inside the mail zip"
         uploads = list((tree / "out" / "tester").glob("record_*_upload"))
-        assert uploads and list(uploads[-1].glob("record_*_0001.part")) and (uploads[-1] / "record_%s.json" % uploads[-1].name.split("_")[1]).is_file(), uploads
+        assert uploads and list(uploads[-1].glob("record_*_0001.part")) and (uploads[-1] / "record_%s.json" % uploads[-1].name.split("_")[1]).is_file(), (uploads, rec.stdout[-1800:], rec.stderr[-600:])
         assert ("recording" in rec.stdout and ("uploaded to the shared Drive folder" in rec.stdout or "UPLOAD_THESE_FILES.txt" in rec.stdout)), rec.stdout[-1500:]
         plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         newest_plain2 = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
