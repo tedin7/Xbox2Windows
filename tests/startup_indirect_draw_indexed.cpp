@@ -2109,9 +2109,12 @@ int main(int argc, char** argv) try
             !dispatch(aliased_vertex.Get(), root.Get(), "mesh descriptor with a vertex slot") ||
             !dispatch(incomplete.Get(), root.Get(), "mesh descriptor with an incomplete PS span") ||
             !std::filesystem::is_empty(cache)) return 1;
+        const bool control = GetEnvironmentVariableA("X2W_MESH_REQUEST_CONTROL", nullptr, 0) != 0;
         if (!dispatch(pair.Get(), root.Get(), "mesh with PS") ||
             !dispatch(depth.Get(), root.Get(), "mesh with no PS") ||
-            !dispatch(pair.Get(), root.Get(), "repeat mesh with PS")) return 1;
+            (!control && !dispatch(pair.Get(), root.Get(), "repeat mesh with PS"))) return 1;
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
         unsigned requests = 0, with_ps = 0, files = 0;
         const auto matches = [](const std::filesystem::path& path, const void* bytes, std::size_t size) {
             std::ifstream stream(path, std::ios::binary);
@@ -2127,8 +2130,23 @@ int main(int argc, char** argv) try
             ++requests;
             if (!matches(path, ms, ms_size) ||
                 !matches(path.replace_extension(".root"), root_blob->GetBufferPointer(), root_blob->GetBufferSize())) return 1;
-            if (matches(path.replace_extension(".ps57"), ps, ps_size)) ++with_ps;
+            const bool has_ps = matches(path.replace_extension(".ps57"), ps, ps_size);
+            if (has_ps) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
+            const auto key = path.stem().string().substr(4);  // req_<key>
+            const char* count = has_ps ? "2" : "1";
+            const auto use = report.find("x2w-render key use mesh " + key + " first ");
+            const auto use_count = report.find(" uses ", use);
+            const auto expected_use = std::string(" uses ") + count + "\n";
+            const bool correct_use = use_count != std::string::npos && use_count < report.find('\n', use) &&
+                report.compare(use_count, expected_use.size(), expected_use) == 0;
+            const bool correct_refusal = report.find("key=" + key + " reason=mesh no translation calls=" +
+                                                     count + "\n") != std::string::npos;
+            if (!correct_use || !correct_refusal) {
+                std::fprintf(stderr, "mesh request census mismatch for %s (expected %s uses and refusals)\n%s",
+                             key.c_str(), count, report.c_str());
+                return 1;
+            }
         }
         if (requests != 2 || with_ps != 1 || files != 6) return 1;
         if (!exchange_size) std::filesystem::remove_all(cache);

@@ -661,27 +661,66 @@ void log_compute_census()
             keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
 }
 
-// One line per pipeline key (graphics and compute) whose use count changed since the last line: first and last use in
-// seconds since the process started. The report script keeps the earliest first and the latest last per key.
-void log_key_use_census()
+// Mesh requests have no entry in either draw or compute translation accounting.
+auto& indirect_mesh_key_uses()
+{
+    static std::unordered_map<u64, KeyUse> uses;
+    return uses;
+}
+
+template <class Emit>
+void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use)
+{
+    char line[160];
+    std::snprintf(line, sizeof(line), "x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu",
+                  kind, key, use.first_ms / 1000.0, use.last_ms / 1000.0, use.uses);
+    emit(line);
+}
+
+void note_indirect_mesh_use(u64 key)
+{
+    KeyUse first_use;
+    {
+        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+        auto& use = indirect_mesh_key_uses()[key];
+        // Publish the first use even if the title never reaches the periodic report.
+        use.note(process_ms());
+        if (use.uses == 1) {
+            use.reported_uses = use.uses;
+            first_use = use;
+        }
+    }
+    if (first_use.uses)
+        emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, first_use);
+}
+
+// The report script keeps the earliest first and the latest last per key.
+template <class Emit>
+void report_key_use_census(Emit emit, bool only_if_changed)
 {
     struct Row { const char* kind; u64 key; KeyUse use; };
     std::vector<Row> rows;
-    AcquireSRWLockExclusive(&draw_lock);
-    for (auto& item : compute_translations())
-        if (item.second.use.uses != item.second.use.reported_uses) {
-            rows.push_back({"compute", item.second.key, item.second.use});
-            item.second.use.reported_uses = item.second.use.uses;
-        }
-    for (auto& item : translation_by_key())
-        if (item.second && item.second->use.uses != item.second->use.reported_uses) {
-            rows.push_back({"graphics", item.second->key, item.second->use});
-            item.second->use.reported_uses = item.second->use.uses;
-        }
-    ReleaseSRWLockExclusive(&draw_lock);
+    {
+        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+        const auto collect = [&](const char* kind, u64 key, KeyUse& use) {
+            if (!use.uses || (only_if_changed && use.uses == use.reported_uses)) return;
+            rows.push_back({kind, key, use});
+            if (only_if_changed) use.reported_uses = use.uses;
+        };
+        for (auto& item : compute_translations())
+            collect("compute", item.second.key, item.second.use);
+        for (auto& item : translation_by_key())
+            if (item.second) collect("graphics", item.second->key, item.second->use);
+        for (auto& item : indirect_mesh_key_uses())
+            collect("mesh", item.first, item.second);
+    }
     for (const Row& row : rows)
-        log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
-            row.use.last_ms / 1000.0, row.use.uses);
+        emit_key_use(emit, row.kind, row.key, row.use);
+}
+
+void log_key_use_census()
+{
+    report_key_use_census([](const char* line) { log("%s", line); }, true);
 }
 
 // Fixtures: the census without waiting for the frame that logs it.

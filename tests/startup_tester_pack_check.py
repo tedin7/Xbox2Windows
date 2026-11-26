@@ -528,6 +528,42 @@ def check_request_files():
             assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
 
 
+def check_indirect_mesh_requests():
+    """A refused mesh pipeline used only by ExecuteIndirect supplies its own pack weight."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache, run = tmp / "cache", tmp / "run"
+        cache.mkdir()
+        run.mkdir()
+        make_run(run, 1)
+        files = {}
+        for key, stages in (("3000000000000001", ("m57", "ps57")), ("4000000000000001", ("m86",))):
+            for ext in (*stages, "root"):
+                name = f"req_{key}.{ext}"
+                files[name] = ext.encode()
+                write(cache, name, files[name])
+            write(cache, f"req_{key}.fail", b"unsupported synthetic mesh instruction\n")
+        census = (
+            b"x2w-d3d12 indirect-graphics refusal 1: key=3000000000000001 reason=mesh no translation calls=2\n"
+            b"x2w-d3d12 indirect-graphics refusal 2: key=4000000000000001 reason=mesh no translation calls=5\n"
+        )
+        for used in (True, False):
+            log = census + (b"x2w-render key use mesh 3000000000000001 first 1.0 s last 2.0 s uses 2\n"
+                            b"x2w-render key use mesh 4000000000000001 first 1.0 s last 3.0 s uses 5\n" if used else b"")
+            write(run, "stderr.txt", log)
+            T.pack(str(run), MANIFEST, str(tmp / "mesh.zip"), cache_dir=str(cache))
+            with zipfile.ZipFile(tmp / "mesh.zip") as archive:
+                prefix = T.REQUESTS_DIR + "/"
+                packed = {n[len(prefix):]: archive.read(n) for n in archive.namelist() if n.startswith(prefix)}
+                assert packed == (files if used else {}), packed
+                ranked = json.loads(archive.read("manifest.json"))["request_files"]["ranked"]
+                assert [(r["kind"], r["weight"]) for r in ranked] == ([("mesh86", 5), ("mesh57", 2)] if used else [])
+            if used:
+                chosen = T.select_requests(str(cache), T.cache_results(str(cache)), {}, top=1, families=0,
+                                           uses=T.key_use(str(run)))
+                assert [(r[0], r[2]) for r in chosen] == [("4000000000000001", 5)], chosen
+
+
 def check_part_one_has_the_small_files():
     """Several parts: shader_results.txt, the debugger summary and every small log are in part 1 (Run Q: part 2 never arrived and
     took shader_results.txt and the summary with it), the big log chunks come after them."""
@@ -874,6 +910,7 @@ if __name__ == "__main__":
     check_cache_results()
     check_key_use()
     check_request_files()
+    check_indirect_mesh_requests()
     check_request_code_files()
     check_mail_ready_parts()
     check_phase_table()
