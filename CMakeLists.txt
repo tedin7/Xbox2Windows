@@ -1417,6 +1417,22 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_FORCE_SERIALIZED_QUEUES=1")
 endforeach()
 
+add_executable(sysmem_policy_check tests/sysmem_policy_check.cpp)
+target_include_directories(sysmem_policy_check PRIVATE src)
+target_compile_features(sysmem_policy_check PRIVATE cxx_std_17)
+add_test(NAME sysmem_policy COMMAND sysmem_policy_check)
+
+# A texture whose default-heap creation runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1).
+add_executable(startup_sysmem_fallback tests/startup_sysmem_fallback.cpp)
+target_include_directories(startup_sysmem_fallback PRIVATE src)
+target_compile_features(startup_sysmem_fallback PRIVATE cxx_std_17)
+target_link_libraries(startup_sysmem_fallback PRIVATE d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_sysmem_fallback_${backend} COMMAND startup_sysmem_fallback ${backend})
+    set_tests_properties(startup_sysmem_fallback_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_BUDGET=1" PASS_REGULAR_EXPRESSION "sysmem fallback checks passed")
+endforeach()
+
 add_executable(startup_resource_budget tests/startup_resource_budget.cpp)
 target_include_directories(startup_resource_budget PRIVATE src)
 target_compile_features(startup_resource_budget PRIVATE cxx_std_17)
@@ -2217,7 +2233,7 @@ add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_c
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
-foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit)
+foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-covers unplaced-heap-limit exact-start)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
@@ -2229,6 +2245,16 @@ add_test(NAME startup_srv_refusal_cache COMMAND startup_srv_refusal_cache_check)
 foreach(mutation IN ITEMS generation witness stamp key device age hits unproven)
     add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
     set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+# Opt-in drop of the top mip level of big sampled textures (src/startup_stubs/texture_drop_mips.h); the mutated runs
+# are negative controls.
+add_executable(startup_texture_drop_mips_check tests/startup_texture_drop_mips_check.cpp)
+target_include_directories(startup_texture_drop_mips_check PRIVATE src)
+target_compile_features(startup_texture_drop_mips_check PRIVATE cxx_std_17)
+add_test(NAME startup_texture_drop_mips COMMAND startup_texture_drop_mips_check)
+foreach(mutation IN ITEMS texel-allowed unknown-allowed view-start small-allowed block-tail rt-allowed keep-view-mips)
+    add_test(NAME startup_texture_drop_mips_${mutation}_control COMMAND startup_texture_drop_mips_check --mutate ${mutation})
+    set_tests_properties(startup_texture_drop_mips_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
 # Descriptor word 3 for formatted buffer loads (src/startup_stubs/buffer_format_word3.h); the mutated run must fail.
 add_executable(startup_buffer_format_word3_check tests/startup_buffer_format_word3_check.cpp)
@@ -4017,6 +4043,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_2d_array_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # Manifest line srvuse (sampling only / texel / lod) that the opt-in mip drop reads.
+    add_test(NAME startup_srvuse_manifest COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_srvuse_manifest_check.py")
     # gfx2hlsl packed 2D A16 image_sample / image_sample_lz coordinates and modifier validation.
     add_test(NAME startup_image_sample_a16_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_a16_check.py")
@@ -4946,6 +4975,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_small_texture_4k_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
         set_tests_properties(startup_small_texture_4k_draw_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # A big sampled texture loses its top mip level (opt-in, src/startup_stubs/texture_drop_mips.h): the draw reads the
+        # next level; texel-addressed, hint-less and under-threshold textures keep every level.
+        add_test(NAME startup_texture_drop_mips_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_texture_drop_mips_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
+        set_tests_properties(startup_texture_drop_mips_draw_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME startup_slot57_blend_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot57_blend_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

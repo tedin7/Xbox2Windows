@@ -5,6 +5,7 @@
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
+  tester_pack.py seed-cache <cache root> <new cache> [--jobs N]  copy the old caches' requests under the new keys (pre-translation backlog)
   tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
   tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR]   write the zip, print its path and size
 
@@ -168,6 +169,78 @@ def cache_stats(cache_dir):
             elif os.path.isfile(os.path.join(cache_dir, match.group(1) + ".fail")):
                 failed += 1
     return ready, requests, failed
+
+
+def request_count(cache_dir):
+    """Request keys (ready markers .a / .rtv / .c67 / .m57) in a shader cache folder."""
+    if not os.path.isdir(cache_dir):
+        return 0
+    return sum(1 for name in os.listdir(cache_dir) if REQUEST_RE.match(name))
+
+
+def older_caches(cache_root, new_cache):
+    """The other shader_cache_* folders of the tester's cache root, most recently changed first."""
+    new = os.path.normcase(os.path.abspath(new_cache))
+    found = []
+    if os.path.isdir(cache_root):
+        for name in os.listdir(cache_root):
+            path = os.path.join(cache_root, name)
+            if name.startswith("shader_cache_") and os.path.isdir(path) and os.path.normcase(os.path.abspath(path)) != new:
+                found.append((os.path.getmtime(path), path))
+    return [path for _, path in sorted(found, reverse=True)]
+
+
+def seed_cache(cache_root, new_cache, jobs=0, rekey=None):
+    """Pre-translation of an old cache after a shader revision bump. When the new cache folder holds no request yet, the
+    request files of every older shader_cache_* folder are copied into it under the keys of the current revision
+    (shader_cache_rekey.py: re-hashed with this gfx2hlsl.py, ready marker last, requests only, no result file of the old
+    revision). The --watch translator the run starts then finds them as a backlog and translates them in its process pool
+    while the title boots; requests the title publishes meanwhile go first. Never raises and never blocks a run: any
+    problem is returned as `skipped`/`failed` text.
+
+    Returns {"seeded": new requests, "sources": older caches used, "seconds": time spent, "skipped": reason or None,
+    "failed": [(older cache, first line of the error)]}."""
+    import subprocess
+    import time
+    started = time.monotonic()
+    result = {"seeded": 0, "sources": 0, "seconds": 0.0, "skipped": None, "failed": []}
+    here = os.path.dirname(os.path.abspath(__file__))
+    rekey = rekey or os.path.join(here, "shader_cache_rekey.py")
+    try:
+        olds = older_caches(cache_root, new_cache)
+        if request_count(new_cache):
+            result["skipped"] = "the new cache already holds requests"
+        elif not olds:
+            result["skipped"] = "no older shader_cache_* folder"
+        elif not os.path.isfile(rekey):
+            result["skipped"] = "shader_cache_rekey.py is missing"
+        else:
+            env = dict(os.environ)
+            if jobs > 0:
+                env["X2W_TRANSLATE_JOBS"] = str(jobs)
+            os.makedirs(new_cache, exist_ok=True)
+            for old in olds:
+                done = subprocess.run([sys.executable, "-B", rekey, old, new_cache], capture_output=True, text=True, env=env)
+                if done.returncode == 0:
+                    result["sources"] += 1
+                else:
+                    text = (done.stderr or done.stdout or "").strip().splitlines()
+                    result["failed"].append((os.path.basename(old), text[0][:160] if text else "exit %d" % done.returncode))
+            result["seeded"] = request_count(new_cache)
+            if not result["sources"]:
+                result["skipped"] = "every older cache was refused"
+    except Exception as error:  # noqa: BLE001 - seeding must never stop a tester run
+        result["skipped"] = "%s: %s" % (type(error).__name__, str(error)[:120])
+    result["seconds"] = round(time.monotonic() - started, 1)
+    return result
+
+
+def seed_line(result):
+    if result["skipped"]:
+        return "pre-translate: skipped (%s)" % result["skipped"] + "".join("; %s: %s" % item for item in result["failed"])
+    return "pre-translate: %d requests from %d older cache(s) in %g s%s" % (
+        result["seeded"], result["sources"], result["seconds"],
+        "".join("; skipped %s: %s" % item for item in result["failed"]))
 
 
 RESULTS_NAME = "shader_results.txt"
@@ -347,6 +420,11 @@ def main(argv):
     n.add_argument("translator")
     c = sub.add_parser("cache-stats")
     c.add_argument("cache")
+    s = sub.add_parser("seed-cache")
+    s.add_argument("cache_root")
+    s.add_argument("new_cache")
+    s.add_argument("--jobs", type=int, default=0)
+    s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
     q = sub.add_parser("pack")
@@ -372,6 +450,13 @@ def main(argv):
         return 0
     if args.cmd == "cache-results":
         sys.stdout.write(format_results(cache_results(args.cache)))
+        return 0
+    if args.cmd == "seed-cache":
+        result = seed_cache(args.cache_root, args.new_cache, args.jobs)
+        print(seed_line(result))
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as handle:
+                json.dump(result, handle)
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)

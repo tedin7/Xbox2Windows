@@ -6,8 +6,9 @@
 
 namespace x2w_budget {
 
-enum Category { placed, texture, buffer, upload, readback, heap, category_count };
-inline constexpr const char* names[] = {"placed", "texture", "buffer", "upload", "readback", "heap"};
+// sysmem: a texture created in system memory after video memory ran out (X2W_D3D12_SYSMEM_FALLBACK=1), the non-local share.
+enum Category { placed, texture, buffer, upload, readback, heap, sysmem, category_count };
+inline constexpr const char* names[] = {"placed", "texture", "buffer", "upload", "readback", "heap", "sysmem"};
 
 struct Counts {
     std::uint64_t bytes, objects;
@@ -15,6 +16,7 @@ struct Counts {
 struct Snapshot {
     Counts live[category_count], retained[category_count];
     std::uint64_t unmeasured;
+    std::uint64_t sysmem_fallbacks, sysmem_fallback_bytes;  // every fallback ever made, released or not
 };
 
 inline bool enabled()
@@ -32,6 +34,7 @@ struct Counter {
 inline SRWLOCK lock = SRWLOCK_INIT;
 inline Counter live[category_count], retained[category_count];
 inline LONG64 unmeasured{};
+inline LONG64 sysmem_fallbacks{}, sysmem_fallback_bytes{};
 
 inline Snapshot snapshot()
 {
@@ -42,6 +45,8 @@ inline Snapshot snapshot()
         result.retained[i] = {static_cast<std::uint64_t>(retained[i].bytes), static_cast<std::uint64_t>(retained[i].objects)};
     }
     result.unmeasured = static_cast<std::uint64_t>(InterlockedCompareExchange64(&unmeasured, 0, 0));
+    result.sysmem_fallbacks = static_cast<std::uint64_t>(InterlockedCompareExchange64(&sysmem_fallbacks, 0, 0));
+    result.sysmem_fallback_bytes = static_cast<std::uint64_t>(InterlockedCompareExchange64(&sysmem_fallback_bytes, 0, 0));
     ReleaseSRWLockShared(&lock);
     return result;
 }
@@ -149,12 +154,20 @@ inline Ticket* resource(ID3D12Device* device, ID3D12Resource* resource, Category
     return attach(resource, category, device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes);
 }
 
-inline Ticket* committed(ID3D12Device* device, ID3D12Resource* resource, D3D12_HEAP_TYPE type)
+// `system_memory`: the resource was created in the system pool by the out-of-memory fallback. It is counted in `sysmem`,
+// and the ticket (one object, one release) takes that count back with the resource, as it does for any category.
+// The fallback totals are counted whether or not the budget is on.
+inline Ticket* committed(ID3D12Device* device, ID3D12Resource* resource, D3D12_HEAP_TYPE type, bool system_memory = false)
 {
-    if (!enabled()) return nullptr;
     const auto desc = resource->GetDesc();
-    const auto category = type == D3D12_HEAP_TYPE_UPLOAD ? upload : type == D3D12_HEAP_TYPE_READBACK ? readback :
-        desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? buffer : texture;
+    if (system_memory) {
+        InterlockedIncrement64(&sysmem_fallbacks);
+        InterlockedAdd64(&sysmem_fallback_bytes,
+                         static_cast<LONG64>(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes));
+    }
+    if (!enabled()) return nullptr;
+    const auto category = system_memory ? sysmem : type == D3D12_HEAP_TYPE_UPLOAD ? upload :
+        type == D3D12_HEAP_TYPE_READBACK ? readback : desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? buffer : texture;
     return attach(resource, category, device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes);
 }
 

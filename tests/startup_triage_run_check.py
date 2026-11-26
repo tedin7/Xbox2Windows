@@ -583,6 +583,10 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
             f'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0{commit}'
         )
 
+    # The line the shim writes now carries the system-memory category and the fallback totals: it still parses.
+    current = sample("2500/3000", "100/5+40/2").replace(" unmeasured=0", " sysmem=4096/1+0/0 unmeasured=0 sysmem-fallback=1 bytes=4096")
+    if not triage_run.RE_GPU_BUDGET.fullmatch(current):
+        failures.append("the budget line with the sysmem category and fallback totals was not parsed")
     # The system commit and pool counters report_budget() appends (known, and unavailable).
     with_commit = " commit=14335/16100 avail=1765 sections=113609 slabs=3 slots=113000/609 job_peak=14250 job_limit=14336"
     commit_n_a = " commit=n/a avail=n/a sections=n/a slabs=n/a slots=n/a job_peak=n/a job_limit=none"

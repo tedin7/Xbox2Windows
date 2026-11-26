@@ -91,11 +91,13 @@ RE_GPU_BUDGET = re.compile(
     rf" texture=(?P<live>{BUDGET_DECIMAL})/{BUDGET_DECIMAL}"
     rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
     + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
-    + rf" unmeasured={BUDGET_DECIMAL}"
+    # sysmem: textures created in system memory after video memory ran out; the fallback totals close the line.
+    + rf"(?: sysmem={BUDGET_CATEGORY})? unmeasured={BUDGET_DECIMAL}"
     # Added with the system commit and pool counters (absent in older logs): commit=<used>/<limit> avail=<free> in MiB.
     + rf"(?: commit=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a) avail=(?:{BUDGET_DECIMAL}|n/a)"
     + rf" sections=(?:{BUDGET_DECIMAL}|n/a) slabs=(?:{BUDGET_DECIMAL}|n/a) slots=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
     + rf" job_peak=(?:{BUDGET_DECIMAL}|n/a) job_limit=(?:{BUDGET_DECIMAL}|none|n/a))?"
+    + rf"(?: sysmem-fallback={BUDGET_DECIMAL} bytes={BUDGET_DECIMAL})?"
 )
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")

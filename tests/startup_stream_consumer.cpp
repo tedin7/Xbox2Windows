@@ -248,7 +248,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
-    if (mode == "dispatch-input-copied") {
+    // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
+    // exist only in title memory (the desktop copy of a buffer that does not alias holds zeros); dispatch-input-copied
+    // leaves that memory zero.
+    if (mode == "dispatch-input-snapshot") std::memcpy(reinterpret_cast<void*>(between), input, sizeof(input));
+    if (mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot") {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* copied = nullptr;
@@ -260,7 +264,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(descriptors[0], view, sizeof(view));
     } else if (mode == "dispatch-input-past") {
         descriptors[0][2] = words + 4;
-    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied") {
+    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot") {
         descriptors[0][0] = static_cast<UINT>(between);
         descriptors[0][1] = static_cast<UINT>(between >> 32) | 4u << 16;
     }
@@ -601,10 +605,11 @@ int main(int argc, char** argv)
                static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
                std::strcmp(argv[9], "tiled") == 0};
         bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
+        bc7.dropmips = std::strcmp(argv[9], "dropmips") == 0;
         if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
                         : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
-        else if (bc7.small4k) {}
+        else if (bc7.small4k || bc7.dropmips) {}
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;

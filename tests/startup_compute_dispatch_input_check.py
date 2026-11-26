@@ -85,6 +85,22 @@ def main(consumer, dxc, adapter):
         assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and             not lines(result, 'refused: '), result.stderr[-3000:]
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
+        # Opt-in X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT: an input in a placed buffer that does not alias title memory holds
+        # its bytes only in title memory (the desktop copy is zeros). Off, it is refused; on, the bytes are snapshotted
+        # into the upload ring and all 320 words match; with title memory zero (dispatch-input-copied) the dispatch runs
+        # on zeros: not refused, not the expected words, not untouched.
+        snapshot_env = dict(env, X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-snapshot')
+        assert got == untouched and lines(result, 'refused: ')[0].endswith(CONTROLS[3][1]), result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-snapshot')
+        assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert len(lines(result, 'comes from a snapshot of title memory (1280 bytes)')) == 1, result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
+        got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
+        print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
 
