@@ -9,6 +9,7 @@ import bisect
 from contextlib import suppress
 import functools
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -600,7 +601,7 @@ def native_instructions(code):
     return out
 
 
-def decode(code, refusals=None):
+def decode(code, refusals=None, *, stop_at_end=False):
     out, off = [], 0
     while off + 4 <= len(code):
         try:
@@ -615,6 +616,8 @@ def decode(code, refusals=None):
             refusals.append((str(reason), 'decode'))
         else:
             out.append((off, n, name, asm))
+            if stop_at_end and name == 's_endpgm':
+                return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
     return out[:last + 1]
@@ -865,7 +868,8 @@ def scalar_effects(name, asm):
         reads.add('exec')
         writes.add('exec')
         may |= EXEC_KEYS
-    if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
+    if ((base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base
+            or base == 's_bcnt1_i32_b32' and srcs in (['exec'], ['exec_lo'])):
         writes.add('scc')
     # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
     if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
@@ -1180,8 +1184,11 @@ def reads_scc(name, asm):
     return 'src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))
 
 
-def calculated_pc_proof(ins, kind):
+def calculated_pc_proof(ins, kind, raw=b'', constant_loads=None):
     """Return offset -> target for proven SETPCs, and offset -> None for their address arithmetic.
+
+    Compute without SETPC can also consume a proven address in a scalar load
+    from the trailing bytes, or discard it when neither word escapes.
 
     RDNA 2 GETPC returns the address of its successor. A low-word ADD_U32 and a
     high-word ADDC_U32 with its matching sign extension add one signed byte
@@ -1199,7 +1206,10 @@ def calculated_pc_proof(ins, kind):
     elided write may still hold a symbolic root binding, not its zero-initialized
     HLSL local.
     """
-    if not any(name == 's_setpc_b64' for _, _, name, _ in ins):
+    has_jump = any(name == 's_setpc_b64' for _, _, name, _ in ins)
+    embedded = (not has_jump and kind == 'cs' and constant_loads is not None
+                and any(name == 's_getpc_b64' for _, _, name, _ in ins))
+    if not has_jump and not embedded:
         return {}
     by_off = {off: (n, name, asm) for off, n, name, asm in ins}
     end = ins[-1][0] + ins[-1][1]
@@ -1207,7 +1217,8 @@ def calculated_pc_proof(ins, kind):
     entry_defs = dict.fromkeys(tracked, -1)
 
     def refuse(off, reason):
-        raise Unsupported('s_setpc_b64: %s at +0x%x' % (reason, off))
+        op = 's_getpc_b64' if embedded else 's_setpc_b64'
+        raise Unsupported('%s: %s at +0x%x' % (op, reason, off))
 
     def boundary(off, target):
         if target % 4:
@@ -1241,6 +1252,7 @@ def calculated_pc_proof(ins, kind):
     incoming = {0: (set(), {}, None, entry_defs)}
     pending = [0]
     lowered = {}
+    loads = {}
 
     def propagate(off, words, pairs, scc, definitions):
         state = incoming.get(off)
@@ -1283,7 +1295,8 @@ def calculated_pc_proof(ins, kind):
             words.update((p, p + 1))
             pairs[p] = (off + n, None)
             lowered[off] = None
-        elif name in ('s_add_u32', 's_addc_u32') and words & refs:
+        elif name in ('s_add_u32', 's_addc_u32') and words & (
+                scalar_registers(', '.join(ops[1:])) if embedded else refs):
             row = reg_range(ops[0]) if ops else None
             p = row[1] if row and row[0] == 's' and row[1] == row[2] else None
             imm = pc_word(ops[2]) if len(ops) == 3 else None
@@ -1304,6 +1317,27 @@ def calculated_pc_proof(ins, kind):
                 pairs[p - 1] = (fact[0], None)
                 scc = -1
             lowered[off] = None
+        elif embedded and name.startswith('s_load_dword') and words & scalar_registers(' '.join(ops[1:] + mods)):
+            count = {'s_load_dword': 1, 's_load_dwordx2': 2, 's_load_dwordx4': 4,
+                     's_load_dwordx8': 8, 's_load_dwordx16': 16}.get(name)
+            dst = reg_range(ops[0]) if ops else None
+            base = pc_pair(ops[1]) if len(ops) == 3 else None
+            imm = pc_word(ops[2]) if len(ops) == 3 else None
+            fact = pairs.get(base)
+            if (not count or not dst or dst[0] != 's' or dst[2] > 105 or dst[2] - dst[1] + 1 != count
+                    or mods or imm is None or not -(1 << 20) <= imm < 1 << 20
+                    or fact is None or fact[1] is not None):
+                refuse(off, 'unsupported embedded constant load')
+            address = (fact[0] + imm) & ~3  # SMEM clears the low two address bits.
+            if address < end or address + 4 * count > len(raw):
+                refuse(off, 'embedded constant load is outside trailing data')
+            values = struct.unpack_from('<%dI' % count, raw, address)
+            if off in loads and loads[off] != (dst[1], values):
+                refuse(off, 'ambiguous embedded constant load')
+            loads[off] = dst[1], values
+            written = set(range(dst[1], dst[2] + 1))
+            clobber(written)
+            definitions.update((reg, off) for reg in written & tracked)
         elif name == 's_setpc_b64':
             p = pc_pair(ops[0]) if len(ops) == 1 else None
             if p is None or mods or n != 4:
@@ -1376,6 +1410,8 @@ def calculated_pc_proof(ins, kind):
                     linear_defs.pop(reg, None)
             continue
         written, reads, maybe_written = ordinary_accesses(name, ops, mods, scalar_registers(asm))
+        if off in loads:
+            reads = set()  # the address is consumed by the proof, not by Stage
         if off in incoming:
             reaching = incoming[off][3]
             for reg in sorted(reads & tracked):
@@ -1384,6 +1420,8 @@ def calculated_pc_proof(ins, kind):
         for reg in maybe_written:
             linear_defs.pop(reg, None)
         linear_defs.update((reg, off) for reg in written & tracked)
+    if embedded:
+        constant_loads.update(loads)
     return lowered
 
 
@@ -2433,9 +2471,35 @@ class Stage:
         self.refusals = refusals
         self.raw_code = strip_header(code)
         if refusals is None:
-            self.ins = decode(self.raw_code)
+            try:
+                self.ins = decode(self.raw_code)
+            except Unsupported as error:
+                if kind != 'cs':
+                    raise
+                prefix = decode(self.raw_code, stop_at_end=True)
+                # Keep the original decoding error unless a proven load
+                # actually consumes the bytes after the terminator as data.
+                loads = {}
+                try:
+                    calculated_pc_proof(prefix, kind, self.raw_code, loads)
+                except Unsupported:
+                    raise error from None
+                if not loads:
+                    raise
+                self.ins = prefix
         else:
             self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
+        if kind == 'cs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
+            # A trailing constant can have the encoding of another END_PGM.
+            first_end = next((i for i, row in enumerate(self.ins) if row[2] == 's_endpgm'), len(self.ins) - 1)
+            if first_end < len(self.ins) - 1:
+                prefix, loads = self.ins[:first_end + 1], {}
+                try:
+                    calculated_pc_proof(prefix, kind, self.raw_code, loads)
+                except Unsupported:
+                    pass
+                if loads:
+                    self.ins = prefix
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
@@ -3125,6 +3189,9 @@ class Stage:
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
         refused, into = {}, {}
+        self.nested_execz_joins = set()
+        wave = getattr(getattr(self, 'pipe', None), 'wave_size', None)
+        wave32 = wave == 32 or wave is None and wave32_exec_proof(self.ins)
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
@@ -3167,10 +3234,42 @@ class Stage:
                 return t <= j and all(b <= k < t for k in into.get(t, ())) and not any(
                     effects[k][2] & EXEC_KEYS for k in range(t, j)) and not any(k in into for k in range(t + 1, j + 1))
             unread = {}
+            # A closed save/restore scope preserves the outer EXEC bit even
+            # when an edge into the outer block prevented the clear-mask proof.
+            # No edge may bypass the save or enter the inner body or restore.
+            nested = {}
+            if wave32:
+                for head in range(b + 2, t):
+                    save = self.ins[head - 1]
+                    match = re.fullmatch(r's_and_saveexec_b32 (s\d+), (vcc_lo|s\d+)', save[3])
+                    if not match or int(match[1][1:]) > 105 or self.ins[head][2] != 's_cbranch_execz':
+                        continue
+                    if match[2] != 'vcc_lo' and (
+                            head - 1 in into or not self.ins[head - 2][2].startswith('v_cmp_')
+                            or parse(self.ins[head - 2][3])[1][0] != match[2]):
+                        continue
+                    join = index.get(int(parse(self.ins[head][3])[1][0].split('_')[1], 16), -1)
+                    saved = match[1]
+                    if not head + 1 < join < t or into.get(join) != [head] or 'scc' in live_in[head]:
+                        continue
+                    if self.ins[join][3] not in (f's_mov_b32 exec_lo, {saved}',
+                                                  f's_or_b32 exec_lo, exec_lo, {saved}',
+                                                  f's_or_b32 exec_lo, {saved}, exec_lo'):
+                        continue
+                    if self.ins[join][2] == 's_or_b32' and 'scc' in live_in[join + 1]:
+                        continue
+                    if any(i in into or (i > head and
+                           (effects[i][2] & (EXEC_KEYS | {saved}) or
+                            self.ins[i][2].startswith(('s_branch', 's_cbranch', 's_setpc', 's_endpgm'))))
+                           for i in range(head, join)):
+                        continue
+                    nested[head - 1] = nested[join] = join
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
                 reason = None
+                unproved_exec = may & EXEC_KEYS and (
+                    entered or i in before and not entry <= clear_after(inner, inner_asm, may, before[i]))
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
@@ -3181,8 +3280,7 @@ class Stage:
                             t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
                             and target in index and index[target] <= b for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_cbranch_scc0'
-                elif may & EXEC_KEYS and (entered or i in before and
-                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
+                elif unproved_exec and i not in nested:
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
@@ -3193,6 +3291,8 @@ class Stage:
                         ': read by %s after the join' % self.ins[first][2] if named else '')
                     if named:
                         reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
+                if not reason and i in nested and unproved_exec:
+                    self.nested_execz_joins.add(self.ins[nested[i]][0])
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
@@ -3739,7 +3839,9 @@ class Stage:
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
         try:
-            self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+            self.pc_constant_loads = {}
+            self.calculated_pc = calculated_pc_proof(
+                self.ins, getattr(self, 'kind', None), self.raw_code, self.pc_constant_loads)
         except Unsupported as reason:
             if refusals is None:
                 raise
@@ -4959,6 +5061,9 @@ class Stage:
         self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
             return None
+        if (base == 's_bcnt1_i32_b32' and len(ops) == 2 and ops[1] in ('exec', 'exec_lo')
+                and getattr(self, 'kind', None) == 'cs'):
+            return self.count_exec_lo(ops, mods)
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
@@ -4982,6 +5087,11 @@ class Stage:
     def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
         calculated = getattr(self, 'calculated_pc', {})
+        if pc in getattr(self, 'pc_constant_loads', {}):
+            dst, values = self.pc_constant_loads[pc]
+            for reg, value in enumerate(values, dst):
+                self.set_s(reg, '0x%08xu' % value, ('const', value))
+            return None
         if pc in calculated:
             target = calculated[pc]
             if target is not None:
@@ -5258,10 +5368,12 @@ class Stage:
                 return None
             raise Unsupported(base)
         if base == 's_getpc_b64':
+            if getattr(self, 'kind', None) == 'cs':
+                raise Unsupported('s_getpc_b64: unproven code address use')
             # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
-            # offset, which is not an integer this model can emit. It is elided only when the program also
-            # calculates a branch target, which calculated_pc_proof() proves and records. Reaching here means no
-            # such proof was found, so name the reason instead of reporting the mnemonic alone.
+            # offset, which is not an integer this model can emit. The proof can elide it when the program
+            # calculates a branch target, or when the compute proof can discard it or resolve a trailing-data load.
+            # Reaching here means it was not covered by calculated_pc_proof().
             raise Unsupported('%s: the shader load address is only elided for a program that also calculates a branch target' % base)
         raise Unsupported(base)
 
@@ -6180,6 +6292,37 @@ class Stage:
                     self.heap_index[d] = (('rc', p, w, scale * k & 0xffffffff, add * k & 0xffffffff) if base == 's_mul_i32'
                                           else ('rc', p, w, scale, add + k & 0xffffffff))
                     break
+
+    def count_exec_lo(self, ops, mods):
+        """Count the low EXEC word, including when a guest wave spans host waves."""
+        dst = reg_range(ops[0])
+        if mods or not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_bcnt1_i32_b32 destination or modifiers')
+        threads = math.prod(self.pipe.group)
+        wave = self.pipe.wave_size
+        if wave is None:
+            if threads > 32 and not wave32_exec_proof(
+                    row for row in self.ins if row[2] != 's_bcnt1_i32_b32'):
+                raise Unsupported('s_bcnt1_i32_b32 source exec: unknown guest wave size')
+            wave = 32
+        if wave not in (32, 64):
+            raise Unsupported('s_bcnt1_i32_b32 source exec: unknown guest wave size')
+        # All group threads must reach any shared-memory barriers. A forward
+        # branch whose target is at or before this site has reconverged here.
+        divergent = 's_bcnt1_i32_b32 source exec: count is not at a workgroup convergence point'
+        for off, _, name, asm in self.ins:
+            if name in ('s_setpc_b64', 's_swappc_b64', 's_call_b64', 's_rfe_b64', 's_trap'):
+                raise Unsupported(divergent)
+            if off < self.pc and name == 's_endpgm':
+                raise Unsupported(divergent)
+            if name.startswith(('s_cbranch', 's_branch')):
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+                if target <= off or off < self.pc < target:
+                    raise Unsupported(divergent)
+            if off < self.pc and name.startswith('s_wqm'):
+                raise Unsupported('s_bcnt1_i32_b32 source exec: EXEC was widened by WQM')
+        self.exec_count_wave = wave
+        self.set_s(dst[1], 'x2w_count_exec_lo(tid, exec != 0u)', scc='$ != 0', uniform=False)
 
     def set_exec_scc(self, expr):
         self.exec_known = self.exec_narrow_only = False
@@ -10320,7 +10463,11 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
+        nested = getattr(self, 'nested_execz_joins', ())
+        inlined = set()
         for i, (off, lines, term) in enumerate(self.blocks):
+            if i in inlined:
+                continue
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
@@ -10347,6 +10494,12 @@ class Stage:
                 out.append('        pc = 0xffffu;')
             elif term[0] == 'jump':
                 out.append('        pc = %d;' % goto(term[1]))
+            elif (not loops and i + 2 < len(self.blocks) and self.blocks[i + 1][2] is None
+                  and term[2] in nested and term[2] == self.blocks[i + 2][0]):
+                out.append('        if (!(%s)) {' % term[1])
+                out.extend('            ' + line for line in self.blocks[i + 1][1])
+                out.extend(('        }', '        pc = %d;' % (i + 2)))
+                inlined.add(i + 1)
             else:
                 out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
             out.append('    }')
@@ -11930,6 +12083,36 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        wave = getattr(s, 'exec_count_wave', None)
+        if wave is not None:
+            x, y, z = self.group
+            threads = x * y * z
+            if getattr(s, 'uses_lds', False) and self.lds_words + threads > 8192:
+                raise Unsupported('s_bcnt1_i32_b32 source exec: shared-memory reduction exceeds the LDS limit')
+            shared.extend([
+                'groupshared uint x2w_exec_bits[%d];' % threads,
+                'uint x2w_count_exec_lo(uint3 tid, bool enabled) {',
+                # Count participating threads, rather than relying on an ordering
+                # between host lane indices and guest thread IDs.
+                '    uint i = tid.x + %du * (tid.y + %du * tid.z);' % (x, y),
+                '    uint first = i / %du * %du;' % (wave, wave),
+                '    uint4 participating = countbits(WaveActiveBallot(true));',
+                '    if (participating.x + participating.y + participating.z + participating.w == %du) {' % threads,
+                '        uint count = 0u;',
+                '        for (uint start = 0u; start < %du; start += %du) {' % (threads, wave),
+                '            uint4 bits = countbits(WaveActiveBallot(enabled && i >= start && i < start + 32u));',
+                '            if (start == first) count = bits.x + bits.y + bits.z + bits.w;',
+                '        }',
+                '        return count;',
+                '    }',
+                '    x2w_exec_bits[i] = enabled ? 1u : 0u;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint count = 0u;',
+                '    for (uint j = first; j < min(first + 32u, %du); ++j) count += x2w_exec_bits[j];' % threads,
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return count;',
+                '}',
+            ])
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'

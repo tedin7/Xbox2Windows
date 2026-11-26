@@ -1,15 +1,7 @@
-"""`s_getpc_b64` names why it is refused instead of reporting the mnemonic alone.
+"""Check GETPC refusal diagnostics and calculated-jump compatibility.
 
-usage: startup_gfx2hlsl_getpc_refusal_check.py
-
-RDNA 2 GETPC returns the address of its successor, i.e. the shader's load address plus a known byte offset, which
-the HLSL model cannot represent as an integer. `calculated_pc_proof()` elides the pair when the program also
-calculates a branch target; a program that reaches the dispatcher without such a proof was refused with the bare
-mnemonic, which the refusal census cannot tell apart from an instruction the translator has no handler for.
-
-This checks the named refusal for the forms a pixel or compute stage can carry, and the negative control: the same
-instruction inside a program whose `s_setpc_b64` target is proven is elided, so the message only covers the unproven
-case.
+The compute path can discard an unused code address or use it to read trailing
+constants. Pixel GETPC without a proven calculated jump keeps its diagnostic.
 """
 import sys
 from pathlib import Path
@@ -60,10 +52,16 @@ FORMS = (
     ['s_getpc_b64 s[4:5]', 's_add_u32 s4, s4, 0x10', 's_addc_u32 s5, s5, 0'],
     ['s_getpc_b64 s[4:5]', 's_load_dword s0, s[4:5], 0x0'],
 )
-for kind in ('ps', 'cs'):
-    for lines in FORMS:
-        reason, _ = refusal(lines, kind)
-        check('%s: %s names the reason' % (kind, ' ; '.join(lines)[:52]), reason == REASON, repr(reason))
+for lines in FORMS:
+    reason, _ = refusal(lines)
+    check('ps: %s names the reason' % ' ; '.join(lines)[:52], reason == REASON, repr(reason))
+
+for lines in FORMS[:2]:
+    reason, _ = refusal([*lines, 's_endpgm'], 'cs')
+    check('cs: unused code address is elided', reason is None, repr(reason))
+
+reason, _ = refusal([*FORMS[2], 's_endpgm'], 'cs')
+check('cs: load into code is refused', reason is not None and 'outside trailing data' in reason, repr(reason))
 
 # The refusal is not the bare mnemonic: that is the regression this check exists for.
 reason, _ = refusal(['s_getpc_b64 s[4:5]'])

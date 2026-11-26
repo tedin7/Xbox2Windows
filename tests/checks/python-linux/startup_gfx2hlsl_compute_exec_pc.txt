@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_compute_exec_pc_check.py
