@@ -3860,6 +3860,7 @@ class Stage:
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
+            self.uses_mask_ballot = False
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
@@ -4949,6 +4950,76 @@ class Stage:
                 return t.strip()
         return None
 
+    def lower_mask_word_sop2(self, base, ops, mods):
+        """Lower whole-word reads of entry EXEC and straight-line compare masks."""
+        if (base not in MASK_WORD_SOP2 or mods or len(ops) != 3 or getattr(self, 'kind', None) != 'cs'
+                or getattr(self, 'has_branches', False) or not getattr(self, 'exec_known', False)):
+            return False
+        # SM 6.0 guarantees at least four lanes per host wave. The group fits both the host
+        # wave and the guest's low word. Use logical thread IDs so host lane numbering is irrelevant.
+        group = getattr(getattr(self, 'pipe', None), 'group', None)
+        if group not in ((2, 1, 1), (3, 1, 1), (4, 1, 1)):
+            return False
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            return False
+        sources = ops[1:]
+        masks = [self.is_lane_mask(tok) for tok in sources]
+        if not any(masks) or (base == 's_nor_b32' and all(masks)):
+            return False  # keep the existing all-mask NOR projection
+        if self.reads_mask_high(sources):
+            return False
+        keys = [tok.removesuffix('_lo') for tok in sources]
+        # A tagged bit alone is insufficient. Only entry EXEC and a compare issued with
+        # entry EXEC prove that bits for absent lanes are zero.
+        proven = {'exec'}
+        for off, _, name, asm in self.ins:
+            if off >= self.pc:
+                break
+            operands = parse(asm)[1]
+            if writes_exec(name, operands) or 'movrel' in name or name.startswith(('s_setpc', 's_swappc')):
+                return False
+            _, writes, may = scalar_effects(name, asm)
+            proven.difference_update(may)
+            if name.startswith('v_cmp'):
+                for word in writes - {'vcc_hi', 'exec_hi'}:
+                    reg = reg_range(word)
+                    if reg:
+                        if reg[1] % 2 == 0 and getattr(self.pipe, 'wave_size', None) != 32:
+                            # The decoder may print only the low destination of a wave64 compare.
+                            proven.discard('s%d' % (reg[1] + 1))
+                        if reg[2] != reg[1]:
+                            continue
+                    proven.add(word)
+        if any(key not in proven if flag else not self.uniform_source(tok)
+               for tok, flag, key in zip(sources, masks, keys)):
+            return False
+        if any(not flag and (reg := reg_range(tok)) and
+               (reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105)
+               for tok, flag in zip(sources, masks)):
+            return False
+
+        values = [self.u(tok) for tok in sources]
+        for i, flag in enumerate(masks):
+            if flag:
+                temp = 'x2w_mask_%x_%d' % (self.pc, i)
+                self.emit('uint %s = x2w_ballot(%s, tid.x);' % (temp, values[i]))
+                values[i] = temp
+        self.uses_mask_ballot = True
+        expr = SCA[base][0].format(*values)
+        d = dst[1]
+        if base == 's_nor_b32':
+            word = 'x2w_nor_%x' % self.pc
+            self.emit('uint %s = %s;' % (word, expr))
+            self.set_scc('%s != 0u' % word)
+            self.set_s(d, '(%s >> tid.x) & 1u' % word, uniform=False)
+            self.masks.add(d)
+        else:
+            if base in SHIFT_ADD:
+                self.set_scc(shift_add_carry(base, values, expr))
+            self.set_s(d, expr)
+        return True
+
     def lower(self, base, asm, ops, mods):
         """Lower one instruction; a vector ALU form that reads a lane mask as a number is refused.
 
@@ -4958,6 +5029,8 @@ class Stage:
         The check runs after the form's own refusals, so those keep their messages."""
         self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
+            return None
+        if self.lower_mask_word_sop2(base, ops, mods):
             return None
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
@@ -6024,8 +6097,7 @@ class Stage:
                 self.set_scc(scc_text)
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
-            n = SHIFT_ADD[base]
-            self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
+            self.set_scc(shift_add_carry(base, values, expr))
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -10884,6 +10956,10 @@ SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
                             's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
 
 
+def shift_add_carry(base, values, result):
+    return '(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - SHIFT_ADD[base], result, values[1])
+
+
 def add_sub_min_max_scc(base, a, b, result):
     """The SCC expression of s_add/s_sub/s_min/s_max_{i,u}32 over the source texts a and b and the result text.
     s_add_u32: carry out; s_sub_u32: borrow (S0 < S1); s_add_i32 / s_sub_i32: signed overflow (the sign of the result
@@ -10940,6 +11016,7 @@ SCALAR_CONST_FOLD = {
 }
 # shift amount of the scalar shift-and-add forms; their SCC is a carry from the sources, not a rule over the result
 SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
+MASK_WORD_SOP2 = SHIFT_ADD.keys() | {'s_mul_i32', 's_nor_b32'}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast, name='s_cmp_%s_%s' % (_name, _typ)):
@@ -11930,6 +12007,16 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if s.uses_mask_ballot:
+            shared.extend([
+                'uint x2w_ballot(uint bit, uint lane) {',
+                '    uint word = 0u;',
+                '    [unroll] for (uint i = 0u; i < %du; ++i) {' % self.group[0],
+                '        if (any(WaveActiveBallot(bit != 0u && lane == i) != 0u)) word |= 1u << i;',
+                '    }',
+                '    return word;',
+                '}',
+            ])
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
