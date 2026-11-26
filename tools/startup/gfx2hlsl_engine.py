@@ -6136,6 +6136,8 @@ class Stage:
     def op_s_andn2_saveexec_b64(self, ops, mods):
         self.op_s_and_saveexec_b64(ops, mods, '{0} & ~exec')
 
+    op_s_andn2_saveexec_b32 = op_s_andn2_saveexec_b64
+
     def op_s_andn2_wrexec_b64(self, ops, mods):
         if len(ops) != 2:
             raise Unsupported('wrexec with %d operands, expected 2' % len(ops))

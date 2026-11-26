@@ -877,6 +877,31 @@ CASES['JOIN-S-empty'] = (JOIN_HEAD + JOIN_ENTRY_GROUP + JOIN_BLOCK + JOIN_AFTER_
     '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f1400064a82060834870396be7e0395be078106bfc18017851703febe020088bf07051693160416801503febe16000c4a001070e004060480000081bf'), JOIN_RSRC2, (8, 1, 1), (4, 1, 1))
 
 
+# The else arm of a divergent if: s_and_saveexec_b32 picks lanes 0-2 for the then arm (v6 = 100) and keeps the entry mask in
+# s24; s_andn2_saveexec_b32 s24, s24 then leaves exec = s24 & ~exec (the other five lanes, v6 = 200) and the or restores
+# every lane. Each lane stores the value of its own arm: 100 for lanes 0-2, 200 for lanes 3-7, in every group.
+ELSE_SOURCE = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_saveexec_b32 s24, vcc_lo
+v_mov_b32 v6, 100
+s_andn2_saveexec_b32 s24, s24
+v_mov_b32 v6, 200
+s_or_b32 exec_lo, exec_lo, s24
+buffer_store_dword v6, v4, s[16:19], 0 offen
+s_endpgm
+"""
+CASES['ELSE-saveexec'] = (ELSE_SOURCE, bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f1400064a820608348300887d6a3c98beff020c7e64000000183f98beff020c7e'
+    'c80000007e187e88001070e004060480000081bf'), JOIN_RSRC2, (8, 1, 1), (4, 1, 1))
+
+
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
 
@@ -943,6 +968,10 @@ def expected(name):
                 if name == 'JOIN-S-guarded' and lane >= 3:
                     continue
                 out[group * 8 + lane] = (block + lane) & MASK
+        return out
+    if name == 'ELSE-saveexec':
+        for index in range(32):
+            out[index] = 100 if index % 8 < 3 else 200
         return out
     if name == 'O-dword':
         for group in range(4):
@@ -2304,6 +2333,8 @@ CONTROLS = {
     'join-s-drop': ('JOIN-S-after', 's22 = s7 * ud1;', 's22 = 0u;'),
     # The wave vote dropped: a wave with no active lane runs the block and reads the block's value instead of 7.
     'join-s-no-vote': ('JOIN-S-empty', 'pc = !x2w_any ? 2u : 1u;', 'pc = 1u;'),
+    # s_andn2_saveexec keeps the lanes the then arm did not take: S0 & ~exec. With S0 & exec the else arm runs on the then lanes.
+    'else-keeps-then': ('ELSE-saveexec', 'exec = (w & ~exec) & 1;', 'exec = (w & exec) & 1;'),
     # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
     's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
     # s_sub_u32 borrow: the first source is the smaller one.
@@ -2410,7 +2441,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
         else:
             runs = [(name, None) for name in CASES]
             runs.append(('join-load', 'join-load-zero'))
-            runs += [('JOIN-S-after', 'join-s-drop'), ('JOIN-S-empty', 'join-s-no-vote')]
+            runs += [('JOIN-S-after', 'join-s-drop'), ('JOIN-S-empty', 'join-s-no-vote'), ('ELSE-saveexec', 'else-keeps-then')]
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
             runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
