@@ -97,7 +97,7 @@ def make_tree(root):
     return tree, head, gen / "x2w_build_rev.cpp"
 
 
-def run_script(shell, tree, *args, extra_path=None, extra_env=None):
+def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr=False):
     env = dict(os.environ)
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     if extra_path:
@@ -107,8 +107,14 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None):
         del env[key]
     if "-FinishTranslateSeconds" not in args:
         args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
-    command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tree / "tools" / "startup" / "tester_run.ps1"),
-               "-Exe", "title.exe", "-DataDir", "data", *args]
+    script = str(tree / "tools" / "startup" / "tester_run.ps1")
+    if merge_stderr:
+        # A caller that merges the script's error stream into its output (`... 2>&1`, as a tester's wrapper or a log pipe
+        # does): Windows PowerShell 5.1 then turns every line a native command writes to stderr into an error record.
+        words = " ".join("'%s'" % word for word in ("-Exe", "title.exe", "-DataDir", "data", *args))
+        command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& '%s' %s 2>&1; exit $LASTEXITCODE" % (script, words)]
+    else:
+        command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Exe", "title.exe", "-DataDir", "data", *args]
     return subprocess.run(command, capture_output=True, text=True, errors="replace", env=env, timeout=300, cwd=str(tree))
 
 
@@ -314,7 +320,7 @@ def check_build(shell):
         shim.mkdir()
         (shim / "cmake.cmd").write_text('@echo CMake Warning: stub warning on stderr 1>&2\r\n@"%s" %%*\r\n' % shutil.which("cmake"),
                                         encoding="ascii")
-        result = run_script(shell, tree, "-CaptureEvery", "0", extra_path=shim)
+        result = run_script(shell, tree, "-CaptureEvery", "0", extra_path=shim, merge_stderr=True)
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert "stub warning on stderr" in result.stdout + result.stderr, "the shim did not run"
         assert "building startup_runtime" in result.stdout, result.stdout
