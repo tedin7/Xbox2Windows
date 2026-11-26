@@ -10,11 +10,14 @@
                                         64 threads (two wave32 waves): every thread stores its wave-ID bits and the scc select
   waves-control <wave-id-zero|wave-width-16> <dxc> <offscreen_check> <warp|hardware>
 
+  group-dispatch <dxc> <offscreen_check> warp
+                                        256-thread wave64 group and 250-thread wave32 group, wave IDs and counts
+  group-control <wave-id-zero|wave-count-floor> <dxc> <offscreen_check> warp
+
 For groups of at most 32 threads (one wave), TG_SIZE[11:6] (wave ID, mask 0xfc0) is identically 0.
 TG_SIZE sits in the SGPR immediately following USER_SGPR and any enabled TGID_X/Y/Z SGPRs.
-Only `s_and_b32 R, TG, 0xfc0` (or `0xfc0, TG`) into a plain SGPR <= 105 is accepted, lowering to
-`R = 0u; scc = false;` with `R` tracked as `('const', 0)`; every other read of the untouched
-TG_SIZE SGPR is refused.
+The startup translator accepts masks for the wave count and wave ID. Other reads of
+the untouched TG_SIZE SGPR are refused.
 """
 
 import struct
@@ -212,6 +215,42 @@ def waves_expected_words():
     return out
 
 
+# Every invocation stores one word with the RDNA2 wave-ID and wave-count fields.
+GROUP_CASES = {
+    'wave64': ((16, 4, 4), None, 64),
+    'wave32-tail': ((10, 5, 5), 32, 32),
+}
+
+
+def group_program(x, y):
+    return b''.join([
+        sop1(S_MOV_B32, 10, 6),
+        sop1(S_MOV_B32, 11, INLINE_0),
+        S_LOAD_X8_S12_S10,
+        sop2(S_AND_B32, 20, 8, LIT, 0x1f00000),
+        sop2(S_AND_B32, 21, LIT, 8, 0x3f),
+        sop2(S_OR_B32, 22, 20, 21),
+        vop3(V_MAD_U32_U24, 3, 256 + 2, 128 + y, 256 + 1),
+        vop3(V_MAD_U32_U24, 3, 256 + 3, 128 + x, 256 + 0),
+        vop2(V_LSHLREV_B32, 4, INLINE_2, 3),
+        vop1(V_MOV_B32, 8, 22),
+        S_WAITCNT_LGKM0,
+        bytes.fromhex('001070e004080480'),  # buffer_store_dword v8, v4, s[16:19], 0 offen
+        S_ENDPGM,
+    ])
+
+
+def group_case(name):
+    group, wave_size, reference_width = GROUP_CASES[name]
+    x, y, z = group
+    threads = x * y * z
+    waves = len(range(0, threads, reference_width))
+    expected = [(index // reference_width) << 20 | waves for index in range(threads)]
+    expected.extend([SENTINEL] * (WORDS - threads))
+    pipe = translate(code=group_program(x, y), group=group, wave_size=wave_size)
+    return group, expected, pipe.hlsl_cs()
+
+
 def translate(code=MAIN_PROGRAM, rsrc2=RSRC2, group=GROUP, wave_size=None):
     return G.ComputePipeline(code, root_blob(), rsrc2, group, wave_size=wave_size)
 
@@ -285,14 +324,27 @@ def check_controls():
     hi_hlsl = translate(code=hi_prog).hlsl_cs()
     assert '    v8 = 0x00000000u;' in hi_hlsl, hi_hlsl
 
-    # 4. >32 threads per group with TG_SIZE_EN is refused unless the program is wave32 (stated or proved) and whole waves.
-    for bad_group in ((8, 4, 2), (33, 1, 1), (64, 1, 1)):
-        refused('TG_SIZE_EN requires at most 32 threads per group',
-                lambda g=bad_group: translate(code=S_ENDPGM, group=g))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(33, 1, 1), wave_size=32))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(8, 4, 2), wave_size=64))
+    # 4. Multi-wave groups use the guest wave width and round up a partial last wave.
     wave_and = sop2(S_AND_B32, 20, 8, LIT, 0xfc0) + S_ENDPGM
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=wave_and, group=(8, 4, 2)))  # no wave size known
+    for group, wave_size, width in (((33, 1, 1), 32, 32), ((8, 4, 3), 64, 64), ((8, 4, 3), None, 64)):
+        hlsl = translate(code=wave_and, group=group, wave_size=wave_size).hlsl_cs()
+        assert 'uint group_index : SV_GroupIndex' in hlsl
+        assert 's20 = ((group_index / %du) << 6u);' % width in hlsl
+    folded = translate(code=wave_and, group=(64, 1, 1), wave_size=64).hlsl_cs()
+    assert 's20 = 0u;' in folded and 'SV_GroupIndex' not in folded
+    for name, width, waves in (('wave64', 64, 4), ('wave32-tail', 32, 8)):
+        _, expected, hlsl = group_case(name)
+        assert 'uint group_index : SV_GroupIndex' in hlsl
+        assert 's20 = ((group_index / %du) << 20u);' % width in hlsl
+        assert 's21 = %du;\n    scc = true;' % waves in hlsl
+        assert 's22 = s20 | 0x%08xu;' % waves in hlsl
+        assert expected[width] == (1 << 20) | waves
+    proved_code = sop1(S_MOV_B32, EXEC_LO, INLINE_NEG1) + group_program(10, 5)
+    proved_hlsl = translate(code=proved_code, group=(10, 5, 5)).hlsl_cs()
+    assert 's20 = ((group_index / 32u) << 20u);' in proved_hlsl
+    for control, name in GROUP_CONTROL_CASES.items():
+        _, _, hlsl = group_case(name)
+        assert mutate(hlsl, control, GROUP_CONTROLS) != hlsl
     waves_hlsl = translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32).hlsl_cs()
     assert '    s20 = (((tid.x + 8u * (tid.y + 4u * tid.z)) >> 5u) << 6u);\n    scc = s20 != 0u;' in waves_hlsl, waves_hlsl
     waves_pipe = translate(code=wave_and, group=(8, 4, 2), wave_size=32)
@@ -307,7 +359,7 @@ def check_controls():
 
     # 5. Disallowed reads of TG_SIZE are refused.
     bad_tg_reads = [
-        ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0x3f)),
+        ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0x40)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, 8)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, M0, 8, LIT, 0xfc0)),
@@ -395,7 +447,7 @@ def check_controls():
     ])
     refused('holding joined at a branch target', lambda: translate(code=join_leak).hlsl_cs())
 
-    print('tg_size_en: entry layout, s_and_b32 0xfc0 folding, v_mbcnt_lo base, overwrite and refusals pass')
+    print('tg_size_en: entry layout, wave ID and count, v_mbcnt_lo base, overwrite and refusals pass')
 
 
 CONTROLS = {
@@ -422,20 +474,39 @@ WAVES_MISMATCH = {
 }
 
 
+GROUP_CONTROL_CASES = {'wave-id-zero': 'wave64', 'wave-count-floor': 'wave32-tail'}
+GROUP_CONTROLS = {
+    'wave-id-zero': ('s20 = ((group_index / 64u) << 20u);', 's20 = 0u;'),
+    'wave-count-floor': ('s22 = s20 | 0x00000008u;', 's22 = s20 | 0x00000007u;'),
+}
+GROUP_MISMATCH = {
+    'wave-id-zero': 'word=64 expected=00100004 actual=00000004',
+    'wave-count-floor': 'word=0 expected=00000008 actual=00000007',
+}
+
+
 def mutate(hlsl, control, controls=None):
     old, new = (controls or CONTROLS)[control]
     assert hlsl.count(old) == 1, (control, hlsl)
     return hlsl.replace(old, new)
 
 
-def check_dispatch(dxc, runner, adapter, control=None, waves=False):
+def check_dispatch(dxc, runner, adapter, control=None, waves=False, group_name=None):
     runner = str(Path(runner).resolve())
     out = ROOT / 'out'
     out.mkdir(exist_ok=True)
-    controls, mismatch = (WAVES_CONTROLS, WAVES_MISMATCH) if waves else (CONTROLS, CONTROL_MISMATCH)
-    groups, group, expected = (WAVES_DISPATCH_GROUPS, WAVES_GROUP, waves_expected_words()) if waves else (
-        DISPATCH_GROUPS, GROUP, expected_words())
-    hlsl = (translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32) if waves else translate()).hlsl_cs()
+    if group_name:
+        controls, mismatch = GROUP_CONTROLS, GROUP_MISMATCH
+        groups = (1, 1, 1)
+        group, expected, hlsl = group_case(group_name)
+    elif waves:
+        controls, mismatch = WAVES_CONTROLS, WAVES_MISMATCH
+        groups, group, expected = WAVES_DISPATCH_GROUPS, WAVES_GROUP, waves_expected_words()
+        hlsl = translate(code=WAVES_PROGRAM, group=group, wave_size=32).hlsl_cs()
+    else:
+        controls, mismatch = CONTROLS, CONTROL_MISMATCH
+        groups, group, expected = DISPATCH_GROUPS, GROUP, expected_words()
+        hlsl = translate().hlsl_cs()
     if control:
         if control not in controls:
             raise SystemExit(f'unknown control {control!r}')
@@ -490,5 +561,13 @@ if __name__ == '__main__':
         sys.exit(check_dispatch(*sys.argv[2:], waves=True))
     elif len(sys.argv) == 6 and sys.argv[1] == 'waves-control':
         sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2], waves=True))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'group-dispatch':
+        for name in GROUP_CASES:
+            status = check_dispatch(*sys.argv[2:], group_name=name)
+            if status:
+                sys.exit(status)
+    elif len(sys.argv) == 6 and sys.argv[1] == 'group-control':
+        control = sys.argv[2]
+        sys.exit(check_dispatch(*sys.argv[3:], control=control, group_name=GROUP_CONTROL_CASES[control]))
     else:
         sys.exit(__doc__)

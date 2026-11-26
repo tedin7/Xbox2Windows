@@ -1719,7 +1719,8 @@ def check_controls():
         assert stage.entry == entry + ['v0 = tid.x;'], (hex(rsrc2), stage.entry)
     # Entry refusals.
     end = bytes.fromhex('000081bf')
-    refused('TG_SIZE_EN', lambda: G.ComputePipeline(end, root_blob(), USER7 | TG_SIZE_EN, (8, 4, 2)))
+    refused('TG_SIZE_EN requires a guest wave size of 32 or 64',
+            lambda: G.ComputePipeline(end, root_blob(), USER7 | TG_SIZE_EN, (8, 4, 2), wave_size=16))
     refused('thread-ID component count', lambda: G.ComputePipeline(end, root_blob(), USER7 | (3 << 11), (1, 1, 1)))
     refused('gives 6 user SGPRs', lambda: G.ComputePipeline(end, root_blob(), 6 << 1, (1, 1, 1)))
     refused('thread group', lambda: G.ComputePipeline(end, root_blob(), USER7, (1024, 2, 1)))

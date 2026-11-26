@@ -4668,7 +4668,7 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
-    # gfx2hlsl COMPUTE_PGM_RSRC2.TG_SIZE_EN wave-ID masking for single-wave groups <= 32 threads (Refs #2274).
+    # gfx2hlsl COMPUTE_PGM_RSRC2.TG_SIZE_EN wave ID and wave count (Refs #2274).
     add_test(NAME startup_compute_tg_size_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py")
     foreach(adapter IN ITEMS warp hardware)
@@ -4695,6 +4695,17 @@ if(EXISTS "${INTAKE_PYTHON}")
             set_tests_properties(startup_compute_tg_size_waves_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
+    endforeach()
+    add_test(NAME startup_compute_tg_size_group_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" group-dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_compute_tg_size_group_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    foreach(control IN ITEMS wave-id-zero wave-count-floor)
+        add_test(NAME startup_compute_tg_size_group_${control}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" group-control ${control} "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" warp)
+        set_tests_properties(startup_compute_tg_size_group_${control}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
     endforeach()
     # gfx2hlsl wave32 vcc_hi as an ordinary scalar register in a compute program with an s_cbranch_execz block.
     add_test(NAME startup_compute_vcc_hi_controls COMMAND "${INTAKE_PYTHON}" -B
