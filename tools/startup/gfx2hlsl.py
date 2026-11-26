@@ -9,6 +9,7 @@ import bisect
 from contextlib import suppress
 import functools
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -699,6 +700,11 @@ IMPLICIT_VCC_READ = ('v_div_fmas',)
 SCC_READERS = ('s_cselect', 's_cmov', 's_addc', 's_subb', 's_cbranch_scc')
 READ_MODIFY_WRITE = ('s_addk_i32', 's_mulk_i32', 's_cmov', 's_bitset', 'v_mac', 'v_fmac')
 TWO_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
+# Numeric forms covered by the compute scalar join readback fixtures.
+EXECZ_SCALAR_JOIN = frozenset({
+    's_and_b32', 's_bfm_b32', 's_lshl_b32',
+    's_buffer_load_dwordx2', 's_buffer_load_dwordx4', 's_load_dwordx2', 's_load_dwordx4',
+})
 # Effects outside scalar registers, or control flow the wave takes as a whole: refused inside such a block.
 EXECZ_REFUSED = ('s_endpgm', 's_store', 's_atomic', 's_buffer_store', 's_buffer_atomic', 's_barrier', 's_sendmsg',
                  's_setreg', 's_setpc', 's_swappc', 's_dcache', 's_icache', 's_gl1', 's_memtime', 's_memrealtime',
@@ -3063,6 +3069,8 @@ class Stage:
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
+        Also record which refusals the wave-uniform control-flow path can try to resolve.
+
         The wave runs such a block when any lane is active, so its scalar results are the same for every lane; the
         model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
         join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
@@ -3125,6 +3133,7 @@ class Stage:
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
         refused, into = {}, {}
+        self.execz_scalar_votes = {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
@@ -3171,6 +3180,7 @@ class Stage:
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
                 reason = None
+                vote_eligible = False
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
@@ -3186,6 +3196,12 @@ class Stage:
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
+                    # Reserve the fallback for ordinary scalar writes. The vote keeps every lane on the same
+                    # control-flow edge, so the existing runtime join selects every word (and SCC) together.
+                    dst = parse(inner_asm)[1][:1]
+                    vote_eligible = (straight and inner in EXECZ_SCALAR_JOIN and bool(dst)
+                                     and re.fullmatch(r's(?:\d+|\[\d+:\d+\])', dst[0]) is not None
+                                     and set(words) <= scalar_tokens(dst[0]) | (effects[i][1] & {'scc'}))
                     named = [unread[word] for word in words if unread[word] >= 0]
                     first = min(named) if named else None
                     word_of = next((w for w in words if unread[w] == first), None)
@@ -3194,7 +3210,9 @@ class Stage:
                     if named:
                         reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
-                    refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+                    message = '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason)
+                    refused.setdefault(at, message)
+                    self.execz_scalar_votes[at] = self.execz_scalar_votes.get(at, True) and vote_eligible
         return refused
 
     def execz_read_cause(self, j, word, b, t, effects, into):
@@ -3786,6 +3804,13 @@ class Stage:
         # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
+        # Use the existing wave-uniform branch path only for a compute shader the lane proof rejected.
+        # A group of at most 32 threads fits one compute wave under the runtime's wave model.
+        scalar_vote = (bool(refused) and all(self.execz_scalar_votes.get(at) for at in refused)
+                       and all(target > pc for pc, target in branches)
+                       and math.prod(getattr(self.pipe, 'group', (33,))) <= 32)
+        if scalar_vote:
+            self.wave_exec = True
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
@@ -4057,7 +4082,14 @@ class Stage:
                         self.float_const_s.pop(reg, None)
                 try:
                     if off in refused:
-                        raise Unsupported(refused[off])
+                        if not scalar_vote:
+                            raise Unsupported(refused[off])
+                        operands = parse(asm)[1]
+                        sources = operands[1:] if name in SCA else [smem_offset(operands[2])]
+                        if not all(self.uniform_source(src) for src in sources):
+                            raise Unsupported(refused[off])
+                        if name.startswith('s_buffer_load') and self.descriptor(operands[1]) in self.pipe.rw_keys:
+                            raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
@@ -12944,6 +12976,8 @@ LIFTED_REASONS = (
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
     ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),
+    ('compute-execz-scalar', r'^(?:' + '|'.join(sorted(EXECZ_SCALAR_JOIN)) +
+     r') inside a block s_cbranch_execz skips per lane: definition of .*?, live where the block joins'),
     ('mesh57-firstlane', r'^slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
