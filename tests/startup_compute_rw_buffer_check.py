@@ -11,6 +11,7 @@ buffer cannot be bound in one dispatch. The loads now read the same RWByteAddres
   store_then_load: out[i] = i; out[i] = out[i] + 7   (a store followed by a load of the word it wrote)
 """
 import argparse
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -108,7 +109,7 @@ def dispatch(dxc, runner, adapter):
                              + struct.pack('<%dI' % WORDS, *expected(name))
                              + struct.pack('<16I', KEY, STRIDE, *([0] * 14)))
             # The control reads zero instead of the buffer: the readback must then differ from the reference.
-            mutant = hlsl.replace('u0.Load(', '(0u & u0.Load(', 1)
+            mutant = re.sub(r'u0\.Load\(([^;]*)\);', r'(0u & u0.Load(\1));', hlsl, count=1)
             assert mutant != hlsl and mutant.count('(0u & u0.Load(') == 1, hlsl
             for label, text in (('baseline', hlsl), ('dropped-load', mutant)):
                 src, cso = td / f'{name}_{label}.hlsl', td / f'{name}_{label}.cso'
