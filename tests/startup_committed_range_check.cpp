@@ -15,6 +15,10 @@ LONG CALLBACK count_fault(EXCEPTION_POINTERS* e)
 {
     if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         InterlockedIncrement(&faults);  // only the mutant gets here
+        // End with a plain exit code: CTest reports an unhandled access violation as an exception, which WILL_FAIL does not turn into a pass.
+        std::printf("startup_committed_range: FAILED, memory was touched (access violation at %p)\n", e->ExceptionRecord->ExceptionAddress);
+        std::fflush(stdout);
+        ExitProcess(1);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
