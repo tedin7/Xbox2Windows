@@ -269,6 +269,20 @@ struct RootParameter;
 void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
+// True when `handle` lies in a title descriptor heap but not on the start of one of its slots.
+bool cpu_handle_inside_slot(std::uint64_t handle)
+{
+    bool inside = false;
+    AcquireSRWLockShared(&descriptor_lock);
+    for (const auto& r : descriptor_ranges) {
+        if (handle < r.title || handle - r.title >= r.bytes) continue;
+        inside = r.title_stride && (handle - r.title) % r.title_stride != 0;
+        break;
+    }
+    ReleaseSRWLockShared(&descriptor_lock);
+    return inside;
+}
+
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
 {
     std::uint64_t result = handle;
@@ -5001,7 +5015,16 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     Timed timed(time_view);
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
-    args[D] = desktop_cpu_handle(args[D]);
+    // A handle inside a descriptor slot is not a descriptor: a driver that tags handle bits (vkd3d-proton) reads wild memory.
+    if (cpu_handle_inside_slot(title_dest)) {
+        static LONG refused;
+        if (InterlockedIncrement(&refused) <= 4)
+            log("x2w-d3d12 view slot %d: destination 0x%llx is not on a descriptor slot boundary, refused", N,
+                static_cast<unsigned long long>(title_dest));
+        args[D] = 0;
+    } else {
+        args[D] = desktop_cpu_handle(args[D]);
+    }
     // Slots 18-21 name a resource in a descriptor slot. While shadow_slot() tracks the destination, note_view() owns the
     // slot's reference: the view (slot 19 for its resource and its counter resource) holds the resource in the retire
     // class until the slot is overwritten, copied over, or its heap is destroyed. Without a tracked slot the shim cannot

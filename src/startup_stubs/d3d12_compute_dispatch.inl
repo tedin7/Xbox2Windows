@@ -427,7 +427,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             views[i].wrapper = view.token_owner;
             views[i].words[0] = view_token_magic;
             views[i].words[1] = view.stride << 16;
-            views[i].words[2] = static_cast<UINT>(view.bytes / (view.stride ? view.stride : 4));
+            // A raw view (stride 0) counts records in bytes, a structured or typed view in elements.
+            views[i].words[2] = static_cast<UINT>(view.stride ? view.bytes / view.stride : view.bytes);
             continue;
         }
         // A hardware buffer descriptor must name a placed buffer that aliases title memory.
@@ -569,6 +570,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     }
     // Order later UAV accesses even if the resource stays in UAV state. SRV consumers transition it with require_state.
     for (std::size_t i = inputs; i < count; ++i) {
+        if (views[i].wrapper && views[i].words[0] == view_token_magic)
+            note_placed_gpu_write(views[i].wrapper, views[i].offset, views[i].bytes);  // title memory is stale now
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;
