@@ -29,11 +29,11 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-MENUS_STEP_S = 6
-MENUS_END_S = 500          # the preset stops here however long the run is
+MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
+MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
 BUTTON_A = "4"
-MENUS_HOLD_S = "1.5"       # a press is held this long: at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
 MENUS2_HOLD_S = "1.2"
 MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
@@ -63,8 +63,8 @@ def menus2_script():
 
 
 def input_preset(spec, seconds):
-    """`menus` is D-pad down, D-pad down, A, one press every 6 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 500 s, at most 256 entries. Anything else is a raw script."""
+    """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
+    `seconds` of script time, but not past 300 s, at most 256 entries. Anything else is a raw script."""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
