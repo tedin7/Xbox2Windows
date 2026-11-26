@@ -11061,7 +11061,9 @@ class Pipeline:
                 '        y *= asfloat(0x0c800000u); n += 102;',
                 '        if (n < -126) { y *= asfloat(0x0c800000u); n += 102; if (n < -126) n = -126; }',
                 '    }',
-                '    return y * asfloat(uint(0x7f + n) << 23);',
+                '    float r = y * asfloat(uint(0x7f + n) << 23);',
+                '    // An underflow to zero keeps the sign of the source, as the product does (some compilers return +0).',
+                '    return r == 0.0f ? asfloat(asuint(x) & 0x80000000u) : r;',
                 '}',
             ))
         if 'v_sad_u8' in self.uses_sad:
