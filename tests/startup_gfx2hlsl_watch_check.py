@@ -8,9 +8,15 @@ earlier failure once, translate a new request while it runs and not rewrite a fa
 passes. A --pending scan with four parallel workers must print the same results and write the same
 failures as one worker, an unexpected translator error must become <key>.fail, a broken process
 pool must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall
-back to the processor count.
+back to the processor count. Requests are served oldest published first, with those published after the
+watcher started ahead of the backlog; a request published during a long --watch pass is translated next
+(one worker, and two forked workers), not after the backlog; and a --pending scan with four workers and a
+--watch pass leave the same files as translating each pending request on its own.
 """
+import contextlib
+import io
 import json
+import multiprocessing
 import os
 import re
 import struct
@@ -225,7 +231,7 @@ with tempfile.TemporaryDirectory() as tmp:
 from concurrent.futures.process import BrokenProcessPool  # noqa: E402
 
 
-def broken(out_dir, skip_failed=False):
+def broken(out_dir, skip_failed=False, **watch_options):
     raise BrokenProcessPool('a worker was terminated abruptly')
 
 
@@ -282,6 +288,135 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('watcher output (each request translated once)', [line[:16] for line in lines], ['%016x' % 7, '%016x' % 8])
     if err.strip():
         failures.append('watcher stderr: %r' % err.strip()[-500:])
+
+
+# Order: the oldest published request first; under --watch the ones published after the watcher started go first.
+def recorded_order(d, since=None, rescan=False, on_call=None):
+    calls = []
+    real = gfx2hlsl.translate_request
+
+    def fake(out_dir, key):
+        calls.append(key)
+        if on_call:
+            on_call(len(calls))
+        time.sleep(0.05)
+        return 'ok'
+    gfx2hlsl.translate_request = fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            gfx2hlsl.translate_pending(str(d), jobs=1, rescan=rescan, since=since)
+    finally:
+        gfx2hlsl.translate_request = real
+    return calls
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    now = time.time()
+    for key, age in ((0x30, 30), (0x10, 10), (0x20, 20), (0x40, 1)):  # key order differs from age order
+        touch(d / ('req_%016x.rtv' % key), mtime=now - age)
+    expect('oldest published first', recorded_order(d), [0x30, 0x20, 0x10, 0x40])
+    expect('requests since the watcher started first, then the backlog',
+           recorded_order(d, since=now - 15), [0x10, 0x40, 0x30, 0x20])
+
+# A request published during a long pass is translated before the old backlog ends (in-process, one worker).
+saved_rescan = gfx2hlsl.RESCAN_SECONDS
+gfx2hlsl.RESCAN_SECONDS = 0.0
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    now = time.time()
+    backlog = [0x100 + n for n in range(8)]
+    for n, key in enumerate(backlog):
+        touch(d / ('req_%016x.rtv' % key), mtime=now - 100 + n)
+    late = 0x1
+    calls = recorded_order(d, since=now, rescan=True,
+                           on_call=lambda n: n == 2 and touch(d / ('req_%016x.rtv' % late)))
+    expect('every request translated once, the late one included', sorted(calls), sorted(backlog + [late]))
+    expect('the late request is next after the request in progress', calls.index(late) if late in calls else None, 2)
+    # Without rescans (one-shot --pending) the late request waits for the next scan.
+    for key in backlog + [late]:
+        (d / ('req_%016x.rtv' % key)).unlink()
+    for n, key in enumerate(backlog):
+        touch(d / ('req_%016x.rtv' % key), mtime=now - 100 + n)
+    calls = recorded_order(d, since=now, rescan=False,
+                           on_call=lambda n: n == 2 and touch(d / ('req_%016x.rtv' % late)))
+    expect('one-shot scan: the late request is not picked up', late in calls, False)
+
+# The same with parallel workers (forked, so they run this check's slow fake): the late request finishes before
+# the backlog does.
+if os.name != 'nt' and 'fork' in multiprocessing.get_all_start_methods():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        now = time.time()
+        backlog = [0x200 + n for n in range(12)]
+        for n, key in enumerate(backlog):
+            touch(d / ('req_%016x.rtv' % key), mtime=now - 100 + n)
+        late = 0x2
+        real = gfx2hlsl.translate_request
+
+        def slow(out_dir, key):
+            if key == backlog[1]:
+                touch(Path(out_dir) / ('req_%016x.rtv' % late))
+            time.sleep(0.4)
+            Path(out_dir, '%016x.done' % key).write_text(repr(time.time()))
+            return 'ok'
+        gfx2hlsl.translate_request = slow
+        previous = multiprocessing.get_start_method(allow_none=True)
+        multiprocessing.set_start_method('fork', force=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gfx2hlsl.translate_pending(str(d), jobs=2, rescan=True, since=now)
+        finally:
+            gfx2hlsl.translate_request = real
+            multiprocessing.set_start_method(previous, force=True)
+        done = {int(p.name[:16], 16): float(p.read_text()) for p in d.glob('*.done')}
+        expect('parallel: every request translated', sorted(done), sorted(backlog + [late]))
+        if late in done and set(backlog) <= set(done):
+            expect('parallel: the late request finished before the backlog ended',
+                   done[late] < max(done[key] for key in backlog), True)
+gfx2hlsl.RESCAN_SECONDS = saved_rescan
+
+# The files the driver leaves are those of translating each pending request on its own, as the earlier driver did
+# (key order, one worker): a translated pair, an RTV variant of it and a refused mesh pair, manifest-only.
+def fixture_cache(d):
+    root = quad.root_blob()
+    key = gfx2hlsl.pipeline_key(quad.VS_WORDS, quad.EXPORT, root)
+    for ext, blob in (('.a', quad.VS_WORDS), ('.b', quad.EXPORT), ('.root', root)):
+        touch(d / ('req_%016x%s' % (key, ext)), blob)
+    request = b'rtv1 %d 28' % key
+    touch(d / ('req_%016x.rtv' % gfx2hlsl.fnv(request)), request)
+    mesh_root = (b'DXBC' + bytes(24) + struct.pack('<II', 1, 36) + b'RTS0' + struct.pack('<I6I', 24, 1, 0, 24, 0, 24, 0))
+    mkey = gfx2hlsl.mesh57_key(vertex, pixel, mesh_root)
+    for ext, blob in (('.root', mesh_root), ('.ps57', pixel), ('.m57', vertex)):
+        touch(d / ('req_%016x%s' % (mkey, ext)), blob)
+
+
+def tree(d):
+    return {p.name: p.read_bytes() for p in sorted(Path(d).iterdir())}
+
+
+saved_fxc = os.environ.get('X2W_FXC')
+os.environ['X2W_FXC'] = ''
+try:
+    with tempfile.TemporaryDirectory() as ref, tempfile.TemporaryDirectory() as par, \
+            tempfile.TemporaryDirectory() as watched:
+        for d in (ref, par, watched):
+            fixture_cache(Path(d))
+        with contextlib.redirect_stdout(io.StringIO()):
+            for key in gfx2hlsl.pending_keys(ref, False):
+                gfx2hlsl.translate_one(ref, key)
+            gfx2hlsl.translate_pending(watched, jobs=1, rescan=True, since=time.time())
+        expect('fixture: something was translated and something refused',
+               (any(n.endswith('.txt') for n in tree(ref)), any(n.endswith('.fail') for n in tree(ref))), (True, True))
+        code, _, _ = pending_run(par, 4)
+        expect('parallel --pending exit', code, 0)
+        expect('parallel --pending leaves the same files as one request at a time', tree(par), tree(ref))
+        expect('a --watch pass leaves the same files as one request at a time', tree(watched), tree(ref))
+finally:
+    if saved_fxc is None:
+        os.environ.pop('X2W_FXC', None)
+    else:
+        os.environ['X2W_FXC'] = saved_fxc
 
 for item in failures:
     print('FAIL', item)

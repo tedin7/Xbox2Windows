@@ -1237,6 +1237,11 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
+# Text of the x2w-budget commit fields and the commit-exhausted line (src/startup_stubs/commit_state.h).
+add_executable(startup_commit_state_check tests/startup_commit_state_check.cpp)
+target_compile_features(startup_commit_state_check PRIVATE cxx_std_17)
+target_include_directories(startup_commit_state_check PRIVATE src)
+add_test(NAME startup_commit_state COMMAND startup_commit_state_check)
 # WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint. The sink is
 # compiled once for this check and the pacing control below.
 add_library(startup_audio_sink_obj OBJECT src/startup_stubs/audio_sink.cpp)
