@@ -498,8 +498,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 std::memcpy(&srv, read.desc, sizeof(srv));
                 const auto& array = desc.Texture2DArray;
                 const ComputeMipWrite write = slot.array ? ComputeMipWrite{array.MipSlice, array.FirstArraySlice, array.ArraySize}
-                    : ComputeMipWrite{described ? desc.Texture2D.MipSlice : 0, 0, 1};
-                if (write.mip >= resource.MipLevels || !disjoint_compute_mips(srv, write, resource.MipLevels)) {
+                    : ComputeMipWrite{described ? desc.Texture2D.MipSlice : 0, 0, described ? 1u : resource.DepthOrArraySize};
+                // The barriers below name exactly these subresources: a range past the resource (or a wrapped sum) is refused.
+                if (write.slices == 0 || write.first_slice >= resource.DepthOrArraySize ||
+                    write.slices > resource.DepthOrArraySize - write.first_slice || write.mip >= resource.MipLevels ||
+                    !disjoint_compute_mips(srv, write, resource.MipLevels)) {
                     reason = "an output texture is also an input of the dispatch";
                     break;
                 }
