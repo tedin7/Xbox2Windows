@@ -79,9 +79,12 @@ def _bounded_code(image, start):
     return image[start:end]
 
 
-def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
-    """Both decoded exits must be reachable from the single entry."""
-    instructions = dict(disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
+def _check_two_exits(code, llvm, *, cpu, features, mesh=False, decoder=None):
+    """Both decoded exits must be reachable from the single entry.
+
+    The instruction boundaries come from LLVM, or from `decoder(code)` (a list of (byte offset, text)) when the caller has
+    no LLVM library and decodes the code itself (the startup translator); it must raise ValueError on an undecodable word."""
+    instructions = dict(decoder(code) if decoder else disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
     if len(exits) != 2 or exits[-1] + 4 != len(code):
         raise ValueError("Expected two decoded exits")
@@ -177,7 +180,7 @@ def container_image(program, *, stage):
     return image
 
 
-def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", decoder=None):
     """Extract the stage-specific instruction stream from a DXIL program part."""
     image = container_image(program, stage=stage)
     start = struct.unpack_from("<I", image, 192)[0] + 40
@@ -189,8 +192,8 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
         if markers == 1:
             return code
         mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
-        if (stage in (0, 5) or mesh) and markers == 2 and llvm is not None:
-            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh)
+        if (stage in (0, 5) or mesh) and markers == 2 and (llvm is not None or decoder is not None):
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, decoder=decoder)
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.
