@@ -1764,7 +1764,7 @@ def mesh_constant_trip(ins, header, latch, offsets):
     return (trips,) if trips is not None else None
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_inner=None):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -1949,7 +1949,12 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
                     match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
-                    scalar = [i for i in range(source + 1, target) if not (no_effect(i) or lane_only(i))]
+                    # Inner forward scalar branches of the block (decided by SCC) stay inside it: the translation takes them
+                    # per lane, which is the wave's decision when the SCC is wave-uniform (the emitter checks that).
+                    inner = [i for i in range(source + 1, target) if i in edges
+                             and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
+                             and i < edges[i] <= target]
+                    scalar = [i for i in range(source + 1, target) if i not in inner and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
                     # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
                     # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
@@ -1971,13 +1976,24 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     # land between the compare and the execz branch, and the block itself is straight-line code.
                     entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
-                    if (compare <= a_end or ins[reset][3] != 's_mov_b64 exec, -1' or not match or entries
-                            or targets.intersection(range(source + 1, target))
-                            or any(s in edges for s in range(source + 1, target))
-                            or any(live_at_join(reg, target) for reg in masks)
-                            or any(not mesh_wave_block_scalar(*ins[i][2:]) for i in scalar)):
-                        raise Unsupported(exchange_branch_refusal if target == count_at else execz_effects)
+                    causes = [name for name, failed in (
+                        ('no compare before the branch', compare <= a_end),
+                        ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
+                        ('compare is not v_cmpx_gt_u32 sN, vK', not match),
+                        ('a branch lands between the reset and the branch', bool(entries)),
+                        ('a branch from outside lands inside the block',
+                         any(source < d < target and not source < s < target for s, d in edges.items())),
+                        ('a branch inside the block other than a forward SCC branch',
+                         any(s in edges and s not in inner for s in range(source + 1, target))),
+                        ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
+                        ('a scalar instruction the wave block cannot run once per wave',
+                         any(not mesh_wave_block_scalar(*ins[i][2:]) for i in scalar))) if failed]
+                    if causes:
+                        raise Unsupported(exchange_branch_refusal if target == count_at
+                                          else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
                     load_compares[compare] = int(match[2])
+                    if wave_inner is not None:
+                        wave_inner.update(ins[i][0] for i in inner)
                     wave_loads[ins[source][0]] = (ins[compare][0], match[1],
                                                   tuple(ins[i][0] for i in loads), tuple(live))
                     continue
@@ -2277,10 +2293,12 @@ class Stage:
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
+            self.mesh_wave_inner = set()
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads,
+                                     self.mesh_wave_inner)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
@@ -3446,6 +3464,7 @@ class Stage:
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
         wave_limits = getattr(self, 'mesh_wave_limits', {})
         wave_loads = getattr(self, 'mesh_wave_loads', {})
+        wave_inner = getattr(self, 'mesh_wave_inner', set())
         wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
@@ -3782,6 +3801,9 @@ class Stage:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                             cond_uniform = True
+                        if off in wave_inner and not cond_uniform:
+                            # An SCC branch inside a wave-load block is the wave's decision only when every lane agrees.
+                            raise Unsupported(execz_effects + ' (wave-load block: an inner SCC branch on a lane-dependent SCC)')
                         if cond_uniform:
                             self.uniform_branches.add(off)
                         elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
