@@ -7,7 +7,7 @@
 // around the call and back at Close; upload and readback buffers keep the state their heap requires.
 // CopyTextureRegion (16) and CopyTiles (18) carry footprints and addresses and are not handled here.
 
-LONG list_buffer_copies, list_resource_copies, list_resolves, list_copies_refused;
+LONG list_buffer_copies, list_resource_copies, list_resolves, list_copies_refused, list_title_memory_copies;
 
 // One copy argument: the desktop resource, and its wrapper when the title passed one.
 struct CopyEndpoint {
@@ -217,6 +217,29 @@ bool copy_source_authoritative(Wrapper* self, const CopyEndpoint& from, u64 offs
     return placed.alias || list_copied_gpu_range(self, from.resource, offset, bytes);
 }
 
+// A buffer copy whose source is a placed buffer that does not alias title memory is refused (its desktop copy holds nothing the
+// title wrote). When the title wrote the source with the CPU (no recorded copy wrote it) and the destination is title-backed too,
+// the copy is made in title memory now, which is also when a draw in the same recording snapshots the destination. A source or
+// destination the GPU wrote keeps the refusal: its newer bytes are not in title memory.
+bool copy_in_title_memory(const CopyEndpoint& to, u64 to_offset, const CopyEndpoint& from, u64 from_offset, u64 bytes)
+{
+    if (!to.wrapper || !from.wrapper || !to.resource || !from.resource || !bytes) return false;
+    auto* const to_memory = static_cast<unsigned char*>(to.wrapper->own().title_memory);
+    auto* const from_memory = static_cast<const unsigned char*>(from.wrapper->own().title_memory);
+    if (!to_memory || !from_memory) return false;
+    const auto* from_info = resource_info(from.wrapper);
+    if (!from_info || from_info->placement != Placement::copied_buffer) return false;
+    if (placed_gpu_written(from.wrapper, from_offset, bytes) || placed_gpu_written(to.wrapper, to_offset, bytes)) return false;
+    const u64 to_width = to.resource->GetDesc().Width, from_width = from.resource->GetDesc().Width;
+    if (to_offset > to_width || bytes > to_width - to_offset || from_offset > from_width || bytes > from_width - from_offset)
+        return false;
+    if (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
+        !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes)))
+        return false;
+    std::memmove(to_memory + to_offset, from_memory + from_offset, static_cast<std::size_t>(bytes));
+    return true;
+}
+
 // List slot 15, CopyBufferRegion(destination, destination offset, source, source offset, bytes).
 void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 destination_offset, u64 source, u64 source_offset,
                                        u64 bytes)
@@ -235,6 +258,19 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
         copy_source_authoritative(self, from, source_offset, bytes);
     if (refusal == x2w_startup::CopyRefusal::none && !authoritative && !sync_title_source(self, from))
         refusal = x2w_startup::CopyRefusal::title_backed_source;
+    if (refusal == x2w_startup::CopyRefusal::title_backed_source) {
+        static LONG logged_title_copies;
+        const bool made = !snapshot_placed_buffers_mutant() && copy_in_title_memory(to, destination_offset, from, source_offset, bytes);
+        if (first_calls(logged_title_copies, 16))
+            log("x2w-d3d12 CopyBufferRegion from a placed buffer without title backing: destination %p+0x%llx source %p+0x%llx %llu bytes -> %s",
+                to.wrapper ? to.wrapper->own().title_memory : nullptr, destination_offset,
+                from.wrapper ? from.wrapper->own().title_memory : nullptr, source_offset, bytes,
+                made ? "copied in title memory" : "refused");
+        if (made) {
+            InterlockedIncrement(&list_title_memory_copies);
+            return;
+        }
+    }
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyBufferRegion", refusal);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
