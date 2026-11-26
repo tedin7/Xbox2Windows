@@ -327,7 +327,7 @@ def check_build(shell):
                                         encoding="ascii")
         result = run_script(shell, tree, "-CaptureEvery", "0", extra_path=shim, merge_stderr=True)
         assert result.returncode == 0, (result.stdout, result.stderr)
-        assert "stub warning on stderr" in result.stdout + result.stderr, "the shim did not run"
+        assert "stub warning on stderr" in result.stdout + result.stderr, ("the shim did not run", result.stdout[-1500:], result.stderr[-500:])
         assert "building startup_runtime" in result.stdout, result.stdout
         for dll in DLLS:
             assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"
