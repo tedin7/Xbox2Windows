@@ -12251,10 +12251,11 @@ def main():
         # The pool is small (watch_jobs) and logs its size and commit every POOL_LOG_SECONDS.
         started = time.time()  # requests published after this are the running title's: they go first
         jobs, monitor = watch_jobs(), PoolMonitor()
+        clock = TitleClock(os.environ.get('X2W_TITLE_START_FILE'), started)
         print('gfx2hlsl watch: pool of at most %d workers, old failures left for the pass after the run' % jobs,
               file=sys.stderr, flush=True)
         while True:
-            watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
+            watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True, clock=clock)
             monitor.tick(None)
             time.sleep(interval)
     translate_pending(out_dir, since_translator=translator_stamp())
@@ -12275,14 +12276,15 @@ def translator_stamp():
     return max(os.path.getmtime(name) for name in files if os.path.isfile(name))
 
 
-def watch_pass(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False):
+def watch_pass(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False,
+               clock=None):
     """One --watch pass: translate_pending with rescans, so a request the title publishes during a long pass starts
     within about RESCAN_SECONDS. A worker killed from outside (out of memory) breaks the pool; the pass is
     reported and its requests are retried on the next pass instead of ending the watcher."""
     from concurrent.futures.process import BrokenProcessPool
     try:
         translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since, since_translator=since_translator,
-                          jobs=jobs, monitor=monitor, recycle=recycle)
+                          jobs=jobs, monitor=monitor, recycle=recycle, clock=clock)
         return True
     except BrokenProcessPool as error:
         print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
@@ -12376,6 +12378,35 @@ def private_bytes(pid):
         return None
 
 
+TITLE_START_SLACK = 30.0  # s: a title.pid older than the watcher by more than this is an earlier run's
+
+
+class TitleClock:
+    """--watch: the ' [t=N s]' suffix of a result line (translate.txt), so a translation lines up with the run's
+    timeline. N counts from the title's start, the mtime of `start_file` (the run's title.pid, written when the title
+    is launched, a few seconds after the watcher) once it exists and is not older than the watcher; until then from the
+    watcher's start, marked ' [t=N s, translator clock]'."""
+
+    def __init__(self, start_file, started, now=time.time):
+        self.start_file, self.started, self.now, self.zero = start_file, started, now, None
+
+    def title_start(self):
+        if self.zero is None and self.start_file:
+            try:
+                written = os.stat(self.start_file).st_mtime
+            except OSError:
+                return None
+            if written >= self.started - TITLE_START_SLACK:  # a title.pid left by an earlier run is not this start
+                self.zero = written
+        return self.zero
+
+    def __call__(self):
+        zero = self.title_start()
+        if zero is None:
+            return ' [t=%.1f s, translator clock]' % (self.now() - self.started)
+        return ' [t=%.1f s]' % (self.now() - zero)
+
+
 class PoolMonitor:
     """Logs the --watch pool every POOL_LOG_SECONDS to stderr: workers alive, requests running, their committed
     private memory now and the peak seen."""
@@ -12430,7 +12461,7 @@ def request_order(stamps, since=None):
 
 
 def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None,
-                      monitor=None, recycle=False):
+                      monitor=None, recycle=False, clock=None):
     """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
     the ready markers last.
 
@@ -12469,13 +12500,13 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 key = queue.pop(0)
                 handled[key] = stamps[key]
                 if pool is None:
-                    print('%016x: %s' % (key, translate_one(out_dir, key)), flush=True)
+                    print('%016x: %s%s' % (key, translate_one(out_dir, key), clock() if clock else ''), flush=True)
                     break
                 running[pool.submit(translate_one, out_dir, key)] = key
             if running:
                 done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
                 for future in done:
-                    print('%016x: %s' % (running.pop(future), future.result()), flush=True)
+                    print('%016x: %s%s' % (running.pop(future), future.result(), clock() if clock else ''), flush=True)
             if monitor is not None:
                 monitor.tick(pool, len(running or ()))
             idle = not queue and not running
