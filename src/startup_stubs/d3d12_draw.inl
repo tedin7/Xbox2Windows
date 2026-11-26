@@ -1643,13 +1643,15 @@ bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
     return false;
 }
 
-// Protected by draw_lock. A frame hold keeps slices alive between recordings.
+// Shared by both index staging switches. A frame hold preserves the slice between recordings.
 std::map<std::pair<u64, std::size_t>, UploadReservation> indirect_index_copies;
 UploadChunkMask indirect_index_chunks;
 
 void finish_indirect_index_frame()
 {
     if (!indirect_index_chunks) return;
+    static const bool stale = indirect_index_shadow_enabled() && x2w_local::env_on("X2W_TEST_INDIRECT_INDEX_SHADOW_STALE");
+    if (stale) return; // Fixture mutant: leave the previous frame's bytes visible.
     indirect_index_copies.clear();
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(indirect_index_chunks, upload_chunks.data());
@@ -1657,21 +1659,22 @@ void finish_indirect_index_frame()
     ReleaseSRWLockExclusive(&allocator_lock);
 }
 
-bool copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW view, IndirectIndexView& result)
+IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW view, IndirectIndexView& result)
 {
-    const auto key = std::make_pair(view.BufferLocation, std::size_t{view.SizeInBytes});
-    // Fixture mutations affect only the opt-in copy route.
-    enum class Mutant { none, late, wide };
+    const std::size_t bytes = view.SizeInBytes;
+    const u64 address = view.BufferLocation;
+    enum class IndexCopyMutant { none, late, wide };
     static const auto mutant = [] {
         char value[16]{};
         const auto size = GetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_COPY", value, sizeof(value));
-        if (size >= sizeof(value)) return Mutant::none;
-        if (std::strcmp(value, "late") == 0) return Mutant::late;
-        if (std::strcmp(value, "wide") == 0) return Mutant::wide;
-        return Mutant::none;
+        if (size >= sizeof(value)) return IndexCopyMutant::none;
+        if (std::strcmp(value, "late") == 0) return IndexCopyMutant::late;
+        if (std::strcmp(value, "wide") == 0) return IndexCopyMutant::wide;
+        return IndexCopyMutant::none;
     }();
-    if (mutant == Mutant::wide && view.Format == DXGI_FORMAT_R16_UINT) view.Format = DXGI_FORMAT_R32_UINT;
+    if (mutant == IndexCopyMutant::wide && view.Format == DXGI_FORMAT_R16_UINT) view.Format = DXGI_FORMAT_R32_UINT;
 
+    const auto key = std::make_pair(address, bytes);
     draw_lock_acquire_exclusive();
     struct Unlock { ~Unlock() { draw_lock_release_exclusive(); } } unlock;
     UploadReservation slice;
@@ -1679,31 +1682,35 @@ bool copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW view, Indir
     if (hit != indirect_index_copies.end() && bind_upload_slice(self, hit->second)) {
         slice = hit->second;
     } else {
-        u64 source = view.BufferLocation;
-        if (mutant == Mutant::late) {
-            const UINT index_bytes = view.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
-            const auto needed = std::size_t{view.SizeInBytes} + index_bytes;
-            if (readable_window(source, needed) < needed) return false;
+        // Fixture mutations (X2W_TEST_INDIRECT_INDEX_COPY=late or wide) affect only the staged copy.
+        u64 source = address;
+        if (mutant == IndexCopyMutant::late) {
+            const std::size_t index_bytes = view.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+            if (readable_window(address, bytes + index_bytes) < bytes + index_bytes) return IndexCopyResult::unreadable;
             source += index_bytes;
+        } else if (readable_window(address, bytes) != bytes) {
+            return IndexCopyResult::unreadable;
         }
-        u64 offset = 0;
-        ID3D12Resource* ring = nullptr;
+        // The translated validator reads dwords even for a final 16-bit index.
+        const std::size_t padded = (bytes + 3) & ~std::size_t{3};
         constexpr std::size_t cache_limit = 256;
         const bool cache_slice = indirect_index_copies.size() < cache_limit;
-        if (!ring_copy(self, source, view.SizeInBytes, &offset, &ring,
-                       cache_slice ? &indirect_index_chunks : nullptr, &slice) || !ring || (offset & 3))
-            return false;
+        slice = reserve_upload_ring(self, padded, cache_slice ? &indirect_index_chunks : nullptr);
+        if (!slice.mapped || !slice.resource || (slice.offset & 3)) return IndexCopyResult::unavailable;
+        if (!x2w_local::guarded_memcpy(slice.mapped, reinterpret_cast<const void*>(source), bytes, false))
+            return IndexCopyResult::unreadable;
+        std::memset(slice.mapped + bytes, 0, padded - bytes);
         if (cache_slice) {
             try {
                 indirect_index_copies.insert_or_assign(key, slice);
             } catch (const std::bad_alloc&) {
-                // The recording still owns the slice if it could not be cached.
+                // The recording already holds the slice.
             }
         }
     }
     view.BufferLocation = slice.resource->GetGPUVirtualAddress() + slice.offset;
     result = {view, slice.resource, slice.offset, true};
-    return true;
+    return IndexCopyResult::copied;
 }
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.

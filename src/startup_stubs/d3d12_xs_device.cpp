@@ -2879,16 +2879,11 @@ unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset,
-               ID3D12Resource** resource = nullptr, UploadChunkMask* frame_hold = nullptr,
-               UploadReservation* slice = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
 {
-    const auto reservation = reserve_upload_ring(list, bytes, frame_hold);
-    if (resource) *resource = reservation.resource;
-    if (offset) *offset = reservation.offset;
-    if (slice) *slice = reservation;
-    if (!reservation.mapped) return false;
-    std::memcpy(reservation.mapped, reinterpret_cast<const void*>(title_address), bytes);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
+    if (!dest) return false;
+    std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
 }
 
@@ -3458,14 +3453,18 @@ void note_indirect_mesh_use(u64 key);
 
 bool indirect_index_copy_enabled()
 {
-    static const bool enabled = [] {
-        char value[2]{};
-        return GetEnvironmentVariableA("X2W_INDIRECT_INDEX_COPY", value, sizeof(value)) == 1 && value[0] == '1';
-    }();
+    static const bool enabled = x2w_local::env_on("X2W_INDIRECT_INDEX_COPY");
     return enabled;
 }
 
-bool copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW view, IndirectIndexView& result);
+bool indirect_index_shadow_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_INDIRECT_INDEX_SHADOW");
+    return enabled;
+}
+
+enum class IndexCopyResult { copied, unreadable, unavailable };
+IndexCopyResult copy_indirect_index_view(Wrapper* self, D3D12_INDEX_BUFFER_VIEW view, IndirectIndexView& result);
 
 namespace indirect_other_refusal_code {
 constexpr const char* list_closed = "list_closed";
@@ -3755,9 +3754,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 view.BufferLocation = upload.gpu;
                 index_view = {view, upload.resource, upload.offset, true};
             } else {
-                const bool plain_candidate = translated && !indices.owner &&
+                const bool plain_translated = translated && !indices.owner &&
                     !list_upload_range(self, view.BufferLocation, 1).resource;
-                const auto alias = plain_candidate
+                const auto alias = plain_translated
                     ? indirect_address_alias(self->own().list_device, view.BufferLocation, view.SizeInBytes) : IndirectAddressAlias{};
                 if (alias.resource) {
                     const auto gpu = alias.resource->GetGPUVirtualAddress();
@@ -3766,24 +3765,26 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                                       indirect_other, indirect_other_refusal_code::aliased_index_unaligned);
                     view.BufferLocation = gpu + alias.offset;
                     index_view = {view, alias.resource, alias.offset};
-                } else if (plain_candidate && indirect_index_copy_enabled()) {
-                    // The GPU validator trims the draw to StartIndexLocation and IndexCountPerInstance.
-                    // Those values can be GPU-written, so stage the entire declared view here.
-                    if ((view.BufferLocation | view.SizeInBytes) & 3)
+                } else {
+                    const bool shadow = !indices.owner && indirect_index_shadow_enabled();
+                    const bool plain = plain_translated ||
+                        (shadow && !translated && !list_upload_range(self, view.BufferLocation, 1).resource);
+                    if (!plain || (!shadow && !indirect_index_copy_enabled()))
+                        return refuse("index view has no proven desktop buffer range", indirect_other,
+                                      indirect_other_refusal_code::index_no_desktop_range);
+                    if (!shadow && ((view.BufferLocation | view.SizeInBytes) & 3))
                         return refuse("plain index view is not dword-aligned and dword-sized",
                                       indirect_other, indirect_other_refusal_code::invalid_index_view);
                     if (view.SizeInBytes > (16u << 20))
-                        return refuse("plain index view exceeds the copy limit",
-                                      indirect_other, indirect_other_refusal_code::index_over_copy_limit);
-                    if (readable_window(view.BufferLocation, view.SizeInBytes) < view.SizeInBytes)
-                        return refuse("plain index view is not fully readable",
-                                      indirect_other, indirect_other_refusal_code::index_unreadable);
-                    if (!copy_indirect_index_view(self, view, index_view))
-                        return refuse("plain index view has no aligned upload reservation",
-                                      indirect_other, indirect_other_refusal_code::index_copy_unavailable);
-                } else {
-                    return refuse("index view has no proven desktop buffer range",
-                                  indirect_other, indirect_other_refusal_code::index_no_desktop_range);
+                        return refuse("plain index view exceeds the copy limit", indirect_other,
+                                      indirect_other_refusal_code::index_over_copy_limit);
+                    const auto copied = copy_indirect_index_view(self, view, index_view);
+                    if (copied == IndexCopyResult::unreadable)
+                        return refuse("plain index view is not fully readable", indirect_other,
+                                      indirect_other_refusal_code::index_unreadable);
+                    if (copied != IndexCopyResult::copied)
+                        return refuse("plain index view could not be staged", indirect_other,
+                                      indirect_other_refusal_code::index_copy_unavailable);
                 }
             }
         }
@@ -3798,7 +3799,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     if (index_view.resource) {
         if (index_view.resource == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        else require_state(self, index_view.resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        else if (!index_view.upload) require_state(self, index_view.resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&index_view.view);
     }
     const bool rect_list = graphics && !mesh && pass.topology == 0x11;
@@ -7798,7 +7799,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
-    const bool reuse_indirect_indices = indirect_index_copy_enabled();
+    const bool reuse_indirect_indices = indirect_index_copy_enabled() || indirect_index_shadow_enabled();
     if (reuse_large_bindings || reuse_indirect_indices) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
