@@ -1078,6 +1078,8 @@ struct TextureUpload {
     u64 revision = 0;
     bool staged = false;       // the last upload attempt put the title memory into the desktop texture
     bool gpu_written = false;  // a list copy or resolve wrote the texture; its title memory is stale and must not be uploaded
+    UINT uploads = 0;          // X2W_D3D12_RESIDENCY observation: copies of title memory into this texture over the run
+    LONG last_use = -1;        // frame_number of the last upload_texture call that named it (a bind, a copy or a dispatch)
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 u64 address_upload_revision;
@@ -1303,6 +1305,33 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
+LONG textures_reuploaded;  // uploads of a texture that had been uploaded before (X2W_D3D12_RESIDENCY observation)
+
+bool residency_observe()
+{
+    static const bool on = std::getenv("X2W_D3D12_RESIDENCY") != nullptr && std::getenv("X2W_D3D12_RESIDENCY")[0] == '1';
+    return on;
+}
+
+// One "x2w-residency" line: how many textures the run uploaded, how many were uploaded again, the highest repeat counts
+// and how many textures were used in the last 120 frames (counts only; nothing is evicted by this).
+void residency_report(LONG frame)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    UINT top[5] = {};
+    std::size_t known = 0, recent = 0;
+    for (const auto& entry : texture_uploads()) {
+        const TextureUpload& t = entry.second;
+        if (!t.uploads) continue;
+        ++known;
+        if (frame - t.last_use <= 120) ++recent;
+        UINT v = t.uploads;
+        for (UINT& slot : top) if (v > slot) std::swap(v, slot);
+    }
+    ReleaseSRWLockExclusive(&draw_lock);
+    log("x2w-residency textures uploaded %llu, uploads repeated %ld, top repeat counts %u %u %u %u %u, used in last 120 frames %llu",
+        static_cast<unsigned long long>(known), textures_reuploaded, top[0], top[1], top[2], top[3], top[4], static_cast<unsigned long long>(recent));
+}
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
 {
     u64 h = 0xcbf29ce484222325ull;
@@ -1356,6 +1385,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         return false;
     }
     TextureUpload& state = *cached;
+    state.last_use = frame_number;
     TextureWrite written;
     AcquireSRWLockShared(&written_lock);
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
@@ -1524,6 +1554,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     state.staged = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
+    if (state.uploads++) InterlockedIncrement(&textures_reuploaded);
     static LONG shown;
     if (first_calls(shown, 12))
         log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s%s", static_cast<void*>(texture), desc.Width,
