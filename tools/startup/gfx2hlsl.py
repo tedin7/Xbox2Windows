@@ -8038,6 +8038,71 @@ class Stage:
     def op_v_mbcnt_hi_u32_b32(self, ops, mods):
         self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
 
+    def float_bits(self, tok):
+        """uint bits of a float source, with the inline neg/abs operand modifiers applied."""
+        return 'U(%s)' % self.f(tok)
+
+    def op_v_frexp_mant_f32(self, ops, mods):
+        # Sign and mantissa in [0.5, 1) of a normal input; zero and denormals read as a signed zero;
+        # infinity and NaN pass through unchanged (RDNA 2 ISA, V_FREXP_MANT_F32).
+        if len(ops) != 2:
+            raise Unsupported('v_frexp_mant_f32 with %d operands, expected 2' % len(ops))
+        b = self.float_bits(ops[1])
+        e = '((%s >> 23) & 255u)' % b
+        expr = 'F(%s == 255u ? %s : %s == 0u ? (%s & 0x80000000u) : ((%s & 0x807fffffu) | 0x3f000000u))' % (
+            e, b, e, b, b)
+        self.set_vf(reg_range(ops[0])[1], expr, mods)
+
+    def op_v_frexp_exp_i32_f32(self, ops, mods):
+        # Exponent e with input = mantissa * 2^e and mantissa in [0.5, 1). Zero, denormal, infinity and NaN give 0.
+        if mods:
+            raise Unsupported('v_frexp_exp_i32_f32 with modifiers')
+        if len(ops) != 2:
+            raise Unsupported('v_frexp_exp_i32_f32 with %d operands, expected 2' % len(ops))
+        e = '((%s >> 23) & 255u)' % self.float_bits(ops[1])
+        self.set_v(reg_range(ops[0])[1], '(%s == 0u || %s == 255u) ? 0u : (%s - 126u)' % (e, e, e))
+
+    def float_to_int(self, base, ops, mods, rpi):
+        # Saturating conversion. v_cvt_flr rounds toward -inf; v_cvt_rpi adds 1 to floor(x) when the exact
+        # fraction x - floor(x) is at least 0.5 (binary32 x + 0.5 would round 0x3effffff up and 2^23 + 1 off).
+        # A NaN reads 0x7fffffff with its sign bit clear and 0x80000000 with it set; a value at or above 2^31
+        # reads INT_MAX and one below -2^31 reads INT_MIN (native RDNA 2 words, tests/pixel_aot_check.py).
+        if mods:
+            raise Unsupported('%s with modifiers' % base)
+        if len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
+        x = self.f(ops[1])
+        r = 'floor(%s)' % x
+        if rpi:
+            r = '(%s + (((%s) - %s) >= 0.5 ? 1.0 : 0.0))' % (r, x, r)
+        bits = self.float_bits(ops[1])
+        self.set_v(reg_range(ops[0])[1], '((%s & 0x7fffffffu) > 0x7f800000u) ? (0x7fffffffu + (%s >> 31)) : '
+                   '(%s >= 2147483648.0) ? 0x7fffffffu : uint(int(clamp(%s, -2147483648.0, 2147483520.0)))' % (
+                       bits, bits, x, r))
+
+    def op_v_cvt_flr_i32_f32(self, ops, mods):
+        self.float_to_int('v_cvt_flr_i32_f32', ops, mods, False)
+
+    def op_v_cvt_rpi_i32_f32(self, ops, mods):
+        self.float_to_int('v_cvt_rpi_i32_f32', ops, mods, True)
+
+    def op_v_ldexp_f32(self, ops, mods):
+        # D = S0 * 2^S1 with S1 a signed integer, clamped to +-300 (the result is 0 or inf past that anyway).
+        # The scale is applied in three parts of at most 2^100 each, so that no factor overflows binary32
+        # when the product is finite.
+        if len(ops) != 3:
+            raise Unsupported('v_ldexp_f32 with %d operands, expected 3' % len(ops))
+        n = 'clamp(int(%s), -300, 300)' % self.u(ops[2])
+        a = '(%s / 3)' % n
+        b = '((%s - %s) / 2)' % (n, a)
+        c = '(%s - %s - %s)' % (n, a, b)
+        # A NaN keeps its word: the product would give a payload the hardware chooses (an RTX 3070 Ti reads
+        # 0x7fc00000 * 2^k back as 0x7fffffff).
+        bits = self.float_bits(ops[1])
+        expr = 'F(((%s & 0x7fffffffu) > 0x7f800000u) ? %s : U(((%s * exp2(float(%s))) * exp2(float(%s))) * exp2(float(%s))))' % (
+            bits, bits, self.f(ops[1]), a, b, c)
+        self.set_vf(reg_range(ops[0])[1], expr, mods)
+
     def proven_uniform_v(self, n):
         """VGPR n holds one value in every lane EXEC enables now. In the entry block EXEC is known; past it, a
         recomputable expression proves no join, EXEC write or overwrite lies between the definition and here."""

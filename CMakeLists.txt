@@ -3563,6 +3563,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # SDWA forms of the float-result conversions (#1727).
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
+    # v_frexp_mant_f32, v_frexp_exp_i32_f32, v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32 and v_ldexp_f32 (#1723).
+    add_test(NAME startup_gfx2hlsl_frexp_cvt COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_frexp_cvt_check.py")
+    set_tests_properties(startup_gfx2hlsl_frexp_cvt PROPERTIES TIMEOUT 60)
     # The SDWA form of v_cndmask_b32: fixture and model controls; the draws are registered below.
     add_test(NAME startup_gfx2hlsl_sdwa_cndmask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cndmask_check.py")
@@ -4133,6 +4137,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_vcc_hi_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_vcc_hi_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl frexp, float-to-int conversions and ldexp (#1723): translation controls, then a desktop draw of each
+    # operation compared with a reference computed from Python doubles, with a mutated lowering that must differ.
+    add_test(NAME startup_gfx2hlsl_frexp_cvt_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_frexp_cvt_warp_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_frexp_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_frexp_cvt_warp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_frexp_cvt_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl 24-bit multiplies, v_xnor_b32 and the funnel shifts: CPU evaluation of the translated text
     # against an independent reference built from unbounded integers.

@@ -16017,6 +16017,19 @@ a store inside the loop, a live-out scalar that depends on the key (or is comput
 descriptor keeps an instruction-specific refusal. The fixtures include a key-independent live-out read after the loop
 (accepted, checked against a D3D12 WARP readback) and key-dependent live-outs (refused).
 
+### Startup translator: frexp, float-to-int conversions and ldexp
+
+`tools/startup/gfx2hlsl.py` lowers five more operations: `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_cvt_flr_i32_f32`, `v_cvt_rpi_i32_f32` and `v_ldexp_f32`. This is the startup path, separate from the `pixel_aot.py` helpers of the same names. `v_cvt_rpi_i32_f32` adds one to `floor(x)` when the exact fraction `x - floor(x)` is at least 0.5, because binary32 `x + 0.5` would round `0x3effffff` up to 1 and move `8388609.0`. A NaN reads `0x7fffffff` with its sign bit clear and `0x80000000` with it set, and values outside the int32 range saturate, matching `CVT_FLR_RPI_EXCEPTIONAL` in `tests/pixel_aot_check.py`. `v_frexp_exp_i32_f32` gives 0 for zero, denormals, infinity and NaN. Output modifiers and `clamp` on the two conversions and on `v_frexp_exp_i32_f32` are refused.
+
+`tests/startup_gfx2hlsl_frexp_cvt_check.py` is CPU only: it translates each operation, runs the emitted line on a small evaluator that rounds every binary32 add, subtract and multiply, and compares with an exact reference over 51 words per unary operation (including all six NaN spellings, both infinities and the saturation edges) and 736 `v_ldexp_f32` pairs. `tests/startup_gfx2hlsl_frexp_cvt_warp_check.py` draws the same operations through D3D12 and compares the read-back with that reference on WARP and on hardware.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_frexp_cvt_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_frexp_cvt' -V
+```
+
+Not covered: denormal inputs and results of `v_ldexp_f32` (the denormal mode decides them), signalling-NaN payloads of `v_frexp_mant_f32`, and the console's own results.
+
 ## Desktop audio render sink
 
 `startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
