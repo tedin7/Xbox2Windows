@@ -17549,3 +17549,14 @@ With `X2W_D3D12_LAZY_TEXTURES=1` (Refs #2764, #2379, #1199), device slot 133 (`C
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_slot133_lazy_textures_' -V
 ```
+## Startup translator: lane-local DPP forms
+
+`tools/startup/gfx2hlsl.py` lowers a `_dpp` spelling of a VOP1/VOP2 operation that is already in its vector tables (for example `v_add_f32_dpp`, `v_or_b32_dpp`, `v_add_nc_u32_dpp`, `v_sub_f32_dpp`) only when it reads the lane's own value. The translator models one lane, so that form is the plain operation. The accepted controls are `quad_perm:[0,1,2,3]` or `dpp8:[0,1,2,3,4,5,6,7]`, with `row_mask` and `bank_mask` either absent or `0xf` (every lane enabled). Anything else is refused by name: any other `quad_perm` or `dpp8` select, `row_*` and `wave_*` controls, a partial `row_mask` or `bank_mask`, `bound_ctrl` and `fi`, a DPP spelling with no lane-local control, and a DPP spelling of an operation outside the vector tables (for example `v_swap_b32_dpp`). Lowering one of those as the plain operation would silently use the wrong value.
+
+`tests/startup_gfx2hlsl_dpp_check.py` checks that each accepted spelling translates to the same statements as the plain one and that each refusal names its control. This is a translator check. It does not show how a driver executes DPP.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_dpp_check.py
+```
+
+Expected: every line ends in `ok` and the last line is `PASS`. Result on this commit: `PASS`.
