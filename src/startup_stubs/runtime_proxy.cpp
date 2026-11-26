@@ -487,6 +487,7 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
 }
 
 #include "startup_stubs/registry_console_mode.inl"
+#include "startup_stubs/movie_skip.inl"
 
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
 {
@@ -566,6 +567,11 @@ int patch_module(HMODULE module)
         const int registry = patch_registry_imports(base, image_size);
         if (registry > 0)
             x2w_local::logf("x2w-runtime console mode: %d registry import(s) patched in the %s", registry,
+                            module == GetModuleHandleW(nullptr) ? "main module" : "package module");
+        // Movie player imports (movie_skip.inl): only with X2W_SKIP_MOVIES set.
+        const int movies = patch_movie_imports(base, image_size);
+        if (movies > 0)
+            x2w_local::logf("x2w-movie %d Bink import(s) patched in the %s (X2W_SKIP_MOVIES)", movies,
                             module == GetModuleHandleW(nullptr) ? "main module" : "package module");
     }
     return patched;
