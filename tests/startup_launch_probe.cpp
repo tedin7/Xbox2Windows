@@ -7,6 +7,8 @@
 // path, and its build or temp folder can hold characters the active ANSI code page cannot.
 #include <windows.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -117,6 +119,21 @@ int main(int argc, char** argv)
         std::memset(memory, 0x5a, mib << 20);
         std::printf("allocate ok %zu MiB\n", mib);
         VirtualFree(memory, 0, MEM_RELEASE);
+        return 0;
+    }
+    if (std::strcmp(mode, "addresses") == 0) {
+        // The highest address VirtualAlloc hands out for blocks of several sizes (the title's blocks come the same way).
+        unsigned long long highest = 0;
+        const SIZE_T sizes[] = {SIZE_T{64} << 10, SIZE_T{16} << 20, SIZE_T{1} << 30, SIZE_T{4} << 30};
+        for (const SIZE_T bytes : sizes) {
+            void* memory = VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+            if (!memory) {
+                std::printf("addresses failed error=%lu\n", GetLastError());
+                return 0;
+            }
+            highest = (std::max)(highest, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory)) + bytes - 1);
+        }
+        std::printf("addresses highest=0x%llx\n", highest);
         return 0;
     }
     if (std::strcmp(mode, "spawn") == 0) {
