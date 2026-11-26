@@ -1000,7 +1000,24 @@ def main():
             raw = read(addr, length * (2 if unicode else 1))
             text = raw.decode("utf-16-le" if unicode else "latin-1", errors="replace").rstrip("\0\r\n")
             # One record per message, whole: line breaks are escaped (a CRLF used to split the record in two) and nothing is cut.
-            log(f"{time.time() - start:7.3f} debug-output {text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
+            # Who printed it: the event's thread id, and the first return address on its stack that is not in a system DLL
+            # (the thread is stopped at this event, so its context can be read). "-" when none can be resolved.
+            caller = "-"
+            thread, ctx = get_ctx(tid)
+            if thread:
+                try:
+                    rsp = struct.unpack_from("<Q", ctx, 0x98)[0]
+                    stack = read_stack(read, rsp, 64)
+                    for word in struct.unpack_from("<64Q", stack):
+                        if any(b <= word < b + 0x10000000 for b in modules):
+                            where_word = where(word)
+                            if not where_word.lower().startswith(("ntdll", "kernelbase", "kernel32", "ucrtbase", "msvcp", "vcruntime")):
+                                caller = where_word
+                                break
+                finally:
+                    k32.CloseHandle(wt.HANDLE(thread))
+            log(f"{time.time() - start:7.3f} debug-output thread {tid} from {caller}: "
+                f"{text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
         elif code == EXCEPTION:
             ex_code, ex_flags, _, ex_addr, nparams = struct.unpack_from("<IIQQI", event, 16)
             params = struct.unpack_from("<" + "Q" * min(nparams, 15), event, 16 + 32) if nparams else ()

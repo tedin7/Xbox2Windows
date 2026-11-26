@@ -44,6 +44,12 @@ int main()
         while (message.size() < 400) message += L"0123456789 \u00fc ";
         message += L"\r\nprobe-msg-suffix-7f3a";
         OutputDebugStringW(message.c_str());
+        // the same from a thread of its own: the debugger must name that thread (a "thread N created" line), not the main one
+        if (HANDLE worker = CreateThread(nullptr, 0, [](void*) -> DWORD { OutputDebugStringW(L"probe-worker-message"); return 0; },
+                                         nullptr, 0, nullptr)) {
+            WaitForSingleObject(worker, 5000);
+            CloseHandle(worker);
+        }
     }
     // STARTUP_WINDOW_PROBE_CHURN=1: load and free a DLL, start a thread that ends at once (the debugger logs the unload, and
     // the thread's creation and exit with the live thread count).
