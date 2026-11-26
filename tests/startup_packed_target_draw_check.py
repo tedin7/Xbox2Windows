@@ -153,7 +153,9 @@ def check(work, consumer, dxc, backend):
             for x in range(64):
                 got = tuple(pixels[(y * 64 + x) * 4:(y * 64 + x) * 4 + 4])
                 good += all(abs(a - e) <= 1 for a, e in zip(got, decoded(texture_format, texel(x, y))))
-        return created, good
+        # A texture with a render-target, depth or unordered-access flag is GPU-owned: the runtime does not copy the
+        # title's memory into it (d3d12_draw.inl, "texture not uploaded ... flags").
+        return created, good, any("texture upload " in line for line in run.stderr.splitlines())
 
     paths = set()
     for name, resource_format, flags in (("B5G5R5A1 render target with unordered access", B5G5R5A1, RT | UAV),
@@ -163,19 +165,20 @@ def check(work, consumer, dxc, backend):
         paths.add("stand-in" if created == RGBA8 else "as described")
     # Uploaded 16-bit texels. No render-target flag: never substituted, so every texel must decode exactly.
     for name, texture_format in (("B5G5R5A1 uploaded texels", B5G5R5A1), ("B4G4R4A4 uploaded texels", B4G4R4A4)):
-        created, good = uploaded(name, texture_format, 0)
-        assert created == texture_format, f"{name}: created as {created}"
+        created, good, copied = uploaded(name, texture_format, 0)
+        assert created == texture_format and copied, f"{name}: created as {created}, uploaded {copied}"
         assert good == 64 * 64, f"{name}: only {good} of 4096 texels read back as the 16-bit layout decodes them"
         print(f"{backend} {name}: all 4096 texels exact (format {created})")
-    # With the render-target flag: native on adapters that can render to it (must be exact), a stand-in elsewhere
-    # (title texels are not converted by design; reported as a finding, not asserted).
+    # With the render-target flag the runtime does not upload the title's memory at all (native or stand-in format):
+    # reported as a finding, not blessed. If an upload is ever recorded, a native texture must then be exact.
     for name, texture_format in (("B5G5R5A1 render-target uploaded texels", B5G5R5A1), ("B4G4R4A4 render-target uploaded texels", B4G4R4A4)):
-        created, good = uploaded(name, texture_format, RT)
-        if created == texture_format:
-            assert good == 64 * 64, f"{name}: native format but only {good} of 4096 texels exact"
-            print(f"{backend} {name}: native format, all 4096 texels exact")
+        created, good, copied = uploaded(name, texture_format, RT)
+        if copied and created == texture_format:
+            assert good == 64 * 64, f"{name}: uploaded in the native format but only {good} of 4096 texels exact"
+            print(f"{backend} {name}: uploaded, native format, all 4096 texels exact")
         else:
-            print(f"{backend} {name}: FINDING stand-in format {created}: {good} of 4096 uploaded texels read back as the 16-bit layout decodes them")
+            print(f"{backend} {name}: FINDING {'uploaded' if copied else 'not uploaded (render-target flag)'}, format {created}: "
+                  f"{good} of 4096 title texels read back as the 16-bit layout decodes them")
     # Control that draws: never substituted.
     plain, _ = rendered("control, R8G8B8A8 render target", RGBA8, RT, {RGBA8})
     assert stored(B5G5R5A1) != stored(RGBA8) != stored(B4G4R4A4) and stored(B5G6R5) != stored(RGBA8)
