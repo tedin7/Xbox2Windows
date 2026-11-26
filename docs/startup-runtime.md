@@ -2465,7 +2465,9 @@ These are measured on one executable; treat them as hypotheses for others.
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
   entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
   array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
-  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  sRGB or non-colour format, a format without typed UAV store (or, for a store whose dmask selects only some
+  channels, which reads the texel back and is marked by a `uavload N` line after its `uav` line, without
+  typed UAV load; `tests/startup_pixel_uav_support_check.cpp`), and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
   written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
   draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`

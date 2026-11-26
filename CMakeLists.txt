@@ -2525,6 +2525,13 @@ target_compile_features(startup_d16_image_format_check PRIVATE cxx_std_17)
 add_test(NAME startup_d16_image_format COMMAND startup_d16_image_format_check)
 add_test(NAME startup_d16_image_format_accept_uint_control COMMAND startup_d16_image_format_check --mutate accept-uint)
 set_tests_properties(startup_d16_image_format_accept_uint_control PROPERTIES WILL_FAIL TRUE)
+# Typed UAV support a pixel image store needs; a partial-dmask store also needs typed load ('uavload N').
+add_executable(startup_pixel_uav_support_check tests/startup_pixel_uav_support_check.cpp)
+target_include_directories(startup_pixel_uav_support_check PRIVATE src)
+target_compile_features(startup_pixel_uav_support_check PRIVATE cxx_std_17)
+add_test(NAME startup_pixel_uav_support COMMAND startup_pixel_uav_support_check)
+add_test(NAME startup_pixel_uav_support_no_load_check_control COMMAND startup_pixel_uav_support_check --mutate no-load-check)
+set_tests_properties(startup_pixel_uav_support_no_load_check_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
@@ -4223,6 +4230,17 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_dpp_quad_flow_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # A DPP16 quad min inside an if (EXEC narrowed by s_and_saveexec): the contract of a lane-exact EXEC model (a disabled
+    # source lane is invalid, BOUND_CTRL decides), drawn by hand-written HLSL against a CPU reference; reading the disabled
+    # neighbour and the other BOUND_CTRL rule must fail; the translator's lowering is drawn once it produces one.
+    add_test(NAME startup_gfx2hlsl_dpp_quad_inactive COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_inactive_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_quad_inactive_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_inactive_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_dpp_quad_inactive_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lowers DPP16 quad swaps (quad_perm [1,0,3,2], [2,3,0,1], [3,2,1,0]) in a pixel stage to QuadReadAcross*.
     add_test(NAME startup_gfx2hlsl_dpp_quad_swap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_check.py")
@@ -4521,6 +4539,18 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})
             set_tests_properties(startup_compute_tg_size_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+        # More than 32 threads per group (two wave32 waves): the wave ID bits of TG_SIZE are the flat thread index / 32.
+        add_test(NAME startup_compute_tg_size_waves_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" waves-dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_tg_size_waves_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wave-id-zero wave-width-16)
+            add_test(NAME startup_compute_tg_size_waves_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" waves-control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_tg_size_waves_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()

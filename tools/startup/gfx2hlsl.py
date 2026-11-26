@@ -2467,6 +2467,9 @@ class Stage:
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
+            if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
+                    and not wave32_exec_proof(self.ins):
+                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -4460,6 +4463,25 @@ class Stage:
         whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
         return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
 
+    def quad_exec_cause(self):
+        """Why a DPP quad read meets an EXEC that is not the entry mask or a program that is not straight-line, for the
+        refusal text (the refusal itself is unchanged): the stage when it is neither a pixel nor a compute stage, the last
+        instruction before the read that can write EXEC (writes_exec), or, for a compute program, its first branch, so a
+        tester report names the shape to lift. Empty when none applies."""
+        kind = getattr(self, 'kind', None)
+        if kind not in ('ps', 'cs'):
+            return ': %s stage' % (kind or 'unknown')
+        here = getattr(self, 'pc', None)
+        before = [(off, name, asm) for off, _n, name, asm in getattr(self, 'ins', ()) if here is None or off < here]
+        if not getattr(self, 'exec_known', False):
+            writer = next(((off, name) for off, name, asm in reversed(before) if writes_exec(name, parse(asm)[1])), None)
+            return ': EXEC written at +0x%x by %s' % writer if writer else ': EXEC not known at entry'
+        if kind == 'cs' and not self.quad_flow_straight():
+            branch = next(((off, name) for off, _n, name, _a in getattr(self, 'ins', ())
+                           if name == 's_branch' or name.startswith('s_cbranch')), None)
+            return ': branch at +0x%x (%s)' % branch if branch else ': not straight-line'
+        return ''
+
     def note_quad_flow(self, base):
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
             self.quad_flow_reads.append((self.pc, base))
@@ -4976,7 +4998,7 @@ class Stage:
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
-    def dpp_broadcast(self, base, ops, mods):
+    def dpp_broadcast(self, base, ops, mods, fetch_inactive=False):
         fields, rest = {}, []
         for m in mods:
             key, _, value = m.partition(':')
@@ -4992,15 +5014,22 @@ class Stage:
                               % (base, fields.get('quad_perm', 'without quad_perm')))
         if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
-        if fields.get('bound_ctrl', '1') != '1':
-            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
         # A branch to offset zero also makes the nominal entry block re-entrant.
         # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
-        if (not getattr(self, 'exec_known', False) or
-                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
-            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
+        narrowed = False
+        if not getattr(self, 'exec_known', False):
+            if self.narrowing_proof():
+                narrowed = True
+            else:
+                raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                                  % (base, self.quad_exec_cause()))
+        elif not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))):
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                              % (base, self.quad_exec_cause()))
+        if not narrowed and fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -5023,6 +5052,9 @@ class Stage:
         rewritten = '-' + rewritten if neg else rewritten
         self.note_quad_flow(base)
         self.needs_sm6 = True
+        if narrowed:
+            return self.dpp_broadcast_narrowed(base, ops, rest, rewritten, token, lanes.group(1), fields,
+                                               fetch_inactive)
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
         if base == 'v_mov_b32':
@@ -5030,6 +5062,59 @@ class Stage:
                 raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
             return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
         return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+
+    DPP_VALID = 257  # hidden: the source lane's EXEC bit, read with the data
+
+    NARROWING_WRITERS = ('v_cmpx_', 's_and_saveexec_', 's_and_b32', 's_and_b64', 's_andn2_b32', 's_andn2_b64')
+
+    def narrowing_proof(self):
+        """Whether EXEC at this point is the whole-quad mask of an entry s_wqm narrowed only by AND-type writes, in
+        straight-line code: then every lane that is inactive here was active (helper lanes included) up to its
+        narrowing, so the guest's and the host's VGPRs of an inactive lane agree and a quad read may take them."""
+        wqm = getattr(self, 'wqm_set_at', None)
+        if (self.kind != 'ps' or wqm is None or not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)
+                or not self.quad_flow_straight()):
+            return False
+        for off, _n, name, asm in getattr(self, 'ins', ()):
+            if off >= getattr(self, 'pc', 1 << 62):
+                break
+            ops = parse(asm)[1]
+            if not writes_exec(name, ops):
+                continue
+            base = re.sub(r'_e(32|64)$', '', name)
+            if off == wqm and base in ('s_wqm_b32', 's_wqm_b64'):
+                continue
+            if off < wqm or not base.startswith(self.NARROWING_WRITERS):
+                return False
+        return True
+
+    def dpp_broadcast_narrowed(self, base, ops, rest, rewritten, token, lane, fields, fetch_inactive):
+        """A quad broadcast behind a narrowed EXEC (RDNA 2 ISA DPP16; model section 2a). Per lane the source is valid
+        when FI is set or the source lane's EXEC bit is 1; an invalid source reads 0 when BOUND_CTRL is set, and
+        otherwise leaves the destination unwritten. The quad reads are unconditional (every thread of the quad runs
+        them, as the quad intrinsics need); only the destination write is guarded by the thread's own EXEC bit."""
+        self.used_v.update((self.DPP_TEMP, self.DPP_VALID))
+        self.uniform_v.discard(self.DPP_TEMP)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(self.DPP_TEMP)
+        self.emit('v%d = QuadReadLaneAt(%s, %su);' % (self.DPP_TEMP, self.u(token), lane))
+        bound = fields.get('bound_ctrl') == '1'
+        guard = False
+        if not fetch_inactive:
+            self.emit('v%d = QuadReadLaneAt(exec & 1u, %su);' % (self.DPP_VALID, lane))
+            if bound:
+                self.emit('v%d = v%d != 0u ? v%d : 0u;' % (self.DPP_TEMP, self.DPP_VALID, self.DPP_TEMP))
+            else:
+                guard = True
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32' and (rest or len(operands) != 2):
+            raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+        if guard:
+            self.emit('if (v%d != 0u) {' % self.DPP_VALID)
+        result = self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+        if guard:
+            self.emit('}')
+        return result
 
     # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
     # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
@@ -5043,9 +5128,10 @@ class Stage:
         # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
         # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
         # source lane is disabled and it decides nothing.
+        fetch_inactive = 'fi:1' in mods
         mods = [m for m in mods if m != 'fi:1']
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
-            return self.dpp_broadcast(base, ops, mods)
+            return self.dpp_broadcast(base, ops, mods, fetch_inactive=fetch_inactive)
         perm = None
         row_ror8 = False
         for m in mods:
@@ -5099,7 +5185,7 @@ class Stage:
             self.compute_quad_gate(base, row_ror8)
         else:
             if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
             if not getattr(self, 'wqm_exec', False):
                 raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                                   'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
@@ -5136,7 +5222,7 @@ class Stage:
         if row_ror8 and x * y * z % 16:
             raise Unsupported('%s_dpp row_ror:8 in a compute program requires a group of whole rows (a multiple of 16 threads)' % base)
         if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
+            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC%s' % (base, self.quad_exec_cause()))
 
     def quad_source(self, intrinsic, source, compute):
         """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
@@ -5531,7 +5617,14 @@ class Stage:
                          else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
                          else None)
                 if other is not None and self.const_u32(other) == 0xfc0:
-                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    x, y, z = self.pipe.group
+                    if x * y * z <= 32:
+                        self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                        return None
+                    # Wave32 waves hold 32 consecutive threads in x-major order: the wave ID is the flat thread index / 32,
+                    # and differs between the waves of one group (so the register is not uniform).
+                    flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                    self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
@@ -7699,12 +7792,20 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        if mask != 0xf:
+        # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
+        # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
+        channels = [i for i in range(4) if mask >> i & 1]
+        if self.kind != 'ps' and mask != 0xf:
+            # Proven by readback in the pixel stage only; a compute store keeps the refusal.
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
+        if not channels or mask > 0xf or (d16 and mask != 0xf):
+            raise Unsupported('%s with dmask %s: %s' % (
+                name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
+                else 'no channel selected or out of range'))
         data = reg_range(ops[0])
-        count = 2 if d16 else 4
+        count = 2 if d16 else len(channels)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
-            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
+            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], {1: 'one', 2: 'two', 3: 'three', 4: 'four'}[count]))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7733,7 +7834,12 @@ class Stage:
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
             index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        body = '%s[%s] = %s;' % (image, index, value)
+        if len(channels) == 4 or d16:
+            body = '%s[%s] = %s;' % (image, index, value)
+        else:
+            sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
+            body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
+            self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
@@ -11040,6 +11146,8 @@ class Pipeline:
             if source[0] != 'table':
                 raise Unsupported('stored image through %s' % (source,))
             lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
+            if r.get('load'):
+                lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
@@ -11056,12 +11164,35 @@ class Pipeline:
         return '\n'.join(lines) + '\n'
 
 
+TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group '
+                         '(more needs whole wave32 waves and a program proved wave32)')
+
+
+def wave32_exec_proof(ins):
+    """True when the program names a wave32 exec write (a 32-bit scalar op into exec_lo, or s_*saveexec_b32) and no wave64
+    exec form (the 64-bit exec pair or a 64-bit scalar op on it). The opcodes differ between the sizes (RDNA 2 ISA, SOP1
+    S_AND_SAVEEXEC_B32 / _B64, SOP1 S_MOV_B32 / _B64), so a compiler's exec handling states the wave size; a program that
+    never touches exec states nothing, and the caller must say wave_size=32."""
+    wave32 = wave64 = False
+    for _off, _size, name, asm in ins:
+        if not name.startswith('s_'):
+            continue
+        if re.search(r'\bexec\b', asm):
+            wave64 = True
+        elif name.endswith('saveexec_b32'):
+            wave32 = True
+        elif re.search(r'\bexec_lo\b', asm) and name.endswith('_b32'):
+            ops = parse(asm)[1]
+            wave32 |= bool(ops) and ops[0] == 'exec_lo'
+    return wave32 and not wave64
+
+
 class ComputePipeline(Pipeline):
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -11070,8 +11201,10 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
-            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
+                wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
+            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
