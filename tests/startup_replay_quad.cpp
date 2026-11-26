@@ -5,7 +5,12 @@
 // Frame f: clear to a colour that moves with f, draw the stream pipeline's triangle in a scissor whose width moves
 // with f, execute, present the target (queue slot 32), signal and wait. No mapped memory is written.
 //
-// usage: startup_replay_quad <vs> <ps> <root> <warp|hardware> <presents>   [X2W_TEST_REPLAY_PAUSE=<frame>,<ms>]
+// With a sixth argument, `heaps`, the render target view is not used where it was created: it is copied into a second
+// RTV heap every frame (even frames CopyDescriptorsSimple into slot 2, odd frames CopyDescriptors with ranges into
+// slot 1), and the clear and OMSetRenderTargets name the copy. A recording of that run replays to the same pictures only
+// if the copy calls, the heap starts and the handle arithmetic replay (tests/startup_replay_heaps_check.py).
+//
+// usage: startup_replay_quad <vs> <ps> <root> <warp|hardware> <presents> [heaps]  [X2W_TEST_REPLAY_PAUSE=<frame>,<ms>]
 #include <d3d12.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -32,6 +37,10 @@ struct Scene {
     void* list = nullptr;
     void* fence = nullptr;
     SIZE_T rtv = 0;
+    void* device = nullptr;
+    void* copy_heap = nullptr;
+    SIZE_T copy_start = 0, source_rtv = 0;
+    UINT increment = 0;
 };
 
 int create_scene(void* device, Scene& s)
@@ -56,6 +65,8 @@ int create_scene(void* device, Scene& s)
     if (start(&s.rtv, s.rtv_heap) != &s.rtv || !s.rtv) return 24;
     const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     invoke(device, 20, arg(s.target), arg(&view), s.rtv);
+    s.device = device;
+    s.source_rtv = s.rtv;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&s.queue)))) ||
@@ -68,8 +79,38 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
-int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
+// A second RTV heap of three descriptors; every frame the view is copied into it and the frame draws through the copy.
+int create_copy_heap(void* device, Scene& s)
 {
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } copy_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3}, 0, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&copy_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.copy_heap)))))
+        return 25;
+    using Start = SIZE_T* (*)(SIZE_T*, void*);
+    const auto start = reinterpret_cast<Start>((*static_cast<void***>(s.copy_heap))[9]);
+    if (start(&s.copy_start, s.copy_heap) != &s.copy_start || !s.copy_start) return 26;
+    s.increment = static_cast<UINT>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_RTV));
+    return s.increment ? 0 : 27;
+}
+
+void copy_view(Scene& s, UINT frame)
+{
+    if (frame % 2 == 0) {
+        s.rtv = s.copy_start + 2 * s.increment;
+        invoke(s.device, 24, 1, s.rtv, s.source_rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    } else {
+        s.rtv = s.copy_start + 1 * s.increment;
+        const D3D12_CPU_DESCRIPTOR_HANDLE destination{s.rtv}, source{s.source_rtv};
+        const UINT one = 1;
+        invoke(s.device, 23, 1, arg(&destination), arg(&one), 1, arg(&source), arg(&one), D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+}
+
+int draw_frame(Scene& s, void* pso, UINT frame, UINT frames, bool heaps)
+{
+    if (heaps) copy_view(s, frame);
     const float t = static_cast<float>(frame) / static_cast<float>(frames);
     const float colour[] = {t, 0.25f, 1.0f - t, 1.0f};
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
@@ -106,7 +147,8 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
 
 int main(int argc, char** argv)
 {
-    if (argc != 6) return 2;
+    if (argc != 6 && !(argc == 7 && std::strcmp(argv[6], "heaps") == 0)) return 2;
+    const bool heaps = argc == 7;
     const UINT frames = static_cast<UINT>(std::strtoul(argv[5], nullptr, 10));
     if (!frames || frames > 1000) return 2;
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -117,6 +159,8 @@ int main(int argc, char** argv)
         return rc;
     Scene scene;
     if (const int rc = create_scene(device, scene)) return rc;
+    if (heaps)
+        if (const int rc = create_copy_heap(device, scene)) return rc;
     // X2W_TEST_REPLAY_PAUSE=<frame>,<ms>: a pause before that frame (a slowdown for the recorder's "slow" trigger).
     char pause[32]{};
     unsigned pause_frame = ~0u, pause_ms = 0;
@@ -124,7 +168,7 @@ int main(int argc, char** argv)
         return 2;
     for (UINT frame = 0; frame < frames; ++frame) {
         if (frame == pause_frame) Sleep(pause_ms);
-        if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
+        if (const int rc = draw_frame(scene, pso, frame, frames, heaps)) return rc;
     }
     std::printf("replay quad: %u presents drawn\n", frames);
     return 0;
