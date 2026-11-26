@@ -1,5 +1,7 @@
 # Tester loop branch
 
+Real-hardware testing by @Makto94 - thanks for the help.
+
 This branch is `origin/main` plus the tooling a tester needs for one fast round trip: run one command, send back
 the zip it prints. It is not a release; upstream gets each piece through its own pull request.
 
