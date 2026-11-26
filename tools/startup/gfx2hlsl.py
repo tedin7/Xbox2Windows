@@ -12330,12 +12330,12 @@ def raise_site(error):
     return frames[-1] if frames else None
 
 
-# Refusal families this round's translator lifts or narrows, by the reason an older build wrote (the first line of its
-# .fail). In the run the --watch pool leaves old refusals alone and the pass after the run retries them, so a lift
-# would reach only the next run: tester_run retries the old refusals of these families before the title starts
-# (--retry-lifted). Every lift adds the reason it removes here. A family this build does not lift is only refused
-# again, within PRE_RUN_RETRY_SECONDS.
+# Refusal families recent translators lift or narrow, by the reason an older build wrote (the first line of its .fail).
+# In the run the --watch pool leaves old refusals alone and the pass after the run retries them, so a lift would reach
+# only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
+# first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
@@ -12354,8 +12354,15 @@ def lifted_family(reason, families=LIFTED_REASONS):
 def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
     """Keys of the requests an older build refused (a .fail older than since_translator, still pending) for a reason
     of a lifted family, oldest request first."""
-    keys = []
-    for key in pending_keys(out_dir, False, since_translator):
+    return [key for key, lifted in old_failures(out_dir, since_translator, families) if lifted]
+
+
+def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
+    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
+    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
+    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+    rows = []
+    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
             if since_translator is not None and os.path.getmtime(fail) >= since_translator:
@@ -12364,27 +12371,31 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
                 reason = handle.readline()
         except OSError:
             continue
-        if lifted_family(reason, families):
-            keys.append(key)
-    return keys
+        lifted = lifted_family(reason, families) is not None
+        compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
+        rows.append((not lifted, compute, order, key, lifted))
+    return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
 
 
 class RetryReport:
-    def __init__(self, keys, ok, refused, left, seconds):
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0):
         self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
+        self.lifted = lifted
 
     def line(self):
-        """tester_run's log line: requests retried, translated, still refused, left for the pass after the run."""
+        """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
+        the pass after the run."""
         left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
-        return 'pre-run retry: %d keys, ok %d, still refused %d%s, %.0f s' % (
-            self.keys, self.ok, self.refused, left, self.seconds)
+        return 'pre-run retry: %d keys (%d in lifted families), ok %d, still refused %d%s, %.0f s' % (
+            self.keys, self.lifted, self.ok, self.refused, left, self.seconds)
 
 
 def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic):
-    """Translate again, on every core, the old refusals of the lifted families (lifted_failures) before the title starts.
+    """Translate again, on every core, the old refusals (old_failures: lifted families first) before the title starts.
     No new request is started after `seconds`; what is left keeps its .fail for the pass after the run."""
     start = clock()
-    keys = lifted_failures(out_dir, translator_stamp(), families)
+    rows = old_failures(out_dir, translator_stamp(), families)
+    keys = [key for key, _lifted in rows]
     results = {}
     if keys:
         jobs = max(1, min(jobs or translation_jobs(), len(keys)))
@@ -12407,7 +12418,8 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     for future in done:
                         results[running.pop(future)] = future.result()
     ok = sum(1 for result in results.values() if result == 'ok')
-    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start)
+    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
+                       sum(1 for _key, lifted in rows if lifted))
 
 
 def translate_one(out_dir, key):

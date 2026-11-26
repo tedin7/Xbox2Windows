@@ -209,8 +209,9 @@ $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-S
 # and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
 # The --watch pool beside the title leaves old refusals for the pass after the run, so a translator lift would reach
-# only the next run: the old refusals of the families this build lifts (gfx2hlsl.py LIFTED_REASONS) are translated
-# again now, on every core, for at most 180 s. Never blocks the run.
+# only the next run: every old refusal (a .fail an older build wrote) is translated again now, on every core, for at
+# most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
+# Never blocks the run.
 try {
     $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 } | Out-String).Trim()
     if ($retryLine) { Write-Host "tester_run: $retryLine" }
