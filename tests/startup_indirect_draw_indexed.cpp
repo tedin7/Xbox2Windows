@@ -103,6 +103,18 @@ void write_two_triangles() {
 }
 
 [numthreads(1, 1, 1)]
+void write_left_root_constant() {
+    data.Store(4, 17);
+    data.Store4(8, uint4(3, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_right_root_constant() {
+    data.Store(4, 29);
+    data.Store4(8, uint4(3, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
 void write_buffer_colour() {
     data.Store(16, 0xff00ff00u);
     data.Store(32, 0xff0000ffu);
@@ -200,6 +212,13 @@ float4 pixel(Varying input) : SV_Target {
     return float4(0, 0, 0, 1);
 }
 cbuffer entry : register(b0) { uint ud0; uint ud1; uint ud2; };
+cbuffer indirect_entry : register(b1) { uint draw_constant; };
+float4 indirect_constant_pixel(Varying input) : SV_Target {
+    if (draw_constant == 17 && input.position.x < 2) return float4(1, 0, 0, 1);
+    if (draw_constant == 29 && input.position.x >= 2) return float4(0, 1, 0, 1);
+    discard;
+    return float4(0, 0, 0, 1);
+}
 Texture2D<float4> translated_texture : register(t0);
 ByteAddressBuffer translated_buffer : register(t0);
 Texture2D<float4> translated_indexed_texture : register(t1);
@@ -601,8 +620,8 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
-enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute, full_signature_off };
+enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect, root_constant };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 {
@@ -697,6 +716,7 @@ constexpr UINT command_stride(DrawKind kind)
     switch (kind) {
     case DrawKind::indexed_rect:
     case DrawKind::indexed: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+    case DrawKind::root_constant: return sizeof(UINT) + sizeof(D3D12_DRAW_ARGUMENTS);
     case DrawKind::vertices:
     case DrawKind::rect: return sizeof(D3D12_DRAW_ARGUMENTS);
     case DrawKind::mesh: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -762,6 +782,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
+    const bool root_constant = kind == DrawKind::root_constant;
     const UINT indexed_argument_offset = translated_indexed && draw_right ? 8 : argument_offset;
     const bool mesh = kind == DrawKind::mesh;
     const UINT index_bytes = indexed ? (draw_right ? sizeof(wide_indices) : sizeof(indices)) : 0;
@@ -779,7 +800,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
     const void* index_data = draw_right ? static_cast<const void*>(wide.data()) : narrow.data();
     Words initial_words = initial;
-    if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
+    if (!indexed) initial_words[1 + command_stride(kind) / sizeof(UINT)] = 0x3c3c3c3c;
     const bool external_arguments = leased && leased->argument;
     std::optional<PlacedBuffer> arguments, index_buffer;
     if (!external_arguments)
@@ -1157,7 +1178,11 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         std::memcpy(observed.data(), memory, sizeof(observed));
         arg_readback->Unmap(0, &untouched);
         Words expected = initial_words;
-        if (writer) {
+        if (writer && root_constant) {
+            expected[1] = draw_right ? 29 : 17;
+            expected[2] = 3;
+            expected[3] = 1;
+        } else if (writer) {
             const UINT word = indexed_argument_offset / sizeof(std::uint32_t);
             expected[word] = refusal == Refusal::overflowing_count ? 0xffffffffu
                            : refusal == Refusal::rect_bad_count ? 4
@@ -1197,6 +1222,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
         UINT painted = 0;
         bool pixels_match = true;
+        bool differs_from_draw_reference = false;
         for (UINT y = 0; y < height; ++y)
             for (UINT x = 0; x < width; ++x) {
                 std::uint32_t actual = 0;
@@ -1205,8 +1231,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
                 const bool covered = (cached_depth_only && !cached_depth_pixel) ||
-                    (indexed ? right_half == draw_right : translated || !right_half || draw_right);
-                const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
+                    ((indexed || root_constant) ? right_half == draw_right : translated || !right_half || draw_right);
+                const bool drawn = writer && covered &&
+                    (refusal == Refusal::none || refusal == Refusal::full_signature_off);
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
                 const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
                 auto wanted = drawn ? (cached_depth_only ? depth_word :
@@ -1219,6 +1246,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                     wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
                         ? (0xff350000 | (v[y] << 8) | u[x]) : black;
                 }
+                if (refusal == Refusal::full_signature_off) {
+                    differs_from_draw_reference |= actual != wanted;
+                    wanted = background;
+                }
                 if (actual != background) ++painted;
                 if (actual == wanted) continue;
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
@@ -1227,6 +1258,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         pixel_readback->Unmap(0, &untouched);
         std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
                     external_arguments ? "" : ", argument guards intact");
+        if (refusal == Refusal::full_signature_off && !differs_from_draw_reference) {
+            std::fprintf(stderr, "%s: switch-off control matched the draw reference\n", label);
+            return false;
+        }
         if (!pixels_match) {
             if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
             return false;
@@ -1744,6 +1779,11 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
+    const bool full_signature_off = argc == 3 && std::strcmp(argv[2], "full-signature-off") == 0;
+    const bool full_signature = full_signature_off || (argc == 3 && std::strcmp(argv[2], "full-signature") == 0);
+    if (full_signature)
+        check(SetEnvironmentVariableA("X2W_INDIRECT_FULL_SIGNATURE", full_signature_off ? nullptr : "1") ? S_OK : E_FAIL,
+              "configure full indirect signatures");
     const bool lease_writer = argc == 3 && std::strcmp(argv[2], "mesh-lease-writer") == 0;
     const bool skip_argument_wait = argc == 3 && std::strcmp(argv[2], "mesh-xmem-arguments-skip-wait") == 0;
     const bool lease_arguments = skip_argument_wait || (argc == 3 && std::strcmp(argv[2], "mesh-xmem-arguments") == 0);
@@ -1781,7 +1821,8 @@ int main(int argc, char** argv) try
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    if (full_signature) kind = DrawKind::root_constant;
+    else if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
@@ -2400,6 +2441,43 @@ int main(int argc, char** argv) try
         }
         if (ok) std::filesystem::remove_all(cache);
         return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+    }
+    if (full_signature) {
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameter.Constants = {1, 0, 1};
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const auto root = create_root(guest.Get(), {1, &parameter, 0, nullptr, root_flags});
+        const auto vs = compile("vertex", "vs_5_0");
+        const auto ps = compile("indirect_constant_pixel", "ps_5_0");
+        const auto pipeline = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(guest.Get(), root.Get(),
+            {vs->GetBufferPointer(), vs->GetBufferSize()}, {ps->GetBufferPointer(), ps->GetBufferSize()});
+        D3D12_INDIRECT_ARGUMENT_DESC args[2]{};
+        args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        args[0].Constant = {0, 0, 1};
+        args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        const D3D12_COMMAND_SIGNATURE_DESC desc{command_stride(kind), 2, args, 0};
+        ComPtr<ID3D12CommandSignature> signature;
+        check(guest->CreateCommandSignature(&desc, root.Get(), IID_PPV_ARGS(&signature)), "create root-constant draw signature");
+
+        const auto left = writer_pipeline(device.Get(), writer.Get(), "write_left_root_constant");
+        const auto right = writer_pipeline(device.Get(), writer.Get(), "write_right_root_constant");
+        const auto refusal = full_signature_off ? Refusal::full_signature_off : Refusal::none;
+        if (!run(device.Get(), guest.Get(), writer.Get(), left.Get(), root.Get(), pipeline.Get(), signature.Get(),
+                 kind, false, refusal, "root constant 17") ||
+            !run(device.Get(), guest.Get(), writer.Get(), right.Get(), root.Get(), pipeline.Get(), signature.Get(),
+                 kind, true, refusal, "root constant 29")) return 1;
+
+        const auto line = indirect_line(guest.Get(), log_path);
+        const char* expected = full_signature_off
+            ? "x2w-render indirect: forwarded: 0; refused graphics-pipeline: 0; compute-pipeline: 0; placeholder-signature: 0; other: other 2"
+            : "x2w-render indirect: forwarded: draw 2; refused graphics-pipeline: 0; compute-pipeline: 0; placeholder-signature: 0; other: 0";
+        DeleteFileW(log_path.c_str());
+        if (line != expected) {
+            std::fprintf(stderr, "root-constant draw census: got '%s', expected '%s'\n", line.c_str(), expected);
+            return 1;
+        }
+        return !info || !info->GetNumStoredMessages() ? 0 : 1;
     }
     const auto graphics = create_root(guest.Get(), graphics_desc);
     const char* left_entry = indexed ? "write_left" : "write_one_triangle";

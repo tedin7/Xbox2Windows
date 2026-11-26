@@ -164,6 +164,7 @@ struct IndirectGraphicsPipeline {
     bool cached_depth_writes{};
     const std::vector<RootParameter>* guest_root_params{};
     UINT cached_srv_root = UINT_MAX;
+    bool requires_indirect_constants{};
 };
 
 // Why a resource is outside the retire class (X2W_D3D12_RELEASE_RETIRED), decided at creation, and why it left it later.
@@ -218,10 +219,10 @@ struct alignas(16) WrapperOwn {
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
-    Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
+    Wrapper* signature_device; // CommandSignature: owner of the supported signature
     IndirectCommand indirect_command;
-    ID3D12RootSignature* signature_root; // CommandSignature: desktop root of a Dispatch with root constants, or null
-    UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
+    ID3D12RootSignature* signature_root; // CommandSignature: desktop root of a signature with root constants, or null
+    UINT indirect_bytes; // CommandSignature: byte stride of the supported command record
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
     UINT list_node_mask;
@@ -1295,6 +1296,8 @@ void __stdcall device_copyable_footprints(Wrapper* self, const D3D12_RESOURCE_DE
     device_of(self)->GetCopyableFootprints(&copy, first, count, base, layouts, rows, row_bytes, total);
 }
 
+bool indirect_draw_constants(const D3D12_COMMAND_SIGNATURE_DESC& desc, const Wrapper* root);
+
 // Device slot 41, desktop CreateCommandSignature(desc, root, riid, ppv); on failure the descriptor and
 // its argument descriptors are logged. The observed console-only type 0x69 gets a placeholder before
 // desktop validation. Other types still reach the desktop even when they postdate DISPATCH_MESH.
@@ -1320,9 +1323,20 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         return *output ? u64{S_OK} : out_of_memory;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
-    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && root && desc->NumArgumentDescs > 1) {
-        // A Dispatch preceded by root constants for the signature's root (#1759 part 2). Other root argument
-        // types (root views, vertex and index buffer views) and graphics commands remain unsupported here.
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && output && readable_args && root &&
+        x2w_local::env_on("X2W_INDIRECT_FULL_SIGNATURE") &&
+        indirect_draw_constants(*desc, as_wrapper(reinterpret_cast<const void*>(root)))) {
+        auto* signature = static_cast<Wrapper*>(*output);
+        if (signature && signature->own().kind == command_signature_kind) {
+            auto& state = signature->own();
+            state.indirect_command = IndirectCommand::draw;
+            state.signature_root = reinterpret_cast<ID3D12RootSignature*>(unwrap(root));
+            state.indirect_bytes = desc->ByteStride;
+            state.signature_device = self;
+        }
+    }
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && readable_args && root && desc->NumArgumentDescs > 1) {
+        // A Dispatch preceded by root constants for the signature's root (#1759 part 2).
         auto* signature = *reinterpret_cast<Wrapper**>(out);
         UINT bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
         bool constants_only = desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
@@ -1338,7 +1352,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             state.signature_device = self;
         }
     }
-    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && readable_args && !root && desc->NumArgumentDescs == 1) {
         auto* signature = *reinterpret_cast<Wrapper**>(out);
         if (signature && signature->own().kind == command_signature_kind) {
             auto& state = signature->own();
@@ -2403,6 +2417,41 @@ const std::vector<RootParameter>* root_info(const Wrapper* root)
     return info;
 }
 
+const std::vector<RootParameter>* indirect_constants_root(const Wrapper* root)
+{
+    if (!root || root->own().kind != root_signature_kind || !root->own().real || root_heap_flags(root)) return nullptr;
+    const auto* params = root_info(root);
+    if (!params || params->empty() || params->size() > 16) return nullptr;
+    for (const auto& param : *params)
+        if (param.type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) return nullptr;
+    return params;
+}
+
+bool indirect_draw_constants(const D3D12_COMMAND_SIGNATURE_DESC& desc, const Wrapper* root)
+{
+    const auto* params = indirect_constants_root(root);
+    if (!params || desc.NumArgumentDescs != params->size() + 1 ||
+        desc.pArgumentDescs[desc.NumArgumentDescs - 1].Type != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)
+        return false;
+
+    // This path supplies every word through ExecuteIndirect. The native graphics path does not
+    // replay guest root setters. Let D3D12 validate the root and argument order at creation.
+    UINT seen = 0;
+    UINT bytes = sizeof(D3D12_DRAW_ARGUMENTS);
+    for (UINT i = 0; i + 1 < desc.NumArgumentDescs; ++i) {
+        const auto& argument = desc.pArgumentDescs[i];
+        if (argument.Type != D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT) return false;
+        const auto& constant = argument.Constant;
+        const UINT param = constant.RootParameterIndex;
+        if (param >= params->size() || (seen & (1u << param)) || constant.DestOffsetIn32BitValues ||
+            constant.Num32BitValuesToSet != (*params)[param].constants_count)
+            return false;
+        seen |= 1u << param;
+        bytes += constant.Num32BitValuesToSet * sizeof(UINT);
+    }
+    return desc.ByteStride >= bytes && !(desc.ByteStride & 3);
+}
+
 // Device slot 16, desktop CreateRootSignature(node, blob, size, riid, ppv); the parameter list is
 // kept for the translated shaders (register and space of each root descriptor), and the heap-indexing
 // flags for command-list slot 34.
@@ -2492,14 +2541,20 @@ bool readable_shader_container(const D3D12_SHADER_BYTECODE& code)
         !std::memcmp(code.pShaderBytecode, "DXBC", 4);
 }
 
-bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage)
+bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage,
+                                      bool allow_constants)
 {
     if (!readable_shader_container(code)) return false;
     x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
     if (FAILED(D3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(shader.GetAddressOf())))) return false;
     D3D12_SHADER_DESC desc{};
     if (FAILED(shader->GetDesc(&desc)) || desc.Version >> 16 != stage ||
-        ((desc.Version >> 4) & 0xf) != 5 || desc.BoundResources) return false;
+        ((desc.Version >> 4) & 0xf) != 5) return false;
+    for (UINT i = 0; i < desc.BoundResources; ++i) {
+        D3D12_SHADER_INPUT_BIND_DESC binding{};
+        if (!allow_constants || FAILED(shader->GetResourceBindingDesc(i, &binding)) || binding.Type != D3D_SIT_CBUFFER)
+            return false;
+    }
     if (stage == D3D12_SHVER_VERTEX_SHADER) {
         for (UINT i = 0; i < desc.InputParameters; ++i) {
             D3D12_SIGNATURE_PARAMETER_DESC input{};
@@ -2622,6 +2677,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     }
     const bool empty_root = root && root->own().kind == root_signature_kind && root->own().root_without_bindings;
     const bool native_mesh_root = empty_root || cached_mesh;
+    const bool native_constants_root = !mesh && x2w_local::env_on("X2W_INDIRECT_FULL_SIGNATURE") &&
+        indirect_constants_root(root);
     for (std::size_t offset = 0; ok && offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
         if (type == 0) {
@@ -2632,10 +2689,11 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             if (code->pShaderBytecode) {
                 const bool is_vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
                 bool supported = false;
-                if ((mesh ? native_mesh_root : empty_root) && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
-                    // The native PSO validates the DXIL stages against the empty root.
+                if ((mesh ? native_mesh_root : (empty_root || native_constants_root)) && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                    // The native PSO validates shader bindings against the desktop root.
                     supported = mesh ? !is_vertex && readable_shader_container(*code)
-                        : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER);
+                        : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER,
+                                                           native_constants_root);
                 }
                 if (!supported) {
                     std::snprintf(why, why_size, "stage %u has no translation or supported desktop binding", type);
@@ -2729,6 +2787,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     if (pipeline && (vertex || mesh) && (pixel || cached_mesh)) {
         graphics = {cached_mesh ? cached_root : static_cast<ID3D12RootSignature*>(root->own().real),
             targets.RTFormats[0], mesh, cached_mesh};
+        graphics.requires_indirect_constants = native_constants_root;
         if (cached_mesh) {
             graphics.cached_target_count = targets.NumRenderTargets;
             std::copy_n(targets.RTFormats, targets.NumRenderTargets, graphics.cached_targets);
@@ -3457,6 +3516,7 @@ constexpr const char* invalid_list_type = "invalid_list_type";
 constexpr const char* invalid_command_count = "invalid_command_count";
 constexpr const char* count_offset_without_buffer = "count_offset_without_buffer";
 constexpr const char* signature_device_mismatch = "signature_device_mismatch";
+constexpr const char* graphics_signature_root = "graphics_signature_root";
 constexpr const char* graphics_multi_command = "graphics_multi_command";
 constexpr const char* cached_mesh_attachments = "cached_mesh_attachments";
 constexpr const char* no_render_target = "no_render_target";
@@ -3566,6 +3626,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("requires a supported signature from this device", indirect_other, indirect_other_refusal_code::signature_device_mismatch);
     const auto command = sig->own().indirect_command;
     const bool indexed = command == IndirectCommand::draw_indexed;
+    const bool draw_constants = command == IndirectCommand::draw && sig->own().signature_root;
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
@@ -3575,13 +3636,15 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
-    u64 bytes = sig->own().indirect_bytes;
+    const u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
     if (graphics) {
-        if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
-        else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
-        else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
+        if ((draw_constants && (translated || sig->own().signature_root != pass.graphics_root ||
+                               pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)) ||
+            (!draw_constants && pass.indirect_graphics.requires_indirect_constants))
+            return refuse("indirect draw root constants require the matching desktop root and triangle-list topology",
+                          indirect_other, indirect_other_refusal_code::graphics_signature_root);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || (!translated && (!pass.indirect_graphics.root ||
             pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
             // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
@@ -3873,6 +3936,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (draw_constants) {
+        // D3D12 zeroes the words written by the signature after execution.
+        std::memset(pass.constants, 0, sizeof(pass.constants));
+    }
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);

@@ -14735,6 +14735,9 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 - Raw desktop topology rejection: passing raw `0x11` to desktop `CreateGraphicsPipelineState`
   is rejected with `0x80070057` (`E_INVALIDARG`).
 
+See [Indirect draws with root constants](experiments/indirect-draw-root-constants.md)
+for the opt-in desktop command signature and its WARP fixture.
+
 ### Indirect Draw with a rectangle list
 
 An indirect `Draw` whose recorded topology is `0x11` is forwarded as a triangle-list `ExecuteIndirect`
