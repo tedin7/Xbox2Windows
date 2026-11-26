@@ -2235,8 +2235,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             // Name both resources so the next run shows whether two placements overlap this range.
             static LONG mismatch_logged;
             if (first_calls(mismatch_logged, 8)) {
-                const auto* token_real = static_cast<ID3D12Resource*>(owner->own().real);
-                const auto* placed_real = placed.owner ? static_cast<ID3D12Resource*>(placed.owner->own().real) : nullptr;
+                auto* token_real = static_cast<ID3D12Resource*>(owner->own().real);
+                auto* placed_real = placed.owner ? static_cast<ID3D12Resource*>(placed.owner->own().real) : nullptr;
                 log("x2w-draw input token resource title memory=%p width=%llu; placement at the range: title memory=%p width=%llu; range address=0x%llx bytes=%llu offset=%llu",
                     owner->own().title_memory, token_real ? static_cast<unsigned long long>(token_real->GetDesc().Width) : 0ull,
                     placed.owner ? placed.owner->own().title_memory : nullptr, placed_real ? static_cast<unsigned long long>(placed_real->GetDesc().Width) : 0ull,
