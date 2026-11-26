@@ -319,6 +319,8 @@ def controls():
         # check_draw below reads this pixel stage's plain 2D d16 sample back). d16 together with a16 is a second modifier
         # on the same instruction and keeps both halves of the semantics: packed address, packed data.
         d16_text = translate(MIMG_LLVM_MC[f'{prefix}_d16'][1]).hlsl_ps()
+        both = translate(encode_mimg(op, a16=1, d16=1)).hlsl_ps()
+        assert 'float2(f16tof32(v0), f16tof32(v0 >> 16))' in both and 'pack16_rne(t.x) | (pack16_rne(t.y) << 16)' in both, both
         assert 'pack16_rne(t.x) | (pack16_rne(t.y) << 16)' in d16_text, d16_text
         assert 'pack16_rne(t.z) | (pack16_rne(t.w) << 16)' in d16_text, d16_text
         expect_refused(lambda o=op: translate(encode_mimg(o, a16=1, nsa=1, extra_addrs=(1,))),
@@ -440,7 +442,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
 
             # d16 sample (plain 2D, the case this check used to refuse): v4 holds the red and green halves, v5 the blue and
             # alpha halves; v6 and v7 stay 0. Every texel channel here is exact in binary16, so the words are the halves.
-            d16_hlsl = translate(MIMG_LLVM_MC['sample_d16'][1]).hlsl_ps()
+            # The plain d16 fixture has float addresses (v0 = the root constant's bits, v1 = 0.75: one fixed texel), so the
+            # four quadrants are read through a16 + d16: packed binary16 address in v0, binary16 pairs in v[4:5].
+            d16_hlsl = translate(encode_mimg(IMG_SAMPLE, a16=1, d16=1)).hlsl_ps()
             d16_ps = compile_hlsl(compiler, kind, d16_hlsl, f'sample_d16_{kind}', ps_profile, directory)
 
             def halves(x, y):

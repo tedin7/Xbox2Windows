@@ -7509,7 +7509,7 @@ class Stage:
                 op_name = 'image_sample' if how == 'sample' else 'image_sample_lz'
                 packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
                 # d16 returns the sampled channels as binary16 pairs (RNE): vdata is ceil(channels / 2) registers.
-                allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ('d16',))
+                allowed = ('dlc', 'glc', 'slc', 'd16') + (('a16',) if packed_2d else ())
                 for m in mods:
                     if not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                         raise Unsupported('%s modifier %s' % (op_name, m))
