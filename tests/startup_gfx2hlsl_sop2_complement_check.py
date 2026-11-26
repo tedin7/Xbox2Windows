@@ -4,6 +4,7 @@ tools/startup/gfx2hlsl.py.
   (no arguments)        translation controls, pure Python
   binary <llvm-mc>      assemble the decoded text of every form with llvm-mc and compare with the words built here
   decode <libLLVM>      disassemble the same words with LLVM's C API and compare with tools/disasm_rdna2.py
+  descriptor_gpu <dxc> <offscreen_check> warp   pixel and compute descriptor-word readback with a stale SCC mutant
 
 The instruction words are built here from the SOP2 layout that tools/disasm_rdna2.py reads: [31:30] = 0b10,
 [29:23] opcode, [22:16] sdst, [15:8] ssrc1, [7:0] ssrc0, and one literal dword after the word when a source is 255.
@@ -645,17 +646,19 @@ def controls():
                 accepted.append(('%s s3, s1(mask), s2' % name, [str(error)]))
         check('%s: %d lane-mask forms refused' % (name, len(MASK_FORMS) + 1), not accepted, str(accepted[:2]))
 
-    # Symbolic descriptor sources cannot silently leave the previous SCC in place.
+    # Unavailable words must refuse before writing SCC and name the missing input.
     for name in OPS:
-        stage = Probe()
-        stage.sym[1] = ('ptr', 0, 0)
-        try:
-            stage.one(name, '%s s3, s1, s2' % name)
-        except G.Unsupported as error:
-            check('%s refuses a descriptor before writing SCC' % name,
-                  str(error).startswith('scc from descriptor data') and not stage.lines, str(error))
-        else:
-            check('%s refuses a descriptor before writing SCC' % name, False, str(stage.lines))
+        for symbol, word in ((('ptrhi', ('root', 0)), 'pointer high word'),
+                             (('desc', ('table', 0), 0, 2), 'descriptor dword 2')):
+            stage = Probe()
+            stage.sym[1] = symbol
+            try:
+                stage.one(name, '%s s3, s1, s2' % name)
+            except G.Unsupported as error:
+                check('%s refuses unavailable %s' % (name, word),
+                      'cannot materialize %s in s1' % word in str(error) and not stage.lines, str(error))
+            else:
+                check('%s refuses unavailable %s' % (name, word), False, str(stage.lines))
 
     # 6. Mutated table entries, built from the sibling's, must read a wrong word or SCC.
     saved = dict(G.SCA)
@@ -715,12 +718,37 @@ def check_decode(library):
           len(texts) == len(codes) and not wrong, str(wrong[:3]))
 
 
+def descriptor_operations():
+    def absdiff(word):
+        delta = (word - 1) & MASK
+        result = abs(delta - (1 << 32) if delta >> 31 else delta)
+        return result, bool(result)
+
+    def complement(word, operation):
+        result = ~operation(word) & MASK
+        return result, bool(result)
+
+    return [
+        ('s_nand_b32', '-1', lambda word: complement(word, lambda v: v)),
+        ('s_nor_b32', '0', lambda word: complement(word, lambda v: v)),
+        ('s_xnor_b32', '1', lambda word: complement(word, lambda v: v ^ 1)),
+        ('s_absdiff_i32', '1', absdiff),
+    ]
+
+
 def main():
+    from startup_gfx2hlsl_descriptor_scc_gpu import check_gpu, shader
+
     if len(sys.argv) == 1:
         controls()
+        for name, rhs, _ in descriptor_operations():
+            for kind in ('ps', 'cs'):
+                shader(kind, name, rhs)
     else:
         mode, *args = sys.argv[1:]
-        if mode == 'binary':
+        if mode == 'descriptor_gpu':
+            check_gpu(*args, descriptor_operations())
+        elif mode == 'binary':
             check_binary(*args)
         elif mode == 'decode':
             check_decode(*args)

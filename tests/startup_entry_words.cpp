@@ -32,18 +32,22 @@ std::vector<char> read_blob(const char* path)
 
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width, UINT height)
+                               UINT width, UINT height, const std::uint32_t* srv_word)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
 
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.Constants = {0, 0, entry_count};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, entry_count};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &range};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 1;
-    rs.pParameters = &param;
+    rs.NumParameters = srv_word ? 2 : 1;
+    rs.pParameters = params;
     ComPtr<ID3DBlob> signature, errors;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)))
         throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer())
@@ -95,6 +99,30 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRoot32BitConstants(0, entry_count, entry, 0);
+    ComPtr<ID3D12Resource> input;
+    ComPtr<ID3D12DescriptorHeap> srvs;
+    if (srv_word) {
+        input = make_buffer(device, sizeof(*srv_word), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        const D3D12_RANGE no_reads{0, 0};
+        void* mapped = nullptr;
+        check(input->Map(0, &no_reads, &mapped), "Map pixel input");
+        std::memcpy(mapped, srv_word, sizeof(*srv_word));
+        input->Unmap(0, nullptr);
+
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&srvs)), "Create pixel SRV heap");
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = 1;
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device->CreateShaderResourceView(input.Get(), &view, srvs->GetCPUDescriptorHandleForHeapStart());
+        ID3D12DescriptorHeap* heaps[]{srvs.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootDescriptorTable(1, srvs->GetGPUDescriptorHandleForHeapStart());
+    }
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);

@@ -1579,11 +1579,11 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
     return words;
 }
 
-// --startup-entry-words <vs.cso> <ps.cso> <entry words> <expected words>: draws one pixel with a gfx2hlsl
+// --startup-entry-words <vs.cso> <ps.cso> <entry words> <expected words> [<SRV word>]: draws one pixel with a gfx2hlsl
 // vertex and pixel pair that reads its operands from the entry constant buffer (tests/startup_entry_words.cpp).
 // <entry words> is 1..32 comma-separated 8-digit hex words, ud0 first; the translated vertex stage reads ud0
 // as its rectangle-list switch, so a plain triangle fixture keeps it 0. <expected words> is the four words the
-// target must hold, compared bit for bit.
+// target must hold, compared bit for bit. An optional word is bound as a raw t0 SRV.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
     const auto entry = parse_hex_words(ctx.argv[5]);
@@ -1592,8 +1592,12 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
     if (expected.size() != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
+    const auto input = ctx.argc == 8 ? parse_hex_words(ctx.argv[7]) : std::vector<std::uint32_t>{};
+    if (ctx.argc == 8 && input.size() != 1)
+        return {OutcomeKind::fail, "SRV input is not one hex word"};
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words,
+                              1, 1, input.empty() ? nullptr : input.data());
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1729,7 +1733,7 @@ const OperationSpec kOperations[] = {
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
-    {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
+    {"--startup-entry-words", 7, 8, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},

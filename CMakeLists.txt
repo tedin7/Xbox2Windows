@@ -3786,6 +3786,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_src_scc_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_src_scc_alias_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_check.py" alias_dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_src_scc_alias_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    foreach(family IN ITEMS s_lshl_add sop2_complement)
+        add_test(NAME startup_gfx2hlsl_${family}_descriptor_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_${family}_check.py" descriptor_gpu "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" warp)
+        set_tests_properties(startup_gfx2hlsl_${family}_descriptor_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     # src_scc at a branch target that one uniform SCC write reaches on every path.
     add_test(NAME startup_gfx2hlsl_src_scc_join COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_join_check.py")

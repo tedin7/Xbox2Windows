@@ -1,6 +1,6 @@
 """The scalar shift-and-add forms s_lshl1..4_add_u32 in tools/startup/gfx2hlsl.py (Run 20 census #16).
 
-usage: startup_gfx2hlsl_s_lshl_add_check.py
+usage: startup_gfx2hlsl_s_lshl_add_check.py [descriptor_gpu <dxc> <offscreen_check> warp]
 
 D = (S0 << N) + S1 on 32 bits, and SCC = carry out of the wide sum (S0 << N) + S1 (bits shifted out of S0 count).
 Words are built from the SOP2 layout tools/disasm_rdna2.py reads: [31:30] = 0b10, [29:23] opcode, [22:16] sdst,
@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERE))
 import disasm_rdna2 as D  # noqa: E402
 import gfx2hlsl as G  # noqa: E402
 from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
+from startup_gfx2hlsl_descriptor_scc_gpu import check_gpu, shader  # noqa: E402
 
 MASK = 0xffffffff
 OPCODE = {name: op for op, (name, _) in D.SOP2_OPS.items()}
@@ -107,6 +108,37 @@ def first_mismatch(n):
                 return name, sdst, ssrc0, ssrc1, hex(a), hex(b), (out.get(dest), out['scc']), want
     return None
 
+
+# Five as the second operand exercises carry from the sum as well as shifted-out bits.
+descriptor_operations = [
+    (name, '5', lambda word, n=n: reference(n, word, 5))
+    for n, name in NAMES.items()
+]
+
+
+def incoming_scc_reference(word):
+    # The fixture seeds SCC opposite to carry. With shift 2 and a one-bit addend,
+    # only the shift can set carry.
+    return reference(2, word, int(word < 0x40000000))
+
+
+descriptor_operations.append((NAMES[2], 'src_scc', incoming_scc_reference))
+stride_operations = [
+    ('stride', (NAMES[2], '9', lambda word: reference(2, word, 9))),
+    ('stride_min1', (NAMES[2], '9', lambda word: reference(2, max(word, 1), 9))),
+]
+
+if len(sys.argv) == 5 and sys.argv[1] == 'descriptor_gpu':
+    check_gpu(*sys.argv[2:], descriptor_operations)
+    for field, operation in stride_operations:
+        check_gpu(*sys.argv[2:], (operation,), field=field, cases=(0, 7, 0x3fff))
+    sys.exit(0)
+
+for kind in ('ps', 'cs'):
+    for name, rhs, _ in descriptor_operations:
+        shader(kind, name, rhs)
+for field, (name, rhs, _) in stride_operations:
+    shader('cs', name, rhs, field)
 
 for n in NAMES:
     mismatch = first_mismatch(n)

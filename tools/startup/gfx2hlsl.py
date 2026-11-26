@@ -2619,6 +2619,31 @@ class Stage:
             dest = 'none'
         return '%s [%s: %s, destination %s]' % (text, path, opcode, dest)
 
+    def descriptor_scalar_word(self, tok, sym):
+        """Materialize only the descriptor fields the runtime supplies in the entry buffer."""
+        if not sym or sym[0] not in ('desc', 'descnum', 'ptr', 'ptrhi'):
+            return self.u(tok)
+        field = sym[1] if sym[0] == 'descnum' and len(sym) == 3 else None
+        word = sym[2] if field else sym
+        if word[0] == 'desc' and names_one_value(word) and word[1][0] == 'table':
+            key = desc_key(word)
+            source = ('stride' if field in ('stride', 'stride_min1') else
+                      'descword3' if field is None and word[3] % 4 == 3 else None)
+            reg = reg_range(tok)
+            proven = not getattr(self, 'past_entry', False) or (
+                field is None and reg and self.formatted_descriptor_from_block(reg, word))
+            if (source and proven and key not in self.pipe.modified
+                    and key not in getattr(self.pipe, 'rw_keys', ())
+                    and self.pipe.resources.get(key, {}).get('kind', 'buf') == 'buf'):
+                self.pipe.resource(key, 'buf')
+                value = 'ud%d' % self.pipe.ud((source, self.srv_index(key)))
+                return 'max(%s, 1u)' % value if field == 'stride_min1' else value
+        detail = ('descriptor dword %d' % (word[3] % 4) if word[0] == 'desc' else
+                  {'ptrhi': 'pointer high word', 'ptr': 'pointer low word',
+                   'descnum': 'derived descriptor word'}[word[0]])
+        raise Unsupported(self.scc_refusal('scc from descriptor data',
+                                           'cannot materialize %s in %s' % (detail, tok)))
+
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
         if tok == 'src_scc':
@@ -2957,12 +2982,13 @@ class Stage:
         return True
 
     def set_scc(self, expr, proof=None):
-        """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
-        sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
+        """Emit an SCC assignment and track uniformity. A proof can be a source expression or a
+        uniformity result computed before a destination write changes the source registers."""
         self.scc_effect = 'emitted'
         self.scc_verified = True
         if self.tracks_uniformity():
-            self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
+            self.scc_uniform = (proof if isinstance(proof, bool) else
+                                self.scalar_expr_uniform(expr if proof is None else proof))
         self.emit('scc = %s;' % expr)
 
     def record_scalar_uniformity(self, n, uniform):
@@ -5908,7 +5934,9 @@ class Stage:
                     self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
-        if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+        descriptor_sources = any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms)
+        numeric_descriptor = descriptor_sources and (shift_add or word_complement or word_absdiff)
+        if descriptor_sources and not numeric_descriptor:
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
@@ -5916,8 +5944,6 @@ class Stage:
                 self.scc_verified = False
                 if self.tracks_uniformity():
                     self.scc_uniform = False
-            if shift_add or word_complement or word_absdiff:
-                raise Unsupported(self.scc_refusal('scc from descriptor data', 'shift-add, complement or absdiff'))
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
             # Every path below writes the destination's symbol directly, not through set_s, or refuses. The
@@ -5994,10 +6020,16 @@ class Stage:
             if pair:
                 raise Unsupported('%s into null' % base)
         deferred_scc = None
+        snapshot = False
+        result_uniform = None
+        scc_proof = None
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
-        values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
+        if numeric_descriptor:
+            values = [self.descriptor_scalar_word(t, sym) for t, sym in zip(srcs, syms)]
+        else:
+            values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
         expr = text.format(*values)
         if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
             for tok in srcs:
@@ -6011,21 +6043,36 @@ class Stage:
         elif base in SCC_UNMODELLED:
             scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
             if re.search(r'\bscc\b', scc_text):
-                # An operand is the incoming SCC (src_scc): the destination must read it before this instruction's own
-                # SCC replaces it, so the destination is written first and the SCC after, from sources it did not change.
-                if dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
-                        reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
-                        for t in srcs):
+                snapshot = any(reg_range(t) and reg_range(t)[0] == 's' and
+                               dst and dst[1] <= reg_range(t)[1] <= dst[2] for t in srcs)
+                if (dname in ('m0', 'null') or mask_dest or not dst or dst[0] != 's'
+                        or dst[1] > 105 or (snapshot and self.is_lane_mask(dname))):
                     raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
                                       % base)
+                if snapshot:
+                    # Prove uniformity while the original operands still name the incoming values.
+                    if self.tracks_uniformity():
+                        result_uniform = self.scalar_expr_uniform(expr)
+                        scc_proof = self.scalar_expr_uniform(scc_text)
+                    self.emit('{ uint scc_src0 = %s, scc_src1 = %s;' % tuple(values))
+                    expr = text.format('scc_src0', 'scc_src1')
+                    scc_text = add_sub_min_max_scc(base, 'scc_src0', 'scc_src1', expr)
                 deferred_scc = scc_text
             else:
                 # From the sources, before the destination is written (it can be a source).
                 self.set_scc(scc_text)
         if shift_add:
-            # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
+            # Carry includes shifted-out bits and wrap of the sum. Read both before writing the destination.
             n = SHIFT_ADD[base]
-            self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
+            carry = '(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1])
+            if numeric_descriptor and 'src_scc' in srcs:
+                # The result also needs the incoming SCC after the carry assignment.
+                if self.tracks_uniformity():
+                    result_uniform = self.scalar_expr_uniform(expr)
+                self.emit('{ uint scc_in = (scc ? 1u : 0u);')
+                expr = text.format(*(v if t != 'src_scc' else 'scc_in' for t, v in zip(srcs, values)))
+                snapshot = True
+            self.set_scc(carry)
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -6033,6 +6080,8 @@ class Stage:
                 # Through set_scc, so an SCC derived from a lane mask (s_and_b32 m0, vcc_lo, -1)
                 # is tracked as varying like any other scalar result.
                 self.set_scc(scc.replace('$', 'm0'), proof=scc.replace('$', '(%s)' % expr))
+            if snapshot:
+                self.emit('}')
             return None
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
@@ -6126,9 +6175,11 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
-        self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        self.set_s(d, expr, scc=None if lane_complement else scc, uniform=result_uniform, align4=salu_align4)
         if deferred_scc is not None:
-            self.set_scc(deferred_scc)
+            self.set_scc(deferred_scc, proof=scc_proof)
+        if snapshot:
+            self.emit('}')
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
             # Keep the runtime SGPR assignment intact while letting const_words() read inline float patterns
             # such as 0x40000000 (OPAQUE_BLACK, encoded as inline 244 / '2.0').

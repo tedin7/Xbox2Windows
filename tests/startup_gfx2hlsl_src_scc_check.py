@@ -2,6 +2,7 @@
 
 usage: startup_gfx2hlsl_src_scc_check.py
        startup_gfx2hlsl_src_scc_check.py dispatch <dxc> <offscreen_check> <warp|hardware>
+       startup_gfx2hlsl_src_scc_check.py alias_dispatch <dxc> <offscreen_check> warp
 
 The census contained `s_mul_i32 s28, 1.0, src_scc`, refused as `operand 'src_scc'` (#870, issue #1820).
 Source code 253 reads the SCC bit as the integer value 0 or 1; the generated shader carries SCC as a
@@ -207,8 +208,78 @@ def check_dispatch(dxc, runner, adapter):
     print('dispatch ok')
 
 
-if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
-    check_dispatch(*sys.argv[2:])
+def alias_shader(op):
+    from startup_gfx2hlsl_descriptor_scc_gpu import ENTRY_ROOT, program
+
+    # One low dword updates SCC, then two in-place dwords consume and update it.
+    guest = f"""\
+s_mov_b32 s31, s5
+s_mov_b32 s32, 0
+s_load_dwordx4 s[36:39], s[31:32], 0
+s_load_dwordx4 s[44:47], s[31:32], 0x30
+s_waitcnt lgkmcnt(0)
+s_buffer_load_dwordx4 s[48:51], s[36:39], 0
+s_waitcnt lgkmcnt(0)
+{op} s48, s48, 1
+{op} s49, s49, src_scc
+{op} s50, s50, src_scc
+s_mov_b32 s51, src_scc
+v_mov_b32 v7, s48
+v_mov_b32 v8, s49
+v_mov_b32 v9, s50
+v_mov_b32 v10, s51
+buffer_store_dwordx4 v[7:10], v0, s[44:47], 0 offen
+s_endpgm
+"""
+    refusals = []
+    pipe = G.ComputePipeline(b'', ENTRY_ROOT, 6 << 1, (1, 1, 1), decoded=program(guest), refusals=refusals)
+    source = pipe.hlsl_cs()
+    assert not refusals, refusals
+    return source
+
+
+def late_snapshot(source, op):
+    """Write the result from live inputs, then wrongly snapshot the clobbered input for SCC."""
+    for dst in ('s49', 's50'):
+        snapshot = f'    {{ uint scc_src0 = {dst}, scc_src1 = (scc ? 1u : 0u);'
+        assignment = f'    {dst} = scc_src0 {op} scc_src1;'
+        old = snapshot + '\n' + assignment
+        new = f'    {{ {dst} = {dst} {op} (scc ? 1u : 0u);\n' + snapshot.replace('{ ', '  ', 1)
+        assert source.count(old) == 1, source
+        source = source.replace(old, new, 1)
+    return source
+
+
+def check_alias_dispatch(dxc, runner, adapter):
+    from startup_gfx2hlsl_descriptor_scc_gpu import compile_shader, compute_case, verify_readback
+
+    out = Path(here).parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        for name, op, step, cases in (
+            ('s_add_u32', '+', 1, ((MASK, MASK, 7), (MASK, MASK, MASK), (41, MASK, 6))),
+            ('s_sub_u32', '-', -1, ((0, 0, 7), (0, 0, 0), (41, 0, 6))),
+        ):
+            source = alias_shader(name)
+            good = compile_shader(dxc, directory, name, 'cs_6_0', source)
+            bad = compile_shader(dxc, directory, name + '_late', 'cs_6_0', late_snapshot(source, op))
+            for i, words in enumerate(cases):
+                total = sum(word << (32 * j) for j, word in enumerate(words)) + step
+                expected = tuple((total >> (32 * j)) & MASK for j in range(3))
+                expected += (int(total < 0 or total >= 1 << 96),)
+                case = directory / 'alias.case'
+                compute_case(case, (), expected, words)
+                command = [runner, adapter, '--compute-store-sized-case']
+                verify_readback([*command, str(good), str(case)])
+                # In the first two cases the middle word consumes carry or borrow and passes it on.
+                # The late snapshot loses it, so the first mismatch is the high word.
+                verify_readback([*command, str(bad), str(case)], 'word=2 expected=' if i < 2 else None)
+
+
+if len(sys.argv) == 5 and sys.argv[1] in ('dispatch', 'alias_dispatch'):
+    run = check_dispatch if sys.argv[1] == 'dispatch' else check_alias_dispatch
+    run(*sys.argv[2:])
     sys.exit(0)
 elif len(sys.argv) != 1:
     sys.exit(__doc__)
@@ -275,11 +346,17 @@ check('s_add_u32 reading incoming verified src_scc is accepted',
 # The destination reads the incoming SCC before this add's own carry replaces it (the carry is emitted after the write).
 check('s_add_u32 src_scc operand is read before the add writes SCC',
       emitted.index(read_line) < emitted.index('scc = ((scc ? 1u : 0u) + 0x00000001u) < ((scc ? 1u : 0u));'), emitted)
-check('s_add_u32 whose destination is also a source and reads src_scc is refused',
-      refused_reason(encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
-                     + encode_sop2(SOP2_ADD_U32, S1, S1, S_SCC)
-                     + encode_sopp(SOPP_ENDPGM)) == 's_add_u32 reads src_scc with a destination that is also a source '
-                                                    'or a special register')
+for opcode, name in ((SOP2_ADD_U32, 's_add_u32'), (0x01, 's_sub_u32')):
+    for dst in (106, 124, 125, 126):
+        reason = refused_reason(encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
+                                + encode_sop2(opcode, dst, S1, S_SCC)
+                                + encode_sopp(SOPP_ENDPGM))
+        check(f'{name} with special destination {dst} keeps its refusal',
+              reason == f'{name} reads src_scc with a destination that is also a source or a special register', reason)
+    source = alias_shader(name)
+    check(f'{name} snapshots both aliased instructions', source.count('{ uint scc_src0 =') == 2)
+    late_snapshot(source, '+' if name == 's_add_u32' else '-')
+
 _asm, emitted, _stage = translate_program(
     encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
     + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)
