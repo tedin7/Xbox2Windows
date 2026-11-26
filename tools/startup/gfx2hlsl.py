@@ -3060,7 +3060,7 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
-    def execz_refusals(self):
+    def execz_refusals(self, exits=(), uniform_moves=()):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
         The wave runs such a block when any lane is active, so its scalar results are the same for every lane; the
@@ -3075,7 +3075,8 @@ class Stage:
         the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
         the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
         shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
-        or a backward s_cbranch_execz is refused.
+        or a backward s_cbranch_execz is refused. The structured lowering reruns this check with proven enclosing
+        exits and candidate uniform moves. Translation checks the move operands before emitting the new body.
 
         The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
@@ -3128,7 +3129,8 @@ class Stage:
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
-            if name != 's_cbranch_execz':
+            # An enclosing exit is lowered as a wave-wide decision inside an already checked block.
+            if name != 's_cbranch_execz' or off in exits:
                 continue
             t = index.get(int(parse(asm)[1][0].split('_')[1], 16))
             if t is None or t <= b:
@@ -3173,7 +3175,7 @@ class Stage:
                 reason = None
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
-                elif inner.startswith(('s_cbranch', 's_branch')) and not (
+                elif at not in exits and inner.startswith(('s_cbranch', 's_branch')) and not (
                         b < (exit_index := index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1)) <= t):
                     reason = 'branch out of the block'
                     # A lane can leave while the wave takes the latch, or take the latch after the wave exits.
@@ -3185,6 +3187,7 @@ class Stage:
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
+                               if (at, word) not in uniform_moves
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
                     named = [unread[word] for word in words if unread[word] >= 0]
                     first = min(named) if named else None
@@ -3196,6 +3199,60 @@ class Stage:
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def structured_execz_plan(self, branches, refused):
+        """Find forward regions for the single guest wave in a small compute group.
+
+        Every host thread follows each guest scalar edge, so joins also see uniform scalar writes made while
+        their own EXEC bit was clear. EXECZ votes span the group even when the host uses smaller waves.
+        """
+        group = getattr(getattr(self, 'pipe', None), 'group', None)
+        if not refused or not group or group[0] * group[1] * group[2] > 32:
+            return None
+        edges = dict(branches)
+        targets = set(edges.values())
+        offsets = {off for off, _, _, _ in self.ins}
+        stack, exits, inputs, moves = [], set(), {}, set()
+        nested_execz = False
+        for i, (off, _, name, asm) in enumerate(self.ins):
+            while stack and off == stack[-1]:
+                stack.pop()
+            if name.startswith(('s_setpc', 's_swappc')) or (name == 's_endpgm' and i != len(self.ins) - 1):
+                return None
+            target = edges.get(off)
+            if target is not None:
+                if target <= off or target not in offsets:
+                    return None
+                if name in ('s_cbranch_scc0', 's_cbranch_scc1'):
+                    if not stack or off in targets or not self.ins[i - 1][2].startswith('s_cmp_'):
+                        return None
+                    cmp_off, _, _, cmp_asm = self.ins[i - 1]
+                    inputs[cmp_off] = (off, parse(cmp_asm)[1])
+                elif name == 's_cbranch_execz':
+                    nested_execz |= bool(stack)
+                else:
+                    return None
+                if stack and target > stack[-1]:
+                    if target not in stack:
+                        return None
+                    exits.add(off)
+                else:
+                    stack.append(target)
+            elif stack and name == 's_mov_b32' and off in refused:
+                _, ops, _ = parse(asm)
+                if len(ops) == 2 and re.fullmatch(r's\d+', ops[0]):
+                    inputs[off] = (off, ops[1:])
+                    moves.add((off, ops[0]))
+        if not nested_execz or not (exits or moves) or self.execz_refusals(exits, moves):
+            return None
+        return {edges[off] for off in exits}, inputs
+
+    def structured_execz_uniform_inputs(self, operands):
+        for operand in operands:
+            reg = reg_range(operand)
+            if not self.uniform_source(operand) or (reg and (reg[0] != 's' or reg[1] not in self.defined_uniform_s)):
+                return False
+        return True
 
     def execz_read_cause(self, j, word, b, t, effects, into):
         """Why the read at instruction j of `word` after the join t of an execz block is not proven (execz_live_read),
@@ -3776,6 +3833,8 @@ class Stage:
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
+        self.structured_execz = self.structured_execz_plan(branches, refused) if refused else None
+        execz_inputs = self.structured_execz[1] if self.structured_execz else {}
         # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
         # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
         self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
@@ -4056,8 +4115,12 @@ class Stage:
                     for reg in dests:
                         self.float_const_s.pop(reg, None)
                 try:
-                    if off in refused:
+                    if self.structured_execz is None and off in refused:
                         raise Unsupported(refused[off])
+                    if off in execz_inputs:
+                        branch, operands = execz_inputs[off]
+                        if not self.structured_execz_uniform_inputs(operands):
+                            raise Unsupported(refused.get(branch, 'nested EXECZ requires a proven uniform SCC source'))
                     base = re.sub(r'_e(32|64)$', '', name)
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
@@ -4089,6 +4152,10 @@ class Stage:
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
+                            cond_uniform = True
+                        if self.structured_execz:
+                            if cond in ('scc0', 'scc1') and not (self.scc_uniform and self.scc_verified):
+                                raise Unsupported(refused.get(off, 'nested EXECZ requires proven uniform SCC'))
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
@@ -5083,6 +5150,8 @@ class Stage:
                 word = 'exec' if base[10:].startswith('exec') else 'vcc'
                 bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
                 cond = ('!' if base[10:].endswith('z') else '') + 'WaveActiveAnyTrue(%s)' % bit
+            elif base == 's_cbranch_execz' and getattr(self, 'structured_execz', None):
+                cond = '!x2w_execz_any(tid, (exec & 1u) != 0u)'
             elif base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
                 # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
                 # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
@@ -10305,6 +10374,8 @@ class Stage:
     # ---- output ------------------------------------------------------------------------------
     def body(self):
         """Statements of the whole program as structured HLSL."""
+        if getattr(self, 'structured_execz', None):
+            return self.structured_execz_body()
         out = []
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
@@ -10352,6 +10423,41 @@ class Stage:
             out.append('    }')
         if loops:
             out.append('    }')
+        return out
+
+    def structured_execz_body(self):
+        """Nest local fall-through arms and guard the rest of an enclosing arm after an early exit."""
+        exit_targets, _ = self.structured_execz
+        out, joins, running = [], [], {}
+
+        def emit(line, extra=0):
+            out.append('    ' * (1 + len(joins) + extra) + line)
+
+        for off, lines, term in self.blocks:
+            while joins and off == joins[-1]:
+                joins.pop()
+                emit('}')
+            running.pop(off, None)
+            guard = ' && '.join(running.values())
+            if lines and guard:
+                emit('if (%s) {' % guard)
+            for line in lines:
+                emit(line, int(bool(guard)))
+            if lines and guard:
+                emit('}')
+            if not term or term[0] == 'end':
+                continue
+            _, cond, target = term
+            prefix = guard + ' && ' if guard else ''
+            if joins and target > joins[-1]:
+                emit('if (%s(%s)) %s = false;' % (prefix, cond, running[target]))
+                continue
+            fallthrough = cond[1:] if cond.startswith('!') else '!(%s)' % cond
+            emit('if (%s%s) {' % (prefix, fallthrough))
+            joins.append(target)
+            if target in exit_targets and target not in running:
+                running[target] = 'x2w_running_%x' % target
+                emit('bool %s = true;' % running[target])
         return out
 
     def declarations(self):
@@ -11930,6 +12036,22 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if getattr(s, 'structured_execz', None):
+            # All threads reach the same calls. The second barrier protects each read before the next vote writes.
+            x, y, z = self.group
+            size = x * y * z
+            shared += [
+                'groupshared uint x2w_execz_lanes[%d];' % size,
+                'bool x2w_execz_any(uint3 tid, bool active) {',
+                '    uint lane = tid.x + %du * (tid.y + %du * tid.z);' % (x, y),
+                '    x2w_execz_lanes[lane] = active ? 1u : 0u;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint mask = 0u;',
+                '    [unroll] for (uint j = 0u; j < %du; ++j) mask |= x2w_execz_lanes[j];' % size,
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return mask != 0u;',
+                '}',
+            ]
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
