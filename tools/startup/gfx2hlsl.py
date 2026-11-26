@@ -7853,7 +7853,7 @@ class Stage:
                 if len(cs) != expected:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
             if sample_d16:
-                expected_dst = (dmask.bit_count() + 1) // 2
+                expected_dst = (bin(dmask).count('1') + 1) // 2
                 if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
                     raise Unsupported('image_sample_lz d16 destination %s for dmask %#x' % (ops[0], dmask))
             heap = self.heap_sampler(ops[3])
