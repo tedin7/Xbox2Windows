@@ -4259,6 +4259,23 @@ python3 -B tests/startup_ngg_slice_check.py
 python3 -B tests/startup_ngg_slice_check.py binary llvm-mc-15
 ```
 
+### NGG vertex pass-through lowering
+
+`tools/startup/gfx2hlsl.py` translates the straight-line NGG pass-through vertex profile (#1723). `s_sendmsg` message 9 (`GS_ALLOC_REQ`) and `s_barrier` are dropped, because D3D assembles the primitives itself. The primitive export (`exp prim` / `target_20`) is accepted only as the unchanged entry `v0` word with the other channels off.
+
+An LDS round trip is forwarded as a register copy (`ds_write_b32 vA, vD offset:N` then `ds_read_b32 vR, vB offset:M` becomes `vR = vD`) only when the translator proves that no other lane can touch the slot. The entry `v0` is a packed word with no known layout, so the proof starts from the lane id: `v_mbcnt_lo_u32_b32 v, -1, 0` followed by `v_mbcnt_hi_u32_b32 v, -1, v` is the lane number 0..63. An address is accepted only as the affine form `stride * lane + offset` built from it by `v_mov_b32`, `v_lshlrev_b32`, `v_add_nc_u32`, `v_mul_u32_u24`, `v_mul_lo_u32` and `v_mad_u32_u24` with immediate operands. Each form must have a 4-byte aligned stride and offset and stay inside 64 KiB for all 64 lanes. Every `ds_write_b32` is then checked against every earlier write and against itself: for all lane pairs `i != j` the four-byte intervals must be disjoint. A read takes the register of the write with the identical form (the same stride and byte offset, whatever register holds the address) and is refused if the payload register changed since. A register that holds a lane address exists only to address LDS: any other use is refused. The proof covers the lanes of one wave. It does not analyse any per-wave base, so separation between waves is not proven here; two waves writing one address with different values would race on hardware too.
+
+Refused, naming the missing proof: the entry `v0` or a copy of it as an address, `v_mbcnt_lo` alone (lanes 32..63 share a value), a stride that lets two lanes (or two write offsets) reach one dword, or two writes of one lane meet (for example stride 4 with offsets 16 and 20, or stride 0), an unaligned or out-of-range form, any other computed address, a read without a matching write, other `s_sendmsg` messages, any branch or non-vertex stage, and every other LDS opcode.
+
+```sh
+python3 -B tests/startup_gfx2hlsl_ngg_passthrough_check.py
+python3 -B tests/startup_gfx2hlsl_ngg_passthrough_check.py binary llvm-mc-15
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ngg_passthrough' -V
+```
+
+`startup_gfx2hlsl_ngg_passthrough_warp` draws a vertex shader that parks twelve payload words in LDS (stride 48 per lane, offsets 0..44), reads them back and exports them as parameters, and compares the pixels with a CPU reference. The fixture `tests/startup_gfx2hlsl_ngg_passthrough_tail.s` assembles with `llvm-mc -mcpu=gfx1013` into the recorded words. The pure-Python controls include the disjoint case, the aliasing case with distinct per-lane payloads, a non-affine control, and a mutation control that removes the disjointness check and so lowers the aliasing case.
+
+
 ## Local compute container index
 
 `tools/compute_container_index.py` joins the digest in a recognized slot 67

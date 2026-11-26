@@ -2433,6 +2433,7 @@ class Stage:
         r = reg_range(tok)
         if r:
             if r[0] == 'v':
+                self.refuse_lane_read(range(r[1], r[2] + 1))
                 for reg in range(r[1], r[2] + 1):
                     self.used_v.add(reg)
                     if not low16_only:
@@ -2683,9 +2684,23 @@ class Stage:
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
             self.low16_only_v.discard(n)
 
+    def note_v_write(self, *regs):
+        """Count writes per VGPR: the NGG pass-through checks use it to prove a register is unchanged."""
+        counts = self.__dict__.setdefault('v_writes', {})
+        forms = self.__dict__.get('lane_aff')
+        for n in regs:
+            counts[n] = counts.get(n, 0) + 1
+            if forms is not None:
+                forms.pop(n, None)
+
+    def v_version(self, n):
+        return self.__dict__.get('v_writes', {}).get(n, 0)
+
     def set_v(self, n, expr, *, low16_only=False, align4=False):
+        self.refuse_lane_read(re.findall(r'\bv(\d+)\b', expr))
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
+        self.note_v_write(n)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         if isinstance(self.align4_v, set):
@@ -4518,6 +4533,9 @@ class Stage:
         return result
 
     def _lower(self, base, asm, ops, mods):
+        form = self.lane_result(base, ops, mods)
+        if form is not None:
+            return self.set_lane_form(ops[0], form)
         pc = getattr(self, 'pc', None)
         calculated = getattr(self, 'calculated_pc', {})
         if pc in calculated:
@@ -4624,6 +4642,9 @@ class Stage:
             return self.export(asm)
         if base in (*LDS_EXCHANGE_OPS, 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
+                handler = getattr(self, 'op_' + base, None)
+                if handler:
+                    return handler(ops, mods)
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
             if not hasattr(self, 'lds_error'):
@@ -8102,6 +8123,161 @@ class Stage:
         expr = 'F(((%s & 0x7fffffffu) > 0x7f800000u) ? %s : U(((%s * exp2(float(%s))) * exp2(float(%s))) * exp2(float(%s))))' % (
             bits, bits, self.f(ops[1]), a, b, c)
         self.set_vf(reg_range(ops[0])[1], expr, mods)
+    # ---- NGG vertex pass-through ---------------------------------------------------------------
+    # A pass-through NGG vertex shader asks for its allocation (s_sendmsg GS_ALLOC_REQ), parks per-lane values in LDS,
+    # synchronises (s_barrier), reads them back and exports the position, the parameters and the primitive word. D3D
+    # assembles the primitives itself, so the allocation request and the barrier have no effect here.
+    #
+    # An LDS slot is the register it was written from only if no other lane can touch the same dword. The entry v0 is
+    # a packed word with no proven layout, so the proof starts from the lane id itself: v_mbcnt_lo_u32_b32 v, -1, 0
+    # then v_mbcnt_hi_u32_b32 v, -1, v is the lane number 0..63. An address is accepted only as the affine form
+    # stride * lane + offset built from that lane id by v_mov / v_lshlrev / v_add_nc / v_mul_u32_u24 / v_mad_u32_u24
+    # with immediate operands. Every write is checked against every earlier write (and itself): for all lane pairs
+    # i != j the four-byte intervals must be disjoint. A read forwards the register of the write with the identical
+    # form. Anything else is refused. The proof covers the lanes of one wave only: separation between waves is not
+    # analysed here, and two waves writing one address with different values would race on hardware too.
+    GS_ALLOC_REQ = 9
+    LANES = 64                    # widest guest wave
+    LDS_BYTES = 1 << 16
+    LANE_ADDR_LIMIT = 1 << 24     # keeps the u24 multiplies exact
+    LANE_MASK_ALL = ('-1', '0xffffffff')
+
+    def ngg_stage(self, what):
+        if self.kind != 'vs' or self.has_branches or not self.exec_known:
+            raise Unsupported('%s requires a straight-line vertex shader with entry EXEC' % what)
+
+    def op_s_sendmsg(self, ops, mods):
+        self.ngg_stage('s_sendmsg')
+        try:
+            message = int(ops[0], 0) if len(ops) == 1 and not mods else None
+        except ValueError:
+            message = None
+        if message != self.GS_ALLOC_REQ:
+            raise Unsupported('s_sendmsg %s' % ' '.join(ops + mods))
+        return None
+
+    def op_s_barrier(self, ops, mods):
+        self.ngg_stage('s_barrier')
+        return None
+
+    def lane_forms(self):
+        return self.__dict__.setdefault('lane_aff', {})
+
+    def refuse_lane_read(self, regs):
+        forms = self.__dict__.get('lane_aff')
+        if forms:
+            for reg in regs:
+                if int(reg) in forms:
+                    raise Unsupported('v%s holds a lane address that is only valid as an LDS address' % reg)
+
+    def lane_operand(self, tok):
+        r = reg_range(tok)
+        if r:
+            return self.lane_forms().get(r[1]) if r[0] == 'v' and r[1] == r[2] else None
+        try:
+            return ('imm', int(tok, 0))
+        except ValueError:
+            return None
+
+    def lane_affine(self, stride, offset):
+        """The form, or None when a lane could leave the exact 24-bit range."""
+        if stride < 0 or offset < 0 or stride * (self.LANES - 1) + offset >= self.LANE_ADDR_LIMIT:
+            return None
+        return ('aff', stride, offset)
+
+    def lane_result(self, base, ops, mods):
+        """The proven lane form of a VGPR the instruction writes, or None when it is not one of the proven shapes."""
+        if mods or getattr(self, 'kind', None) != 'vs' or len(ops) < 2:
+            return None
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            return None
+        a = [self.lane_operand(t) for t in ops[1:]]
+        if base == 'v_mbcnt_lo_u32_b32' and len(a) == 2:
+            return ('lo',) if ops[1] in self.LANE_MASK_ALL and a[1] == ('imm', 0) else None
+        if base == 'v_mbcnt_hi_u32_b32' and len(a) == 2:
+            return ('aff', 1, 0) if ops[1] in self.LANE_MASK_ALL and a[1] == ('lo',) else None
+        imm = [x[1] for x in a if x and x[0] == 'imm']
+        aff = [x for x in a if x and x[0] == 'aff']
+        if len(imm) + len(aff) != len(a) or len(aff) != 1:
+            return None
+        _, stride, offset = aff[0]
+        if base == 'v_mov_b32' and len(a) == 1:
+            return aff[0]
+        if base == 'v_lshlrev_b32' and len(a) == 2 and a[0][0] == 'imm' and 0 <= a[0][1] < 16:
+            return self.lane_affine(stride << a[0][1], offset << a[0][1])
+        if base == 'v_add_nc_u32' and len(a) == 2:
+            return self.lane_affine(stride, offset + imm[0])
+        if base in ('v_mul_u32_u24', 'v_mul_lo_u32') and len(a) == 2 and 0 <= imm[0] < self.LANE_ADDR_LIMIT:
+            return self.lane_affine(stride * imm[0], offset * imm[0])
+        if base == 'v_mad_u32_u24' and len(a) == 3 and a[2][0] == 'imm' and 0 <= imm[0] < self.LANE_ADDR_LIMIT:
+            return self.lane_affine(stride * imm[0], offset * imm[0] + a[2][1])
+        return None
+
+    def set_lane_form(self, tok, form):
+        n = reg_range(tok)[1]
+        self.note_v_write(n)
+        self.lane_forms()[n] = form
+        return None
+
+    LDS_PROOF = ('%s: an LDS slot is private to a lane only if the address is proven to be stride * lane + offset '
+                 'from the lane id (v_mbcnt_lo_u32_b32 -1, 0 then v_mbcnt_hi_u32_b32 -1) with %s')
+
+    def lds_form(self, name, ops, mods, count):
+        """The (stride, byte offset) of one LDS access, proven aligned and inside the 64 KiB allocation."""
+        self.ngg_stage(name)
+        text = ' '.join([name] + ops + mods)
+        offsets = [m for m in mods if re.fullmatch(r'offset:\d+', m)]
+        if len(ops) != count or len(offsets) != len(mods) or len(mods) > 1:
+            raise Unsupported(self.LDS_PROOF % (text, 'one VGPR address and at most one offset'))
+        offset = int(offsets[0][7:]) if offsets else 0   # the decoder omits a zero immediate offset
+        addr = reg_range(ops[0] if name == 'ds_write_b32' else ops[1])
+        form = self.lane_forms().get(addr[1]) if addr and addr[0] == 'v' and addr[1] == addr[2] else None
+        if not form or form[0] != 'aff':
+            raise Unsupported(self.LDS_PROOF % (text, 'an address register that holds it'))
+        stride, total = form[1], form[2] + offset
+        if stride % 4 or total % 4 or stride * (self.LANES - 1) + total + 4 > self.LDS_BYTES:
+            raise Unsupported(self.LDS_PROOF % (text, 'a 4-byte aligned stride and offset inside 64 KiB'))
+        return stride, total
+
+    def lds_overlap(self, a, b):
+        """Whether the four-byte interval of lane i under form a meets lane j under form b, other than the same lane
+        rewriting its own slot (a == b, i == j). A meeting inside one lane is refused too: a later write would
+        replace the slot a read forwards."""
+        for i in range(self.LANES):
+            for j in range(self.LANES):
+                if abs((a[0] * i + a[1]) - (b[0] * j + b[1])) < 4 and (i != j or a != b):
+                    return True
+        return False
+
+    def op_ds_write_b32(self, ops, mods):
+        form = self.lds_form('ds_write_b32', ops, mods, 2)
+        data = reg_range(ops[1])
+        if not data or data[0] != 'v' or data[1] != data[2]:
+            raise Unsupported('ds_write_b32 needs one VGPR payload')
+        self.refuse_lane_read([data[1]])
+        writes = self.__dict__.setdefault('lds_writes', [])
+        for other in writes + [form]:
+            if self.lds_overlap(form, other):
+                raise Unsupported('ds_write_b32 %s: the four-byte intervals of two lanes are not disjoint '
+                                  '(stride %d offset %d against stride %d offset %d), so one lane could overwrite '
+                                  'another lane\'s slot' % (' '.join(ops), form[0], form[1], other[0], other[1]))
+        writes.append(form)
+        self.__dict__.setdefault('lds', {})[form] = (data[1], self.v_version(data[1]))
+        self.used_v.add(data[1])
+        return None
+
+    def op_ds_read_b32(self, ops, mods):
+        form = self.lds_form('ds_read_b32', ops, mods, 2)
+        dst = reg_range(ops[0])
+        slot = self.__dict__.get('lds', {}).get(form)
+        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('ds_read_b32 needs one VGPR destination')
+        if slot is None or self.v_version(slot[0]) != slot[1]:
+            raise Unsupported('ds_read_b32 %s: no write of the same lane address (stride %d offset %d) still '
+                              'holds its register' % (' '.join(ops), form[0], form[1]))
+        self.set_v(dst[1], self.u('v%d' % slot[0]))
+        return None
 
     def proven_uniform_v(self, n):
         """VGPR n holds one value in every lane EXEC enables now. In the entry block EXEC is known; past it, a
@@ -8417,6 +8593,7 @@ class Stage:
         # input or output modifier and no scalar or constant operand: both operands are plain VGPRs.
         if mods:
             raise Unsupported('v_swap_b32 with %s' % mods)
+        self.refuse_lane_read([reg_range(o)[1] for o in ops if reg_range(o) and reg_range(o)[0] == 'v'])
         if len(ops) != 2:
             raise Unsupported('v_swap_b32 with %d operands, expected 2' % len(ops))
         regs = [reg_range(o) for o in ops]
@@ -8438,6 +8615,7 @@ class Stage:
         moved = {src: exprs.pop(dst, None), dst: exprs.pop(src, None)}
         exprs.update({reg: e for reg, e in moved.items() if e is not None and reg in self.uniform_v})
         self.used_v.update((dst, src))
+        self.note_v_write(dst, src)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def op_v_cndmask_b32(self, ops, mods):
@@ -8882,6 +9060,7 @@ class Stage:
         self.clear_low16(dst[1])
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
+        self.note_v_write(dst[1], dst[2])
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
         # Scalar or literal sources give every lane the same result, under the conditions Stage.one uses for VALU.
         pair = reg_range(ops[2])
@@ -9323,6 +9502,12 @@ class Stage:
                 raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
             self.exports['depth'] = True
             self.emit('o.depth = %s;' % self.f(vals[0]))
+            return None
+        if target in ('prim', 'target_20'):
+            # Hardware pass-through connectivity: the entry VGPR0 word, exported unchanged and alone.
+            if (self.kind != 'vs' or self.has_branches or not self.exec_known or 'compr' in flags
+                    or len(vals) != 4 or vals[0] != 'v0' or vals[1:] != ['off', 'off', 'off'] or self.v_version(0)):
+                raise Unsupported('non-identity primitive export %s' % asm)
             return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
