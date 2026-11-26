@@ -523,11 +523,24 @@ const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOU
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
 
+// Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the three causes the census
+// keeps apart. `published` is true when a publication was attempted (BC, console layout, single element), false when
+// only a live resource with this base and description could have served the view.
+constexpr u64 max_published_texture_bytes = 64ull << 20;  // the transient upload ring's single-copy limit
+const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc, bool published)
+{
+    if (!published) return "texture_no_resource";
+    const auto bytes = address_texture_bytes(device, desc);
+    if (bytes > max_published_texture_bytes) return "texture_over_64mib";
+    if (!x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return "texture_unreadable";
+    return "texture_unavailable";  // publication failed for another reason (no wrapper)
+}
+
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = address_texture_bytes(device, desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
+    if (bytes > max_published_texture_bytes || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {
@@ -690,8 +703,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             note_memory_srv_write(resource, input, destination);
         } else {
-            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", "texture_unavailable", resource, input,
-                              destination);
+            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout",
+                              texture_unavailable_reason(self, input->address, *resource, true), resource, input, destination);
         }
         return;
     }
@@ -751,10 +764,14 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             outcome = "published console layout";
         }
     }
-    if (!texture) outcome = held ? held : "texture_unavailable (no resource there, or texels not readable or over 64 MiB)";
+    // A publication was attempted for a BC / console-layout view; any other view only looks up a live resource.
+    const char* unavailable = texture || held ? nullptr
+        : texture_unavailable_reason(self, input->address, *resource,
+                                     tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) || console_layout_srv(*resource));
+    if (!texture) outcome = held ? held : unavailable;
     log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
-        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",
+        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : unavailable,
                           resource, input, destination);
         return;
     }
