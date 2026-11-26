@@ -236,33 +236,10 @@ inline void draw_lock_note_max(volatile LONG64& max, LONG64 value)
         seen = before;
     }
 }
-// Per acquiring site (function and line of the draw_lock_acquire_exclusive call): how long its holds took and how long it waited. The
-// table is read and written only with draw_lock held (the holder updates its own entry just before it releases), so it needs no
-// atomics; draw_lock_holders_line takes the lock to read it. One line per 30 s names the top holders.
-struct LockSite {
-    const char* function;
-    unsigned line;
-    LONG64 holds, hold_ticks, hold_max, wait_ticks;
-};
-constexpr std::size_t lock_site_slots = 128;
-LockSite lock_sites[lock_site_slots];
+// Holders of draw_lock by acquiring site (lock_sites.h); touched only with draw_lock held.
+x2w_local::LockSites lock_sites;
 const char* draw_lock_holder_function;
 unsigned draw_lock_holder_line;
-LONG64 draw_lock_holder_waited;
-inline LockSite* lock_site_for(const char* function, unsigned line)
-{
-    std::size_t at = (reinterpret_cast<std::uintptr_t>(function) / 8 * 31 + line) % lock_site_slots;
-    for (std::size_t probe = 0; probe < lock_site_slots; ++probe, at = (at + 1) % lock_site_slots) {
-        LockSite& site = lock_sites[at];
-        if (!site.function) {
-            site.function = function;
-            site.line = line;
-            return &site;
-        }
-        if (site.function == function && site.line == line) return &site;
-    }
-    return nullptr;
-}
 inline void draw_lock_acquire_exclusive(const char* function = __builtin_FUNCTION(), unsigned line = __builtin_LINE())
 {
     LARGE_INTEGER start, end, frequency;
@@ -274,7 +251,7 @@ inline void draw_lock_acquire_exclusive(const char* function = __builtin_FUNCTIO
     const LONG64 waited = end.QuadPart - start.QuadPart;
     draw_lock_holder_function = function;
     draw_lock_holder_line = line;
-    if (LockSite* site = lock_site_for(function, line)) site->wait_ticks += waited;
+    lock_sites.waited(function, line, waited);
     InterlockedIncrement64(&draw_lock_stats.wait_calls);
     InterlockedAdd64(&draw_lock_stats.wait_ticks, waited);
     draw_lock_note_max(draw_lock_stats.wait_max, waited);
@@ -290,36 +267,18 @@ inline void draw_lock_release_exclusive()
     InterlockedAdd64(&draw_lock_stats.hold_ticks, held);
     draw_lock_note_max(draw_lock_stats.hold_max, held);
     if (held * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.hold_over_5ms);
-    if (LockSite* site = lock_site_for(draw_lock_holder_function, draw_lock_holder_line)) {
-        ++site->holds;
-        site->hold_ticks += held;
-        if (held > site->hold_max) site->hold_max = held;
-    }
+    lock_sites.held(draw_lock_holder_function, draw_lock_holder_line, held);
     ReleaseSRWLockExclusive(&draw_lock);
 }
-// Top holders since the last call, by total hold time; resets the table. `out` gets one line (empty result: nothing recorded).
+// Top holders since the last call, by total hold time; resets the table. False when nothing was recorded.
 inline bool draw_lock_holders_line(char* out, std::size_t size)
 {
-    LockSite copy[lock_site_slots];
-    AcquireSRWLockExclusive(&draw_lock);
-    std::memcpy(copy, lock_sites, sizeof(copy));
-    std::memset(lock_sites, 0, sizeof(lock_sites));
-    ReleaseSRWLockExclusive(&draw_lock);
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
-    const double per_ms = frequency.QuadPart / 1000.0;
-    int order[lock_site_slots], count = 0;
-    for (int i = 0; i < static_cast<int>(lock_site_slots); ++i)
-        if (copy[i].function && copy[i].holds) order[count++] = i;
-    if (!count) return false;
-    std::sort(order, order + count, [&](int a, int b) { return copy[a].hold_ticks > copy[b].hold_ticks; });
-    int n = std::snprintf(out, size, "x2w-render draw_lock top holders (since the last such line; function:line holds, hold ms total/max, wait ms):");
-    for (int k = 0; k < count && k < 6 && n > 0 && static_cast<std::size_t>(n) < size; ++k) {
-        const LockSite& site = copy[order[k]];
-        n += std::snprintf(out + n, size - n, " [%s:%u %lld, %.0f/%.1f, %.0f]", site.function, site.line, static_cast<long long>(site.holds),
-                           site.hold_ticks / per_ms, site.hold_max / per_ms, site.wait_ticks / per_ms);
-    }
-    return true;
+    AcquireSRWLockExclusive(&draw_lock);
+    const bool any = lock_sites.top_line(out, size, frequency.QuadPart / 1000.0);
+    ReleaseSRWLockExclusive(&draw_lock);
+    return any;
 }
 // Where a translated Dispatch spends its time under draw_lock: 0 translation lookup and checks, 1 the descriptor walk, 2 entry values,
 // 3 texture sync, 4 descriptor writes and recording. Started after the lock is held, ended when it is released.

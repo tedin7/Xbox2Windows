@@ -20,6 +20,7 @@
 #include "startup_stubs/committed_range.h"
 #include "startup_stubs/zero_tail.h"
 #include "startup_stubs/copy_cache_trim.h"
+#include "startup_stubs/lock_sites.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
