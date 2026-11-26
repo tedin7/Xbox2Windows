@@ -350,6 +350,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         view.Texture2D.MipLevels = 1;
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
     }
+    if (mode == "dispatch-input-null-token") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        view.Buffer = {0, words, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+        invoke(device, 18, 0, word(&view), cpu);
+        // The 32-byte token overlaps the following 16-byte table descriptor.
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
+    }
     if (mode == "dispatch-input-memory-view") {
         // The input is a buffer view (device slot 70) of memory no buffer is placed over, 16 bytes in; its token
         // replaces the input descriptor and the words are written after the view exists.
@@ -500,6 +508,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(queue, 10, 1, word(&lists[t]));
         }
     } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;

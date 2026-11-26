@@ -7,17 +7,20 @@ gfx2hlsl.py --pending with DXC, the unchanged recording still matches all 320 wo
 time is replaced, and each dispatch is refused with its own reason, logs which input and descriptor once, writes
 no output word and leaves the input as written:
 
-- dispatch-input-empty: zero records with a nonzero base and word 3 zero (synthetic values);
+- dispatch-input-empty: an unfilled heap slot, submitted twice to check one diagnostic;
 - dispatch-input-past: 16 bytes past the end of the placed input buffer;
 - dispatch-input-unplaced: memory between the two placed buffers;
 - dispatch-input-copied: a buffer placed at an offset the desktop cannot alias, so it is a separate copy;
-- dispatch-input-token: the token of a texture view.
+- dispatch-input-token: the token of a texture view;
+- dispatch-input-null-token: a buffer SRV token with no resource. It runs only with
+  X2W_NULL_TOKEN_ZERO=1, when all output words must match the CPU reference for zero input.
 
 Last, dispatch-input-memory-view replaces the input descriptor with the token of a buffer view (device slot 70) of
 memory no buffer is placed over, 16 bytes in, and writes the input words there after the view exists: all 320
 words match. The stand-in places that buffer in the consumer's own heap, outside its placement index.
 Exit 77 when the adapter is not available.
 """
+from math import prod
 import os
 from pathlib import Path
 import subprocess
@@ -36,6 +39,7 @@ CONTROLS = (
     ('dispatch-input-unplaced', 'an input is in title memory outside any placed buffer'),
     ('dispatch-input-copied', 'an input is in a placed buffer that does not alias title memory'),
     ('dispatch-input-token', 'an input view token is not a buffer view of a desktop resource'),
+    ('dispatch-input-null-token', 'an input view token is not a buffer view of a desktop resource'),
 )
 
 
@@ -43,6 +47,7 @@ def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
+        env.pop('X2W_NULL_TOKEN_ZERO', None)
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -80,9 +85,27 @@ def main(consumer, dxc, adapter):
             refused = lines(result, 'refused: ')
             census = lines(result, 'x2w-render compute census')
             where = lines(result, f'x2w-draw compute {key:016x} first refused input 0 (table ')
-            assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), '%s:\n%s' % (mode, result.stderr[-3000:])
-            assert len(census) == 3 and census[1].endswith(f'reason "{reason}": 1 keys, 1 dispatches'), (mode, census)
+            calls = 2 if mode == 'dispatch-input-empty' else 1
+            assert len(refused) == calls and all(line.endswith('refused: ' + reason) for line in refused), (mode, refused)
+            assert len(census) == 3 and census[1].endswith(f'reason "{reason}": 1 keys, {calls} dispatches'), (mode, census)
             assert len(where) == 1, (mode, result.stderr[-3000:])
+            slot_lines = lines(result, 'unfilled heap slot ')
+            assert slot_lines == ([f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}']
+                                  if mode == 'dispatch-input-empty' else []), (mode, slot_lines)
+
+        null_env = dict(env, X2W_NULL_TOKEN_ZERO='1')
+        got, result = dispatch(directory, consumer, null_env, 'dispatch-input-empty')
+        assert got == untouched and not lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
+        assert lines(result, 'unfilled heap slot ') == [f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}'], result.stderr[-3000:]
+
+        got, result = dispatch(directory, consumer, null_env, 'dispatch-input-null-token')
+        written = prod(group) * prod(groups)
+        zero_expected = [(C.KEY + i * C.STRIDE) & C.MASK for i in range(written)]
+        zero_expected += untouched[written:]
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert got == zero_expected, 'null-token output differs from the CPU reference for zero input'
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
         got, result = dispatch(directory, consumer, env, 'dispatch-input-memory-view')
         assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and             not lines(result, 'refused: '), result.stderr[-3000:]
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
@@ -107,7 +130,7 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, env, 'dispatch-input-null')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert len(lines(result, 'comes from zeros for a null descriptor (16 bytes)')) == 1, result.stderr[-3000:]
-        assert got != expected and got != untouched, 'a null input must read zeros, not the expected words'
+        assert got == zero_expected, 'all-zero descriptor output differs from the CPU reference for zero input'
         # A manifest whose first input is out of order is not bound, and the log names the line: the pipeline key, the
         # line number, the reason and the line itself.
         manifest = cache / f'{key:016x}.txt'
