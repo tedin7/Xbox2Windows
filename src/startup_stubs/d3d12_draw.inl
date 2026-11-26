@@ -2800,6 +2800,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && formatted.entry) {
+            // A readable range whose copy failed (upload ring full) is a ring_full refusal, not an unresolved buffer.
+            if (readable_range) count_null_binding(x2w_local::NullCause::ring_full);
             InterlockedIncrement(&formatted_draws_refused);
             static LONG refused;
             if (first_calls(refused, 6))
