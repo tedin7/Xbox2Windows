@@ -250,7 +250,8 @@ $runArgs = @{
     MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
-if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
+if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true; $runArgs.TraceFiles = 1 }
+elseif ($runParams.ContainsKey("TraceFiles")) { $runArgs.TraceFiles = 0 }   # files.txt lists every open (one per ~5 ms on a hard disk): off unless -Deep
 if (-not $NoLazyMemory) { $runArgs.LazyMemory = $true }
 $runArgs.NoNullIdentity = $true   # X2W_DRAW_NULL_IDENTITY=1 replaced the real address of an empty buffer slot in the log (Run I); the tester run keeps it
 if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB }

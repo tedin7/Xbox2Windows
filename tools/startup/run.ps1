@@ -32,6 +32,7 @@ param(
     [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
     [switch]$NoNullIdentity,                   # with -Render: do not set X2W_DRAW_NULL_IDENTITY (an empty buffer slot then keeps its real address in the log)
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
+    [int]$TraceFiles = 1,                      # 1 = debug_launch.py lists every file open in files.txt (--trace-files 1; slow on a hard disk), 0 = only denied/redirected ones
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
     [int]$CommitHeadroomMiB = 0,               # --commit-headroom-mib: end the run cleanly when the system commit has less than this free (0 = off)
@@ -127,9 +128,14 @@ if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") 
 if ($CommitHeadroomMiB -gt 0) { $captureArgs += @("--commit-headroom-mib", "$CommitHeadroomMiB") }
 if ($CommitWarnMiB -gt 0) { $captureArgs += @("--commit-warn-mib", "$CommitWarnMiB") }
 try {
-    & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs *> "$LogDir.out"
-    $debuggerExit = $LASTEXITCODE
+    # Windows PowerShell 5.1 wraps redirected native stderr as an error record. Keep that
+    # from aborting the launcher before it can report the debugger's exit code.
+    & {
+        $ErrorActionPreference = "Continue"
+        & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
+            --trace-files $TraceFiles --continue-asserts $ContinueAsserts @traceArgs @captureArgs
+        $script:debuggerExit = $LASTEXITCODE
+    } *> "$LogDir.out"
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.
     if ($translator -and -not $translator.HasExited) {
