@@ -579,6 +579,20 @@ def check_encoding(code, off, n, name, asm):
     return asm
 
 
+def native_instructions(code):
+    """[(byte offset, assembly text)] of every instruction of `code`, for pixel_aot's two-exit check; ValueError when a word
+    does not decode. Unlike decode(), nothing after the last s_endpgm is dropped: the caller checks the code ends there."""
+    out, off = [], 0
+    while off < len(code):
+        try:
+            n, _, asm, _ = D.decode_instruction(code, off)
+        except Exception as error:
+            raise ValueError('undecodable word at +0x%x: %s' % (off, error)) from error
+        out.append((off, asm))
+        off += n
+    return out
+
+
 def decode(code, refusals=None):
     out, off = [], 0
     while off + 4 <= len(code):
@@ -11109,7 +11123,9 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         from resource_inventory import parts
         try:
             container, ps_container = a, b
-            a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
+            # Only the pixel stage may have two exits (a kill or demote block after the first s_endpgm, kill_exit_block);
+            # the instruction boundaries of that check come from this translator's own decoder, no LLVM library needed.
+            a, b = (container_code(parts(blob)[b'DXIL'], stage=stage, decoder=native_instructions if stage == 0 else None)
                     for blob, stage in ((a, 1), (b, 0)))
             attr_map = stream_interface(container, ps_container)
             if starts_with_fetch_call(a):
