@@ -2294,6 +2294,12 @@ target_compile_features(startup_committed_extent_check PRIVATE cxx_std_17)
 add_test(NAME startup_committed_extent COMMAND startup_committed_extent_check)
 add_test(NAME startup_committed_extent_prefix_control COMMAND startup_committed_extent_check --mutate prefix)
 set_tests_properties(startup_committed_extent_prefix_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_copy_cache_check tests/startup_copy_cache_check.cpp)
+target_include_directories(startup_copy_cache_check PRIVATE src)
+target_compile_features(startup_copy_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_copy_cache COMMAND startup_copy_cache_check)
+add_test(NAME startup_copy_cache_per_frame_control COMMAND startup_copy_cache_check --mutate per-frame)
+set_tests_properties(startup_copy_cache_per_frame_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_zero_tail_check tests/startup_zero_tail_check.cpp)
 target_include_directories(startup_zero_tail_check PRIVATE src)
 target_compile_features(startup_zero_tail_check PRIVATE cxx_std_17)
@@ -5162,7 +5168,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_frame_copy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
-        set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

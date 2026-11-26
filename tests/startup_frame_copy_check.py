@@ -30,6 +30,9 @@ def check(directory, consumer, backend):
     cases = (
         ("changed", (RED * 4 + BLUE * 4) * 4, 1),  # rewritten in place: the second draw must see blue
         ("same", RED * 8 * 4, 0),                  # untouched: both draws red, no new copy
+        # A 64 KiB buffer, the second draw in the NEXT frame: a copy kept from the first frame must show the new bytes.
+        ("big-changed", (RED * 4 + BLUE * 4) * 4, None),
+        ("big-same", RED * 8 * 4, None),
     )
     for mode, expected, refreshed_lines in cases:
         pixels, refreshed = run(directory, consumer, backend, mode)
@@ -37,9 +40,24 @@ def check(directory, consumer, backend):
             return 77
         if pixels != expected:
             raise AssertionError(f"{mode}: actual {pixels.hex()} expected {expected.hex()}")
-        if len(refreshed) != refreshed_lines:
+        if refreshed_lines is not None and len(refreshed) != refreshed_lines:
             raise AssertionError(f"{mode}: {len(refreshed)} refresh log lines, expected {refreshed_lines}:\n" + "\n".join(refreshed))
         print(f"{backend} {mode}: 32 pixels exact, {refreshed_lines} refresh log lines")
+    # The controls of the cross-frame reuse: reuse off still shows the new bytes; a reuse that never compares (the mutant) must show
+    # the OLD bytes, which proves the big-changed case above would catch it.
+    for name, extra, expected in (
+        ("big-changed with reuse off", {"X2W_BIG_COPY_REUSE": "0"}, (RED * 4 + BLUE * 4) * 4),
+        ("big-changed, never-refill mutant", {"X2W_TEST_FRAME_COPY_STALE": "1"}, RED * 8 * 4),
+    ):
+        folder = directory / name.replace(" ", "_").replace(",", "")
+        folder.mkdir()
+        pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": "big-changed", **extra},
+                              binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        if pixels != expected:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {expected.hex()}")
+        print(f"{backend} {name}: 32 pixels exact")
     return 0
 
 
