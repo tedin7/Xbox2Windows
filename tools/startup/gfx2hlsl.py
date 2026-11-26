@@ -978,12 +978,13 @@ def smem_mods(mods):
 
 
 # Each conversion uses only its input bits (including byte extraction for ubyte0).
-# Multiply, fused multiply-add (including the literal form), reciprocal and median of three use
+# Multiply, fused multiply-add (including the literal form), reciprocal, log2, ceil and median of three use
 # only local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
 UNIFORM_VALU = frozenset((
     'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_cvt_off_f32_i4',
     'v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32',
-    'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
+    'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_log_f32', 'v_ceil_f32',
+    'v_med3_f32', 'v_mov_b32',
     # Pure 32-bit integer ALU: each lane computes the result from its own sources only, so equal sources give
     # equal results in every lane (no carry-out, no lane ID, no cross-lane read).
     'v_add_nc_u32', 'v_sub_nc_u32', 'v_subrev_nc_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32', 'v_not_b32',
@@ -995,6 +996,7 @@ UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_
                       'buffer_load_format_x': 1, 'buffer_load_format_xy': 2, 'buffer_load_format_xyz': 3,
                       'buffer_load_format_xyzw': 4}
 UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
+UNIFORM_IMAGE_LOADS = frozenset(('image_load',))
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -2294,6 +2296,7 @@ class Stage:
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
     exec_known = False        # unit probes without __init__ customize this explicitly when needed
+    has_image_writes = True   # proved False in translate() only when no image write exists in the dispatch
     loads_after_exec_write = ()  # compute loads reached from an EXEC writer through the block graph
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
@@ -3013,8 +3016,13 @@ class Stage:
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
-                        b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
+                        b < (exit_index := index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1)) <= t):
                     reason = 'branch out of the block'
+                    # A lane can leave while the wave takes the latch, or take the latch after the wave exits.
+                    if inner == 's_cbranch_scc0' and any(
+                            t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
+                            and target in index and index[target] <= b for latch, target in jumps):
+                        reason = 'loop exit crosses a backward s_cbranch_scc0'
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
@@ -3543,9 +3551,11 @@ class Stage:
             name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
         self.uses_quad_vote = False
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
+        all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
-                any(name in UNIFORM_LOADS for _, _, name, _ in self.ins)):
+                any(name in all_uniform_loads for _, _, name, _ in self.ins)):
             # A later block can reach an earlier load through one or more edges. exec_known only sees
             # instructions already translated. Follow the CFG, including paths outside a loop's textual range.
             bounds, _, succ, _ = self.spill_cfg
@@ -3559,7 +3569,7 @@ class Stage:
                 if block not in visited:
                     visited.add(block)
                     lo, hi = bounds[block]
-                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in UNIFORM_LOADS)
+                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
                     pending.extend(succ[block])
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
@@ -4211,6 +4221,71 @@ class Stage:
             return False
         return True
 
+    def uniform_image_load_regs(self, base, ops, mods):
+        """Return the range of destination VGPRs written uniformly by `image_load`, or () when unproved."""
+        if (base not in UNIFORM_IMAGE_LOADS or len(ops) < 3 or not self.tracks_uniformity() or
+                getattr(self, 'kind', None) != 'cs' or not getattr(self, 'exec_known', False) or
+                getattr(self, 'has_image_writes', True)):
+            return ()
+        past_entry = getattr(self, 'past_entry', None)
+        if past_entry is None or (past_entry and (getattr(self, 'uniform_expr', None) is None or
+                                                self.pc in getattr(self, 'loads_after_exec_write', ()))):
+            return ()
+        rsrc = reg_range(ops[2])
+        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 7 and rsrc[2] <= 105 else None
+        if (not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or
+                first[3] % 8 or not names_one_value(first)):
+            return ()
+        masks = getattr(self, 'masks', ())
+        varying_s = getattr(self, 'varying_s', ())
+        modified = getattr(self.pipe, 'modified', ())
+        other_modified = getattr(self.pipe, 'other_modified', ())
+        stored = self.pipe.stored_images() if hasattr(self.pipe, 'stored_images') else (getattr(self.pipe, 'uavs', None) or ())
+        key = desc_key(first)
+        if key in modified or key in other_modified or key in stored:
+            return ()
+        for i in range(8):
+            reg = rsrc[1] + i
+            word = desc_word(first, first[3] + i)
+            if (reg in masks or reg in varying_s or self.sym.get(reg) != word or
+                    desc_key(word) in modified):
+                return ()
+        dims = [m for m in mods if m.startswith('dim:')]
+        dmasks = [m for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(dmasks) != 1:
+            return ()
+        dim = dims[0][4:]
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY'):
+            return ()
+        try:
+            dmask = int(dmasks[0][6:], 0)
+        except ValueError:
+            return ()
+        if not dmask or (dmask & ~0xf):
+            return ()
+        packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+        allowed = ('unorm', 'glc', 'slc', 'dlc') + (('a16',) if packed_2d else ())
+        if any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods):
+            return ()
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            if not r or r[0] != 'v':
+                return ()
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        expected_addr = 1 if packed_2d else (3 if dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') else 2)
+        if len(cs) != expected_addr:
+            return ()
+        if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 and self.uniform_source(c) for c in cs):
+            return ()
+        candidate = reg_range(ops[0])
+        count = bin(dmask).count('1')
+        if not candidate or candidate[0] != 'v' or candidate[2] > 255 or candidate[2] - candidate[1] + 1 != count:
+            return ()
+        return range(candidate[1], candidate[2] + 1)
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         if (getattr(self, 'vcc_lost', False) or
@@ -4275,6 +4350,12 @@ class Stage:
                 dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
                 loaded = recomputed = False
+        if dst is None:
+            img_regs = self.uniform_image_load_regs(base, ops, mods)
+            if img_regs:
+                dst, loaded_regs = img_regs.start, img_regs
+                loaded = not getattr(self, 'past_entry', True)
+                recomputed = getattr(self, 'past_entry', False)
         # A shift right of a value built from the X thread id that leaves no thread-id bit.
         shifted = None
         if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and
@@ -4573,6 +4654,8 @@ class Stage:
         llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
         The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
         The check runs after the form's own refusals, so those keep their messages."""
+        if self.wave_reduction(base, ops):
+            return None
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
@@ -7897,7 +7980,8 @@ class Stage:
     def op_s_ff1_i32_b32(self, ops, mods):
         """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
 
-        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        The compute-entry special case on `exec_lo` still folds to lane 0; in a pixel stage `exec_lo` is the
+        first active lane for a later v_readlane_b32 (first_active_lane). Every other accepted
         source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
         """
         if mods or len(ops) != 2:
@@ -7906,6 +7990,9 @@ class Stage:
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
             raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
         if ops[1] == 'exec_lo':
+            if self.kind == 'ps':
+                self.first_active_lane(dst[1])
+                return None
             if self.kind != 'cs':
                 raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
             if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
@@ -8504,9 +8591,65 @@ class Stage:
         if value is not None:
             self.emit('sp%d_%d = %s;' % (n, lane, value))
 
+    # The first active lane of a pixel stage (#2618, the F rows). `s_ff1_i32_b32 sD, exec_lo` gives the index of the
+    # lowest lane in EXEC (RDNA 2 ISA, S_FF1_I32_B32) and `v_readlane_b32 sX, vY, sD` copies vY from that lane, so the
+    # pair reads vY from the first active lane. The console packs pixels into waves in its own way, so a correct
+    # program cannot depend on which pixel that is (the contract of the #2835 wave reductions), and the pair becomes
+    # WaveReadLaneFirst(vY) over the active lanes of the desktop wave. The lane number itself means nothing on the
+    # desktop, so sD is a symbol with no run-time value and every other read of it is refused. Accepted only where the
+    # one-lane model holds the whole wave's EXEC: a straight-line pixel stage whose EXEC is the entry mask at the
+    # s_ff1 and at each readlane, without s_wqm (helper lanes are then out of EXEC on the console, as they are out of
+    # desktop wave operations). The decoder prints wave32 syntax, and in wave64 exec_lo is half the wave (an empty
+    # low half gives -1, which v_readlane reads as lane 63), so a program that names exec_hi or the 64-bit exec is
+    # refused.
+    def first_active_lane(self, n):
+        what = 's_ff1_i32_b32 s%d, exec_lo in a pixel stage' % n
+        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+            raise Unsupported('%s with branches: only straight-line pixel stages are lowered' % what)
+        if not getattr(self, 'exec_known', False):
+            raise Unsupported('%s: EXEC is not the entry mask' % what)
+        if getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s after s_wqm exec, exec: the first lane may be a helper lane' % what)
+        ins = self.ins
+        if any('exec_hi' in scalar_tokens(' '.join(parse(asm)[1])) for _o, _n, _name, asm in ins):
+            raise Unsupported('%s of a program that names exec_hi or the 64-bit exec (in wave64, exec_lo is half the '
+                              'wave)' % what)
+        index = next(i for i, item in enumerate(ins) if item[0] == self.pc)
+        key = 's%d' % n
+        for _off, _n, name, asm in ins[index + 1:]:
+            reads, writes, may = scalar_effects(name, asm)
+            ops = parse(asm)[1]
+            if key in reads and not (re.sub(r'_e(32|64)$', '', name) == 'v_readlane_b32' and len(ops) == 3 and
+                                     ops[2] == key):
+                raise Unsupported('%s: %s reads the lane number as data (the desktop numbers its lanes in its own '
+                                  'way); only the lane select of v_readlane_b32 is lowered' % (what, asm))
+            if key in writes or key in may:
+                break
+        self.set_s(n, 'WaveReadLaneFirst(WaveGetLaneIndex())', sym=('first_lane',))
+
+    def read_first_lane(self, ops, mods):
+        """v_readlane_b32 sX, vY, sD with sD from first_active_lane: WaveReadLaneFirst(vY)."""
+        what = 'v_readlane_b32 %s of the first active lane' % ', '.join(ops)
+        dst, src = reg_range(ops[0]), reg_range(ops[1])
+        if mods:
+            raise Unsupported('%s with %s' % (what, ' '.join(mods)))
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105 or src[1] != src[2] or src[1] > 255:
+            raise Unsupported('%s: expected one SGPR destination and one VGPR' % what)
+        if not getattr(self, 'exec_known', False) or getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s: EXEC is no longer the entry mask of the s_ff1_i32_b32' % what)
+        for _o, _n, name, asm in self.ins:
+            other = parse(asm)[1]
+            if re.sub(r'_e(32|64)$', '', name) == 'v_writelane_b32' and other and reg_range(other[0]) == src:
+                raise Unsupported('%s: v%d is a lane spill written by v_writelane_b32' % (what, src[1]))
+        self.set_s(dst[1], 'WaveReadLaneFirst(%s)' % self.u(ops[1]), uniform=False)
+
     def op_v_readlane_b32(self, ops, mods):
         if len(ops) != 3 or reg_range(ops[1]) is None or reg_range(ops[1])[0] != 'v':
             raise Unsupported('v_readlane_b32 requires a VGPR source')
+        lane = reg_range(ops[2])
+        if lane and lane[0] == 's' and lane[1] == lane[2] and getattr(self, 'sym', {}).get(lane[1]) == ('first_lane',):
+            self.read_first_lane(ops, mods)
+            return
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if getattr(self, 'has_branches', False):
             sym, uniform, proven, mask = self.spill_join(n, lane)
@@ -9578,6 +9721,239 @@ class Stage:
                 lines.append('    int ai = 0;')
         lines += ['    s%d = %s;' % kv for kv in sorted(getattr(self, 'materialized', {}).items())]
         return lines
+
+    # ---- whole-wave reductions (#2125 item D) --------------------------------------------------------------------------
+    # A wave32 reduction reads lanes outside the pixel quad, so its instructions cannot be lowered one at a time. The
+    # whole chain is recognised instead, in the order the #2125 censuses report for every wave32 chain (LLVM 15
+    # spelling; vT, vX, vP, sS, sD any registers, OP one operation, ID its identity):
+    #   s_or_saveexec_b32 sS, -1                            save EXEC, enable all 32 lanes
+    #   v_cndmask_b32_e64 vT, ID, vX, sS                    the identity fill: vX where sS has the lane, ID elsewhere
+    #   OP_dpp vT, vT, vT quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf   lane pairs
+    #   OP_dpp vT, vT, vT quad_perm:[2,3,0,1] ...           quads
+    #   OP_dpp vT, vT, vT row_half_mirror ...               lane i with lane 7 - i: eight lanes
+    #   OP_dpp vT, vT, vT row_mirror ...                    lane i with lane 15 - i: the row of sixteen
+    #   v_permlanex16_b32 vP, vT, 0, 0                      lane 0 of the other row
+    #   OP vT, vP, vT                                       every lane now holds the whole wave
+    #   s_mov_b32 exec_lo, sS
+    #   v_readlane_b32 sD, vT, 31
+    # (RDNA 2 ISA: DPP16 quad_perm, row_half_mirror and row_mirror, V_PERMLANEX16_B32, V_READLANE_B32.) With every
+    # lane enabled no DPP or permlane source is disabled, so bound_ctrl and fi have nothing to decide. sD is OP over
+    # the lanes active before the chain, the others adding the identity. The census also shows a min chain whose
+    # readlane comes later: after its restore, one v_cndmask_b32_sdwa, then the s_or_saveexec_b32 sS2, -1 of a max
+    # chain, and only then v_readlane_b32 sD, vT, 31; the max chain takes that readlane between its saveexec and its
+    # fill. Readlane ignores EXEC, so the min result is still the one in vT as long as nothing in between writes vT
+    # (checked); the v_cndmask_b32_sdwa keeps its own handler, under the restored EXEC. The console packs pixels into
+    # waves in its own way, so a correct program cannot depend on which pixels share a wave: the chain becomes one
+    # WaveActiveBitOr / WaveActiveMin / WaveActiveMax of vX over the active lanes of the desktop wave, which leaves
+    # helper lanes out. Accepted only in a straight-line pixel stage whose EXEC is the entry mask, not widened by
+    # s_wqm (helper lanes would then be counted on the console). Every other shape that starts like a chain is refused
+    # with its reason: wave64, another fill, a wrong identity, missing or reordered steps, other or mixed operations,
+    # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
+    # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
+    WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
+                   'v_max_u32': ('WaveActiveMax({0})', 0)}
+    WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
+
+    @staticmethod
+    def wave_reduce_cndmask_fill(stretch, ss):
+        """The identity fill of the census: exactly v_cndmask_b32_e64 vT, 0 | -1, vX, sS (the input where the saved
+        mask has the lane, the inline constant elsewhere). (vT, 'vX', identity), or None for any other stretch."""
+        if len(stretch) != 1:
+            return None
+        base, ops, mods, _text = stretch[0]
+        if base != 'v_cndmask_b32' or mods or len(ops) != 4 or ops[3] != 's%d' % ss or ops[1] not in ('0', '-1') or \
+                not re.fullmatch(r'v\d+', ops[0]) or not re.fullmatch(r'v\d+', ops[2]) or ops[0] == ops[2]:
+            return None
+        return int(ops[0][1:]), ops[2], int(ops[1]) & 0xffffffff
+
+    # The identity fill, between s_or_saveexec_b32 sS, -1 and the first quad_perm step: each entry is a function
+    # (stretch, sS) -> (vT, input operand, identity) for a form it proves, or None; stretch is a list of
+    # (base, operands, modifiers, text). The identity itself is checked against OP afterwards.
+    WAVE_REDUCE_FILLS = (wave_reduce_cndmask_fill,)
+    # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
+    WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
+
+    def wave_reduction(self, base, ops):
+        """True when this instruction belongs to a recognised wave reduction (its result is lowered at the restore of
+        EXEC, its readlane at the readlane). False for anything that does not start like one; Unsupported for a chain of
+        the wrong shape."""
+        plan, pc = getattr(self, 'reduce_plan', None), getattr(self, 'pc', None)
+        if plan and pc in plan:
+            action = plan[pc]
+            if action:
+                action()
+            return True
+        if pc is None or not isinstance(getattr(self, 'ins', None), list) or not (
+                base in ('s_or_saveexec_b32', 's_or_saveexec_b64') and len(ops) == 2 and ops[1] == '-1'):
+            return False
+        index = next((i for i, item in enumerate(self.ins) if item[0] == pc), None)
+        if index is None:
+            return False
+        steps = [parse(asm) for _off, _n, _name, asm in self.ins[index:index + 17]]
+        if not any(name == 'v_permlanex16_b32' or name.endswith('_dpp') and ('row_mirror' in mods or
+                                                                             'row_half_mirror' in mods)
+                   for name, _ops, mods in steps[1:]):
+            return False   # not a reduction: the instruction keeps its own handler
+        if base.endswith('_b64'):
+            raise Unsupported('wave reduction in the wave64 form (%s %s): only the wave32 chain is lowered'
+                              % (base, ', '.join(ops)))
+        ss = reg_range(ops[0])
+        if not ss or ss[0] != 's' or ss[1] != ss[2]:
+            raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
+        ss = ss[1]
+        first = next((k for k, (name, _o, m) in enumerate(steps)
+                      if name.endswith('_dpp') and set(m) & set(self.WAVE_REDUCE_STEPS)), len(steps))
+        items = self.ins[index:index + first + 10]
+
+        def at(k, what):
+            if k >= len(items):
+                raise Unsupported('wave reduction: the chain ends before %s' % what)
+            name, o, m = parse(items[k][3])
+            return re.sub(r'_e(32|64)$', '', name), o, m, items[k][3]
+
+        stretch = [at(k, 'the first quad_perm step') for k in range(1, first)]
+        pending = getattr(self, 'reduce_pending', {})
+        taken = None   # the later readlane of the min chain just before, which this chain carries before its fill
+        if stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
+            taken = pending[items[1][0]]
+            stretch = stretch[1:]
+        fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
+        if fill is None:
+            raise Unsupported('wave reduction: the identity fill after s_or_saveexec_b32 s%d, -1 (%s) is not a known '
+                              'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
+        vt, source, identity = fill
+        op = None
+        for k, want in enumerate(self.WAVE_REDUCE_STEPS):
+            b, o, m, text = at(first + k, want)
+            if not b.endswith('_dpp'):
+                raise Unsupported('wave reduction: missing step %s (found %s)' % (want, text))
+            controls = [x for x in m if not x.startswith(('row_mask:', 'bank_mask:', 'bound_ctrl:', 'fi:'))]
+            if controls != [want]:
+                order = ' (steps out of order or missing)' if controls and controls[0] in self.WAVE_REDUCE_STEPS else ''
+                raise Unsupported('wave reduction: %s in place of %s%s' % (' '.join(controls) or 'no DPP control', want,
+                                                                         order))
+            if 'row_mask:0xf' not in m or 'bank_mask:0xf' not in m:
+                raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
+            this = b[:-len('_dpp')]
+            if this not in self.WAVE_REDUCE:
+                raise Unsupported('wave reduction of %s: only v_or_b32, v_min_u32 and v_max_u32 are lowered' % this)
+            if op not in (None, this):
+                raise Unsupported('wave reduction mixes %s and %s' % (op, this))
+            op = this
+            if o != ['v%d' % vt] * 3:
+                raise Unsupported('wave reduction: %s does not combine v%d with itself' % (text, vt))
+        if identity != self.WAVE_REDUCE[op][1]:
+            raise Unsupported('wave reduction of %s: the inactive lanes get 0x%08x, the identity is 0x%08x'
+                              % (op, identity, self.WAVE_REDUCE[op][1]))
+        if taken is not None and op != 'v_max_u32':
+            raise Unsupported('wave reduction: a %s chain carries the later readlane of the v_min_u32 chain before it; '
+                              'only a v_max_u32 chain is lowered there' % op)
+        b, o, m, text = at(first + 4, 'v_permlanex16_b32')
+        if b != 'v_permlanex16_b32' or len(o) != 4 or o[1] != 'v%d' % vt or not re.fullmatch(r'v\d+', o[0]) or \
+                o[0] == o[1]:
+            raise Unsupported('wave reduction: %s in place of v_permlanex16_b32 vN, v%d, 0, 0' % (text, vt))
+        if m or o[2:] != ['0', '0']:
+            raise Unsupported('wave reduction: %s: only the lane selects 0, 0 without modifiers are lowered' % text)
+        vp = int(o[0][1:])
+        b, o, m, text = at(first + 5, 'the two rows are combined')
+        if b != op or m or len(o) != 3 or o[0] != 'v%d' % vt or sorted(o[1:]) != sorted(['v%d' % vt, 'v%d' % vp]):
+            mixed = b in self.WAVE_REDUCE and b != op
+            raise Unsupported('wave reduction %s' % ('mixes %s and %s' % (op, b) if mixed else
+                                                     ': %s in place of %s v%d, v%d, v%d' % (text, op, vt, vt, vp)))
+        b, o, m, text = at(first + 6, 'EXEC is restored')
+        if b != 's_mov_b32' or o != ['exec_lo', 's%d' % ss] or m:
+            raise Unsupported('wave reduction: %s in place of s_mov_b32 exec_lo, s%d (EXEC restored before the readlane)'
+                              % (text, ss))
+        read = first + 7   # the readlane: right after the restore, or later in the min chain
+        b, o, m, text = at(read, 'v_readlane_b32')
+        later = b == 'v_cndmask_b32_sdwa'
+        if later:
+            # The census's min form: restore, one v_cndmask_b32_sdwa (its own handler, under the restored EXEC), the
+            # s_or_saveexec_b32 sS2, -1 of the max chain that follows, then this chain's readlane. Readlane ignores
+            # EXEC; vT must still hold the result, and sS2 must survive the readlane for the max chain's fill and
+            # restore.
+            if op != 'v_min_u32':
+                raise Unsupported('wave reduction of %s: %s after the restore in place of v_readlane_b32 sN, v%d, 31 '
+                                  '(only the v_min_u32 chain reads its lane later)' % (op, text, vt))
+            if o and reg_range(o[0]) and reg_range(o[0])[0] == 'v' and \
+                    reg_range(o[0])[1] <= vt <= reg_range(o[0])[2]:
+                raise Unsupported('wave reduction: %s rewrites v%d before the readlane of the v_min_u32 chain'
+                                  % (text, vt))
+            b, o, m, text = at(first + 8, 'the s_or_saveexec_b32 of the v_max_u32 chain')
+            nxt = reg_range(o[0]) if b == 's_or_saveexec_b32' and len(o) == 2 and o[1] == '-1' and not m else None
+            if not nxt or nxt[0] != 's' or nxt[1] != nxt[2]:
+                raise Unsupported('wave reduction: %s in place of the s_or_saveexec_b32 sN, -1 of the v_max_u32 chain '
+                                  'before the readlane of the v_min_u32 chain' % text)
+            read = first + 9
+            b, o, m, text = at(read, 'the readlane of the v_min_u32 chain')
+        sd = reg_range(o[0]) if len(o) == 3 else None
+        if b != 'v_readlane_b32' or m or not sd or sd[0] != 's' or sd[1] != sd[2] or sd[1] == ss or \
+                o[1] != 'v%d' % vt:
+            raise Unsupported('wave reduction: %s in place of v_readlane_b32 sN, v%d, 31' % (text, vt))
+        if o[2] != '31':
+            raise Unsupported('wave reduction: %s reads lane %s: only lane 31 is lowered' % (text, o[2]))
+        if later and sd[1] == nxt[1]:
+            raise Unsupported('wave reduction: the readlane of the v_min_u32 chain overwrites s%d, the EXEC saved by '
+                              'the v_max_u32 chain' % sd[1])
+        end = items[read][0]
+        targets = {int(parse(asm)[1][0].split('_')[1], 16) for _off, _n, name, asm in self.ins
+                   if name.startswith('s_cbranch') or name == 's_branch'}
+        inside = sorted(t for t in targets if pc < t <= end)
+        if inside:
+            raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
+        if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
+            raise Unsupported('wave reduction outside a pixel stage')
+        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+            raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
+        if not getattr(self, 'exec_known', False):
+            raise Unsupported('wave reduction: EXEC is not the entry mask')
+        if getattr(self, 'wqm_exec', False):
+            raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
+        for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
+            _name, o, _m = parse(asm)
+            hits = [i for i, tok in enumerate(o) if any(
+                int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
+                for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
+            if not hits:
+                continue
+            short = re.sub(r'_e(32|64)$', '', name)
+            if hits == [0] and short.startswith('v_') and not self.WAVE_REDUCE_KEEPS.match(short):
+                break
+            raise Unsupported('wave reduction: v%d (the other row from v_permlanex16_b32) is read after the chain by %s'
+                              % (vp, asm))
+        # Nothing of the chain is emitted until the restore, so every register read there still holds its value from
+        # the fill (the only instruction lowered in between is the min chain's readlane carried here, an SGPR write
+        # that is not this chain's saved EXEC). The readlane then copies vT, which nothing has rewritten since.
+        plan = self.reduce_plan = getattr(self, 'reduce_plan', {})
+        if taken is not None:
+            taken[0] = True
+        for k in range(1, read + 1):
+            if k in (first + 7, first + 8) and later:
+                continue   # the v_cndmask_b32_sdwa keeps its handler; the max chain's saveexec starts that chain
+            plan.setdefault(items[k][0], None)
+        plan[items[first + 6][0]] = lambda: self.lower_wave_reduction(op, vt, vp, ss, source)
+        claim = [False]
+        if later:
+            self.reduce_pending = {**pending, items[read][0]: claim}
+        plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
+        return True
+
+    def lower_wave_reduction(self, op, vt, vp, ss, source):
+        value = self.WAVE_REDUCE[op][0].format(self.u(source))
+        self.needs_sm6 = True
+        self.set_s(ss, 'exec')
+        self.sym[ss] = ('execcopy',)
+        self.masks.add(ss)
+        self.set_v(vt, value)
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(vp)
+        self.set_scc('true')   # s_or_saveexec_b32 set SCC from the all-lanes EXEC
+
+    def lower_wave_readlane(self, sd, vt, claim):
+        if claim is not None and not claim[0]:
+            raise Unsupported('wave reduction: the later readlane of the v_min_u32 chain is not carried by a v_max_u32 '
+                              'chain')
+        self.set_s(sd, self.u('v%d' % vt), uniform=False)
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)

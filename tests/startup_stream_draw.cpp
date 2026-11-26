@@ -192,6 +192,114 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
 
 bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding);
 
+int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char* pixels)
+{
+    constexpr UINT width = 8, height = 4;
+    const DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const float clear[] = {0, 0, 1, 1};
+    const D3D12_CLEAR_VALUE optimized_clear{format, {clear[0], clear[1], clear[2], clear[3]}};
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+        format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    void* target = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 27, arg(&default_heap), D3D12_HEAP_FLAG_NONE, arg(&target_desc),
+            D3D12_RESOURCE_STATE_COMMON, arg(&optimized_clear), arg(&__uuidof(ID3D12Resource)), arg(&target)))) || !target)
+        return 21;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total = 0;
+    desktop->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const D3D12_RESOURCE_DESC readback_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* readback = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 27, arg(&readback_heap), D3D12_HEAP_FLAG_NONE, arg(&readback_desc),
+            D3D12_RESOURCE_STATE_COPY_DEST, 0, arg(&__uuidof(ID3D12Resource)), arg(&readback)))) || !readback) {
+        invoke(target, 2);
+        return 27;
+    }
+
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+    void* rtv_heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&rtv_desc), arg(&__uuidof(ID3D12DescriptorHeap)),
+                                           arg(&rtv_heap))))) {
+        invoke(readback, 2);
+        invoke(target, 2);
+        return 22;
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(rtv_heap, 9))};
+    const D3D12_RENDER_TARGET_VIEW_DESC view{format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+    invoke(guest, 20, arg(target), arg(&view), rtv.ptr);
+
+    void *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&queue)))) ||
+        FAILED(static_cast<HRESULT>(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator)))) ||
+        FAILED(static_cast<HRESULT>(invoke(guest, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list)))) ||
+        FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
+
+    // Plane record as queue_present resolves it: 0x48 bytes, +0x08 resource count, +0x10 pointer to wrapper array.
+    alignas(8) unsigned char plane[0x48]{};
+    const std::uint64_t resources[1]{reinterpret_cast<std::uint64_t>(target)};
+    const std::uint64_t token = 7, count_one = 1, resources_ptr = reinterpret_cast<std::uint64_t>(resources);
+    std::memcpy(plane + 0x00, &token, 8);
+    std::memcpy(plane + 0x08, &count_one, 8);
+    std::memcpy(plane + 0x10, &resources_ptr, 8);
+
+    // First present advances frame_number to 1 before the dumped draw runs.
+    invoke(queue, 32, 1, arg(plane), 0);
+
+    if (FAILED(static_cast<HRESULT>(invoke(allocator, 8))) ||
+        FAILED(static_cast<HRESULT>(invoke(list, 139, arg(allocator))))) return 35;
+    invoke(list, 52, rtv.ptr, arg(clear));
+    invoke(list, 50, 1, arg(&rtv));
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    const D3D12_RECT scissor{2, 1, 6, 3};
+    invoke(list, 21, 1, arg(&viewport));
+    invoke(list, 22, 1, arg(&scissor));
+    invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    invoke(list, 25, arg(pso));
+    invoke(list, 12, 3, 1);
+    invoke(list, 9);
+    invoke(queue, 10, 1, arg(&list));
+
+    const auto wait_fence = [&](UINT64 value) -> int {
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), value)))) return 24;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+        return invoke(fence, 8) == value ? 0 : 25;
+    };
+    if (const int rc = wait_fence(1)) return rc;
+
+    // Second present invokes draw_dump_flush() once the frame-1 draw copy has completed.
+    invoke(queue, 32, 1, arg(plane), 0);
+
+    if (FAILED(static_cast<HRESULT>(invoke(allocator, 8))) ||
+        FAILED(static_cast<HRESULT>(invoke(list, 139, arg(allocator))))) return 35;
+    D3D12_TEXTURE_COPY_LOCATION to{static_cast<ID3D12Resource*>(readback), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    to.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION from{static_cast<ID3D12Resource*>(target), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    invoke(list, 16, arg(&to), 0, 0, 0, arg(&from), 0);
+    invoke(list, 9);
+    invoke(queue, 10, 1, arg(&list));
+    if (const int rc = wait_fence(2)) return rc;
+
+    void* mapped = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(readback, 8, 0, 0, arg(&mapped)))) || !mapped) return 32;
+    std::ofstream out(pixels, std::ios::binary);
+    for (UINT y = 0; y < height; ++y)
+        out.write(static_cast<const char*>(mapped) + y * footprint.Footprint.RowPitch, width * 4);
+    const D3D12_RANGE none{};
+    invoke(readback, 9, 0, arg(&none));
+    invoke(readback, 2);
+    invoke(target, 2);
+    return out ? 0 : 33;
+}
+
 bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
 {
     std::ifstream file(input.blocks, std::ios::binary);
@@ -321,6 +429,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
+        return draw_pixel_history(desktop.Get(), guest, pso, pixels);
     Bc7Binding binding;
     if (bc7 && bc7->packed) {
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
@@ -340,13 +450,16 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     char index_probe[32]{};
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
+    void* vertex_resource = nullptr;
     if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
-        if (!std::strcmp(index_probe, "visible")) initial_visible = final_visible = true;
-        else if (!std::strcmp(index_probe, "late-visible") || wide_indices) final_visible = true;
-        else if (!std::strcmp(index_probe, "late-clipped")) initial_visible = true;
-        else if (std::strcmp(index_probe, "clipped")) return 70;
+        const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;
+        const bool unplaced_vb = !std::strcmp(index_probe, "late-visible-vb-unplaced");
+        if (!std::strcmp(index_probe, "visible") || !std::strcmp(index_probe, "visible-vb")) initial_visible = final_visible = true;
+        else if (!std::strcmp(index_probe, "late-visible") || !std::strcmp(index_probe, "late-visible-vb") || wide_indices || unplaced_vb) final_visible = true;
+        else if (!std::strcmp(index_probe, "late-clipped") || !std::strcmp(index_probe, "late-clipped-vb")) initial_visible = true;
+        else if (std::strcmp(index_probe, "clipped") && std::strcmp(index_probe, "clipped-vb")) return 70;
         D3D12_FEATURE_DATA_EXISTING_HEAPS capability{};
         if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &capability, sizeof(capability))) || !capability.Supported)
             return 77;
@@ -357,6 +470,26 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(index_memory), arg(&desc),
                 D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&index_resource)))) ||
             !index_resource || invoke(index_resource, 11) != arg(index_memory)) return 72;
+        if (with_vb || unplaced_vb) {
+            void* vertex_memory = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!vertex_memory) return 73;
+            if (!unplaced_vb) {
+                const D3D12_RESOURCE_DESC vdesc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+                    DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+                if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(vertex_memory), arg(&vdesc),
+                        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&vertex_resource)))) ||
+                    !vertex_resource || invoke(vertex_resource, 11) != arg(vertex_memory)) return 74;
+            }
+            auto* vwords = static_cast<float*>(vertex_memory);
+            for (UINT i = 0; i < 6; ++i) {
+                vwords[4 * i + 0] = i >= 3 ? 8.0f : 0.0f;
+                vwords[4 * i + 1] = 0.0f;
+                vwords[4 * i + 2] = 0.0f;
+                vwords[4 * i + 3] = 0.0f;
+            }
+            const D3D12_VERTEX_BUFFER_VIEW vb_view{arg(vertex_memory), 6 * 16, 16};
+            invoke(list, 48, 0, 1, arg(&vb_view));
+        }
         const auto write = [&](bool visible) {
             const UINT first = visible ? 0 : 3;
             if (wide_indices) {
@@ -575,6 +708,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     }
     if (const int rc = submit(last)) return rc;
     if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
+    if (vertex_resource) invoke(vertex_resource, 2);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
         extern int report_pixel_uavs(const char*);
         if (const int rc = report_pixel_uavs(pixels)) return rc;
