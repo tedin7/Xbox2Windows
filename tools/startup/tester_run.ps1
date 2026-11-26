@@ -64,11 +64,11 @@ $clock = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Windows PowerShell 5.1 turns a native command's stderr into error records when the script's own stderr is redirected
 # (a caller that captures it), and "Stop" then ends the script on a harmless warning (cmake, git, python). Native commands
-# run with "Continue" here and are judged by $LASTEXITCODE; stray error records never reach a captured value.
+# run with "Continue" here and are judged by $LASTEXITCODE; a native command's stderr is shown, not captured.
 function Invoke-Native([scriptblock]$Command) {
     $saved = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    try { & $Command | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } }
+    try { & $Command | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Host $_.ToString() } else { $_ } } }
     finally { $ErrorActionPreference = $saved }
 }
 
