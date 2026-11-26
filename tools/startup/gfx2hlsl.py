@@ -7781,10 +7781,10 @@ class Stage:
             raise Unsupported('%s without exactly one dim and dmask' % name)
         # Compute also stores to 1D, 2D-array and 3D images: the address is x; x, y, layer; x, y, z, and the bound
         # view is a RWTexture1D, RWTexture2DArray or RWTexture3D (a 3D view keeps the caller's W range, as an
-        # array view keeps its slices). Pixel stages store to 2D only.
+        # array view keeps its slices). Pixel stages store to 2D and 2D-array images (#2830); 1D and 3D stay compute-only.
         shapes = {'SQ_RSRC_IMG_2D': (2, 'tex2d', 'x and y'), 'SQ_RSRC_IMG_2D_ARRAY': (3, 'tex2da', 'x, y and layer'),
                   'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z')}
-        if dims[0] not in shapes or (dims[0] != 'SQ_RSRC_IMG_2D' and self.kind != 'cs') or \
+        if dims[0] not in shapes or (dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D') and self.kind != 'cs') or \
                 (d16 and dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D')):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
         address, image_kind, address_text = shapes[dims[0]]
