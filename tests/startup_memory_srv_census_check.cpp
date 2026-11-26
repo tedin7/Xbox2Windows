@@ -98,6 +98,29 @@ int main()
     srv.note("null_address", nullptr);
     check("forced report does not hide the next change", lines(srv, false).size() == report.size() && lines(srv, true).size() == 1);
 
+    MemorySrvCensus dimensions;
+    D3D12_SHADER_RESOURCE_VIEW_DESC cube{};
+    cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    for (UINT64 width = 1; width <= 20; ++width) {
+        const auto shape = texture(width, DXGI_FORMAT_R8_UNORM, 1);
+        dimensions.note("unsupported_description", &shape, &cube, true);
+    }
+    dimensions.note("unreadable_resource", nullptr, &cube, true);
+    dimensions.note("null_destination", nullptr, nullptr);
+    const auto dimension_lines = [&](std::uint64_t ms) {
+        std::vector<std::string> out;
+        dimensions.report_dimensions(ms, [&](const char* line) { out.emplace_back(line); });
+        return out;
+    };
+    check("dimension census waits 30 seconds", dimension_lines(29999).empty());
+    const auto first_dimensions = dimension_lines(30000);
+    check("dimension census includes overflow shapes and unreadable descriptions",
+          first_dimensions == std::vector<std::string>{
+              "x2w-d3d12 slot 70 refusal census: reason=unreadable_resource resource_dim=-1 view_dim=10 calls=1",
+              "x2w-d3d12 slot 70 refusal census: reason=unsupported_description resource_dim=3 view_dim=10 calls=20"});
+    check("dimension census keeps cumulative counts at 30-second intervals",
+          dimension_lines(59999).empty() && dimension_lines(60000) == first_dimensions);
+
     TokenNullCensus tokens;
     check("first pipeline is detailed", tokens.note(0x1000000000000001ull));
     check("its repeat is not", !tokens.note(0x1000000000000001ull));

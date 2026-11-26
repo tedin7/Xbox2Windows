@@ -191,6 +191,7 @@ struct alignas(16) WrapperOwn {
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
+    bool window_buffer_srv;  // Upload backing for a partially committed slot-70 buffer window.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
     bool lazy_view_created;    // Resource: at least one materialized view was created referencing this wrapper.
     std::uint8_t drop_levels;  // Lazy texture: top mip levels left out of the desktop texture (texture_drop_mips.h), 0 = all kept.
@@ -7911,6 +7912,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("%s", line);
     }
+    if (placed_srv_shapes_enabled()) report_memory_srv_dimensions();
     if (now - last_report >= 5000) {
         last_report = now;
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "

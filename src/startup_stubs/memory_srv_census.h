@@ -14,6 +14,7 @@
 // such report.
 #pragma once
 
+#include <atomic>
 #include <windows.h>
 #include <d3d12.h>
 
@@ -81,13 +82,20 @@ public:
 
     // Counts one refusal. True when the call is the first of one of the first detail_shapes distinct
     // shapes of its reason: the caller then logs its detail line even when its own line limit is spent.
-    bool note(const char* reason_name, const D3D12_RESOURCE_DESC* resource)
+    bool note(const char* reason_name, const D3D12_RESOURCE_DESC* resource,
+              const D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr, bool count_dimensions = false)
     {
         const int reason = memory_srv_reason_index(reason_name);
         bool detail = false;
         AcquireSRWLockExclusive(&lock_);
         ++reasons_[reason];
         ++total_;
+        if (count_dimensions) {
+            const UINT resource_dim = resource ? static_cast<UINT>(resource->Dimension) : resource_dimensions - 1;
+            const UINT view_dim = view ? static_cast<UINT>(view->ViewDimension) : view_dimensions - 1;
+            ++dimensions_[reason][resource_dim < resource_dimensions ? resource_dim : resource_dimensions - 1]
+                                 [view_dim < view_dimensions ? view_dim : view_dimensions - 1];
+        }
         if (resource && memory_srv_reason_has_shape(reason)) {
             const RefusedShape key{reason, static_cast<std::uint32_t>(resource->Dimension), static_cast<std::uint32_t>(resource->Format),
                                    resource->Width, resource->Height, resource->DepthOrArraySize, resource->MipLevels,
@@ -147,12 +155,44 @@ public:
         return true;
     }
 
+    template <class Emit>
+    void report_dimensions(std::uint64_t elapsed_ms, Emit emit)
+    {
+        constexpr std::uint64_t interval_ms = 30000;
+        if (elapsed_ms < last_dimensions_report_.load(std::memory_order_relaxed) + interval_ms) return;
+        AcquireSRWLockExclusive(&lock_);
+        if (elapsed_ms >= last_dimensions_report_.load(std::memory_order_relaxed) + interval_ms) {
+            last_dimensions_report_.store(elapsed_ms, std::memory_order_relaxed);
+            for (int reason = 0; reason <= memory_srv_reason_count; ++reason) {
+                for (UINT resource = 0; resource < resource_dimensions; ++resource) {
+                    for (UINT view = 0; view < view_dimensions; ++view) {
+                        const auto calls = dimensions_[reason][resource][view];
+                        if (!calls) continue;
+                        char line[192];
+                        std::snprintf(line, sizeof(line),
+                            "x2w-d3d12 slot 70 refusal census: reason=%s resource_dim=%d view_dim=%d calls=%llu",
+                            reason < memory_srv_reason_count ? memory_srv_reasons[reason] : "other",
+                            resource == resource_dimensions - 1 ? -1 : static_cast<int>(resource),
+                            view == view_dimensions - 1 ? -1 : static_cast<int>(view),
+                            static_cast<unsigned long long>(calls));
+                        emit(static_cast<const char*>(line));
+                    }
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&lock_);
+    }
+
 private:
     static bool same(const RefusedShape& a, const RefusedShape& b)
     {
         return a.reason == b.reason && a.dimension == b.dimension && a.format == b.format && a.width == b.width &&
                a.height == b.height && a.depth == b.depth && a.mips == b.mips && a.layout == b.layout && a.flags == b.flags;
     }
+    static constexpr UINT resource_dimensions = D3D12_RESOURCE_DIMENSION_TEXTURE3D + 2;
+    static constexpr UINT view_dimensions = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE + 2;
+    std::atomic<std::uint64_t> last_dimensions_report_{0};
+    std::uint64_t dimensions_[memory_srv_reason_count + 1][resource_dimensions][view_dimensions] = {};
     SRWLOCK lock_ = SRWLOCK_INIT;
     std::uint64_t reasons_[memory_srv_reason_count + 1] = {};
     std::uint64_t total_ = 0, reported_ = 0, more_shape_calls_ = 0;

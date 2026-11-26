@@ -59,13 +59,29 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
     return plan.size == UINT64_MAX ? 0 : (plan.size + 0xFFFF) & ~u64{0xFFFF};
 }
 
+bool placed_srv_shapes_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_PLACED_SRV_SHAPES", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void report_memory_srv_dimensions()
+{
+    static const u64 started = GetTickCount64();
+    memory_srv_census.report_dimensions(GetTickCount64() - started, [](const char* line) { log("%s", line); });
+}
+
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
 // The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
 // addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (supports_placed_memory_srv(r, v)) return true;
-    return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
+    return (console_layout_srv(r) && x2w_startup::address_view_fits(r, v)) ||
+           (placed_srv_shapes_enabled() && x2w_startup::supports_placed_texture_srv_shapes(r, v));
 }
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
@@ -100,7 +116,7 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
 
 // The layout tables describe the bytes independently of the desktop adapter's format support.
 bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& r,
-                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v, bool live_placement = false)
 {
     auto* const desktop = device_of(device);
     D3D12_FEATURE_DATA_FORMAT_INFO planes{r.Format};
@@ -112,13 +128,18 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
         !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
         return false;
 
+    const UINT req = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                                                                       : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+    const bool cube = v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE ||
+                      v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    if (live_placement)
+        return (view.Support1 & req) && (!cube || ((view.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE) &&
+                                                  (view.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)));
+
     D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
     if (r.Format == v.Format) storage = view;
     else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage)))) return false;
-    const UINT req = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
-                                                                       : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
-    return (storage.Support1 & req) &&
-           (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
+    return (storage.Support1 & req) && (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
 }
 
 bool memory_srv_destination(u64 handle)
@@ -189,7 +210,7 @@ bool address_resource_overlap(u64 address, u64 span)
     bool found = false;
     note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+        if (wrapper->own().tiled_address_srv || wrapper->own().window_buffer_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
@@ -237,7 +258,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
-        if (info.placement != Placement::none ||
+        if (wrapper->own().window_buffer_srv || info.placement != Placement::none ||
             info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
@@ -269,6 +290,7 @@ struct UnplacedBufferEntry {
     bool exact = false;  // starts at the view address (a structured view whose stride does not divide the page offset)
     x2w_startup::ComPtr<ID3D12Resource> resource;
     Wrapper* wrapper = nullptr;
+    std::vector<unsigned char> snapshot;  // The exact window exposed to any recorded descriptors.
 };
 
 std::mutex unplaced_buffer_mutex;
@@ -317,13 +339,25 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     }
 
     x2w_startup::PlacedBufferRange memory{};
+    bool window_upload = false;
     if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
         !memory.covered) {
-        if (memory.region_info)
-            prove(x2w_startup::SrvRefusalKind::fully_committed);
-        else if (memory.witness)
-            prove(x2w_startup::SrvRefusalKind::witness_page, memory.witness, reinterpret_cast<u64>(memory.base));
-        return nullptr;
+        // The requested bytes can be committed even when adjacent pages in the placement extent are not.
+        // Keep the old failure witness unless the requested range itself can back an upload.
+        x2w_startup::PlacedBufferRange window{};
+        if (!placed_srv_shapes_enabled() ||
+            !x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(address), span_bytes, window) ||
+            !window.covered || !x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(span_bytes))) {
+            if (memory.region_info)
+                prove(x2w_startup::SrvRefusalKind::fully_committed);
+            else if (memory.witness)
+                prove(x2w_startup::SrvRefusalKind::witness_page, memory.witness, reinterpret_cast<u64>(memory.base));
+            return nullptr;
+        }
+        memory = window;
+        page_start = address;
+        page_span = span_bytes;
+        window_upload = true;
     }
 
     const auto nearby = placed_buffer_range(device, page_start, page_span, true);
@@ -332,10 +366,8 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
     }
 
-    // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
-    // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
-    // starts at the address itself (checked above to lie inside memory the title owns).
-    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    // The page base may also be incompatible with an element offset even when all pages are present.
+    const bool exact = window_upload || x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
     if (exact) {
         page_start = address;
         page_span = span_bytes;
@@ -344,23 +376,44 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     auto* desktop = device_of(device);
     if (!desktop) return nullptr;
 
+    std::vector<unsigned char> snapshot;
+    if (window_upload) {
+        try {
+            snapshot.resize(static_cast<std::size_t>(span_bytes));
+        } catch (const std::bad_alloc&) {
+            return nullptr;
+        }
+        if (!x2w_local::guarded_memcpy(snapshot.data(), reinterpret_cast<const void*>(address), snapshot.size(), true))
+            return nullptr;
+    }
+    const auto copy_upload = [&](ID3D12Resource* upload, u64 start, u64 span) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range{0, 0};
+        if (FAILED(upload->Map(0, &read_range, &mapped))) return !window_upload;
+        const void* source = window_upload ? snapshot.data() : reinterpret_cast<const void*>(start);
+        std::memcpy(mapped, source, static_cast<std::size_t>(span));
+        upload->Unmap(0, nullptr);
+        return true;
+    };
+
     std::lock_guard lock(unplaced_buffer_mutex);
     for (auto& entry : unplaced_buffers) {
         if (entry.device == device && entry.allocation_base == memory.base && entry.exact == exact &&
-            x2w_startup::unplaced_buffer_covers(entry.page_start, entry.page_span, address, span_bytes)) {
+            entry.wrapper->own().window_buffer_srv == window_upload &&
+            (window_upload ? entry.page_start == page_start && entry.page_span == page_span
+                           : x2w_startup::unplaced_buffer_covers(entry.page_start, entry.page_span, address, span_bytes))) {
             x2w_startup::PlacedBufferRange verify{};
             if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(entry.page_start), entry.page_span, verify) ||
                 !verify.covered || verify.base != memory.base) {
                 continue;
             }
-            if (entry.is_upload && entry.resource) {
-                void* mapped = nullptr;
-                D3D12_RANGE read_range{0, 0};
-                if (SUCCEEDED(entry.resource->Map(0, &read_range, &mapped))) {
-                    std::memcpy(mapped, reinterpret_cast<const void*>(entry.page_start), static_cast<std::size_t>(entry.page_span));
-                    entry.resource->Unmap(0, nullptr);
-                }
+            // A previously published exact window can still be in use by a recorded or submitted list.
+            if (window_upload) {
+                if (entry.snapshot == snapshot) return entry.wrapper;
+                continue;
             }
+            if (entry.is_upload && entry.resource &&
+                !copy_upload(entry.resource.Get(), entry.page_start, entry.page_span)) return nullptr;
             return entry.wrapper;
         }
     }
@@ -433,12 +486,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
                                                       D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                       IID_PPV_ARGS(&native_resource)))) {
             is_upload = true;
-            void* mapped = nullptr;
-            D3D12_RANGE read_range{0, 0};
-            if (SUCCEEDED(native_resource->Map(0, &read_range, &mapped))) {
-                std::memcpy(mapped, reinterpret_cast<const void*>(page_start), static_cast<std::size_t>(page_span));
-                native_resource->Unmap(0, nullptr);
-            }
+            if (!copy_upload(native_resource.Get(), page_start, page_span)) return nullptr;
         }
     }
 
@@ -447,6 +495,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     Wrapper* w = wrap(native_resource.Get(), resource_kind);
     if (!w) return nullptr;
     w->own().title_memory = reinterpret_cast<void*>(page_start);
+    w->own().window_buffer_srv = window_upload;
     D3D12_RESOURCE_DESC rdesc{};
     rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     rdesc.Width = page_span;
@@ -467,7 +516,8 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         w->own().budget = x2w_budget::committed(desktop, native_resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     }
 
-    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, exact, native_resource, w});
+    unplaced_buffers.push_back(
+        UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, exact, native_resource, w, std::move(snapshot)});
     x2w_startup::note_placement_change();
     return w;
 }
@@ -760,7 +810,11 @@ void refuse_memory_srv(LONG& refused, const char* what, const char* reason, cons
                        const MemoryShaderResourceView* input, u64 destination)
 {
     const bool within_limit = first_calls(refused, 8);
-    const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
+    const bool dimensions = placed_srv_shapes_enabled();
+    const auto* desc = x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr;
+    const auto* view = dimensions && x2w_local::readable(input, sizeof(*input)) ? &input->view : nullptr;
+    const bool new_shape = memory_srv_census.note(reason, desc, view, dimensions);
+    if (dimensions) report_memory_srv_dimensions();
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
     log_layout0_texture(reason, resource, input);
 }
@@ -931,6 +985,23 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     Wrapper* texture = held ? nullptr
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
+    if (texture && placed_srv_shapes_enabled() &&
+        x2w_startup::supports_placed_texture_srv_shapes(*resource, input->view) &&
+        !supports_placed_memory_srv(*resource, input->view)) {
+        auto* native = materialize_lazy_texture(texture);
+        if (!native) {
+            held = "texture_unavailable";
+        } else {
+            const auto storage = native->GetDesc();
+            auto view = input->view;
+            view.Format = desktop_format(view.Format);
+            if (storage.MipLevels != resource->MipLevels ||
+                !x2w_startup::supports_placed_texture_srv_shapes(storage, view) ||
+                !desktop_address_view_supported(self, storage, view, true))
+                held = "unsupported_desktop_format";
+        }
+        if (held) texture = nullptr;
+    }
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
     // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";

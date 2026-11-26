@@ -1657,6 +1657,24 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_RESOURCE_INDEX_CHECK=1;X2W_D3D12_DEBUG=0")
 endforeach()
 
+# Read back the shader result for each new slot-70 shape and its switch-off refusal.
+foreach(backend IN ITEMS warp hardware)
+    foreach(shape IN ITEMS mip array cube cube_array volume typed structured raw)
+        foreach(mode IN ITEMS on off)
+            set(test startup_placed_srv_shapes_${backend}_${shape}_${mode})
+            if(mode STREQUAL "on")
+                set(placed_srv_shapes_env "X2W_PLACED_SRV_SHAPES=set:1")
+            else()
+                set(placed_srv_shapes_env "X2W_PLACED_SRV_SHAPES=unset:")
+            endif()
+            add_test(NAME ${test} COMMAND startup_resource_retire_title ${backend} srv-shape ${shape} ${mode})
+            set_tests_properties(${test} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+                ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LAZY_TEXTURES=0"
+                ENVIRONMENT_MODIFICATION "${placed_srv_shapes_env}")
+        endforeach()
+    endforeach()
+endforeach()
+
 # Preserve live SRVs and their copies with and without the legacy views switch. Also verify that an
 # explicit overwrite permits ordinary retirement, and that disabling base retirement keeps the resource.
 add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)

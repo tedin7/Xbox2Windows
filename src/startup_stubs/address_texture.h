@@ -97,6 +97,33 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
     return false;
 }
 
+// Desktop views over a matching live placed texture. Its resource provides the storage layout.
+inline bool supports_placed_texture_srv_shapes(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    if (r.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || r.SampleDesc.Count != 1 || r.SampleDesc.Quality ||
+        (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || !r.Width || !r.Height ||
+        !r.DepthOrArraySize || !r.MipLevels)
+        return false;
+    if (v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE &&
+        v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
+        return address_view_fits(r, v);
+    if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.Width != r.Height ||
+        r.DepthOrArraySize < 6 || !address_view_format(r.Format, v.Format) ||
+        !address_component_mapping(v.Shader4ComponentMapping))
+        return false;
+
+    const bool array = v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    const UINT first_mip = array ? v.TextureCubeArray.MostDetailedMip : v.TextureCube.MostDetailedMip;
+    const UINT mips = array ? v.TextureCubeArray.MipLevels : v.TextureCube.MipLevels;
+    const float clamp = array ? v.TextureCubeArray.ResourceMinLODClamp : v.TextureCube.ResourceMinLODClamp;
+    if (clamp != 0 || first_mip >= r.MipLevels || !mips || (mips != ~0u && mips > r.MipLevels - first_mip))
+        return false;
+    if (!array) return true;
+    const auto& cubes = v.TextureCubeArray;
+    return cubes.First2DArrayFace % 6 == 0 && cubes.First2DArrayFace < r.DepthOrArraySize &&
+           cubes.NumCubes && cubes.NumCubes <= (r.DepthOrArraySize - cubes.First2DArrayFace) / 6u;
+}
+
 inline bool supports_volume_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return false;

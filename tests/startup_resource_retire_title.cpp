@@ -1213,11 +1213,15 @@ bool case10_heap_start_abi(Context& c)
     return true;
 }
 
+#include "startup_placed_srv_shapes.inl"
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
+    const bool shapes = argc == 5 && !std::strcmp(argv[2], "srv-shape") &&
+        (!std::strcmp(argv[4], "on") || !std::strcmp(argv[4], "off"));
+    if (argc < 2 || (!shapes && argc > 3) || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
         (argc == 3 && std::strcmp(argv[2], "off")))
         return 2;
     ComPtr<IDXGIFactory4> factory;
@@ -1255,9 +1259,10 @@ int main(int argc, char** argv)
     const bool switch_on = GetEnvironmentVariableA("X2W_D3D12_RELEASE_RETIRED", switch_value, sizeof(switch_value)) == 1 &&
         switch_value[0] == '1';
     const bool off_mode = argc == 3;
-    if (switch_on == off_mode) return 2;
+    if (!shapes && switch_on == off_mode) return 2;
     const bool on = !off_mode;
-    std::printf("adapter=%ls debug_layer=%s mode=%s\n", adapter_desc.Description, debug ? "enabled" : "off", off_mode ? "off" : "on");
+    const char* mode = shapes ? argv[4] : off_mode ? "off" : "on";
+    std::printf("adapter=%ls debug_layer=%s mode=%s\n", adapter_desc.Description, debug ? "enabled" : "off", mode);
 
     constexpr SIZE_T page = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     auto* mem1 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -1289,6 +1294,18 @@ int main(int argc, char** argv)
             !require(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                                      nullptr, IID_PPV_ARGS(&c.readback)), "readback"))
             return 4;
+        if (shapes) {
+            // Reserve the desktop placement extent, but commit only the first OS page.
+            constexpr SIZE_T committed = 4096;
+            void* sparse = VirtualAlloc(nullptr, page, MEM_RESERVE, PAGE_READWRITE);
+            if (!sparse || !VirtualAlloc(sparse, committed, MEM_COMMIT, PAGE_READWRITE)) return 4;
+            const bool ok = case_placed_srv_shape(c, argv[3], !std::strcmp(mode, "on"), mem1, sparse) &&
+                            (!debug || debug->GetNumStoredMessages() == 0);
+            VirtualFree(sparse, 0, MEM_RELEASE);
+            for (auto* memory : {mem1, mem2, mem3, mem4, mem5}) VirtualFree(memory, 0, MEM_RELEASE);
+            CloseHandle(c.event);
+            return ok ? 0 : 5;
+        }
         if (!c.make_queue(c.direct) || !c.make_queue(c.gated) || !c.make_list(c.drain_list) || !c.close(c.drain_list)) return 4;
         if (!x2w_d3d12_budget_snapshot(&c.base, sizeof(c.base))) return 4;
 
