@@ -70,3 +70,14 @@ if(TARGET startup_replay_quad AND TARGET startup_stream_consumer AND TARGET x2w_
         set_tests_properties(startup_replay_dump_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+if(TARGET x2w_replay)
+    add_executable(startup_replay_invoke tests/startup_replay_invoke.cpp src/replay/replay_invoke.asm)
+    target_compile_features(startup_replay_invoke PRIVATE cxx_std_17)
+    add_test(NAME startup_replay_invoke COMMAND startup_replay_invoke)
+    if(EXISTS "${INTAKE_PYTHON}")
+        add_test(NAME startup_replay_call_formats COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_replay_call_formats_check.py" "$<TARGET_FILE:x2w_replay>")
+        set_tests_properties(startup_replay_call_formats PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+endif()

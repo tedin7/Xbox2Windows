@@ -1887,17 +1887,22 @@ Unset, no slot is wrapped and nothing changes.
 Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
 the real slot first except for the optional submit scan below, then appends
 to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
-present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
-are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
-shader's is; argument words 8 to 11, mostly the caller's stack, get 256 bytes each and are not followed), and the wrapper an argument's memory holds after the call (a creation's
-result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
-written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
-closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
+present count), argument memory from declared layouts, and the wrapper a declared output receives. The recorder keeps
+the raw call words for replay. For memory capture it follows only declared pointers and byte counts, including shader
+bytecode in a pipeline stream. A call shares a 1 MiB copy budget across all its argument memory, including descriptor
+arrays. Memory contents are stored once per content. The recorder checks commitment and readable protection with
+`VirtualQuery`, caching results within 64 KiB granules for up to 16 presents. Copies use `ReadProcessMemory` so a
+mapping change can fail the copy safely. Calls with opaque layouts can have insufficient memory for replay.
+
+Full buffers are written under one file lock. The window opens and closes at presents. Closing the recording disables
+capture for both the window and the prefix and finishes the file, whether the trigger is the window end, the file cap,
+`x2w_d3d12_replay_record_stop`, or process exit.
 
 File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
 `CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
 `OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
-`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` and settings whose value is a drive or share path left out: recordings travel, and such paths
+carry the user's name).
 Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
 and anything past 512 MiB in total are left out and counted in the log).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
@@ -1927,11 +1932,12 @@ must match the original pictures with the switch enabled and differ when the swi
 
 The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
 creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
-destination starts, destination sizes, source starts and source sizes of every `CopyDescriptors` call, in the prefix and in
-the window (the generic argument memory is cut at a few hundred bytes). Its header is the call sequence (u64); the payload
-omits null arrays and uses the counts from the call. The player relocates the descriptor handles in the arrays and runs the
-call from them. An array that cannot be read or is over the size cap is logged (`CopyDescriptors arrays of call N not
-recorded exactly`) and the call falls back to the generic memory. A successful heap creation with caller-supplied backing
+destination starts, destination sizes, source starts and source sizes of a `CopyDescriptors` call. Its header is the call
+sequence (u64). The payload omits null arrays and uses the counts from the call. The player relocates the descriptor
+handles in the arrays and runs the call from them. If the arrays are unreadable or exceed the per-call budget, the
+recorder logs the omission and replay skips the copy when its arguments are unavailable. Direct CPU writes to descriptor backing memory are outside
+this recipe: the pages of the heap's title memory carry them.
+A successful heap creation with caller-supplied backing
 has a `DHPM` chunk with three u64 fields (call sequence, address, byte count) and an empty payload. The player reserves and
 commits that range through the same allocator as `MAP` before playing any calls. It passes the original backing address
 to heap creation and uses that address for descriptor writes. `DHPM` carries no memory contents and is recorded even
@@ -2007,6 +2013,22 @@ Play with `--dump HEX_ADDRESS:BYTES` to write up to 64 MiB of a reserved title r
 and before trailing page updates. Wait for GPU completion in the recorded workload before either readback.
 Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
+The recorder uses the layouts in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h)
+for device slots 70, 73, 80 and 86. It keeps format 3. The player reads formats 2 and 3.
+With `X2W_REPLAY_SLOT_LAYOUTS=1` stored in `XENV`, the player also maps the CPU
+pointer returned by list slot 148 over the requested range. As with other memory-backed views, replay of slot
+
+The player checks each CALL header against its format (104 bytes in v2,
+136 in v3). Format 2 supplies zero for argument words 7 through 10. The
+Windows x64 bridge forwards all eleven integer or pointer words.
+
+Run the synthetic CALL compatibility and bridge checks together with the replay
+scenes on Windows after building Release:
+
+```powershell
+ctest --preset release --no-tests=error -R '^(startup_replay_(call_formats|invoke|warp|hardware))$'
+```
+
 Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
 in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
 recorder keeps format 3 and stores the switch in `XENV`. The player reads
@@ -2019,8 +2041,7 @@ made through it.
 
 List slot 146 currently returns zero through the list no-op. The capture
 probe suggests a barrier array, but the stand-in does not consume one.
-Opaque no-ops with unknown argument layouts retain the generic capture
-path. List slots 28–30 use query objects and scalar arguments when
+Opaque no-ops with unknown argument layouts record their raw call words. List slots 28–30 use query objects and scalar arguments when
 `X2W_D3D12_QUERY_SLOTS=1` selects the experimental bindings. For switched
 recordings, replay checks the slot 146 result and the slot 80 HRESULT and
 written frame token. A mismatch returns exit 6.

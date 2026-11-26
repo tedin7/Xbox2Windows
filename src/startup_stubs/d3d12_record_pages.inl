@@ -206,7 +206,7 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
             const u64 at = range.address + page_cursor_offset;
             const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset));
             page_cursor_offset += want;
-            const std::size_t readable = readable_window(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
+            const std::size_t readable = committed_readable_prefix(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
             SIZE_T got = 0;
             if (!readable || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), buffer.data(), readable, &got) ||
                 got != readable) {
@@ -306,7 +306,7 @@ u64 pages_before_call(bool root, u64 address, bool submit)
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     if (root) remember_page_range(address, 0x10000, false);
     init_page_writer();
-    if (page_writer && !page_budget_reached && !stop_requested && !stopped) {
+    if (page_writer && !page_budget_reached && !stop_requested && active) {
         scan_pages_into(b, window_open && !page_base_done, seq - 1, window_open);
         if (submit) page_last_submit = (std::max)(page_last_submit, seq);
     }

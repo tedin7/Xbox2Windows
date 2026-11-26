@@ -99,6 +99,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -125,7 +126,7 @@ extern "C" std::uint32_t x2w_no_stripped_root_flags(const void*, std::size_t) { 
 namespace {
 
 using u64 = std::uint64_t;
-constexpr int slot_count = 512;
+constexpr int slot_count = x2w_replay_slots::slot_count;
 // Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
@@ -2363,6 +2364,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 //
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
+std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
 #include "startup_stubs/d3d12_record.inl"
 #include "startup_stubs/d3d12_present_pictures.inl"

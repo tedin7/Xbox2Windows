@@ -7,12 +7,13 @@
 namespace x2w_replay_slots {
 
 inline constexpr char setting[] = "X2W_REPLAY_SLOT_LAYOUTS";
+inline constexpr int slot_count = 512;
 inline constexpr int device = 0, list = 4;
 
 struct Layout {
     int kind, slot;
     const char* name;
-    bool known_memory;  // false retains the recorder's generic argument probe
+    bool known_memory;  // false means the recorder has no declared argument memory
     std::size_t memory[5];  // exact top-level byte counts, from rdx onward
     int wrapper_output = -1;
     int follow = -1;  // argument containing a pipeline stream pointer and size

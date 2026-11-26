@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "../startup_stubs/replay_pages.h"
+#include "../startup_stubs/d3d12_replay_slots.h"
 
 namespace x2w_replay {
 
@@ -31,7 +33,13 @@ struct CallRecord {
     std::int32_t present, pad;
 };
 static_assert(sizeof(CallRecord) == 136, "CALL header layout");
-constexpr std::size_t call_v2_bytes = 104;  // format 2: args[7]
+static_assert(offsetof(CallRecord, args) == 24 && offsetof(CallRecord, ret) == 112 &&
+              offsetof(CallRecord, seconds) == 120 && offsetof(CallRecord, present) == 128 &&
+              offsetof(CallRecord, pad) == 132, "CALL field offsets");
+constexpr std::size_t call_v2_prefix = offsetof(CallRecord, args) + 7 * sizeof(u64);
+constexpr std::size_t call_trailer_bytes = sizeof(CallRecord) - offsetof(CallRecord, ret);
+constexpr std::size_t call_v2_bytes = call_v2_prefix + call_trailer_bytes;
+static_assert(call_v2_bytes == 104);
 
 struct ArgMemory {
     std::uint32_t arg, depth;  // arg: the call's argument (low byte) | 0x100 * (word in the parent + 1) when nested
@@ -124,7 +132,8 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
         const unsigned char* h = out.base + header_at;
         const std::string name(tag);
         if (at == 0 && name != "XREC") return "not a replay recording (no XREC first)";
-        if (name == "XREC" && header_bytes >= 16) {
+        if (name == "XREC") {
+            if (at != 0 || header_bytes < 16) return "invalid XREC header at " + std::to_string(at);
             std::uint32_t call_bytes;
             std::memcpy(&out.version, h, 4);
             std::memcpy(&call_bytes, h + 4, 4);
@@ -132,15 +141,20 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             if (out.version != file_version && out.version != 2)
                 return "recording version " + std::to_string(out.version) + ", this replayer reads 2 and " + std::to_string(file_version);
             if (call_bytes != (out.version == 2 ? call_v2_bytes : sizeof(CallRecord))) return "unexpected CALL size " + std::to_string(call_bytes);
-        } else if (name == "CALL" && (header_bytes == sizeof(CallRecord) || (out.version == 2 && header_bytes == call_v2_bytes))) {
+        } else if (name == "CALL") {
+            if (header_bytes != (out.version == 2 ? call_v2_bytes : sizeof(CallRecord)))
+                return "unexpected CALL size at " + std::to_string(at);
             Step step{};
-            if (header_bytes == sizeof(CallRecord)) {
+            if (out.version == file_version) {
                 std::memcpy(&step.call, h, sizeof(CallRecord));
             } else {
                 // Format 2: seven argument words, then ret, seconds, present; rcx's memory is ARGM 7 (moved to 15 below).
-                std::memcpy(&step.call, h, 24 + 7 * 8);
-                std::memcpy(&step.call.ret, h + 24 + 7 * 8, call_v2_bytes - 24 - 7 * 8);
+                std::memcpy(&step.call, h, call_v2_prefix);
+                auto* trailer = reinterpret_cast<unsigned char*>(&step.call) + offsetof(CallRecord, ret);
+                std::memcpy(trailer, h + call_v2_prefix, call_trailer_bytes);
             }
+            if (step.call.slot >= x2w_replay_slots::slot_count)
+                return "CALL slot out of range at " + std::to_string(at);
             by_seq[step.call.seq] = out.steps.size();
             out.steps.push_back(step);
         } else if (name == "ARGM" && header_bytes >= 40) {

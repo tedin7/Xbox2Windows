@@ -18,6 +18,8 @@
 
 #include "startup_stream_setup.h"
 
+extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_calls();
+
 using Word = StreamWord;
 template <class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
 
@@ -44,6 +46,68 @@ struct Scene {
     void* signature = nullptr;
     void* arguments = nullptr;
 };
+
+LONG volatile access_exceptions;
+
+LONG CALLBACK count_access_exceptions(EXCEPTION_POINTERS* exception)
+{
+    const DWORD code = exception->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_GUARD_PAGE)
+        InterlockedIncrement(&access_exceptions);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool record_memory_cases(void* device)
+{
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    auto* reserved = static_cast<unsigned char*>(VirtualAlloc(nullptr, system.dwAllocationGranularity, MEM_RESERVE, PAGE_NOACCESS));
+    constexpr std::size_t large_size = 2u << 20;
+    auto* large = static_cast<unsigned char*>(VirtualAlloc(nullptr, large_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    void* committed = reserved ? VirtualAlloc(reserved + system.dwPageSize, system.dwPageSize, MEM_COMMIT, PAGE_READWRITE) : nullptr;
+    void* handler = AddVectoredExceptionHandler(1, count_access_exceptions);
+    bool ok = reserved && large && committed && handler;
+    if (ok) {
+        // The unsupported IID keeps the real slot from consuming the blob.
+        // The recorder sees a declared pointer and size in every call.
+        constexpr UINT marker = 0x11223344;
+        const GUID unsupported{};
+        void* output = nullptr;
+        auto root = [&](const void* blob, std::size_t bytes, Word tail) {
+            return static_cast<HRESULT>(invoke(device, 16, marker, arg(blob), bytes, arg(&unsupported), arg(&output), tail,
+                                               large_size)) == E_NOINTERFACE;
+        };
+        ok = root(reserved, 64, arg(large)) && root(committed, 64, arg(reserved));
+        // Reserved when first named, committed and written before it is named again: the second call holds it.
+        auto* late = reserved + 2 * system.dwPageSize;
+        ok = ok && root(late, 64, 0) && VirtualAlloc(late, system.dwPageSize, MEM_COMMIT, PAGE_READWRITE);
+        if (ok) std::memset(late, 0x5a, 64);
+        ok = ok && root(late, 64, 0);
+        for (unsigned i = 0; i < 20 && ok; ++i) {
+            large[0] = static_cast<unsigned char>(i);
+            ok = root(large, large_size, arg(reserved));
+        }
+        // Individually small ranges can still exceed the same call's remaining budget.
+        constexpr std::size_t shader_bytes = 600u << 10;
+        struct alignas(8) Shader {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+            D3D12_SHADER_BYTECODE bytecode;
+        } shaders[] = {
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {large, shader_bytes}},
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {large + shader_bytes, shader_bytes}},
+        };
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream{sizeof(shaders), shaders};
+        ok = ok && static_cast<HRESULT>(invoke(device, 86, arg(&stream), arg(&unsupported), arg(&output),
+                                              marker)) == E_NOINTERFACE;
+        invoke(device, 1, arg(reserved));
+        invoke(device, 2, arg(reserved));
+    }
+    if (handler) RemoveVectoredExceptionHandler(handler);
+    if (large) VirtualFree(large, 0, MEM_RELEASE);
+    if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
+    std::printf("replay quad: recorder access exceptions %ld\n", access_exceptions);
+    return ok;
+}
 
 int create_scene(void* device, Scene& s)
 {
@@ -293,6 +357,16 @@ int main(int argc, char** argv)
         if (frames != 3) return 2;
         if (const int rc = create_indirect_arguments(device, scene)) return rc;
     }
+    char recorder_case[16]{};
+    GetEnvironmentVariableA("X2W_TEST_REPLAY_RECORDER", recorder_case, sizeof(recorder_case));
+    if (std::strcmp(recorder_case, "memory") == 0 && !record_memory_cases(device)) return 37;
+    if (std::strcmp(recorder_case, "cap") == 0) {
+        // CALL chunks alone drive the file over 1 MiB while the timed window is still far away.
+        for (unsigned i = 0; i < 8000; ++i) {
+            invoke(device, 1);
+            invoke(device, 2);
+        }
+    }
     // X2W_TEST_REPLAY_PAUSE=<frame>,<ms>: a pause before that frame (a slowdown for the recorder's "slow" trigger).
     char pause[32]{};
     unsigned pause_frame = ~0u, pause_ms = 0;
@@ -304,6 +378,9 @@ int main(int argc, char** argv)
         if (frame == pause_frame) Sleep(pause_ms);
         if (const int rc = draw_frame(scene, device, pso, frame, frames, slot_layouts)) return rc;
     }
+    if (std::strcmp(recorder_case, "cap") == 0)
+        std::printf("replay quad: recorder calls after scene %llu\n",
+                    static_cast<unsigned long long>(x2w_d3d12_replay_record_calls()));
     std::printf("replay quad: %u presents drawn\n", scene.signature ? 0 : frames);
     return 0;
 }
