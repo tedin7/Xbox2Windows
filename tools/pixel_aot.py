@@ -5667,7 +5667,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint sb{i} = {b_expr};")
             lines.append(f"    uint ci{i} = {condition[1]} ? 1u : 0u;")
             lines.append(f"    uint cp{i} = {partial.format(f'sa{i}', f'sb{i}')};")
-            lines.append(f"    uint co{i} = {result_tmpl.format(p=f'cp{i}', c=f'ci{i}')};")
+            if op == "sub":
+                # The RX 5700 XT returned the subtrahend for this uniform SDWA chain (#2731).
+                # In uint arithmetic ~(b - a) is a - b - 1. Select the completed difference.
+                result = f"{condition[1]} ? ~(sb{i} - sa{i}) : cp{i}"
+            else:
+                result = result_tmpl.format(p=f"cp{i}", c=f"ci{i}")
+            lines.append(f"    uint co{i} = {result};")
             lines.append(f"    bool cmp{i} = {carry_out_tmpl.format(f'sa{i}', f'sb{i}', p=f'cp{i}', c=f'ci{i}', r=f'co{i}')};")
             placed = sdwa_dest(f"co{i}", dst_sel, unused, vector.get(dst))
             lines.append(f"    precise float alu{i} = asfloat({placed});")

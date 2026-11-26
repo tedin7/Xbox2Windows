@@ -15,12 +15,21 @@ def check(label, condition, detail=''):
 
 
 class Pipe:
-    """The single resource needed by the buffer-load probe."""
+    """The minimal pipeline resources needed by the load probes."""
 
     resources = {(('table', 0), 0): {'index': 0}}  # the formatted load reads the stride and FORMAT words by index
 
+    def __init__(self):
+        self.modified, self.other_modified, self.uavs = set(), set(), {}
+
     def resource(self, key, kind):
         return 'r0'
+
+    def uav(self, key, kind='raw'):
+        return 'w0'
+
+    def stored_images(self):
+        return self.uavs
 
     def ud(self, key):
         return 0
@@ -41,6 +50,8 @@ def run(*instructions, exec_known=True, kind=None, group=None):
         s.pipe.group = group
     s.attrs = {}
     s.sym = {4 + i: ('desc', ('table', 0), 0, i) for i in range(4)}
+    s.sym.update({16 + i: ('desc', ('table', 0), 32, i) for i in range(8)})
+    s.sym.update({24 + i: ('desc', ('table', 0), 64, i) for i in range(8)})
     s.sym[3] = ('fixed_buffer_word',)
     s.used_s, s.used_v, s.masks = set(), set(), set()
     s.exec_known = exec_known
@@ -88,6 +99,16 @@ ACCEPTED = [
      ['v7 = U(F(s2) * 2.0 + F(0x3f800000u));']),
     ('reciprocal', ('v_rcp_f32_e32 v7, s2',),
      ['v7 = U(1.0 / F(s2));']),
+    ('base-2 logarithm', ('v_log_f32_e32 v7, s2',),
+     ['v7 = U(log2(F(s2)));']),
+    ('clamped log2 of abs scalar', ('v_log_f32_e64 v7, |s2| clamp',),
+     ['v7 = U(saturate(log2(abs(F(s2)))));']),
+    ('ceiling', ('v_ceil_f32_e32 v7, s2',),
+     ['v7 = U(ceil(F(s2)));']),
+    ('scaled ceiling of negated scalar', ('v_ceil_f32_e64 v7, -s2 mul:2',),
+     ['v7 = U((ceil((-F(s2)))) * 2.0);']),
+    ('log2 then ceil chain', ('v_log_f32_e32 v7, s2', 'v_ceil_f32_e32 v7, v7'),
+     ['v7 = U(log2(F(s2)));', 'v7 = U(ceil(F(v7)));']),
     # The clamp to [0, 0.5] of a scalar, as compiled shaders write it.
     ('median of three', ('v_med3_f32 v7, s2, 0, 0.5',),
      ['v7 = U(med3_32(F(s2), F(0x00000000u), 0.5));']),
@@ -128,6 +149,10 @@ REFUSED = [
     ('varying scalar buffer offset',
      (COMPARE, 's_buffer_load_dword s3, s[4:7], s2', 'v_mov_b32_e32 v7, s3', READ)),
     ('listed op with varying source', (MOVE, 'v_mul_f32_e64 v7, v0, 2.0', READ)),
+    ('log2 of a varying source', ('v_log_f32_e32 v7, v0', READ)),
+    ('ceil of a varying source', ('v_ceil_f32_e32 v7, v0', READ)),
+    ('log2 of a lane mask', (COMPARE, 'v_log_f32_e32 v7, s2', READ)),
+    ('ceil of a lane mask', (COMPARE, 'v_ceil_f32_e32 v7, s2', READ)),
     ('median of three with a varying source', (MOVE, 'v_med3_f32 v7, s2, v0, 0.5', READ)),
     ('median of three of a lane mask', (COMPARE, 'v_med3_f32 v7, s2, 0, 0.5', READ)),
     ('op_sel overwrite', (MOVE, 'v_mul_f32_e64 v7, s2, 2.0 op_sel:[0,0]', READ)),
@@ -198,6 +223,8 @@ EARLIER = {
     'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
     'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
     'median of three of a lane mask': 'v_med3_f32 reads lane mask s2 as numeric data',
+    'log2 of a lane mask': 'v_log_f32 reads lane mask s2 as numeric data',
+    'ceil of a lane mask': 'v_ceil_f32 reads lane mask s2 as numeric data',
     'unsigned to float conversion of a mask': 'v_cvt_f32_u32 reads lane mask s2 as numeric data',
     # A scalar op that reads a lane mask as a number is refused where it is lowered (before the read).
     'aliased load first word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
@@ -277,6 +304,62 @@ for label, instructions, read in (
         ('other register after a load', ('v_mov_b32_e32 v6, v0', 'buffer_load_dwordx2 v[7:8], off, s[4:7], s2'), 6)):
     got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind='cs')
     check(f'{label} refused', got == REFUSAL, repr(got))
+
+# A compute image_load through an unmodified fixed table descriptor at uniform coordinates is uniform when
+# no image write exists in the dispatch; the entry-block read has no recomputable expression.
+IMG_LOAD = 'image_load v7, [v2, v3], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'
+IMG_COORDS = ('v_mov_b32_e32 v2, s2', 'v_mov_b32_e32 v3, 1')
+for label, instructions, read in (
+        ('2D single-channel image_load', IMG_COORDS + (IMG_LOAD,), 7),
+        ('2D multi-channel image_load, second component',
+         IMG_COORDS + ('image_load v[7:8], v[2:3], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D',), 8),
+        ('2D packed a16 image_load',
+         ('v_mov_b32_e32 v2, s2', 'image_load v7, v2, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D a16'), 7),
+        ('2D-array image_load',
+         ('v_mov_b32_e32 v2, 1', 'v_mov_b32_e32 v3, 2', 'v_mov_b32_e32 v4, s2',
+          'image_load v7, v[2:4], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY'), 7),
+        ('image_load overwriting its uniform coordinate',
+         IMG_COORDS + ('image_load v2, v[2:3], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D',), 2)):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind='cs')
+    check(f'{label} accepted', isinstance(got, list) and got[-1] == 's9 = v%d;' % read, repr(got))
+
+for label, instructions, read, kind, known in (
+        ('image_load with varying x coordinate',
+         ('v_mov_b32_e32 v3, 1', 'image_load v7, [v0, v3], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'), 7, 'cs', True),
+        ('image_load with varying y coordinate',
+         ('v_mov_b32_e32 v2, 1', 'image_load v7, [v2, v0], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'), 7, 'cs', True),
+        ('image_load with modified descriptor',
+         ('s_or_b32 s17, s17, 0x1000',) + IMG_COORDS + (IMG_LOAD,), 7, 'cs', True),
+        ('image_load with overwritten descriptor word',
+         ('s_mov_b32 s18, 0',) + IMG_COORDS + (IMG_LOAD,), 7, 'cs', True),
+        ('image_load in a dispatch with image_store',
+         IMG_COORDS + (
+             'v_mov_b32_e32 v10, 0', 'v_mov_b32_e32 v11, 0',
+             'v_mov_b32_e32 v12, 0', 'v_mov_b32_e32 v13, 0',
+             'v_mov_b32_e32 v14, 0', 'v_mov_b32_e32 v15, 0',
+             IMG_LOAD, 'image_store v[12:15], v[10:11], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D'),
+         7, 'cs', True),
+        ('image_load_mip with uniform coordinates',
+         IMG_COORDS + ('v_mov_b32_e32 v4, 0', 'image_load_mip v7, v[2:4], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'),
+         7, 'cs', True),
+        ('image_load in a graphics stage', IMG_COORDS + (IMG_LOAD,), 7, 'ps', True),
+        ('image_load without a stage kind', IMG_COORDS + (IMG_LOAD,), 7, None, True),
+        ('image_load with unknown exec', IMG_COORDS + (IMG_LOAD,), 7, 'cs', False),
+        ('image_load read after a branch target',
+         IMG_COORDS + (IMG_LOAD, 's_cbranch_scc0 label_0018', 's_endpgm', 's_endpgm'), 7, 'cs', True),
+        ('other register after two-channel image_load',
+         ('v_mov_b32_e32 v9, v0',) + IMG_COORDS +
+         ('image_load v[7:8], v[2:3], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D',), 9, 'cs', True)):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind=kind, exec_known=known)
+    check(f'{label} refused', got == REFUSAL, repr(got))
+
+original_img = G.UNIFORM_IMAGE_LOADS
+G.UNIFORM_IMAGE_LOADS = frozenset()
+try:
+    got = run(*(IMG_COORDS + (IMG_LOAD, READ)), kind='cs')
+    check('control: image_load refused without tracking', got == REFUSAL, repr(got))
+finally:
+    G.UNIFORM_IMAGE_LOADS = original_img
 
 # tid.x >> n is 0 in every lane when the group's X size is at most 1 << n (the thread id VGPR is untouched).
 WAVE = 'v_lshrrev_b32_e32 v1, 6, v0'

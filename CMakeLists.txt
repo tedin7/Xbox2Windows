@@ -1289,6 +1289,17 @@ add_test(NAME startup_dump_fence_removed_control_warp COMMAND startup_dump_fence
 set_tests_properties(startup_dump_fence_removed_control_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45
     WILL_FAIL TRUE)
 
+# Per-draw texel history: three source-built draws where only the second covers the watched texel,
+# then a control without that draw. The report must name draw 2 and leave the texel black in the control.
+add_executable(startup_pixel_history tests/startup_pixel_history.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_pixel_history PRIVATE cxx_std_17)
+target_include_directories(startup_pixel_history PRIVATE src)
+target_link_libraries(startup_pixel_history PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_pixel_history_warp COMMAND startup_pixel_history)
+set_tests_properties(startup_pixel_history_warp PROPERTIES TIMEOUT 60)
+add_test(NAME startup_pixel_history_hardware COMMAND startup_pixel_history hardware)
+set_tests_properties(startup_pixel_history_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 add_executable(startup_typed_buffer_view tests/startup_typed_buffer_view.cpp)
 target_compile_features(startup_typed_buffer_view PRIVATE cxx_std_17)
 add_test(NAME startup_typed_buffer_view COMMAND startup_typed_buffer_view)
