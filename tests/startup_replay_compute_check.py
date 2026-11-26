@@ -87,8 +87,11 @@ def main(consumer, player, dxc, adapter):
             if mode in ('dispatch', 'dispatch-same-root'):
                 assert got == expected, '%s: the recorded run itself differs from the CPU reference' % mode
             dumped, log = play(player, recording, directory / ('replay_' + mode), adapter, dump)
-            assert dumped == words_bytes(got), '%s: the replayed output differs from the recorded run at word %d\n%s' % (
-                mode, next(i for i, (a, b) in enumerate(zip(dumped, words_bytes(got))) if a != b) // 4, log[-2500:])
+            want = words_bytes(got)
+            if dumped != want:
+                first = next((i for i, (a, b) in enumerate(zip(dumped, want)) if a != b), min(len(dumped), len(want)))
+                raise AssertionError("%s: the replayed output differs from the recorded run (%d bytes against %d, first difference at word %d)\n%s" % (
+                    mode, len(dumped), len(want), first // 4, log[-2500:]))
             assert 'Dispatch(3, 2, 2) translated' in log or 'translated' in log, '%s: the replay did not translate the Dispatch\n%s' % (mode, log[-2500:])
             print('replay %s: output equal to the recorded run (%d words)' % (mode, C.WORDS))
         recording, got, _, dump = record(directory, consumer, env, 'dispatch-none')
