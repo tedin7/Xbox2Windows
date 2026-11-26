@@ -44,6 +44,14 @@ def main(consumer, dxc, adapter):
         # A list that asks for the new pipeline while another list's first manifest read is in flight is refused once ("no translation");
         # that is the stand-in's existing behaviour. More than one such refusal per extra list means a refusal outlived the read.
         threads = int(env['X2W_TEST_BENCH_THREADS'])
+        rounds = int(env['X2W_TEST_BENCH_CALLS'])
+        # Every Dispatch of every list must be translated except the one a racing list may be refused while the first manifest read is in
+        # flight. A refusal that is remembered for good (the refusal cache keeping "no translation" past the first read) loses thousands.
+        census = [line for line in lines(result, 'x2w-render compute census key ')]
+        assert len(census) == 1, census
+        translated = int(census[0].split(' dispatches, ')[1].split(' translated')[0])
+        assert translated >= threads * rounds - (threads - 1), (
+            f'only {translated} of {threads * rounds} Dispatches were translated (a refusal outlived the first manifest read)\n' + census[0])
         refused = lines(result, 'refused')
         assert len(refused) <= threads - 1, refused
         print(bench[0])
