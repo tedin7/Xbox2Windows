@@ -4536,6 +4536,15 @@ class Stage:
                 self.set_s(d + 1, '0x%08xu' % ((value >> 32) & 0xffffffff), ('const', (value >> 32) & 0xffffffff))
             self.masks.discard(d)
             return None
+        if base == 's_mov_b32' and not pair and len(srcs) == 1 and reg_range(srcs[0]) and reg_range(srcs[0])[0] == 's' \
+                and reg_range(srcs[0])[1] == reg_range(srcs[0])[2] and len(self.sym.get(reg_range(srcs[0])[1]) or ()) == 2 \
+                and self.is_const(reg_range(srcs[0])[1]) is not None:
+            # A copy of an SGPR holding a plain known constant (not the tagged unassigned placeholder) is that constant (llc copies a zero into an inline
+            # sampler word: s_mov_b32 s12, s15 after s_mov_b32 s15, 0).
+            value = self.is_const(reg_range(srcs[0])[1])
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+            self.masks.discard(d)
+            return None
         if base in SCALAR_CONST_FOLD:
             # Constant operands give a known word, so a descriptor built from them (an inline sampler from
             # s_movk_i32, s_bfm_b32, s_mov_b32 and s_brev_b32 into s[N:N+3]) is a constant descriptor.
