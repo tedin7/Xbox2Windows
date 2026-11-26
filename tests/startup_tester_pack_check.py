@@ -759,6 +759,15 @@ def check_record_spec():
         report = T.folder_report(tmp)
         assert report["files"] == 2 and report["bytes"] == 6000 and report["largest"][0] == ("sub/b.bin", 5000), report
         assert T.folder_report(str(Path(tmp) / "none")) == {"files": 0, "bytes": 0, "largest": []}
+        # A run whose log says the cap stopped the recording before its window opened: the file is a prefix, not a recording.
+        logs = Path(tmp) / "logs"
+        logs.mkdir()
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "no stderr: nothing to say"
+        write(logs, "stderr.txt", b"x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, 20 calls\n")
+        assert T.folder_report(tmp, str(logs))["unusable"] == "prefix only"
+        assert "unusable" not in T.folder_report(tmp), "no log folder given"
+        write(logs, "stderr.txt", b"x2w-replay record: stopped after 900 calls, 3 blobs\n")
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "a window that opened is usable"
 
 
 def make_old_cache(folder):
