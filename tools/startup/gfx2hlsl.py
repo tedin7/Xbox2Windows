@@ -4939,6 +4939,22 @@ class Stage:
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_H:
             return self.half_alu(base, ops, mods)
+        if base == 'v_ldexp_f32':
+            # RDNA 2 ISA VOP3 v_ldexp_f32: D = S0.f * 2^S1.i, S1 a signed 32-bit exponent of any size. x2w_ldexp
+            # (prelude) works on the binary32 fields, so every exponent, denormal and signed zero rounds like the product.
+            if len(ops) != 3:
+                raise Unsupported('%s with %d operands, expected 3' % (base, len(ops)))
+            if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
+                raise Unsupported('%s with %s' % (base, mods))
+            dst = reg_range(ops[0])
+            if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+                raise Unsupported('%s destination %s' % (base, ops[0]))
+            if ops[2].startswith(('-', '|')) and not re.fullmatch(r'-(?:0x[0-9a-fA-F]+|\d+)', ops[2]):
+                raise Unsupported('%s exponent with a source modifier' % base)
+            pipe = getattr(self, 'pipe', None)
+            if pipe is not None:
+                pipe.uses_ldexp = True
+            return self.set_vf(dst[1], 'asfloat(x2w_ldexp(asuint(%s), asint(%s)))' % (self.f(ops[1]), self.u(ops[2])), mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -4962,6 +4978,15 @@ class Stage:
             return None
         if base in VEC_U:
             arity, text = VEC_U[base]
+            high = (False, False)
+            if base == 'v_mad_u32_u16' and len(mods) == 1 and mods[0].startswith('op_sel:'):
+                # RDNA 2 VOP3 op_sel: bit i set takes the high halfword of source i for a 16-bit operand. S2 is a
+                # full 32-bit addend and the destination is 32 bits wide, so only bits 0 and 1 are meaningful here;
+                # a set bit 2 or 3 stays refused.
+                bits = re.fullmatch(r'op_sel:\[([01]),([01]),([01])(?:,([01]))?\]', mods[0].replace(' ', ''))
+                if not bits or bits[3] == '1' or bits[4] == '1':
+                    raise Unsupported('%s with %s' % (base, mods))
+                high, mods = (bits[1] == '1', bits[2] == '1'), []
             if mods:
                 raise Unsupported('%s with %s' % (base, mods))
             if len(ops) != arity + 1:
@@ -4989,10 +5014,12 @@ class Stage:
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
             elif base == 'v_mad_u32_u16':
-                # S0 and S1 read only bits [15:0]; S2 reads all 32 bits.
-                args = [self.u(ops[1], low16_only=True),
-                        self.u(ops[2], low16_only=True),
+                # S0 and S1 read only bits [15:0] (or [31:16] with op_sel); S2 reads all 32 bits.
+                args = [self.u(ops[1], low16_only=not high[0]),
+                        self.u(ops[2], low16_only=not high[1]),
                         self.u(ops[3])]
+                text = '(%s & 0xffffu) * (%s & 0xffffu) + {2}' % (
+                    '({0} >> 16u)' if high[0] else '{0}', '({1} >> 16u)' if high[1] else '{1}')
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
             if base in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8'):
@@ -11045,6 +11072,34 @@ class Pipeline:
                 '        if (prev == cur) break;',
                 '        cur = prev;',
                 '    }',
+                '}',
+            ))
+        if getattr(self, 'uses_ldexp', False):
+            # Integer arithmetic on the binary32 fields (sign, biased exponent, 24-bit significand): x * 2^n with one
+            # rounding to nearest even. The result exponent is e + n; at 255 or more it overflows to infinity, below 1
+            # the significand is shifted right by 1 - E bits and rounded (a carry into bit 23 is the smallest normal),
+            # and a shift past 25 bits is zero. A denormal source is normalised first. No float multiply is involved,
+            # so denormal results and the sign of a zero survive compilers that flush or fold them.
+            out.extend((
+                'uint x2w_ldexp(uint b, int n) {',
+                '    uint sign = b & 0x80000000u, m = b & 0x7fffffu;',
+                '    int e = int((b >> 23) & 0xffu);',
+                '    if (e == 255) return m != 0u ? (b | 0x00400000u) : b;',
+                '    if (e == 0) {',
+                '        if (m == 0u) return b;',
+                '        int s = 23 - int(firstbithigh(m));',
+                '        m <<= uint(s); e = 1 - s;',
+                '    } else {',
+                '        m |= 0x00800000u;',
+                '    }',
+                '    int E = e + clamp(n, -1000, 1000);',
+                '    if (E >= 255) return sign | 0x7f800000u;',
+                '    if (E >= 1) return sign | (uint(E) << 23) | (m & 0x7fffffu);',
+                '    int sh = 1 - E;',
+                '    if (sh > 25) return sign;',
+                '    uint keep = m >> uint(sh), rem = m & ((1u << uint(sh)) - 1u), half = 1u << uint(sh - 1);',
+                '    if (rem > half || (rem == half && (keep & 1u) != 0u)) keep += 1u;',
+                '    return sign | keep;',
                 '}',
             ))
         if 'v_sad_u8' in self.uses_sad:
