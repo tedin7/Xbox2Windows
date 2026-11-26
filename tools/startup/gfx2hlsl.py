@@ -5576,9 +5576,24 @@ class Stage:
                 k = lit[1 - i]
                 offset = self.heap_word_offset(srcs[i], syms[i]) if k is not None else None
                 if offset:
-                    p, w, scale, add = offset
+                    p, w, scale, add, *mask = offset
+                    if mask:
+                        # (word & mask) plus a literal: the add keeps the mask, a multiply would need a scale of the masked word.
+                        if base != 's_mul_i32':
+                            self.heap_index[d] = ('rc', p, w, scale, add + k & 0xffffffff, mask[0])
+                        break
                     self.heap_index[d] = (('rc', p, w, scale * k & 0xffffffff, add * k & 0xffffffff) if base == 's_mul_i32'
                                           else ('rc', p, w, scale, add + k & 0xffffffff))
+                    break
+        elif base == 's_and_b32' and len(srcs) == 2 and getattr(self, 'kind', None) == 'ps':
+            # root constant word AND a literal: the draw's own constant, read when the draw is bound (pixel stage only: the
+            # compute dispatch does not read a mask).
+            for i in (0, 1):
+                # an inline constant such as -16 is a negative decimal
+                k = int(srcs[1 - i], 0) & 0xffffffff if re.fullmatch(r'-?(0x[0-9a-f]+|[0-9]+)', srcs[1 - i]) else None
+                offset = self.heap_word_offset(srcs[i], syms[i]) if k is not None else None
+                if offset and len(offset) == 4 and offset[2:] == (1, 0):
+                    self.heap_index[d] = ('rc', offset[0], offset[1], 1, 0, k)
                     break
 
     def set_exec_scc(self, expr):
@@ -5940,7 +5955,7 @@ class Stage:
                 self.sym[dst[1] + i] = ('const', 0, 'unassigned')
             self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
-        if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
+        if p[1] == ('resheap',) and getattr(self, 'kind', None) in ('cs', 'ps'):
             return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
@@ -5959,7 +5974,8 @@ class Stage:
                               'offset' % what)
         if not index or index[0] not in ('rootconst', 'buffer'):
             raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
-        if count != 4:
+        # A compute program takes the buffer descriptor (four words); a pixel program the image descriptor (eight).
+        if count != (8 if self.kind == 'ps' else 4):
             raise Unsupported('%s of %d dwords' % (what, count))
         if imm is not None:
             raise Unsupported('%s with offset:%#x' % (what, imm))
@@ -6202,10 +6218,11 @@ class Stage:
             first = self.sym.get(r[1])
             at = (None, None, 0, val) if is_lit else self.heap_word_offset(
                 token, self.sym.get(sreg[1]) if sreg and sreg[0] == 's' else None)
-            if (at and at[2] % 4 == 0 and (at[3] + extra) % 4 == 0  # a dword-aligned word for any root constant
+            masked = bool(at) and len(at) == 5
+            if (at and (at[2] % 4 == 0 or (masked and at[4] & 3 == 0 and at[2] == 1)) and (at[3] + extra) % 4 == 0  # dword-aligned for any root constant
                     and first[0] == 'desc' and key[0][0] == 'table' and key not in getattr(self.pipe, 'modified', ())  # probes build a bare pipe
                     and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
-                where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
+                where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,) + at[4:]
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
@@ -6213,7 +6230,7 @@ class Stage:
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
             if hasattr(self, 'heap_index'):
-                self.heap_index[dst[1] + i] = ('bufword',) + (where[:5] + ((where[5] + 4 * i) & 0xffffffff,) if where else ())
+                self.heap_index[dst[1] + i] = ('bufword',) + (where[:5] + ((where[5] + 4 * i) & 0xffffffff,) + where[6:] if where else ())
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -10049,6 +10066,19 @@ VERIFIED_UINT_RTVS = frozenset((3, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 
+def heap_where(source):
+    """Manifest words naming the 32-byte resource-heap record a source ('resheap', ...) selects (see heap_record):
+    `heap rootconst P W` for the record a root constant word indexes, or `heap word table T B at A [rootconst P W times S
+    [mask M]]` for the record indexed by the word at byte A (+ (root constant word & M) * S) of table buffer <T> <B>."""
+    if len(source) == 3:
+        return 'heap rootconst %d %d' % source[1:]
+    if source[1] != 'word':
+        return None
+    table, byte, param, word, scale, at, *mask = source[2:]
+    return 'heap word table %d %d at %d' % (table, byte, at) + (
+        '' if param is None else ' rootconst %d %d times %d' % (param, word, scale) + (' mask %d' % mask[0] if mask else ''))
+
+
 class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
@@ -10637,6 +10667,8 @@ class Pipeline:
             source, off = key
             where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0), 'vbtab': 'vb %d' % ((off or 0) // 16),
                      'root': 'root %d' % (source[1] if len(source) > 1 else 0)}.get(source[0])
+            if where is None and source[0] == 'resheap' and off in (None, 0):
+                where = heap_where(source)
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
@@ -10738,9 +10770,7 @@ class ComputePipeline(Pipeline):
                 where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
             elif source[0] == 'resheap' and source[1] == 'word' and r['kind'] == 'buf':
                 # The record the word at byte `at` (+ root constant word * `times`) of table buffer <param> <byte> indexes.
-                table, byte, param, word, scale, at = source[2:]
-                where = 'heap word table %d %d at %d' % (table, byte, at) + (
-                    '' if param is None else ' rootconst %d %d times %d' % (param, word, scale))
+                where = heap_where(source)
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
