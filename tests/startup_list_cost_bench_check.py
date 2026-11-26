@@ -7,6 +7,7 @@ Runs the compute fixture of startup_compute_dispatch_check.py in mode dispatch-b
 the case's expectation (the dispatches really ran), and the run prints `x2w-bench` and the stand-in-shaped slots line that
 tools/startup/slot_compare.py reads. The numbers are the scoreboard of the translate-once work: compare runs, not WARP against the tester.
 With X2W_BENCH_OUT=<file> the slots line is also written there. Exit 77 when the adapter is not available.
+After timing, both adapters run a fence-gated allocator reset with GPU readback and a no-write control.
 """
 import os
 from pathlib import Path
@@ -19,6 +20,19 @@ from startup_compute_dispatch_check import dispatch, lines, prepare_case
 from startup_stream_check import gfx2hlsl as G
 
 CALLS = '2000'  # two recording threads by default: two lists record the same new pipeline at once (a refusal cached while the first read was in flight would show here)
+
+
+def check_gated_reset(directory, consumer, env, expected):
+    for mode in ('dispatch-bench-reset', 'dispatch-bench-reset-no-write'):
+        got, result = dispatch(directory, consumer, env, mode)
+        pool = lines(result, 'x2w-bench gated reset:')
+        assert pool == ['x2w-bench gated reset: 2 desktop allocators'], (
+            f'{mode}: expected a fresh allocator while the submit was pending, got {pool}')
+        reference = expected if mode == 'dispatch-bench-reset' else [C.SENTINEL] * C.WORDS
+        for i, (actual, wanted) in enumerate(zip(got, reference, strict=True)):
+            assert actual == wanted, f'{mode}: word {i}: got {actual:08x}, expected {wanted:08x}'
+        if mode == 'dispatch-bench-reset-no-write':
+            assert got != expected, 'omitting the dispatch must fail the CPU reference comparison'
 
 
 def main(consumer, dxc, adapter):
@@ -58,13 +72,13 @@ def main(consumer, dxc, adapter):
             # A list that races the first manifest read waits for it: nothing is refused, every Dispatch of every list is translated.
             assert translated == threads * rounds and not refused, (
                 f'X2W_NOLOCK_REFUSE=1: {translated} of {threads * rounds} Dispatches translated, {len(refused)} refusals\n' + census[0])
-        refused = lines(result, 'refused')
+        check_gated_reset(directory, consumer, env, expected)
         print(bench[0])
         print(slots[0])
         target = os.environ.get('X2W_BENCH_OUT')
         if target:
             Path(target).write_text(slots[0] + '\n')
-        print(f'startup_list_cost_bench: PASS on {adapter} (all {C.WORDS} words match; numbers above)')
+        print(f'startup_list_cost_bench: PASS on {adapter} ({C.WORDS} words checked per run, gated reset and no-write control)')
 
 
 if __name__ == '__main__':

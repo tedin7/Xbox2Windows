@@ -22,6 +22,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_allocator_pool_size(void* allocator);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
@@ -234,6 +235,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool gated_reset = mode == "dispatch-bench-reset" || mode == "dispatch-bench-reset-no-write";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -507,9 +509,28 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(lists[t], 9);
             invoke(queue, 10, 1, word(&lists[t]));
         }
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (mode != "dispatch-none" && mode != "dispatch-bench-reset-no-write") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+    if (gated_reset) {
+        const auto ok = [](StreamWord result) { return SUCCEEDED(static_cast<HRESULT>(result)); };
+        void *gate = nullptr, *scratch_allocator = nullptr;
+        if (!ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&gate))) ||
+            !ok(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&scratch_allocator))) ||
+            !ok(invoke(queue, 17, word(gate), 1))) return 84;
+
+        invoke(queue, 10, 1, word(&list));
+        // Detach the closed recording so allocator_reset has to rely on the pending submit fence.
+        const bool reset = ok(invoke(list, 139, word(scratch_allocator))) && ok(invoke(list, 9)) &&
+                           ok(invoke(allocator, 8));
+        const unsigned pool = x2w_d3d12_allocator_pool_size(allocator);
+        // Re-record an empty list so only the original submission can produce the expected words.
+        const bool rerecorded = reset && ok(invoke(list, 139, word(allocator))) && ok(invoke(list, 9));
+        // Release the gate even when a reset fails.
+        if (!ok(invoke(gate, 10, 1))) return 85;
+        std::fprintf(stderr, "x2w-bench gated reset: %u desktop allocators\n", pool);
+        if (!rerecorded) return 86;
+    }
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
     for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
