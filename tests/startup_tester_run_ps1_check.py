@@ -237,7 +237,8 @@ def check_build(shell):
         build = tree / "out" / "build" / "release"
         shutil.rmtree(build)
         (tree / "CMakeLists.txt").write_text(STUB_CMAKE, encoding="utf-8")
-        configured = subprocess.run(["cmake", "-S", str(tree), "-B", str(build)], capture_output=True, text=True)
+        generator = ["-G", "Ninja"] if shutil.which("ninja") else []  # as the real presets: single config, no MSBuild
+        configured = subprocess.run(["cmake", *generator, "-S", str(tree), "-B", str(build)], capture_output=True, text=True)
         assert configured.returncode == 0, configured.stdout + configured.stderr
         git(tree, "add", "CMakeLists.txt")
         git(tree, "commit", "-q", "-m", "cmake")
