@@ -451,7 +451,11 @@ def check_shell(shell):
         both = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-Matrix", "gray")
         assert both.returncode != 0 and "own run" in (both.stdout + both.stderr), (both.stdout[-500:], both.stderr[-500:])
         auto = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "auto", "-NoUpload")
-        assert auto.returncode == 0 and "recording 140,20 into" in auto.stdout and "(cap 500 MiB" in auto.stdout, (auto.stdout[-1500:], auto.stderr[-500:])
+        assert auto.returncode == 0 and "recording slow into" in auto.stdout and "(cap 400 MiB" in auto.stdout, (auto.stdout[-1500:], auto.stderr[-500:])
+        auto_zip = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(auto_zip) as z:
+            auto_env = json.loads(z.read("manifest.json").decode("utf-8-sig"))["env"]
+        assert auto_env["X2W_REPLAY_RECORD"] == "slow" and auto_env["X2W_REPLAY_MAX_MIB"] == "400", auto_env
         assert "uploaded" not in auto.stdout and "UPLOAD_THESE_FILES" not in auto.stdout, "-NoUpload keeps the recording local"
         rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64")
         assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])
