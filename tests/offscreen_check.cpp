@@ -1704,6 +1704,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-wave-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_case},
     {"--compute-store-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
     {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},

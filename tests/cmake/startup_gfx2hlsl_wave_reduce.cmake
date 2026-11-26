@@ -9,4 +9,13 @@ if(EXISTS "${INTAKE_PYTHON}" AND TARGET offscreen_check)
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_wave_reduce_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+
+    # Compute reductions compare two guest waves with a CPU reference on WARP.
+    set(wave_reduce_cs_check "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_wave_reduce_cs_check.py")
+    add_test(NAME startup_gfx2hlsl_wave_reduce_cs_controls COMMAND "${INTAKE_PYTHON}" -B "${wave_reduce_cs_check}")
+    foreach(mode IN ITEMS dispatch mutant)
+        add_test(NAME startup_gfx2hlsl_wave_reduce_cs_warp_${mode} COMMAND "${INTAKE_PYTHON}" -B
+            "${wave_reduce_cs_check}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${mode})
+        set_tests_properties(startup_gfx2hlsl_wave_reduce_cs_warp_${mode} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
 endif()

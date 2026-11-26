@@ -10413,10 +10413,10 @@ class Stage:
     WAVE_REDUCE_CONTROL = re.compile(r'quad_perm:\[[0-3],[0-3],[0-3],[0-3]\]|row_half_mirror|row_mirror')
 
     @staticmethod
-    def wave_steps_reduce(controls, op):
+    def wave_steps_reduce(controls, op, all_lanes=False):
         """Whether four DPP16 steps (each a quad_perm, row_half_mirror or row_mirror, every lane valid) followed by
         v_permlanex16_b32 with lane selects 0, 0 and the combine leave lane 31 with every lane's input exactly once
-        (ISA, DPP16 and V_PERMLANEX16_B32). Each lane holds, per source lane, how often that input went into its value:
+        (or every lane, for the compute lowering). Each lane holds, per source lane, how often that input went into its value:
         a step adds the permuted lane's counts to the lane's own. An idempotent operation (or, and, min, max) only needs
         every count at least once; xor and sum need exactly once."""
         def source(control, lane):
@@ -10430,7 +10430,7 @@ class Stage:
         for control in controls:
             held = [[a + b for a, b in zip(held[source(control, lane)], held[lane])] for lane in range(32)]
         held = [[a + b for a, b in zip(held[(lane & ~15 ^ 16)], held[lane])] for lane in range(32)]
-        counts = held[31]
+        counts = (count for lane in (held if all_lanes else held[31:]) for count in lane)
         return all(c == 1 for c in counts) if op in ('v_xor_b32', 'v_add_nc_u32') else all(c >= 1 for c in counts)
 
     @staticmethod
@@ -10449,6 +10449,22 @@ class Stage:
     # (stretch, sS) -> (vT, input operand, identity) for a form it proves, or None; stretch is a list of
     # (base, operands, modifiers, text). The identity itself is checked against OP afterwards.
     WAVE_REDUCE_FILLS = (wave_reduce_cndmask_fill,)
+
+    @staticmethod
+    def compute_wave_fill(stretch, ss):
+        """The compute cndmask may overwrite its input or spell the identity as a literal."""
+        if len(stretch) != 1:
+            return None
+        base, ops, mods, _text = stretch[0]
+        if base != 'v_cndmask_b32' or mods or len(ops) != 4 or ops[3] != 's%d' % ss:
+            return None
+        dst, identity, src, _mask = ops
+        if not re.fullmatch(r'v\d+', dst) or not re.fullmatch(r'v\d+', src):
+            return None
+        if not re.fullmatch(r'-?\d+|0x[0-9a-f]+', identity):
+            return None
+        return int(dst[1:]), src, int(identity, 16 if identity.startswith('0x') else 10) & 0xffffffff
+
     # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
     WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
 
@@ -10535,7 +10551,9 @@ class Stage:
         if stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
             taken = pending[items[1][0]]
             stretch = stretch[1:]
-        fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
+        compute = getattr(self, 'kind', None) == 'cs'
+        fills = (self.compute_wave_fill,) if compute else self.WAVE_REDUCE_FILLS
+        fill = next((found for found in (form(stretch, ss) for form in fills) if found), None)
         if fill is None:
             raise Unsupported('wave reduction: the identity fill after s_or_saveexec_b32 s%d, -1 (%s) is not a known '
                               'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
@@ -10564,6 +10582,8 @@ class Stage:
         if not self.wave_steps_reduce(seen, op):
             raise Unsupported('wave reduction: the steps %s do not bring every lane\'s input into lane 31%s' % (
                 ', '.join(seen), ' exactly once' if op in ('v_xor_b32', 'v_add_nc_u32') else ''))
+        if compute and not self.wave_steps_reduce(seen, op, all_lanes=True):
+            raise Unsupported('wave reduction: the compute steps do not reduce into every lane')
         if identity != self.WAVE_REDUCE[op][1]:
             raise Unsupported('wave reduction of %s: the inactive lanes get 0x%08x, the identity is 0x%08x'
                               % (op, identity, self.WAVE_REDUCE[op][1]))
@@ -10623,9 +10643,15 @@ class Stage:
         inside = sorted(t for t in targets if pc < t <= end)
         if inside:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
-        if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
+        if compute:
+            x, y, z = self.pipe.group
+            if self.pipe.wave_size not in (None, 32) or not wave32_exec_proof(self.ins) or x * y * z % 32:
+                raise Unsupported('wave reduction: compute requires wave32 and a group of whole guest waves')
+            if not self.quad_flow_straight():
+                raise Unsupported('wave reduction: compute requires straight-line control flow')
+        elif getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if not getattr(self, 'wave_exec', False):
+        if not compute and not getattr(self, 'wave_exec', False):
             # Straight-line only: every lane of the host wave runs the chain with the entry EXEC.
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
                 raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are '
@@ -10634,8 +10660,11 @@ class Stage:
                 raise Unsupported('wave reduction: EXEC is not the entry mask')
         if getattr(self, 'wqm_exec', False):
             raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
+        overwrite_all = self.exec_known if compute else True
         for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
             _name, o, _m = parse(asm)
+            if compute and writes_exec(name, o):
+                overwrite_all = False
             hits = [i for i, tok in enumerate(o) if any(
                 int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
                 for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
@@ -10643,7 +10672,10 @@ class Stage:
                 continue
             short = re.sub(r'_e(32|64)$', '', name)
             if hits == [0] and short.startswith('v_') and not self.WAVE_REDUCE_KEEPS.match(short):
-                break
+                if not compute or short == 'v_mov_b32' and overwrite_all:
+                    break
+                if short == 'v_mov_b32':
+                    continue
             raise Unsupported('wave reduction: v%d (the other row from v_permlanex16_b32) is read after the chain by %s'
                               % (vp, asm))
         # Nothing of the chain is emitted until the restore, so every register read there still holds its value from
@@ -10668,7 +10700,8 @@ class Stage:
         if not self.exec_known:
             # Past an EXEC write the lanes outside the old EXEC take the identity (the v_cndmask of the chain).
             operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
-        value = self.WAVE_REDUCE[op][0].format(operand)
+        value = (self.compute_wave_reduction(op, operand) if getattr(self, 'kind', None) == 'cs'
+                 else self.WAVE_REDUCE[op][0].format(operand))
         self.needs_sm6 = True
         self.set_s(ss, 'exec')
         self.sym[ss] = ('execcopy',)
@@ -10683,6 +10716,34 @@ class Stage:
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(vp)
         self.set_scc('true')   # s_or_saveexec_b32 set SCC from the all-lanes EXEC
+
+    def compute_wave_reduction(self, op, operand):
+        """Use the intrinsic when the host wave contains exactly one complete guest wave."""
+        self.uses_reduce_shared = True
+        x, y, _z = self.pipe.group
+        result = 'reduce_%x' % self.pc
+        intrinsic = self.WAVE_REDUCE[op][0].format('word')
+        self.emit('uint %s;' % result)
+        self.emit('{')
+        self.emit('    uint flat = tid.x + %du * (tid.y + %du * tid.z);' % (x, y))
+        self.emit('    uint first = flat & ~31u;')
+        self.emit('    uint word = %s;' % operand)
+        self.emit('    x2w_reduce[flat] = word;')
+        self.emit('    GroupMemoryBarrierWithGroupSync();')
+        self.emit('    if (WaveActiveCountBits(true) == 32u && WaveActiveAllEqual(first)) {')
+        self.emit('        %s = %s;' % (result, intrinsic))
+        self.emit('    } else {')
+        self.emit('        uint a = %du;' % self.WAVE_REDUCE[op][1])
+        self.emit('        for (uint lane = first; lane < first + 32u; ++lane) {')
+        self.emit('            uint b = x2w_reduce[lane];')
+        self.emit('            a = %s;' % VEC_U[op][1].format('a', 'b'))
+        self.emit('        }')
+        self.emit('        %s = a;' % result)
+        self.emit('    }')
+        # All reads must finish before another reduction can reuse the slots.
+        self.emit('    GroupMemoryBarrierWithGroupSync();')
+        self.emit('}')
+        return result
 
     def lower_wave_readlane(self, sd, vt, claim):
         if claim is not None and not claim[0]:
@@ -11930,6 +11991,8 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if getattr(s, 'uses_reduce_shared', False):
+            shared.append('groupshared uint x2w_reduce[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
