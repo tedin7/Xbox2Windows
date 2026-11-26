@@ -910,6 +910,19 @@ stopping the scan. An operand refusal
 in `<key>.fail` names the instruction that refused it (`operand '-v30' in v_and_b32_e64`); the
 refusal's own message, which `--refusals` counts, stays `operand '-v30'`. A worker killed from outside
 (for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
+With `X2W_REQUEST_RESCAN=1`, an empty first scan gets a second snapshot before the
+watcher sleeps. Mid-pass rescans rebuild the queue from the current cache and keep each active
+key assigned to one worker. The worker records actual pickup in `<key>.picked-up` and gives
+each shader compiler invocation 120 seconds. The scan also picks up slot 86 mesh requests
+(`.m86`). It records an explicit refusal when the request needs a separately validated desktop
+shader pair. An existing slot 86 desktop result takes precedence over the refusal.
+
+After stopping the workers, run `python -B tools/startup/gfx2hlsl.py --request-census <shader cache>`
+to print one row per ready key and totals for requested, picked up, translated, refused, never
+picked up, and picked up but crashed or timed out. An unanswered pickup also covers cancellation
+when the watcher stopped. Published results provide pickup evidence for older caches.
+Older unanswered requests have no pickup record, so their pickup history cannot be recovered.
+
 FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
 one pending request translates them in parallel processes, one per logical processor (at most 61 on
 Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request

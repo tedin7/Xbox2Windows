@@ -307,15 +307,18 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
 enum class TableSample { texture, buffer, buffer_tail };
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
-                                    bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
+                                    bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false,
+                                    const std::filesystem::path& staging = {})
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
-    auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
-    auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
+    static constexpr std::uint32_t late_vertex_id = 0x59a12041, late_pixel_id = 0x59a12042;
+    const auto& vertex_id = staging.empty() ? vertex_ids[indexed ? 2 : needs_start] : late_vertex_id;
+    const auto& pixel_id = staging.empty() ? (indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)])
+                                           : late_pixel_id;
     std::uint64_t key = 1469598103934665603ull;
     const auto add = [&key](const void* data, std::size_t bytes) {
         const auto* p = static_cast<const unsigned char*>(data);
@@ -330,9 +333,11 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
     char directory[MAX_PATH];
     const DWORD size = GetEnvironmentVariableA("X2W_SHADER_CACHE", directory, MAX_PATH);
     check(size && size < MAX_PATH ? S_OK : E_FAIL, "find fixture cache");
-    const std::string prefix = std::string(directory) + "\\" + stem;
+    const auto prefix = (staging.empty() ? std::filesystem::path(directory) : staging) / stem;
     const auto write = [&](const char* suffix, const void* bytes, std::size_t count) {
-        std::ofstream file(prefix + suffix, std::ios::binary | std::ios::trunc);
+        auto path = prefix;
+        path += suffix;
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
         file.write(static_cast<const char*>(bytes), count);
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
@@ -601,7 +606,7 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute, translation_pending };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -1771,6 +1776,7 @@ int main(int argc, char** argv) try
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
+    const bool late_translation = argc == 3 && std::strcmp(argv[2], "translated-late") == 0;
     const bool root_fix_control = argc == 3 && std::strcmp(argv[2], "translated-root-control") == 0;
     const bool root_fix = root_fix_control || (argc == 3 && std::strcmp(argv[2], "translated-root") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
@@ -1778,7 +1784,7 @@ int main(int argc, char** argv) try
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = late_translation || root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2157,7 +2163,13 @@ int main(int argc, char** argv) try
         return 0;
     }
     if (translated) {
-        const auto cache = std::filesystem::current_path() / ("indirect-translated-" + std::to_string(GetCurrentProcessId()));
+        wchar_t exchange[MAX_PATH]{};
+        if (late_translation) {
+            const auto size = GetEnvironmentVariableW(L"X2W_INDIRECT_RESCAN_DIR", exchange, MAX_PATH);
+            check(size && size < MAX_PATH ? S_OK : E_FAIL, "get late request fixture directory");
+        }
+        const auto cache = late_translation ? std::filesystem::path(exchange) / "requests" :
+            std::filesystem::current_path() / ("indirect-translated-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set fixture cache");
         if (alias_index)
@@ -2236,17 +2248,37 @@ int main(int argc, char** argv) try
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
         }
-        const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
-        const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
-        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
+        const auto staging = late_translation ? cache.parent_path() / "compiled" : std::filesystem::path{};
+        if (late_translation) std::filesystem::create_directory(staging);
+        const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false,
+                                             TableSample::texture, false, false, staging);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
-        const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
         argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
         const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
         const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+        if (late_translation) {
+            const auto draw = [&](Refusal expected, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(),
+                    pso.Get(), signature.Get(), DrawKind::vertices, false, expected, label, &red_binding);
+            };
+            if (!draw(Refusal::translation_pending, "before worker pickup")) return 1;
+            std::ofstream(cache.parent_path() / "first-draw-finished").close();
+            const auto finished = cache.parent_path() / "worker-finished";
+            const auto deadline = GetTickCount64() + 20000;
+            while (!std::filesystem::exists(finished) && GetTickCount64() < deadline) Sleep(10);
+            if (!std::filesystem::exists(finished)) return 1;
+            // The runtime retries a missing manifest at most every 250 ms.
+            Sleep(300);
+            const bool ok = draw(Refusal::none, "late translation readback");
+            if (info && info->GetNumStoredMessages()) return 1;
+            return ok ? 0 : 3;
+        }
+        const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
+        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
+        const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         if (root_fix) {
             check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", "1") ? S_OK : E_FAIL, "enable indirect root fix");
             if (root_fix_control)

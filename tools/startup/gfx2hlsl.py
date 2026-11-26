@@ -12169,7 +12169,7 @@ def translate_compute(out_dir, key):
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
             bytecode = os.path.join(staging, 'cs.cso')
             r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, **request_compile_timeout())
             if r.returncode or not has_bytecode(bytecode):
                 # DXC names the source path; keep only the diagnostic after it.
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
@@ -12305,7 +12305,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                     command = [compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
                 else:
                     command = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
-                r = subprocess.run(command, capture_output=True, text=True)
+                r = subprocess.run(command, capture_output=True, text=True, **request_compile_timeout())
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
                     write_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
@@ -12566,7 +12566,7 @@ def translate_mesh57(out_dir, key):
             for stage, profile, _ in sources:
                 bytecode = os.path.join(staging, stage + '.cso')
                 r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, **request_compile_timeout())
                 if r.returncode or not has_complete_mesh57_bytecode(bytecode):
                     # DXC names the source path; keep only the diagnostic after it.
                     lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
@@ -12584,6 +12584,10 @@ def translate_mesh57(out_dir, key):
 
 def translate_request(out_dir, key):
     """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
+    if request_rescan_enabled() and os.path.isfile(os.path.join(out_dir, 'req_%016x.m86' % key)):
+        reason = 'slot 86 mesh requires a separately validated desktop shader pair'
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), reason)
+        return 'unsupported: ' + reason
     if is_compute_request(out_dir, key):
         return translate_compute(out_dir, key)
     if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):
@@ -12797,6 +12801,9 @@ def refusals_main(argv):
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '--request-census':
+        print_request_census(sys.argv[2])
+        return
     if any(arg == '--refusals' or arg.startswith('--refusals=') for arg in sys.argv[1:]):
         return refusals_main(sys.argv[1:])
     out_dir = sys.argv[2]
@@ -13267,6 +13274,8 @@ def retry_families(out_dir, seconds, jobs, clock, weights):
 def translate_one(out_dir, key):
     """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
     try:
+        if request_rescan_enabled():
+            atomic_retry_text(os.path.join(out_dir, '%016x.picked-up' % key), 'picked up\n')
         return translate_request(out_dir, key)
     except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
         reason = 'translator error: %s: %s' % (type(error).__name__, error)
@@ -13389,15 +13398,65 @@ def translation_jobs():
 
 RESCAN_SECONDS = 1.0  # --watch: how often a pass looks for requests published since it started
 READY_MARKERS = ('a', 'rtv', 'c67', 'm57')
+REQUEST_MARKER = re.compile(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57|m86)')
 
 
-def request_stamps(out_dir, keys):
+def request_rescan_enabled():
+    return os.environ.get('X2W_REQUEST_RESCAN') == '1'
+
+
+def request_compile_timeout():
+    return {'timeout': 120} if request_rescan_enabled() else {}
+
+
+def mesh86_result_ready(stem):
+    pixel_source = os.path.join(os.path.dirname(stem), 'req_' + os.path.basename(stem) + '.ps86')
+    return (has_bytecode(stem + '.mesh86.txt') and has_bytecode(stem + '.ms.cso')
+            and (not has_bytecode(pixel_source) or has_bytecode(stem + '.ps.cso')))
+
+
+def print_request_census(out_dir):
+    """Snapshot a cache after the workers stop; an unanswered pickup can also be a cancellation."""
+    totals = dict.fromkeys(('requested', 'picked_up', 'translated', 'refused',
+                            'never_picked_up', 'picked_up_but_crashed_or_timeout'), 0)
+    outcomes = {}
+    pending = set(pending_keys(out_dir, True, include_mesh86=True, outcomes=outcomes))
+    requests = {}
+    for name in sorted(os.listdir(out_dir)):
+        match = REQUEST_MARKER.fullmatch(name)
+        if match:
+            requests.setdefault(int(match[1], 16), set()).add(match[2])
+    for key, kinds in sorted(requests.items()):
+        stem = os.path.join(out_dir, '%016x' % key)
+        stamp = request_stamps(out_dir, (key,), include_mesh86=True)[key]
+        state = 'never_picked_up'
+        if key not in pending:
+            state = outcomes.get(key, state)
+            if state == 'refused':
+                with suppress(OSError):
+                    if read_failure(stem + '.fail')[0].startswith('translator error:'):
+                        state = 'picked_up_but_crashed_or_timeout'
+        with suppress(OSError):
+            if state == 'never_picked_up' and os.path.getmtime(stem + '.picked-up') >= stamp:
+                state = 'picked_up_but_crashed_or_timeout'
+        totals['requested'] += 1
+        if state != 'never_picked_up':
+            totals['picked_up'] += 1
+        totals[state] += 1
+        print('%016x %s requested=1 picked_up=%d %s' %
+              (key, ','.join(sorted(kinds)), state != 'never_picked_up', state))
+    print('request census: ' + ' '.join('%s=%d' % item for item in totals.items()))
+
+
+
+def request_stamps(out_dir, keys, *, include_mesh86=False):
     """{key: modification time of its ready marker}: when the runtime published the request (it writes the marker
     last). A request whose marker is gone sorts last."""
     stamps = {}
+    markers = READY_MARKERS + ('m86',) if include_mesh86 or request_rescan_enabled() else READY_MARKERS
     for key in keys:
         stamps[key] = float('inf')
-        for ext in READY_MARKERS:
+        for ext in markers:
             with suppress(OSError):
                 stamps[key] = os.path.getmtime(os.path.join(out_dir, 'req_%016x.%s' % (key, ext)))
                 break
@@ -13424,12 +13483,25 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     """
     stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
+    reconcile = rescan and request_rescan_enabled()
+    if not queue and reconcile:
+        # A request committed while the initial directory snapshot was being read
+        # should not wait for the next outer watch interval.
+        stamps = request_stamps(out_dir, pending_keys(out_dir, skip_failed, since_translator))
+        queue = request_order(stamps, since)
     if not queue:
         return
     handled = {}  # key -> marker time it was queued with in this pass
 
     def refill(queue):
         # A failure written during this pass is final for the pass (skip_failed), as on the next pass.
+        if reconcile:
+            active = set(running.values()) if running else set()
+            fresh = request_stamps(out_dir, pending_keys(out_dir, True))
+            candidates = {key: stamp for key, stamp in fresh.items()
+                          if key not in active and handled.get(key) != stamp}
+            stamps.update(candidates)
+            return request_order(candidates, since)
         queued = set(queue)
         fresh = request_stamps(out_dir, [key for key in pending_keys(out_dir, True) if key not in queued])
         stamps.update((key, t) for key, t in fresh.items() if handled.get(key) != t)
@@ -13471,19 +13543,25 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
             pool.shutdown()
 
 
-def pending_keys(out_dir, skip_failed, since_translator=None):
+def pending_keys(out_dir, skip_failed, since_translator=None, *, include_mesh86=False, outcomes=None):
     """Keys whose request has no finished result. A key with a .fail is skipped when the .fail is newer than its
     request and stream description. Outside watch mode it must also match the translator content fingerprint,
     or postdate the legacy translator timestamp. With neither cutoff, every failure is tried again."""
     keys = []
+    extended_scan = include_mesh86 or request_rescan_enabled()
     version = since_translator if isinstance(since_translator, str) and not skip_failed else None
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
-        if not m:
+        m = REQUEST_MARKER.fullmatch(name)
+        if not m or (m[2] == 'm86' and not extended_scan):
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
+        mesh86 = m[2] == 'm86'
+        if mesh86 and mesh86_result_ready(result):
+            if outcomes is not None:
+                outcomes[key] = 'translated'
+            continue
         mesh = m.group(2) == 'm57'
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
@@ -13501,25 +13579,43 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
             # A result translated with a description recorded it (dependency_record). With that description gone,
             # the result is checked again and withdrawn; a legacy request without a record is not read again.
             lost = described is None and os.path.isfile(result + '.psdep')
-        if os.path.isfile(manifest) and not lost and not (
-                described is not None and described > os.path.getmtime(manifest)):
+        published = not mesh86 and os.path.isfile(manifest) and not lost
+        if published and described is not None:
+            try:
+                published = described <= os.path.getmtime(manifest)
+            except FileNotFoundError:
+                if not extended_scan:
+                    raise
+                published = False
+        if published:
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
+                if outcomes is not None:
+                    outcomes[key] = 'translated'
                 continue
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
-                with suppress(OSError), open(manifest, 'rb') as published:
-                    if b'ps none' in published.read().splitlines():
+                with suppress(OSError), open(manifest, 'rb') as result_file:
+                    if b'ps none' in result_file.read().splitlines():
+                        if outcomes is not None:
+                            outcomes[key] = 'translated'
                         continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
         # still published without its recorded description is checked even with an older .fail, which a success on
         # the manifest-only path leaves in place.
         recheck = lost and os.path.isfile(manifest)
-        inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
+        try:
+            inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
+        except FileNotFoundError:
+            if extended_scan:
+                continue
+            raise
         cutoff = inputs if skip_failed or version else (
             None if since_translator is None else max(inputs, since_translator))
         if cutoff is not None and not recheck:
             with suppress(OSError):
                 if os.path.getmtime(fail) >= cutoff and (version is None or read_failure(fail)[2] == version):
+                    if outcomes is not None:
+                        outcomes[key] = 'refused'
                     continue
         keys.append(key)
     return keys

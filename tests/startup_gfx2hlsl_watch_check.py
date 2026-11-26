@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
@@ -531,6 +532,55 @@ with tempfile.TemporaryDirectory() as tmp:
         del os.environ['X2W_TRANSLATE_JOBS']
     else:
         os.environ['X2W_TRANSLATE_JOBS'] = saved_jobs
+
+# Save the empty directory snapshot, then publish before the worker receives it.
+# Disabled scheduling is the negative control for the same pass.
+for enabled in ('0', '1'):
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'X2W_REQUEST_RESCAN': enabled}):
+        d = Path(directory)
+        original_scan = gfx2hlsl.pending_keys
+        key = 0xbe71
+        marker = d / f'req_{key:016x}.m86'
+
+        def publish_after_scan(*args, **kwargs):
+            snapshot = original_scan(*args, **kwargs)
+            if not marker.exists():
+                touch(marker, b'synthetic mesh request')
+            return snapshot
+
+        log = io.StringIO()
+        with patch.object(gfx2hlsl, 'pending_keys', side_effect=publish_after_scan), contextlib.redirect_stdout(log):
+            gfx2hlsl.watch_pass(directory, True, jobs=1)
+        stem = d / f'{key:016x}'
+        expect('late mesh request answered in the same pass', stem.with_suffix('.fail').exists(), enabled == '1')
+        expect('late mesh request entered the worker', stem.with_suffix('.picked-up').exists(), enabled == '1')
+        if enabled == '0':
+            expect('legacy scan omits an already published slot 86 request', original_scan(directory, True), [])
+        else:
+            expect('mesh request has a specific refusal',
+                   'separately validated desktop shader pair' in stem.with_suffix('.fail').read_text(), True)
+            expect('answered mesh request leaves no pending work', original_scan(directory, True), [])
+            touch(stem.with_suffix('.ms.cso'), b'synthetic desktop mesh bytecode marker')
+            touch(stem.with_suffix('.mesh86.txt'), b'synthetic desktop mesh manifest')
+            outcomes = {}
+            original_scan(directory, True, outcomes=outcomes)
+            expect('externally published mesh result takes precedence over refusal', outcomes, {key: 'translated'})
+
+with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'X2W_FXC': ''}):
+    d = Path(directory)
+    for key in range(1, 6):
+        touch(d / f'req_{key:016x}.a')
+    touch(d / '0000000000000002.txt')
+    touch(d / '0000000000000003.fail', b'unsupported fixture')
+    touch(d / '0000000000000004.picked-up')
+    touch(d / '0000000000000005.fail', b'translator error: TimeoutExpired')
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        gfx2hlsl.print_request_census(directory)
+    expect('census totals', log.getvalue().splitlines()[-1],
+           'request census: requested=5 picked_up=4 translated=1 refused=1 '
+           'never_picked_up=1 picked_up_but_crashed_or_timeout=2')
+    expect('one row per request', len(log.getvalue().splitlines()), 6)
 
 for item in failures:
     print('FAIL', item)

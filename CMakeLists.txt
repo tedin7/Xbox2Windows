@@ -1924,6 +1924,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_mesh86_srv_proof PROPERTIES TIMEOUT 60)
     add_test(NAME runtime_mesh86_cache_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh86_cache_cli_check.py")
+    foreach(mode IN ITEMS enabled control)
+        add_test(NAME startup_indirect_request_rescan_warp_${mode} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_request_rescan_check.py"
+            "$<TARGET_FILE:startup_indirect_draw_indexed>" ${mode})
+        set_tests_properties(startup_indirect_request_rescan_warp_${mode} PROPERTIES TIMEOUT 60)
+    endforeach()
     add_test(NAME startup_indirect_mesh_lease_warp_dual-trace-disabled COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
         "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" warp
