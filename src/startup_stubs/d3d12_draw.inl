@@ -1181,6 +1181,14 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
+std::string rtv_translation_request(const Translation& base, const Pass& pass)
+{
+    std::string request = "rtv1 " + std::to_string(base.key);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
+    return request;
+}
+
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
@@ -1189,9 +1197,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             load_translation(*base);
         return base;
     }
-    std::string request = "rtv1 " + std::to_string(base->key);
-    for (UINT i = 0; i < pass.target_count; ++i)
-        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
+    const auto request = rtv_translation_request(*base, pass);
     const u64 key = fnv_bytes(request.data(), request.size());
     auto& entry = translation_by_key()[key];
     if (!entry) {
@@ -2167,7 +2173,44 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
-bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
+struct DrawTableRead {
+    u64 entry = 0;
+    std::uint32_t words[8]{};
+    bool readable = false;
+    bool known = false;
+    ViewRecord view{};
+};
+
+bool read_draw_view(const std::uint32_t* words, ViewRecord& view)
+{
+    if (words[0] != view_token_magic) return false;
+    note_lock_acquire(false);
+    const bool known = words[1] < view_records().size();
+    if (known) view = view_records()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    return known;
+}
+
+void read_draw_view(DrawTableRead& read)
+{
+    read.known = read_draw_view(read.words, read.view);
+}
+
+void read_draw_table(const x2w_startup::ViewTable& table, u64 offset, DrawTableRead& read)
+{
+    read.entry = table.record(offset, sizeof(read.words));
+    read.readable = read.entry && x2w_local::readable(reinterpret_cast<const void*>(read.entry), sizeof(read.words));
+    if (read.readable) std::memcpy(read.words, reinterpret_cast<const void*>(read.entry), sizeof(read.words));
+}
+
+void read_draw_table(const Pass& pass, const Translation::Srv& srv, DrawTableRead& read)
+{
+    if (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0)
+        read_draw_table(pass.view_tables[srv.a], static_cast<u64>(srv.b), read);
+}
+
+bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32],
+                    const DrawTableRead* shared_tables)
 {
     if (!tr.d16_srvs.any()) return true;
     const auto refuse = [&](UINT slot, const char* reason, int detail) {
@@ -2184,19 +2227,16 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
-        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
-        std::uint32_t words[8] = {};
-        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
-            return refuse(i, "unreadable table entry", srv.a);
-        std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
-        if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
-        ViewRecord record{};
-        bool known = false;
-        note_lock_acquire(false);
-        known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
-        if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
+        DrawTableRead local{};
+        if (!shared_tables) {
+            read_draw_table(pass, srv, local);
+            read_draw_view(local);
+        }
+        const auto& table = shared_tables ? shared_tables[i] : local;
+        if (!table.readable) return refuse(i, "unreadable table entry", srv.a);
+        if (table.words[0] != view_token_magic) return refuse(i, "missing view token", 0);
+        const auto& record = table.view;
+        if (!table.known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
         ID3D12Resource* texture = sampled_address_texture(resource);
         if (!texture) return refuse(i, "missing texture resource", 0);
@@ -2458,10 +2498,12 @@ bool title_input_snapshot_enabled()
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
+constexpr u64 indirect_table_buffer_limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
-                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool allow_title_snapshot = false)
+                                         u64 limit = indirect_table_buffer_limit,
+                                         bool allow_title_snapshot = false, const ViewRecord* shared_view = nullptr)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2473,10 +2515,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     bool own_memory = false;
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
-        ViewRecord record{};
-        note_lock_acquire(false);
-        if (words[1] < view_records().size()) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        ViewRecord local{};
+        if (!shared_view) read_draw_view(words, local);
+        const auto& record = shared_view ? *shared_view : local;
         if (record.slot == 17 && record.desc_bytes >= 12) {
             UINT size = 0;
             std::memcpy(&address, record.desc, 8);
@@ -2613,14 +2654,12 @@ struct FormattedBufferDescriptor {
 // Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
 // buffer view the title created (words[0] its token) the word the driver builds from its format and component
 // mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
-const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format, const DrawTableRead* shared = nullptr)
 {
     if (words[0] == view_token_magic) {
-        ViewRecord record{};
-        note_lock_acquire(false);
-        const bool known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        ViewRecord local{};
+        const bool known = shared ? shared->known : read_draw_view(words, local);
+        const auto& record = shared ? shared->view : local;
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
         D3D12_SHADER_RESOURCE_VIEW_DESC view;
         std::memcpy(&view, record.desc, 40);
@@ -2633,7 +2672,8 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
     return x2w_startup::descriptor_word3_refusal(words[3]);
 }
 
-bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
+bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32],
+                             const DrawTableRead* shared_tables)
 {
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
         InterlockedIncrement(&formatted_draws_refused);
@@ -2651,13 +2691,15 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         const auto& srv = tr.srvs[ud.a];
         if (srv.kind != 0 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(ud.a, "missing hardware descriptor");
-        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), sizeof(descriptor.words));
-        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
-            return refuse(ud.a, "missing hardware descriptor");
-        std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
+        DrawTableRead local{};
+        if (!shared_tables) read_draw_table(pass, srv, local);
+        const auto& table = shared_tables ? shared_tables[ud.a] : local;
+        if (!table.readable) return refuse(ud.a, "missing hardware descriptor");
+        std::memcpy(descriptor.words, table.words, sizeof(descriptor.words));
         std::uint32_t format = 0;
-        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
-        descriptor.entry = entry;
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format, shared_tables ? &table : nullptr))
+            return refuse(ud.a, reason, format);
+        descriptor.entry = table.entry;
     }
     return true;
 }
@@ -2670,7 +2712,8 @@ struct PixelUavBinding {
 // draw_lock held. The writable textures of tr (#1996 F), from the unordered-access views the title created at
 // their table entries (pixel_uav_view). False, with the reason logged, when one cannot be bound as the program
 // expects: the draw is then not translated, and no other view is bound in its place.
-bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding* out)
+bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding* out,
+                        const DrawTableRead* shared_srvs, const DrawTableRead* shared_uavs)
 {
     const auto refuse = [&](std::size_t i, const char* reason, unsigned long long detail) {
         static LONG refused;
@@ -2682,18 +2725,17 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         const PixelUav& uav = tr.uavs[i];
         const x2w_startup::ViewTable& table = pass.view_tables[uav.parameter];
         if (!table.address) return refuse(i, "no descriptor table at the parameter", uav.parameter);
-        const u64 entry = table.record(uav.offset, 32);
-        if (!entry) return refuse(i, "table entry outside the bound table", uav.offset);
-        std::uint32_t words[8] = {};
-        if (!x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) return refuse(i, "table entry unreadable", entry);
-        std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
-        if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
-        ViewRecord record{};
-        note_lock_acquire(false);
-        const bool known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
-        if (!known) return refuse(i, "unknown view token", words[1]);
+        DrawTableRead local{};
+        if (!shared_uavs) {
+            read_draw_table(table, uav.offset, local);
+            read_draw_view(local);
+        }
+        const auto& read = shared_uavs ? shared_uavs[i] : local;
+        if (!read.entry) return refuse(i, "table entry outside the bound table", uav.offset);
+        if (!read.readable) return refuse(i, "table entry unreadable", read.entry);
+        if (read.words[0] != view_token_magic) return refuse(i, "table entry holds no view", read.words[0]);
+        if (!read.known) return refuse(i, "unknown view token", read.words[1]);
+        const auto& record = read.view;
         if (record.slot != 19) return refuse(i, "table entry is not an unordered-access view", record.slot);
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
         if (!resource || resource->own().kind != resource_kind || !resource->own().real) return refuse(i, "view has no resource", record.resource);
@@ -2727,14 +2769,13 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
             if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
-            const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
-            std::uint32_t srv_words[8] = {};
-            if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
-            std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
-            if (srv_words[0] != view_token_magic) continue;
-            note_lock_acquire(false);
-            const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
-            ReleaseSRWLockShared(&note_lock);
+            DrawTableRead local_srv{};
+            if (!shared_srvs) {
+                read_draw_table(pass, srv, local_srv);
+                read_draw_view(local_srv);
+            }
+            const auto& srv_read = shared_srvs ? shared_srvs[s] : local_srv;
+            const u64 srv_resource = srv_read.known ? srv_read.view.resource : 0;
             if (srv_resource && srv_resource == record.resource) return refuse(i, "the texture is also an SRV of this draw", s);
         }
         out[i].resource = texture;
@@ -2852,6 +2893,33 @@ void log_not_drawn_causes()
             render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
+bool walk_shared_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_WALK_SHARED", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+// Caller holds draw_lock shared. Ready translations have published their SRV layouts.
+// A miss goes through the existing exclusive path, which can load manifests or insert entries.
+const Translation* ready_draw_walk_translation(const Pass& pass)
+{
+    const auto& pipelines = translation_by_pipeline();
+    const auto pipeline = pipelines.find(pass.pipeline);
+    if (pipeline == pipelines.end() || !pipeline->second->translation) return nullptr;
+    const Translation* tr = pipeline->second->translation;
+    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+        const auto request = rtv_translation_request(*tr, pass);
+        const auto& translations = translation_by_key();
+        const auto variant = translations.find(fnv_bytes(request.data(), request.size()));
+        if (variant == translations.end()) return nullptr;
+        tr = variant->second;
+    }
+    return tr && tr->state == 1 ? tr : nullptr;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -2862,6 +2930,31 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool indexed_rect = rect && indexed && indirect;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) return not_drawn(0);
+    std::optional<std::array<DrawTableRead, 32>> table_reads;
+    std::optional<std::array<DrawTableRead, pixel_uav_limit>> uav_reads;
+    const Translation* walked = nullptr;
+    if (walk_shared_enabled()) {
+        struct SharedDrawLock {
+            SharedDrawLock() { AcquireSRWLockShared(&draw_lock); }
+            ~SharedDrawLock() { ReleaseSRWLockShared(&draw_lock); }
+        } shared;
+        walked = ready_draw_walk_translation(pass);
+        if (walked) {
+            auto& reads = table_reads.emplace();
+            for (std::size_t i = 0; i < walked->srvs.size(); ++i) {
+                read_draw_table(pass, walked->srvs[i], reads[i]);
+                read_draw_view(reads[i]);
+            }
+            if (!walked->uavs.empty()) {
+                auto& outputs = uav_reads.emplace();
+                for (std::size_t i = 0; i < walked->uavs.size(); ++i) {
+                    const auto& uav = walked->uavs[i];
+                    read_draw_table(pass.view_tables[uav.parameter], uav.offset, outputs[i]);
+                    read_draw_view(outputs[i]);
+                }
+            }
+        }
+    }
     draw_lock_acquire_exclusive();
     DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
@@ -2872,8 +2965,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;
-    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
-    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    // Consume a snapshot only for the same published translation selected by the exclusive path.
+    const auto* shared_tables = translation_ok && walked == tr ? table_reads->data() : nullptr;
+    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16, shared_tables);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers, shared_tables);
     if (!formatted_ok) {
         if (indirect && tr)
             indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
@@ -2945,7 +3040,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         return not_drawn(7);
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
-    if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {
+    if (!resolve_pixel_uavs(*tr, pass, uav_bindings, shared_tables,
+                            shared_tables && uav_reads ? uav_reads->data() : nullptr)) {
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
@@ -3016,6 +3112,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
+    static const bool measure_walk = GetEnvironmentVariableA("X2W_TEST_WALK_THREADS", nullptr, 0) != 0;
+    UINT shared_table_reads = 0, exclusive_table_reads = 0;
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
@@ -3042,27 +3140,26 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = readable_window(address, 0x10000);
         }
         const auto& formatted = formatted_buffers[i];
-        const u64 entry = formatted.entry ? formatted.entry :
-            (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
-                pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
-        std::uint32_t words[8] = {};
-        const bool entry_ok = formatted.entry ||
-            (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
-        if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
+        DrawTableRead local_read{};
+        const bool use_shared_read = shared_tables != nullptr;
+        if (!use_shared_read && !formatted.entry) read_draw_table(pass, srv, local_read);
+        if (measure_walk && srv.source == 0) {
+            if (use_shared_read) ++shared_table_reads;
+            else ++exclusive_table_reads;
+        }
+        const auto& table = use_shared_read ? shared_tables[i] : local_read;
+        const u64 entry = formatted.entry ? formatted.entry : table.entry;
+        const auto& words = formatted.entry ? formatted.words : table.words;
+        const bool entry_ok = formatted.entry || table.readable;
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 4) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
-            ViewRecord record{};
-            bool known = false;
-            if (words[0] == view_token_magic) {
-                note_lock_acquire(false);
-                known = words[1] < view_records().size();
-                if (known) record = view_records()[words[1]];
-                ReleaseSRWLockShared(&note_lock);
-            }
+            if (!use_shared_read) local_read.known = read_draw_view(words, local_read.view);
+            const auto& record = table.view;
+            const bool known = table.known;
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -3183,7 +3280,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
                 }
             } else if (entry_ok) {
-                view = indirect_table_buffer(self, words);
+                view = indirect_table_buffer(self, words, false, nullptr, indirect_table_buffer_limit,
+                                             false, shared_tables ? &table.view : nullptr);
             }
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
                 indirect->set_refusal(
@@ -3203,11 +3301,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (srv.source == 0 && words[0] == view_token_magic && entry) {
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
-            ViewRecord record{};
-            note_lock_acquire(false);
-            buffer_token_known = words[1] < view_records().size();
-            if (buffer_token_known) record = view_records()[words[1]];
-            ReleaseSRWLockShared(&note_lock);
+            if (!use_shared_read) local_read.known = read_draw_view(words, local_read.view);
+            const auto& record = table.view;
+            buffer_token_known = table.known;
             if (record.slot == 17 && record.desc_bytes >= 12) {
                 std::uint32_t size = 0;
                 std::memcpy(&address, record.desc, 8);
@@ -3588,6 +3684,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
+    if (measure_walk)
+        log("x2w-draw table reads: %u shared, %u exclusive", shared_table_reads, exclusive_table_reads);
     if (indirect) return drawn;
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";

@@ -17561,3 +17561,8 @@ With `X2W_D3D12_LAZY_TEXTURES=1` (Refs #2764, #2379, #1199), device slot 133 (`C
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_slot133_lazy_textures_' -V
 ```
+
+## Shared descriptor walk for translated draws
+
+[`X2W_WALK_SHARED` and the recording-thread fixture](experiments/draw-walk-shared.md)
+describe the lock boundary and the WARP and hardware checks.

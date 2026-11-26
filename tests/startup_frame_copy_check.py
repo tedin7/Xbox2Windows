@@ -1,10 +1,11 @@
 """Check title-memory snapshots for writes between draws and across frame boundaries."""
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 
-from startup_address_srv_check import draw_texture
+from startup_address_srv_check import draw_texture, prepare_draw_cache
 
 HLSL = (
     "ByteAddressBuffer constants : register(t0);\n"
@@ -118,8 +119,41 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_walk(directory, consumer, backend):
+    log = directory / "trap.log"
+    env, args, output = prepare_draw_cache(directory, consumer, HLSL, {
+        "X2W_TRAP_LOG": str(log), "X2W_BIGBIND_ONCE": "1",
+    }, "srv 0 buf table 0 0")
+    colors = (RED, bytes((0, 255, 0, 255)), bytes((255, 255, 0, 255)), bytes((255, 0, 255, 255)))
+    expected = tuple((color * 4 + BLUE * 4) * 4 for color in colors)
+    reference = None
+    for enabled, threads in ((0, 1), (0, 2), (0, 4), (1, 2), (1, 4)):
+        log.unlink(missing_ok=True)
+        for i in range(len(colors)):
+            Path(f"{output}.{i}").unlink(missing_ok=True)
+        run = subprocess.run([*args, backend, output],
+                             env=dict(env, X2W_WALK_SHARED=str(enabled), X2W_TEST_WALK_THREADS=str(threads)),
+                             capture_output=True, text=True, timeout=45)
+        if run.returncode == 77:
+            return 77
+        if run.returncode:
+            raise AssertionError(f"{threads} threads, switch {enabled}: exit {run.returncode}\n{run.stderr[-5000:]}")
+        actual = tuple(Path(f"{output}.{i}").read_bytes() for i in range(len(colors)))
+        if reference is None:
+            reference = actual
+        assert actual == expected == reference, f"{threads} threads, switch {enabled}: target pixels differ"
+        reads = re.findall(r"x2w-draw table reads: (\d+) shared, (\d+) exclusive",
+                           log.read_text(errors="replace"))
+        # The first draw warms the cache, then each of four targets is drawn four times.
+        want = (str(enabled), str(1 - enabled))
+        assert len(reads) == 17 and reads[1:] == [want] * 16, (threads, enabled, reads)
+        print(f"{backend}: {threads} recording threads, switch {enabled}, "
+              f"128 exact pixels and {1 - enabled} exclusive table reads per measured draw")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "walk": check_walk}.get(next(iter(sys.argv[3:]), ""), check)
         sys.exit(check_mode(Path(temporary), consumer, backend))

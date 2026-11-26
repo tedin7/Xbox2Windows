@@ -3,12 +3,15 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
@@ -413,6 +416,78 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 }
 }  // namespace
 
+int draw_walk_threads(ID3D12Device* desktop, void* guest, void* pso, const char* pixels, unsigned threads)
+{
+    constexpr unsigned target_count = 4;
+    constexpr unsigned rounds = 4;
+    constexpr UINT width = 8, height = 4;
+    std::array<StreamTarget, target_count> frames{};
+    std::array<void*, target_count> heaps{};
+    alignas(256) float constants[target_count][64] = {
+        {1, 0, 0, 1}, {0, 1, 0, 1}, {1, 1, 0, 1}, {1, 0, 1, 1},
+    };
+    std::array<std::vector<unsigned char>, target_count> backing;
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT entries = (32 + increment - 1) / increment;
+    for (unsigned i = 0; i < target_count; ++i) {
+        if (const int rc = open_stream_target(desktop, guest, pso, width, height,
+                                              DXGI_FORMAT_R8G8B8A8_UNORM, width / 2, frames[i])) return rc;
+        backing[i].resize(std::size_t{entries} * increment);
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entries, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+               arg(backing[i].data()), backing[i].size()};
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&desc), arg(&__uuidof(ID3D12DescriptorHeap)),
+                                               arg(&heaps[i]))))) return 44;
+        const auto cpu = invoke(heaps[i], 9);
+        const auto table = invoke(heaps[i], 10);
+        if (cpu != arg(backing[i].data()) || !table) return 45;
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC view{arg(constants[i]), 256};
+        invoke(guest, 17, arg(&view), cpu);
+        invoke(frames[i].list, 32, 1, arg(&heaps[i]));
+        invoke(frames[i].list, 36, 0, table);
+    }
+
+    // Warm the translation and PSO before entering the measured draws.
+    invoke(frames[0].list, 12, 3, 1);
+    const float clear[] = {0, 0, 1, 1};
+    invoke(frames[0].list, 52, invoke(frames[0].rtv_heap, 9), arg(clear));
+    std::atomic<unsigned> arrivals{0};
+    std::array<std::thread, target_count> workers;
+    for (unsigned worker = 0; worker < threads; ++worker) {
+        workers[worker] = std::thread([&, worker] {
+            for (unsigned round = 0; round < rounds; ++round) {
+                // Each worker owns its lists and allocators. Align the start of each round.
+                arrivals.fetch_add(1);
+                while (arrivals.load() < (round + 1) * threads) std::this_thread::yield();
+                const LONG x = static_cast<LONG>(round);
+                const D3D12_RECT column{x, 0, x + 1, height};
+                for (unsigned i = worker; i < target_count; i += threads) {
+                    invoke(frames[i].list, 22, 1, arg(&column));
+                    invoke(frames[i].list, 12, 3, 1);
+                }
+            }
+        });
+    }
+    for (unsigned i = 0; i < threads; ++i) workers[i].join();
+
+    for (unsigned i = 0; i < target_count; ++i) {
+        auto& frame = frames[i];
+        if (FAILED(static_cast<HRESULT>(invoke(frame.list, 9)))) return 46;
+        invoke(frame.queue, 10, 1, arg(&frame.list));
+        if (FAILED(static_cast<HRESULT>(invoke(frame.queue, 14, arg(frame.fence), 1)))) return 47;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(frame.fence, 8) < 1 && GetTickCount64() < deadline) Sleep(1);
+        if (invoke(frame.fence, 8) != 1) return 48;
+        const auto output = std::string(pixels) + "." + std::to_string(i);
+        if (const int rc = read_stream_target(desktop, frame, output.c_str())) return rc;
+        for (void* object : {frame.list, frame.allocator, frame.queue, frame.fence, frame.rtv_heap, heaps[i]})
+            invoke(object, 2);
+    }
+    return 0;
+}
+
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
@@ -429,6 +504,13 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    char walk_threads[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_WALK_THREADS", walk_threads, sizeof(walk_threads)) == 1) {
+        const unsigned threads = walk_threads[0] - '0';
+        if (threads == 1 || threads == 2 || threads == 4)
+            return draw_walk_threads(desktop.Get(), guest, pso, pixels, threads);
+        return 49;
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
         return draw_pixel_history(desktop.Get(), guest, pso, pixels);
     Bc7Binding binding;
