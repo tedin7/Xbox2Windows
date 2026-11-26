@@ -30,6 +30,9 @@ struct ComputeTranslation {
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
+    ULONGLONG retry_pipeline_at = 0;
+    ComputeDispatchReason load_failure = manifest_rejected;
+    ComputeDispatchReason absent_reason = translation_pending;
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
@@ -73,10 +76,23 @@ std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
+ComputeDispatchReason absent_compute_manifest_reason(u64 key)
+{
+    wchar_t path[MAX_PATH];
+    if (cache_path(path, L"", key, L".fail")) {
+        const DWORD attributes = GetFileAttributesW(path);
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            return offline_translation_refused;
+    }
+    return translation_pending;
+}
+
 // Both wrappers and the prefetch worker use stable entries, even after a wrapper is released.
 struct ComputeManifest {
     x2w_startup::ManifestPrefetch::Publication publication;
     std::once_flag probe;
+    // Set before watch_missing publishes the missing state. Immutable after the first probe.
+    ComputeDispatchReason absent_reason = translation_pending;
 };
 
 bool nolock_compute_refuse()
@@ -104,8 +120,10 @@ bool compute_manifest_missing(ComputeManifest& manifest, u64 key)
         auto& source = manifest_source();
         if (source.read_first(key, publication.text))
             publication.state.store(State::ready, std::memory_order_release);
-        else
+        else {
+            if (compute_pipe_late_enabled()) manifest.absent_reason = absent_compute_manifest_reason(key);
             source.prefetch().watch_missing(key, publication);
+        }
     });
     return publication.state.load(std::memory_order_acquire) == State::missing;
 }
@@ -120,6 +138,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         // The manifest is ready and draw_lock serializes its consumption and PSO creation.
         manifest = std::move(prefetched->publication.text);
     } else if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
+        if (compute_pipe_late_enabled()) tr.absent_reason = absent_compute_manifest_reason(tr.key);
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }
@@ -221,18 +240,34 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
             return "an entry value names a descriptor that is not a buffer input or output";
     }
+    return nullptr;
+}
+
+// Keep the parsed layout and any successfully created root across retries; state 1 requires both objects.
+const char* build_compute_translation(ComputeTranslation& tr)
+{
+    wchar_t path[MAX_PATH];
     x2w_startup::ComPtr<ID3DBlob> code;
+    tr.load_failure = compiled_shader_missing;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
-        return "root signature creation failed";
+    if (!tr.root) {
+        tr.load_failure = translated_root_failed;
+        if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
+                static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            return "root signature creation failed";
+    }
+    tr.load_failure = translated_pipeline_failed;
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
     desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     if (FAILED(device_of(the_device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(&tr.pipeline))))
         return "pipeline creation failed";
     tr.state = 1;
+    if (tr.retry_pipeline_at) {
+        tr.retry_pipeline_at = 0;
+        InterlockedIncrement(&compute_dispatch_reasons[recovered_pipeline]);
+    }
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
@@ -264,12 +299,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const bool valid_groups = x <= x2w_startup::max_dispatch_groups && y <= x2w_startup::max_dispatch_groups &&
                               z <= x2w_startup::max_dispatch_groups;
     const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
+    const bool late = compute_pipe_late_enabled();
     if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
         InterlockedIncrement(&compute_dispatches_untranslated);
+        if (late) InterlockedIncrement(&compute_dispatch_reasons[manifest->absent_reason]);
         return "no translation";
     }
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
+    auto refusal_bucket = translated_dispatch_rejected;
     struct View {
         ID3D12Resource* resource;
         u64 offset, bytes;
@@ -296,12 +334,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
-        if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            tr->unmodelled = load_compute_translation(*tr, manifest);
-            if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+        const bool load_manifest = !tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at);
+        if (load_manifest) tr->unmodelled = load_compute_translation(*tr, manifest);
+        if ((load_manifest && !tr->unmodelled && !tr->retry_manifest_at) ||
+            (late && tr->retry_pipeline_at && GetTickCount64() >= tr->retry_pipeline_at)) {
+            tr->unmodelled = build_compute_translation(*tr);
+            if (late && tr->unmodelled) tr->retry_pipeline_at = GetTickCount64() + manifest_retry_ms;
         }
+        if (load_manifest && tr->unmodelled)
+            log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         if (tr->state != 1) {
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
+            refusal_bucket = tr->unmodelled ? tr->load_failure : tr->absent_reason;
             reason = tr->unmodelled ? tr->unmodelled : "no translation";
             counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
         }
@@ -546,6 +590,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         timer.finish(x2w_phase::refused);
         draw_lock_release_exclusive();
         InterlockedIncrement(counter);
+        if (late) InterlockedIncrement(&compute_dispatch_reasons[refusal_bucket]);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
         if (!dispatch.signature && first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16))
@@ -734,6 +779,7 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
     log_key_use_census();
+    report_compute_dispatch_reasons([](const char* line) { log("%s", line); });
 }
 
 // Fixtures: snapshot the counters without acquiring or resetting draw_lock.

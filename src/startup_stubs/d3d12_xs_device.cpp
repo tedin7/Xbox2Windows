@@ -4403,6 +4403,39 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     }
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
+bool compute_pipe_late_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_PIPE_LATE");
+    return enabled;
+}
+
+enum ComputeDispatchReason {
+    missing_pipeline_and_root, missing_pipeline, missing_root, translation_pending, offline_translation_refused,
+    manifest_rejected, compiled_shader_missing, translated_root_failed, translated_pipeline_failed,
+    translated_dispatch_rejected, recovered_pipeline, compute_reason_count
+};
+LONG compute_dispatch_reasons[compute_reason_count]{};
+
+template <typename Emit>
+void report_compute_dispatch_reasons(Emit emit)
+{
+    if (!compute_pipe_late_enabled()) return;
+    LONG counts[compute_reason_count];
+    for (int i = 0; i < compute_reason_count; ++i)
+        counts[i] = InterlockedCompareExchange(&compute_dispatch_reasons[i], 0, 0);
+    char line[512];
+    std::snprintf(line, sizeof(line),
+        "x2w-render compute dispatch reasons: missing_pipeline_and_root=%ld missing_pipeline=%ld missing_root=%ld "
+        "translation_pending=%ld offline_translation_refused=%ld manifest_rejected=%ld compiled_shader_missing=%ld "
+        "translated_root_failed=%ld "
+        "translated_pipeline_failed=%ld translated_dispatch_rejected=%ld recovered_pipeline=%ld",
+        counts[missing_pipeline_and_root], counts[missing_pipeline], counts[missing_root], counts[translation_pending],
+        counts[offline_translation_refused],
+        counts[manifest_rejected], counts[compiled_shader_missing], counts[translated_root_failed],
+        counts[translated_pipeline_failed], counts[translated_dispatch_rejected], counts[recovered_pipeline]);
+    emit(line);
+}
+
 // List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
 void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
@@ -4424,6 +4457,11 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     request.x = x, request.y = y, request.z = z;
     const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
     if (decision != x2w_startup::DispatchDecision::forward) {
+        if (compute_pipe_late_enabled() && decision == x2w_startup::DispatchDecision::no_compute_state) {
+            const auto reason = request.compute_pipeline ? missing_root
+                : request.compute_root ? missing_pipeline : missing_pipeline_and_root;
+            InterlockedIncrement(&compute_dispatch_reasons[reason]);
+        }
         static LONG refusals;
         if (first_calls(refusals, 16))
             log("x2w-render Dispatch(%u, %u, %u) refused: %s", x, y, z, x2w_startup::dispatch_reason(decision));
@@ -7908,6 +7946,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
+        report_compute_dispatch_reasons([](const char* line) { log("%s", line); });
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
@@ -8032,6 +8071,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_graphics_refusal_census.total()) indirect_graphics_refusal_census.report(emit, false);
     report_key_use_census(emit, false);
+    report_compute_dispatch_reasons(emit);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;

@@ -320,7 +320,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));
-        invoke(list, 25, word(slot67_pipeline));
+        if (mode != "dispatch-no-pipeline") invoke(list, 25, word(slot67_pipeline));
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
@@ -507,7 +507,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(lists[t], 9);
             invoke(queue, 10, 1, word(&lists[t]));
         }
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (mode == "dispatch-pipe-late" || mode == "dispatch-no-pipeline") invoke(list, 14, 1, 1, 1);
+    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
@@ -834,8 +835,10 @@ int main(int argc, char** argv)
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
-        if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
-            if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;
+        const bool pipe_late = std::strcmp(argv[8], "dispatch-pipe-late") == 0;
+        if (nolock_retry || pipe_late || std::strcmp(argv[8], "dispatch-retry") == 0) {
+            if (int rc = dispatch_slot67(adapter.Get(), device,
+                    nolock_retry ? "dispatch-nolock-burst" : pipe_late ? argv[8] : "dispatch")) return rc;
             const auto before = nolock_retry ? compute_refusal_stats().background_reads : 0;
             std::puts("first slot 67 Dispatch fenced");
             std::fflush(stdout);
