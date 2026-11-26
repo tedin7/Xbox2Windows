@@ -49,6 +49,12 @@ PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f402
                        'f6020e7e' '7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
+# a16: x and y share v0 (x low half, y high half). v0 = 1 | (2 << 16) addresses the same texel (1, 2); v1 holds a
+# sentinel that must not be read as part of the address.
+A16_STORE = bytes.fromhex('080f20f000040440')
+A16_PREFIX = PREFIX.replace(bytes.fromhex('8102007e' '8202027e'), bytes.fromhex('ff02007e' '01000200' '8202027e'))
+A16_WORDS = A16_PREFIX + A16_STORE + SUFFIX
+A16_LINE = 'w0[uint2(v0 & 0xffffu, v0 >> 16)] = asfloat(uint4(v4, v5, v6, v7));'
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
 
@@ -108,7 +114,23 @@ def controls():
 
     # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
     # a partial channel mask and other image dimensions.
-    cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
+    # a16: x and y packed in v0 is lowered; other dimensions would pack a second register and stay refused.
+    decoded = D.decode_instruction(A16_STORE, 0)[2]
+    assert decoded == 'image_store v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16', decoded
+    a16_ps = translate(A16_WORDS).hlsl_ps()
+    assert '    ' + A16_LINE in a16_ps and STORE_LINE not in a16_ps, a16_ps
+    print('a16 store: %s' % A16_LINE)
+    for name, store in (('a16 3D', bytes.fromhex('100f20f000040440')), ('a16 2D array', bytes.fromhex('280f20f000040440')),
+                        ('a16 1D', bytes.fromhex('000f20f000040440'))):
+        print('refused %-20s %s' % (name + ':', refused(with_store(store), 'a16 only on a 2D image')))
+    try:
+        pipe_a16 = translate(A16_WORDS)
+        pipe_a16.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'a16'])
+    except G.Unsupported as error:
+        assert 'one packed register' in str(error), error
+    else:
+        raise AssertionError('a16 with two address registers was accepted')
+    cases = (('d16', patched(7, 0x80)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
              ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
@@ -225,6 +247,23 @@ def check_draw(dxc, renderer, adapter):
                 ('store deleted', source.replace(STORE_LINE, ''), 'x=1 y=2 expected=%s %s' % (expected, untouched)),
                 ('x and y exchanged', source.replace('w0[uint2(v0, v1)]', 'w0[uint2(v1, v0)]'), 'x=2 y=1')):
             assert text != source, label
+            run = draw(text, label.replace(' ', '_'))
+            if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
+                raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
+            print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
+
+        # a16: v0 = 1 | (2 << 16) must reach the same texel (1, 2). Controls: ignoring the high half writes (1, 0);
+        # exchanging the halves writes (2, 1).
+        a16_source = translate(A16_WORDS).hlsl_ps()
+        run = draw(a16_source, 'a16_store')
+        if run.returncode:
+            raise AssertionError('a16 store draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw a16: texel (1, 2) = %s, all other texels untouched' % expected)
+        for label, text, needle in (
+                ('a16 high half ignored', a16_source.replace('v0 >> 16', '0u'), 'x=1 y=2'),
+                ('a16 halves exchanged', a16_source.replace('uint2(v0 & 0xffffu, v0 >> 16)', 'uint2(v0 >> 16, v0 & 0xffffu)'),
+                 'x=1 y=2')):
+            assert text != a16_source, label
             run = draw(text, label.replace(' ', '_'))
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
