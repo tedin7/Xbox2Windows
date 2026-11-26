@@ -214,8 +214,9 @@ def find_debugger(logdir):
     if os.name == "nt":
         import subprocess
         quoted = logdir.replace("'", "''")
-        command = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*debug_launch.py*' -and "
-                   "$_.CommandLine -like '*%s*' } | ForEach-Object { $_.ProcessId }" % quoted)
+        # the query's own PowerShell (a child of this process) carries the needles in its command line: never a match
+        command = ("Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -ne %d -and $_.CommandLine -like '*debug_launch.py*' -and "
+                   "$_.CommandLine -like '*%s*' } | ForEach-Object { $_.ProcessId }" % (os.getpid(), quoted))
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True,
                                  timeout=60).stdout.split()
@@ -232,6 +233,33 @@ def find_debugger(logdir):
             if any(w.endswith("debug_launch.py") for w in text) and logdir in text:
                 return int(entry)
     return None
+
+
+def find_processes(*needles):
+    """PIDs of the processes whose command line contains every needle (case-insensitive), this process excluded."""
+    wanted = [n.lower() for n in needles if n]
+    found = []
+    if os.name == "nt":
+        import subprocess
+        tests = " -and ".join("$_.CommandLine -like '*%s*'" % n.replace("'", "''") for n in needles if n)
+        # the query's own PowerShell (a child of this process) carries the needles in its command line: never a match
+        command = ("Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -ne %d -and %s } | "
+                   "ForEach-Object { $_.ProcessId }" % (os.getpid(), tests))
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True,
+                                 timeout=60).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [int(x) for x in out if x.isdigit() and int(x) != os.getpid()]
+    for entry in os.listdir("/proc"):
+        if entry.isdigit() and int(entry) != os.getpid():
+            try:
+                line = Path("/proc", entry, "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if wanted and all(n in line for n in wanted):
+                found.append(int(entry))
+    return found
 
 
 def kill_tree(pid):
