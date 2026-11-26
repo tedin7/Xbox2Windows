@@ -108,6 +108,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -174,6 +175,7 @@ enum class RetireNever : std::uint8_t { slot, none, buffer, dimension, msaa, rt_
 enum class RetireLeft : std::uint8_t { none, view, view_copy, residency, present, hold_missed, count };
 
 struct ComputeManifest;
+struct Slot57Mesh;
 
 struct alignas(16) WrapperOwn {
     IUnknown* real;
@@ -224,6 +226,7 @@ struct alignas(16) WrapperOwn {
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
+    void* volatile slot57_mesh{};
     UINT list_node_mask;
     D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
@@ -3506,6 +3509,26 @@ void note_indirect_graphics_refusal(u64 key, const char* kind, const char* reaso
     indirect_graphics_refusal_census.note(key, detail);
 }
 
+u64 slot57_mesh_for(Wrapper* pipeline, const std::vector<RootParameter>* root, u64 requested_key,
+                    Slot57Mesh*& entry);
+bool slot57_mesh_pending(Slot57Mesh& mesh);
+void flush_slot57_refusals();
+
+bool translated_indirect_mesh_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_MESH");
+    return enabled;
+}
+bool bind_slot57_mesh(Wrapper* self, Slot57Mesh& mesh, ID3D12Resource* argument, const char*& refusal);
+
+bool mesh_attachments_match(const Pass& pass, const IndirectGraphicsPipeline& pso)
+{
+    return pass.targets_bound && pass.viewport_set && pass.scissor_set && pass.targets_single_sample &&
+        pass.target_count == pso.cached_target_count && pass.dsv_format == pso.cached_depth &&
+        (!pso.cached_depth_writes || pass.depth_view_writable) &&
+        std::equal(pso.cached_targets, pso.cached_targets + pso.cached_target_count, pass.target_formats);
+}
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -3574,6 +3597,14 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+    const bool slot57_enabled = mesh && console_pipeline && !pass.pipeline->own().mesh86_key &&
+        translated_indirect_mesh_enabled();
+    Slot57Mesh* slot57 = nullptr;
+    u64 slot57_key = 0;
+    const auto refuse_slot57 = [&](const char* reason) {
+        note_indirect_graphics_refusal(slot57_key, "mesh", reason);
+        return refuse(reason, indirect_graphics_pipeline);
+    };
     const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
@@ -3582,16 +3613,27 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
-        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || (!translated && (!pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
-            // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
-            // nothing is drawn.
-            if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && pass.pipeline && !pass.pipeline->own().real &&
-                (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
+        if (mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT && console_pipeline) {
+            if (slot57_enabled)
+                slot57_key = slot57_mesh_for(pass.pipeline, pass.root, 0, slot57);
+            if (!slot57_key && (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
                 pass.requested_mesh_pipeline = pass.pipeline;
                 pass.requested_mesh_root = pass.root;
                 pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root);
-            } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
+            }
+            if (slot57_enabled && !slot57_key && pass.requested_mesh_key &&
+                pass.requested_mesh_pipeline == pass.pipeline && pass.requested_mesh_root == pass.root)
+                slot57_key = slot57_mesh_for(pass.pipeline, pass.root, pass.requested_mesh_key, slot57);
+            if (slot57_key) {
+                if (slot57_mesh_pending(*slot57)) return refuse("result incomplete", indirect_graphics_pipeline);
+                note_indirect_mesh_use(slot57_key);
+                if (!pass.targets_bound || !pass.viewport_set || !pass.scissor_set || !pass.targets_single_sample)
+                    return refuse_slot57("target mismatch");
+            }
+        }
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || (!translated && !slot57 && (!pass.indirect_graphics.root ||
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
+            if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
             }
@@ -3615,12 +3657,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
                           indirect_graphics_pipeline);
         }
-        if (pass.indirect_graphics.cached_mesh) {
+        if (slot57) {
+            // The translated pipeline checks the manifest and attachments when it binds.
+        } else if (pass.indirect_graphics.cached_mesh) {
             const auto& pso = pass.indirect_graphics;
-            if (!pass.targets_bound || !pass.viewport_set || !pass.scissor_set || !pass.targets_single_sample ||
-                pass.target_count != pso.cached_target_count || pass.dsv_format != pso.cached_depth ||
-                (pso.cached_depth_writes && !pass.depth_view_writable) ||
-                !std::equal(pso.cached_targets, pso.cached_targets + pso.cached_target_count, pass.target_formats))
+            if (!mesh_attachments_match(pass, pso))
                 return refuse("cached mesh requires matching color and depth attachments, viewport and scissor",
                               indirect_other, indirect_other_refusal_code::cached_mesh_attachments);
             if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags) {
@@ -3802,7 +3843,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         draw_arguments = scratch;
         draw_offset = 0;
     }
-    if (graphics) {
+    if (slot57) {
+        const char* reason = "binding refused";
+        if (!bind_slot57_mesh(self, *slot57, draw_arguments, reason)) return refuse_slot57(reason);
+    } else if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
         if (pass.indirect_graphics.cached_mesh) {
@@ -3873,6 +3917,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (slot57) {
+        if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
+        pass.srv_bound = 0;
+    }
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
@@ -8001,6 +8049,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        flush_slot57_refusals();
         indirect_graphics_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
@@ -8030,6 +8079,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     token_null_census.report(emit, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
+    flush_slot57_refusals();
     if (indirect_graphics_refusal_census.total()) indirect_graphics_refusal_census.report(emit, false);
     report_key_use_census(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);

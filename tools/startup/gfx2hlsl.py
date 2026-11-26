@@ -12525,7 +12525,7 @@ def translate_mesh57(out_dir, key):
     """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
 
     Writes <key>.ms57.hlsl and the compiled .ms57.cso, their .ps57 counterparts if present, and <key>.ms57.txt (last).
-    No runtime path loads these names yet."""
+    The runtime's opt-in slot 57 reader uses the manifest as the publication marker."""
     source = os.path.join(out_dir, 'req_%016x' % key)
     ms, ps, root = (open(source + ext, 'rb').read() for ext in ('.m57', '.ps57', '.root'))
     if mesh57_key(ms, ps, root) != key:

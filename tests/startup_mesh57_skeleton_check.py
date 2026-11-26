@@ -8,6 +8,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py indirect <dxc> <publisher> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -1045,7 +1046,8 @@ def publish_request(directory, publisher, adapter):
     ms, ps = code(MESH), code(PIXEL)
     (directory / 'ms.bin').write_bytes(ms)
     (directory / 'ps.bin').write_bytes(ps)
-    env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
+    env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
+               X2W_TRANSLATED_INDIRECT_MESH='0')
     result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
     print(result.stdout, end='')
     if result.returncode:
@@ -1065,6 +1067,70 @@ def publish_request(directory, publisher, adapter):
     if FAILED:
         return 1, None
     return 0, (cache, key, root_blob)
+
+
+def indirect_draw(dxc, publisher, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        status, published = publish_request(directory, publisher, adapter)
+        if status:
+            return status
+        cache, key, _ = published
+        result = G.translate_request(str(cache), key)
+        if result != 'ok':
+            print(result)
+            return 1
+
+        # A new asymmetric scene exercising the existing source-built skeleton.
+        points = [(4, 3), (25, 8), (10, 24)] + [(0, 0)] * 9
+        colours = [(33, 171, 89, 255)] * 12
+        triangles = [(0, 1, 2)]
+        (directory / 'input.bin').write_bytes(buffer(points, colours, [1 << 10 | 2 << 20]))
+        image = bytes(channel for pixel in rasterise(points, colours, triangles, 3, 1) for channel in pixel)
+        reference = directory / 'reference.bin'
+        reference.write_bytes(image)
+        manifest = cache / f'{key:016x}.ms57.txt'
+        staged = manifest.with_suffix('.txt.staged')
+        pixel = cache / f'{key:016x}.ps57.cso'
+        intact_pixel = pixel.read_bytes()
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=tmp)
+
+        for mode in ('off', 'truncated', 'ready', 'mutant', 'depth'):
+            if mode == 'truncated':
+                pixel.write_bytes(intact_pixel[:-9])
+            if mode in ('ready', 'mutant'):
+                pixel.write_bytes(intact_pixel)
+                manifest.rename(staged)
+            if mode == 'mutant':
+                changed = bytearray(image)
+                first_painted = next(i for i in range(0, len(image), 4) if image[i])
+                changed[first_painted] ^= 1
+                reference.write_bytes(changed)
+            if mode == 'depth':
+                root_blob = published[2]
+                depth_key = G.mesh57_key(code(MESH), b'', root_blob)
+                if G.translate_request(str(cache), depth_key) != 'ok':
+                    return 1
+                depth_manifest = cache / f'{depth_key:016x}.ms57.txt'
+                depth_manifest.rename(depth_manifest.with_suffix('.txt.staged'))
+                vertices = bytearray((directory / 'input.bin').read_bytes())
+                for i in range(3):
+                    struct.pack_into('<f', vertices, 16 * i + 8, 0.0)
+                (directory / 'input.bin').write_bytes(vertices)
+                reference.write_bytes(b''.join(struct.pack('<I', 0 if image[i] else 0xffff)
+                                               for i in range(0, len(image), 4)))
+            env.update(X2W_TEST_SLOT57_DRAW=mode, X2W_TRANSLATED_INDIRECT_MESH='0' if mode == 'off' else '1')
+            run = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
+            print(run.stdout, end='')
+            print(run.stderr, end='')
+            if mode == 'mutant':
+                if run.returncode != 1 or 'slot 57 result readback: pixel (' not in run.stderr:
+                    return 1
+            elif run.returncode:
+                return run.returncode
+        return 0
 
 
 def draw(dxc, renderer, adapter, publisher=None):
@@ -1437,6 +1503,8 @@ def main(argv):
         status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:
         status = draw_shift(*argv[2:])
+    elif argv[1:2] == ['indirect'] and len(argv) == 5:
+        status = indirect_draw(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:

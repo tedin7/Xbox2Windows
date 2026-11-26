@@ -27,43 +27,43 @@ public:
 
     // Counts one refusal for (key, reason_name). Returns true on the first insertion of one of
     // the first detail_entries distinct (key, reason) pairs so callers can budget detail logs.
-    bool note(std::uint64_t key, const char* reason_name)
+    bool note(std::uint64_t key, const char* reason_name, std::uint64_t calls = 1)
     {
         char reason[max_reason_bytes] = {};
         copy_sanitized(reason, sizeof(reason), reason_name, "unknown");
 
         std::lock_guard<std::mutex> lock(mutex_);
-        ++total_;
+        total_ += calls;
         // Linear scan over max_entries under mutex_ is sized for refusal paths, not a per-draw hot path.
         for (unsigned i = 0; i < entry_count_; ++i) {
 #if defined(X2W_CENSUS_KEEP_LAST) || defined(X2W_CENSUS_KEEP_FIRST)
             if (entries_[i].key == key) {
                 if (std::strcmp(entries_[i].reason, reason) == 0) {
-                    ++entries_[i].calls;
+                    entries_[i].calls += calls;
 #ifdef X2W_CENSUS_KEEP_LAST
                 } else {
                     std::memcpy(entries_[i].reason, reason, sizeof(reason));
-                    entries_[i].calls = 1;
+                    entries_[i].calls = calls;
 #endif
                 }
                 return false;
             }
 #else
             if (entries_[i].key == key && std::strcmp(entries_[i].reason, reason) == 0) {
-                ++entries_[i].calls;
+                entries_[i].calls += calls;
                 return false;
             }
 #endif
         }
         if (entry_count_ >= max_entries) {
-            ++overflow_calls_;
+            overflow_calls_ += calls;
             return false;
         }
         if (!has_key_locked(key)) ++distinct_keys_;
         Entry& entry = entries_[entry_count_];
         entry.key = key;
         std::memcpy(entry.reason, reason, sizeof(reason));
-        entry.calls = 1;
+        entry.calls = calls;
         entry.reported_calls = 0;
         const bool detail = entry_count_ < detail_entries;
         ++entry_count_;

@@ -10247,9 +10247,26 @@ sentinel only because of the discard. A reference without the depth writes
 stage with a colour export before its null export, a pair whose pixel stage
 does not match its key, and the mesh shapes the paired path refuses next to
 the depth-only pixel stage; it checks that `pending_keys` keeps
-the pair pending until both `.ms57.cso` and `.ps57.cso` are complete. The
-runtime does not load slot 57 results yet, so these draws are not submitted
-through the guest path.
+the pair pending until both `.ms57.cso` and `.ps57.cso` are complete.
+
+`X2W_TRANSLATED_INDIRECT_MESH=1` enables slot 57 result loading for
+`ExecuteIndirect`. The switch defaults off. The manifest worker checks
+`<key>.ms57.txt` and the required bytecode. A pending pipeline counts
+`mesh result incomplete` without reopening files on the recording thread.
+On the first compatible pass, the runtime creates a desktop mesh pipeline
+with the pass's attachment formats and the manifest's shader bindings.
+A bound depth view uses writable depth and a LESS test. Later calls reuse
+the pipeline and check its attachments, viewport, scissor and sample count.
+The census also records `mesh target mismatch` and `mesh binding refused`.
+
+`startup_indirect_mesh_slot57_{warp,hardware}` exercises the guest path with
+a source-built mesh and pixel pair. The test publishes a result after the
+first request, compares a 32 × 32 readback with a CPU rasterizer, and checks
+a reused pipeline, switch off, truncated pixel bytecode, missing viewport
+and missing resource table. The depth-only case exercises `ps none`. A
+one-pixel reference mutation must fail.
+Run `ctest --preset dev --no-tests=error -R '^startup_indirect_mesh_slot57_(warp|hardware)$'`
+on Windows.
 
 The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact

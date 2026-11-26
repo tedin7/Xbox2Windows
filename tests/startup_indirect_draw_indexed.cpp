@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -750,14 +751,53 @@ void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT wo
                  converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
 }
 
+bool debug_messages_ok(ID3D12InfoQueue* info)
+{
+    if (info) {
+        for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+            SIZE_T bytes = 0;
+            check(info->GetMessage(i, nullptr, &bytes), "get debug message size");
+            std::vector<char> storage(bytes);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            check(info->GetMessage(i, message, &bytes), "get debug message");
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                std::fprintf(stderr, "D3D12 debug message %u: %s\n", static_cast<unsigned>(message->ID), message->pDescription);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::uint64_t mesh_refusals(const char* reason)
+{
+    std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    const std::string field = std::string("reason=mesh ") + reason + " calls=";
+    const auto at = report.find(field);
+    return at == std::string::npos ? 0 : std::strtoull(report.c_str() + at + field.size(), nullptr, 10);
+}
+
+struct Slot57DrawFixture {
+    static constexpr UINT side = 32;
+    std::vector<char> input;
+    std::vector<char> reference;
+    TranslatedDrawFixture& table;
+    bool expect_draw;
+    bool pending{};
+};
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
+         Slot57DrawFixture* slot57 = nullptr)
 {
+    const UINT draw_width = slot57 ? Slot57DrawFixture::side : width;
+    const UINT draw_height = slot57 ? Slot57DrawFixture::side : height;
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
@@ -780,6 +820,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     const void* index_data = draw_right ? static_cast<const void*>(wide.data()) : narrow.data();
     Words initial_words = initial;
     if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
+    if (slot57) initial_words[1] = initial_words[2] = initial_words[3] = 1;
     const bool external_arguments = leased && leased->argument;
     std::optional<PlacedBuffer> arguments, index_buffer;
     if (!external_arguments)
@@ -799,7 +840,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
 
     const auto target_format = cached_depth_only ? DXGI_FORMAT_D16_UNORM : format;
-    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, target_format, {1, 0},
+    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, draw_width, draw_height, 1, 1, target_format, {1, 0},
         D3D12_TEXTURE_LAYOUT_UNKNOWN, cached_depth_only ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL :
                                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     constexpr float clear[]{0, 0, 0, 1};
@@ -927,8 +968,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Scissor = void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*);
     using Index = void (WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
-    const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
-    const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(draw_width), static_cast<float>(draw_height), 0, 1};
+    const D3D12_RECT scissor{rect ? 1 : 0, 0, static_cast<LONG>(draw_width), static_cast<LONG>(draw_height)};
     if (cached_depth_only) {
         slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
         list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -969,6 +1010,27 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
         slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
         slot<Table>(wrapped, 36)(wrapped, 0, translated->gpu);
+    }
+    if (slot57) {
+        using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+        const UINT counts[]{1, 3};
+        slot<Constants>(wrapped, 40)(wrapped, 0, 2, counts, 0);
+        if (refusal != Refusal::missing_texture) {
+            using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+            auto* input = slot<Allocate>(wrapped, 148)(wrapped, slot57->input.size(), D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+            if (!input) return false;
+            std::memcpy(input, slot57->input.data(), slot57->input.size());
+            const auto address = reinterpret_cast<UINT64>(input);
+            if (address >> 48) return false;
+            const std::uint32_t view[]{static_cast<UINT>(address), static_cast<UINT>(address >> 32),
+                static_cast<UINT>(slot57->input.size()), 0};
+            std::memcpy(reinterpret_cast<void*>(slot57->table.cpu), view, sizeof(view));
+            ID3D12DescriptorHeap* heaps[]{slot57->table.heap.Get()};
+            using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+            using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
+            slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+            slot<Table>(wrapped, 36)(wrapped, 1, slot57->table.gpu);
+        }
     }
     if (!mesh) slot<Topology>(wrapped, 20)(wrapped,
         rect || kind == DrawKind::rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11)
@@ -1075,8 +1137,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
+    const auto previous_pending = slot57 ? mesh_refusals("result incomplete") : 0;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
                                external_arguments ? leased->argument_offset : offset, nullptr, 0);
+    if (slot57) slot57->pending = mesh_refusals("result incomplete") != previous_pending;
     if (restore_compute) {
         // Leave the previously forwarded root + SRV alone. Only install the
         // consumer PSO and the output UAV that this fixture owns.
@@ -1197,8 +1261,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
         UINT painted = 0;
         bool pixels_match = true;
-        for (UINT y = 0; y < height; ++y)
-            for (UINT x = 0; x < width; ++x) {
+        for (UINT y = 0; y < draw_height; ++y)
+            for (UINT x = 0; x < draw_width; ++x) {
                 std::uint32_t actual = 0;
                 const auto pixel_bytes = cached_depth_only ? 2u : sizeof(actual);
                 std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes,
@@ -1219,13 +1283,15 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                     wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
                         ? (0xff350000 | (v[y] << 8) | u[x]) : black;
                 }
+                if (slot57 && slot57->expect_draw && !slot57->pending && refusal == Refusal::none)
+                    std::memcpy(&wanted, slot57->reference.data() + (y * draw_width + x) * sizeof(wanted), sizeof(wanted));
                 if (actual != background) ++painted;
                 if (actual == wanted) continue;
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
                 pixels_match = false;
             }
         pixel_readback->Unmap(0, &untouched);
-        std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
+        std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, draw_width * draw_height,
                     external_arguments ? "" : ", argument guards intact");
         if (!pixels_match) {
             if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
@@ -2105,6 +2171,51 @@ int main(int argc, char** argv) try
                        DrawKind::mesh, false, Refusal::none, label);
         };
         const auto pair = make_pso(true, false, false);
+        char mode[16]{};
+        if (GetEnvironmentVariableA("X2W_TEST_SLOT57_DRAW", mode, sizeof(mode))) {
+            TranslatedDrawFixture table(guest.Get(), 0);
+            const bool off = std::strcmp(mode, "off") == 0;
+            const bool truncated = std::strcmp(mode, "truncated") == 0;
+            const bool depth_only = std::strcmp(mode, "depth") == 0;
+            const auto mesh_pipeline = depth_only ? make_pso(false, false, false) : pair;
+            Slot57DrawFixture test{read_stage(L"input.bin"), read_stage(L"reference.bin"), table, !off && !truncated};
+            if (test.input.size() != 512 || test.reference.size() != test.side * test.side * sizeof(UINT)) return 1;
+            const auto draw_slot57 = [&](Refusal refusal, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), nullptr, root.Get(), mesh_pipeline.Get(), signature.Get(),
+                           DrawKind::mesh, false, refusal, label, nullptr, false, nullptr,
+                           false, false, 0, depth_only, false, nullptr, nullptr, false, &test);
+            };
+            if (!draw_slot57(Refusal::none, "slot 57 initial readback")) return 1;
+            if (off) return mesh_refusals("no translation") == 1 && debug_messages_ok(info.Get()) ? 0 : 1;
+            if (!test.pending) return 1;
+            if (!truncated) {
+                // The prefetched manifest becomes visible after the same pipeline has already missed.
+                for (const auto& file : std::filesystem::directory_iterator(cache)) {
+                    auto path = file.path();
+                    if (path.extension() == ".staged") {
+                        auto published = path;
+                        published.replace_extension();
+                        std::filesystem::rename(path, published);
+                        break;
+                    }
+                }
+            }
+            const auto end = GetTickCount64() + (truncated ? 1000 : 7000);
+            do {
+                Sleep(100);
+                if (!draw_slot57(Refusal::none, "slot 57 result readback")) return 1;
+                if (!test.pending) {
+                    if (truncated) return 1;
+                    if (!draw_slot57(Refusal::none, "slot 57 cached readback") ||
+                        !draw_slot57(Refusal::missing_viewport, "slot 57 target mismatch") ||
+                        !draw_slot57(Refusal::missing_texture, "slot 57 binding refused")) return 1;
+                    if (mesh_refusals("target mismatch") != 1 || mesh_refusals("binding refused") != 1) return 1;
+                    return debug_messages_ok(info.Get()) ? 0 : 1;
+                }
+            } while (GetTickCount64() < end);
+            if (!truncated) std::fputs("slot 57 result stayed pending\n", stderr);
+            return truncated && debug_messages_ok(info.Get()) ? 0 : 1;
+        }
         const auto depth = make_pso(false, false, false);
         const auto aliased_vertex = make_pso(true, true, false);
         const auto incomplete = make_pso(true, false, true);
@@ -2516,20 +2627,7 @@ int main(int argc, char** argv) try
         two.join();
         if (!concurrent_ok) return 1;
     }
-    if (info) {
-        for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
-            SIZE_T bytes = 0;
-            check(info->GetMessage(i, nullptr, &bytes), "get debug message size");
-            std::vector<char> storage(bytes);
-            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-            check(info->GetMessage(i, message, &bytes), "get debug message");
-            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
-                std::fprintf(stderr, "D3D12 debug message %u: %s\n", static_cast<unsigned>(message->ID), message->pDescription);
-                return 1;
-            }
-        }
-    }
-    return 0;
+    return debug_messages_ok(info.Get()) ? 0 : 1;
 }
 catch (const std::exception&) {
     return 3;
