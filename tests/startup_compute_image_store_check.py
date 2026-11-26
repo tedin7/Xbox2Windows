@@ -401,7 +401,7 @@ def dispatch(directory, compiler, renderer, adapter):
         ('1D dmask 0x5, data swapped', source.replace('t.x = asfloat(v14); t.z = asfloat(v15);', 't.x = asfloat(v15); t.z = asfloat(v14);'),
          16, 'mip=0 word=0 expected=3f400000 actual=3e800000'),
         ('1D dmask 0x5, all four written', source.replace(PARTIAL_1D, 'w0[v8] = asfloat(uint4(v14, v15, v16, v17));'),
-         16, 'mip=0 word=1 expected=bf000001 actual=3e800000'),
+         24, 'mip=0 word=1 expected=bf000001 actual=3e800000'),  # y, z and w of the 8 stored texels differ
     )
     if draw_cases(directory, compiler, renderer, adapter, initial + expected + [0] * len(initial), cases,
                   selector=fixture.GROUPS | TEXTURE_1D_FLAG, compared=len(initial)) == 77:

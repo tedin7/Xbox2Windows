@@ -92,7 +92,7 @@ def main(consumer, dxc, adapter):
         # on zeros: not refused, not the expected words, not untouched.
         snapshot_env = dict(env, X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
         got, result = dispatch(directory, consumer, env, 'dispatch-input-snapshot')
-        assert got == untouched and lines(result, 'refused: ')[0].endswith(CONTROLS[3][1]), result.stderr[-3000:]
+        assert got == untouched and lines(result, 'refused: ')[0].endswith(dict(CONTROLS)['dispatch-input-copied']), result.stderr[-3000:]
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-snapshot')
         assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert len(lines(result, 'comes from a snapshot of title memory (1280 bytes)')) == 1, result.stderr[-3000:]
