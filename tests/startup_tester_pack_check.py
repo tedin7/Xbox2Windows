@@ -520,6 +520,31 @@ def check_request_files():
             assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
 
 
+def check_part_one_has_the_small_files():
+    """Several parts: shader_results.txt, the debugger summary and every small log are in part 1 (Run Q: part 2 never arrived and
+    took shader_results.txt and the summary with it), the big log chunks come after them."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        rng = random.Random(9)
+        write(run, "stderr.txt", bytes(rng.randrange(256) for _ in range(700 * 1024)))  # incompressible, bigger than a part
+        (tmp / "run.out").write_bytes(b"debugger summary\n")
+        parts = T.pack(str(run), MANIFEST, str(tmp / "p.zip"), T.MANIFEST_ROOM + 300 * 1024, chunk_bytes=128 * 1024, cache_dir=str(cache))
+        assert len(parts) >= 3, parts
+        with zipfile.ZipFile(parts[0][0]) as z:
+            names = z.namelist()
+            assert T.RESULTS_NAME in names and T.SUMMARY_NAME in names, names
+            assert {"events.txt", "finished.txt", "translate.txt"} <= set(names), names
+            files = json.loads(z.read("manifest.json"))["files"]
+        assert files[T.RESULTS_NAME]["part"] == 1 and files[T.SUMMARY_NAME]["part"] == 1
+        assert max(v["part"] for v in files.values()) >= 3, "the big log spills over into later parts"
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -660,6 +685,7 @@ if __name__ == "__main__":
     check_cache_results()
     check_key_use()
     check_request_files()
+    check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
     check_manifest()

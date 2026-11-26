@@ -50,6 +50,7 @@ SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
                  "windows_build", "wall_seconds", "deep", "lazy_textures", "lazy_memory", "memory_gib", "shader_cache", "translations_at_start")
 DEFAULT_LIMIT_MB = 20
+SMALL_FILE_BYTES = 512 * 1024   # a file up to this size goes into the zip before the big logs, so part 1 holds all of them
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
 
@@ -679,31 +680,38 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         listing[member] = {"bytes": len(data), "part": len(members)}
         used += packed
 
-    for name, path in log_files(logdir):
-        for member, data in chunks(name, path, chunk_bytes):
-            add(member, data)
+    # Order = what a part 1 that arrives alone must still answer (Run Q: part 2 never came, and with it shader_results.txt, the
+    # debugger summary and every small log): the result text and the symbol table first, then every small file
+    # (SMALL_FILE_BYTES, the debugger summary included), then the big logs and the pictures, the request files last.
+    rows = []
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
         add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
+    if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
+        with open(map_file, encoding="utf-8", errors="replace") as handle:
+            symbol_rows = parse_symbols(handle.read())
+        manifest["symbols"] = len(symbol_rows)
+        add(SYMBOLS_NAME, format_symbols(symbol_rows).encode("utf-8"))
+    files = log_files(logdir)
+    small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
+    for name, path in small + [f for f in files if f not in small]:
+        for member, data in chunks(name, path, chunk_bytes):
+            add(member, data)
+    if cache_dir:  # the request files of the worst refused keys (select_requests)
         stderr_path = os.path.join(logdir, "stderr.txt")
         weights = {}
         if os.path.isfile(stderr_path):
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
                 weights = key_weights(handle.read())
         chosen = select_requests(cache_dir, rows, weights)
-        for key, kind, weight, files in chosen:
-            for name, _ in files:
+        for key, kind, weight, files_of_key in chosen:
+            for name, _ in files_of_key:
                 with open(os.path.join(cache_dir, name), "rb") as handle:
                     add(REQUESTS_DIR + "/" + name, handle.read())
         manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
                                      "bytes": sum(b for c in chosen for _, b in c[3]),
                                      "ranked": [{"key": k, "kind": kd, "weight": w} for k, kd, w, _ in chosen]}
-    if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
-        with open(map_file, encoding="utf-8", errors="replace") as handle:
-            rows = parse_symbols(handle.read())
-        manifest["symbols"] = len(rows)
-        add(SYMBOLS_NAME, format_symbols(rows).encode("utf-8"))
     stem, ext = os.path.splitext(zip_path)
     count = len(members)
     for index, group in enumerate(members, 1):
