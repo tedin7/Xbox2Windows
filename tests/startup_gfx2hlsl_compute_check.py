@@ -820,9 +820,10 @@ def expected(name):
     return out
 
 
-def translate(name, rsrc2=None, code=None, group=None):
+def translate(name, rsrc2=None, code=None, group=None, wave=None):
     source, words, default_rsrc2, local, _ = CASES[name]
-    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local)
+    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local,
+                             wave=wave)
 
 
 def refused(fragment, build):
@@ -1651,7 +1652,14 @@ def check_controls():
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
     # A readfirstlane of a buffer load at a uniform address translates; at a per-lane address it is refused.
     assert 's20 = v1;' in translate('N').hlsl_cs()
-    refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
+    # A per-lane address: the read takes the lowest enabled lane of the guest wave when the wave size is known
+    # (WaveSync gather), and is refused when it is not.
+    for group in ((16, 1, 1), (64, 1, 1)):
+        varying = translate('N', code=WORDS_N_VARYING, group=group, wave=32).hlsl_cs()
+        assert 'InterlockedMin(x2w_first[' in varying and 'x2w_val[x2w_snap_' in varying, varying
+        assert varying.count('GroupMemoryBarrierWithGroupSync();') == 2, varying  # the prologue and the one site
+    refused('v_readfirstlane_b32 requires a proven uniform source',
+            lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
     print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 

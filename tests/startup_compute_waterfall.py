@@ -38,9 +38,30 @@ def program(*, before_save=(), after_save=(), compare=COMPARE, body=(ADD, XOR), 
     return (*PREFIX, *before_save, SAVE, *after_save, *loop, branch, RESTORE, *after_restore, STORE, END)
 
 
-def translate(rows, group=(4, 1, 1)):
+# First-lane readfirstlane (RFL3): the lanes above the root constant s4 stay enabled, s22 reads v5 of the lowest of them
+# (lane 0 when none is enabled) and every lane adds it to 13 after EXEC is restored.
+ABOVE = ('v_cmpx_lt_u32_e32 s4, v0', '0400a27d')
+FIRST_READ = ('v_readfirstlane_b32 s22, v5', '05052c7e')
+ADD_FIRST = ('v_add_nc_u32_e32 v7, s22, v7', '160e0e4a')
+
+
+def first_lane_program():
+    return (*PREFIX[:-1], ABOVE, FIRST_READ, RESTORE, ADD_FIRST, STORE, END)
+
+
+def first_lane_expected(lanes, active, source, wave=32):
+    """Per thread: 13 plus the v5 word of the lowest enabled thread of its own guest wave (its lane 0 when none)."""
+    out = []
+    for lane in range(lanes):
+        base = lane // wave * wave
+        enabled = [t for t in range(base, min(base + wave, lanes)) if t > active]
+        out.append((13 + source[enabled[0] if enabled else base]) & MASK)
+    return out
+
+
+def translate(rows, group=(4, 1, 1), wave=None):
     code = bytes.fromhex(''.join(word for _, word in rows))
-    return G.ComputePipeline(code, root_blob(), USER7, group).hlsl_cs()
+    return G.ComputePipeline(code, root_blob(), USER7, group, wave=wave).hlsl_cs()
 
 
 def controls(llvm_mc=None):
@@ -83,9 +104,57 @@ def controls(llvm_mc=None):
         else:
             assert 's22 = v5;' in translate(rows)
     refused('at most 32 threads', lambda: translate(program(), (33, 1, 1)))
+    # A source that differs between lanes is read from the lowest enabled lane of its guest wave (WaveSync gather).
+    if llvm_mc:
+        rows = first_lane_program()
+        source = '\n'.join(asm for asm, _ in rows) + '\n'
+        assert assemble(llvm_mc, source) == bytes.fromhex(''.join(word for _, word in rows)), source
+        wave64 = assemble(llvm_mc, 's_and_saveexec_b64 s[0:1], vcc\nv_mov_b32 v0, 1\n')
+        assert G.guest_wave_size(wave64) == 64 and G.guest_wave_size(bytes.fromhex(''.join(w for _, w in rows))) == 32
+    for lanes, wave in ((4, 32), (32, 32), (33, 32), (64, 32), (64, 64)):
+        text = translate(first_lane_program(), (lanes, 1, 1), wave)
+        assert 'if ((exec & 1) != 0u) InterlockedMin(x2w_first[' in text and 'x2w_value_' in text, text
+        assert 'groupshared uint x2w_first[3][%d];' % -(-lanes // wave) in text, text
+    refused('guest wave size', lambda: translate(first_lane_program(), (4, 1, 1), 128))
+
+
+def first_lane_dispatch(directory, dxc, runner, adapter):
+    """Groups of 32 and 64 threads (one and two guest waves) are many host waves on WARP (4 lanes) and some GPUs: the
+    lowest enabled lane must not depend on how the host splits the group."""
+    cases = []
+    shaders = {}
+    for lanes in (32, 64):
+        src, shader = directory / ('first_lane%d.hlsl' % lanes), directory / ('first_lane%d.cso' % lanes)
+        src.write_text(translate(first_lane_program(), (lanes, 1, 1), 32), encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+        shaders[lanes] = shader
+    source = [(0x9e3779b1 * (i + 1) + 7) & MASK for i in range(WORDS)]
+    for lanes, shader in shaders.items():
+        cases = []
+        for active in (0, 5, 16, 30, 31, 40, 63):
+            output = first_lane_expected(lanes, active, source)
+            words = [1, *output, *([SENTINEL] * (WORDS - lanes)), active, *([0] * 15), *source]
+            case = directory / ('first-lane-%d-%d.case' % (lanes, active))
+            case.write_bytes(struct.pack('<%dI' % len(words), *words))
+            cases.append((case, '%d threads, lanes above %d enabled' % (lanes, active), None))
+            if active == 16:
+                wrong = list(output)
+                lane = 5  # lane 0 of its wave instead of its first enabled lane (17)
+                wrong[lane] = (13 + source[0]) & MASK
+                words = [1, *wrong, *([SENTINEL] * (WORDS - lanes)), active, *([0] * 15), *source]
+                case = directory / ('first-lane-%d-wrong.case' % lanes)
+                case.write_bytes(struct.pack('<%dI' % len(words), *words))
+                cases.append((case, 'lane 0 instead of the first enabled lane',
+                              'word=%d expected=%08x actual=%08x' % (lane, wrong[lane], output[lane])))
+        status = check_references('first-lane readfirstlane %d' % lanes, runner, adapter, shader, cases)
+        if status:
+            return status
+    return 0
 
 
 def dispatch(directory, dxc, runner, adapter):
+    if first_lane_dispatch(directory, dxc, runner, adapter):
+        return 77
     for label, body in (('arithmetic', (ADD, XOR)), ('fixed-buffer', FIXED_LOAD), ('invariant', (CONST, XOR))):
         src, shader = directory / 'waterfall.hlsl', directory / 'waterfall.cso'
         after = (USE_CONST,) if label == 'invariant' else ()

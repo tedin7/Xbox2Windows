@@ -2146,6 +2146,31 @@ class WaveSync:
         return ['uint x2w_any_%d = 0u, x2w_first_%d = 0u, x2w_snap_%d = 0u;' % (k, k, k)]
 
 
+def guest_wave_size(code):
+    """32 or 64 when the instructions of a compute program show the wave size they were compiled for, else None.
+
+    A wave32 program touches the execution mask only through exec_lo and 32-bit mask operations; a wave64 program
+    uses the 64-bit mask (exec, exec_hi, _b64 forms of the exec-writing instructions, a compare with a register pair
+    destination). A program that never touches the mask, or mixes both, proves nothing."""
+    try:
+        ins = decode(code, [])
+    except Exception:  # noqa: BLE001 - the stage reports the real error
+        return None
+    sizes = set()
+    for _, _, name, asm in ins:
+        operands = parse(asm)[1]
+        if 'exec' in name:
+            sizes.add(64 if name.endswith('_b64') else 32 if name.endswith('_b32') else 0)
+        if re.match(r'v_cmpx?_', name) and operands and re.fullmatch(r's\[\d+:\d+\]', operands[0]):
+            sizes.add(64)
+        for tok in operands:
+            if tok == 'exec_lo':
+                sizes.add(32)
+            elif tok in ('exec', 'exec_hi'):
+                sizes.add(64)
+    return sizes.pop() or None if len(sizes) == 1 else None
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -3209,6 +3234,7 @@ class Stage:
             self.wqm_exec = init_wqm_exec
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
+            self.first_lane_reads = False  # a v_readfirstlane_b32 lowered through the group (op_v_readfirstlane_b32)
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.masks = set(init_masks)
@@ -3475,6 +3501,13 @@ class Stage:
             break
         else:
             reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, self.kind))
+        if getattr(self, 'first_lane_reads', False) and not self.uniform_cf:
+            # Every thread of the group has to reach the barriers of a first-lane read.
+            reason = ('v_readfirstlane_b32 requires a proven uniform source '
+                      '(the first-lane read needs control flow that is the same for every lane)')
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
@@ -7023,8 +7056,10 @@ class Stage:
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
+                not src or src[0] != 'v' or src[1] != src[2]):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        if not self.proven_uniform_v(src[1]):
+            return self.first_lane_read(ops, dst, src)
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
             # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
@@ -7032,6 +7067,26 @@ class Stage:
             self.set_s(dst[1], self.uniform_expr[src[1]])
         else:
             self.set_s(dst[1], self.u(ops[1]))
+
+    def first_lane_read(self, ops, dst, src):
+        """v_readfirstlane_b32 of a VGPR that is not proven wave-uniform, in a compute stage.
+
+        The hardware reads the VGPR of the lowest lane of the guest wave whose EXEC bit is set (lane 0 when EXEC is
+        zero). The model keeps `exec & 1` per thread, so the lowest enabled lane is a gather site of the shared wave
+        engine (WaveSync.gather_first: groupshared words and a group barrier, independent of the host wave size).
+        Every thread of the group must reach the barrier, so the program is refused when any branch is not proved the
+        same for every lane (first_lane_reads, checked after the pass), and when the guest wave size is unknown."""
+        ws = getattr(getattr(self, 'pipe', None), 'wavesync', None)
+        if getattr(self, 'kind', None) != 'cs' or ws is None or not getattr(self, 'uniform_cf', False):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        self.first_lane_reads = self.uses_wavesync = True
+        _, value, lines = ws.gather_first('(exec & 1) != 0u', self.u(ops[1]))
+        for line in lines:
+            self.emit(line)
+        # No enabled lane: the hardware reads lane 0 of the wave.
+        first = value.replace('x2w_value_', 'x2w_first_')
+        snap = value.replace('x2w_value_', 'x2w_snap_')
+        self.set_s(dst[1], '(%s == %s ? x2w_val[%s][x2w_wave * %du] : %s)' % (first, ws.FIRST_NONE, snap, ws.wave, value))
 
     # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k
@@ -9101,7 +9156,7 @@ class ComputePipeline(Pipeline):
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -9114,6 +9169,10 @@ class ComputePipeline(Pipeline):
             raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
+        # The guest wave size (32 or 64): given by the caller (the dispatch's wave mode), else shown by the
+        # program's mask operations. Unknown: no wave-wide gather (WaveSync) is emitted.
+        self.wave = wave if wave is not None else guest_wave_size(cs_code)
+        self.wavesync = WaveSync(self.group, self.wave) if self.wave else None
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -9154,9 +9213,13 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        uses_sync = getattr(s, 'uses_wavesync', False)
+        if uses_sync:
+            shared += self.wavesync.declarations()
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + (['    ' + line for line in self.wavesync.prologue()] if uses_sync else [])
+                         + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
