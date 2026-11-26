@@ -1,0 +1,10 @@
+if(EXISTS "${INTAKE_PYTHON}")
+    set(heap_affine_check "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_heap_affine_check.py")
+    add_test(NAME startup_compute_heap_affine COMMAND "${INTAKE_PYTHON}" -B "${heap_affine_check}")
+    if(DXC_EXECUTABLE AND TARGET startup_stream_consumer)
+        add_test(NAME startup_compute_heap_affine_warp COMMAND "${INTAKE_PYTHON}" -B "${heap_affine_check}"
+            --warp "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")
+        set_tests_properties(startup_compute_heap_affine_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+    unset(heap_affine_check)
+endif()

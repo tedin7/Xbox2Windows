@@ -234,6 +234,20 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool affine = mode.rfind("dispatch-heap-affine-", 0) == 0;
+    if (affine) {
+        ComPtr<ID3D12Device> desktop;
+        if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+        D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+            model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
+            FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3) {
+            std::puts("SKIP: directly indexed compute fixtures require shader model 6.6 and resource binding tier 3");
+            return 77;
+        }
+    }
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -311,12 +325,19 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
-    if (heap_record)
-        for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
-            std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
-                        sizeof(descriptors[0]));
+    const bool affine_add = mode.rfind("dispatch-heap-affine-add", 0) == 0;
+    if (heap_record) {
+        const UINT input_at = affine_add ? 96u : 64u;
+        for (const UINT at : {0u, 32u, 64u, 96u}) {
+            if (at == 96 && !affine_add) continue;
+            const bool input = at == input_at || (at == 0 && mode == "dispatch-heap-word-null");
+            std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[input ? 0 : 1], sizeof(descriptors[0]));
+        }
+    }
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
-    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
+    UINT root_index = mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word || affine_add ? 1u : 2u;
+    if (affine && mode.find("-outside") != std::string::npos) root_index = 0x07fffffdu;
+    const UINT constants[3] = {0x01234567, 0x9e3779b9, root_index};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));

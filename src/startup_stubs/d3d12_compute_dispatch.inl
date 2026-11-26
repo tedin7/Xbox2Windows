@@ -16,7 +16,7 @@ struct ComputeTranslation {
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
     // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
-    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records, heap_bias, heap_size };
     struct Slot {
         int a, b;
         bool texture, heap;
@@ -26,12 +26,14 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool affine = false;  // byte offset is the root constant times + at, modulo 2^32
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    bool direct_heap = false;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -145,8 +147,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
         // The manifest names of the Source values after root_constant, in their order.
         const auto source = [&] {
-            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords"};
-            for (int s = 0; s < 5; ++s)
+            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords", "heap_bias", "heap_size"};
+            for (std::size_t s = 0; s < sizeof(names) / sizeof(names[0]); ++s)
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
@@ -162,6 +164,13 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap affine rootconst %d %d scale %u add %u%n",
+                     &i, &a, &b, &x, &y, &used) == 5 && whole() && i == tr.srvs.size() &&
+                 a >= 0 && b >= 0 && x && !(x % 32) && !(y % 32)) {
+            tr.srvs.push_back({a, b, false, true, -1, 0, y, x});
+            tr.srvs.back().affine = true;
+            tr.direct_heap = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u%n", &i, &a, &b, &x, &used) == 4 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({-1, 0, false, true, a, b, x});
@@ -216,6 +225,15 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
+        if (ud.source == ComputeTranslation::heap_size) {
+            if (!tr.direct_heap || ud.a != 0) return "a heap size without a directly indexed resource";
+            continue;
+        }
+        if (ud.source == ComputeTranslation::heap_bias) {
+            if (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.srvs[ud.a].affine)
+                return "a heap bias without a directly indexed resource";
+            continue;
+        }
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
@@ -225,7 +243,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()),
+            tr.direct_heap ? D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED : D3D12_ROOT_SIGNATURE_FLAG_NONE)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -279,6 +298,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
     } views[40]{};
+    UINT heap_indices[32] = {};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
@@ -349,9 +369,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
             }
         }
-        // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
-        // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+        // Match the guest's 32-bit byte arithmetic before checking the heap span.
+        const std::uint32_t heap_offset = slot.affine ? index * slot.times + slot.at : index << 5;
+        if (slot.affine) heap_indices[i] = heap_offset / 32;
+        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0
+                ? pass.title_view_heap.record(heap_offset, slot.affine ? 32 : 16) : 0)
             : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
@@ -510,7 +532,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
-        const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
+        const bool descriptor_word = ud.source >= ComputeTranslation::input_stride && ud.source <= ComputeTranslation::output_records;
+        const std::size_t view_index = descriptor_word ? (ud.source >= ComputeTranslation::output_word3 ? inputs : 0) + ud.a : 0;
+        const View& view = views[view_index];
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
         case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;
@@ -526,6 +550,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
+        case ComputeTranslation::heap_size: values[i] = draw_heap_size; break;
+        case ComputeTranslation::heap_bias: break;  // the destination heap slot is assigned below
         }
     }
     phases.to(3);
@@ -594,6 +620,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
         pass.heap_set = true;
         pass.bound_sampler_heap = nullptr;
+    }
+    if (tr->direct_heap) {
+        for (std::size_t i = 0; i < tr->uds.size(); ++i) {
+            const auto& ud = tr->uds[i];
+            // Unsigned bias maps the shader's guest record index to the checked desktop view.
+            if (ud.source == ComputeTranslation::heap_bias)
+                values[i] = first + static_cast<UINT>(ud.a) - heap_indices[ud.a];
+        }
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());

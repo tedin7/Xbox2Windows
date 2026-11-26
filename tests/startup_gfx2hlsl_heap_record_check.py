@@ -51,7 +51,7 @@ ENCODED = {
     's_lshl_b32 s6, s14, 5': '0e85068f', 's_mov_b32 s9, 1': '810389be', 's_mov_b32 s9, s5': '050389be',
     's_load_dwordx4 s[16:19], s[8:9], s6 offset:0x20': '040408f42000000c',
     's_load_dwordx8 s[16:23], s[8:9], s6': '04040cf40000000c', 's_load_dwordx4 s[16:19], s[8:9], s5': '040408f40000000a',
-    's_load_dwordx4 s[16:19], s[8:9], m0': '040408f4000000f8', 's_add_u32 s6, s6, 0': '06800680',
+    's_load_dwordx4 s[16:19], s[8:9], m0': '040408f4000000f8', 's_xor_b32 s6, s6, 0': '06800689',
     's_load_dwordx4 s[28:31], s[12:13], 0x20': '060708f4200000fa',
     's_buffer_load_dword s6, s[28:31], 0x0': '8e0120f4000000fa', 's_buffer_load_dword s6, s[28:31], s14': '8e0120f40000001c',
     's_buffer_load_dword s26, s[28:31], s14': '8e0620f40000001c',
@@ -166,10 +166,10 @@ def check_refusals():
         ('a group ID shifted', {SHIFT: ('s_lshl_b32 s6, s14, 5',)}, not_shifted),
         ('another register as the offset', {LOAD: ('s_load_dwordx4 s[16:19], s[8:9], s5',)}, not_shifted),
         ('m0 as the offset', {LOAD: ('s_load_dwordx4 s[16:19], s[8:9], m0',)}, not_shifted),
-        ('index register written again', {SHIFT: (SHIFT, 's_add_u32 s6, s6, 0')}, not_shifted),
+        ('index register written again', {SHIFT: (SHIFT, 's_xor_b32 s6, s6, 0')}, not_shifted),
         ('index register loaded from a buffer after the shift',
          {SHIFT: (SHIFT, TABLE_LOAD, 's_buffer_load_dword s6, s[28:31], 0x0')}, not_shifted),
-        ('branch target between the shift and the load', {SHIFT: (SHIFT,) + JUMP}, not_shifted),
+        ('fallthrough overwrites the offset', {SHIFT: (SHIFT,) + JUMP[:-1] + ('s_xor_b32 s6, s6, 0',)}, not_shifted),
         ('index read from a buffer at a group-ID offset',
          {SHIFT: (TABLE_LOAD, 's_buffer_load_dword s26, s[28:31], s14', 's_lshl_b32 s6, s26, 5')}, from_buffer),
         ('index read from a buffer at a group-ID offset into the shifted register',
@@ -210,9 +210,9 @@ def check_refusals():
 
 def check_mutations():
     """Translator mutation a control above must catch: without the write tracking the refused control translates."""
-    again = {SHIFT: (SHIFT, 's_add_u32 s6, s6, 0')}
+    again = {SHIFT: (SHIFT, 's_xor_b32 s6, s6, 0')}
     saved = G.scalar_destinations
-    G.scalar_destinations = lambda name, asm: set() if name.startswith('s_add_u32') else saved(name, asm)
+    G.scalar_destinations = lambda name, asm: set() if name.startswith('s_xor_b32') else saved(name, asm)
     try:
         assert pipeline(again).manifest() == MANIFEST, 'a write no longer ends the mark, and the control did not change'
     finally:

@@ -3813,6 +3813,7 @@ class Stage:
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
                                  if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
+        self.heap_affine = self.heap_affine_offsets(self.spill_cfg) if getattr(self, 'kind', None) == 'cs' else {}
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
         init_narrow_only = getattr(self, 'exec_narrow_only', True)
@@ -6149,6 +6150,76 @@ class Stage:
             self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
 
+    def heap_affine_offsets(self, cfg):
+        """Find dispatch-uniform affine offsets at scalar loads, including loop-invariant values."""
+        bounds, _, succ, _ = cfg
+        if not bounds or ('ptr', ('resheap',)) not in self.sym.values():
+            return {}
+        mask = 0xffffffff
+        arity = {'s_mov_b32': 2, 's_add_u32': 3, 's_add_i32': 3, 's_mul_i32': 3, 's_lshl_b32': 3}
+
+        def operand(token):
+            if re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', token):
+                return (False, int(token, 0) & mask)
+            if re.fullmatch(r's[0-9]+', token):
+                return (True, int(token[1:]))
+            return (False, None)
+
+        # Predecode each transfer once. All other SGPR writes invalidate the old value.
+        operations = []
+        for pc, _, name, asm in self.ins:
+            writes = scalar_destinations(name, asm)
+            _, ops, mods = parse(asm)
+            load = re.fullmatch(r's([0-9]+)', ops[2]) if name.startswith('s_load_dword') and len(ops) == 3 else None
+            load = int(load[1]) if load else None
+            args = [operand(token) for token in ops[1:]] if len(writes) == 1 and len(ops) == arity.get(name) and not mods else []
+            operations.append((pc, name, writes, load, args))
+
+        entry = {reg: self.pipe.uds[sym[1]][1:] + (1, 0) for reg, sym in self.sym.items()
+                 if sym[0] == 'ud' and self.pipe.uds[sym[1]][0] == 'rootconst'}
+        before, pending, offsets = {0: entry}, {0}, {}
+        while pending:
+            block = pending.pop()
+            facts = before[block].copy()
+            lo, hi = bounds[block]
+            for pc, name, writes, load, args in operations[lo:hi]:
+                if load is not None:
+                    offsets[pc] = facts.get(load)
+                values = [facts.get(value) if is_reg else value for is_reg, value in args]
+                if 'any' in writes:
+                    facts.clear()
+                else:
+                    for reg in writes:
+                        facts.pop(reg, None)
+                if name == 's_mov_b32' and values and values[0] is not None:
+                    facts[next(iter(writes))] = values[0]
+                elif len(values) == 2:
+                    fact, literal = values
+                    if name != 's_lshl_b32' and isinstance(literal, tuple):
+                        fact, literal = literal, fact
+                    if not isinstance(fact, tuple) or not isinstance(literal, int):
+                        continue
+                    param, word, scale, add = fact
+                    if name == 's_lshl_b32':
+                        if literal & 31 != 5:
+                            continue
+                        literal = 32
+                    if name in ('s_lshl_b32', 's_mul_i32'):
+                        scale *= literal
+                        add *= literal
+                    else:
+                        add += literal
+                    facts[next(iter(writes))] = (param, word, scale & mask, add & mask)
+            for target in succ[block]:
+                previous = before.get(target)
+                merged = facts.copy() if previous is None else {
+                    reg: value for reg, value in previous.items() if facts.get(reg) == value
+                }
+                if previous != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return offsets
+
     def heap_word_offset(self, tok, sym):
         """(param, word, scale, add) when tok, whose symbol before this instruction is sym, holds root constant word
         (param, word) times scale plus add, modulo 2^32 (see mark_heap_index); else None."""
@@ -6550,27 +6621,28 @@ class Stage:
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
     def heap_record(self, dst, base, token, imm, count):
-        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is an index shifted left by 5
-        with no later write of R and no branch target in between: D is the buffer descriptor in the 32-byte heap
-        record that the index names. The index is a root constant word, or a word an s_buffer_load read from an
-        unmodified table buffer at a literal byte offset or at a root constant word times a literal plus a literal
-        (the marks, see mark_heap_index, end at a branch target). The manifest names the root constant or where the
-        word is; the dispatch reads the word and the record. Only these exact forms are modelled."""
+        """Recognize a raw buffer record at a dispatch-uniform, 32-byte aligned offset."""
         what = 's_load of a resource heap record'
         r = reg_range(token)
         index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
         if index == ('buffer',):
             raise Unsupported('%s whose index is read from a buffer other than a table buffer at a dispatch-constant '
                               'offset' % what)
-        if not index or index[0] not in ('rootconst', 'buffer'):
-            raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+        if index and index[0] == 'rootconst':
+            source = ('resheap',) + index[1:]
+        elif index and index[0] == 'buffer':
+            source = ('resheap', 'word') + index[1:]
+        else:
+            affine = getattr(self, 'heap_affine', {}).get(getattr(self, 'pc', None))
+            if not isinstance(affine, tuple) or not affine[2] or affine[2] % 32 or affine[3] % 32:
+                raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+            source = ('resheap', 'affine') + affine
         if count != 4:
             raise Unsupported('%s of %d dwords' % (what, count))
         if imm is not None:
             raise Unsupported('%s with offset:%#x' % (what, imm))
         if self.sym.get(base[2]) != ('const', 0):
             raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
-        source = ('resheap',) + index[1:] if index[0] == 'rootconst' else ('resheap', 'word') + index[1:]
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', source, 0, i)
 
@@ -11381,6 +11453,8 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
+            if key[0][:2] == ('resheap', 'affine'):
+                continue
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
@@ -11913,6 +11987,23 @@ class ComputePipeline(Pipeline):
                           'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }')
         return out
 
+    def heap_bindings(self):
+        lines = []
+        for (source, _), resource in self.resources.items():
+            if source[:2] != ('resheap', 'affine') or resource['kind'] != 'buf':
+                continue
+            param, word, scale, add = source[2:]
+            index = resource['index']
+            root = self.ud(('rootconst', param, word))
+            bias = self.ud(('heap_bias', index))
+            size = self.ud(('heap_size', 0))
+            lines.extend((
+                f'    uint heapIndex{index} = (ud{root} * {scale}u + {add}u) / 32u + ud{bias};',
+                f'    if (heapIndex{index} >= ud{size}) return;',
+                f'    ByteAddressBuffer r{index} = ResourceDescriptorHeap[heapIndex{index}];',
+            ))
+        return lines
+
     def hlsl_cs(self):
         # The body can also meet a buffer that is both loaded and stored: translate again with it as one RW view.
         while True:
@@ -11930,12 +12021,14 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        heaps = self.heap_bindings()
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + heaps + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
+        self.heap_bindings()  # register the entry constants even if the caller only requests the manifest
         lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
@@ -11945,6 +12038,8 @@ class ComputePipeline(Pipeline):
                 where = 'root %d' % source[1]
             elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
                 where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
+            elif source[:2] == ('resheap', 'affine') and r['kind'] == 'buf':
+                where = 'heap affine rootconst %d %d scale %d add %d' % source[2:]
             elif source[0] == 'resheap' and source[1] == 'word' and r['kind'] == 'buf':
                 # The record the word at byte `at` (+ root constant word * `times`) of table buffer <param> <byte> indexes.
                 table, byte, param, word, scale, at = source[2:]
@@ -12145,7 +12240,7 @@ def log_unvalidated_lod(key, pipe):
 
 
 def translate_compute(out_dir, key):
-    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
+    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0 or cs_6_6) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
     with suppress(FileNotFoundError):
@@ -12160,15 +12255,18 @@ def translate_compute(out_dir, key):
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
     if os.environ.get('X2W_FXC') != '':
+        direct_heap = ('heap_size', 0) in pipe.uds
+        profile = 'cs_6_6' if direct_heap else 'cs_6_0'
         compiler = find_dxc()
         if compiler is None:
-            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model %s' % (
+                os.environ.get('X2W_DXC', '<unset>'), '6.6' if direct_heap else '6.0')
             write_failure(name + '.fail', message)
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
             bytecode = os.path.join(staging, 'cs.cso')
-            r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
                                capture_output=True, text=True)
             if r.returncode or not has_bytecode(bytecode):
                 # DXC names the source path; keep only the diagnostic after it.
