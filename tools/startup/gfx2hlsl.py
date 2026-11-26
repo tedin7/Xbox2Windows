@@ -11869,17 +11869,44 @@ def log_unvalidated_lod(key, pipe):
               % (key, ', '.join(sorted(forms))), file=sys.stderr, flush=True)
 
 
-def engine_compute_only():
-    """X2W_ENGINE=compute: the opt-in engine translates compute requests only; graphics and mesh stay on this translator.
-    src/startup_stubs/d3d12_draw.inl then hashes the engine suffix into the compute key alone."""
-    return os.environ.get('X2W_ENGINE') == 'compute'
-
-
 def translate_compute(out_dir, key):
-    if engine_compute_only():
-        import gfx2hlsl_engine
-        return gfx2hlsl_engine.translate_compute(out_dir, key)
-    return translate_compute_default(out_dir, key)
+    """One front door for a compute request: this translator first; when it refuses, the engine (tools/startup/gfx2hlsl_engine.py)
+    gets the same request under the same key (no cache wipe). Graphics and mesh requests never reach the engine.
+    X2W_COMPUTE_FALLBACK=0 switches the second try off."""
+    result = translate_compute_default(out_dir, key)
+    if not result.startswith('unsupported:') or os.environ.get('X2W_COMPUTE_FALLBACK') == '0':
+        return result
+    return translate_compute_via_engine(out_dir, key, result)
+
+
+def translate_compute_via_engine(out_dir, key, refusal):
+    name = os.path.join(out_dir, '%016x' % key)
+    try:
+        with open(name + '.fail') as f:
+            fail_text = f.read()
+    except OSError:
+        fail_text = None
+    try:
+        import gfx2hlsl_engine as engine
+        suffix = engine.ENGINE_KEY_SUFFIX
+        engine.ENGINE_KEY_SUFFIX = b''   # the request carries this translator's key: the engine checks and publishes under it
+        try:
+            outcome = engine.translate_compute(out_dir, key)
+        finally:
+            engine.ENGINE_KEY_SUFFIX = suffix
+    except Exception as error:  # an engine bug is a refusal, never a dead translator
+        outcome = 'engine failed: %s' % type(error).__name__
+    if outcome == 'ok':
+        with suppress(FileNotFoundError):
+            os.remove(name + '.fail')
+        print('x2w: compute %016x translated via engine' % key, flush=True)
+        return 'ok'
+    # Both refused: keep this translator's reason on record (the statistics stay comparable) and note the engine's.
+    if fail_text is not None:
+        with open(name + '.fail', 'w') as f:
+            f.write(fail_text)
+    print('x2w: compute %016x engine also refused: %s' % (key, str(outcome)[:120]), flush=True)
+    return refusal
 
 
 def translate_compute_default(out_dir, key):

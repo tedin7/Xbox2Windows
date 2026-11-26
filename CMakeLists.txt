@@ -4592,9 +4592,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     # Opt-in engine (X2W_ENGINE): WaveSync wave-wide gathers (first active lane, any lane, one lane) read back on a plain device: guest waves of 32 and
     # 64, groups of 32 to 1024 threads, a short last wave, an empty-mask wave; three wrong-value controls must be rejected.
-    # X2W_ENGINE=compute: compute requests go to the engine, graphics and mesh stay on the default translator.
-    add_test(NAME startup_engine_compute_only COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/startup_engine_compute_only_check.py")
+    # Compute front door: the default translator first, the engine on a refusal (same key); graphics and mesh never reach the engine.
+    add_test(NAME startup_engine_front_door COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_engine_front_door_check.py")
     add_test(NAME startup_engine_wavesync_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_engine_wavesync_check.py")
     foreach(adapter IN ITEMS warp hardware)

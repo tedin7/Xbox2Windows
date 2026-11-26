@@ -22,19 +22,6 @@ inline bool env_on(const char* name) noexcept
     return on;
 }
 
-// True when the variable holds exactly this word (the switch values that are not just 1).
-inline bool env_is(const char* name, const char* word) noexcept
-{
-    const DWORD saved = GetLastError();
-    char value[16]{};
-    const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
-    bool same = n != 0 && n < sizeof(value);
-    for (std::size_t i = 0; same && word[i] != 0; ++i) same = value[i] == word[i];
-    same = same && value[std::strlen(word)] == 0;
-    SetLastError(saved);
-    return same;
-}
-
 inline void logf(const char* format, ...) noexcept
 {
     char line[1536];
