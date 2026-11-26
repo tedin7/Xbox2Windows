@@ -32,7 +32,8 @@
         "startup_indirect_dispatch", "startup_indirect_draw_indexed"
       ]
     },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "runtime", "configurePreset": "release", "targets": ["startup_runtime"] }
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },

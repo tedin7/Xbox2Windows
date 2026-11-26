@@ -22,7 +22,7 @@ def check_refusal_lines(log):
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
         # 2. Short backing / unregistered address
         prefix
-        + r"unavailable texture at the supplied base and layout: reason=texture_unavailable "
+        + r"unavailable texture at the supplied base and layout: reason=texture_(?:no_resource|unreadable) "
         + res_base
         + r" view\{dim=8 fmt=28 map=0x1688 mostmip=1 mips=1 clamp=0\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",

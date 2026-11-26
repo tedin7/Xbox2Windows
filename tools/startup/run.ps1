@@ -20,7 +20,7 @@ param(
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
-    [string]$StoragePath = "",                 # X2W_STORAGE_PATH: persistent local storage root (a trailing \ is added when missing)
+    [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
     [switch]$FakeUser,                         # answer the user API for one local user

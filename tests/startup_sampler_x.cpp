@@ -18,8 +18,11 @@ constexpr UINT texture_size = 8;
 constexpr UINT mip_levels = 4;
 constexpr float border_value = 1.0f;  // OPAQUE_WHITE red channel; every texel value is at least 2.
 // Linear probes use 0.25-step texel fractions and a 0.5 LOD fraction, which fixed-point filter
-// weights represent exactly; the tolerance only absorbs float rounding.
+// weights represent exactly. D3D12 only requires the bilinear weights and the mip weight to carry
+// 8 fractional bits (D3D11.3 functional spec, texture filtering precision), so a sampler may move a weight
+// by one 1/256 step. The tolerance is that step times the texel range the weight blends, plus float rounding.
 constexpr float linear_tolerance = 0.01f;
+constexpr float weight_step = 1.0f / 256.0f;
 
 struct Probe {
     float u, v, lod;
@@ -126,6 +129,29 @@ float reference(const SamplerCase& s, const Probe& p)
     const UINT next = (std::min)(mip + 1, mip_levels - 1);
     const float f = lod - mip;
     return bilinear(s, mip, p.u, p.v) * (1 - f) + bilinear(s, next, p.u, p.v) * f;
+}
+
+// Largest value difference inside the 2x2 footprint of one mip: what a one-step weight error is multiplied by.
+float footprint_span(const SamplerCase& s, UINT mip, float u, float v)
+{
+    const float n = static_cast<float>(texture_size >> mip);
+    const int x = static_cast<int>(std::floor(u * n - 0.5f)), y = static_cast<int>(std::floor(v * n - 0.5f));
+    const float a = fetch(s, mip, x, y), b = fetch(s, mip, x + 1, y);
+    const float c = fetch(s, mip, x, y + 1), d = fetch(s, mip, x + 1, y + 1);
+    return (std::max)((std::max)(a, b), (std::max)(c, d)) - (std::min)((std::min)(a, b), (std::min)(c, d));
+}
+
+// Point filtering is exact. Linear filtering may move each 8-bit weight by one step: the two bilinear weights
+// act within a mip, and the mip weight acts across the difference between the two bilinear results.
+float tolerance_for(const SamplerCase& s, const Probe& p)
+{
+    if (!is_linear(s)) return 0.0f;
+    const float lod = (std::min)((std::max)(p.lod, s.min_lod), (std::min)(s.max_lod, float(mip_levels - 1)));
+    const UINT mip = static_cast<UINT>(lod);
+    const UINT next = (std::min)(mip + 1, mip_levels - 1);
+    const float mip_gap = std::fabs(bilinear(s, next, p.u, p.v) - bilinear(s, mip, p.u, p.v));
+    const float span = footprint_span(s, mip, p.u, p.v) + footprint_span(s, next, p.u, p.v);
+    return linear_tolerance + weight_step * (2.0f * span + mip_gap);
 }
 
 bool probes_differ(const SamplerCase& a, const SamplerCase& b)
@@ -329,7 +355,6 @@ bool check_startup_sampler_x(ID3D12Device* device, bool swapped)
     for (UINT table = 0; table < samplers.size(); ++table) {
         // In the swapped control, table 0 holds sampler 1 and table 1 holds sampler 0.
         const auto& bound = samplers[bound_case(table)];
-        const float tolerance = is_linear(bound) ? linear_tolerance : 0.0f;
         UINT count = 0;
         const Probe* probes = table_probes(table, count);
         std::printf("startup_sampler_x swapped=%u table=%u values=", static_cast<unsigned>(swapped), table);
@@ -337,7 +362,7 @@ bool check_startup_sampler_x(ID3D12Device* device, bool swapped)
             const float got = actual[word];
             const float want = reference(bound, probes[p]);
             std::printf("%s%g", p ? "," : "", got);
-            if (std::fabs(got - want) <= tolerance) continue;
+            if (std::fabs(got - want) <= tolerance_for(bound, probes[p])) continue;
             if (!mismatches++) {
                 std::fprintf(stderr, "First sampler mismatch: table %u probe %u (u=%g v=%g lod=%g) expected %g, got %g\n",
                              table, p, probes[p].u, probes[p].v, probes[p].lod, want, got);

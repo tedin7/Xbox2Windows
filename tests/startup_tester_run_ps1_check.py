@@ -15,6 +15,7 @@ notice and passes, because Linux hosts cannot run the script.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,14 +27,14 @@ REPO = Path(__file__).resolve().parent.parent
 STARTUP = REPO / "tools" / "startup"
 STUB_RUN = r"""
 param([string]$Exe, [string]$DataDir, [string]$LogDir, [int]$Seconds, [string]$BuildDir, [string]$ShaderCache,
-      [int]$ContinueAsserts, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
-      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi)
+      [int]$ContinueAsserts, [int]$MemoryGiB, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
+      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi, [switch]$LazyMemory)
 $seen = @(Get-ChildItem -LiteralPath $ShaderCache -Force | ForEach-Object { $_.Name })
 $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -52,6 +53,7 @@ key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
 """
+DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
 
 
@@ -79,6 +81,8 @@ def make_tree(root):
     head = git(tree, "rev-parse", "--short=8", "HEAD")
     gen = tree / "out" / "build" / "release" / "generated"
     gen.mkdir(parents=True)
+    for dll in DLLS:
+        (gen.parent / (dll + ".dll")).write_bytes(b"MZ")
     return tree, head, gen / "x2w_build_rev.cpp"
 
 
@@ -124,6 +128,9 @@ def check_shell(shell):
                                 "args.json", "debugger_summary.out", "manifest.json"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
+        assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
+        assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
+        assert "job memory cap %d GiB" % args["MemoryGiB"] in ok.stdout, ok.stdout
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
@@ -158,6 +165,20 @@ def check_shell(shell):
             plain_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             plain_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not plain_args["Lazy"] and plain_manifest["lazy_textures"] is False
+        nomem = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoLazyMemory")
+        assert nomem.returncode == 0, (nomem.stdout, nomem.stderr)
+        newest_mem = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_mem) as z:
+            mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
+        assert big.returncode == 0, (big.stdout, big.stderr)
+        newest_big = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_big) as z:
+            big_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            big_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert big_args["MemoryGiB"] == 33 and big_manifest["memory_gib"] == 33
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
@@ -190,7 +211,83 @@ def check_shell(shell):
           % Path(shell).name)
 
 
+def check_targets():
+    """tester_run.ps1 builds the startup_runtime target, whose DLLs are the ones run.ps1 copies."""
+    script = (STARTUP / "tester_run.ps1").read_text(encoding="utf-8")
+    assert "--target startup_runtime" in script
+    dlls = re.findall(r'"([A-Za-z0-9_]+)"', re.search(r"\$runDlls = @\((.*?)\)", script).group(1))
+    run_dlls = re.findall(r'"(\w+)"', re.search(r'foreach \(\$dll in (.*?)\) \{', (STARTUP / "run.ps1").read_text(encoding="utf-8")).group(1))
+    assert dlls == run_dlls, (dlls, run_dlls)
+    assert "add_custom_target(startup_runtime)" in (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
+    print("tester_run.ps1 builds startup_runtime for the %d DLLs run.ps1 copies" % len(run_dlls))
+
+
+STUB_CMAKE = """\
+cmake_minimum_required(VERSION 3.20)
+project(stub NONE)
+add_custom_target(x2w_build_rev_generate COMMAND ${CMAKE_COMMAND} "-DSRC=${CMAKE_SOURCE_DIR}"
+    "-DOUT=${CMAKE_BINARY_DIR}/generated/x2w_build_rev.cpp" -P "${CMAKE_SOURCE_DIR}/rev.cmake")
+foreach(pair IN ITEMS xmem_shim:xmem d3d12_xs_shim:d3d12_xs startup_stub_acphal:AcpHal startup_stub_chad:chad
+        startup_stub_xapu:xapu startup_stub_xcrdapi:XCRDAPI startup_stub_xg_xs:xg_xs startup_stub_gameinput:GameInput)
+    string(REPLACE ":" ";" parts "${pair}")
+    list(GET parts 0 target)
+    list(GET parts 1 dll)
+    add_custom_target(${target} COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/${dll}.dll")
+    list(APPEND runtime_targets ${target})
+endforeach()
+add_custom_target(startup_runtime)
+add_dependencies(startup_runtime x2w_build_rev_generate ${runtime_targets})
+# Everything else a full build would compile: it must stay unbuilt for a run.
+add_custom_target(all_targets ALL)
+add_dependencies(all_targets startup_runtime)
+add_custom_target(decoy_test_exe ALL COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/decoy.txt")
+"""
+
+
+REV_CMAKE = r"""
+execute_process(COMMAND git -C "${SRC}" rev-parse --short=8 HEAD OUTPUT_VARIABLE rev OUTPUT_STRIP_TRAILING_WHITESPACE)
+file(WRITE "${OUT}" "const char x2w_build_rev[] = \"${rev}\";\n")
+"""
+
+
+def check_build(shell):
+    """A configured but unbuilt build directory: tester_run.ps1 builds only the run's targets (-FullBuild: all)."""
+    if not shutil.which("cmake"):
+        print("startup_tester_run_ps1_check: no cmake on this host: build check skipped")
+        return
+    with tempfile.TemporaryDirectory() as root:
+        tree, head, _ = make_tree(root)
+        build = tree / "out" / "build" / "release"
+        shutil.rmtree(build)
+        (tree / "CMakeLists.txt").write_text(STUB_CMAKE, encoding="utf-8")
+        (tree / "rev.cmake").write_text(REV_CMAKE, encoding="utf-8")
+        generator = ["-G", "Ninja"] if shutil.which("ninja") else []  # as the real presets: single config, no MSBuild
+        configured = subprocess.run(["cmake", *generator, "-S", str(tree), "-B", str(build)], capture_output=True, text=True)
+        assert configured.returncode == 0, configured.stdout + configured.stderr
+        git(tree, "add", "CMakeLists.txt", "rev.cmake")
+        git(tree, "commit", "-q", "-m", "cmake")
+        head = git(tree, "rev-parse", "--short=8", "HEAD")
+        assert not (build / "xmem.dll").exists()
+        result = run_script(shell, tree, "-CaptureEvery", "0")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "building startup_runtime" in result.stdout, result.stdout
+        for dll in DLLS:
+            assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"
+        assert (build / "generated" / "x2w_build_rev.cpp").read_text().count('"%s"' % head) == 1
+        assert not (build / "decoy.txt").exists(), "a target the run does not need was built"
+        # A missing DLL is rebuilt even when the revision stamp is current.
+        (build / "GameInput.dll").unlink()
+        again = run_script(shell, tree, "-CaptureEvery", "0")
+        assert again.returncode == 0 and (build / "GameInput.dll").exists() and "GameInput.dll" in again.stdout, again.stdout
+        # -FullBuild builds the rest too (the revision is current, so a DLL has to be missing to trigger a build).
+        (build / "xmem.dll").unlink()
+        full = run_script(shell, tree, "-CaptureEvery", "0", "-FullBuild")
+        assert full.returncode == 0 and "-FullBuild" in full.stdout and (build / "decoy.txt").exists(), (full.stdout, full.stderr)
+    print("tester_run.ps1 builds only the run's targets (and everything with -FullBuild) under %s" % Path(shell).name)
+
+
 def main():
+    check_targets()
     available = shells()
     if not available or not shutil.which("git"):
         print("startup_tester_run_ps1_check: no PowerShell or no git on this host: skipped")
@@ -200,6 +297,7 @@ def main():
         return 0
     for shell in available:
         check_shell(shell)
+        check_build(shell)
     return 0
 
 

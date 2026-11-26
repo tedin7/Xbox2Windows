@@ -2,7 +2,8 @@
 // executable in a kill-on-close job with a timeout, a commit cap and captured stdout/stderr, and
 // this fixture is the only executable the check needs: it writes known bytes to both streams and
 // the trap log, reports a known exit code, or holds memory, spawns a child or stays alive so the
-// job limits have to stop it. Paths stay UTF-16 throughout: the launcher passes a Unicode trap-log
+// job limits have to stop it. The "overlap" mode (from X2W_LAUNCH_PROBE_MODE, because the debugger passes no
+// arguments) opens one file from four threads that enter CreateFileW together, for tests/startup_hook_check.py. Paths stay UTF-16 throughout: the launcher passes a Unicode trap-log
 // path, and its build or temp folder can hold characters the active ANSI code page cannot.
 #include <windows.h>
 
@@ -45,11 +46,56 @@ void spawn_second_process(const wchar_t* self)
     CloseHandle(child.hProcess);
     std::printf("spawn ok\n");
 }
+constexpr int overlap_threads = 4;
+constexpr int overlap_rounds = 16;
+
+struct Overlap {
+    const wchar_t* path;
+    volatile LONG arrived[overlap_rounds];
+    volatile LONG opened;
+};
+
+// All threads spin for each other before every open, so each round enters the same function at once.
+DWORD WINAPI overlap_thread(LPVOID parameter)
+{
+    auto* shared = static_cast<Overlap*>(parameter);
+    for (int round = 0; round < overlap_rounds; ++round) {
+        InterlockedIncrement(&shared->arrived[round]);
+        const ULONGLONG begin = GetTickCount64();
+        while (shared->arrived[round] < overlap_threads && GetTickCount64() - begin < 10000) YieldProcessor();
+        const HANDLE file = CreateFileW(shared->path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) continue;
+        CloseHandle(file);
+        InterlockedIncrement(&shared->opened);
+    }
+    return 0;
+}
+
+int overlapping_opens()
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"X2W_LAUNCH_PROBE_FILE", path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return 64;
+    static Overlap shared{};
+    shared.path = path;
+    HANDLE threads[overlap_threads]{};
+    for (HANDLE& thread : threads) {
+        thread = CreateThread(nullptr, 0, overlap_thread, &shared, 0, nullptr);
+        if (!thread) return 65;
+    }
+    const DWORD waited = WaitForMultipleObjects(overlap_threads, threads, TRUE, 60000);
+    constexpr int total = overlap_threads * overlap_rounds;
+    std::printf("overlap opens %ld of %d\n", static_cast<long>(shared.opened), total);
+    return waited == WAIT_OBJECT_0 && shared.opened == total ? 0 : 1;
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     const char* mode = argc > 1 ? argv[1] : "report";
+    char from_env[16]{};
+    if (argc == 1 && GetEnvironmentVariableA("X2W_LAUNCH_PROBE_MODE", from_env, sizeof(from_env))) mode = from_env;
+    if (std::strcmp(mode, "overlap") == 0) return overlapping_opens();
     if (std::strcmp(mode, "report") == 0) {
         stream(stdout, "launch-probe stdout\n");
         stream(stderr, "launch-probe stderr\n");

@@ -451,8 +451,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             invoke(list, 25, arg(pso));
             return true;
         };
-        // Retrying the same bytes after abandoning a recording still needs an upload. Keep the
-        // shared-ring control's first upload submitted so its mismatch comes from ring wrap.
+        // Retrying the same bytes after abandoning a recording still needs an upload. The shared-ring
+        // control skips it so every upload behind the gate comes from the ring, whose 256 MiB cap is
+        // then exhausted: the later reservations are refused and those draws bind the null view.
         if (!GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0)) {
             if (const int result = draw_gated_console_payload(guest, list, 0, true)) return result;
             if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || !next_recording()) return 35;

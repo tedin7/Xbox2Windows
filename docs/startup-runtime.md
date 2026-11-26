@@ -777,7 +777,14 @@ ctest --preset release --no-tests=error -R '^startup_stubs$' -V
 ```
 
 The build produces `xmem.dll`, `d3d12_xs.dll`, `AcpHal.dll`, `XCRDAPI.dll`, `chad.dll`, `xapu.dll`,
-`xg_xs.dll` and `GameInput.dll`. Without the switches, every export that has no implementation
+`xg_xs.dll` and `GameInput.dll`. To run a title you need only these eight and the build revision stamp, not the test
+executables: `cmake --preset release` once, then
+
+```powershell
+cmake --build --preset runtime
+```
+
+builds the `startup_runtime` target, which depends on exactly the files `run.ps1` copies. Without the switches, every export that has no implementation
 traps: it logs `x2w-trap <dll>!<export>` with its argument registers and ends the process with a
 code that names the export (see `src/startup_stubs/trap.h`).
 
@@ -798,7 +805,8 @@ are not copied. Keep using the package root as `-DataDir`, then run the staged e
     -Seconds 180 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
 ```
 
-`run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+`run.ps1` copies the stand-ins next to the executable (build them with `cmake --build --preset runtime`) and starts
+`tools/startup/debug_launch.py`.
 Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
 and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
@@ -1473,6 +1481,31 @@ cmake --build --preset dev --target startup_trap_header_check
 ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_precedence_control)?$' -V
 ```
 
+## Concurrent calls through a hooked function
+
+The debugger's file, socket and allocation hooks are one patched byte per function. To run the original
+instruction it restores the byte, single-steps the thread that hit it and patches the byte again. A second thread that
+entered the function inside that window ran untraced, so `files.txt` could miss opens and the
+offline mode could miss a refused socket. Now every other thread is held for the step and resumes when the stepping
+thread is done (`tools/startup/hook_window.py`). A thread that had already trapped when it was held goes back to the
+hook address and traps again afterwards, so its call is traced once, not twice. Each window has a 2 s deadline, so a
+thread is never held forever. Per-thread state of a call in flight (the return address and stack pointer it will come back to) is
+keyed by thread id, not shared.
+
+Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+
+`tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
+enter `CreateFileW` together 16 times each on one file, and all 64 opens must show in `files.txt` with their result and
+`unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
@@ -1509,7 +1542,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -2015,6 +2048,11 @@ exists succeeds. Names must be one plain path component of at most 128 bytes (no
 `..`, control characters, device names or the reserved suffixes `.x2w-part` and `.x2w-old`, in any
 case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
 that is a symbolic link or, on Windows, a junction is refused by every operation.
+
+`X2W_STORAGE_PATH` is the root of the console drive, not the save folder. The title appends
+`x2w-gamesave` to it, so `S:\` stores the files under `S:\x2w-gamesave` while
+`S:\x2w-gamesave` stores them under `S:\x2w-gamesave\x2w-gamesave`. Point it at the drive root
+(or a folder mounted as a drive) and keep one path per profile set.
 
 Blob writes and deletes are kept with the update and reach the disk only when the update is
 submitted (the public API makes the whole update atomic at submit). An update closed without a
@@ -3312,7 +3350,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
   for each new combination of format, layout, one or several mips, one or several slices, flags,
   dimension, view format, view dimension and outcome (at most 200). The outcome is
   `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
-  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+  `published console layout`, one of the two hold reasons, `texture_no_resource` (no live resource at that base and description), `texture_unreadable` (the texels are not readable), `texture_over_64mib` (more than the 64 MiB single-copy limit) or `texture_unavailable` (publication failed otherwise).
 - `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
   submits that drop retained uploads.
 
@@ -3336,8 +3374,14 @@ recording and before submit, while the cap skips multi-GiB existing heaps to avo
 uncovered prefix, and right before
 `OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
-success (`not aliased` in the log). `reserve_upload_ring` similarly grows in demand chunks starting at 16 MiB up to the
-256 MiB total cap instead of committing 256 MiB upfront. `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+success (`not aliased` in the log). `reserve_upload_ring` grows in demand
+chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
+bytes for the process; the allocator may use an older unused tail but
+refuses exhaustion or allocation failure rather than resetting live storage.
+`upload_reservation` exercises the shared cursor and returned-pointer contract
+without D3D12; on non-Windows hosts run
+`c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
+`X2W_D3D12_LINEAR_BUFFERS` changes placement for one buffer kind: a
 buffer description with row-major or unknown layout and initial state `COMMON`
 (`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
 Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.

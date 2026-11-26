@@ -4,7 +4,8 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
-   into generated\x2w_build_rev.cpp). If not, it builds (cmake --build) or, with -NoBuild, stops with a message.
+   into generated\x2w_build_rev.cpp). If not, or a DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
+   revision stamp; -FullBuild builds everything) or, with -NoBuild, stops with a message.
 2. Uses one shader cache folder per shader revision (out\startup\shader_cache_<rev>, from the x2w-startup-shader-N
    strings of gfx2hlsl.py): kept across runs and across branch updates that do not bump the revision. The --watch translator needs minutes to catch up, so an emptied cache would leave
    pipelines untranslated and the screen black. The summary says how many translations were present at start.
@@ -16,13 +17,22 @@ One command for a tester: check the build, run the title offline with a per-comm
    files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
 
+The launcher's job memory cap (run.ps1 -MemoryGiB, default 14) is set to 75% of physical RAM, at least 14 GiB: a run whose
+commit passes the cap dies with error 1455. -MemoryGiB overrides it; the summary prints it and the manifest records it.
+
+Lazy memory commit is ON by default (run.ps1 -LazyMemory): physical pages and the large startup blocks are committed on
+first touch, which cuts the section commit. -NoLazyMemory turns it off. The manifest records it.
+
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
 
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
 -Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
-time counts from that poll, which the title reaches late). Any other value is a raw
+time counts from that poll, which the title reaches late).
+-Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
+still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
+Any other value is a raw
 X2W_INPUT_SCRIPT (docs/startup-runtime.md, "Input script").
 
 .EXAMPLE
@@ -38,8 +48,11 @@ param(
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$LimitMB = 20,
+    [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
+    [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
+    [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures                     # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
 )
 $ErrorActionPreference = "Stop"
@@ -62,18 +75,43 @@ function Get-BuildRevision {
     return $null
 }
 
+# `startup_runtime` builds exactly the eight DLLs run.ps1 copies next to the title (OUTPUT_NAMEs xmem, d3d12_xs, AcpHal,
+# XCRDAPI, chad, xapu, xg_xs, GameInput) and the build revision stamp (cmake --build --preset runtime); a run needs nothing
+# else, so the full build (hundreds of test executables) is skipped unless -FullBuild asks for it.
+$runDlls = @("xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput")
+
+function Get-MissingDlls {
+    return @($runDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $buildRoot "$_.dll")) })
+}
+
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }
 $built = Get-BuildRevision
-if ($built -ne $wanted) {
+$missing = Get-MissingDlls
+if ($built -ne $wanted -or $missing.Count -gt 0) {
     $have = if ($built) { $built } else { "no build" }
+    if ($built -eq $wanted) { $have = "$built without " + ($missing -join ", ") + ".dll" }
     if ($NoBuild) {
         throw "tester_run: the build in $buildRoot is from $have, this checkout is $wanted. Build it (cmake --build `"$buildRoot`") or run without -NoBuild."
     }
-    Write-Host "tester_run: build is from $have, checkout is ${wanted}: building"
-    & cmake --build $buildRoot
+    if (-not (Test-Path -LiteralPath (Join-Path $buildRoot "CMakeCache.txt"))) {
+        if ($BuildDir -ne "out/build/release") { throw "tester_run: $buildRoot is not configured (run cmake -S `"$repo`" -B `"$buildRoot`" first)" }
+        Write-Host "tester_run: configuring $buildRoot (cmake --preset release)"
+        Push-Location $repo
+        try { & cmake --preset release } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw "tester_run: the configure failed (cmake exit $LASTEXITCODE)" }
+    }
+    if ($FullBuild) {
+        Write-Host "tester_run: build is from $have, checkout is ${wanted}: building everything (-FullBuild)"
+        & cmake --build $buildRoot
+    } else {
+        Write-Host "tester_run: build is from $have, checkout is ${wanted}: building startup_runtime (the run's targets)"
+        & cmake --build $buildRoot --target startup_runtime
+    }
     if ($LASTEXITCODE -ne 0) { throw "tester_run: the build failed (cmake exit $LASTEXITCODE)" }
     $built = Get-BuildRevision
+    $missing = Get-MissingDlls
+    if ($missing.Count -gt 0) { throw "tester_run: after the build these DLLs are missing in ${buildRoot}: " + ($missing -join ", ") }
     if ($built -ne $wanted) {
         throw "tester_run: after the build the revision is $built, expected $wanted"
     }
@@ -102,15 +140,19 @@ $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-
 $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
+$physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+if ($MemoryGiB -le 0) { $MemoryGiB = [int](& $python -B $pack memory-gib $physicalBytes) }
+Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir
-    ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
+    MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
+if (-not $NoLazyMemory) { $runArgs.LazyMemory = $true }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
@@ -139,7 +181,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$stamp.json"

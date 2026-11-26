@@ -35,6 +35,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
+#include "startup_stubs/upload_reservation.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
@@ -48,6 +49,7 @@
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
@@ -1009,14 +1011,20 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
     *out = nullptr;
     HRESULT hr = E_NOINTERFACE;
     if (is_base_iid(*iid) || kind_for(*iid) == self->own().kind) {
-        InterlockedIncrement(&self->own().refs);
+        const auto refs = InterlockedIncrement(&self->own().refs);
+        if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
         *out = self;
         hr = S_OK;
     }
     log("x2w-d3d12 %s::QueryInterface riid=%s -> 0x%08lx", kind_names[self->own().kind], text, static_cast<unsigned long>(hr));
     return hr;
 }
-ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
+ULONG __stdcall add_ref(Wrapper* self)
+{
+    const auto refs = InterlockedIncrement(&self->own().refs);
+    if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
+    return static_cast<ULONG>(refs);
+}
 // X2W_D3D12_LINEAR_BUFFERS (opt-in): the shared or copied backing of slot 133's linear buffers
 // (src/startup_stubs/linear_buffer_backing.h). Unused while the switch is off.
 x2w_startup::LinearBuffers& linear_buffers()
@@ -1057,6 +1065,9 @@ struct LazyTextureRecord {
     DXGI_FORMAT desktop_format{};
 };
 std::mutex lazy_texture_mutex;  // lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock
+// Publications of a lazy texture in progress and finished, so a guest descriptor copy can tell whether its native copy may
+// have raced one (it then writes the real view into the destination, see refresh_copied_lazy_views).
+LONG lazy_publishing, lazy_published_total;
 std::unordered_map<const Wrapper*, LazyTextureRecord>& lazy_textures()
 {
     static std::unordered_map<const Wrapper*, LazyTextureRecord> m;
@@ -1082,6 +1093,9 @@ ULONG __stdcall release(Wrapper* self)
         if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
+            // The last release ends the resource for existing_memory_buffer and address_resource_overlap (they skip
+            // refs <= 0) whether or not it has a placement entry: a refusal cached while it was live is stale.
+            x2w_startup::note_placement_change();
             retire_placement(self);
             if (self->own().retire_when_idle) retire_note_title_release(self);
             if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
@@ -2461,26 +2475,18 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     return pipeline;
 }
 
-// Transient data the title addresses by GPU address (fetch tables, vertices, constants) is copied
-// from its memory into a desktop upload buffer; the copy's GPU address is bound instead.
-// Chunks start at 16 MiB and append on demand (doubling up to the 256 MiB total cap), staying alive
-// for the process so previously returned (ID3D12Resource*, offset) and GPU virtual addresses remain valid.
-struct UploadRingChunk {
-    ID3D12Resource* resource = nullptr;
-    unsigned char* mapped = nullptr;
-    u64 capacity = 0;
-    u64 used = 0;
-};
+// Transient guest data is copied into mapped upload chunks. Chunks grow from
+// 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
+// refuses new reservations rather than reusing storage without completion.
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+UploadReservation reserve_upload_ring(std::size_t bytes)
 {
     constexpr u64 initial_chunk_bytes = u64{16} << 20;
     constexpr u64 max_total_bytes = u64{256} << 20;
     constexpr u64 max_alloc_bytes = max_total_bytes / 4;
-    if (resource) *resource = nullptr;
-    if (offset) *offset = 0;
-    if (bytes == 0 || bytes > max_alloc_bytes) return nullptr;
-    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
+    UploadReservation reservation;
+    if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
+    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
     static SRWLOCK lock = SRWLOCK_INIT;
     static std::vector<UploadRingChunk> chunks;
@@ -2488,18 +2494,12 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
     static u64 total_bytes = 0;
 
     AcquireSRWLockExclusive(&lock);
-    auto finish = [&](UploadRingChunk& chunk, u64 start) -> unsigned char* {
-        if (offset) *offset = start;
-        if (resource) *resource = chunk.resource;
-        ReleaseSRWLockExclusive(&lock);
-        return chunk.mapped + start;
-    };
-
-    if (!chunks.empty() && chunks[active].used + rounded <= chunks[active].capacity) {
-        UploadRingChunk& chunk = chunks[active];
-        const u64 start = chunk.used;
-        chunk.used += rounded;
-        return finish(chunk, start);
+    if (!chunks.empty()) {
+        reservation = reserve_upload_chunk(chunks[active], rounded);
+        if (reservation.mapped) {
+            ReleaseSRWLockExclusive(&lock);
+            return reservation;
+        }
     }
 
     const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
@@ -2525,10 +2525,12 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
                 auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
                 if (SUCCEEDED(created->Map(0, nullptr, &base))) {
                     try {
-                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, rounded});
+                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
                         active = chunks.size() - 1;
-                        return finish(chunks[active], 0);
+                        reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        ReleaseSRWLockExclusive(&lock);
+                        return reservation;
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
                         if (budget) budget->end_use();
@@ -2541,18 +2543,32 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
             }
         }
     }
-
-    for (std::size_t step = 1; step <= chunks.size(); ++step) {
-        const std::size_t idx = (active + step) % chunks.size();
-        if (chunks[idx].capacity >= rounded) {
-            active = idx;
-            chunks[idx].used = rounded;
-            return finish(chunks[idx], 0);
+    // Allocation failed or the cap was reached. Older unused tails are still safe.
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        reservation = reserve_upload_chunk(chunks[index], rounded);
+        if (reservation.mapped) {
+            active = index;
+            ReleaseSRWLockExclusive(&lock);
+            return reservation;
         }
     }
 
     ReleaseSRWLockExclusive(&lock);
-    return nullptr;
+    static LONG refused;
+    if (first_calls(refused, 8))
+        log("x2w-draw upload ring reservation refused: no unused capacity");
+    return reservation;
+}
+
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+{
+    if (resource) *resource = nullptr;
+    if (offset) *offset = 0;
+    const UploadReservation reservation = reserve_upload_ring(bytes);
+    if (!reservation.mapped) return nullptr;
+    if (offset) *offset = reservation.offset;
+    if (resource) *resource = reservation.resource;
+    return reservation.mapped;
 }
 
 bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
@@ -4826,6 +4842,91 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     return result;
 }
 
+// Writes the desktop SRV for a lazy texture's view record into one descriptor slot, as the title's view described it.
+// The caller holds note_lock shared and has checked that the slot still names the record.
+void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_RESOURCE_DESC& created_desc,
+                     x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
+        device->CreateShaderResourceView(created, nullptr, dest);
+        return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
+    if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
+        if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
+                static_cast<unsigned>(created_desc.Format), view_mode)) {
+            device->CreateShaderResourceView(created, nullptr, dest);
+        }
+        return;
+    }
+    srv_desc.Format = desktop_format(srv_desc.Format);
+    if (x2w_startup::packed_target_format(srv_desc.Format)) {
+        const auto verdict = x2w_startup::packed_view(
+            srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
+        if (verdict == x2w_startup::PackedView::refused) return;
+        if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
+    }
+    device->CreateShaderResourceView(created, &srv_desc, dest);
+}
+
+// After a guest descriptor copy: a destination slot that now names a lazy texture which already has its real resource got
+// the native NULL descriptor from the desktop copy when the copy ran while the texture was being published (its
+// refresh had taken its snapshot already, or the copy raced the real descriptor). Write the real view into such slots.
+// A texture that has no real resource yet is handled by its own refresh, which runs after this slot is recorded.
+void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT increment)
+{
+    if (!lazy_textures_enabled() || !count) return;
+    struct Candidate {
+        std::uint32_t index, id;
+        Wrapper* texture;
+    };
+    std::vector<Candidate> candidates;
+    try {
+        AcquireSRWLockShared(&note_lock);
+        std::uint32_t room = 0;
+        const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
+        if (ids && count <= room) {
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t id = ids[i];
+                if (!id || id - 1 >= view_records().size() || !view_materialized()[id - 1]) continue;
+                const ViewRecord& vr = view_records()[id - 1];
+                if (vr.slot == 18 && vr.resource) candidates.push_back({i, id, reinterpret_cast<Wrapper*>(vr.resource)});
+            }
+        }
+        ReleaseSRWLockShared(&note_lock);
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockShared(&note_lock);
+        return;
+    }
+    for (const Candidate& candidate : candidates) {
+        ID3D12Resource* real = nullptr;
+        {
+            // lazy_texture_mutex comes before note_lock in the lock order; a texture not in the map is not lazy.
+            std::lock_guard lock(lazy_texture_mutex);
+            const auto found = lazy_textures().find(candidate.texture);
+            if (found == lazy_textures().end()) continue;
+            real = static_cast<ID3D12Resource*>(candidate.texture->own().real);
+            if (real) real->AddRef();
+        }
+        if (!real) continue;
+        const D3D12_RESOURCE_DESC real_desc = real->GetDesc();
+        const auto view_mode = view_defaults_mode();
+        AcquireSRWLockShared(&note_lock);
+        std::uint32_t room = 0;
+        const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
+        // The slot must still name the record, and the record still the texture (the title may have overwritten it).
+        if (ids && candidate.index < room && ids[candidate.index] == candidate.id && candidate.id - 1 < view_records().size() &&
+            view_materialized()[candidate.id - 1] && view_records()[candidate.id - 1].slot == 18 &&
+            view_records()[candidate.id - 1].resource == reinterpret_cast<u64>(candidate.texture)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE dest{static_cast<SIZE_T>(dest_desktop + u64{candidate.index} * increment)};
+            create_lazy_srv(device_of(self), real, real_desc, view_mode, view_records()[candidate.id - 1], dest);
+        }
+        ReleaseSRWLockShared(&note_lock);
+        real->Release();
+    }
+}
+
 // Copy through actual desktop heaps. A logical range may straddle the last
 // shader-visible descriptor and the first CPU-only descriptor.
 void copy_descriptor_run(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DESCRIPTOR_HEAP_TYPE type)
@@ -4839,8 +4940,14 @@ void copy_descriptor_run(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DES
         const auto s = desktop_cpu_handle(src, &src_room, &src_total);
         if (count > dest_total || count > src_total || !d || !s) return;
         const UINT chunk = (std::min)(count, (std::min)(dest_room, src_room));
+        const LONG published_before = InterlockedCompareExchange(&lazy_published_total, 0, 0);
+        const bool publishing_before = InterlockedCompareExchange(&lazy_publishing, 0, 0) != 0;
         device_of(self)->CopyDescriptorsSimple(chunk, {static_cast<SIZE_T>(d)}, {static_cast<SIZE_T>(s)}, type);
         note_copy(dest, src, d, s, chunk, increment);
+        // A copy that overlapped the publication of a lazy texture may have copied its native NULL descriptor.
+        if (publishing_before || InterlockedCompareExchange(&lazy_publishing, 0, 0) != 0 ||
+            InterlockedCompareExchange(&lazy_published_total, 0, 0) != published_before)
+            refresh_copied_lazy_views(self, d, chunk, increment);
         dest += u64{chunk} * dest_stride;
         src += u64{chunk} * src_stride;
         count -= chunk;
@@ -5111,7 +5218,7 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
     auto& group = placement_group(desc->Width);
     const HRESULT hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
-        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); });
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); x2w_startup::note_placement_change(); });
     if (FAILED(hr)) {
         // The caller has never received this wrapper; release its desktop resource and storage.
         AcquireSRWLockExclusive(&registry_lock);
@@ -5407,6 +5514,17 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     if (!w->own().lazy_slot133_texture) return static_cast<ID3D12Resource*>(w->own().real);
     if (InterlockedCompareExchange(&w->own().refs, 0, 0) == retired_refs) return nullptr;
 
+    // Counts this publication (the real resource and its descriptor refresh) for the descriptor copies that overlap it.
+    struct PublishScope {
+        bool on = false;
+        void begin() { on = true; InterlockedIncrement(&lazy_publishing); }
+        ~PublishScope()
+        {
+            if (!on) return;
+            InterlockedIncrement(&lazy_published_total);
+            InterlockedDecrement(&lazy_publishing);
+        }
+    } publish;
     ID3D12Device* device = nullptr;
     ID3D12Resource* created = nullptr;
     {
@@ -5433,6 +5551,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         }
         if (FAILED(hr) || !created) return nullptr;
 
+        publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
             AcquireSRWLockExclusive(&retire_lock);
             if (InterlockedCompareExchange(&w->own().refs, 0, 0) == retired_refs) {
@@ -5507,27 +5626,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
             if (vr.slot != 18 || vr.resource != target_wrapper) continue;
             const D3D12_CPU_DESCRIPTOR_HANDLE dest{
                 static_cast<SIZE_T>(target_heap->desktop_cpu + u64{item.slot_index} * target_heap->increment)};
-            if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-                device->CreateShaderResourceView(created, nullptr, dest);
-                continue;
-            }
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-            std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
-            if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
-                if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
-                        static_cast<unsigned>(created_desc.Format), view_mode)) {
-                    device->CreateShaderResourceView(created, nullptr, dest);
-                }
-                continue;
-            }
-            srv_desc.Format = desktop_format(srv_desc.Format);
-            if (x2w_startup::packed_target_format(srv_desc.Format)) {
-                const auto verdict = x2w_startup::packed_view(
-                    srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
-                if (verdict == x2w_startup::PackedView::refused) continue;
-                if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
-            }
-            device->CreateShaderResourceView(created, &srv_desc, dest);
+            create_lazy_srv(device, created, created_desc, view_mode, vr, dest);
         }
         ReleaseSRWLockShared(&note_lock);
     }
@@ -5861,6 +5960,7 @@ void drain_retired_resources()
             {
                 x2w_startup::ExclusiveNoteLock guard(note_lock);
                 resource_address_index().erase(address, drop.wrapper);
+                x2w_startup::note_placement_change();
             }
             if (drop.wrapper->own().retire_has_written_gen && !retire_address_has_live_user(address, drop.wrapper)) {
                 AcquireSRWLockExclusive(&written_lock);
@@ -7432,29 +7532,75 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& sizes,
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build)
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build, x2w_startup::PlacedBuildCause* reported)
 {
-    if (build.SourceAccelerationStructureData ||
-        (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE))
+    using Cause = x2w_startup::PlacedBuildCause;
+    // One log line per cause, for the first refusal of that kind in the process.
+    static LONG logged[static_cast<std::size_t>(Cause::count)];
+    // What the resolver published for each placed build (flags per structure), see PlacedBuildLedger.
+    static SRWLOCK ledger_lock = SRWLOCK_INIT;
+    static x2w_startup::PlacedBuildLedger ledger;
+    const auto refuse = [&](Cause cause, const char* role, UINT64 address) {
+        if (reported) *reported = cause;
+        if (first_calls(logged[static_cast<std::size_t>(cause)], 1))
+            log("x2w-dxr placed build refused: %s (%s at title 0x%llx)", x2w_startup::cause_name(cause), role,
+                static_cast<unsigned long long>(address));
         return E_INVALIDARG;
-    constexpr UINT64 alignment = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
-    const auto translate = [&](UINT64 address, UINT64 bytes, D3D12_RESOURCE_STATES state) -> UINT64 {
-        if (address % alignment) return 0;
+    };
+    const bool update = (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
+    const UINT64 source = build.SourceAccelerationStructureData;
+    if (const Cause shape = x2w_startup::check_update_shape(update, source, dest, sizes.ResultDataMaxSizeInBytes);
+        shape != Cause::ok)
+        return refuse(shape, "source", source);
+    constexpr UINT64 alignment = x2w_startup::build_alignment;
+    struct Translated {
+        Cause cause;
+        UINT64 gpu;
+    };
+    const auto translate = [&](UINT64 address, UINT64 bytes, D3D12_RESOURCE_STATES state) -> Translated {
+        if (address % alignment) return {Cause::unaligned, 0};
         const auto found = placed_buffer_range(static_cast<const Wrapper*>(guest_device), address, bytes);
-        if (!found.owner || found.reject) return 0;
+        if (!found.owner || found.reject) return {Cause::not_placed, 0};
         const auto* info = resource_info(found.owner);
-        if (!info || info->initial_state != state) return 0;
+        if (!info || info->initial_state != state) return {Cause::wrong_state, 0};
         const auto base = reinterpret_cast<UINT64>(found.owner->own().title_memory);
         const auto gpu = static_cast<ID3D12Resource*>(found.owner->own().real)->GetGPUVirtualAddress();
         const auto offset = address - base;
-        if (!gpu || offset > UINT64_MAX - gpu || (gpu + offset) % alignment) return 0;
-        return gpu + offset;
+        if (const Cause usable = x2w_startup::gpu_range_cause(gpu, offset); usable != Cause::ok) return {usable, 0};
+        return {Cause::ok, gpu + offset};
     };
-    const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-    const auto temp = translate(scratch, sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (!out || !temp) return E_INVALIDARG;
-    build.DestAccelerationStructureData = out;
-    build.ScratchAccelerationStructureData = temp;
+    constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, as_state);
+    if (out.cause != Cause::ok) return refuse(out.cause, "dest", dest);
+    // An update is sized by its own scratch requirement, a full build by the build one.
+    // A device may report no update scratch at all (WARP does). Then a null scratch is fine, and a scratch the title
+    // still passes must be a placed buffer, checked over at least one byte.
+    const UINT64 scratch_bytes = update ? sizes.UpdateScratchDataSizeInBytes : sizes.ScratchDataSizeInBytes;
+    const bool no_scratch = update && !scratch_bytes && !scratch;
+    const auto temp = no_scratch ? Translated{Cause::ok, 0}
+                                 : translate(scratch, (std::max<UINT64>)(scratch_bytes, 1), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (temp.cause != Cause::ok) return refuse(temp.cause, "scratch", scratch);
+    Translated from{Cause::ok, 0};
+    if (update) {
+        from = translate(source, sizes.ResultDataMaxSizeInBytes, as_state);
+        if (from.cause != Cause::ok) return refuse(x2w_startup::as_source_cause(from.cause), "source", source);
+    }
+    // The provenance of the source and the record of this build are one step under the lock: nothing is recorded for a refusal.
+    AcquireSRWLockExclusive(&ledger_lock);
+    if (update) {
+        if (const Cause built = ledger.check_source(source); built != Cause::ok) {
+            ReleaseSRWLockExclusive(&ledger_lock);
+            return refuse(built, "source", source);
+        }
+    }
+    // The structure written here keeps ALLOW_UPDATE only if this build asked for it (an update repeats the source's flags).
+    ledger.record(dest, sizes.ResultDataMaxSizeInBytes,
+                  (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE) != 0);
+    ReleaseSRWLockExclusive(&ledger_lock);
+    build.DestAccelerationStructureData = out.gpu;
+    build.ScratchAccelerationStructureData = temp.gpu;
+    if (update) build.SourceAccelerationStructureData = from.gpu;
+    if (reported) *reported = Cause::ok;
     return S_OK;
 }
 

@@ -52,6 +52,7 @@ from startup_gfx2hlsl_f32_lg_check import (  # noqa: E402
     COMPARES, F32_OPS, PAIRS, VALUES, CLEAR, ONE, WIDTH, HEIGHT, Expr, G, assemble, compile_hlsl, flushed,
     is_nan, modified, reference)
 from startup_image_3d_check import CompileQueue  # noqa: E402
+import gpu_case_runner  # noqa: E402
 
 NAN_FORMS = ('nlt', 'nle', 'ngt', 'nge', 'o', 'u')
 BROKEN_BY = {'nlt': 'fxc', 'nle': 'fxc', 'ngt': 'fxc', 'nge': 'fxc', 'o': 'dxc', 'u': 'dxc'}
@@ -345,8 +346,7 @@ def check_decode(library):
 
 
 def draw(renderer, adapter, vs, ps, expected):
-    run = subprocess.run([renderer, adapter, '--startup-pixel-words', str(vs), str(ps), str(WIDTH), str(HEIGHT),
-                          str(expected)], capture_output=True, text=True)
+    run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-words', vs, ps, WIDTH, HEIGHT, expected])
     if run.returncode == 77:
         print(run.stdout + run.stderr)
         sys.exit(1 if failures else 77)
