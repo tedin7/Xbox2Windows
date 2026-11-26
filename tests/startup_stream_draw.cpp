@@ -263,7 +263,11 @@ int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char
     invoke(list, 22, 1, arg(&scissor));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
-    invoke(list, 12, 3, 1);
+    // (with X2W_TEST_PIXEL_HISTORY=1) X2W_TEST_PRESENT_SOURCE=draw|clear: the `x2w-render present source` line (the read-back happens at present 6). `clear` leaves the
+    // target with its clear colour only: no translated draw writes the presented surface.
+    char present_source[16] = "";
+    GetEnvironmentVariableA("X2W_TEST_PRESENT_SOURCE", present_source, sizeof(present_source));
+    if (std::strcmp(present_source, "clear") != 0) invoke(list, 12, 3, 1);
     invoke(list, 9);
     invoke(queue, 10, 1, arg(&list));
 
@@ -277,6 +281,7 @@ int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char
 
     // Second present invokes draw_dump_flush() once the frame-1 draw copy has completed.
     invoke(queue, 32, 1, arg(plane), 0);
+    if (present_source[0]) for (int i = 0; i < 4; ++i) invoke(queue, 32, 1, arg(plane), 0);  // presents 3..6: the 6th reads the surface back
 
     if (FAILED(static_cast<HRESULT>(invoke(allocator, 8))) ||
         FAILED(static_cast<HRESULT>(invoke(list, 139, arg(allocator))))) return 35;

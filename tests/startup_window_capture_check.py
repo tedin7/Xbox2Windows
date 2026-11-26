@@ -170,5 +170,16 @@ class Frames(unittest.TestCase):
         self.assertEqual(series.offer(2, 4, 4, self.a), "saved")
 
 
+class ShapeNote(unittest.TestCase):
+    def test_the_first_picture_and_every_change_of_the_window_are_logged_once(self):
+        from window_capture import shape_note
+        first = shape_note(None, 1600, 900, 31, 5)
+        self.assertEqual(first, "  window capture: first picture at 5 s: 1600x900 window, title text length 31")
+        self.assertIsNone(shape_note((1600, 900, 31), 1600, 900, 31, 10), "the same window is not logged again")
+        self.assertEqual(shape_note((1600, 900, 31), 1920, 1080, 12, 400),
+                         "  window capture: the window changed at 400 s: 1920x1080 window, title text length 12")
+        self.assertIn("unavailable", shape_note(None, 4, 4, "unavailable", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

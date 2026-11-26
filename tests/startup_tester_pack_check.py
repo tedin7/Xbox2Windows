@@ -7,6 +7,7 @@ numbered parts instead of dropping a log when it is over the size limit.
 import json
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -67,11 +68,17 @@ def check_preset():
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
     accept = T.input_preset("accept", 600)
     presses = accept.split(",")
-    assert presses[:3] == ["4@35+0.3", "4@45+0.3", "4@55+0.3"] and presses[-1] == "4@595+0.3" and len(presses) == 57, (presses[:3], presses[-1], len(presses))
+    assert presses[:4] == ["4@35+0.3", "4@45+0.3", "4@55+1.5", "4@65+0.3"], presses[:4]
+    assert presses[-1] == "4@415+1.5" and len(presses) == 39, (presses[-1], len(presses))
     assert {p.split("@")[0] for p in presses} == {"4"}, "only A (mask 4): never Start (1), D-pad or the other buttons"
+    holds = [p for p in presses if p.endswith("+1.5")]
+    assert holds and len(holds) == len(presses) // 3 and all(p.endswith("+0.3") for i, p in enumerate(presses) if (i + 1) % 3), "every 3rd press is the hold"
+    assert max(int(p.split("@")[1].split("+")[0]) for p in presses) < T.ACCEPT_END_S == 420, "no press after the cutoff"
+    assert max(int(p.split("@")[1].split("+")[0]) for p in T.input_preset("accept", 100000).split(",")) < 420, "a long run still stops pressing at 420 s"
     assert T.input_preset("accept", 35) == "" and T.input_preset("accept", 36) == "4@35+0.3", "presses stop with the run"
-    assert len(T.input_preset("accept", 100000).split(",")) == T.MAX_ENTRIES and len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
-    assert T.input_labels("accept", 600) == ["press A #%d (accept)" % n for n in range(1, 58)], "one label per press"
+    assert len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
+    labels = T.input_labels("accept", 600)
+    assert len(labels) == 39 and labels[:3] == ["press A #1 (accept, tap)", "press A #2 (accept, tap)", "press A #3 (accept, hold 1.5 s)"], labels[:3]
     assert T.input_labels("accept", 20) == []
     for none in ("none", "off", "OFF", ""):
         assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none
@@ -213,6 +220,13 @@ def check_zip():
                 for name in z.namelist():
                     assert name not in seen, name
                     seen[name] = z.read(name)
+        # every part says which part it is and what all parts hold
+        notes = {n: seen.pop(n).decode() for n in sorted(seen) if re.match(r"^part_\d\d_of_\d\d\.txt$", n)}
+        assert sorted(notes) == ["part_%02d_of_%02d.txt" % (i, len(parts2)) for i in range(1, len(parts2) + 1)], sorted(notes)
+        first_note = notes["part_01_of_%02d.txt" % len(parts2)]
+        assert first_note.startswith("part 1 of %d: mail ALL %d parts" % (len(parts2), len(parts2))), first_note[:80]
+        assert all(("part %d of %d" % (i, len(parts2))) in first_note for i in range(1, len(parts2) + 1)), first_note
+        assert "(this one)" in first_note and "events.txt" in first_note, first_note
         assert json.loads(seen.pop("manifest.json"))["parts"] == len(parts2)
         for name in ("events.txt", "window.png", "window_180s.png", "stdout.txt"):
             assert name in seen, name
@@ -514,6 +528,184 @@ def check_request_files():
             assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
 
 
+def check_part_one_has_the_small_files():
+    """Several parts: shader_results.txt, the debugger summary and every small log are in part 1 (Run Q: part 2 never arrived and
+    took shader_results.txt and the summary with it), the big log chunks come after them."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        rng = random.Random(9)
+        write(run, "stderr.txt", bytes(rng.randrange(256) for _ in range(700 * 1024)))  # incompressible, bigger than a part
+        (tmp / "run.out").write_bytes(b"debugger summary\n")
+        parts = T.pack(str(run), MANIFEST, str(tmp / "p.zip"), T.MANIFEST_ROOM + 300 * 1024, chunk_bytes=128 * 1024, cache_dir=str(cache))
+        assert len(parts) >= 3, parts
+        with zipfile.ZipFile(parts[0][0]) as z:
+            names = z.namelist()
+            assert T.RESULTS_NAME in names and T.SUMMARY_NAME in names, names
+            assert {"events.txt", "finished.txt", "translate.txt"} <= set(names), names
+            files = json.loads(z.read("manifest.json"))["files"]
+        assert files[T.RESULTS_NAME]["part"] == 1 and files[T.SUMMARY_NAME]["part"] == 1
+        assert max(v["part"] for v in files.values()) >= 3, "the big log spills over into later parts"
+
+
+def check_request_code_files():
+    """Run R: the compute keys came without .c67/.data and graphics keys were missing. Every req_<key>.* file of a chosen key ships
+    (compute: .c67 code + .data + state; graphics: .a/.b + state), compute and graphics each have their own ranking and quota,
+    and all of them sit in part 1 even when the logs fill several parts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        rows, weights, stderr = [], {}, []
+        for n in range(30):   # 30 compute keys, huge dispatch counts
+            key = "c%015x" % n
+            for ext in (".c67", ".data", ".desc", ".root", ".sa", ".sb"):
+                write(cache, "req_%s%s" % (key, ext), b"C" * 100)
+            write(cache, "%s.fail" % key, b"v_readfirstlane_b32 requires a proven uniform source\n")
+            stderr.append("x2w-render compute census key %s: %d dispatches, 0 translated, first refusal: x" % (key, 1000000 - n))
+        for n in range(20):   # 20 graphics keys, small draw counts
+            key = "a%015x" % n
+            for ext in (".a", ".b", ".root", ".psin"):
+                write(cache, "req_%s%s" % (key, ext), b"G" * 100)
+            write(cache, "%s.fail" % key, b"MRTZ requires one uncompressed depth export\n")
+            stderr.append("x2w-render not drawn key %s: %d (translation_not_ready)" % (key, 5000 - n))
+        (cache / ("req_%s.data" % ("c%015x" % 29))).unlink()   # a compute key whose .data is not in the cache
+        cache_rows = T.cache_results(str(cache))
+        chosen = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)))
+        kinds = [c[1] for c in chosen]
+        assert len(chosen) == 40 and kinds.count("compute") == 25 and kinds.count("graphics") == 15, (len(chosen), kinds.count("compute"))
+        for key, kind, weight, files, missing in chosen:
+            names = {os.path.splitext(n)[1] for n, _ in files}
+            if kind == "compute":
+                assert {".c67", ".data", ".desc", ".root", ".sa", ".sb"} == names and not missing, (key, names)
+            else:
+                assert {".a", ".b", ".root", ".psin"} == names and not missing, (key, names)
+        assert [c[0] for c in chosen[:2]] == ["c000000000000000", "c000000000000001"], "compute keys by dispatches first"
+        top_graphics = [c[0] for c in chosen if c[1] == "graphics"]
+        assert top_graphics[0] == "a000000000000000" and top_graphics == sorted(top_graphics), "graphics keys by draws"
+        # the one that lost its code files is listed with what is missing (here: it is outside the top 25, so use a small family)
+        few = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)), top=40, compute_share=40)
+        broken = [c for c in few if c[0] == "c%015x" % 29]
+        assert broken and broken[0][4] == [".data"], broken
+
+        # RTV variants: draws counted under a variant key count on its base, whose code ships with the variants' request files
+        base = "a%015x" % 19                       # the weakest graphics key by its own draws (5000 - 19 = 4981 < the others' 4999..)
+        for n, (variant, drawn) in enumerate((("b000000000000001", 4000), ("b000000000000002", 3000))):
+            write(cache, "req_%s.rtv" % variant, ("rtv1 %d 28" % int(base, 16)).encode())
+            stderr.append("x2w-render not drawn key %s: %d (translation_not_ready)" % (variant, drawn))
+        chosen = T.select_requests(str(cache), T.cache_results(str(cache)), T.key_weights("\n".join(stderr)))
+        graphics = [c for c in chosen if c[1] == "graphics"]
+        assert graphics[0][0] == base and graphics[0][2] == 4981 + 7000, graphics[0][:3]
+        assert {n for n, _ in graphics[0][3]} == {"req_%s%s" % (base, e) for e in (".a", ".b", ".root", ".psin")} | {"req_b000000000000001.rtv", "req_b000000000000002.rtv"}
+        assert all(not c[0].startswith("b") for c in chosen), "a variant is never a key of its own"
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        noise = random.Random(4)
+        write(run, "stderr.txt", "\n".join(stderr).encode() + b"\n" + bytes(noise.randrange(256) for _ in range(700 * 1024)))
+        parts = T.pack(str(run), MANIFEST, str(tmp / "p.zip"), T.MANIFEST_ROOM + 300 * 1024, chunk_bytes=128 * 1024, cache_dir=str(cache))
+        assert len(parts) >= 3, len(parts)
+        with zipfile.ZipFile(parts[0][0]) as z:
+            first = set(z.namelist())
+            files = json.loads(z.read("manifest.json"))["files"]
+        want = {T.REQUESTS_DIR + "/" + n for c in chosen for n, _ in c[3]}
+        assert want <= first, sorted(want - first)[:5]
+        assert any(n.endswith(".c67") for n in first) and any(n.endswith(".data") for n in first)
+        assert all(files[n]["part"] == 1 for n in want), "every request file is in part 1"
+
+
+def check_mail_ready_parts():
+    """With the default limit every part is a file the tester can mail as it is (at most 9 MB), whatever the size of the logs,
+    and the shader request files stay together in part 1."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 3)
+        write(run, "stderr.txt", b"x2w-render compute census key 2000000000000001: 900 dispatches, 0 translated, first refusal: x\n" + os.urandom(20 * 1024 * 1024))
+        parts = T.pack(str(run), MANIFEST, str(tmp / "mail.zip"), cache_dir=str(cache))
+        assert len(parts) >= 3, [size for _, size in parts]
+        assert all(size <= 9 * 1024 * 1024 for _, size in parts), [size for _, size in parts]
+        for index, (path, _) in enumerate(parts, 1):
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                assert ("part_%02d_of_%02d.txt" % (index, len(parts))) in names, names
+                if index == 1:
+                    assert T.RESULTS_NAME in names and any(n.startswith(T.REQUESTS_DIR + "/") for n in names), names
+                    assert "manifest.json" in names
+
+
+def check_phase_table():
+    """phases.txt: presents, fps and picture mean per 30 s window from the stand-in heartbeats and the capture rows."""
+    beats = ("x2w-d3d12 heartbeat: 150 frames presented in 5.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 900 frames presented in 30.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1000 frames presented in 60.0 s (16.7 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1010 frames presented in 90.0 s (11.2 fps overall); x\n")
+    timeline = ("   10.0 s  picture window_010s.png mean 0.0  first\n   40.0 s  picture window_040s.png mean 85.5  changed\n"
+                "   55.0 s  picture window_055s.png mean 36.0  changed\n")
+    rows = T.phase_table(beats, timeline).splitlines()
+    assert rows[2].split() == ["0", "30", "900", "30.0", "0.0"], rows[2]
+    assert rows[3].split() == ["30", "60", "100", "3.3", "36.0"], rows[3]
+    assert rows[4].split() == ["60", "90", "10", "0.3", "-"], rows[4]
+    assert rows[-1].startswith("# credits movie: no window pictures after 250 s"), rows[-1]
+    late = timeline + "  300.0 s  picture window_300s.png mean 0.0  unchanged\n  384.0 s  picture window_384s.png mean 72.3  changed\n  400.0 s  picture window_400s.png mean 0.0  changed\n"
+    note = T.movie_note(late)
+    assert note.startswith("# credits movie: content in 1 of 3 of OUR pictures after 250 s (384 s mean 72); capture interval 50 s"), note
+    black = T.movie_note("  300.0 s  picture window_300s.png mean 0.0  first\n  315.0 s  picture window_315s.png mean 1.0  unchanged\n")
+    assert black.startswith("# credits movie: NOT seen in our 2 pictures after 250 s") and "tester's own captures" in black, black
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", beats.encode())
+        write(run, "timeline.txt", timeline.encode())
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "p.zip"))
+        with zipfile.ZipFile(Path(tmp) / "p.zip") as z:
+            assert z.read(T.PHASES_NAME).decode().splitlines()[2].split()[:4] == ["0", "30", "900", "30.0"]
+        write(run, "stderr.txt", b"no heartbeats\n")
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "q.zip"))
+        with zipfile.ZipFile(Path(tmp) / "q.zip") as z:
+            assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
+
+
+def check_request_families():
+    """The top refusal families each bring their 20 keys with the most uses, whatever their dispatch/draw weight (c20: the code of
+    the top 20 'branch out of the block' keys), on top of the weight ranking; the byte cap still holds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "cache"
+        cache.mkdir()
+        uses = {}
+        for n in range(30):   # 30 keys of one wall, no census weight at all
+            key = "d%015x" % n
+            for ext in (".c67", ".data", ".root"):
+                write(cache, "req_%s%s" % (key, ext), b"B" * 50)
+            write(cache, "%s.fail" % key, ("branch out of the block %d is not covered\n" % n).encode())
+            uses[key] = (1.0, 2.0, 100 + n)
+        for n in range(5):    # a small other wall
+            key = "e%015x" % n
+            write(cache, "req_%s.c67" % key, b"E" * 50)
+            write(cache, "%s.fail" % key, b"v_readfirstlane_b32 requires a proven uniform source\n")
+            uses[key] = (1.0, 2.0, 5)
+        rows = T.cache_results(str(cache))
+        assert T.select_requests(str(cache), rows, {}) == [], "without uses nothing is ranked (no weights)"
+        chosen = T.select_requests(str(cache), rows, {}, uses=uses)
+        wall = [c[0] for c in chosen if c[0].startswith("d")]
+        assert sorted(wall) == sorted("d%015x" % n for n in range(10, 30)), "the 20 most used keys of the wall: %r" % wall
+        assert all(any(n.endswith(".c67") for n, _ in c[3]) and any(n.endswith(".data") for n, _ in c[3]) for c in chosen if c[0].startswith("d"))
+        assert len([c for c in chosen if c[0].startswith("e")]) == 5, "a second wall brings its keys too"
+        assert len(T.select_requests(str(cache), rows, {}, uses=uses, cap=700)) < len(chosen), "the byte cap still holds"
+        capped = T.select_requests(str(cache), rows, {}, uses=uses, cap=700)
+        assert sum(b for c in capped for _, b in c[3]) <= 700
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -654,6 +846,11 @@ if __name__ == "__main__":
     check_cache_results()
     check_key_use()
     check_request_files()
+    check_request_code_files()
+    check_mail_ready_parts()
+    check_phase_table()
+    check_request_families()
+    check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
     check_manifest()

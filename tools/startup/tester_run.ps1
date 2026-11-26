@@ -17,7 +17,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
    finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
-   files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
+   files. Over -LimitMB (default 9, so each part fits a mail as it is: never re-zip; every part carries part_NN_of_MM.txt, which says what each part holds) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
 
 The launcher's job memory cap (run.ps1 -MemoryGiB, default 14) is set to 75% of physical RAM, at least 14 GiB: a run whose
@@ -37,7 +37,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input accept (the default): ONLY the A button (mask 4), 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input accept (the default): ONLY the A button (mask 4), first at 35 s after the first pad poll, then every 10 s; a 0.3 s tap, every 3rd press held 1.5 s (movie skips); no press from 420 s on (gameplay) or after the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -62,7 +62,8 @@ param(
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
-    [int]$LimitMB = 20,
+    [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
+    [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
@@ -261,6 +262,9 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
 if ($MemoryGiB -le 0) { $MemoryGiB = [int](Invoke-Native { & $python -B $pack memory-gib $physicalBytes }) }
 Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
+# Periodic thread snapshots (debug_launch X2W_DUMP_AT): the title is stopped for a moment at each one, so 4 by default, not one a minute.
+$dumpAt = if ($ThreadSnapshotEvery -gt 0) { @(1..([math]::Floor(480 / $ThreadSnapshotEvery)) | ForEach-Object { $_ * $ThreadSnapshotEvery }) -join "," } else { "" }
+if ($dumpAt) { $env:X2W_DUMP_AT = $dumpAt } else { Remove-Item Env:X2W_DUMP_AT -ErrorAction SilentlyContinue }
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
@@ -393,7 +397,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
-    pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    thread_snapshots = $dumpAt; pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"

@@ -3436,6 +3436,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         red_producer_draw_after(self, red_samples);
         drawn = true;
     }
+    if (drawn)
+        for (UINT t = 0; t < pass.target_count; ++t)
+            if (pass.bound_targets[t]) note_target_writer(pass.bound_targets[t], tr->key, t, static_cast<unsigned>(pass.target_formats[t]));
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
