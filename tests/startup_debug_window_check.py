@@ -53,13 +53,12 @@ def main(probe):
         first, last = pixel(frames[0]), pixel(frames[-1])
         assert first == RED and last == BLUE, (first, last, [p.name for p in frames])
         assert all(pixel(p) in (RED, BLUE) for p in frames), [p.name for p in frames]
-        # Only the changes are saved: one red frame, one blue frame, the others skipped.
-        assert len(frames) == 2, [p.name for p in frames]
-        found = re.search(r"window captures: (\d+) saved, (\d+) unchanged skipped, first change at (\d+) s", out)
+        # Every tick is saved, repeats included: red frames, then blue frames; the first blue one is the change.
+        found = re.search(r"window captures: (\d+) saved \((\d+) identical to the one before\), first change at (\d+) s", out)
         assert found, out
-        saved, unchanged, change = (int(found.group(i)) for i in (1, 2, 3))
-        assert saved == 2 and unchanged >= 3 and 3 <= change <= 6, found.group(0)
-        assert int(frames[-1].name[7:10]) == change, (frames[-1].name, change)
+        saved, repeated, change = (int(found.group(i)) for i in (1, 2, 3))
+        assert saved == len(frames) and repeated == saved - 2 and repeated >= 3 and 3 <= change <= 6, found.group(0)
+        assert min(int(p.name[7:10]) for p in frames if pixel(p) == BLUE) == change, ([p.name for p in frames], change)
         assert pixel(logdir / "window.png") == BLUE, "the end-of-run picture must stay as before"
         assert "window capture: 160x120 -> window.png" in out, out
 
