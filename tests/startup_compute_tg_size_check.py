@@ -217,7 +217,7 @@ def waves_expected_words():
 
 # Every invocation stores one word with the RDNA2 wave-ID and wave-count fields.
 GROUP_CASES = {
-    'wave64': ((16, 4, 4), None, 64),
+    'wave64': ((16, 4, 4), 64, 64),
     'wave32-tail': ((10, 5, 5), 32, 32),
 }
 
@@ -326,10 +326,12 @@ def check_controls():
 
     # 4. Multi-wave groups use the guest wave width and round up a partial last wave.
     wave_and = sop2(S_AND_B32, 20, 8, LIT, 0xfc0) + S_ENDPGM
-    for group, wave_size, width in (((33, 1, 1), 32, 32), ((8, 4, 3), 64, 64), ((8, 4, 3), None, 64)):
+    for group, wave_size, width in (((33, 1, 1), 32, 32), ((8, 4, 3), 64, 64)):
         hlsl = translate(code=wave_and, group=group, wave_size=wave_size).hlsl_cs()
         assert 'uint group_index : SV_GroupIndex' in hlsl
         assert 's20 = ((group_index / %du) << 6u);' % width in hlsl
+    # An unstated wave size with no wave32 proof is not guessed (wave ID and count depend on it).
+    refused('needs the guest wave size', lambda: translate(code=wave_and, group=(8, 4, 3), wave_size=None).hlsl_cs())
     folded = translate(code=wave_and, group=(64, 1, 1), wave_size=64).hlsl_cs()
     assert 's20 = 0u;' in folded and 'SV_GroupIndex' not in folded
     for name, width, waves in (('wave64', 64, 4), ('wave32-tail', 32, 8)):

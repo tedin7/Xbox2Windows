@@ -2573,7 +2573,12 @@ class Stage:
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
             wave = self.pipe.wave_size
-            self.tg_wave_size = wave if wave is not None else (32 if wave32_exec_proof(self.ins) else 64)
+            if wave is None and wave32_exec_proof(self.ins):
+                wave = 32
+            if wave is None and self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32:
+                # The wave width decides the wave ID and the wave count: do not guess it.
+                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+            self.tg_wave_size = wave if wave is not None else 32
             self.uses_tg_group_index = False
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
@@ -11789,6 +11794,10 @@ class Pipeline:
             if mask != 0xF:
                 lines.append('wmask %d 0x%x' % (int(name[3:]), mask))
         return '\n'.join(lines) + '\n'
+
+
+TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN with more than 32 threads per group needs the guest wave '
+                         'size (stated by the caller or proved wave32 by the program)')
 
 
 def wave32_exec_proof(ins):
