@@ -48,6 +48,16 @@ def pictures(folder):
     return {p.name: pixels(p) for p in sorted(Path(folder).glob("present_*.png"))}
 
 
+def explain(expected, actual, log):
+    """What differs between two pictures (size, colours on the first row), and the replay log's tail."""
+    def row(picture):
+        (width, _height), raw = picture
+        return [tuple(raw[1 + x * 4:5 + x * 4]) for x in range(0, width, max(1, width // 8))]
+    tail = log.read_text(errors="replace")[-2500:] if log.exists() else "(no replay log)"
+    return "recorded %s row %s\nreplayed %s row %s\nreplay log tail:\n%s" % (
+        expected[0], row(expected), actual[0], row(actual), tail)
+
+
 def chunks(data):
     at = 0
     while at < len(data):
@@ -128,7 +138,8 @@ def main(scene, player, backend):
         score, replayed = replay(player, recording, directory / "replayed", backend, env)
         assert sorted(replayed) == names, sorted(replayed)
         differ = [n for n in names if replayed[n] != recorded[n]]
-        assert not differ, "replayed pictures differ from the recorded run: %s" % differ
+        assert not differ, "replayed pictures differ from the recorded run: %s\n%s" % (
+            differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt"))
 
         changed = directory / "changed.x2wr"
         change_last_clear(recording, changed)
