@@ -103,7 +103,7 @@ if ($Translate -and $Render) {
     # The translator and its process pool (every core but one) must never run above the title. A venv or launcher python is a
     # process tree (launcher + real interpreter), so the class is set on the root and on every descendant, for about two
     # seconds so a child that appears a little later is caught; the pool workers the interpreter creates later inherit it.
-    $lowerTree = {
+    $treeOf = {
         param([int]$RootId)
         $ids = @($RootId)
         for ($i = 0; $i -lt $ids.Count; $i++) {
@@ -111,6 +111,11 @@ if ($Translate -and $Render) {
                 if ($ids -notcontains [int]$child.ProcessId) { $ids += [int]$child.ProcessId }
             }
         }
+        return $ids
+    }
+    $lowerTree = {
+        param([int]$RootId)
+        $ids = @(& $treeOf $RootId)
         foreach ($id in $ids) {
             try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
         }
@@ -141,9 +146,16 @@ try {
     if ($translator -and -not $translator.HasExited) {
         # Stop the workers as well. The watcher or a worker can exit during taskkill;
         # in Windows PowerShell 5.1 its redirected stderr would then abort the launcher.
+        $treeIds = @(& $treeOf $translator.Id)
         & {
             $ErrorActionPreference = "Continue"
             & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null
+        }
+        # taskkill returns before the processes are gone, and the watcher and its workers hold translate.txt and
+        # translate_err.txt open: wait until every one has ended, so the log files are free when this script exits
+        # (a caller that removes the run folder right after would otherwise meet a sharing violation).
+        foreach ($id in $treeIds) {
+            try { [void](Get-Process -Id $id -ErrorAction Stop).WaitForExit(10000) } catch { }
         }
     }
 }
