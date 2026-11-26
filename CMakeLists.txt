@@ -1242,6 +1242,11 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
+# Text of the x2w-budget commit fields and the commit-exhausted line (src/startup_stubs/commit_state.h).
+add_executable(startup_commit_state_check tests/startup_commit_state_check.cpp)
+target_compile_features(startup_commit_state_check PRIVATE cxx_std_17)
+target_include_directories(startup_commit_state_check PRIVATE src)
+add_test(NAME startup_commit_state COMMAND startup_commit_state_check)
 # WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint. The sink is
 # compiled once for this check and the pacing control below.
 add_library(startup_audio_sink_obj OBJECT src/startup_stubs/audio_sink.cpp)
@@ -1426,6 +1431,17 @@ foreach(backend IN ITEMS warp hardware)
         set_tests_properties(${case}_inline_control PROPERTIES
             PASS_REGULAR_EXPRESSION "FAIL: inline-control missed Release left buffer above baseline")
     endforeach()
+endforeach()
+
+# Texture residency decision rules (src/startup_stubs/texture_residency.h, X2W_D3D12_RESIDENCY=1): pure logic, no GPU.
+# Each mutant switches one rule off and its case must then report the failure.
+add_executable(startup_texture_residency tests/startup_texture_residency.cpp)
+target_include_directories(startup_texture_residency PRIVATE src)
+target_compile_features(startup_texture_residency PRIVATE cxx_std_17)
+add_test(NAME startup_texture_residency COMMAND startup_texture_residency)
+foreach(mutant IN ITEMS ignore-in-flight ignore-unsafe no-pin early-complete)
+    add_test(NAME startup_texture_residency_mutant_${mutant} COMMAND startup_texture_residency ${mutant})
+    set_tests_properties(startup_texture_residency_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
 endforeach()
 
 # X2W_D3D12_RELEASE_RETIRED=1 frees the desktop object of a committed 2D texture only when no recorded list, no submission

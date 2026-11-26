@@ -15,6 +15,7 @@
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
+#include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
@@ -7089,6 +7090,17 @@ void report_budget(ID3D12CommandQueue* queue)
             std::snprintf(text, sizeof(text), "%llu/%llu", info.CurrentUsage, info.Budget);
     };
     sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
+    if (residency_observe()) {
+        // Observation only (X2W_D3D12_RESIDENCY=1): how often the local group is over its budget at a heartbeat.
+        static LONG samples, over;
+        unsigned long long used_now = 0, budget_now = 0;
+        const bool have = std::sscanf(local, "%llu/%llu", &used_now, &budget_now) == 2 && budget_now;
+        if (have) {
+            InterlockedIncrement(&samples);
+            if (used_now > budget_now) InterlockedIncrement(&over);
+            log("x2w-residency pressure samples %ld, over budget %ld", samples, over);
+        }
+    }
     sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
     const auto counts = x2w_budget::snapshot();
     char text[640]{};
@@ -7101,7 +7113,25 @@ void report_budget(ID3D12CommandQueue* queue)
         if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
         used += n;
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
+    // System commit and the physical-page pool behind it: a run that ends on a commit limit (error 1455) shows
+    // whether the pool (sections, slots) or the resources above grew (#1199).
+    char commit[80];
+    x2w_local::format_commit(commit, sizeof(commit), x2w_local::system_commit());
+    char job[64];
+    x2w_local::format_job(job, sizeof(job), x2w_local::job_memory());
+    char pool[96] = "sections=n/a slabs=n/a slots=n/a";
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    using SlabStats = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*, ULONGLONG*);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {  // adds a reference: released below
+        ULONGLONG sections = 0, slabs = 0, in_use = 0, free_slots = 0;
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        const auto slab_stats = reinterpret_cast<SlabStats>(GetProcAddress(xmem, "x2w_xmem_slab_stats"));
+        if (page_stats && slab_stats && page_stats(&sections) && slab_stats(&slabs, &in_use, &free_slots))
+            std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
+        FreeLibrary(xmem);
+    }
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7277,6 +7307,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
@@ -7295,6 +7326,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
         log_compute_census();
+        log_not_drawn_causes();
     }
     if (render_mode() && frame % 300 == 0) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).

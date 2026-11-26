@@ -736,7 +736,12 @@ def main():
         bitmap = gdi32.CreateCompatibleBitmap(wt.HDC(source), width, height)
         try:
             gdi32.SelectObject(wt.HDC(memory), wt.HBITMAP(bitmap))
-            gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
+            # The title presents through a flip-model swap chain: a GDI BitBlt of the window DC reads the legacy
+            # redirection surface, which stays black. PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT) asks DWM for
+            # the composed picture and does not depend on other windows covering this one. The BitBlt stays as the
+            # fallback when PrintWindow fails.
+            if not user32.PrintWindow(wt.HWND(hwnd), wt.HDC(memory), 0x3):
+                gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
             header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
             pixels = (ctypes.c_ubyte * (width * height * 4))()
             gdi32.GetDIBits(wt.HDC(memory), wt.HBITMAP(bitmap), 0, height, pixels, header, 0)
