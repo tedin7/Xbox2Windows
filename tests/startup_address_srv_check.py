@@ -69,6 +69,9 @@ def check_refusal_lines(log):
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
         prefix + r"unsupported memory SRV arguments: reason=destination_outside_view_heaps " + R8_RESOURCE % 2 + " "
         + R8_VIEW + rf" dest={HEX} dest_in_view_heap=0 address={HEX} address_readable=1",
+        prefix + r"unavailable acceleration structure at the supplied address: reason=as_unaligned res\{unreadable\} "
+        + r"view\{dim=11 fmt=0 map=0x1688 raw=00000001(?:,00000000){5} \(acceleration structure view\)\} "
+        + rf"dest={HEX} dest_in_view_heap=1 address=0x0 address_readable=0",
     ]
     lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
     if len(lines) != len(expected):

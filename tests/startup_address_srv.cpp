@@ -13,6 +13,7 @@ Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, W
 extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
 extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
 extern "C" __declspec(dllimport) void x2w_d3d12_fail_wraps(LONG count);
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_srv_at(Word, D3D12_SHADER_RESOURCE_VIEW_DESC*, Word*);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -45,6 +46,57 @@ bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word ad
     invoke(list, 32, 1, ptr(&heap));
     invoke(list, 36, 0, invoke(heap, 10));
     return true;
+}
+
+int check_refused_as_srv(ID3D12Device* desktop, void* guest, void* texture,
+                         const D3D12_SHADER_RESOURCE_VIEW_DESC& texture_view)
+{
+    // Keep the AS descriptor off the heap used by the Texture2D pixel shader.
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap)))))
+        return 43;
+    const Word cpu = invoke(heap, 9);
+    invoke(guest, 18, ptr(texture), ptr(&texture_view), cpu);
+    D3D12_SHADER_RESOURCE_VIEW_DESC before{};
+    Word old_resource = 0;
+    const unsigned old_id = x2w_d3d12_srv_at(cpu, &before, &old_resource);
+
+    ViewAt rejected{};
+    rejected.view.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    rejected.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    rejected.view.RaytracingAccelerationStructure.Location = 1; // Unaligned and therefore refused.
+    invoke(guest, 70, 0, ptr(&rejected), cpu);
+    D3D12_SHADER_RESOURCE_VIEW_DESC after{};
+    Word resource = 0;
+    const unsigned id = x2w_d3d12_srv_at(cpu, &after, &resource);
+    invoke(heap, 2);
+
+    char setting[4]{};
+    const bool replace = GetEnvironmentVariableA("X2W_SLOT70_REFUSED_NULL", setting, sizeof(setting)) && setting[0] == '1';
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};
+    const bool dxr = SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options, sizeof(options))) &&
+                     options.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+    const auto expected_dimension = replace && dxr ? D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+                                                   : D3D12_SRV_DIMENSION_TEXTURE2D;
+    const auto expected_format = !replace ? texture_view.Format : dxr ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!old_id || old_resource != ptr(texture) || before.ViewDimension != texture_view.ViewDimension ||
+        before.Format != texture_view.Format || !id || after.ViewDimension != expected_dimension ||
+        after.Format != expected_format || after.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING ||
+        (replace ? id == old_id || resource != 0 : id != old_id || resource != old_resource) ||
+        (expected_dimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE &&
+         after.RaytracingAccelerationStructure.Location != 0)) {
+        std::fprintf(stderr, "slot 70 AS refusal: replace=%d DXR=%d tracked dimension=%u (expected %u), format=%u (expected %u)\n",
+                     replace, dxr, static_cast<unsigned>(after.ViewDimension), static_cast<unsigned>(expected_dimension),
+                     static_cast<unsigned>(after.Format), static_cast<unsigned>(expected_format));
+        return 44;
+    }
+    std::printf("slot 70 AS refusal: replace=%d DXR=%d tracked dimension=%u\n",
+                replace, dxr, static_cast<unsigned>(after.ViewDimension));
+    return 0;
 }
 }
 
@@ -135,7 +187,7 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     invoke(guest, 70, ptr(&desc), ptr(&v), cpu + 1); // Not the start of a descriptor in the view heap.
     draw(6);
     publish(desc, ptr(planes[0].data())); draw(7);
-    return 0;
+    return check_refused_as_srv(desktop, guest, placed[0], v.view);
 }
 
 // Exercise the same four columns twice. The fourth view deliberately names a 2D resource.

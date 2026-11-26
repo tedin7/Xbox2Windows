@@ -6699,6 +6699,29 @@ extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long ti
     }
 }
 
+// Fixture probe (startup_address_srv): the SRV description recorded for a title heap slot.
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_srv_at(
+    u64 title_handle, D3D12_SHADER_RESOURCE_VIEW_DESC* desc, u64* resource)
+{
+    const u64 desktop_handle = desktop_cpu_handle(title_handle);
+    note_lock_acquire(false);
+    const auto* slot = shadow_slot(desktop_handle);
+    unsigned id = slot ? *slot : 0;
+    if (id && id <= view_records().size()) {
+        const auto& record = view_records()[id - 1];
+        if (record.slot == 18 && record.desc_bytes == sizeof(*desc)) {
+            std::memcpy(desc, record.desc, sizeof(*desc));
+            *resource = record.resource;
+        } else {
+            id = 0;
+        }
+    } else {
+        id = 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return id;
+}
+
 // Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
 extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
 {

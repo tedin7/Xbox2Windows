@@ -16149,6 +16149,14 @@ compares 32 pixels per switch setting. With replacement enabled, the three
 columns drawn after refusals read zero. The default control reads the texels
 from the previous view.
 
+Each run also seeds a separate CPU descriptor slot with a texture SRV and
+submits an unaligned acceleration-structure SRV to slot 70. The fixture checks
+the refusal diagnostic and the shim's descriptor record for that slot. With
+replacement disabled, the record still names the seeded texture. With
+replacement enabled, a device with raytracing records an acceleration structure
+SRV with an unknown format and a zero location. Other devices record
+the texture null fallback. This leg does not submit a raytracing workload.
+
 ```powershell
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_address_srv_(warp|hardware)$' -V
