@@ -122,6 +122,37 @@ NO_WQM_WORDS = INT_WORDS[len(WQM):]  # the entry EXEC may leave out lanes of a p
 OTHER_WQM_WORDS = struct.pack('<I', 0xBE800000 | 2 << 16 | 0x0a << 8) + NO_WQM_WORDS  # s_wqm_b64 s[2:3], s[0:1]
 MUTATIONS = ('wrong lane', 'own lane')
 
+# Quad broadcasts behind a narrowed EXEC (RDNA 2 ISA, DPP16 fields FI and BOUND_CTRL; model section 2a of the lane-exact
+# EXEC model): after s_wqm exec, exec a v_cmpx keeps only the lanes with an even x (quad lanes 0 and 2). Per lane the
+# source is valid when FI is set or the source lane's EXEC bit is 1; an invalid source reads 0 with BOUND_CTRL and
+# otherwise leaves the destination unwritten. Odd-x pixels are discarded (the target keeps its clear value).
+NARROW_HEAD = """\
+s_wqm_b64 exec, exec
+v_mov_b32 v1, 0x3f800077
+v_mov_b32 v2, 0x3f800077
+v_mov_b32 v3, 0x3f800077
+v_mov_b32 v4, 0x3f800077
+v_and_b32 v5, 1, v0
+v_cmpx_eq_u32 0, v5
+"""
+NARROW_TAIL = "exp mrt0 v1, v2, v3, v4 done vm\ns_endpgm\n"
+NARROW_SPEC = {  # per exported register: (source lane k, fi, bound_ctrl); the four FI x BOUND_CTRL combinations
+    'narrow_a': [(1, 0, 1), (1, 0, 0), (1, 1, 1), (0, 0, 0)],   # lane 1 is inactive for every even-x pixel
+    'narrow_b': [(1, 1, 0), (2, 1, 1), (3, 0, 1), (2, 0, 0)],   # lane 2 is active, lanes 1 and 3 are not
+}
+NARROW_SOURCE = {kind: NARROW_HEAD + ''.join(
+    'v_mov_b32_dpp v%d, v0 quad_perm:[%d,%d,%d,%d]%s%s%s\n' % (
+        i + 1, k, k, k, k, DPP, ' bound_ctrl:1' if bc else '', ' fi:1' if fi else '')
+    for i, (k, fi, bc) in enumerate(spec)) + NARROW_TAIL for kind, spec in NARROW_SPEC.items()}
+NARROW_WORDS = {
+    'narrow_a': bytes.fromhex('7e0afebeff02027e7700803fff02047e7700803fff02067e7700803fff02087e7700803f81000a36800aa47d'
+                              'fa02027e005508fffa02047e005500fffa02067e00550cfffa02087e000000ff0f1800f801020304000081bf'),
+    'narrow_b': bytes.fromhex('7e0afebeff02027e7700803fff02047e7700803fff02067e7700803fff02087e7700803f81000a36800aa47d'
+                              'fa02027e005504fffa02047e00aa0cfffa02067e00ff08fffa02087e00aa00ff0f1800f801020304000081bf'),
+}
+NARROW_INIT, NARROW_CLEAR = 0x3f800077, 0xbf800000  # the pre-set word and the target's clear value (-1.0)
+NARROW_MUTANTS = ('ignore fi', 'ignore exec', 'no guard')
+
 
 def f32(value):
     return struct.unpack('<I', struct.pack('<f', value))[0]
@@ -163,6 +194,43 @@ def image(kind, how='reference'):
 
 def pixel_stage(words):
     return G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=(PACKED, PACKED))
+
+
+def narrow_image(kind, mutant=None):
+    """CPU reference of the narrow fixtures; a mutant gives the image its broken lowering must draw."""
+    words = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            if x & 1:
+                words += [NARROW_CLEAR] * 4  # EXEC is off: the pixel is discarded
+                continue
+            for k, fi, bc in NARROW_SPEC[kind]:
+                source_active = k & 1 == 0
+                valid = (fi and mutant != 'ignore fi') or source_active or mutant == 'ignore exec'
+                if valid or (not bc and mutant == 'no guard'):
+                    words.append(lane_word(x, y, k))
+                else:
+                    words.append(0 if bc else NARROW_INIT)
+    return words
+
+
+def narrow_hlsl(kind, mutant=None):
+    code = NARROW_WORDS[kind]
+    if mutant == 'ignore fi':  # clear DPP16 dword 1 bit 18 of every broadcast
+        code = bytearray(code)
+        for at in range(0, len(code) - 3, 4):
+            if code[at] == 0xfa:
+                code[at + 6] &= ~0x04
+        code = bytes(code)
+    text = pixel_stage(code).hlsl_ps()
+    if mutant == 'ignore exec':
+        text, count = re.subn(r'QuadReadLaneAt\(exec & 1u, ', 'QuadReadLaneAt(1u, ', text)
+        assert count, 'no source exec read to mutate'
+    elif mutant == 'no guard':
+        text, count = re.subn(r'    if \(v257 != 0u\) \{\n(.*)\n    \}\n', r'\1\n', text)
+        assert count, 'no guard to mutate'
+    return text
+
 
 
 def pixel_hlsl(kind, how='reference'):
@@ -289,6 +357,17 @@ def controls():
             reason = str(error)
         check('refusal text for EXEC writers: %s' % (expect or 'no writer, no note'),
               ('entry prefix' in reason and expect in reason) if expect else 'EXEC written before' not in reason, reason)
+    for kind, code in NARROW_WORDS.items():
+        text = pixel_stage(code).hlsl_ps()
+        check('%s translates with unconditional quad reads' % kind,
+              text.count('QuadReadLaneAt(v0,') == 4 and 'QuadReadLaneAt(exec & 1u,' in text, text)
+    # The narrowing must come after s_wqm exec, exec, in straight-line code, and only by AND-type writes.
+    no_wqm = NARROW_WORDS['narrow_a'][4:]
+    check('refused: a narrowed EXEC without the entry s_wqm exec, exec', refused_in_stage(no_wqm))
+    branched = NARROW_WORDS['narrow_a'][:36] + sopp(4, 0) + NARROW_WORDS['narrow_a'][36:]
+    check('refused: a narrowed EXEC in a program with a branch target', refused_in_stage(branched))
+    or_exec = NARROW_WORDS['narrow_a'][:36] + bytes.fromhex('7e0afebe') + NARROW_WORDS['narrow_a'][36:]
+    check('refused: a narrowed EXEC rewritten by another s_wqm', refused_in_stage(or_exec))
     check('control: the sane line itself translates', not refused(sane))
     # fi:1 only decides what a disabled source lane returns, and the whole quad is proven active.
     with_fi = 'v_subrev_f32_dpp v1, v0, v0 quad_perm:[0,0,0,0]' + DPP + ' bound_ctrl:1 fi:1'
@@ -306,6 +385,8 @@ def controls():
 
 
 def check_binary(llvm_mc):
+    for kind, source in NARROW_SOURCE.items():
+        check('llvm-mc assembles the %s fixture to the same words' % kind, assemble(llvm_mc, source) == NARROW_WORDS[kind])
     for kind, (source, words) in FIXTURES.items():
         if kind == 'loop':
             # The loop fixture's branch label is decoder text; llvm-mc needs a real symbol.
@@ -326,6 +407,33 @@ def draw(renderer, adapter, vs, ps, expected):
         print(run.stdout + run.stderr)
         sys.exit(1 if failures else 77)
     return run
+
+
+def check_draw_narrow(dxc, renderer, adapter, directory):
+    vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_narrow', 'vs_6_0', directory)
+    effective = set()
+    for kind in NARROW_SPEC:
+        label = 'narrowed EXEC %s %s' % (kind, adapter)
+        reference = words_file(directory, 'reference_' + kind, narrow_image(kind))
+        ps = compile_hlsl(dxc, 'dxc', narrow_hlsl(kind), 'ps_' + kind, 'ps_6_0', directory)
+        run = draw(renderer, adapter, vs, ps, reference)
+        check('%s: all %d pixels match the reference' % (label, WIDTH * HEIGHT),
+              run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout, run.stdout + run.stderr)
+        for mutant in NARROW_MUTANTS:
+            if narrow_image(kind, mutant) == narrow_image(kind):
+                continue  # this fixture does not exercise the broken rule
+            effective.add(mutant)
+            bad = compile_hlsl(dxc, 'dxc', narrow_hlsl(kind, mutant), 'ps_%s_%s' % (kind, mutant.replace(' ', '_')),
+                               'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, bad, reference)
+            lines = [ln for ln in run.stderr.splitlines() if 'pixel' in ln]
+            check('%s: mutant "%s" fails against the reference' % (label, mutant),
+                  run.returncode != 0 and bool(lines) and lines[0].startswith('pixel mismatch'), run.stdout + run.stderr)
+            own = words_file(directory, '%s_%s' % (kind, mutant.replace(' ', '_')), narrow_image(kind, mutant))
+            run = draw(renderer, adapter, vs, bad, own)
+            check('%s: mutant "%s" matches its own plain-Python image' % (label, mutant), run.returncode == 0,
+                  run.stdout + run.stderr)
+    check('every narrowed-EXEC mutant is exercised by a fixture', effective == set(NARROW_MUTANTS), str(effective))
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
@@ -357,6 +465,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     run = draw(renderer, adapter, vs, bad, own)
                     check('%s: %s mutation matches its own plain-Python image' % (label, how), run.returncode == 0,
                           run.stdout + run.stderr)
+        check_draw_narrow(dxc, renderer, adapter, directory)
         if fxc:
             # The quad read has no shader model 5.1 spelling: FXC must refuse it, which is why the pipeline
             # compiler sends such a pixel stage to DXC.

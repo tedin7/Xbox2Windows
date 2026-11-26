@@ -4873,7 +4873,7 @@ class Stage:
             return ''
         return ' (EXEC written before it by %s)' % ', '.join('%s x%d' % item for item in sorted(seen.items()))
 
-    def dpp_broadcast(self, base, ops, mods):
+    def dpp_broadcast(self, base, ops, mods, fetch_inactive=False):
         fields, rest = {}, []
         for m in mods:
             key, _, value = m.partition(':')
@@ -4889,16 +4889,22 @@ class Stage:
                               % (base, fields.get('quad_perm', 'without quad_perm')))
         if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
-        if fields.get('bound_ctrl', '1') != '1':
-            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
         # A branch to offset zero also makes the nominal entry block re-entrant.
         # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
-        if (not getattr(self, 'exec_known', False) or
-                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
+        narrowed = False
+        if not getattr(self, 'exec_known', False):
+            if self.narrowing_proof():
+                narrowed = True
+            else:
+                raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                                  % (base, self.exec_writers_note()))
+        elif not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))):
             raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
                               % (base, self.exec_writers_note()))
+        if not narrowed and fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -4921,6 +4927,9 @@ class Stage:
         rewritten = '-' + rewritten if neg else rewritten
         self.note_quad_flow(base)
         self.needs_sm6 = True
+        if narrowed:
+            return self.dpp_broadcast_narrowed(base, ops, rest, rewritten, token, lanes.group(1), fields,
+                                               fetch_inactive)
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
         if base == 'v_mov_b32':
@@ -4928,6 +4937,59 @@ class Stage:
                 raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
             return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
         return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+
+    DPP_VALID = 257  # hidden: the source lane's EXEC bit, read with the data
+
+    NARROWING_WRITERS = ('v_cmpx_', 's_and_saveexec_', 's_and_b32', 's_and_b64', 's_andn2_b32', 's_andn2_b64')
+
+    def narrowing_proof(self):
+        """Whether EXEC at this point is the whole-quad mask of an entry s_wqm narrowed only by AND-type writes, in
+        straight-line code: then every lane that is inactive here was active (helper lanes included) up to its
+        narrowing, so the guest's and the host's VGPRs of an inactive lane agree and a quad read may take them."""
+        wqm = getattr(self, 'wqm_set_at', None)
+        if (self.kind != 'ps' or wqm is None or not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)
+                or not self.quad_flow_straight()):
+            return False
+        for off, _n, name, asm in getattr(self, 'ins', ()):
+            if off >= getattr(self, 'pc', 1 << 62):
+                break
+            ops = parse(asm)[1]
+            if not writes_exec(name, ops):
+                continue
+            base = re.sub(r'_e(32|64)$', '', name)
+            if off == wqm and base in ('s_wqm_b32', 's_wqm_b64'):
+                continue
+            if off < wqm or not base.startswith(self.NARROWING_WRITERS):
+                return False
+        return True
+
+    def dpp_broadcast_narrowed(self, base, ops, rest, rewritten, token, lane, fields, fetch_inactive):
+        """A quad broadcast behind a narrowed EXEC (RDNA 2 ISA DPP16; model section 2a). Per lane the source is valid
+        when FI is set or the source lane's EXEC bit is 1; an invalid source reads 0 when BOUND_CTRL is set, and
+        otherwise leaves the destination unwritten. The quad reads are unconditional (every thread of the quad runs
+        them, as the quad intrinsics need); only the destination write is guarded by the thread's own EXEC bit."""
+        self.used_v.update((self.DPP_TEMP, self.DPP_VALID))
+        self.uniform_v.discard(self.DPP_TEMP)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(self.DPP_TEMP)
+        self.emit('v%d = QuadReadLaneAt(%s, %su);' % (self.DPP_TEMP, self.u(token), lane))
+        bound = fields.get('bound_ctrl') == '1'
+        guard = False
+        if not fetch_inactive:
+            self.emit('v%d = QuadReadLaneAt(exec & 1u, %su);' % (self.DPP_VALID, lane))
+            if bound:
+                self.emit('v%d = v%d != 0u ? v%d : 0u;' % (self.DPP_TEMP, self.DPP_VALID, self.DPP_TEMP))
+            else:
+                guard = True
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32' and (rest or len(operands) != 2):
+            raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+        if guard:
+            self.emit('if (v%d != 0u) {' % self.DPP_VALID)
+        result = self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+        if guard:
+            self.emit('}')
+        return result
 
     # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
     # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
@@ -4941,9 +5003,10 @@ class Stage:
         # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
         # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
         # source lane is disabled and it decides nothing.
+        fetch_inactive = 'fi:1' in mods
         mods = [m for m in mods if m != 'fi:1']
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
-            return self.dpp_broadcast(base, ops, mods)
+            return self.dpp_broadcast(base, ops, mods, fetch_inactive=fetch_inactive)
         perm = None
         for m in mods:
             match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
