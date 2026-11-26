@@ -14,13 +14,6 @@ concurrency:
 permissions:
   contents: read
 
-# A new push to a pull request cancels that pull request's older runs. Every
-# other event (push to main, manual dispatch) gets its own group and is never
-# cancelled.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   pixel-binary:
     name: Assemble and translate gfx1013 fixtures
