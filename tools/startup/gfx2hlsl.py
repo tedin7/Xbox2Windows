@@ -8559,7 +8559,7 @@ class Stage:
         # No enabled lane: the hardware reads lane 0 of the wave.
         first = value.replace('x2w_value_', 'x2w_first_')
         snap = value.replace('x2w_value_', 'x2w_snap_')
-        self.set_s(dst[1], '(%s == %s ? x2w_val[%s][x2w_wave * %du] : %s)' % (first, ws.FIRST_NONE, snap, ws.wave, value))
+        self.set_s(dst[1], '(%s == %s ? x2w_val[%s][x2w_wave * %du] : %s)' % (first, ws.FIRST_NONE, snap, ws.wave, value), uniform=False)
 
     # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k

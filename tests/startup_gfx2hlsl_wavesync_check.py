@@ -76,6 +76,24 @@ def check_text():
     return 'text and refusals'
 
 
+def check_first_lane_branch():
+    """A scalar read from the first lane of a per-lane VGPR differs between guest waves, so a branch on it is not uniform
+    for the group: a later first-lane gather inside that branch would put a barrier in divergent flow. 64 threads,
+    guest wave 32: refused; without the branch the same reads translate."""
+    import startup_compute_waterfall as W
+    read = [('v_readfirstlane_b32 s22, v5', '05052c7e'), ('s_cmp_eq_u32 s22, 0', '168006bf'),
+            ('s_cbranch_scc1 2', '020085bf')]
+    tail = [('v_readfirstlane_b32 s23, v6', '06052e7e'), ('v_add_nc_u32 v7, s23, v7', '170e0e4a')]
+    W.translate([*W.PREFIX[:-1], read[0], *tail, W.STORE, W.END], (64, 1, 1), 32)
+    try:
+        W.translate([*W.PREFIX[:-1], *read, *tail, W.STORE, W.END], (64, 1, 1), 32)
+    except G.Unsupported as err:
+        assert 'requires a proven uniform source' in str(err), err
+    else:
+        raise AssertionError('a branch on a first-lane scalar translated')
+    return 'branch on a first-lane scalar refused'
+
+
 def emit(directory):
     os.makedirs(directory, exist_ok=True)
     for threads, wave in GROUPS:
@@ -95,7 +113,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--emit')
     args = parser.parse_args()
-    what = check_text()
+    what = '%s, %s' % (check_text(), check_first_lane_branch())
     if args.emit:
         emit(args.emit)
     print('startup_gfx2hlsl_wavesync: PASS (%s)' % what)
