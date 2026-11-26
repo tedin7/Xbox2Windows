@@ -2898,18 +2898,31 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         // A range in a placed buffer that does not alias title memory and that a recorded copy has written: the title's memory
         // does not hold those bytes, the buffer's own desktop copy does, so bind that instead of a snapshot of the memory.
-        if (!placed.alias && address && bytes && bytes % 4 == 0 && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 &&
-            !snapshot_placed_buffers_mutant()) {
-            const auto holder = placed_buffer_range(self->own().list_device, address, bytes);
+        if (!placed.alias && address && bytes && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && !snapshot_placed_buffers_mutant()) {
+            auto holder = placed_buffer_range(self->own().list_device, address, bytes);
+            // A root address names no size: its window runs to the end of the readable memory, past the end of a small placed
+            // buffer, so find the buffer by its first byte and cut the range at the buffer's end.
+            if (holder.reject && srv.source == 2) holder = placed_buffer_range(self->own().list_device, address, 1);
             auto* native = holder.owner && !holder.alias && !holder.reject ? static_cast<ID3D12Resource*>(holder.owner->own().real) : nullptr;
             const u64 inside = native ? address - reinterpret_cast<u64>(holder.owner->own().title_memory) : 0;
-            if (native && InterlockedCompareExchange(&holder.owner->own().refs, 0, 0) && placed_gpu_written(const_cast<Wrapper*>(holder.owner), inside, bytes)) {
+            u64 span = bytes;
+            if (native && srv.source == 2) {
+                const u64 width = native->GetDesc().Width;
+                span = inside < width && span > width - inside ? width - inside : span;
+            }
+            const bool written = native && span && span % 4 == 0 && InterlockedCompareExchange(&holder.owner->own().refs, 0, 0) &&
+                                 placed_gpu_written(const_cast<Wrapper*>(holder.owner), inside, span);
+            static LONG held_not_taken;
+            if (native && !written && first_calls(held_not_taken, 4))
+                log("x2w-draw   %016llx srv %u range 0x%llx (%zu bytes) is in a placed buffer without title backing; no recorded copy wrote it (span %llu)",
+                    tr->key, i, address, bytes, span);
+            if (written) {
                 require_state(self, native, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                buffer_view(dest, native, inside, bytes);
+                buffer_view(dest, native, inside, span);
                 static LONG bound_from_copy;
                 if (first_calls(bound_from_copy, 8))
-                    log("x2w-draw   %016llx srv %u constants bound from the placed buffer's own copy (a recorded copy wrote it): address 0x%llx, %zu bytes",
-                        tr->key, i, address, bytes);
+                    log("x2w-draw   %016llx srv %u constants bound from the placed buffer's own copy (a recorded copy wrote it): address 0x%llx, %llu bytes",
+                        tr->key, i, address, span);
                 count_buffer(true);
                 continue;
             }
