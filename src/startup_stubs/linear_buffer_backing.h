@@ -245,13 +245,7 @@ inline bool submit_fence_forced_off()
 // violation or an in-page error instead of a fault in the DLL.
 inline bool guarded_copy(void* to, const void* from, std::size_t bytes) noexcept
 {
-    __try {
-        std::memcpy(to, from, bytes);
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
-                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        return false;
-    }
-    return true;
+    return x2w_local::guarded_memcpy(to, from, bytes, false);
 }
 inline D3D12_RESOURCE_DESC buffer(UINT64 width, D3D12_RESOURCE_FLAGS flags)
 {

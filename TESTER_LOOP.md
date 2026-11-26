@@ -1,5 +1,7 @@
 # Tester loop branch
 
+Real-hardware testing by @Makto94 - thanks for the help.
+
 This branch is `origin/main` plus the tooling a tester needs for one fast round trip: run one command, send back
 the zip it prints. It is not a release; upstream gets each piece through its own pull request.
 
@@ -63,7 +65,7 @@ What it does:
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
    already in the shader cache at start, and when the title first polled the pad.
 
-`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input
+`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input Default privacy step: from script second 90 it ticks the two privacy boxes seen in Run L (A, down, A, down to Conferma, A), then the pattern starts over (-PrivacyBoxes 0 turns it off).
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 `-Input menus2` presses the same buttons, but after every A it waits until the presented picture has changed and stayed still for 2 s (at most 90 s) before the next press, so nothing is pressed blind while a screen loads. It needs render mode, which the script always uses.
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
@@ -102,7 +104,8 @@ Send the zip it printed. If the zip is over 20 MB it is split into `report_..._p
 send every part (mail limit). The zip holds every file the run wrote in its log folder (stdout, stderr, events,
 finished, threads, files, trap.log, translate, translate_err, the window captures, the debugger summary) and
 `manifest.json` (commit, build commit, dirty flag, seconds, input script, `X2W_*` variables, graphics card and driver,
-Windows build, wall time). It holds no game files, no shader cache and no memory dumps.
+Windows build, wall time), and `memory.txt`: every 30 s the PC's committed memory and the 8 programs holding most of it
+(program names and GiB only, no paths or window titles). It holds no game files, no shader cache and no memory dumps.
 
 ## Waiting for a fix on their own branch (conflict with this branch)
 
