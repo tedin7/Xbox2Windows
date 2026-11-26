@@ -5063,6 +5063,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
     add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")
+    # tester_run.ps1 uses a build from another commit when the runtime sources are the same (runtime_sources.py).
+    add_test(NAME startup_runtime_sources COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_sources_check.py")
     add_test(NAME startup_tester_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_run_ps1_check.py")
     set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 300)

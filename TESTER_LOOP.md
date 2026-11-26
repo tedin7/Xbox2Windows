@@ -52,7 +52,9 @@ From a PowerShell in the checkout, with the title's executable folder prepared a
 What it does:
 
 1. Checks that the build in `out/build/release` was made from this checkout's current commit and builds when it was
-   not (`-NoBuild` stops with a message instead).
+   not (`-NoBuild` stops with a message instead). A build from another commit is used as it is when the runtime sources
+   (`src`, `cmake`, `CMakeLists.txt`, `CMakePresets.json`) are the same, so pulling a tools-only fix needs no rebuild; the
+   summary prints why and the manifest records it as `build_check`.
 2. Uses one shader cache folder per shader revision, `out/startup/shader_cache_<rev>` (for example `shader_cache_28-28-3`,
    from the `x2w-startup-shader-N` strings of `gfx2hlsl.py`): kept across runs and across branch updates that leave
    the revision alone, a new empty one when a revision is bumped. The `--watch` translator needs minutes to catch up,
