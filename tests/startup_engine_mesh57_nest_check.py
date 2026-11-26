@@ -42,13 +42,22 @@ CASES = {
     'nest_plain': (HEAD + TAIL, lambda tid: 255 if tid < BOUND else 0),
     'nest_scc': (HEAD + 's_cmp_eq_u32 s44, 9\ns_cbranch_scc1 1\n' + TAIL, lambda tid: 0),
     'nest_scc_not': (HEAD + 's_cmp_eq_u32 s44, 0\ns_cbranch_scc1 1\n' + TAIL, lambda tid: 255 if tid < BOUND else 0),
-    'nest_execz': (HEAD + 's_mov_b64 s[46:47], exec\nv_cmpx_gt_u32_e32 3, v0\ns_cbranch_execz 3\n' + TAIL
+    'nest_execz': (HEAD + 's_mov_b64 s[46:47], exec\nv_cmpx_gt_u32_e32 3, v0\ns_cbranch_execz 2\n' + TAIL
                    + '\ns_mov_b64 exec, s[46:47]', lambda tid: 255 if tid < INNER_EXECZ_BOUND else 0),
 }
 
 
-def case_mesh(asm):
-    return T.wave_load_mesh(T.WAVE_BLOCK_PREFIX, ' '.join(T.assemble('llvm-mc-19', asm)))
+# The words of each body as llvm-mc assembles it (checked by `binary`), so the draw run needs no assembler.
+WORDS = {
+    'nest_plain': 'beac0389 7e0e02f2 bea803f0',
+    'nest_scc': 'beac0389 bf06892c bf850001 7e0e02f2 bea803f0',
+    'nest_scc_not': 'beac0389 bf06802c bf850001 7e0e02f2 bea803f0',
+    'nest_execz': 'beac0389 beae047e 7da80083 bf880002 7e0e02f2 bea803f0 befe042e',
+}
+
+
+def case_mesh(label):
+    return T.wave_load_mesh(T.WAVE_BLOCK_PREFIX, WORDS[label])
 
 
 def reference(points, colours, triangles, green, wave_red):
@@ -83,7 +92,7 @@ def draw(dxc, renderer, adapter):
     wave_red = {0: NEW_RED, 64: OLD_RED}.__getitem__
     with tempfile.TemporaryDirectory() as tmp:
         for label, (asm, green) in CASES.items():
-            mesh = case_mesh(asm)
+            mesh = case_mesh(label)
             key, result = T.request(tmp, mesh)
             T.expect(label + ' translates and compiles', result, 'ok')
             if result != 'ok':
@@ -121,8 +130,7 @@ def draw(dxc, renderer, adapter):
 
 def binary(mc):
     for label, (asm, _) in CASES.items():
-        words = T.assemble(mc, asm)
-        T.expect(label + ' assembles to whole 32-bit words', all(re.fullmatch('[0-9a-f]{8}', w) for w in words), True)
+        T.expect(label + ' words match llvm-mc', ' '.join(T.assemble(mc, asm)), WORDS[label])
 
 
 def main(argv):
