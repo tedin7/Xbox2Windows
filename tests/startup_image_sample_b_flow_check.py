@@ -15,7 +15,8 @@ four lanes reach the call together. In a pixel program with such an op and no ba
 are decided per quad (x2w_quad_any, fine derivatives of the EXEC bit): the guest's wave skips a
 block only when no lane is active and runs it with the other lanes masked, so a quad with an active lane stays together.
 A voted branch parts no quad, so it does not clear Stage.uniform_cf; the vote reads the quad, so it is only taken while
-uniform_cf holds and no lane-exec break (s_wqm of a narrowed EXEC, a discard) came first. Any other branch that can
+uniform_cf holds and no lane-exec break (a discard under an unknown EXEC, an s_wqm of other operands) came first.
+s_wqm_b64 exec, exec on a narrowed EXEC is the same vote written back to EXEC (exec = x2w_quad_any(exec) ? 1u : 0u). Any other branch that can
 differ between lanes (a VCC test, an SCC not proven uniform) clears uniform_cf, as in #2659.
 
 Fixtures (synthetic gfx1013 wave64 programs, no game data). v0 is the packed pixel position (POS_FIXED_PT, the only
@@ -108,6 +109,9 @@ FIXTURES = {
                  + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(1, 8), Fraction(5, 8)), -1),
     'uni_loop': (PROLOGUE + 's_mov_b32 s30, 2\nBB1:\n' + SAMPLE + SUB + 's_add_i32 s30, s30, -1\ns_cmp_lg_u32 s30, 0\n'
                  's_cbranch_scc1 BB1\n' + EXPORT, (Fraction(-3, 8), Fraction(1, 8)), -1),
+    # s_wqm exec, exec on a narrowed EXEC turns the whole quad back on: every lane takes the subtraction (u1 = 1/8, not 5/8).
+    'wqm': (PROLOGUE + CMPX + 's_wqm_b64 exec, exec\n' + SUB + SAMPLE + EXPORT,
+            (Fraction(-3, 8), Fraction(1, 8)), -1),
 }
 # name: (source, text of the refusal)
 REFUSED = {
@@ -141,8 +145,6 @@ REFUSED = {
                  'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     'loop': (PROLOGUE + 'BB1:\n' + SAMPLE + 's_waitcnt vmcnt(0)\nv_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccnz BB1\n'
              + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
-    # s_wqm of a narrowed EXEC is a no-op here while the guest turns the quad back on: a lane-exec break.
-    'wqm_break': (PROLOGUE + CMPX + 's_wqm_b64 exec, exec\n' + SUB + SAMPLE + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A scalar write inside the block an EXEC branch can skip happens once for the wave in the guest; a quad that
     # votes to skip it would miss it (review of the first version): the branch is not voted, the op is refused.
     'scalar_in_block': (PROLOGUE + 's_mov_b32 s28, -1.0\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
@@ -219,11 +221,6 @@ WORDS_HEX = {
         'f0121210ff1204060000003ef302027eff02067e0000803e0902087e8010a47d010089bf000081bff10404067fc08cbf'
         '280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
-    'wqm_break': (
-        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
-        'f0121210ff1204060000003ef302027eff02067e0000803e0902087e8010a47d7e0afebef10404067fc08cbf280f94f0'
-        '010ac400703f8cbf0f1800f80a0b0c0d000081bf'
-    ),
     'uni_loop': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
         'f0121210ff1204060000003ef302027eff02067e0000803e0902087e82039ebe7fc08cbf280f94f0010ac400f1040406'
@@ -267,6 +264,11 @@ WORDS_HEX = {
     ),
     'bias_per_lane': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef2021c7e8010847d011d02028010847d6a2480be010088bff10404067e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'wqm': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
+        'f0121210ff1204060000003ef302027eff02067e0000803e0902087e8010a47d7e0afebef10404067fc08cbf280f94f0'
+        '010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 BRANCH = re.compile(r'^(s_c?branch\w*) (BB\d+)$')
@@ -348,7 +350,7 @@ def controls():
     for name, (_source, text) in REFUSED.items():
         refused(name, text)
     # The quad votes: the EXEC branches of inside, kill and join_pixel, one vote each; v_cmpx alone needs none.
-    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('inside_y', 1)):
+    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('inside_y', 1), ('wqm', 1)):
         text = pipeline(name).hlsl_ps()
         assert text.count('x2w_quad_any(exec)') == votes, (name, text)
     # The gate is the vote's: with the EXEC rule of #2659 (the entry mask only) the divergent-EXEC fixtures are refused.
@@ -359,15 +361,13 @@ def controls():
             refused(name, 'image_sample_b needs implicit derivatives')
     finally:
         G.Stage.derivative_exec_ok = saved
-    # A lane-exec break before the sample keeps it refused: s_wqm of a narrowed EXEC is a no-op in the one-lane model.
-    refused('wqm_break', 'image_sample_b needs implicit derivatives')
     # The drawn vote helper is the text the translation emits.
     assert '\n'.join(G.QUAD_ANY_HLSL) in pipeline('inside').hlsl_ps()
     cells = {name: reference(name) for name in FIXTURES}
     print('image_sample_b after a join, under a v_cmpx EXEC, after a uniform branch, inside an EXEC branch and '
           'past a kill branch: SampleBias; references %s'
           % ', '.join('%s=%s' % kv for kv in cells.items()))
-    print('refused: inside or after a block a VCC branch skips, in a VCC loop, after s_wqm of a narrowed EXEC')
+    print('refused: inside or after a block a VCC branch skips, in a VCC loop')
 
 
 def check_binary(llvm_mc):
@@ -387,6 +387,8 @@ def mutants(name, hlsl):
         out.append(('without the branch write', hlsl.replace(write.group(0), '')))
     if name in ('cmpx', 'inside', 'kill'):
         out.append(('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', ''))))
+    if name == 'wqm':
+        out.append(('s_wqm as a no-op', hlsl.replace('exec = x2w_quad_any(exec) ? 1u : 0u;', '')))
     out.append(('bias ignored', hlsl.replace(CALL, CALL.replace('F(v1))', '0.0)'))))
     for label, text in out:
         assert text != hlsl, (name, label)

@@ -17345,10 +17345,11 @@ with such an op and no backward branch now decides its `s_cbranch_execz` / `s_cb
 (`x2w_quad_any(exec)`: some lane of the 2x2 quad has its EXEC bit, from fine derivatives of the 0/1 bit), as the guest's
 wave skips a block only when no lane is active and runs it with the other lanes masked. A voted branch parts no quad,
 so it keeps `uniform_cf` (#2659); the vote reads the quad, so it is taken only while the control flow is quad-uniform
-and no lane-exec break (`s_wqm` of a narrowed EXEC, a discard under an unknown EXEC) came first. With that, a derivative
+and no lane-exec break (a discard under an unknown EXEC, an `s_wqm` with other operands) came first. With that, a derivative
 op may sit under `v_cmpx`, inside an `execz` block, past an `execnz` kill branch, or after an EXEC restore. Still
 refused: any branch that can differ between lanes and is not an EXEC branch (VCC, SCC not proven uniform), loops with
-such a branch, and an `s_wqm` of a narrowed EXEC before the op.
+such a branch. `s_wqm_b64 exec, exec` on a narrowed EXEC turns every lane of a quad with an active lane on; it is
+lowered as `exec = x2w_quad_any(exec) ? 1u : 0u;`, the same vote written back to EXEC.
 `tests/startup_image_sample_b_flow_check.py` and `tests/startup_image_get_lod_flow_check.py` draw each shape against a
 CPU reference (DXC ps_6_0 and FXC ps_5_1) with wrong-value controls.
 
