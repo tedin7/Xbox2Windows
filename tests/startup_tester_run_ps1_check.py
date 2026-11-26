@@ -151,7 +151,7 @@ def check_shell(shell):
         assert deep_manifest["deep"] is True and deep_args["CaptureEvery"] == 0, deep_manifest
 
         # -LazyTextures $false leaves the variable unset and the manifest says so.
-        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-LazyTextures", "$false")
+        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-LazyTextures", "0")
         assert plain.returncode == 0, (plain.stdout, plain.stderr)
         newest_plain = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_plain) as z:
