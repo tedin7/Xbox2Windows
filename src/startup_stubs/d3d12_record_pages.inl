@@ -58,7 +58,7 @@ void page_gather_ranges()
     page_ranges.clear();
     for (const PageRange& r : raw) {
         if (!page_ranges.empty() && r.address <= page_ranges.back().address + page_ranges.back().bytes) {
-            const u64 end = std::max(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
+            const u64 end = (std::max)(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
             page_ranges.back().bytes = end - page_ranges.back().address;
         } else {
             page_ranges.push_back(r);
