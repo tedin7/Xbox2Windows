@@ -31,12 +31,12 @@ def run(args, env, timeout=300):
     return result.returncode, result.stdout, result.stderr
 
 
-def creations(text):
-    """The stand-in's creation lines, addresses and pointers blanked, in order."""
+def creations(text, raw=False):
+    """The stand-in's creation lines, addresses and pointers blanked (kept with raw=True), in order."""
     lines = []
     for line in text.splitlines():
         if line.startswith("x2w-d3d12 ") and CREATION.match(line) and re.search(r"create|place|heap", line, re.I):
-            lines.append(HEX.sub("#", line))
+            lines.append(line if raw else HEX.sub("#", line))
     return lines
 
 
@@ -103,8 +103,11 @@ def main(argv):
         assert summary["missing_blob"] == 0, "missing blobs: %s" % summary
         replayed = creations(log)
         if replayed != recorded:
-            only_recorded = [l for l in recorded if l not in replayed][:6]
-            only_replayed = [l for l in replayed if l not in recorded][:6]
+            # First positions where the two ordered lists differ, with the raw lines (addresses kept).
+            raw_r, raw_p = creations(out + err, raw=True), creations(log, raw=True)
+            at = [i for i in range(min(len(recorded), len(replayed))) if recorded[i] != replayed[i]][:4]
+            only_recorded = ["#%d %s" % (i, raw_r[i]) for i in at]
+            only_replayed = ["#%d %s" % (i, raw_p[i]) for i in at]
             raise AssertionError("creation lines differ: recorded %d, replayed %d\nonly recorded:\n%s\nonly replayed:\n%s" % (
                 len(recorded), len(replayed), "\n".join(only_recorded), "\n".join(only_replayed)))
         if control:
