@@ -2147,6 +2147,13 @@ void write_file(const wchar_t* path, const void* data, std::size_t bytes);
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
 // copy, the note and the dump alone. Neither is the composited window picture.
+// Gray world (x2w-gray lines): the time the first flat picture was read back, and the last readback (ticks since the process
+// start; 0 = not yet). The onset line in gray_onset_poll compares it with the first ring refusal and the first draw not drawn.
+const ULONGLONG gray_t0 = GetTickCount64();
+volatile LONG64 gray_flat_at_ms = 0, gray_last_readback_ms = 0, gray_last_line_ms = 0;
+volatile LONG64 gray_flat_mean_x100 = 0, gray_flat_spread_x100 = 0;
+volatile LONG gray_flat_episodes = 0;  // times the picture turned flat (bright, no spread); each is logged once, at most 8
+
 void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int raw_plane = -1)
 {
     const bool raw = raw_plane >= 0;
@@ -2300,7 +2307,22 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     const double mean_level = sum / (3.0 * shown_width * shown_height);
     const bool periodic = (count > 0 && count <= 3) || count % 40 == 0;
     const bool moved = std::fabs(mean_level - last_logged_mean) > 2 && change_lines < 300;
-    if (periodic || moved) {
+    // By time as well: a slow run reads the picture back tens of seconds apart, so a line at least every 5 s.
+    const LONG64 tick_ms = static_cast<LONG64>(GetTickCount64() - gray_t0);
+    InterlockedExchange64(&gray_last_readback_ms, tick_ms);
+    const bool timed = tick_ms - gray_last_line_ms >= 5000;
+    if (timed) InterlockedExchange64(&gray_last_line_ms, tick_ms);
+    // A flat picture: bright and nearly no spread. The first one is the onset the interval lines are compared with.
+    static bool was_flat = false;
+    const bool flat_now = luma_mean > 100 && luma_spread < 4;
+    if (flat_now && !was_flat) {
+        InterlockedIncrement(&gray_flat_episodes);
+        gray_flat_at_ms = tick_ms ? tick_ms : 1;
+        gray_flat_mean_x100 = static_cast<LONG64>(luma_mean * 100);
+        gray_flat_spread_x100 = static_cast<LONG64>(luma_spread * 100);
+    }
+    was_flat = flat_now;
+    if (periodic || moved || timed) {
         if (moved && !periodic) {
             ++change_lines;
             log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
@@ -7619,6 +7641,22 @@ PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
     return out;
 }
 
+// One line when the first flat picture, the first upload ring refusal and the first draw not drawn have all happened (or at the
+// first flat picture, listing what has not happened yet): which came first names the branch of the gray world.
+void gray_onset_poll(LONG frame, ULONGLONG)
+{
+    static LONG64 first_refusal_ms = 0, first_not_drawn_ms = 0;
+    static LONG logged_episodes = 0;
+    const LONG64 now_ms = static_cast<LONG64>(GetTickCount64() - gray_t0);
+    if (!first_refusal_ms && upload_ring_refusals) first_refusal_ms = now_ms ? now_ms : 1;
+    if (!first_not_drawn_ms && untranslated_draws) first_not_drawn_ms = now_ms ? now_ms : 1;
+    if (logged_episodes >= gray_flat_episodes || logged_episodes >= 8) return;
+    logged_episodes = gray_flat_episodes;
+    log("x2w-gray onset %ld (frame %ld): flat picture from %.1f s (mean %.2f, spread %.2f); first upload ring refusal at %s%.1f s; first draw not drawn at %s%.1f s",
+        logged_episodes, frame, gray_flat_at_ms / 1000.0, gray_flat_mean_x100 / 100.0, gray_flat_spread_x100 / 100.0, first_refusal_ms ? "" : "NONE yet, ",
+        first_refusal_ms / 1000.0, first_not_drawn_ms ? "" : "NONE yet, ", first_not_drawn_ms / 1000.0);
+}
+
 // The first presents and every 300th: each plane's first resource and its shape.
 void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
 {
@@ -7712,7 +7750,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         hex_text(present_parameters, 0x40, b, sizeof(b));
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
-    if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
+    gray_onset_poll(frame, now);
+    // Also at least every 5 s of run time, so a slow run (a present every second or two) still has a picture line.
+    const bool readback_due = frame % (shown_in_window ? 60 : 6) == 0 ||
+        static_cast<LONG64>(GetTickCount64() - gray_t0) - gray_last_readback_ms >= 5000;
+    if (render_mode() && readback_due && planes && plane_parameters) {
         // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
