@@ -557,6 +557,40 @@ const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOU
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
 
+// A texture range the probe found unreadable is not probed again for a short time: the title republishes the same view
+// every frame, and each probe of an unmapped or protected range costs a first-chance exception (the whole process stops
+// on each one while a debugger is attached). A failure for (address, bytes) holds for any longer range at the address;
+// the entry expires, because the memory may be mapped or committed later.
+struct UnreadableTextureRange {
+    u64 address = 0, bytes = 0;
+    ULONGLONG tick = 0;
+};
+constexpr ULONGLONG unreadable_texture_hold_ms = 1000;
+std::mutex unreadable_texture_mutex;
+UnreadableTextureRange unreadable_textures[64];
+unsigned unreadable_texture_next;
+volatile LONG unreadable_texture_skips;
+
+bool texture_range_readable(u64 address, u64 bytes)
+{
+    const ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard lock(unreadable_texture_mutex);
+        for (const auto& entry : unreadable_textures) {
+            if (entry.address == address && bytes >= entry.bytes && now - entry.tick < unreadable_texture_hold_ms) {
+                const LONG skips = InterlockedIncrement(&unreadable_texture_skips);
+                if (skips == 1 || (skips & (skips - 1)) == 0)
+                    log("x2w-d3d12 slot70 texture range probes skipped (recently unreadable): %ld", skips);
+                return false;
+            }
+        }
+    }
+    if (x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return true;
+    std::lock_guard lock(unreadable_texture_mutex);
+    unreadable_textures[unreadable_texture_next++ % 64] = UnreadableTextureRange{address, bytes, now};
+    return false;
+}
+
 // Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the three causes the census
 // keeps apart. `published` is true when a publication was attempted (BC, console layout, single element), false when
 // only a live resource with this base and description could have served the view.
@@ -566,7 +600,7 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
     if (!published) return "texture_no_resource";
     const auto bytes = address_texture_bytes(device, desc);
     if (bytes > max_published_texture_bytes) return "texture_over_64mib";
-    if (!x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return "texture_unreadable";
+    if (!texture_range_readable(address, bytes)) return "texture_unreadable";
     return "texture_unavailable";  // publication failed for another reason (no wrapper)
 }
 
@@ -574,7 +608,7 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
 {
     const auto bytes = address_texture_bytes(device, desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > max_published_texture_bytes || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
+    if (bytes > max_published_texture_bytes || !texture_range_readable(address, bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {

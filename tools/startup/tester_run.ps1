@@ -15,7 +15,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
-   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png ...), the debugger
+   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
    files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
@@ -37,6 +37,9 @@ keeps video memory from running out. -NoLazyTextures turns it off. The manifest 
 
 -Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
 time counts from that poll, which the title reaches late).
+-PrivacyBoxes N (default 2, with -Input menus; -PrivacyStart S default 90, -PrivacySkipDown K default 0): from script second S the menus
+script ticks N privacy checkboxes (A on a box, D-pad down to the next, down to Conferma, A), then the menus pattern starts over.
+Run L showed two boxes and a Conferma button; the start second is a measured guess, check it in the press lines and pictures.
 -Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
 still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
 Any other value is a raw
@@ -60,6 +63,9 @@ param(
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
     [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
+    [int]$PrivacyBoxes = 2,                     # -Input menus: at -PrivacyStart tick this many privacy checkboxes (A on a box, DOWN to the next, DOWN to Conferma, A); 2 = the two boxes seen in Run L, 0 = leave the screen to the pattern
+    [int]$PrivacyStart = 90,                    # script second (after the first pad poll) the privacy screen is reached (Run L: legal notice at process 90 s, privacy 105 s)
+    [int]$PrivacySkipDown = 0,                  # D-pad downs needed to reach the first checkbox
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
@@ -189,7 +195,7 @@ try {
 }
 Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
-$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
+$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes --privacy-start $PrivacyStart --privacy-skip-down $PrivacySkipDown })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
@@ -227,6 +233,15 @@ if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
+# memory.txt in the run folder (so in the zip): every 30 s the system commit and the 8 processes holding the most of it,
+# names and GiB only (memory_top.py), then one "end" line after the run. Never stops the run.
+$memoryTop = Join-Path $PSScriptRoot "memory_top.py"
+$memoryFile = Join-Path $logDir "memory.txt"
+$memorySampler = $null
+try {
+    $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
+        -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
+} catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
 $exitCode = 0
 try {
     & $runScript @runArgs
@@ -235,6 +250,8 @@ try {
     Write-Warning "tester_run: the run stopped with an error: $($_.Exception.Message)"
     $exitCode = 1
 }
+if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
+Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 
 # Manifest input: X2W_* variables only; the user's profile path is masked.
 $envSet = [ordered]@{}

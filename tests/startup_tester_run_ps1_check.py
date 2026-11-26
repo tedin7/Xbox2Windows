@@ -81,7 +81,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -152,9 +152,12 @@ def check_shell(shell):
             names = sorted(z.namelist())
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            memory = z.read("memory.txt").decode("utf-8").splitlines()
+        # The end line after the run: the system commit and the top processes by commit (this shell is one of them).
+        assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
-                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt"]), names
+                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
@@ -167,7 +170,7 @@ def check_shell(shell):
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
         assert manifest["gpu_time"] is True and manifest["env"].get("X2W_GPU_TIME") == "1", manifest  # GPU time per frame on
-        assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
+        assert args["InputScript"].startswith("80@5+1.2,80@7+1.2,4@9+1.2,80@11+1.2"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)

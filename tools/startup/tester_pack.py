@@ -29,6 +29,7 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
+PRIVACY_START_S = 90       # script second the privacy screen is reached (Run L pictures: legal notice at process 90 s, privacy screen at 105 s, process = script + 8 s)
 MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
 MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
@@ -62,9 +63,30 @@ def menus2_script():
     return ",".join(items)
 
 
-def input_preset(spec, seconds):
+def privacy_items(boxes, start, skip_down=0):
+    """The privacy screen (two checkboxes and a Conferma button): `skip_down` D-pad downs to reach the first checkbox, then A on each box with D-pad down to
+    the next one, D-pad down onto the confirm button after the last box and A to confirm. One press every
+    MENUS_STEP_S. Returns (items, time of the next free step). The layout (how many boxes, where the focus starts) is
+    a parameter until a run's pictures show it."""
+    items, at = [], start
+    def press(mask):
+        nonlocal at
+        items.append("%s@%d+%s" % (mask, at, MENUS_HOLD_S))
+        at += MENUS_STEP_S
+    for _ in range(skip_down):
+        press(DPAD_DOWN)
+    for _ in range(boxes):
+        press(BUTTON_A)
+        press(DPAD_DOWN)
+    press(BUTTON_A)   # confirm
+    return items, at
+
+
+def input_preset(spec, seconds, privacy_boxes=0, privacy_start=PRIVACY_START_S, privacy_skip_down=0):
     """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. Anything else is a raw script."""
+    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 the privacy screen comes
+    at privacy_start (privacy_items, instead of the pattern presses from that second), then the pattern starts over.
+    Anything else is a raw script."""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
@@ -73,9 +95,15 @@ def input_preset(spec, seconds):
         if len([item for item in spec.split(",") if item.strip()]) > MAX_ENTRIES:
             raise ValueError("input script has more than %d entries" % MAX_ENTRIES)
         return spec
-    items = []
-    press, at = 0, MENUS_START_S
+    items, press, at = [], 0, MENUS_START_S
+    block_done = privacy_boxes <= 0
     while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
+        if not block_done and at >= privacy_start:
+            # the privacy screen: its own presses, then the pattern starts over with DOWN
+            block, at = privacy_items(privacy_boxes, at, privacy_skip_down)
+            items.extend(block)
+            block_done, press = True, 0
+            continue
         items.append("%s@%d+%s" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at, MENUS_HOLD_S))
         press += 1
         at += MENUS_STEP_S
@@ -417,6 +445,9 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
+    p.add_argument("--privacy-boxes", type=int, default=0)
+    p.add_argument("--privacy-start", type=int, default=PRIVACY_START_S)
+    p.add_argument("--privacy-skip-down", type=int, default=0)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -440,7 +471,7 @@ def main(argv):
     r.add_argument("cache")
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
-        print(input_preset(args.spec, args.seconds))
+        print(input_preset(args.spec, args.seconds, args.privacy_boxes, args.privacy_start, args.privacy_skip_down))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))

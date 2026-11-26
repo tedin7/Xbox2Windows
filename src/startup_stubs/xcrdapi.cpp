@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 #include <cstdarg>
@@ -501,6 +502,106 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // is counted in requests_compressed ("inflated"), or in requests_bcpack_blank when its BCPack data was not decoded.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 
+// Loading progress (the "x2w-dstorage progress" line every heartbeat): requests enqueued against requests completed
+// (done, inflated, blank or failed) give the queue depth; a ring of enqueue ticks, indexed by sequence number, names the
+// oldest request still pending (queues run in order, so the request numbered "completed" is the oldest; with several
+// queues the age is approximate). Bytes: read = file bytes consumed (the compressed bytes of a compressed request, the
+// copied bytes of an uncompressed one); inflated = the bytes a compressed request wrote. Fixed counters, no allocation.
+LONG requests_enqueued;
+LONG64 bytes_read_total, bytes_inflated_total;
+constexpr unsigned enqueue_ring_size = 4096;  // a power of two
+volatile LONG enqueue_ring_tick[enqueue_ring_size];  // GetTickCount() at the enqueue of request number i % size
+void note_enqueued() noexcept
+{
+    const LONG number = InterlockedIncrement(&requests_enqueued) - 1;
+    enqueue_ring_tick[static_cast<unsigned>(number) & (enqueue_ring_size - 1)] = static_cast<LONG>(GetTickCount());
+}
+// The progress line: queue depth, the oldest pending request's age, and MB/s read and inflated over the last
+// `seconds`. `completed` is the sum of every request outcome; `now` is GetTickCount().
+int format_progress(char* out, std::size_t size, int second, LONG enqueued, LONG completed, LONG64 read_delta,
+                    LONG64 inflated_delta, LONG64 read_total, LONG64 inflated_total, double seconds, DWORD now) noexcept
+{
+    const LONG pending = enqueued > completed ? enqueued - completed : 0;
+    char oldest[48] = "none";
+    if (pending > 0 && pending <= static_cast<LONG>(enqueue_ring_size))
+        std::snprintf(oldest, sizeof(oldest), "%lu ms",
+                      static_cast<unsigned long>(now - static_cast<DWORD>(
+                          enqueue_ring_tick[static_cast<unsigned>(completed) & (enqueue_ring_size - 1)])));
+    else if (pending > 0)
+        std::snprintf(oldest, sizeof(oldest), "unknown, more than %u pending", enqueue_ring_size);
+    return std::snprintf(out, size,
+                         "x2w-dstorage progress %d s: pending %ld (oldest %s), read %.1f MB/s, inflated %.1f MB/s, "
+                         "enqueued %ld completed %ld, total read %lld KiB inflated %lld KiB", second, pending, oldest,
+                         static_cast<double>(read_delta) / 1048576.0 / seconds,
+                         static_cast<double>(inflated_delta) / 1048576.0 / seconds, enqueued, completed,
+                         static_cast<long long>(read_total >> 10), static_cast<long long>(inflated_total >> 10));
+}
+// The disk side of loading (the title package can sit on a hard disk, where seeks, not bandwidth, set the speed):
+// time spent inside the file reads (QueryPerformanceCounter ticks), their sizes in six buckets, and whether each read
+// continues the previous one of the same file (sequential), jumps forward (still in offset order), jumps back, or is
+// the first of its file. One short lock per read; the map of last end offsets is cleared past 256 files.
+constexpr unsigned disk_size_buckets = 6;
+const unsigned long long disk_bucket_limit[disk_size_buckets - 1] = {4096, 16384, 65536, 262144, 1048576};
+struct DiskStats {
+    LONG64 ticks = 0, bytes = 0;
+    LONG reads = 0, failed = 0;
+    LONG sizes[disk_size_buckets] = {};
+    LONG sequential = 0, forward = 0, backward = 0, first = 0;
+};
+DiskStats disk_stats;
+std::mutex disk_mutex;
+std::unordered_map<HANDLE, unsigned long long> disk_last_end;
+void note_disk_read(HANDLE file, unsigned long long offset, unsigned long long count, LONG64 ticks, bool ok) noexcept
+{
+    try {
+        const std::lock_guard guard(disk_mutex);
+        DiskStats& d = disk_stats;
+        d.ticks += ticks;
+        if (!ok) {
+            ++d.failed;
+            return;
+        }
+        d.bytes += static_cast<LONG64>(count);
+        ++d.reads;
+        unsigned bucket = 0;
+        while (bucket < disk_size_buckets - 1 && count > disk_bucket_limit[bucket]) ++bucket;
+        ++d.sizes[bucket];
+        if (disk_last_end.size() > 256) disk_last_end.clear();
+        const auto found = disk_last_end.find(file);
+        if (found == disk_last_end.end()) ++d.first;
+        else if (offset == found->second) ++d.sequential;
+        else if (offset > found->second) ++d.forward;
+        else ++d.backward;
+        disk_last_end[file] = offset + count;
+    } catch (...) {
+    }
+}
+DiskStats disk_snapshot()
+{
+    const std::lock_guard guard(disk_mutex);
+    return disk_stats;
+}
+// The disk line: MB/s while reading and the share of the window spent in reads (high share and low MB/s = seek-bound),
+// read sizes (<=4K <=16K <=64K <=256K <=1M >1M) and the offset order of the reads, all since the start.
+int format_disk(char* out, std::size_t size, int second, const DiskStats& now, const DiskStats& before, double seconds,
+                double ticks_per_second) noexcept
+{
+    const double busy = static_cast<double>(now.ticks - before.ticks) / ticks_per_second;
+    const double megabytes = static_cast<double>(now.bytes - before.bytes) / 1048576.0;
+    return std::snprintf(out, size,
+                         "x2w-dstorage disk %d s: %ld reads (+%ld), %.1f MB/s while reading, reading %.0f%% of the window; "
+                         "read sizes <=4K %ld <=16K %ld <=64K %ld <=256K %ld <=1M %ld >1M %ld; offsets sequential %ld "
+                         "forward %ld backward %ld first %ld; read failures %ld",
+                         second, now.reads, now.reads - before.reads, busy > 0 ? megabytes / busy : 0.0,
+                         seconds > 0 ? 100.0 * busy / seconds : 0.0, now.sizes[0], now.sizes[1], now.sizes[2], now.sizes[3],
+                         now.sizes[4], now.sizes[5], now.sequential, now.forward, now.backward, now.first, now.failed);
+}
+void note_written(bool compressed, std::size_t source_bytes, std::size_t written_bytes) noexcept
+{
+    InterlockedExchangeAdd64(&bytes_read_total, static_cast<LONG64>(compressed ? source_bytes : written_bytes));
+    if (compressed) InterlockedExchangeAdd64(&bytes_inflated_total, static_cast<LONG64>(written_bytes));
+}
+
 // Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
 // count_failure adds it to requests_failed as well, so the causes add up to that total. "other" holds
 // the failures without a cause of their own: unknown option bits, page grants and page writes, a page
@@ -784,8 +885,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
-        if (file_object && file_object->kind == file &&
-            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
+        bool file_read = false;
+        if (file_object && file_object->kind == file) {
+            LARGE_INTEGER began, ended;
+            QueryPerformanceCounter(&began);
+            file_read = x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed);
+            QueryPerformanceCounter(&ended);
+            note_disk_read(file_object->handle, offset, source_size, ended.QuadPart - began.QuadPart, file_read);
+        }
+        if (file_read)
             input = packed.data();
         else {
             outcome = "read failed";
@@ -973,6 +1081,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 } else {
                     InterlockedIncrement(&requests_done);
                 }
+                note_written(zlib || bcpack, source_size, decode_length);
             }
         }
     }
@@ -1524,6 +1633,7 @@ void push(Object* self, Entry&& entry)
 void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
 {
     if (!request) return;
+    note_enqueued();
     Entry entry{};
     entry.type = Entry::request;
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
@@ -1776,6 +1886,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     // failed requests by cause, a third the page-destination requests by end (#1198).
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
+        LONG64 last_read = 0, last_inflated = 0;
+        DiskStats last_disk;
         MemorySample last_memory;
         const DWORD interval_ms = heartbeat_interval_ms();
         for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
@@ -1789,6 +1901,25 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             sample_page_end_counts(page_ends);
             const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
+            {
+                // Every report, changed or not: "loading slow" (pending shrinks, MB/s above 0) against "loading stuck"
+                // (pending flat, oldest age growing, 0 MB/s).
+                const LONG64 read_now = bytes_read_total, inflated_now = bytes_inflated_total;
+                char progress[256];
+                format_progress(progress, sizeof progress, second, requests_enqueued, total2, read_now - last_read,
+                                inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
+                log("%s", progress);
+                const DiskStats disk_now = disk_snapshot();
+                LARGE_INTEGER frequency{};
+                QueryPerformanceFrequency(&frequency);
+                char disk_line[512];
+                format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
+                            frequency.QuadPart > 0 ? static_cast<double>(frequency.QuadPart) : 1.0);
+                log("%s", disk_line);
+                last_disk = disk_now;
+                last_read = read_now;
+                last_inflated = inflated_now;
+            }
             const MemorySample sample = memory_sample();
             const ULONGLONG peak_mib = sample.peak_commit >> 20;
             const ULONGLONG current_mib = sample.commit >> 20;
