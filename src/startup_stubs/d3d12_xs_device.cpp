@@ -4370,7 +4370,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         // recorded either before this submission's user value or after it, as the desktop queue gets them.
         auto order = linear_queue_order(queue, false);
         // Pin the closed recording and its allocator through submission bookkeeping.
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         AcquireSRWLockExclusive(&allocator_lock);
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
@@ -4421,7 +4421,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         }
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
         order.release();
         check_device("CommandQueue execute", 35);
         return;
@@ -6301,9 +6301,9 @@ void drain_retired_resources()
             lazy_textures().erase(drop.wrapper);
         }
         if (drop.resource) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             texture_uploads().erase(drop.resource);
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             drop.resource->Release();
             const LONG64 total = InterlockedIncrement64(&retire_freed);
             if (total <= 8 || total % 1000 == 0) log("x2w-d3d12 retire: %lld desktop references dropped", total);
@@ -6590,9 +6590,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
         out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
         if (auto* real = static_cast<ID3D12Resource*>(r->own().real)) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             AcquireSRWLockShared(&target_lock);
             for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
             ReleaseSRWLockShared(&target_lock);
@@ -6807,9 +6807,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resou
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_texture_upload_probe(void* desktop_resource)
 {
     if (!desktop_resource) return FALSE;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     const bool cached = texture_uploads().count(static_cast<ID3D12Resource*>(desktop_resource)) != 0;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     return cached ? TRUE : FALSE;
 }
 
@@ -7323,12 +7323,12 @@ void draw_overlay(LONG frame, double seconds)
 void log_gpu_time(LONG frame, ULONGLONG now_ms)
 {
     static ULONGLONG last_ms;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     auto& probe = gpu_time_probe();
     probe.harvest(static_cast<std::uint64_t>(frame));
     const auto r = probe.stats.take(last_ms ? static_cast<double>(now_ms - last_ms) : 0);
     const unsigned skipped = probe.skipped, failed = probe.failed;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     last_ms = now_ms;
     log("x2w-gpu-time frame %ld: %llu frames, avg %.2f ms, max %.2f ms, busy %.0f ms of %.0f ms, GPU idle %.0f%% (stamps skipped %u, failed %u)", frame,
         static_cast<unsigned long long>(r.frames), r.avg_ms, r.max_ms, r.busy_ms, r.wall_ms, r.idle_share * 100.0, skipped, failed);
@@ -7654,10 +7654,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
     }
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
@@ -7680,8 +7680,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
-        log("x2w-render manifest lookups: file opens under draw_lock, first lookups %lld, retries %lld (must be 0); manifests read by the background thread %lld",
-            manifest_source().first_opens_under_lock(), manifest_source().retry_opens_under_lock(), manifest_source().background_reads());
+        log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
+            manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
@@ -7733,6 +7733,14 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[400];
             if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[400];
+            if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[500];
+            if (dispatch_phase_line(line, sizeof(line))) log("%s", line);
         }
         {
             LARGE_INTEGER frequency;
