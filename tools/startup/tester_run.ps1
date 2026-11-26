@@ -28,7 +28,8 @@ first touch, which cuts the section commit. -NoLazyMemory turns it off. The mani
 The shader cache is repaired once before the run (tools/startup/shader_cache_repair_packed.py: translations made before the packed-position derivation are withdrawn so the translator redoes them, no revision bump); the console says "repaired N packed-position translations" and the manifest records cache_repaired (-1 = skipped). -NoCacheRepair skips it.
 
 When the report is packed the script finishes the translation: one translator pass over the shader cache (no --watch), until
-nothing is pending or -FinishTranslateSeconds (default 900, 0 = skip) is over, then prints "pending before/after, ok, refused".
+nothing is pending or -FinishTranslateSeconds (default 300, 0 = skip) is over, with at most 4 workers at BelowNormal (Run Q:
+16 workers at 100% CPU), then prints "pending before/after, ok, refused". It is safe to stop: what is written is kept.
 The next run then starts with every request the title made already translated. The mail does not wait for this step.
 
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
@@ -36,7 +37,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
+-Input accept (the default): ONLY the A button (mask 4), 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -55,7 +56,8 @@ param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
-    [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [Alias("Input")] [string]$InputMode = "accept",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
@@ -65,7 +67,7 @@ param(
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
-    [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
+    [int]$FinishTranslateSeconds = 300,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
     [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
@@ -74,6 +76,9 @@ param(
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [string[]]$ScanRoots = @(),                # folders searched after the run for files the title wrote (default: AppData, LocalAppData, Documents, Saved Games, ProgramData, the data folder): shows where it keeps a choice such as the privacy acceptance
+    [switch]$FreshSave,                       # wipe the saved game folder first (out/startup/saves, or -SaveRoot): the title starts as a new profile and shows its legal/privacy screens again
+    [string]$SaveRoot = "out/startup/saves",      # X2W_STORAGE_PATH for the title: its saves and persistent local storage, kept across runs so a screen accepted once is skipped next time
     [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
     [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
@@ -86,6 +91,7 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $repo $BuildDir }
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
+$runStart = Get-Date
 
 # Windows PowerShell 5.1 turns a native command's stderr into error records when the script's own stderr is redirected
 # (a caller that captures it), and "Stop" then ends the script on a harmless warning (cmake, git, python). Native commands
@@ -203,6 +209,21 @@ $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-S
 # but one; the --watch pool beside the title keeps to 4 workers and leaves old refusals alone (gfx2hlsl.py watch_jobs),
 # and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+# The pre-run retry and the pass after the run keep to a few workers, so the PC stays usable (Run Q: the pass after the
+# run took 16 workers at 100% CPU and the tester had to kill it).
+$backgroundJobs = 4
+# The --watch pool beside the title leaves old refusals for the pass after the run, so a translator lift would reach
+# only the next run: every old refusal (a .fail an older build wrote) is translated again now, on 4 workers, for at
+# most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
+# Never blocks the run.
+# A cache without any refusal has nothing to retry: the translator is not even started (it takes seconds to load).
+$anyFailure = Get-ChildItem -LiteralPath $cache -Filter "*.fail" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($anyFailure) { try {
+    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 --jobs $backgroundJobs } | Out-String).Trim()
+    if ($retryLine) { Write-Host "tester_run: $retryLine" }
+} catch {
+    Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"
+} }
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
@@ -222,6 +243,15 @@ Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
+# No script (-Input none): run.ps1 sets X2W_INPUT_SCRIPT only for a non-empty script, so clear one left in this shell's environment.
+if (-not $script) { Remove-Item Env:X2W_INPUT_SCRIPT -ErrorAction SilentlyContinue }
+# One intent label per timed press ("privacy pass 2: toggle box 1", ...), kept in the manifest next to input_script; analyze_run joins
+# them with the "x2w-input script press item N" lines (item N = label N). Empty for scripts that are not the menus preset.
+$inputLabels = @()
+try {
+    $labelJson = (Invoke-Native { & $python -B $pack input-labels $InputMode $Seconds --privacy-boxes $PrivacyBoxes } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $labelJson) { $inputLabels = @((ConvertFrom-Json $labelJson) | ForEach-Object { $_ }) }
+} catch { Write-Warning "tester_run: no input labels ($($_.Exception.Message))" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
@@ -236,6 +266,13 @@ $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
 if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
+$saveDir = if ([System.IO.Path]::IsPathRooted($SaveRoot)) { $SaveRoot } else { Join-Path $repo $SaveRoot }
+if ($FreshSave -and (Split-Path -Leaf $saveDir) -notmatch "save") { throw "tester_run: -FreshSave only wipes a folder whose name contains save (got $saveDir)" }
+if ($FreshSave -and (Test-Path -LiteralPath $saveDir)) { Remove-Item -LiteralPath $saveDir -Recurse -Force }
+New-Item -ItemType Directory -Force $saveDir | Out-Null
+$env:X2W_STORAGE_PATH = $saveDir.TrimEnd('\', '/') + '\'
+$saveBefore = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)
+Write-Host ("tester_run: saves in {0} ({1} files kept from earlier runs{2})" -f $saveDir, $saveBefore.Count, $(if ($FreshSave) { ', -FreshSave wiped it' } else { '' }))
 $HddMode = -not $NoHddMode
 if ($HddMode) { $env:X2W_STORAGE_HDD = "1" } else { Remove-Item Env:X2W_STORAGE_HDD -ErrorAction SilentlyContinue }
 $GpuTime = -not $NoGpuTime
@@ -259,6 +296,7 @@ if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB 
 if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
+    if ($CaptureMenuEvery -gt 0 -and $runParams.ContainsKey("CaptureMenuEvery")) { $runArgs.CaptureMenuEvery = $CaptureMenuEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
 # memory.txt in the run folder (so in the zip): every 30 s the system commit and the 8 processes holding the most of it,
@@ -270,6 +308,42 @@ try {
     $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
 } catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
+# Manifest input: X2W_* variables only; the user's profile path is masked.
+$envSet = [ordered]@{}
+foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } | Sort-Object Name)) {
+    $value = $item.Value
+    if ($env:USERPROFILE) { $value = $value.Replace($env:USERPROFILE, "%USERPROFILE%") }
+    $envSet[$item.Name] = $value
+}
+$video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
+$os = Get-CimInstance Win32_OperatingSystem
+$zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
+# The linker map of our d3d12_xs.dll names its functions in the zip; only a map written with this DLL (within a minute of it).
+$mapArgs = @()
+$dllFile = Join-Path $buildRoot "d3d12_xs.dll"
+$mapFile = Join-Path $buildRoot "d3d12_xs.map"
+if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -and
+    ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
+    $mapArgs = @("--map", $mapFile)
+}
+# Janitor (tester_janitor.py), in a window of its own so that closing this console does not end it: if this script is stopped
+# (Ctrl-C) or its window is closed before the report is packed, it ends the run, ends the translator and packs the report from
+# this early manifest (interrupted = true). After a normal pack tester_run writes pack_done and it only sweeps leftovers.
+$janitorFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_janitor_${stamp}_$PID.json"
+try {
+    $early = [ordered]@{
+        commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds; input_script = $script; env = $envSet
+        gpu = (($video | ForEach-Object { $_.Name }) -join "; "); gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
+        windows_build = $os.BuildNumber; wall_seconds = 0; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures
+        lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; shader_cache = (Split-Path -Leaf $cache)
+        translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
+    }
+    $job = [ordered]@{ manifest = $early; zip = $zip; limit_mb = $LimitMB; cache = $cache; map = $(if ($mapArgs.Count) { $mapArgs[1] } else { "" }) }
+    [System.IO.File]::WriteAllText($janitorFile, ($job | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $janitorArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'tester_janitor.py')`"", "`"$logDir`"", "--parent", "$PID", "--pack-json", "`"$janitorFile`"", "--cache", "`"$cache`"")
+    Start-Process -FilePath $python -WindowStyle Hidden -ArgumentList $janitorArgs `
+        -RedirectStandardError "$janitorFile.err" -RedirectStandardOutput "$janitorFile.out" | Out-Null
+} catch { Write-Warning "tester_run: the janitor is off (Ctrl-C or a closed window will not pack the report): $($_.Exception.Message)" }
 # Stall watchdog (stall_watchdog.py): ends the run through the `stop` file when it is clearly stuck; the reason is printed as
 # "tester_run: STALL STOP at N s: ..." and recorded as stop_reason in the manifest.
 $stallFile = Join-Path $logDir "stall_stop.json"
@@ -300,40 +374,36 @@ Write-Host "tester_run: the run ended: $endCause"
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
 Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 
-# Manifest input: X2W_* variables only; the user's profile path is masked.
-$envSet = [ordered]@{}
-foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } | Sort-Object Name)) {
-    $value = $item.Value
-    if ($env:USERPROFILE) { $value = $value.Replace($env:USERPROFILE, "%USERPROFILE%") }
-    $envSet[$item.Name] = $value
+# Files written during this run outside the save folder (first 60, at most 20 s of searching, 4 levels deep): where the title keeps
+# what it saves by itself, e.g. the privacy acceptance.
+$scanRoots = if ($ScanRoots.Count) { $ScanRoots } else { @($env:LOCALAPPDATA, $env:APPDATA, [Environment]::GetFolderPath("MyDocuments"), (Join-Path $env:USERPROFILE "Saved Games"), $env:ProgramData, $DataDir) }
+$scanClock = [System.Diagnostics.Stopwatch]::StartNew()
+$changedFiles = @()
+foreach ($root in $scanRoots) {
+    if (-not $root -or -not (Test-Path -LiteralPath $root) -or $scanClock.Elapsed.TotalSeconds -gt 20) { continue }
+    $changedFiles += @(Get-ChildItem -LiteralPath $root -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $runStart -and $_.FullName.Substring($root.Length) -notmatch '\\(Temp|CrashDumps|Microsoft\\Windows|Packages|\.git)\\' -and -not $_.FullName.StartsWith($outRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 60 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName, $_.Length })
 }
-$video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
-$os = Get-CimInstance Win32_OperatingSystem
+$saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
 $manifest = [ordered]@{
     commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
-    pretranslate = $preTranslate; cache_repaired = $cacheRepaired
+    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
+    pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 
-$zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
-# The linker map of our d3d12_xs.dll names its functions in the zip; only a map written with this DLL (within a minute of it).
-$mapArgs = @()
-$dllFile = Join-Path $buildRoot "d3d12_xs.dll"
-$mapFile = Join-Path $buildRoot "d3d12_xs.map"
-if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -and
-    ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
-    $mapArgs = @("--map", $mapFile)
-}
 $parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache @mapArgs })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
+Set-Content -LiteralPath (Join-Path $logDir "pack_done") -Value "$PID"   # the janitor then only sweeps leftovers
+Remove-Item -LiteralPath $janitorFile -Force -ErrorAction SilentlyContinue
 foreach ($line in $parts) {
     $path, $bytes = $line -split " (?=\d+$)"
     Write-Host ("Send this file: {0} ({1:N1} MB)" -f $path, ([double]$bytes / 1MB))
@@ -351,11 +421,13 @@ if ($FinishTranslateSeconds -gt 0) {
     $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0] - [int]$before[2])
     $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
     $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
+    Write-Host "tester_run: safe to stop now, results kept (the report is packed; every translation already written stays in the cache)"
     Write-Host ("tester_run: finishing the translation: {0} request(s) pending ({1} refused earlier, retried only if the translator changed), one pass, at most {2} s (the report above is already packed; do not close this window)" -f $pendingBefore, [int]$before[2], $FinishTranslateSeconds)
     $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
-        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
+        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"", "--jobs", "$backgroundJobs")
     $null = $translator.Handle    # keeps the exit code readable after the process ends
+    try { $translator.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
     $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
     if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
     $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "

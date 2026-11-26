@@ -217,10 +217,13 @@ elif len(sys.argv) != 1:
 # 1. At shader entry, SCC is unverified: reading src_scc before any modeled writer must be refused.
 check('entry src_scc in s_mul_i32 is refused',
       refused_reason(encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC) + encode_sopp(SOPP_ENDPGM))
-      == 'src_scc with unverified SCC')
+      .startswith('src_scc with unverified SCC'))
+check('the refusal names its path, opcode and destination class',
+      refused_reason(encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC) + encode_sopp(SOPP_ENDPGM))
+      == 'src_scc with unverified SCC [operand read: s_mul_i32, destination sgpr]')
 check('entry src_scc in s_and_b32 is refused',
       refused_reason(encode_sop2(SOP2_AND_B32, S28, S_SCC, S5) + encode_sopp(SOPP_ENDPGM))
-      == 'src_scc with unverified SCC')
+      .startswith('src_scc with unverified SCC'))
 
 # 2. Modeled compare -> census s_mul_i32 s28, 1.0, src_scc: decodes and lowers using the SCC bit.
 cmp_census = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
@@ -295,7 +298,7 @@ join_refused = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)     # 0x00
                 + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)    # 0x0c (branch target / join)
                 + encode_sopp(SOPP_ENDPGM))                       # 0x10
 check('src_scc across a control-flow join is refused',
-      refused_reason(join_refused) == 'src_scc with unverified SCC',
+      refused_reason(join_refused).startswith('src_scc with unverified SCC'),
       repr(refused_reason(join_refused)))
 
 join_rewritten = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)   # 0x00

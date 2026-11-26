@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
-  tester_pack.py input-preset <menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py input-preset <accept|none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
@@ -13,8 +13,12 @@ The zip holds every file the run wrote in its log folder (stdout, stderr, events
 translate, translate_err, window*.png, bink_luma.png ...), the debugger summary (`<logdir>.out`) and manifest.json.
 Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
 `shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
-of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason. Never
+of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason, and for a key the
+run used its first and last use in seconds since the process started (the refused keys used latest are listed first). Never
 shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
+`shader_requests/`: the request files (req_<key>.*) of the 40 worst refused keys, ranked by draws not drawn (graphics) or dispatches
+without a translation (compute) from stderr.txt, at most 4 MB in all, listed in the manifest (`request_files`). Private data: mailed, never posted.
+
 `d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
 d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
@@ -31,12 +35,12 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
+MENUS_STEP_S = 1           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
 MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_UP = "40"             # GameInput button masks, hexadecimal
 DPAD_DOWN = "80"
 BUTTON_A = "4"
-MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS_HOLD_S = "0.8"       # a press is held this long (0.2 s released before the next one, a press every 1 s): at 28 fps a poll comes every 0.04 s; at 2 to 3 fps every 0.4 s, still two polls
 MENUS2_HOLD_S = "1.2"
 MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
@@ -48,6 +52,23 @@ MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
+
+
+ACCEPT_MASK = "4"        # GameInput A: the only button the title's picker takes. Never Start (Menu = the pause menu in game).
+ACCEPT_FIRST_S = 35      # first press, seconds after the first pad poll
+ACCEPT_EVERY_S = 10
+ACCEPT_HOLD_S = "0.3"
+
+
+def accept_script(seconds):
+    """`accept`: ONLY A, 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run (the picker
+    needs an A at about 31-43 s and the prologue another much later), at most MAX_ENTRIES presses."""
+    count = 0
+    items = []
+    while ACCEPT_FIRST_S + count * ACCEPT_EVERY_S < seconds and count < MAX_ENTRIES:
+        items.append("%s@%d+%s" % (ACCEPT_MASK, ACCEPT_FIRST_S + count * ACCEPT_EVERY_S, ACCEPT_HOLD_S))
+        count += 1
+    return ",".join(items)
 
 
 def menus2_script():
@@ -67,31 +88,77 @@ def menus2_script():
 
 def privacy_cycles(boxes):
     """The presses for the privacy screen (`boxes` checkboxes, then a Conferma button), as passes that never need to know the
-    clock or the state of the boxes. Every pass is: D-pad up `boxes + 1` times (the focus anchors on the first box; the list
-    does not wrap), toggle at most ONE box with A, move down to Conferma and press A. A press on a box toggles it, so a
-    pass that ticked the boxes wrongly cannot be repaired by repeating the same pass; instead the passes toggle a different
-    single box each time, in Gray-code order (none, box 1, box 2, box 1 for two boxes). Whatever state the boxes are in when
-    the screen opens, one pass in each round of 2^boxes reaches Conferma with every box ticked, and Conferma then changes
-    the screen. On the legal-notice screen before it (two list items and an Avanti button) every pass only selects items and
-    ends with A on Avanti, which opens the privacy screen. Returns the list of passes, each a list of button masks."""
-    passes = []
-    toggles = [None] + [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
-    for box in toggles:
-        presses = [DPAD_UP] * (boxes + 1)
-        at_box = 0
-        if box is not None:
-            presses += [DPAD_DOWN] * box + [BUTTON_A]
-            at_box = box
-        presses += [DPAD_DOWN] * (boxes - at_box) + [BUTTON_A]
-        passes.append(presses)
-    return passes
+    clock or the state of the boxes, fast: the first pass is the one that is right when nothing is ticked yet (tick every box,
+    Conferma); if the screen is still there after it, the later passes toggle ONE box each, Gray-code style, so that over
+    the whole round the boxes pass through every state with a press of Conferma at the end of each pass (a press on a box
+    toggles it, so repeating a pass cannot repair a wrong state; whatever state the boxes have when the screen opens,
+    one pass of the round reaches Conferma with every box ticked, and Conferma then changes the screen). Every pass starts
+    with D-pad up `boxes` times: the focus anchors on the first box from any item (the list does not wrap; the
+    previous pass ended on Conferma, the last of boxes + 1 items). On the legal-notice screen before it (two list items and
+    an Avanti button) every pass only selects items and ends with A on Avanti, which opens the privacy screen.
+    Returns the passes, each a list of button masks. Two boxes: 7 + 6 + 6 + 6 presses, a press every second."""
+    def one_pass(toggles):
+        presses = [DPAD_UP] * boxes
+        at = 0
+        for box in sorted(toggles):
+            presses += [DPAD_DOWN] * (box - at) + [BUTTON_A]
+            at = box
+        presses += [DPAD_DOWN] * (boxes - at) + [BUTTON_A]
+        return presses
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    # the round starts with "tick all"; the following passes then visit the other states (the XOR of the toggles of the
+    # passes so far, starting from all toggled, runs through all 2^boxes values: all, then each Gray step)
+    return [one_pass(list(range(boxes)))] + [one_pass([b]) for b in gray]
+
+
+def privacy_labels(boxes):
+    """One label per press of privacy_cycles(boxes), in the same order: what the press is for, so a log can say
+    'privacy pass 2: toggle box 1' instead of a button mask."""
+    labels = []
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    for number, toggled in enumerate([list(range(boxes))] + [[b] for b in gray], 1):
+        head = "privacy pass %d" % number
+        verb = "tick" if number == 1 else "toggle"
+        labels += ["%s: up (anchor on box 1)" % head] * boxes
+        at = 0
+        for box in sorted(toggled):
+            labels += ["%s: down to box %d" % (head, k + 2) for k in range(at, box)]
+            labels.append("%s: %s box %d" % (head, verb, box + 1))
+            at = box
+        labels += ["%s: down to %s" % (head, "Conferma" if target == boxes else "box %d" % (target + 1))
+                   for target in range(at + 1, boxes + 1)]
+        labels.append("%s: Conferma (Avanti on the legal notice)" % head)
+    return labels
+
+
+NO_INPUT = ("none", "off", "")  # input presets that press nothing
+
+
+def input_labels(spec, seconds, privacy_boxes=2):
+    """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
+    `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
+    if spec == "accept":
+        return ["press A #%d (accept)" % (n + 1) for n in range(len(accept_script(seconds).split(",")) if accept_script(seconds) else 0)]
+    if spec != "menus":  # none, off, menus2 and raw scripts have no labelled passes
+        return []
+    count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
+    if privacy_boxes > 0:
+        cycle = privacy_labels(privacy_boxes)
+    else:
+        cycle = ["menu: down", "menu: down", "menu: A"]
+    return [cycle[i % len(cycle)] for i in range(count)]
 
 
 def input_preset(spec, seconds, privacy_boxes=2):
-    """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 (the default; the privacy
+    """`none` (or `off`, or an empty value) is no automatic press at all: an empty script, so the title only sees the tester's own
+    input. `menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
+    `seconds` of script time, but not past 300 s, at most 256 entries (about 260 s at one press a second). With privacy_boxes > 0 (the default; the privacy
     screen has two boxes) the presses are instead privacy_cycles() repeated, which also carries the title through the
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
+    if spec.strip().lower() in NO_INPUT:
+        return ""
+    if spec == "accept":
+        return accept_script(seconds)
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
@@ -330,8 +397,33 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-def format_results(rows):
-    """Text for the zip: totals, the refusals ranked by normalized reason, then one line per key."""
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+LATEST_USED_KEYS = 40
+
+
+def key_use(logdir):
+    """{key: (first_seconds, last_seconds, uses)} from the runtime's 'x2w-render key use' lines in stderr.txt: the earliest
+    first, the latest last and the largest count of each key (a line is printed again only when the count grew)."""
+    found = {}
+    path = os.path.join(logdir, "stderr.txt") if logdir else None
+    if not path or not os.path.isfile(path):
+        return found
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.startswith("x2w-render key use "):
+                continue
+            match = KEY_USE_RE.match(line)
+            if match:
+                first, last, uses = float(match.group(3)), float(match.group(4)), int(match.group(5))
+                old = found.get(match.group(2))
+                found[match.group(2)] = (min(first, old[0]), max(last, old[1]), max(uses, old[2])) if old else (first, last, uses)
+    return found
+
+
+def format_results(rows, use=None):
+    """Text for the zip: totals, the refusals ranked by normalized reason, the refused keys used latest, then one line per
+    key. use is key_use(): a key a draw or Dispatch used carries first=, last= (seconds since the process started) and uses=."""
+    use = use or {}
     kinds = {}
     for _, kind, _, _ in rows:
         kinds[kind] = kinds.get(kind, 0) + 1
@@ -348,9 +440,53 @@ def format_results(rows):
             entry[kind] = entry.get(kind, 0) + 1
     for reason, by_kind in sorted(ranked.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:TOP_REASONS]:
         lines.append("%5d  %s   [%s]" % (sum(by_kind.values()), reason, ", ".join("%s %d" % i for i in sorted(by_kind.items()))))
-    lines += ["", "## keys: key kind status reason"]
-    lines += ["%s %s %s%s" % (key, kind, status, " " + reason if reason else "") for key, kind, status, reason in rows]
+    if use:
+        latest = sorted(((use[key][1], key, kind, reason) for key, kind, status, reason in rows if status == "refused" and key in use), reverse=True)
+        lines += ["", "## refused keys used latest: last use, first use, uses, key kind reason"]
+        lines += ["%8.1f %8.1f %7d %s %s %s" % (last, use[key][0], use[key][2], key, kind, reason) for last, key, kind, reason in latest[:LATEST_USED_KEYS]]
+    lines += ["", "## keys: key kind status reason [first= last= uses= seconds since the process started]"]
+    lines += ["%s %s %s%s%s" % (key, kind, status, " " + reason if reason else "",
+                              " first=%.1fs last=%.1fs uses=%d" % use[key] if key in use else "") for key, kind, status, reason in rows]
     return "\n".join(lines) + "\n"
+
+
+# The request files of the worst refused keys, so a translator can be fixed from the zip alone (private data: mailed, never posted).
+REQUESTS_DIR = "shader_requests"
+REQUESTS_TOP = 40                   # keys
+REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
+REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86")
+NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
+CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
+
+
+def key_weights(stderr_text):
+    """{key: draws not drawn (graphics) or dispatches without a translation (compute)}: each key's newest cumulative line."""
+    weights = {}
+    for m in NOT_DRAWN_KEY_RE.finditer(stderr_text):
+        weights[m.group(1)] = int(m.group(2))
+    for m in CENSUS_KEY_RE.finditer(stderr_text):
+        weights[m.group(1)] = max(0, int(m.group(2)) - int(m.group(3)))
+    return weights
+
+
+def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES):
+    """[(key, kind, weight, [(file name, bytes)])] for the refused keys ranked by weight (ties by key), at most `top`
+    keys, whole keys only, request files of all together within `cap` bytes. Keys without weight are not ranked."""
+    names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
+    chosen, used = [], 0
+    ranked = sorted((r for r in rows if r[2] == "refused" and weights.get(r[0], 0) > 0), key=lambda r: (-weights[r[0]], r[0]))
+    for key, kind, _, _ in ranked:
+        if len(chosen) >= top:
+            break
+        files = []
+        for name in sorted(n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS):
+            files.append((name, os.path.getsize(os.path.join(cache_dir, name))))
+        size = sum(b for _, b in files)
+        if not files or used + size > cap:
+            continue
+        used += size
+        chosen.append((key, kind, weights[key], files))
+    return chosen
 
 
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
@@ -540,7 +676,20 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
-        add(RESULTS_NAME, format_results(rows).encode("utf-8"))
+        add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
+        stderr_path = os.path.join(logdir, "stderr.txt")
+        weights = {}
+        if os.path.isfile(stderr_path):
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
+                weights = key_weights(handle.read())
+        chosen = select_requests(cache_dir, rows, weights)
+        for key, kind, weight, files in chosen:
+            for name, _ in files:
+                with open(os.path.join(cache_dir, name), "rb") as handle:
+                    add(REQUESTS_DIR + "/" + name, handle.read())
+        manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
+                                     "bytes": sum(b for c in chosen for _, b in c[3]),
+                                     "ranked": [{"key": k, "kind": kd, "weight": w} for k, kd, w, _ in chosen]}
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             rows = parse_symbols(handle.read())
@@ -567,6 +716,10 @@ def main(argv):
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
     p.add_argument("--privacy-boxes", type=int, default=2)
+    lab = sub.add_parser("input-labels")
+    lab.add_argument("spec")
+    lab.add_argument("seconds", type=int)
+    lab.add_argument("--privacy-boxes", type=int, default=2)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -594,6 +747,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds, args.privacy_boxes))
+        return 0
+    if args.cmd == "input-labels":
+        print(json.dumps(input_labels(args.spec, args.seconds, args.privacy_boxes)))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))

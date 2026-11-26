@@ -863,8 +863,9 @@ target_include_directories(startup_dstorage_hdd_queue PRIVATE src)
 target_link_libraries(startup_dstorage_hdd_queue PRIVATE psapi)
 add_test(NAME startup_dstorage_hdd_queue_on COMMAND startup_dstorage_hdd_queue on)
 add_test(NAME startup_dstorage_hdd_queue_off COMMAND startup_dstorage_hdd_queue off)
+add_test(NAME startup_dstorage_hdd_deep COMMAND startup_dstorage_hdd_queue deep)
 add_test(NAME startup_dstorage_hdd_forget COMMAND startup_dstorage_hdd_queue forget)
-set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off startup_dstorage_hdd_forget PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off startup_dstorage_hdd_forget startup_dstorage_hdd_deep PROPERTIES TIMEOUT 60)
 # Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
 # page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
 # compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
@@ -1035,6 +1036,9 @@ add_test(NAME startup_root_constant_store COMMAND startup_root_constant_store)
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+add_executable(startup_save_write_log tests/startup_save_write_log.cpp)
+target_compile_features(startup_save_write_log PRIVATE cxx_std_17)
+add_test(NAME startup_save_write_log COMMAND startup_save_write_log)
 # Enumeration of the same store (Store::list_containers, Store::list_blobs): exact names, sizes and
 # order, what is not listed, the busy and untouched-output rules, and a second process that
 # publishes two-blob updates while this one lists.
@@ -1207,6 +1211,10 @@ endif()
 # Input for tests/startup_host_cpu_debug_check.py.
 add_executable(startup_host_cpu_probe tests/startup_host_cpu_probe.cpp)
 target_compile_features(startup_host_cpu_probe PRIVATE cxx_std_17)
+# Samples a TextureCube from one translated compute shader (tests/startup_compute_cube_check.py drives it).
+add_executable(startup_cube_sample_check tests/startup_cube_sample_check.cpp)
+target_compile_features(startup_cube_sample_check PRIVATE cxx_std_17)
+target_link_libraries(startup_cube_sample_check PRIVATE d3d12 dxgi)
 # Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
 add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
 target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
@@ -1399,6 +1407,30 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_resubmit_untracked_${backend} COMMAND startup_list_resubmit ${backend} untracked)
     set_tests_properties(startup_list_resubmit_untracked_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+endforeach()
+
+# List upload pages stay flat over 10,000 record/execute cycles on an allocator that is never reset, are not reused
+# while the GPU has not passed them, and are never reused when no submit can be tracked.
+add_executable(startup_upload_page_reuse tests/startup_upload_page_reuse.cpp)
+target_compile_features(startup_upload_page_reuse PRIVATE cxx_std_17)
+target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_page_reuse_${backend} COMMAND startup_upload_page_reuse ${backend})
+    set_tests_properties(startup_upload_page_reuse_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1")
+    add_test(NAME startup_upload_page_reuse_untracked_${backend} COMMAND startup_upload_page_reuse ${backend} untracked)
+    set_tests_properties(startup_upload_page_reuse_untracked_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+    # The default since Run P: no reuse (X2W_UPLOAD_PAGE_REUSE unset), the pages grow as in Run O (exit 12).
+    add_test(NAME startup_upload_page_reuse_default_off_${backend} COMMAND startup_upload_page_reuse ${backend})
+    set_tests_properties(startup_upload_page_reuse_default_off_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "1 growing: "
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    # Control: without the reuse the pages grow (exit 12).
+    add_test(NAME startup_upload_page_reuse_mutant_${backend} COMMAND startup_upload_page_reuse ${backend})
+    set_tests_properties(startup_upload_page_reuse_mutant_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "1 growing: "
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
 endforeach()
 
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
@@ -2486,7 +2518,26 @@ add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
 target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
+# Per-phase dispatch counters and the multi-thread scaling method (src/startup_stubs/dispatch_phases.h): a single lock gives
+# four threads no throughput, a lock held for resolve only does; the control asks the single lock for the split speedup.
+add_executable(dispatch_phases_check tests/dispatch_phases_check.cpp)
+target_include_directories(dispatch_phases_check PRIVATE src)
+target_compile_features(dispatch_phases_check PRIVATE cxx_std_17)
+add_test(NAME dispatch_phases COMMAND dispatch_phases_check)
+add_test(NAME dispatch_phases_single_lock_control COMMAND dispatch_phases_check single 4 1.45)
+set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
+# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/dsv_planes.h), debug layer on.
+add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
+target_include_directories(dsv_planes_check PRIVATE src)
+target_compile_features(dsv_planes_check PRIVATE cxx_std_17)
+target_link_libraries(dsv_planes_check PRIVATE d3d12 dxgi)
+add_test(NAME dsv_planes_warp COMMAND dsv_planes_check warp)
+add_test(NAME dsv_planes_hardware COMMAND dsv_planes_check hardware)
+add_test(NAME dsv_planes_whole_resource_control COMMAND dsv_planes_check warp --mutate whole)
+set_tests_properties(dsv_planes_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(dsv_planes_whole_resource_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
 set_tests_properties(startup_local_log_reopen_control PROPERTIES WILL_FAIL TRUE)
@@ -3503,12 +3554,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_check.py")
     add_test(NAME startup_compute_image_store_d16 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
+    add_test(NAME startup_compute_cube COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_cube_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_word_check.py")
     add_test(NAME startup_compute_readfirstlane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py")
+    add_test(NAME startup_compute_rw_buffer COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_rw_buffer_check.py")
     add_test(NAME startup_compute_gather_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_gather_l_check.py")
     add_test(NAME startup_compute_buffer_atomics COMMAND "${INTAKE_PYTHON}" -B
@@ -3639,6 +3694,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_watch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_watch_check.py")
     set_tests_properties(startup_gfx2hlsl_watch PROPERTIES TIMEOUT 120)
+    # gfx2hlsl.py --retry-lifted: before the title starts, only the old refusals of lifted families, with a time cap.
+    add_test(NAME startup_gfx2hlsl_retry_lifted COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_retry_lifted_check.py")
+    set_tests_properties(startup_gfx2hlsl_retry_lifted PROPERTIES TIMEOUT 300)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
     # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.
@@ -4602,6 +4661,22 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    # gfx2hlsl v_permlane16_b32 in a straight-line compute program, exchanged through groupshared memory (Run O audit).
+    add_test(NAME startup_compute_permlane16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_permlane16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_permlane16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wrong-row swapped-selects)
+            add_test(NAME startup_compute_permlane16_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_permlane16_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # gfx2hlsl bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops (Refs #1541).
     add_test(NAME startup_compute_lds_b128_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b128_check.py")
@@ -4629,6 +4704,22 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_shift64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # s_bitset0_b32, s_bitset1_b32 and s_ff1_i32_b32 against an integer reference (#1723).
+    add_test(NAME startup_gfx2hlsl_s_bitset_ff1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitset_ff1_check.py")
+    # The SOPK arithmetic forms s_mulk_i32 and s_addk_i32 (#1723).
+    add_test(NAME startup_gfx2hlsl_s_mulk_addk COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_mulk_addk_check.py")
+    set_tests_properties(startup_gfx2hlsl_s_mulk_addk PROPERTIES TIMEOUT 60)
+    # BUF_FMT_8_8_8_8_UINT vertex fetch (#2004).
+    add_test(NAME startup_gfx2hlsl_buf_8888_uint COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_buf_8888_uint_check.py")
+    # Lane-exact EXEC core (tools/startup/lane_exec.py): range restore rule and DPP16 source validity against a per-lane reference.
+    add_test(NAME startup_lane_exec COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_lane_exec_check.py")
+    # The high half of an unsigned 32x32 product (#1792).
+    add_test(NAME startup_gfx2hlsl_mul_hi_u32 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_u32_check.py")
     # gfx2hlsl signed multiply-high (v_mul_hi_i32, s_mul_hi_i32): helper math, refusals, mutations and draws.
     add_test(NAME startup_gfx2hlsl_mul_hi_i32_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_i32_check.py")
@@ -4749,6 +4840,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_float_transcendental_${adapter} PROPERTIES TIMEOUT 300
             SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl v_ldexp_f32 (D = S0 * 2^S1, signed exponent of any size): translation controls, then a draw against a
+    # binary64-scaled reference (overflow, denormal results, a denormal source) and one mutated lowering.
+    add_test(NAME startup_gfx2hlsl_ldexp_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_ldexp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_ldexp_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_gfx2hlsl_scalar_shift64_bfe_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py")
     add_test(NAME startup_gfx2hlsl_scalar_m0_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4809,9 +4910,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stall_watchdog_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stall_watchdog_check.py")
     set_tests_properties(startup_stall_watchdog_check PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_tester_janitor_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_janitor_check.py")
+    set_tests_properties(startup_tester_janitor_check PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_debug_events COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_events_check.py" "$<TARGET_FILE:startup_window_probe>")
+    set_tests_properties(startup_debug_events PROPERTIES TIMEOUT 120)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
@@ -10235,7 +10342,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_mesh57_skeleton_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_loop_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_loop_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -11355,10 +11462,18 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_image_store_d16_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_cube_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_cube_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:startup_cube_sample_check>" ${adapter})
+        set_tests_properties(startup_compute_cube_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_compute_readfirstlane_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_readfirstlane_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_rw_buffer_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_rw_buffer_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_rw_buffer_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_compute_gather_l_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_gather_l_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

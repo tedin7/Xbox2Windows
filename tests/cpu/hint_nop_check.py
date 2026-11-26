@@ -2,9 +2,8 @@
 """Control for the reserved/hint NOP space in the shared lowering (tools/ffx_version_query.py, #1476).
 
 The AMD APM documents `0F 19 /r`, `0F 1D /r`, `0F 1E /r` (unprefixed) and `0F 1F /r` as reserved hint NOPs
-that take a ModRM but access no memory. CET-instrumented code puts `endbr64` at function entries and this
-target has no CET, but ENDBR is deliberately out of this slice: it is listed as a refusal here so widening
-the accepted set later is a visible change rather than a silent one.
+that take a ModRM but access no memory. CET-instrumented code puts `endbr64`/`endbr32` (`F3 0F 1E FA/FB`) at
+indirect-branch targets; both have no register, flag, or memory side effects and execute as NOPs on `x64_zen2`.
 
 What is checked, all on exact byte patterns:
 
@@ -12,8 +11,9 @@ What is checked, all on exact byte patterns:
               already-accepted NOP. Identical bodies are the proof that the instruction evaluates nothing:
               no address computation, no load, no register or flag write. Block labels are normalised
               because they are numbered by instruction count, not by effect.
-  refused   - encodings in the same space that iced decodes as another mnemonic stay refused:
-              ENDBR64/ENDBR32, CLDEMOTE, RDSSPD/RDSSPQ. A widened accepted set would show up here.
+  refused   - encodings in the same space that iced decodes as another mnemonic or unaccepted reserved NOP
+              stay refused: CLDEMOTE, RDSSPD/RDSSPQ, 0F 0D, 0F 18, 0F 1A-0F 1C. A widened accepted set would
+              show up here.
 
 The memory-form cases include a ModRM whose address would fault if evaluated (a non-canonical pointer in
 RAX) and a RIP-relative displacement: identical lifted bodies mean neither can be touched.
@@ -39,6 +39,8 @@ ACCEPTED = {
     "660f1e00": "reserved nop 0F 1E [rax], 16-bit operand size",
     "480f1900": "reserved nop 0F 19 [rax], 64-bit operand size",
     "480f1e00": "reserved nop 0F 1E [rax], 64-bit operand size",
+    "f30f1efa": "endbr64",
+    "f30f1efb": "endbr32",
 }
 
 # Encodings in the same space that iced also decodes as RESERVEDNOP but that are not part of this slice, plus
@@ -50,10 +52,9 @@ REFUSED = {
     "0f1a00": "0F 1A",
     "0f1b00": "0F 1B",
     "0f1c08": "0F 1C /1",
-    "f30f1efa": "endbr64",
-    "f30f1efb": "endbr32",
     "0f1c00": "cldemote [rax]",
     "f30f1ec8": "rdsspd eax",
+    "f3480f1ec8": "rdsspq rax",
 }
 
 LABEL = re.compile(r"block_\d+")

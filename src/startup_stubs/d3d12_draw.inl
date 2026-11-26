@@ -135,11 +135,26 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     return nullptr;
 }
 
+// Milliseconds since this process started (its creation time), for KeyUse. One read of the tick count after the first call.
+std::uint64_t process_ms()
+{
+    static const std::uint64_t base = [] {
+        FILETIME created{}, exited{}, kernel{}, user{}, now{};
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+        GetSystemTimeAsFileTime(&now);
+        const auto value = [](const FILETIME& t) { return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+        const std::uint64_t age_ms = value(now) > value(created) ? (value(now) - value(created)) / 10000 : 0;
+        return GetTickCount64() - age_ms;
+    }();
+    return GetTickCount64() - base;
+}
+
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
@@ -1736,9 +1751,14 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     x2w_upload::Page owned;
     // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
     const bool own_buffer = !console && !tiled && !is_compact && !address_uploads_from_ring() && total >= own_upload_buffer_bytes;
-    if (dedicated || own_buffer) {
+    // A tiled block-compressed chain or surface is written to a zeroed buffer of its own as a console layout is: these are the
+    // large world textures, and sharing the ring with the draws' constants let a streaming burst fill it (draws then lost their
+    // buffers). X2W_TEST_ADDRESS_UPLOAD_RING=1 keeps the ring, for the existing fixtures.
+    const bool own_tiled = (tiled_chain || (tiled && !single)) && !console && !address_uploads_from_ring();
+    if (dedicated || own_buffer || own_tiled) {
         u64 bytes = 0;
-        for (UINT i = 0; i < (console ? mips : plan.count); ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        for (UINT i = 0; i < (console || tiled_chain ? mips : tiled ? 1 : plan.count); ++i)
+            bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
@@ -1748,7 +1768,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             return false;
         }
         // Console layouts detile into a zeroed buffer; a plain upload overwrites every byte it names.
-        if (dedicated) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+        if (dedicated || own_tiled) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1782,30 +1802,48 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
-                u64 offset = 0;
+                u64 offset = owned.cursor;
                 ID3D12Resource* chunk = nullptr;
-                auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-                if (!rows || !chunk) {
-                    state.done = false;
-                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+                if (owned.cpu) {
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                } else {
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    if (!rows || !chunk) {
+                        state.done = false;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                    }
+                    std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
-                std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else if (tiled && !single) {
-        u64 offset = 0;
+        u64 offset = owned.cursor;
         const auto bytes = plan.bytes(0);
         ID3D12Resource* chunk = nullptr;
-        auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-        if (!rows || !chunk) {
-            state.done = false;
-            return false;  // staging failed: not uploaded, so report it and retry at the next bind
+        unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+        if (owned.cpu) {
+            owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+        } else {
+            rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+            if (!rows || !chunk) {
+                state.done = false;
+                return false;  // staging failed: not uploaded, so report it and retry at the next bind
+            }
+            std::memset(rows, 0, static_cast<std::size_t>(bytes));
         }
-        std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
-        plan.upload(list, texture, chunk, 1, 1, 0, 0, offset);
+        plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, 1, 1, 0, 0, offset);
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
@@ -2372,9 +2410,14 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         return {zero_ring, zero_offset, 16, 0, true, 3};
     }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
-    if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
-        ? "an input buffer range is over 16 MiB or not whole dwords"
-        : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
+    if (bytes > limit || bytes % 4) {
+        static LONG size_logged;
+        if (first_calls(size_logged, 16))
+            log("x2w-draw an input buffer descriptor has %llu bytes (stride %u, limit %llu)", static_cast<unsigned long long>(bytes), stride,
+                static_cast<unsigned long long>(limit));
+        if (bytes % 4) return refuse("an input buffer range is not a whole number of dwords");
+        return refuse(limit == (16u << 20) ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
+    }
     ID3D12Resource* native = nullptr;
     bool upload = false;
     int input_source = 0;
@@ -2683,6 +2726,10 @@ void log_not_drawn_causes()
     for (int i = 0; i < not_drawn_sites && used > 0 && used < static_cast<int>(sizeof(text)) - 80; ++i)
         if (not_drawn_counts[i]) used += snprintf(text + used, sizeof(text) - used, " %s %ld,", not_drawn_names[i], not_drawn_counts[i]);
     log("%s", text);
+    // Passes whose depth view has one plane read-only (list_targets binds them with per-plane states; they were refused before).
+    if (render_target_mixed_dsv[1] || render_target_mixed_dsv[2])
+        log("x2w-render OMSetRenderTargets with a depth view with one read-only plane: depth read-only %ld, stencil read-only %ld",
+            render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
@@ -2697,6 +2744,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         (rect && indexed && !indexed_rect)) return not_drawn(0);
     draw_lock_acquire_exclusive();
     BoundPipeline* bound = translation_for(pass.pipeline);
+    if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
