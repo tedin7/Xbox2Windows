@@ -2595,6 +2595,16 @@ class Stage:
         if getattr(self, 'has_branches', False):
             value = tuple(self.sym[i] for i in (106, 107))
             self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
+    def op_v_cvt_pknorm_u16_f32(self, ops, mods):
+        # VOP3 only (no e32 form). Each half is clamp(S, 0, 1) * 65535 rounded to nearest even; saturate maps a NaN
+        # to 0. The neg and abs of a source are applied by f(). An output modifier or op_sel would change the packed
+        # words, so it is refused rather than dropped.
+        if mods:
+            raise Unsupported('v_cvt_pknorm_u16_f32 with %s' % (mods,))
+        if len(ops) != 3:
+            raise Unsupported('v_cvt_pknorm_u16_f32 with %d operands, expected 3' % len(ops))
+        half = 'uint(round(saturate(%s) * 65535.0))'
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % (half % self.f(ops[1]), half % self.f(ops[2])))
 
     def emit(self, text):
         if 'vcc' in text:

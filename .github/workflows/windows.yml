@@ -104,6 +104,7 @@ jobs:
               (["tests/startup_compute_global_load_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_global_load_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_cmp16_check.py", "binary", "llvm-mc-15", "llvm-objcopy-15"], {}),
+              (["tests/startup_gfx2hlsl_pknorm_u16_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_lod_check.py", "binary", "llvm-mc-15"], {}),
@@ -289,6 +290,7 @@ jobs:
             tests/startup_gfx2hlsl_image_get_lod_check.py \
             tests/startup_gfx2hlsl_add_sub_co_check.py \
             tests/startup_gfx2hlsl_add_sub_co_ci_check.py \
+            tests/startup_gfx2hlsl_pknorm_u16_check.py \
             tests/startup_gfx2hlsl_saveexec_same_reg_check.py \
             tests/startup_gfx2hlsl_compare_dst_check.py \
             tests/startup_gfx2hlsl_capture_check.py \
