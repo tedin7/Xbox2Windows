@@ -3,7 +3,10 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S]
+//                   [--from-present K] [--max-seconds S] [--translator "<python> <gfx2hlsl.py>"]
+// --translator: before the first call, the command runs as `<command> --pending <shader cache>` so every shader request
+// of the recording that has no translation yet is translated by THIS machine's translator (a recording needs no title
+// files: the requests and the translations it carries are written to the cache first).
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
@@ -57,7 +60,16 @@ struct Options {
     std::wstring recording, out;
     bool hardware = false;
     double max_seconds = 0;
+    std::wstring translator;
 };
+
+// What the shader cache held for the recording: files seeded from SHDR, and the requests (req_<key>.*) with neither a
+// translation (<key>.txt) nor a refusal (<key>.fail), before and after the translator ran.
+struct ShaderCache {
+    int seeded = 0, requests = 0, untranslated_before = 0, untranslated_after = 0;
+    int translator_exit = -1;  // -1: not run
+};
+ShaderCache shader_cache_state;
 
 struct HeapInfo {
     std::uint32_t type, count;
@@ -316,6 +328,7 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--translator") o.translator = value;
         else if (name == L"--mode" || name == L"--threads" || name == L"--from-present") say("x2w-replay: %ls %ls is not in version 1 (ignored)", name.c_str(), value.c_str());
         else return false;
     }
@@ -329,9 +342,13 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.3f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"stopped_at_max_seconds\": %s, ",
+                        "\"stopped_at_max_seconds\": %s, "
+                        "\"shaders\": {\"seeded\": %d, \"requests\": %d, \"untranslated_before\": %d, \"untranslated_after\": %d, "
+                        "\"translator_exit\": %d}, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, wall, fps,
-                     p.arena_bytes, stopped ? "true" : "false");
+                     p.arena_bytes, stopped ? "true" : "false", shader_cache_state.seeded, shader_cache_state.requests,
+                     shader_cache_state.untranslated_before, shader_cache_state.untranslated_after,
+                     shader_cache_state.translator_exit);
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
@@ -402,10 +419,46 @@ void seed_shader_cache(const Recording& r)
         DWORD done = 0;
         const bool ok = WriteFile(f, file.content.data, static_cast<DWORD>(file.content.bytes), &done, nullptr) && done == file.content.bytes;
         CloseHandle(f);
-        if (ok) ++written;
+        if (ok) ++written, ++shader_cache_state.seeded;
         else DeleteFileW(path.c_str());
     }
     say("x2w-replay: shader cache %ls: %d files from the recording, %d already there, %d refused", dir, written, present, refused);
+}
+
+// Counts the shader requests in the cache directory that have no translation or refusal yet.
+void count_requests(const std::wstring& dir, int& requests, int& untranslated)
+{
+    requests = untranslated = 0;
+    WIN32_FIND_DATAW found;
+    const HANDLE find = FindFirstFileW((dir + L"\\req_*").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::wstring name = found.cFileName;
+        const std::size_t dot = name.find(L'.');
+        if (dot == std::wstring::npos || dot != 4 + 16) continue;  // req_ + 16 hex digits
+        ++requests;
+        const std::wstring key = name.substr(4, 16);
+        const bool done = GetFileAttributesW((dir + L"\\" + key + L".txt").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                          GetFileAttributesW((dir + L"\\" + key + L".fail").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!done) ++untranslated;
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+}
+
+// Runs `<translator> --pending <cache>` and waits for it (at most 15 minutes). Returns its exit code, or -2.
+int run_translator(const std::wstring& translator, const std::wstring& cache)
+{
+    std::wstring command = translator + L" --pending \"" + cache + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process)) return -2;
+    DWORD code = static_cast<DWORD>(-2);
+    if (WaitForSingleObject(process.hProcess, 15 * 60 * 1000) == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
+    else TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(code);
 }
 
 int run(const Options& o)
@@ -435,6 +488,17 @@ int run(const Options& o)
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     seed_shader_cache(r);
+    {
+        wchar_t cache[MAX_PATH];
+        if (GetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache, MAX_PATH)) {
+            count_requests(cache, shader_cache_state.requests, shader_cache_state.untranslated_before);
+            if (!o.translator.empty()) shader_cache_state.translator_exit = run_translator(o.translator, cache);
+            count_requests(cache, shader_cache_state.requests, shader_cache_state.untranslated_after);
+            say("x2w-replay: shader requests %d, untranslated %d before the translator, %d after (translator exit %d)",
+                shader_cache_state.requests, shader_cache_state.untranslated_before, shader_cache_state.untranslated_after,
+                shader_cache_state.translator_exit);
+        }
+    }
     say("x2w-replay: %zu calls, %zu blobs, %llu presents marked, %s", r.steps.size(), r.blobs.size(), r.presents_marked,
         r.ended ? "ended" : "no end chunk (the recorded process stopped early)");
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -480,7 +544,7 @@ int wmain(int argc, wchar_t** argv)
     x2w_replay::Options options;
     if (!x2w_replay::parse(argc, argv, options)) {
         std::fprintf(stderr, "usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] "
-                             "[--threads N|recorded] [--from-present K] [--max-seconds S]\n");
+                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--translator \"<python> <gfx2hlsl.py>\"]\n");
         return 2;
     }
     return x2w_replay::run(options);
