@@ -34,6 +34,7 @@ param(
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
     [int]$CommitHeadroomMiB = 0,               # --commit-headroom-mib: end the run cleanly when the system commit has less than this free (0 = off)
+    [int]$CommitWarnMiB = 0,                   # --commit-warn-mib: log a warning when the system commit has less than this free (0 = off)
     [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
@@ -106,6 +107,7 @@ if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 if ($CommitHeadroomMiB -gt 0) { $captureArgs += @("--commit-headroom-mib", "$CommitHeadroomMiB") }
+if ($CommitWarnMiB -gt 0) { $captureArgs += @("--commit-warn-mib", "$CommitWarnMiB") }
 try {
     & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
         --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs *> "$LogDir.out"

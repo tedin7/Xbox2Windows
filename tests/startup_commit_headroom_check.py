@@ -20,9 +20,9 @@ class Reader:
 
 
 class Guard(unittest.TestCase):
-    def run_guard(self, headroom, values, step=2.0):
+    def run_guard(self, headroom, values, step=2.0, warn=0):
         reader = Reader(values)
-        guard = HeadroomGuard(headroom, reader)
+        guard = HeadroomGuard(headroom, reader, warn)
         for n in range(len(values) + 2):
             line = guard.check(n * step)
             if line:
@@ -66,10 +66,43 @@ class Guard(unittest.TestCase):
 
     def test_summary_names_the_lowest_sample(self):
         guard = HeadroomGuard(1500, Reader([9000, 5200, 7000]))
-        self.assertEqual(guard.summary(), "commit headroom: 1500 MiB, no sample")
+        self.assertEqual(guard.summary(), "commit headroom: stop below 1500 MiB, no sample")
         for n in range(3):
             guard.check(n * 2.0)
-        self.assertEqual(guard.summary(), "commit headroom: 1500 MiB, lowest free commit 5200 MiB")
+        self.assertEqual(guard.summary(), "commit headroom: stop below 1500 MiB, lowest free commit 5200 MiB")
+
+    def test_a_warning_comes_once_and_again_for_every_further_step(self):
+        values = [9000, 2000, 1900, 1800, 1700, 1500, 1500, 9000, 2000]
+        reader = Reader(values)
+        guard = HeadroomGuard(256, reader, warn_mib=2048)
+        lines = []
+        for n in range(len(values)):
+            self.assertIsNone(guard.check(n * 2.0))
+            lines.append(guard.take_warning())
+        self.assertIsNone(guard.take_warning(), "a warning is handed out once")
+        # 2000 warns; 1900 and 1800 are within one step of it; 1700 is a further step down (below 1744); 1500 is not (above 1444);
+        # the recovery to 9000 resets, so 2000 warns again.
+        self.assertEqual([i for i, line in enumerate(lines) if line], [1, 4, 8])
+        self.assertEqual(lines[1], "system commit has 2000 MiB free (warning below 2048 MiB, the run ends below 256 MiB)")
+        self.assertEqual(guard.warnings, 3)
+
+    def test_a_warning_never_ends_the_run(self):
+        at, line, guard, _ = self.run_guard(256, [900, 800, 700, 600, 500], warn=2048)
+        self.assertIsNone(line)
+        self.assertEqual(guard.lowest_free_mib, 500)
+
+    def test_the_stop_is_the_last_resort(self):
+        at, line, _, _ = self.run_guard(256, [4000, 600, 300, 255, 200], warn=2048)
+        self.assertEqual(line, "system commit has 200 MiB free, under the headroom of 256 MiB")
+
+    def test_warn_only_and_summary(self):
+        guard = HeadroomGuard(0, Reader([100]), warn_mib=2048)
+        self.assertIsNone(guard.check(0.0))
+        self.assertTrue(guard.take_warning().endswith("(warning below 2048 MiB)"))
+        self.assertEqual(guard.summary(), "commit headroom: warning below 2048 MiB (1 warning), lowest free commit 100 MiB")
+        both = HeadroomGuard(256, Reader([100]), warn_mib=2048)
+        both.check(0.0)
+        self.assertEqual(both.summary(), "commit headroom: stop below 256 MiB, warning below 2048 MiB (1 warning), lowest free commit 100 MiB")
 
 
 if __name__ == "__main__":
