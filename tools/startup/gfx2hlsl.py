@@ -148,6 +148,9 @@ FETCH_FORMATS = {
     # (Direct3D / Vulkan SNORM rule; LLVM 15 and Mesa ac_formats name the format 16_16_SNORM, number 24).
     'BUF_FMT_16_16_SNORM': ('ldu({0}, a)', ['U(max(float(int(w << 16) >> 16) / 32767.0, -1.0))',
                                             'U(max(float(int(w) >> 16) / 32767.0, -1.0))', '0u', 'U(1.0)']),
+    # Signed 16-bit fields: sign-extend, divide by 32767, and clamp -32768 to -1.0 (the SNORM rule).
+    'BUF_FMT_16_16_SNORM': ('ldu({0}, a)', ['U(max(float(asint(w << 16) >> 16) / 32767.0, -1.0))',
+                                            'U(max(float(asint(w) >> 16) / 32767.0, -1.0))', '0u', 'U(1.0)']),
     'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
     # Four half channels in one 8-byte element: x/y in the first dword, z/w in the second.
     'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32(ldu({0}, a)))', 'U(f16tof32(ldu({0}, a) >> 16))',

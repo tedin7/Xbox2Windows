@@ -3676,6 +3676,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The draw's DXGI -> FORMAT table for typed views read by buffer_load_format_* matches the translation's switch.
     add_test(NAME startup_buffer_format_word3_table COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_buffer_format_word3_table_check.py")
+    # A typed buffer load of BUF_FMT_16_16_SNORM reads two signed 16-bit channels from one dword (#1723).
+    add_test(NAME startup_gfx2hlsl_tbuffer_16_16_snorm COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_tbuffer_16_16_snorm_check.py")
     # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
     add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
