@@ -4601,6 +4601,22 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_shift64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # s_bitset0_b32, s_bitset1_b32 and s_ff1_i32_b32 against an integer reference (#1723).
+    add_test(NAME startup_gfx2hlsl_s_bitset_ff1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitset_ff1_check.py")
+    # The SOPK arithmetic forms s_mulk_i32 and s_addk_i32 (#1723).
+    add_test(NAME startup_gfx2hlsl_s_mulk_addk COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_mulk_addk_check.py")
+    set_tests_properties(startup_gfx2hlsl_s_mulk_addk PROPERTIES TIMEOUT 60)
+    # BUF_FMT_8_8_8_8_UINT vertex fetch (#2004).
+    add_test(NAME startup_gfx2hlsl_buf_8888_uint COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_buf_8888_uint_check.py")
+    # Lane-exact EXEC core (tools/startup/lane_exec.py): range restore rule and DPP16 source validity against a per-lane reference.
+    add_test(NAME startup_lane_exec COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_lane_exec_check.py")
+    # The high half of an unsigned 32x32 product (#1792).
+    add_test(NAME startup_gfx2hlsl_mul_hi_u32 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_u32_check.py")
     # gfx2hlsl signed multiply-high (v_mul_hi_i32, s_mul_hi_i32): helper math, refusals, mutations and draws.
     add_test(NAME startup_gfx2hlsl_mul_hi_i32_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_i32_check.py")
