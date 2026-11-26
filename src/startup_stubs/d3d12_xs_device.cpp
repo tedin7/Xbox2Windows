@@ -1065,6 +1065,9 @@ struct LazyTextureRecord {
     DXGI_FORMAT desktop_format{};
 };
 std::mutex lazy_texture_mutex;  // lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock
+// Publications of a lazy texture in progress and finished, so a guest descriptor copy can tell whether its native copy may
+// have raced one (it then writes the real view into the destination, see refresh_copied_lazy_views).
+LONG lazy_publishing, lazy_published_total;
 std::unordered_map<const Wrapper*, LazyTextureRecord>& lazy_textures()
 {
     static std::unordered_map<const Wrapper*, LazyTextureRecord> m;
@@ -4839,6 +4842,91 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     return result;
 }
 
+// Writes the desktop SRV for a lazy texture's view record into one descriptor slot, as the title's view described it.
+// The caller holds note_lock shared and has checked that the slot still names the record.
+void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_RESOURCE_DESC& created_desc,
+                     x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
+        device->CreateShaderResourceView(created, nullptr, dest);
+        return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
+    if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
+        if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
+                static_cast<unsigned>(created_desc.Format), view_mode)) {
+            device->CreateShaderResourceView(created, nullptr, dest);
+        }
+        return;
+    }
+    srv_desc.Format = desktop_format(srv_desc.Format);
+    if (x2w_startup::packed_target_format(srv_desc.Format)) {
+        const auto verdict = x2w_startup::packed_view(
+            srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
+        if (verdict == x2w_startup::PackedView::refused) return;
+        if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
+    }
+    device->CreateShaderResourceView(created, &srv_desc, dest);
+}
+
+// After a guest descriptor copy: a destination slot that now names a lazy texture which already has its real resource got
+// the native NULL descriptor from the desktop copy when the copy ran while the texture was being published (its
+// refresh had taken its snapshot already, or the copy raced the real descriptor). Write the real view into such slots.
+// A texture that has no real resource yet is handled by its own refresh, which runs after this slot is recorded.
+void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT increment)
+{
+    if (!lazy_textures_enabled() || !count) return;
+    struct Candidate {
+        std::uint32_t index, id;
+        Wrapper* texture;
+    };
+    std::vector<Candidate> candidates;
+    try {
+        AcquireSRWLockShared(&note_lock);
+        std::uint32_t room = 0;
+        const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
+        if (ids && count <= room) {
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t id = ids[i];
+                if (!id || id - 1 >= view_records().size() || !view_materialized()[id - 1]) continue;
+                const ViewRecord& vr = view_records()[id - 1];
+                if (vr.slot == 18 && vr.resource) candidates.push_back({i, id, reinterpret_cast<Wrapper*>(vr.resource)});
+            }
+        }
+        ReleaseSRWLockShared(&note_lock);
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockShared(&note_lock);
+        return;
+    }
+    for (const Candidate& candidate : candidates) {
+        ID3D12Resource* real = nullptr;
+        {
+            // lazy_texture_mutex comes before note_lock in the lock order; a texture not in the map is not lazy.
+            std::lock_guard lock(lazy_texture_mutex);
+            const auto found = lazy_textures().find(candidate.texture);
+            if (found == lazy_textures().end()) continue;
+            real = static_cast<ID3D12Resource*>(candidate.texture->own().real);
+            if (real) real->AddRef();
+        }
+        if (!real) continue;
+        const D3D12_RESOURCE_DESC real_desc = real->GetDesc();
+        const auto view_mode = view_defaults_mode();
+        AcquireSRWLockShared(&note_lock);
+        std::uint32_t room = 0;
+        const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
+        // The slot must still name the record, and the record still the texture (the title may have overwritten it).
+        if (ids && candidate.index < room && ids[candidate.index] == candidate.id && candidate.id - 1 < view_records().size() &&
+            view_materialized()[candidate.id - 1] && view_records()[candidate.id - 1].slot == 18 &&
+            view_records()[candidate.id - 1].resource == reinterpret_cast<u64>(candidate.texture)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE dest{static_cast<SIZE_T>(dest_desktop + u64{candidate.index} * increment)};
+            create_lazy_srv(device_of(self), real, real_desc, view_mode, view_records()[candidate.id - 1], dest);
+        }
+        ReleaseSRWLockShared(&note_lock);
+        real->Release();
+    }
+}
+
 // Copy through actual desktop heaps. A logical range may straddle the last
 // shader-visible descriptor and the first CPU-only descriptor.
 void copy_descriptor_run(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DESCRIPTOR_HEAP_TYPE type)
@@ -4852,8 +4940,14 @@ void copy_descriptor_run(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DES
         const auto s = desktop_cpu_handle(src, &src_room, &src_total);
         if (count > dest_total || count > src_total || !d || !s) return;
         const UINT chunk = (std::min)(count, (std::min)(dest_room, src_room));
+        const LONG published_before = InterlockedCompareExchange(&lazy_published_total, 0, 0);
+        const bool publishing_before = InterlockedCompareExchange(&lazy_publishing, 0, 0) != 0;
         device_of(self)->CopyDescriptorsSimple(chunk, {static_cast<SIZE_T>(d)}, {static_cast<SIZE_T>(s)}, type);
         note_copy(dest, src, d, s, chunk, increment);
+        // A copy that overlapped the publication of a lazy texture may have copied its native NULL descriptor.
+        if (publishing_before || InterlockedCompareExchange(&lazy_publishing, 0, 0) != 0 ||
+            InterlockedCompareExchange(&lazy_published_total, 0, 0) != published_before)
+            refresh_copied_lazy_views(self, d, chunk, increment);
         dest += u64{chunk} * dest_stride;
         src += u64{chunk} * src_stride;
         count -= chunk;
@@ -5420,6 +5514,17 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     if (!w->own().lazy_slot133_texture) return static_cast<ID3D12Resource*>(w->own().real);
     if (InterlockedCompareExchange(&w->own().refs, 0, 0) == retired_refs) return nullptr;
 
+    // Counts this publication (the real resource and its descriptor refresh) for the descriptor copies that overlap it.
+    struct PublishScope {
+        bool on = false;
+        void begin() { on = true; InterlockedIncrement(&lazy_publishing); }
+        ~PublishScope()
+        {
+            if (!on) return;
+            InterlockedIncrement(&lazy_published_total);
+            InterlockedDecrement(&lazy_publishing);
+        }
+    } publish;
     ID3D12Device* device = nullptr;
     ID3D12Resource* created = nullptr;
     {
@@ -5446,6 +5551,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         }
         if (FAILED(hr) || !created) return nullptr;
 
+        publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
             AcquireSRWLockExclusive(&retire_lock);
             if (InterlockedCompareExchange(&w->own().refs, 0, 0) == retired_refs) {
@@ -5520,27 +5626,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
             if (vr.slot != 18 || vr.resource != target_wrapper) continue;
             const D3D12_CPU_DESCRIPTOR_HANDLE dest{
                 static_cast<SIZE_T>(target_heap->desktop_cpu + u64{item.slot_index} * target_heap->increment)};
-            if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-                device->CreateShaderResourceView(created, nullptr, dest);
-                continue;
-            }
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-            std::memcpy(&srv_desc, vr.desc, sizeof(srv_desc));
-            if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
-                if (x2w_view_dimension::default_view_allowed(18, static_cast<unsigned>(created_desc.Dimension),
-                        static_cast<unsigned>(created_desc.Format), view_mode)) {
-                    device->CreateShaderResourceView(created, nullptr, dest);
-                }
-                continue;
-            }
-            srv_desc.Format = desktop_format(srv_desc.Format);
-            if (x2w_startup::packed_target_format(srv_desc.Format)) {
-                const auto verdict = x2w_startup::packed_view(
-                    srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
-                if (verdict == x2w_startup::PackedView::refused) continue;
-                if (verdict == x2w_startup::PackedView::stand_in) srv_desc.Format = created_desc.Format;
-            }
-            device->CreateShaderResourceView(created, &srv_desc, dest);
+            create_lazy_srv(device, created, created_desc, view_mode, vr, dest);
         }
         ReleaseSRWLockShared(&note_lock);
     }
