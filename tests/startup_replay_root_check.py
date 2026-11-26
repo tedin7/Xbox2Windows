@@ -62,14 +62,21 @@ def change_last(source, target, mode):
         at = blobs[argm[(seq, 2)]]
         data[at] ^= 0xFF                                     # the red byte of the last frame's word
     else:
-        # The CBV's data is title memory the replay restores from PAGE chunks: damage the page that holds the last frame's colour.
+        # The CBV's data is title memory. Damage the recorded copy of the last frame's colour: the PAGE chunk that holds it, or
+        # (memory the recorder did not take as pages) the argument memory of the call itself.
         last = struct.pack("<4f", (PRESENTS - 1) / PRESENTS, 0.25, 1.0 - (PRESENTS - 1) / PRESENTS, 1.0)
         hit = 0
         for tag, header, _hb, payload, size in chunks(data):
             if tag == b"PAGE" and bytes(data[payload:payload + 16]) == last:
                 data[payload] ^= 0xFF
                 hit += 1
-        assert hit, "no PAGE chunk holds the last frame's constant buffer"
+        if hit:
+            print("replay root cbv control: damaged %d PAGE chunk(s)" % hit)
+        else:
+            at = blobs[argm[(seq, 1)]]
+            assert bytes(data[at:at + 16]) == last, "the call's argument memory is not the last frame's constant buffer"
+            data[at] ^= 0xFF
+            print("replay root cbv control: no PAGE holds the buffer (plain VirtualAlloc memory); damaged the call's argument memory")
     target.write_bytes(bytes(data))
 
 
