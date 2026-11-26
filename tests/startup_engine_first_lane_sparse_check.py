@@ -40,11 +40,11 @@ VARIANTS = {
     'none32': ('s_mov_b32 exec_lo, 0x80000000\n', 's_mov_b32 exec_lo, -1\n',
                '06038abe80038bbe05030cf4000000fa7fc08cbfff03febe0000008082000834001030e004020380703f8cbf'
                '0205287ec103febe1404063a001070e004030480000081bf', (40, 1, 1), 32),
-    'sparse64': ('s_mov_b32 s24, 0xffffffe0\ns_mov_b32 s25, -1\ns_mov_b64 exec, s[24:25]\n', '',
-                 '06038abe80038bbe05030cf4000000fa7fc08cbfff0398bee0ffffffc10399be1804febe82000834'
+    'sparse64': ('s_mov_b32 s26, 0xffffffe0\ns_mov_b32 s27, -1\ns_mov_b64 exec, s[26:27]\n', '',
+                 '06038abe80038bbe05030cf4000000fa7fc08cbfff039abee0ffffffc1039bbe1a04febe82000834'
                  '001030e004020380703f8cbf0205287e1404063a001070e004030480000081bf', (96, 1, 1), 64),
-    'none64': ('s_mov_b32 s24, 0\ns_mov_b32 s25, 0x100\ns_mov_b64 exec, s[24:25]\n', 's_mov_b64 exec, -1\n',
-               '06038abe80038bbe05030cf4000000fa7fc08cbf800398beff0399be000100001804febe82000834'
+    'none64': ('s_mov_b32 s26, 0\ns_mov_b32 s27, 0x100\ns_mov_b64 exec, s[26:27]\n', 's_mov_b64 exec, -1\n',
+               '06038abe80038bbe05030cf4000000fa7fc08cbf80039abeff039bbe000100001a04febe82000834'
                '001030e004020380703f8cbf0205287ec104febe1404063a001070e004030480000081bf', (96, 1, 1), 64),
 }
 SIZES = {'sparse32': ('odd', 32), 'none32': ('top', 32), 'sparse64': ('from5', 64), 'none64': ('lane40', 64)}
