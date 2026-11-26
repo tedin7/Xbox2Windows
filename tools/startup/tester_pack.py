@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
-  tester_pack.py input-preset <none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py input-preset <accept|none|off|menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
@@ -52,6 +52,23 @@ MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
+
+
+ACCEPT_MASK = "4"        # GameInput A: the only button the title's picker takes. Never Start (Menu = the pause menu in game).
+ACCEPT_FIRST_S = 35      # first press, seconds after the first pad poll
+ACCEPT_EVERY_S = 10
+ACCEPT_HOLD_S = "0.3"
+
+
+def accept_script(seconds):
+    """`accept`: ONLY A, 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run (the picker
+    needs an A at about 31-43 s and the prologue another much later), at most MAX_ENTRIES presses."""
+    count = 0
+    items = []
+    while ACCEPT_FIRST_S + count * ACCEPT_EVERY_S < seconds and count < MAX_ENTRIES:
+        items.append("%s@%d+%s" % (ACCEPT_MASK, ACCEPT_FIRST_S + count * ACCEPT_EVERY_S, ACCEPT_HOLD_S))
+        count += 1
+    return ",".join(items)
 
 
 def menus2_script():
@@ -120,6 +137,8 @@ NO_INPUT = ("none", "off", "")  # input presets that press nothing
 def input_labels(spec, seconds, privacy_boxes=2):
     """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
     `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
+    if spec == "accept":
+        return ["press A #%d (accept)" % (n + 1) for n in range(len(accept_script(seconds).split(",")) if accept_script(seconds) else 0)]
     if spec != "menus":  # none, off, menus2 and raw scripts have no labelled passes
         return []
     count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
@@ -138,6 +157,8 @@ def input_preset(spec, seconds, privacy_boxes=2):
     screens before the privacy screen; privacy_boxes = 0 keeps the plain pattern. Anything else is a raw script."""
     if spec.strip().lower() in NO_INPUT:
         return ""
+    if spec == "accept":
+        return accept_script(seconds)
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
