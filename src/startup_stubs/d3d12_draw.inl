@@ -2254,8 +2254,12 @@ static const char* const not_drawn_names[] = {
     "formatted_buffer_too_large",
     "formatted_buffer_unresolved",
     "indexed_validation_failed",
+    "buffer_copy_failed",
+    "index_data_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
+constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
+constexpr int index_data_unavailable_site = not_drawn_sites - 1;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -2733,7 +2737,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
             ID3D12Resource* chunk = nullptr;
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            const bool readable_range = readable_window(address, bytes) >= bytes;
+            auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            if (readable_range && !target) {
+                // The guest memory is there; only the copy failed. A null binding would read zeros as if the title had bound nothing.
+                static LONG copy_refused;
+                if (first_calls(copy_refused, 6))
+                    log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+                count_null_binding(x2w_local::NullCause::ring_full);
+                ReleaseSRWLockExclusive(&draw_lock);
+                return not_drawn(buffer_copy_failed_site);
+            }
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
@@ -2748,7 +2762,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         ID3D12Resource* chunk = nullptr;
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &offset, &chunk);
+        const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+        bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
@@ -2760,6 +2775,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
             ReleaseSRWLockExclusive(&draw_lock);
             return not_drawn(13);
+        }
+        if (readable_range && !have) {
+            // The guest memory is readable and only the frame copy failed (upload ring full): refuse the draw instead of
+            // binding null, which would read zeros as if the title had bound nothing.
+            static LONG copy_refused;
+            if (first_calls(copy_refused, 6))
+                log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+            count_null_binding(x2w_local::NullCause::ring_full);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return not_drawn(buffer_copy_failed_site);
         }
         if (!have && identity_for_null) {
             static float identity[64];
@@ -2867,6 +2892,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        }
+        if (!view.BufferLocation) {
+            // Index data unreadable, or the index copy failed (upload ring full): count it with its own cause.
+            static LONG index_refused;
+            if (first_calls(index_refused, 6))
+                log("x2w-draw %016llx: index data unavailable (readable %d, %zu bytes), draw skipped", tr->key, indices_ok ? 1 : 0, index_total);
+            not_drawn(index_data_unavailable_site);
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);

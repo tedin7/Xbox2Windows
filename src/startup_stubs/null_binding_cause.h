@@ -10,9 +10,10 @@ enum class NullCause : int {
     unknown_token,       // descriptor memory names a view the wrapper does not know
     texture_wrapper,     // the view's resource is missing or is not a resource wrapper
     dimension_mismatch,  // the view dimension does not match the shader
+    ring_full,           // the guest memory was readable but the frame copy found no upload ring space (the draw is refused)
 };
-constexpr int null_cause_count = 5;
-constexpr const char* null_cause_names[null_cause_count] = {"entry", "buffer", "token", "wrapper", "dimension"};
+constexpr int null_cause_count = 6;
+constexpr const char* null_cause_names[null_cause_count] = {"entry", "buffer", "token", "wrapper", "dimension", "ring_full"};
 
 struct BindingFacts {
     bool texture = false;
@@ -23,10 +24,12 @@ struct BindingFacts {
     bool resource_wrapper = false;    // texture: the view resolves to a resource wrapper
     bool dimension_matches = true;    // texture: the view dimension suits the shader
     bool bound = false;               // buffer: a readable range was bound
+    bool ring_failed = false;         // buffer: the range is readable but the upload ring had no space for its copy
 };
 
 inline NullCause classify_null_binding(const BindingFacts& f)
 {
+    if (!f.texture && f.ring_failed) return NullCause::ring_full;
     // A buffer that ended up bound (also through the identity fallback) is not a null binding.
     if (!f.texture && f.bound) return NullCause::none;
     if (f.from_table && !f.entry_readable) return NullCause::table_entry;
