@@ -8185,6 +8185,19 @@ mask and conversion expressions of the byte-extracting conversions, whose shift 
 checks before.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 
+**`v_cvt_pknorm_u16_f32` in the startup translator (#1946).** `gfx2hlsl.py` used to return `Unsupported` for this
+VOP3-only instruction. It now emits `uint(round(saturate(S0) * 65535.0)) | (uint(round(saturate(S1) * 65535.0)) << 16)`:
+each half is clamped to 0..1, scaled and rounded to nearest even, a NaN reads 0, and source `neg`/`abs` apply to the
+float inputs. Any modifier (output modifier, `op_sel`, `clamp`) and any operand count other than three are refused
+by name rather than dropped, because they would change the packed words.
+`tests/startup_gfx2hlsl_pknorm_u16_check.py` has three modes. With no arguments it checks the translation controls in
+pure Python. With an `llvm-mc` path it reassembles the pixel body and compares it with the recorded words. With
+`draw` it renders four input sets per pixel through DXC ps_6_0 and compares the result words with a reference that
+rounds the binary32 product, and three mutated lowerings (low-half rounding, upper clamp, half order) must fail.
+Verified so far: the Python and LLVM checks. The WARP and GPU draw runs are not yet verified on Windows, and no
+hardware run of the instruction itself was available. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_pknorm_u16' -V`.
+
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
 sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read

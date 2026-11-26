@@ -165,6 +165,9 @@ FETCH_FORMATS = {
     # (Direct3D / Vulkan SNORM rule; LLVM 15 and Mesa ac_formats name the format 16_16_SNORM, number 24).
     'BUF_FMT_16_16_SNORM': ('ldu({0}, a)', ['U(max(float(int(w << 16) >> 16) / 32767.0, -1.0))',
                                             'U(max(float(int(w) >> 16) / 32767.0, -1.0))', '0u', 'U(1.0)']),
+    # Signed 16-bit fields: sign-extend, divide by 32767, and clamp -32768 to -1.0 (the SNORM rule).
+    'BUF_FMT_16_16_SNORM': ('ldu({0}, a)', ['U(max(float(asint(w << 16) >> 16) / 32767.0, -1.0))',
+                                            'U(max(float(asint(w) >> 16) / 32767.0, -1.0))', '0u', 'U(1.0)']),
     'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
     # Four half channels in one 8-byte element: x/y in the first dword, z/w in the second.
     'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32(ldu({0}, a)))', 'U(f16tof32(ldu({0}, a) >> 16))',
@@ -2635,6 +2638,12 @@ class Stage:
         if neg:
             expr = '(%s ^ 0x80000000u)' % expr
         return expr
+        # `|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
+        if len(tok) > 2 and tok.startswith('|') and tok.endswith('|'):
+            text = '(%s & 0x7fffffffu)' % self.u(tok[1:-1])
+        else:
+            text = self.u(tok)
+        return '(%s ^ 0x80000000u)' % text if neg else text
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
@@ -2736,6 +2745,16 @@ class Stage:
         if getattr(self, 'has_branches', False):
             value = tuple(self.sym[i] for i in (106, 107))
             self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
+    def op_v_cvt_pknorm_u16_f32(self, ops, mods):
+        # VOP3 only (no e32 form). Each half is clamp(S, 0, 1) * 65535 rounded to nearest even; saturate maps a NaN
+        # to 0. The neg and abs of a source are applied by f(). An output modifier or op_sel would change the packed
+        # words, so it is refused rather than dropped.
+        if mods:
+            raise Unsupported('v_cvt_pknorm_u16_f32 with %s' % (mods,))
+        if len(ops) != 3:
+            raise Unsupported('v_cvt_pknorm_u16_f32 with %d operands, expected 3' % len(ops))
+        half = 'uint(round(saturate(%s) * 65535.0))'
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % (half % self.f(ops[1]), half % self.f(ops[2])))
 
     def emit(self, text):
         if 'vcc' in text:

@@ -3717,6 +3717,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Vertex-stage buffer stores lower to RWByteAddressBuffer Store* under manifest version 2 (#1723).
     add_test(NAME startup_gfx2hlsl_buffer_store COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_buffer_store_check.py")
+    # An absolute-value source modifier on the vector select clears the sign bit (#1723).
+    add_test(NAME startup_gfx2hlsl_abs_mod COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_abs_mod_check.py")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
@@ -3729,6 +3732,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The draw's DXGI -> FORMAT table for typed views read by buffer_load_format_* matches the translation's switch.
     add_test(NAME startup_buffer_format_word3_table COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_buffer_format_word3_table_check.py")
+    # A typed buffer load of BUF_FMT_16_16_SNORM reads two signed 16-bit channels from one dword (#1723).
+    add_test(NAME startup_gfx2hlsl_tbuffer_16_16_snorm COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_tbuffer_16_16_snorm_check.py")
     # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
     add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
@@ -3927,6 +3933,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp16_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_cmp16_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # v_cvt_pknorm_u16_f32: translation controls, then a draw of the translated pairs with reference words and
+    # three mutated lowerings (rounding, upper clamp, order of the halves).
+    add_test(NAME startup_gfx2hlsl_pknorm_u16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_pknorm_u16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_pknorm_u16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_pknorm_u16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_pknorm_u16_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
@@ -4697,6 +4712,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # tools/pixel_aot.py formulas (zero-src1-byte and 2^32 carry cases), refusals and the unchanged v_sad_u8 output.
     add_test(NAME startup_gfx2hlsl_sad_hi_msad_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sad_hi_msad_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_abs_mod_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_abs_mod_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_abs_mod_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_xg_bc_tiling COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc_tiling_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_bc_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
