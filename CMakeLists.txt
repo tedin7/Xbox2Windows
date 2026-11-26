@@ -2347,6 +2347,15 @@ foreach(mutation IN ITEMS generation witness stamp key device age hits unproven)
     add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
     set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Cache of resolved views (src/startup_stubs/view_cache.h, X2W_VIEW_CACHE); the mutated runs are negative controls.
+add_executable(startup_view_cache_check tests/startup_view_cache_check.cpp)
+target_include_directories(startup_view_cache_check PRIVATE src)
+target_compile_features(startup_view_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_view_cache COMMAND startup_view_cache_check)
+foreach(mutation IN ITEMS resource-generation stamp id resource kind write flush ticket)
+    add_test(NAME startup_view_cache_${mutation}_control COMMAND startup_view_cache_check --mutate ${mutation})
+    set_tests_properties(startup_view_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Opt-in drop of the top mip level of big sampled textures (src/startup_stubs/texture_drop_mips.h); the mutated runs
 # are negative controls.
 add_executable(startup_texture_drop_mips_check tests/startup_texture_drop_mips_check.cpp)
