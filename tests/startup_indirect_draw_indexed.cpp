@@ -2119,7 +2119,7 @@ int main(int argc, char** argv) try
             (!control && !dispatch(pair.Get(), root.Get(), "repeat mesh with PS"))) return 1;
         unsigned pair_uses = 2, depth_uses = 1;
         if (!control && !exchange_size) {
-            constexpr unsigned pair_calls = 4000, depth_calls = 1000;
+            static constexpr unsigned pair_calls = 4000, depth_calls = 1000;
             using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
             using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
             struct Recording {
