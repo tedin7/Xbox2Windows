@@ -2879,11 +2879,24 @@ unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+struct GuardedRingCopy {
+    const unsigned char* data{};
+    bool source_fault{};
+};
+
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr,
+               GuardedRingCopy* guarded = nullptr)
 {
     auto* dest = reserve_upload_ring(list, bytes, offset, resource);
     if (!dest) return false;
-    std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
+    const auto* source = reinterpret_cast<const void*>(title_address);
+    if (guarded) {
+        guarded->source_fault = !x2w_local::guarded_memcpy(dest, source, bytes, true, false);
+        if (guarded->source_fault) return false;
+        guarded->data = dest;
+    } else {
+        std::memcpy(dest, source, bytes);
+    }
     return true;
 }
 
@@ -7759,14 +7772,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
+    const bool cache_readability = readable_frame_cache_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
-    frame_number = frame;
+    InterlockedExchange(&frame_number, frame);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
     }
+    if (cache_readability) report_readable_frame(frame);
     draw_dump_flush();
     red_producers().flush();
     {
@@ -7899,9 +7914,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
         for (int size_class = 0; size_class < 2; ++size_class) {
             const auto& step = buffer_step_stats[size_class];
-            log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
+            log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms); %lld readable hits, %lld probes",
                 size_class ? "64 KiB and larger" : "under 64 KiB", step.calls, step.bytes >> 20, step.trim_us / 1000, step.copy_us / 1000,
-                step.copy_over_1ms, step.copy_max_us / 1000);
+                step.copy_over_1ms, step.copy_max_us / 1000, step.readable_hits, step.probes);
         }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());

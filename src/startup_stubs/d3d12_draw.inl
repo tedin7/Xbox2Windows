@@ -378,7 +378,7 @@ constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at pe
 // Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
 // trim = committed extent + readable probe + zero-tail scan; copy = frame_copy (compare with the cached snapshot, ring copy).
 struct BufferStepStats {
-    LONG64 calls, trim_us, copy_us, copy_over_1ms, copy_max_us, bytes;
+    LONG64 calls, trim_us, copy_us, copy_over_1ms, copy_max_us, bytes, readable_hits, probes, copy_faults;
 };
 BufferStepStats buffer_step_stats[2];
 inline LONG64 step_now_us()
@@ -1606,6 +1606,70 @@ bool bigbind_key_address_mutant()
 std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
 {
     return {address, bigbind_key_address_mutant() ? 0 : full_bytes};
+}
+
+constexpr std::size_t readable_region_bytes = 64u << 10;
+
+bool readable_frame_cache_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_READABLE_FRAME_CACHE");
+    return on;
+}
+
+class ReadableFrameCache {
+    struct Entry {
+        u64 region;
+        LONG frame;
+        unsigned pages;
+    };
+    std::array<Entry, 1024> entries{};
+
+public:
+    // A probe only proves the 4 KiB pages it actually touched. Keep their bits
+    // together in the 64 KiB entry without committing or probing adjacent pages.
+    template<bool Record>
+    bool covers(u64 address, std::size_t bytes, LONG frame)
+    {
+        const u64 last = address + bytes - 1;
+        if (last < address) return false;
+        const u64 first_region = address >> 16, last_region = last >> 16;
+        for (u64 region = first_region; region <= last_region; ++region) {
+            const unsigned first_page = region == first_region ? ((address >> 12) & 15) : 0;
+            const unsigned last_page = region == last_region ? ((last >> 12) & 15) : 15;
+            const unsigned pages = ((2u << last_page) - 1) & ~((1u << first_page) - 1);
+            auto& entry = entries[region % entries.size()];
+            const bool current = entry.region == region && entry.frame == frame;
+            if constexpr (Record) {
+                entry = {region, frame, pages | (current ? entry.pages : 0)};
+            } else if (!current || (entry.pages & pages) != pages) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void invalidate(u64 address, std::size_t bytes)
+    {
+        const u64 first = address >> 16, last = (address + bytes - 1) >> 16;
+        for (u64 region = first; region <= last; ++region)
+            entries[region % entries.size()] = {};
+    }
+};
+thread_local ReadableFrameCache readable_frame_cache;
+
+void report_readable_frame(LONG frame)
+{
+    static const bool report = x2w_local::env_on("X2W_TEST_READABLE_FRAME_REPORT");
+    if (!report) return;
+
+    const auto& step = buffer_step_stats[0];
+    // The fixture records draws and calls Present on the same thread.
+    static LONG64 hits, probes, copy_faults;
+    log("x2w-draw readable bindings frame %ld: %lld hits, %lld probes, %lld copy faults",
+        frame, step.readable_hits - hits, step.probes - probes, step.copy_faults - copy_faults);
+    hits = step.readable_hits;
+    probes = step.probes;
+    copy_faults = step.copy_faults;
 }
 
 void finish_bigbind_frame(LONG frame)
@@ -3376,6 +3440,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         }
         const LONG64 step_t0 = cache_hit ? 0 : step_now_us();
+        const bool small_binding = full_bytes < readable_region_bytes;
+        const bool cache_readability = small_binding && readable_frame_cache_enabled();
+        bool readable_hit = false, probed = false;
         bool readable_range;
         if (cache_hit) {
             bytes = cached->bytes;
@@ -3387,7 +3454,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
                 if (extent_ok) bytes = extent ? extent : 256;
             }
-            readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+            readable_range = false;
+            if (address && bytes && (!cache_readability || address + bytes > address)) {
+                LONG stamp = 0;
+                if (cache_readability) {
+                    // Fixture mutant: keep the same stamp after Present.
+                    static const bool frozen = x2w_local::env_on("X2W_TEST_READABLE_FRAME_FROZEN");
+                    stamp = frozen ? 0 : InterlockedCompareExchange(&frame_number, 0, 0);
+                    readable_hit = readable_frame_cache.covers<false>(address, bytes, stamp);
+                }
+                probed = !readable_hit;
+                readable_range = readable_hit || readable_window(address, bytes) >= bytes;
+                if (cache_readability && probed && readable_range)
+                    readable_frame_cache.covers<true>(address, bytes, stamp);
+            }
             if (readable_range && large_raw) {
                 bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
                 if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
@@ -3400,6 +3480,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
         bool have = false;
+        GuardedRingCopy guarded;
         if (readable_range && cached) {
             auto& slice = cached->slice;
             if (slice.mapped) {
@@ -3422,12 +3503,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 // A retry needs a fresh readability check before it can read title memory.
                 big_bindings.erase(bigbind_key(address, full_bytes));
             }
+        } else if (readable_range && cache_readability) {
+            have = ring_copy(self, address, bytes, &offset, &chunk, &guarded);
+            if (guarded.source_fault) {
+                readable_frame_cache.invalidate(address, bytes);
+                readable_range = false;
+            }
         } else if (readable_range) {
             have = frame_copy(self, address, bytes, &offset, &chunk);
         }
         if (!cache_hit) {
             const LONG64 step_t2 = step_now_us();
-            auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
+            auto& step = buffer_step_stats[small_binding ? 0 : 1];
+            if (small_binding && readable_hit) InterlockedIncrement64(&step.readable_hits);
+            if (small_binding && probed) InterlockedIncrement64(&step.probes);
+            if (guarded.source_fault) InterlockedIncrement64(&step.copy_faults);
             InterlockedIncrement64(&step.calls);
             InterlockedAdd64(&step.trim_us, step_t1 - step_t0);
             InterlockedAdd64(&step.copy_us, step_t2 - step_t1);
@@ -3468,9 +3558,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
+        const auto* binding_data = guarded.data ? guarded.data : reinterpret_cast<const unsigned char*>(address);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
-            if (have && !cache_hit) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
+            if (have && !cache_hit) hex_text(binding_data, bytes < 48 ? bytes : 48, head, sizeof(head));
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
@@ -3484,7 +3575,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const bool constants_due = constants_log && have && !cache_hit && bytes >= 16 && bytes <= 4096 &&
                                    (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
         if (constants_due) {
-            const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);
+            const auto* memory_words = reinterpret_cast<const std::uint32_t*>(binding_data);
             const std::size_t shown = (std::min<std::size_t>)(bytes / 4, 52);
             char text[52 * 14 + 1] = "";
             std::size_t used = 0;

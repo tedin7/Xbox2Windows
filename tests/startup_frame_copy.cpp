@@ -18,6 +18,60 @@ static void* create_present_queue(void* guest)
     return queue;
 }
 
+// Each pixel records a separate translated draw. Two reserved 64 KiB regions
+// hold distinct 256-byte views, backed by just one committed page each.
+static int draw_readable_frame_cache(ID3D12Device* desktop, void* guest, void* list, UINT width, UINT height)
+{
+    constexpr UINT draws = 2000, region = 64u << 10;
+    if (width != draws + 1 || height != 1) return 46;
+
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * region, MEM_RESERVE, PAGE_READWRITE));
+    if (!memory) return 45;
+    if (!VirtualAlloc(memory, 4096, MEM_COMMIT, PAGE_READWRITE) ||
+        !VirtualAlloc(memory + region, 4096, MEM_COMMIT, PAGE_READWRITE)) return 45;
+
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT entries = 1 + (32 + increment - 1) / increment;
+    std::vector<unsigned char> views(static_cast<std::size_t>(entries) * increment);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        StreamWord backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entries, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                reinterpret_cast<std::uintptr_t>(views.data()), views.size()};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, reinterpret_cast<std::uintptr_t>(&heap_desc),
+                                           reinterpret_cast<std::uintptr_t>(&__uuidof(ID3D12DescriptorHeap)),
+                                           reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
+    const StreamWord cpu = invoke(heap, 9), table = invoke(heap, 10);
+    if (cpu != reinterpret_cast<std::uintptr_t>(views.data()) || !table) return 42;
+    for (UINT i = 0; i < 2; ++i) {
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory + i * region), 256};
+        invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu + i * increment);
+    }
+    invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));
+
+    auto draw_pixel = [&](UINT x, UINT binding) {
+        const D3D12_RECT rect{static_cast<LONG>(x), 0, static_cast<LONG>(x + 1), 1};
+        invoke(list, 36, 0, table + binding * increment);
+        invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&rect));
+        invoke(list, 12, 3, 1);
+    };
+    for (UINT i = 0; i < draws; ++i) {
+        const UINT binding = i % 2;
+        const float color[]{float(i & 255) / 255.0f, float(i >> 8) / 255.0f, float(binding), 1.0f};
+        std::memcpy(memory + binding * region, color, sizeof(color));
+        draw_pixel(i, binding);
+    }
+    void* queue = create_present_queue(guest);
+    if (!queue) return 44;
+    invoke(queue, 32, 0, 0, 0);
+    if (!VirtualFree(memory, 4096, MEM_DECOMMIT)) return 47;
+    draw_pixel(draws, 0);  // A stale verdict would attempt to copy the decommitted page.
+    invoke(queue, 32, 0, 0, 0);
+    if (!VirtualFree(memory, 0, MEM_RELEASE)) return 47;
+    return 0;
+}
+
 // Two draws in one command list read the same constant buffer address through a descriptor table; the left half
 // of the target is drawn first, the right half second. X2W_TEST_FRAME_COPY selects what the title does to the
 // memory between the draws:
@@ -34,6 +88,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 {
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+    if (!std::strcmp(mode, "readable-cache"))
+        return draw_readable_frame_cache(desktop, guest, list, width, height);
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool once = keys || !std::strcmp(mode, "once");

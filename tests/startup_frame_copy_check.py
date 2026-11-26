@@ -118,8 +118,57 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def verify_readable_frames(frames):
+    expected = [(1, 1998, 2, 0), (2, 0, 1, 0)]
+    if frames != expected:
+        raise AssertionError(f"readable binding counters {frames!r}, expected {expected!r}")
+
+
+def check_readable_cache(directory, consumer, backend):
+    expected = b"".join(bytes((i & 255, i >> 8, 255 * (i % 2), 255)) for i in range(2000)) + bytes(4)
+    for name, frozen in (("readable", "0"), ("frozen", "1")):
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, HLSL, {
+            "X2W_TEST_FRAME_COPY": "readable-cache",
+            "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "0",
+            "X2W_DRAW_NULL_IDENTITY": "0",
+            "X2W_READABLE_FRAME_CACHE": "1",
+            "X2W_TEST_READABLE_FRAME_REPORT": "1",
+            "X2W_TEST_READABLE_FRAME_FROZEN": frozen,
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        if len(pixels) != len(expected):
+            raise AssertionError(f"{name}: {len(pixels)} bytes, expected {len(expected)}")
+        if pixels != expected:
+            x = next(i for i in range(2001) if pixels[4*i:4*i+4] != expected[4*i:4*i+4])
+            raise AssertionError(f"{name}: pixel {x} got {pixels[4*x:4*x+4].hex()}, expected {expected[4*x:4*x+4].hex()}")
+        frames = [tuple(map(int, match)) for match in re.findall(
+            r"readable bindings frame (\d+): (\d+) hits, (\d+) probes, (\d+) copy faults",
+            log.read_text(errors="replace"))]
+        if frozen == "0":
+            verify_readable_frames(frames)
+            print(f"{backend}: 2001 pixels exact, 2 first-frame probes, next-frame null with no copy fault")
+        else:
+            # The copy guard still binds null, so pixels alone cannot tell which
+            # path refused the range. The same frame assertion must reject it.
+            if frames != [(1, 1998, 2, 0), (2, 1, 0, 1)]:
+                raise AssertionError(f"frozen stamp did not reach the copy guard: {frames!r}")
+            try:
+                verify_readable_frames(frames)
+            except AssertionError:
+                print(f"{backend}: the frame assertion rejects the frozen stamp after a guarded copy fault")
+            else:
+                raise AssertionError("frozen stamp passed the frame assertion")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        checks = {"once": check_once, "readable-cache": check_readable_cache}
+        check_mode = checks[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))

@@ -113,6 +113,14 @@ inline void commit_lazy(const void* pointer, std::size_t bytes) noexcept
     if (commit_range) commit_range(pointer, bytes);
 }
 
+inline void rearm_guard_page(std::uintptr_t at) noexcept
+{
+    MEMORY_BASIC_INFORMATION info{};
+    DWORD old = 0;
+    if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
+        VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
+}
+
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
 // millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so
@@ -156,12 +164,7 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
         }
         (void)sink;
     } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
-        if (code == 0x80000001u) {  // STATUS_GUARD_PAGE_VIOLATION: the system dropped the guard bit
-            MEMORY_BASIC_INFORMATION info{};
-            DWORD old = 0;
-            if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
-                VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
-        }
+        if (code == 0x80000001u) rearm_guard_page(at);  // STATUS_GUARD_PAGE_VIOLATION drops the guard bit.
     }
     if (done < mapped) forget_mapped_spans();  // the span was cached, then freed or protected
     // A free tail only counts as an avoided fault when the mapped prefix was walked without one: a protected page
@@ -172,18 +175,25 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
 
 // memcpy from title memory that may have been freed or unmapped since it was probed. A source that is in free
 // address space is refused up front with no exception (counted in faults_avoided); everything else is copied under
-// __try as the last guard. any_exception false: only an access violation or an in-page error is caught.
-inline bool guarded_memcpy(void* to, const void* from, std::size_t bytes, bool any_exception) noexcept
+// __try as the last guard. Callers with a readability verdict can skip the mapping walk.
+inline LONG copy_exception_filter(const EXCEPTION_RECORD& fault, bool any_exception, bool restore_guard) noexcept
 {
-    if (bytes && mapped_prefix(reinterpret_cast<std::uintptr_t>(from), bytes) < bytes) {
+    if (restore_guard && fault.ExceptionCode == 0x80000001u && fault.NumberParameters >= 2)
+        rearm_guard_page(fault.ExceptionInformation[1]);
+    return any_exception || fault.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+           fault.ExceptionCode == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+inline bool guarded_memcpy(void* to, const void* from, std::size_t bytes, bool any_exception,
+                           bool check_mapping = true) noexcept
+{
+    if (check_mapping && bytes && mapped_prefix(reinterpret_cast<std::uintptr_t>(from), bytes) < bytes) {
         InterlockedIncrement(&faults_avoided);
         return false;
     }
     __try {
         std::memcpy(to, from, bytes);
-    } __except (any_exception || GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
-                        GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
-                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+    } __except (copy_exception_filter(*GetExceptionInformation()->ExceptionRecord, any_exception, !check_mapping)) {
         forget_mapped_spans();
         return false;
     }
