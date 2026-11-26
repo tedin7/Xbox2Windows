@@ -1396,6 +1396,22 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_FORCE_SERIALIZED_QUEUES=1")
 endforeach()
 
+add_executable(sysmem_policy_check tests/sysmem_policy_check.cpp)
+target_include_directories(sysmem_policy_check PRIVATE src)
+target_compile_features(sysmem_policy_check PRIVATE cxx_std_17)
+add_test(NAME sysmem_policy COMMAND sysmem_policy_check)
+
+# A texture whose default-heap creation runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1).
+add_executable(startup_sysmem_fallback tests/startup_sysmem_fallback.cpp)
+target_include_directories(startup_sysmem_fallback PRIVATE src)
+target_compile_features(startup_sysmem_fallback PRIVATE cxx_std_17)
+target_link_libraries(startup_sysmem_fallback PRIVATE d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_sysmem_fallback_${backend} COMMAND startup_sysmem_fallback ${backend})
+    set_tests_properties(startup_sysmem_fallback_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_BUDGET=1" PASS_REGULAR_EXPRESSION "sysmem fallback checks passed")
+endforeach()
+
 add_executable(startup_resource_budget tests/startup_resource_budget.cpp)
 target_include_directories(startup_resource_budget PRIVATE src)
 target_compile_features(startup_resource_budget PRIVATE cxx_std_17)

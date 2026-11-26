@@ -42,6 +42,10 @@ Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
 Lazy slot 133 textures are on for now: the script sets `X2W_D3D12_LAZY_TEXTURES=1` so read-only slot 133 textures are created
 on first use and video memory does not run out. `-NoLazyTextures` turns it off; the manifest records the choice.
 
+The system-memory fallback is on too (`X2W_D3D12_SYSMEM_FALLBACK=1`): when a slot 133 texture runs out of video memory it is created
+once more in system memory instead of returning an error, and the `x2w-budget` line ends with `sysmem-fallback=N bytes=M`.
+`-NoSysmemFallback` turns it off; the manifest records the choice.
+
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
 
 ## What to send

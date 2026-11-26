@@ -88,7 +88,9 @@ RE_GPU_BUDGET = re.compile(
     rf" texture=(?P<live>{BUDGET_DECIMAL})/{BUDGET_DECIMAL}"
     rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
     + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
-    + rf" unmeasured={BUDGET_DECIMAL}"
+    # sysmem: textures created in system memory after video memory ran out; the fallback totals close the line.
+    + rf"(?: sysmem={BUDGET_CATEGORY})? unmeasured={BUDGET_DECIMAL}"
+    + rf"(?: sysmem-fallback={BUDGET_DECIMAL} bytes={BUDGET_DECIMAL})?"
 )
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")

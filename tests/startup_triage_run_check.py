@@ -580,6 +580,10 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
             'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0'
         )
 
+    # The line the shim writes now carries the system-memory category and the fallback totals: it still parses.
+    current = sample("2500/3000", "100/5+40/2").replace(" unmeasured=0", " sysmem=4096/1+0/0 unmeasured=0 sysmem-fallback=1 bytes=4096")
+    if not triage_run.RE_GPU_BUDGET.fullmatch(current):
+        failures.append("the budget line with the sysmem category and fallback totals was not parsed")
     high_usage = sample("2500/3000", "100/5+40/2")
     high_ratio = sample("1800/1000", "150/7+50/3")
     high_retained = sample("n/a", "250/8+900/40").replace("nonlocal=2/8", "nonlocal=n/a")

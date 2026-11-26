@@ -1581,7 +1581,8 @@ An unavailable segment reads `n/a`.
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
-buffers, upload buffers, readback buffers, and explicit heaps. Resource sizes
+buffers, upload buffers, readback buffers, explicit heaps, and `sysmem` (textures
+created in system memory by the fallback below). Resource sizes
 come from the desktop allocation info for the created description. A slot 133
 texture or buffer with committed backing counts in its committed category.
 Each opened or created heap uses its desktop heap size once, even when several
@@ -1597,6 +1598,23 @@ stay live until their desktop references are released. The diagnostic leaves
 those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
+
+### System-memory fallback for textures
+
+`X2W_D3D12_SYSMEM_FALLBACK=1` (opt in): when the desktop `CreateCommittedResource` of a slot 133 texture in a default
+heap fails with `E_OUTOFMEMORY` (the eager path and the lazy first-use path alike), the shim retries once with a custom heap
+in the system pool (`MEMORY_POOL_L0`). The CPU page property depends on the adapter (`D3D12_FEATURE_ARCHITECTURE1`): a
+shared-memory adapter tries `NOT_AVAILABLE`, then `WRITE_COMBINE`, then `WRITE_BACK`; a discrete adapter tries
+`WRITE_COMBINE`, then `WRITE_BACK`, because `NOT_AVAILABLE` belongs to the video-memory pool there. If every retry fails the
+caller gets the original `E_OUTOFMEMORY`, as without the switch. Any other failure, and any other heap type, is not retried.
+
+Such a texture is counted in the `sysmem` category (its ticket is released with the resource, like every category), and
+the first 32 fallbacks log one `x2w-d3d12 sysmem fallback` line each. The `x2w-budget` line ends with
+`sysmem-fallback=N bytes=M`, the total made so far (released or not). `tools/startup/tester_run.ps1` turns the switch on;
+`-NoSysmemFallback` turns it off. Source: Microsoft D3D12 documentation for `D3D12_HEAP_PROPERTIES`, `D3D12_MEMORY_POOL` and
+`D3D12_CPU_PAGE_PROPERTY`. The rules are in `src/startup_stubs/sysmem_policy.h` (`sysmem_policy` test) and the retry in
+`src/startup_stubs/sysmem_create.h` (`startup_sysmem_fallback_{warp,hardware}`: a forced out-of-memory, upload, a sampled
+read-back against a CPU reference, and the controls).
 
 `X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
 2D textures that have one sample, no render-target, depth-stencil or
