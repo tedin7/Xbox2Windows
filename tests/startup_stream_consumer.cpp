@@ -234,6 +234,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool misc_readback = mode == "dispatch-misc";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -310,6 +311,19 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(descriptors[1], alias, sizeof(alias));
     }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    void* readback = nullptr;
+    if (misc_readback) {
+        // A second output view starts four words into the same buffer. Its marker proves the
+        // shader ran even when the first view has no records and discards every store.
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[1] + 4);
+        const UINT probe[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 1, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors)), probe, sizeof(probe));
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+            {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!readback) return 71;
+    }
+
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
@@ -509,6 +523,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         }
     } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
+    if (readback) invoke(list, 15, word(readback), 0, word(placed[1]), 0, words * sizeof(UINT));
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
@@ -523,7 +538,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
-    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
+    if (readback) {
+        void* mapped = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(readback, 8, 0, 0, word(&mapped)))) || !mapped) return 2;
+        std::ofstream(path, std::ios::binary).write(static_cast<const char*>(mapped), words * sizeof(UINT));
+        invoke(readback, 9, 0, 0);
+    } else {
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
+    }
     return 0;
 }
 
@@ -537,16 +559,19 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 // handle, which keeps the first view; texture-store-self also creates a shader resource view of the texture at table byte 0.
 static int texture_slot67(void* device, const std::string& mode)
 {
-    constexpr UINT width = 32, height = 8;
+    const bool scalar = mode == "texture-misc-self";
+    const UINT width = scalar ? 64 : 32;
+    constexpr UINT height = 8;
     const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
     const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
-    const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
+    const UINT pitch = width * (scalar ? 4 : fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
-        mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const DXGI_FORMAT format = scalar ? DXGI_FORMAT_R32_FLOAT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+        mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT :
+        mode == "texture-misc-sint" ? DXGI_FORMAT_R16G16B16A16_SINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
@@ -557,7 +582,9 @@ static int texture_slot67(void* device, const std::string& mode)
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    if (fp32) {
+    if (scalar) {
+        for (UINT i = 0; i < bytes / 4; ++i) static_cast<float*>(memory)[i] = static_cast<float>(i + 11);
+    } else if (fp32) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;
@@ -605,7 +632,7 @@ static int texture_slot67(void* device, const std::string& mode)
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
-    if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
+    if (mode == "texture-store-self" || scalar) invoke(device, 18, word(texture), word(&read), cpu);
     D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     source.PlacedFootprint = {0, {format, width, height, 1, pitch}};

@@ -1089,6 +1089,33 @@ Its `wrong_group` control swaps the group size in the state block and must misma
 request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
 the fixture builds the block at the offsets the translator reads.
 
+### Opt-in compute descriptor handling
+
+Set `X2W_CS_MISC=1` to bind zero-record buffer descriptors as null SRVs or UAVs.
+Loads return zero and stores are discarded. The dispatch can still use its
+other bindings. The switch defaults to off.
+
+For 2D texture outputs, `uav <i> tex2d uint|int table <param> <byte> channels 4`
+declares an integer shader output. The cached shader must declare the matching
+`RWTexture2D<uint4>` or `RWTexture2D<int4>` at `u<i>`. The runtime checks the
+view's signedness and typed-store support.
+
+For a texture read and written by the same dispatch, add `via_uav <j>` to the
+`srv <i> tex2d table <param> <byte>` line. Compile the shader to load through
+`u<j>` as well as store through it. This applies to direct texel loads on a
+matching 2D view of one mip and plane with default component mapping. The
+runtime checks typed-load support. A scalar floating-point UAV can use
+`channels 1`. Supply these manifests with matching compiled shaders. The
+offline translator currently emits the original texture bindings.
+
+The four WARP checks compare full readbacks with CPU references. Each checks
+the switch-off refusal and runs a mutant whose readback must differ from the
+reference. Run on Windows after building the test consumer.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_misc_(zero_input|zero_output|texture_alias|integer_output)_warp$' -V
+```
+
 ### Shader requests from the archive, before a run
 
 `tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes
