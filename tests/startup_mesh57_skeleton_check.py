@@ -4,6 +4,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
@@ -22,6 +23,10 @@ a reference with one wrong pixel must fail.
 twice into a depth buffer cleared to the sentinel 1.0 with depth test LESS, and compares colour (left cleared) and
 depth with the CPU rasteriser; a reference without the depth writes, and the same mesh with a null-export stage
 that does not discard, must each fail.
+`killexit` draws the colour pair whose pixel stage kills lanes with red at or below 0.5 and leaves through the
+early-exit null export (entered by s_cbranch_execz, and in the demote form by s_cbranch_scc0 after s_cselect),
+and compares both with the CPU rasteriser without the killed triangles; the same mesh with the pixel stage that
+does not kill must differ at exactly the killed pixels.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
@@ -59,6 +64,25 @@ NULL_EXPORT = DEPTH_PIXEL.index('f8001890')
 # The drawn stage with exp mrt0 v0, v0, v0, v0 inserted before its null export (after the v_cmpx), then the drawn
 # stage reading attribute 1, which the mesh does not export. The other mixed forms (mrtz, param0, pos0, both orders,
 # no EXEC narrowing) are covered by startup_mesh57_depth_only_check.py.
+# A colour stage with the early exit of a kill (LLVM SILateBranchLowering, Mesa ACO): when no lane is left after
+# v_cmpx, s_cbranch_execz jumps past the main s_endpgm to a block that is only the null export and s_endpgm.
+# Lanes whose flat attribute 0 red is not above 0.5 are killed; the others write their colour.
+KILL_EXIT_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\n'
+                       'v_interp_mov_f32 v2, p0, attr0.z\nv_interp_mov_f32 v3, p0, attr0.w\n'
+                       'v_cmpx_lt_f32_e32 0.5, v0\ns_cbranch_execz .exit\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n'
+                       '.exit:\nexp null off, off, off, off done vm\ns_endpgm\n')
+KILL_EXIT_PIXEL = ('c8020002 c8060102 c80a0202 c80e0302 7c2200f0 bf880003 f800180f 03020100 bf810000'
+                   ' f8001890 00000000 bf810000').split()
+# The demote form of the same exit (LLVM SILateBranchLowering): the live mask leaves SCC, s_cselect sets EXEC to 0
+# when no lane is live, and s_cbranch_scc0 then enters the exit with EXEC zero. Same kill as KILL_EXIT_PIXEL.
+DEMOTE_EXIT_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\n'
+                         'v_interp_mov_f32 v2, p0, attr0.z\nv_interp_mov_f32 v3, p0, attr0.w\n'
+                         's_mov_b64 s[12:13], exec\nv_cmp_gt_f32_e32 vcc, 0.5, v0\ns_andn2_b64 s[12:13], s[12:13], vcc\n'
+                         's_cselect_b64 exec, exec, 0\ns_cbranch_scc0 .exit\ns_mov_b64 exec, s[12:13]\n'
+                         'exp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n'
+                         '.exit:\nexp null off, off, off, off done vm\ns_endpgm\n')
+DEMOTE_EXIT_PIXEL = ('c8020002 c8060102 c80a0202 c80e0302 be8c047e 7c0800f0 8a8c6a0c 85fe807e bf840004 befe040c'
+                     ' f800180f 03020100 bf810000 f8001890 00000000 bf810000').split()
 DEPTH_PIXEL_MUTANTS = (
     ('a colour write next to the drawn null export', DEPTH_PIXEL[:NULL_EXPORT] + ['f800000f', '00000000'] + DEPTH_PIXEL[NULL_EXPORT:],
      'slot 57 pixel stage mixes the null export with another export'),
@@ -1046,6 +1070,52 @@ def draw_depth(dxc, renderer, adapter):
     return 0
 
 
+def draw_kill_exit(dxc, renderer, adapter):
+    """The colour pair whose pixel stage leaves through the early exit of a kill, against a CPU reference without
+    the killed triangles; the same mesh with the pixel stage that does not kill must fail against it."""
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    kept = [triangle for triangle in indices if colours[triangle[0]][0] / 255 > 0.5]
+    image, unkilled = rasterise(points, colours, kept, 12, len(kept)), rasterise(points, colours, indices, 12, 4)
+    killed = sum(a != b for a, b in zip(image, unkilled))
+    assert 0 < len(kept) < len(indices) and killed > 50, (len(kept), killed)
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, KILL_EXIT_PIXEL)
+        expect('the kill-exit pair translates and compiles', result, 'ok')
+        demote, demote_result = request(tmp, MESH, DEMOTE_EXIT_PIXEL)
+        expect('the demote-exit pair translates and compiles', demote_result, 'ok')
+        plain, plain_result = request(tmp, MESH, PIXEL)
+        expect('the pair without the kill translates and compiles', plain_result, 'ok')
+        if result != 'ok' or demote_result != 'ok' or plain_result != 'ok':
+            return 0
+        uds = G.MeshPipeline(code(MESH), code(KILL_EXIT_PIXEL), root()).uds
+        constants = bytearray(1024)
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), len(indices))
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 1)), len(points))
+        words = [a | b << 10 | c << 20 for a, b, c in indices]
+        path = Path(tmp) / 'kill.bin'
+        path.write_bytes(bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+                         + b''.join(bytes(pixel) for pixel in image))
+        print('kept %d of %d triangles; %d pixels differ from a draw without the kill' % (len(kept), len(indices), killed))
+        for label, stem, mismatches in (('kill-exit pair', key, 0), ('demote-exit pair', demote, 0),
+                                        ('the pair without the kill', plain, killed)):
+            name = str(Path(tmp) / ('%016x' % stem))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', name + '.ms57.cso', name + '.ps57.cso', str(path)],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            ok = (run.returncode == int(mismatches > 0)
+                  and 'pixels=1024 mismatches=%d' % mismatches in run.stdout)
+            print('%s: mismatches want %d, exit=%d -> %s' % (label, mismatches, run.returncode,
+                                                          'as expected' if ok else 'UNEXPECTED'))
+            if not ok:
+                print(run.stdout + run.stderr)
+            expect('kill-exit draw: ' + label, ok, True)
+    return 0
+
+
 def draw_formatted(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
@@ -1151,6 +1221,8 @@ def main(argv):
         status = draw(*argv[2:])
     elif argv[1:2] == ['depth'] and len(argv) == 5:
         status = draw_depth(*argv[2:])
+    elif argv[1:2] == ['killexit'] and len(argv) == 5:
+        status = draw_kill_exit(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:

@@ -379,6 +379,11 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
         top.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         bottom.SourceAccelerationStructureData = bottom.DestAccelerationStructureData;
         top.SourceAccelerationStructureData = top.DestAccelerationStructureData;
+        if (placedScene) {
+            // The update goes through the placed resolver too, from the title addresses of the initial build.
+            placedScene->resolve_update(0, bottom);
+            placedScene->resolve_update(1, top);
+        }
         list->ResourceBarrier(1, &order);
         list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
         list->ResourceBarrier(1, &order);
@@ -501,6 +506,39 @@ std::vector<UINT32> dxr_fixture::trace_placed_triangle(ID3D12Device* device, con
                        nullptr, nullptr, nullptr, placement, resolved, counts);
 }
 
+// The accepted PERFORM_UPDATE path (#870, #1758): build the placed BLAS and TLAS with ALLOW_UPDATE, record the update
+// of both through the placed resolver, and read back rays whose result changed. The references are the same update on
+// desktop addresses, and a fresh placed build of the updated scene.
+static void check_placed_update(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    const std::vector<Vertex> initial{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances{instance(7,1), instance(11,2,4)};
+    const SceneUpdate update{{{-1,-1,3}, {1,-1,3}, {0,1,3}}, {instance(7,1,2), instance(11,4,-3)}};
+    std::vector<Ray> rays;
+    for (const auto& probe : {std::pair{0.f, 1u}, {4.f, 2u}, {2.f, 1u}, {-3.f, 4u}})
+        rays.push_back({probe.first,0,0,0.01f,0,0,1,8,probe.second});
+    const auto run = [&](const SceneUpdate* change, bool placed, const std::vector<Vertex>& vertices,
+                         const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& desc) {
+        PlacedBuildScene scene;
+        return trace_scene(device, vertices, desc, rays, Backend::pipeline, change, nullptr, nullptr,
+                           placed ? &scene : nullptr);
+    };
+    const auto updated = run(&update, true, initial, instances);
+    const auto direct = run(&update, false, initial, instances);
+    const auto fresh = run(nullptr, true, update.vertices, update.instances);
+    const auto before = run(nullptr, true, initial, instances);
+    if (updated != direct) throw std::runtime_error("Placed PERFORM_UPDATE differs from the direct-address update");
+    if (updated != fresh) throw std::runtime_error("Placed PERFORM_UPDATE differs from a fresh placed build of the updated scene");
+    if (updated == before) throw std::runtime_error("Placed PERFORM_UPDATE left every ray result unchanged");
+    // Hit instance IDs per ray before and after: the moved instances swap which probe rays they catch.
+    constexpr UINT idsBefore[]{7,11,0,0}, idsAfter[]{0,0,7,11};
+    for (std::size_t i = 0; i < rays.size(); ++i)
+        if (before[4 * i + 1] != idsBefore[i] || updated[4 * i + 1] != idsAfter[i])
+            throw std::runtime_error("Placed PERFORM_UPDATE ray " + std::to_string(i) + " has the wrong instance ID");
+    std::puts("Slot 133 placed PERFORM_UPDATE (ALLOW_UPDATE build, in-place BLAS and TLAS update): ray results changed "
+              "and equal the direct-address update and a fresh placed build");
+}
+
 bool check_dxr_placed_build(ID3D12Device* device) {
     using namespace dxr_fixture;
     if (!supported(device, Backend::pipeline)) return false;
@@ -540,6 +578,7 @@ bool check_dxr_placed_build(ID3D12Device* device) {
         throw std::runtime_error("Routing the instance to the decoy BLAS still matched the direct reference");
     std::printf("Slot 133 placed BLAS/TLAS: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
                 "direct-address reference, decoy routing differs\n", output[3]);
+    check_placed_update(device);
     return true;
 }
 

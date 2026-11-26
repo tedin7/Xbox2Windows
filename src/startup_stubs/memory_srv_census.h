@@ -33,6 +33,8 @@ constexpr const char* memory_srv_reasons[] = {
     // the acceleration-structure holds of publish_as_srv (memory_srv_as.h, as_srv_refusal_name)
     "as_unaligned", "as_not_placed", "as_wrong_state",
     "buffer_unavailable", "texture_unavailable",
+    // the three causes texture_unavailable used to lump together (d3d12_memory_srv.inl, texture_unavailable_reason)
+    "texture_no_resource", "texture_unreadable", "texture_over_64mib",
     // the partial-tile holds of device_memory_srv (upstream #2105)
     "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
     // the console-layout holds of device_memory_srv (#2015)
@@ -74,7 +76,7 @@ public:
     // One reason cannot use the whole table: a reason with many shapes (buffer sizes) used to fill it and hide the
     // shapes of every reason that first appeared later. Past its share a reason's new shapes are counted as "more".
     static constexpr unsigned max_shapes_per_reason = 16;
-    static constexpr unsigned max_shapes = 12 * max_shapes_per_reason;  // later distinct shapes are counted as "more"
+    static constexpr unsigned max_shapes = (memory_srv_reason_count + 1) * max_shapes_per_reason;  // later distinct shapes are counted as "more"
     static constexpr unsigned detail_shapes = 8;
 
     // Counts one refusal. True when the call is the first of one of the first detail_shapes distinct
