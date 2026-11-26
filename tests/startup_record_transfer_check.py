@@ -50,6 +50,21 @@ def main():
         R.upload(str(staging), str(drive), lines.append)
         assert sum("copied" in l for l in lines) == 1, lines
 
+        # no synced folder: the browser fallback lists every chunk with its size, in order, the manifest and the .done marker last
+        plan = R.browser_plan(str(staging))
+        text = "\n".join(plan)
+        numbered = [l for l in plan if l.startswith("  ") and "record_T1" in l]
+        assert len(numbered) == len(manifest["chunks"]) + 2 and "record_T1.done" in numbered[-1] and "LAST" in numbered[-1], numbered
+        assert "record_T1.json" in numbered[-2] and all(c["name"] in text for c in manifest["chunks"]), text
+        assert "drive.google.com" in text and "Carica questi file" in text and "files for this recording" in text
+        assert (staging / "UPLOAD_THESE_FILES.txt").read_text() .startswith("Recording T1:") and (staging / "record_T1.done").is_file()
+        import subprocess
+        no_drive = subprocess.run([sys.executable, "-B", str(Path(R.__file__)), "upload", str(staging)], capture_output=True, text=True,
+                                  env=dict(os.environ, USERPROFILE=str(tmp / "nohome"), HOME=str(tmp / "nohome")))
+        assert no_drive.returncode in (0, 3), no_drive.stderr   # 3 = fallback printed (no synced folder here); 0 only on a PC that has one
+        if no_drive.returncode == 3:
+            assert "Upload by hand in the browser" in no_drive.stdout and "record_T1.done" in no_drive.stdout
+
         # fetch: byte for byte
         got = R.fetch(str(drive), str(out))
         assert got["id"] == "T1"

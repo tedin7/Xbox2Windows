@@ -5,6 +5,7 @@ and this script only copies files into that synced folder.
 
   record_transfer.py pack   <record dir> <staging dir> [--id ID] [--chunk-mb 100]   tar+gzip stream cut into chunks + a manifest
   record_transfer.py upload <staging dir> <drive folder>                            resumable copy, chunk by chunk, DONE marker last
+  record_transfer.py browser <staging dir>                                          no synced folder: the files to upload by hand in the browser
   record_transfer.py find-drive                                                     print the synced x2w-registrazioni folder, if any
   record_transfer.py fetch  <drive folder or local copy> <out dir> [--id ID]       (our side) verify every chunk, then unpack
 
@@ -129,6 +130,37 @@ def upload(staging_dir, drive_dir, log=print):
     return ids
 
 
+def browser_plan(staging_dir, folder=FOLDER_NAME):
+    """The fallback when this PC has no synced Drive folder: the files to upload by hand in the browser (drive.google.com, the shared
+    folder `folder`), in the order that matters, with sizes. No credentials, no API. Also writes the empty-ish record_<id>.done
+    marker into the staging folder (the last file to upload) and returns the instruction lines (also saved as UPLOAD_THESE_FILES.txt)."""
+    lines = []
+    for name in sorted(os.listdir(staging_dir)):
+        if not (name.startswith("record_") and name.endswith(".json")):
+            continue
+        record_id = name[len("record_"):-len(".json")]
+        with open(os.path.join(staging_dir, name), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        done = os.path.join(staging_dir, "record_%s.done" % record_id)
+        with open(done, "w", encoding="utf-8") as handle:
+            handle.write("complete: %d chunks, %d bytes\n" % (len(manifest["chunks"]), manifest["packed_bytes"]))
+        lines += ["Recording %s: %d files to upload to the shared folder '%s' (open drive.google.com in the browser, open the folder, drag the files in)." % (
+                  record_id, len(manifest["chunks"]) + 2, folder),
+                  "Carica questi file nella cartella condivisa '%s' di Google Drive (dal browser, trascinali nella cartella)." % folder,
+                  "Folder with the files: %s" % os.path.abspath(staging_dir), "Upload in THIS order, the last one only when all others are done:"]
+        for number, chunk in enumerate(manifest["chunks"], 1):
+            lines.append("  %2d. %s  (%.1f MB)" % (number, chunk["name"], chunk["bytes"] / 1048576.0))
+        lines.append("  %2d. record_%s.json" % (len(manifest["chunks"]) + 1, record_id))
+        lines.append("  %2d. record_%s.done   <- LAST: it tells us the recording is complete" % (len(manifest["chunks"]) + 2, record_id))
+        lines.append("Check at the end: the folder shows %d files for this recording." % (len(manifest["chunks"]) + 2))
+        lines.append("")
+    if not lines:
+        raise ValueError("no recording (record_<id>.json) in " + staging_dir)
+    with open(os.path.join(staging_dir, "UPLOAD_THESE_FILES.txt"), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return lines
+
+
 def find_drive(roots=None):
     """The synced x2w-registrazioni folder on this PC: <letter>:\\My Drive\\..., <letter>:\\Il mio Drive\\..., <letter>:\\..., the
     user's 'Google Drive' folder. Returns the first that exists, else None."""
@@ -203,7 +235,9 @@ def main(argv):
     p.add_argument("--chunk-mb", type=float, default=CHUNK_BYTES / 1048576.0)
     u = sub.add_parser("upload")
     u.add_argument("staging_dir")
-    u.add_argument("drive_dir")
+    u.add_argument("drive_dir", nargs="?", default=None, help="default: the synced folder find-drive finds; none found = print the browser upload list (exit 3)")
+    b = sub.add_parser("browser")
+    b.add_argument("staging_dir")
     sub.add_parser("find-drive")
     f = sub.add_parser("fetch")
     f.add_argument("source_dir")
@@ -215,8 +249,15 @@ def main(argv):
         print("record %s: %d files, %.1f MB -> %d chunks, %.1f MB packed" % (manifest["id"], len(manifest["files"]),
               manifest["source_bytes"] / 1048576.0, len(manifest["chunks"]), manifest["packed_bytes"] / 1048576.0))
     elif args.cmd == "upload":
-        for record_id in upload(args.staging_dir, args.drive_dir):
+        target = args.drive_dir or find_drive()
+        if not target:
+            print("No synced Google Drive folder '%s' on this PC. Upload by hand in the browser:" % FOLDER_NAME)
+            print("\n".join(browser_plan(args.staging_dir)))
+            return 3
+        for record_id in upload(args.staging_dir, target):
             print("record %s uploaded: complete (.done written)" % record_id)
+    elif args.cmd == "browser":
+        print("\n".join(browser_plan(args.staging_dir)))
     elif args.cmd == "find-drive":
         found = find_drive()
         print(found or "")
