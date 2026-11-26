@@ -16,6 +16,9 @@ import sys
 
 def main(argv):
     cmake, build, run_ps1, dlls = argv[1], argv[2], argv[3], argv[4:]
+    for dll in dlls:  # a full build leaves them on disk: delete first, so the target itself has to build each one
+        if os.path.isfile(dll):
+            os.remove(dll)
     built = subprocess.run([cmake, "--build", build, "--target", "startup_runtime"], capture_output=True, text=True)
     assert built.returncode == 0, built.stdout[-2000:] + built.stderr[-2000:]
     for dll in dlls:
