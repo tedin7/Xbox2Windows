@@ -68,14 +68,14 @@ def change_last(source, target, mode):
         hit = 0
         for tag, header, _hb, payload, size in chunks(data):
             if tag == b"PAGE" and bytes(data[payload:payload + 16]) == last:
-                data[payload] ^= 0xFF
+                data[payload + 3] ^= 0x40
                 hit += 1
         if hit:
             print("replay root cbv control: damaged %d PAGE chunk(s)" % hit)
         else:
             at = blobs[argm[(seq, 1)]]
             assert bytes(data[at:at + 16]) == last, "the call's argument memory is not the last frame's constant buffer"
-            data[at] ^= 0xFF
+            data[at + 3] ^= 0x40                                # the red float 0.875 becomes huge (the low byte would not show in 8 bits)
             print("replay root cbv control: no PAGE holds the buffer (plain VirtualAlloc memory); damaged the call's argument memory")
     target.write_bytes(bytes(data))
 
