@@ -231,10 +231,60 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// Upload two distinct mips, with independent values along every axis and in every array slice.
+static bool bind_dispatch_input_shape(void* device, void* list, StreamWord cpu, const std::string& mode)
+{
+    const bool line = mode == "dispatch-shape-1d";
+    const bool volume = mode == "dispatch-shape-3d";
+    constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, subresource_bytes = 16 * pitch;
+    const UINT slices = line || volume ? 1 : 3;
+    const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+        volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const D3D12_RESOURCE_DESC texture_desc{dimension, 0, 4, line ? 1u : 4u,
+        static_cast<UINT16>(volume ? 4 : slices), 2, DXGI_FORMAT_R32_FLOAT, {1, 0}};
+    const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slices * 2 * subresource_bytes,
+        1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
+    void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    void* mapped = nullptr;
+    if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&mapped)))) || !mapped)
+        return false;
+    for (UINT slice = 0; slice < slices; ++slice) {
+        for (UINT mip = 0; mip < 2; ++mip) {
+            const UINT subresource = 2 * slice + mip, extent = 4 >> mip;
+            const UINT height = line ? 1 : extent, depth = volume ? extent : 1;
+            const UINT64 offset = subresource * subresource_bytes;
+            auto* const data = static_cast<char*>(mapped) + offset;
+            for (UINT z = 0; z < depth; ++z)
+                for (UINT y = 0; y < height; ++y) {
+                    auto* const row = reinterpret_cast<float*>(data + (z * height + y) * pitch);
+                    for (UINT x = 0; x < extent; ++x)
+                        row[x] = static_cast<float>(1000 * mip + 100 * slice + 16 * z + 4 * y + x);
+                }
+            D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            image.SubresourceIndex = subresource;
+            D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            source.PlacedFootprint = {offset, {DXGI_FORMAT_R32_FLOAT, extent, height, depth, pitch}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
+    }
+    invoke(upload, 9, 0, 0);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_FLOAT,
+        line ? D3D12_SRV_DIMENSION_TEXTURE1D : volume ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    if (line) view.Texture1D = {1, 1, 0.0f};
+    else if (volume) view.Texture3D = {1, UINT(-1), 0.0f};
+    else view.Texture2DArray = {1, 1, mode == "dispatch-shape-2da-slice0" ? 0u : 1u, 2, 0, 0.0f};
+    invoke(device, 18, word(texture), word(&view), cpu + 64);
+    return true;
+}
+
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool input_shape = mode.rfind("dispatch-shape-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
@@ -327,6 +377,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     Slot67Indirect record;
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
+    if (input_shape && !bind_dispatch_input_shape(device, list, cpu, mode)) return 80;
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
@@ -507,7 +558,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(lists[t], 9);
             invoke(queue, 10, 1, word(&lists[t]));
         }
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (input_shape) invoke(list, 14, 1, 1, 1);
+    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));

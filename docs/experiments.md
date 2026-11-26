@@ -308,6 +308,27 @@ run publishes both bytecode files and clears the failure report. The next run
 skips the completed request. Restart the runtime if it already read the manifest
 before the bytecode was available.
 
+## Texture input shapes in translated compute dispatches
+
+Set `X2W_COMPUTE_INPUT_SHAPES=1` to bind 1D, 2D-array and 3D shader
+resource views (SRVs) from translated compute manifests. The switch defaults
+to off. The runtime validates the view and resource dimensions and the mip
+and array ranges. It passes the recorded view to Direct3D 12, preserving
+its mip and slice origins.
+[2D-array SRV fields](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_tex2d_array_srv)
+
+Run the synthetic readback and controls on Windows with WARP.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_dispatch_texture_warp$' -V
+```
+
+The fixture reads mip 1 for each shape and starts the array view at slice 1.
+It checks the full output buffer against a CPU reference after fencing the
+dispatch. The disabled switch must leave the output untouched and report
+the original refusal. A slice-0 array view and a volume shader that swaps
+its y and z read coordinates must each fail the original comparison.
+
 ## One-dimensional texture sampling in startup draws
 
 The startup translator accepts ordinary 1D image sampling with a single coordinate and a

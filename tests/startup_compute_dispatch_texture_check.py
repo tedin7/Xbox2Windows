@@ -1,4 +1,4 @@
-"""Translated compute programs with 2D texture views, dispatched through the stand-in's command list (slot 14).
+"""Translated compute programs with texture views, dispatched through the stand-in's command list (slot 14).
 
 usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware>
 
@@ -23,6 +23,10 @@ every word keeps the sentinel.
 Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
 and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
 changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
+Input shapes: translated 1D, 2D-array and 3D reads into a raw output buffer from mip 1. The array's view starts
+at slice 1. With the switch absent each manifest is refused. The same CPU check must detect a slice-0 view and
+a volume program with exchanged y/z read coordinates.
+Use `binary <llvm-mc>` to reassemble and translate the input-shape fixtures without Windows.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -263,6 +267,142 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+
+# Original gfx1013 programs assembled from input_shape_source. The Windows test uses the pinned words.
+SHAPE_PREFIX = '80038dbe 06038cbe 060708f4100000fa 06080cf4400000fa'
+SHAPE_GRID = '080043d502090104 080043d501052104 82101034 7fc08cbf'
+SHAPE_TAIL = '703f8cbf 001070e0080b0780 000081bf'
+INPUT_SHAPES = {
+    'tex1d': ('1D', 'v0', (2, 1, 1),
+              '0003107e 82101034 7fc08cbf 8004a8be 8004aabe 000d127e f0121210 ff1212060000803e 00019cf0090b4801'),
+    'tex2da': ('2D_ARRAY', 'v[0:2]', (2, 2, 2), SHAPE_GRID + ' 280100f0000b0800'),
+    'tex3d': ('3D', 'v[0:2]', (2, 2, 2), SHAPE_GRID + ' 100100f0000b0800'),
+    'tex3d-yz': ('3D', '[v0, v2, v1]', (2, 2, 2), SHAPE_GRID + ' 120100f0000b080002010000'),
+}
+SHAPE_MODES = {'tex1d': 'dispatch-shape-1d', 'tex2da': 'dispatch-shape-2da', 'tex3d': 'dispatch-shape-3d'}
+SHAPE_SWITCH = 'X2W_COMPUTE_INPUT_SHAPES'
+
+
+def input_shape_source(dimension, coords, group):
+    index = ('v_mov_b32 v8, v0' if group[1] == 1 else
+             'v_mad_u32_u24 v8, v2, 4, v0\nv_mad_u32_u24 v8, v1, 2, v8')
+    image = f'image_load v11, {coords}, s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_{dimension}'
+    if dimension == '1D':
+        image = """s_mov_b64 s[40:41], 0
+s_mov_b64 s[42:43], 0
+v_cvt_f32_u32 v9, v0
+v_mul_f32 v9, 0.5, v9
+v_add_f32 v9, 0.25, v9
+image_sample_lz v11, v9, s[32:39], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_1D"""
+    return f"""\
+s_mov_b32 s13, 0
+s_mov_b32 s12, s6
+s_load_dwordx4 s[28:31], s[12:13], 0x10
+s_load_dwordx8 s[32:39], s[12:13], 0x40
+{index}
+v_lshlrev_b32 v8, 2, v8
+s_waitcnt lgkmcnt(0)
+{image}
+s_waitcnt vmcnt(0)
+buffer_store_dword v11, v8, s[28:31], 0 offen
+s_endpgm
+"""
+
+
+def input_shape_program(kind):
+    _, _, group, body = INPUT_SHAPES[kind]
+    code = bytes.fromhex(f'{SHAPE_PREFIX} {body} {SHAPE_TAIL}')
+    return code, C.USER7 | C.tidig(1 if group[1] == 1 else 3), group
+
+
+def check_shape_binary(llvm_mc):
+    for kind, (dimension, coords, _, _) in INPUT_SHAPES.items():
+        code, rsrc2, group = input_shape_program(kind)
+        assert C.assemble(llvm_mc, input_shape_source(dimension, coords, group)) == code, kind
+        pipeline = G.ComputePipeline(code, C.root_blob(table_range=True), rsrc2, group)
+        assert pipeline.hlsl_cs()
+        assert f'srv 0 {kind.split("-")[0]} table 1 64' in pipeline.manifest().splitlines(), kind
+        assert 'uav 0 table 1 16' in pipeline.manifest().splitlines(), kind
+    print('input shapes: four source-built programs assemble and translate')
+
+
+def shape_reference(kind, *, slice0=False, swap_yz=False):
+    _, _, (width, height, depth), _ = INPUT_SHAPES[kind]
+    expected = []
+    for z in range(depth):
+        for y in range(height):
+            for x in range(width):
+                row, plane = (z, y) if swap_yz else (y, z)
+                slice_index = z + int(not slice0) if kind == 'tex2da' else 0
+                value = 1000 + 100 * slice_index + (16 * plane if kind == 'tex3d' else 0) + 4 * row + x
+                expected.append(struct.unpack('<I', struct.pack('<f', value))[0])
+    return expected + [C.SENTINEL] * (C.WORDS - len(expected))
+
+
+def shaped_input(directory, consumer, dxc, env, kind):
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    env.pop(SHAPE_SWITCH, None)
+    enabled = dict(env, **{SHAPE_SWITCH: '1'})
+    root = directory / 'compute_root'
+    root.write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = enabled['X2W_TEST_COMPUTE_ROOT'] = str(root)
+    (directory / 'data').write_bytes(DATA)
+    layout = '<%dI' % C.WORDS
+    untouched = [C.SENTINEL] * C.WORDS
+    mode = SHAPE_MODES[kind]
+
+    def publish(program):
+        code, rsrc2, group = input_shape_program(program)
+        (directory / 'program').write_bytes(code)
+        (directory / 'state').write_bytes(state_a(group, rsrc2))
+        got, result = run(directory, consumer, enabled, mode, layout)
+        requests = lines(result, 'x2w-draw compute request')
+        assert got == untouched and len(requests) == 1 and ' published ' in requests[0], result.stderr[-3000:]
+        key = int(requests[0].split()[3], 16)
+        translate(cache, dxc, key)
+        manifest = (cache / f'{key:016x}.txt').read_text()
+        assert f'srv 0 {kind} table 1 64' in manifest.splitlines(), manifest
+
+    def read(mode):
+        got, result = run(directory, consumer, enabled, mode, layout)
+        assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
+        return got, clean(result)
+
+    publish(kind)
+    got, result = run(directory, consumer, env, mode, layout)
+    reason = 'a resource that is not a raw table buffer, a 2D texture or a cube map'
+    rejected = lines(result, ' manifest line ')
+    assert got == untouched and any(f'rejected ({reason};' in line for line in rejected), result.stderr[-3000:]
+
+    def check(got, expected):
+        mismatch = next((i for i, (actual, want) in enumerate(zip(got, expected)) if actual != want), None)
+        assert mismatch is None, f'{kind}: word={mismatch}, got {got[mismatch]:#010x}, expected {expected[mismatch]:#010x}'
+
+    reference = shape_reference(kind)
+    got, layer = read(mode)
+    check(got, reference)
+    print(f'{kind}: all {C.WORDS} words match, unset switch refuses the manifest; debug layer: {layer}')
+
+    if kind == 'tex2da':
+        mutant, _ = read('dispatch-shape-2da-slice0')
+        mutant_reference = shape_reference(kind, slice0=True)
+    elif kind == 'tex3d':
+        publish('tex3d-yz')
+        mutant, _ = read(mode)
+        mutant_reference = shape_reference(kind, swap_yz=True)
+    else:
+        return
+    check(mutant, mutant_reference)
+    try:
+        check(mutant, reference)
+    except AssertionError as error:
+        print(f'control rejected: {error}')
+    else:
+        raise AssertionError(f'{kind}: mutated dispatch passed the CPU reference')
+
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
@@ -271,10 +411,15 @@ def main(consumer, dxc, adapter):
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        for kind in SHAPE_MODES:
+            shaped_input(Path(temporary) / kind, consumer, dxc, env, kind)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == 'binary':
+        check_shape_binary(sys.argv[2])
+        sys.exit()
     if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
         sys.exit(__doc__)
     main(*sys.argv[1:])

@@ -1,8 +1,8 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
-// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
+// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and textures
+// (`srv <i> <shape> table <param> <byte>` inputs, `uav <i> <shape> float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -24,9 +24,10 @@ struct ComputeTranslation {
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
         bool array = false;
-        // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
+        // Texture dimensionality (0 for legacy 2D outputs and cube inputs).
         int dimension = 0;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
+        bool extended_input_shape() const { return array || dimension == 1 || dimension == 3; }
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -124,6 +125,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         return nullptr;
     }
     tr.retry_manifest_at = 0;
+    static const bool input_shapes = x2w_local::env_on("X2W_COMPUTE_INPUT_SHAPES");
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
         std::size_t end = manifest.find('\n', at);
@@ -188,11 +190,21 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().dimension = 3;
         }
-        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
             tr.srvs.push_back({a, b, true});
+            tr.srvs.back().dimension = 2;
+        }
         else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
             tr.srvs.push_back({a, b, true});
             tr.srvs.back().cube = true;
+        }
+        else if (input_shapes && std::sscanf(line.c_str(), "srv %u %15s table %d %d%n", &i, name, &a, &b, &used) == 4 &&
+                 whole() && i == tr.srvs.size() &&
+                 (!std::strcmp(name, "tex1d") || !std::strcmp(name, "tex2da") || !std::strcmp(name, "tex3d"))) {
+            tr.srvs.push_back({a, b, true});
+            auto& slot = tr.srvs.back();
+            slot.array = !std::strcmp(name, "tex2da");
+            slot.dimension = slot.array ? 2 : !std::strcmp(name, "tex1d") ? 1 : 3;
         }
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
         // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
@@ -204,7 +216,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.samplers.read_manifest_line(line.c_str());
         else {
             // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
-            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
+            const char* const why = line.rfind("srv", 0) == 0 ?
+                  (input_shapes ? "a resource that is not a raw table buffer, a 1D, 2D, 2D-array or 3D texture, or a cube map"
+                                : "a resource that is not a raw table buffer, a 2D texture or a cube map")
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
@@ -390,11 +404,40 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "an input texture view is not a cube map";
                 else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
                     reason = "a cube map view's texture is not six 2D faces";
-                else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-                                                  : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
+                else if (!slot.cube && !slot.extended_input_shape() &&
+                         (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                                    : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
                     reason = "an input texture view is not 2D";
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                if (!reason && slot.extended_input_shape()) {
+                    const auto valid_mips = [&](UINT first, UINT levels) {
+                        return first < resource.MipLevels && levels &&
+                               (levels == UINT(-1) || levels <= resource.MipLevels - first);
+                    };
+                    if (slot.dimension == 1) {
+                        if (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE1D)
+                            reason = "an input texture view is not 1D";
+                        else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || resource.DepthOrArraySize != 1 ||
+                                 !valid_mips(desc.Texture1D.MostDetailedMip, desc.Texture1D.MipLevels))
+                            reason = "a 1D input view is outside its texture";
+                    } else if (slot.array) {
+                        const auto& v = desc.Texture2DArray;
+                        if (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+                            reason = "an input texture view is not a 2D array";
+                        else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
+                                 !valid_mips(v.MostDetailedMip, v.MipLevels) || !v.ArraySize ||
+                                 v.FirstArraySlice >= resource.DepthOrArraySize ||
+                                 v.ArraySize > resource.DepthOrArraySize - v.FirstArraySlice)
+                            reason = "a 2D array input view is outside its texture";
+                    } else {
+                        if (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE3D)
+                            reason = "an input texture view is not 3D";
+                        else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+                                 !valid_mips(desc.Texture3D.MostDetailedMip, desc.Texture3D.MipLevels))
+                            reason = "a 3D input view is outside its texture";
+                    }
+                }
                 views[i] = {texture, 0, 0, true, true, described};
                 std::memcpy(views[i].desc, &desc, sizeof(desc));
                 views[i].wrapper = wrapper;
@@ -564,8 +607,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
-            require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            if (!tr->srvs[i].extended_input_shape() && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+                state |= sampled_state(self, view.resource);
+            require_state(self, view.resource, state);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
