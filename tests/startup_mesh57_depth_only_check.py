@@ -107,16 +107,20 @@ def mrtz_kill_exit():
     refused = 'unsupported: MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC'
     branch, export = words.index('bf880004'), words.index('f8001881')
     exit_at = words.index('f8001890')
-    for label, mutant in (
+    for label, mutant, cause in (
             # The kill exit is only an s_endpgm: a lane that left EXEC takes the branch, runs no export and is not discarded.
-            ('an early exit that discards nothing', words[:exit_at] + ['bf810000'] + words[exit_at + 3:]),
+            ('an early exit that discards nothing', words[:exit_at] + ['bf810000'] + words[exit_at + 3:],
+             'a path reaches s_endpgm without the depth export or a discarding exit (exp null vm)'),
             # The depth export without vm: a lane that left EXEC would still write depth.
-            ('a depth export without vm', words[:export] + ['f8000881'] + words[export + 1:]),
+            ('a depth export without vm', words[:export] + ['f8000881'] + words[export + 1:],
+             'the depth export has no vm flag'),
             # The depth export in a loop: a branch back over it (s_cbranch_vccnz to the s_mov) after the export.
             ('a depth export inside a loop',
              words[:branch] + [S.branch(0xbf88, branch, exit_at + 1)] + words[branch + 1:export + 2]
-             + [S.branch(0xbf87, export + 2, branch + 1)] + words[export + 2:])):
-        S.expect(label + ' is refused', translate(mutant)[0], refused)
+             + [S.branch(0xbf87, export + 2, branch + 1)] + words[export + 2:],
+             'the depth export is inside a loop')):
+        # The refusal names which condition failed, so a run's triage says what to lift (the log line that was missing).
+        S.expect(label + ' is refused with its cause', translate(mutant)[0], refused + ': ' + cause)
 
 
 def main():

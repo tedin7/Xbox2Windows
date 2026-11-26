@@ -2274,8 +2274,8 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
-def mrtz_covers_every_path(ins, at):
-    """True when every path from the first instruction to an s_endpgm either runs the depth export at offset `at` or ends in a
+def mrtz_path_fault(ins, at):
+    """None when every path from the first instruction to an s_endpgm either runs the depth export at offset `at` or ends in a
     `exp null ... vm` export (the early exit of a kill: it discards a lane that left EXEC), and the export cannot run twice.
 
     Instruction-level control flow of a decoded pixel program (RDNA 2 ISA, SOPP branches). A taken s_cbranch_execz is the
@@ -2289,16 +2289,16 @@ def mrtz_covers_every_path(ins, at):
         if name == 's_endpgm':
             successors.append([])
         elif name in ('s_setpc_b64', 's_swappc_b64', 's_trap'):
-            return False
+            return 'an indirect jump or trap'
         elif name == 's_branch' or name.startswith('s_cbranch'):
             target = index.get(int(parse(asm)[1][0].split('_')[1], 16))
             if target is None:
-                return False
+                return 'a branch leaves the program'
             successors.append([target] if name == 's_branch' else [i + 1, target])
         else:
             successors.append([i + 1] if i + 1 < len(ins) else [])
     if at not in index:
-        return False
+        return 'the export is not in the program'
     stack, seen = [0], set()
     while stack:
         i = stack.pop()
@@ -2308,19 +2308,24 @@ def mrtz_covers_every_path(ins, at):
         if ins[i][0] in absorbing:
             continue
         if ins[i][2] == 's_endpgm':
-            return False  # a path ends without the depth export and without the discarding exit
+            return 'a path reaches s_endpgm without the depth export or a discarding exit (exp null vm)'
         stack += successors[i]
     # The export must not be inside a loop: it would run once per pass.
     stack, seen = list(successors[index[at]]), set()
     while stack:
         i = stack.pop()
         if i == index[at]:
-            return False
+            return 'the depth export is inside a loop'
         if i not in seen:
             seen.add(i)
             stack += successors[i]
-    return True
+    return None
 
+
+
+def mrtz_covers_every_path(ins, at):
+    """True when mrtz_path_fault finds nothing: every path runs the depth export once or exits through a discard."""
+    return mrtz_path_fault(ins, at) is None
 
 
 class Stage:
@@ -9833,8 +9838,13 @@ class Stage:
             straight = not (self.has_branches or self.blocks) and self.exec_known
             # Not straight-line: the export is still one assignment of o.depth when every lane that is not discarded runs
             # it exactly once (mrtz_covers_every_path) and a lane that left EXEC is discarded by the export's own vm flag.
-            if not plain or not (straight or ('vm' in flags and mrtz_covers_every_path(self.ins, self.pc))):
-                raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
+            cause = None
+            if not plain:
+                cause = 'not one plain depth export (compressed, repeated, or other channels on)'
+            elif not straight:
+                cause = ('the depth export has no vm flag' if 'vm' not in flags else mrtz_path_fault(self.ins, self.pc))
+            if cause:
+                raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC: %s' % cause)
             self.exports['depth'] = True
             self.emit('o.depth = %s;' % self.f(vals[0]))
             return None
