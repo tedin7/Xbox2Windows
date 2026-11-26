@@ -102,6 +102,11 @@ def main(scene, backend):
         assert "replay quad: recorder access exceptions 0" in text, text[-3000:]
         end_totals(memory)
         check_argument_memory(memory)
+        # Recordings are mailed: no folder of this machine in the file (the shader cache and the run's temp folder are).
+        settings = [payload for tag, _, payload in chunks(memory.read_bytes()) if tag == "XENV"]
+        assert settings and b"X2W_D3D12_RENDER=1" in settings[0], settings
+        assert b":\\" not in settings[0] and b"X2W_SHADER_CACHE" not in settings[0], settings[0]
+        assert str(directory).encode() not in memory.read_bytes(), "the recording holds the run's folder"
 
         capped = directory / "capped.x2wr"
         code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="f100000,1", X2W_REPLAY_RECORD_FILE=str(capped),

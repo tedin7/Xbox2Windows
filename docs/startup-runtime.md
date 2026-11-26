@@ -1901,7 +1901,8 @@ capture for both the window and the prefix and finishes the file, whether the tr
 File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
 `CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
 `OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
-`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` and settings whose value is a drive or share path left out: recordings travel, and such paths
+carry the user's name).
 Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
 and anything past 512 MiB in total are left out and counted in the log).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its

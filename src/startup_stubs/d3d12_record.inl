@@ -611,6 +611,16 @@ void present()
     ReleaseSRWLockExclusive(&b.lock);
 }
 
+// A setting whose value names a file or folder on this machine (a drive path or a share) stays out of XENV: recordings
+// are mailed, and such paths carry the user's name. The player sets its own paths (and skips path settings anyway).
+bool local_path_setting(const wchar_t* entry)
+{
+    const wchar_t* value = std::wcschr(entry, L'=');
+    if (!value) return false;
+    ++value;
+    return std::wcsstr(value, L":\\") || std::wcsstr(value, L":/") || std::wcsncmp(value, L"\\\\", 2) == 0;
+}
+
 // X2W_REPLAY_RECORD: all | <start s>,<seconds> | f<first present>,<presents> | slow[,<after s>,<gap ms>,<seconds>,
 // <fallback s>] (default slow,120,500,10,180). Reads it, opens the file and wraps the slots; build_tables calls it
 // last. Unset: nothing changes.
@@ -685,7 +695,9 @@ void install()
     if (wchar_t* block = GetEnvironmentStringsW()) {
         std::string settings;
         for (const wchar_t* entry = block; *entry; entry += std::wcslen(entry) + 1) {
-            if (std::wcsncmp(entry, L"X2W_", 4) != 0 || std::wcsncmp(entry, L"X2W_REPLAY_RECORD", 17) == 0) continue;
+            if (std::wcsncmp(entry, L"X2W_", 4) != 0 || std::wcsncmp(entry, L"X2W_REPLAY_RECORD", 17) == 0 ||
+                local_path_setting(entry))
+                continue;
             char narrow[2048];
             const int n = WideCharToMultiByte(CP_UTF8, 0, entry, -1, narrow, sizeof(narrow), nullptr, nullptr);
             if (n > 0) settings.append(narrow, static_cast<std::size_t>(n));  // n counts the NUL
