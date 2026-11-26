@@ -1982,14 +1982,15 @@ def check_controls():
     # vcc branch after an absorbed read, and an absorbed read at the join that a loop re-enters after the restore
     # (exec is no longer the join's there). The reason names the first read that is not proven.
     live = 'v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc, live where the block joins'
-    for before, after, name in (([], ['s_and_b32 s23, vcc_lo, exec_lo'], 's_and_b32'),
-                                (['s_mov_b32 s23, vcc_lo'], [], 's_mov_b32'),
-                                (['s_orn2_b32 s23, exec_lo, vcc_lo'], [], 's_orn2_b32'),
-                                (['s_and_b32 s23, vcc_lo, exec_hi'], [], 's_and_b32'),
-                                (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'],
-                                 's_cbranch_vccz'),
-                                (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32')):
-        refused('%s: read by %s after the join' % (live, name), lambda before=before, after=after: translate(
+    for before, after, name, cause in (
+            ([], ['s_and_b32 s23, vcc_lo, exec_lo'], 's_and_b32', 'exec is written between the join and the read'),
+            (['s_mov_b32 s23, vcc_lo'], [], 's_mov_b32', 'lane-mask operation mov'),
+            (['s_orn2_b32 s23, exec_lo, vcc_lo'], [], 's_orn2_b32', 'the word is not paired with the exec word'),
+            (['s_and_b32 s23, vcc_lo, exec_hi'], [], 's_and_b32', 'the word is not paired with the exec word'),
+            (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'], 's_cbranch_vccz',
+             'a data read or a copy'),
+            (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32', 'another path enters the join')):
+        refused('%s: read by %s after the join (cause: %s' % (live, name, cause), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
     # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
     # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
