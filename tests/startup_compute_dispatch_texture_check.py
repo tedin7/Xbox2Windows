@@ -20,6 +20,10 @@ is 1.0 and a shader resource view of it (device slot 18). After translation all 
 expectation XOR the bits of 1.0f; dispatch-sampled-unbound (no view created) is refused with one logged reason and
 every word keeps the sentinel.
 
+Opt-in input views: the same dispatch binds a placed buffer SRV and a texture SRV, with separate cases
+for a buffer backed by an upload shadow and a texture whose descriptor is known through the heap shadow.
+The controls verify switch-off refusals, rejection of a sub-slot lookup and a changed texture readback.
+
 Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
 and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
 changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
@@ -61,6 +65,10 @@ def translate(cache, dxc, key):
 
 def clean(result):
     assert not lines(result, 'refused'), result.stderr[-3000:]
+    return debug_layer(result)
+
+
+def debug_layer(result):
     errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
     assert not errors, errors[0]
     layer = lines(result, 'x2w-d3d12 debug layer: ')
@@ -199,8 +207,58 @@ def sample(directory, consumer, dxc, env):
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an input texture entry is not the token of a shader resource view' in refused[0], \
         result.stderr[-3000:]
+    input_view_tokens(directory, consumer, env, cache, key, layout, untouched, plain, expected, written)
     print(f'texture input: all {C.WORDS} words match after translation; untouched before translation and without a '
           f'view; debug layer: {layer}')
+
+
+def input_view_tokens(directory, consumer, env, cache, key, layout, untouched, plain, expected, written):
+    off = dict(env, X2W_INPUT_VIEW_TOKENS='0', X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='0')
+    on = dict(off, X2W_INPUT_VIEW_TOKENS='1')
+    placed = 'dispatch-sampled-token-placed'
+    buffer_shadow = 'dispatch-sampled-token-buffer-shadow'
+    buffer_copied = 'dispatch-sampled-token-buffer-copied'
+    texture_shadow = 'dispatch-sampled-token-texture-shadow'
+    buffer_reason = "an input buffer view token's resource does not hold its range"
+    texture_reason = 'an input texture entry is not the token of a shader resource view'
+
+    def translated(got, result, reference):
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+        clean(result)
+        wrong = [i for i, (actual, wanted) in enumerate(zip(got, reference)) if actual != wanted]
+        assert not wrong, f'word {wrong[0]}: got {got[wrong[0]]:08x}, expected {reference[wrong[0]]:08x}'
+
+    def refused(mode, switches, reason):
+        got, result = run(directory, consumer, switches, mode, layout)
+        diagnostics = lines(result, 'refused: ')
+        assert got == untouched and len(diagnostics) == 1 and diagnostics[0].endswith('refused: ' + reason), result.stderr[-3000:]
+        debug_layer(result)
+
+    for mode in (placed, buffer_copied, buffer_shadow, texture_shadow):
+        translated(*run(directory, consumer, on, mode, layout), expected)
+    refused(buffer_shadow, off, buffer_reason)
+    refused(buffer_copied, off, 'an input is in a placed buffer that does not alias title memory')
+    refused(texture_shadow, off, texture_reason)
+    refused('dispatch-sampled-unbound', on, texture_reason)
+
+    # Shifting the lookup four bytes into the very same descriptor slot must refuse it.
+    manifest = cache / f'{key:016x}.txt'
+    original = manifest.read_bytes()
+    old = b'srv 1 tex2d table 1 64'
+    assert original.count(old) == 1
+    manifest.write_bytes(original.replace(old, b'srv 1 tex2d table 1 68'))
+    try:
+        refused(texture_shadow, on, texture_reason)
+    finally:
+        manifest.write_bytes(original)
+
+    # Mutate the bound texture's red channel. The dispatch still runs, but every written word must
+    # fail the same CPU reference used by the positive cases, and all other words must match.
+    got, result = run(directory, consumer, on, 'dispatch-sampled-token-mutant', layout)
+    translated(got, result, plain)
+    assert [i for i, (actual, wanted) in enumerate(zip(got, expected)) if actual != wanted] == list(range(written))
+    print(f'input view tokens: {len(expected)} words match for placed and shadow SRVs; '
+          f'off and interior slot refused; mutant differs in {written} words')
 
 
 # The texture input case with a constant sampler instead of the zero one: s21 MAX_LOD 12, s22 linear min, mag and mip
@@ -264,7 +322,7 @@ def filtered(directory, consumer, dxc, env):
 
 
 def main(consumer, dxc, adapter):
-    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
+    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_INPUT_VIEW_TOKENS='0')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:

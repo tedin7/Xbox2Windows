@@ -48,6 +48,7 @@ def main(consumer, dxc, adapter):
         directory = Path(temporary)
         cache, env = prepare(directory)
         env.pop('X2W_NULL_TOKEN_ZERO', None)
+        env['X2W_INPUT_VIEW_TOKENS'] = '0'
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -92,6 +93,11 @@ def main(consumer, dxc, adapter):
             slot_lines = lines(result, 'unfilled heap slot ')
             assert slot_lines == ([f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}']
                                   if mode == 'dispatch-input-empty' else []), (mode, slot_lines)
+
+        # The opt-in only resolves compatible SRVs. A texture token in a raw buffer input still refuses.
+        got, result = dispatch(directory, consumer, dict(env, X2W_INPUT_VIEW_TOKENS='1'), 'dispatch-input-token')
+        refused = lines(result, 'refused: ')
+        assert got == untouched and len(refused) == 1 and refused[0].endswith('refused: ' + CONTROLS[4][1]), result.stderr[-3000:]
 
         null_env = dict(env, X2W_NULL_TOKEN_ZERO='1')
         got, result = dispatch(directory, consumer, null_env, 'dispatch-input-empty')

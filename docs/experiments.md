@@ -16969,6 +16969,28 @@ Measured on two synthetic programs. In a local set of 29 compute programs whose 
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_entry_" -V
 ```
 
+### Compute input view tokens
+
+`X2W_INPUT_VIEW_TOKENS=1` extends the translated compute bind for texture and
+buffer shader resource views. For an empty texture record, it checks the desktop
+heap shadow only at a whole title slot. Explicit descriptor contents take
+precedence. Buffer tokens retain their view offset and length. For upload shadows
+and copied placements that need title data, each recording takes its own
+snapshot. A tracked GPU copy on that list takes precedence for copied placements.
+
+The synthetic fixture in `startup_compute_dispatch_texture_check.py` dispatches
+with a texture SRV and a slot 70 buffer SRV. It compares all 320 words copied to a
+D3D12 readback buffer against a CPU reference. Switch-off controls and a texture
+lookup four bytes into a slot expect a refusal and the original sentinel. A
+changed red channel must differ from the reference in all 288 written words.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_(texture|input)_warp$' -V
+```
+
+The Windows WARP results for these cases are pending. The offline synthetic
+compute translator check passed with `python3 -B tests/startup_gfx2hlsl_compute_check.py`.
+
 ### Static samplers with a LOD clamp
 
 The translator writes a constant sampler of `image_sample`, `_l` or `_lz` whose mip filter is not 0 as an `smpl` line (#2482): a static sampler whose MinLOD and MaxLOD come from the descriptor's word 1. The compute Dispatch now reads `smpl` lines as the draw path does, through the same `TranslatedSamplers::read_manifest_line` and `create_translated_root`; the only difference for compute is that the root signature is set with `SetComputeRootSignature`, and static samplers need nothing else. A comparison sampler (`smpc`) and the run-time sampler heap table (`smpheap`) are still refused, as "a comparison sampler" and "a sampler from the sampler heap". Binding the heap table for compute would need the draw path's sampler snapshot (`snapshot_samplers`, `create_sampler_snapshot_heap`) taken from the compute root's sampler heap pointer, the sampler heap set with `SetDescriptorHeaps` and its table set with `SetComputeRootDescriptorTable`.

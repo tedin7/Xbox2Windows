@@ -251,6 +251,24 @@ void log_dispatch_phases()
     log("%s", line);
 }
 
+// A title table may name a heap slot whose SRV is only present in the desktop shadow.
+// Map whole title slots only: the low bits of a desktop CPU handle can identify its heap.
+u64 compute_input_shadow_handle(u64 entry)
+{
+    u64 handle = 0;
+    AcquireSRWLockShared(&descriptor_lock);
+    for (const auto& range : descriptor_ranges) {
+        if (entry < range.title || entry - range.title >= range.bytes) continue;
+        const u64 offset = entry - range.title;
+        const u64 index = offset / range.title_stride;
+        if (offset % range.title_stride == 0 && index < range.desktop_descriptors)
+            handle = range.desktop + index * range.desktop_stride;
+        break;
+    }
+    ReleaseSRWLockShared(&descriptor_lock);
+    return handle;
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -372,6 +390,20 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     created = view_materialized()[words[1]] != 0;
                 }
                 ReleaseSRWLockShared(&note_lock);
+            } else if (!output && compute_input_view_tokens_enabled()) {
+                // An empty texture record can be backed by an SRV in the heap's shadow. Give explicit
+                // title descriptors precedence over the shadow, which guest memory writes do not update.
+                const bool empty = std::all_of(words, words + entry_bytes / sizeof(words[0]), [](auto word) { return word == 0; });
+                const u64 handle = empty ? compute_input_shadow_handle(entry) : 0;
+                if (handle) {
+                    note_lock_acquire(false);
+                    const std::uint32_t* shadow = shadow_slot(handle);
+                    if (shadow && *shadow && *shadow - 1 < view_records().size()) {
+                        record = view_records()[*shadow - 1];
+                        known = true;
+                    }
+                    ReleaseSRWLockShared(&note_lock);
+                }
             }
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr

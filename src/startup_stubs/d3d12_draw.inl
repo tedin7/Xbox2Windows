@@ -2465,6 +2465,12 @@ bool title_input_snapshot_enabled()
     return enabled;
 }
 
+bool compute_input_view_tokens_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_INPUT_VIEW_TOKENS");
+    return enabled;
+}
+
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
@@ -2480,7 +2486,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     u64 address = 0, offset = 0, bytes = 0;
     UINT stride = 0;
     const Wrapper* owner = nullptr;
-    bool own_memory = false;
+    bool own_memory = false, shadow_upload = false;
     if (why) *why = nullptr;
     if (unfilled_heap_slot(words)) return refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
@@ -2520,9 +2526,21 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 const auto* info = resource_info(owner);
                 D3D12_HEAP_PROPERTIES props{};
                 D3D12_HEAP_FLAGS flags{};
-                own_memory = info && info->placement == Placement::none &&
-                    SUCCEEDED(static_cast<ID3D12Resource*>(owner->own().real)->GetHeapProperties(&props, &flags)) &&
-                    props.Type == D3D12_HEAP_TYPE_CUSTOM;
+                const bool known_heap = info && info->placement == Placement::none &&
+                    SUCCEEDED(static_cast<ID3D12Resource*>(owner->own().real)->GetHeapProperties(&props, &flags));
+                own_memory = known_heap && props.Type == D3D12_HEAP_TYPE_CUSTOM;
+                if (compute_input && compute_input_view_tokens_enabled() && known_heap &&
+                    props.Type == D3D12_HEAP_TYPE_UPLOAD && view.Buffer.NumElements &&
+                    InterlockedCompareExchange(&owner->own().refs, 0, 0) > 0) {
+                    auto* native = static_cast<ID3D12Resource*>(owner->own().real);
+                    const auto desc = native->GetDesc();
+                    x2w_startup::ComPtr<ID3D12Device> native_device;
+                    shadow_upload = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                        !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+                        offset <= desc.Width && bytes <= desc.Width - offset &&
+                        SUCCEEDED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) &&
+                        native_device.Get() == device_of(self->own().list_device);
+                }
                 if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
                 if (!own_memory) address = base + offset;
             }
@@ -2564,7 +2582,17 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         }
         const auto placed = placed_buffer_range(device, address, bytes);
         if (placed.reject) return refuse("an input range crosses the end of a placed buffer");
-        if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
+        if (owner && owner != placed.owner && !(shadow_upload && !placed.owner)) return refuse("an input buffer view token's resource does not hold its range");
+        if (shadow_upload && !placed.owner) {
+            // The slot 70 upload backing is a copy. Snapshot this view for the recording, as draw does.
+            u64 ring_offset = 0;
+            ID3D12Resource* ring = nullptr;
+            if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
+                return refuse("an input range in title memory is not readable");
+            if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
+                return refuse("an input range could not be copied from title memory");
+            return {ring, ring_offset, bytes, stride, true, 2};
+        }
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
             const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
@@ -2577,9 +2605,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
         if (!placed.alias) {
+            const bool resolve_token = compute_input && words[0] == view_token_magic && compute_input_view_tokens_enabled();
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
-            } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+            } else if (compute_input && (title_input_snapshot_enabled() || resolve_token) && bytes <= (u64{16} << 20)) {
                 // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
                 // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
                 // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
