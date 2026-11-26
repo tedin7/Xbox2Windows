@@ -64,6 +64,10 @@ s_endpgm
 HEAD = ARRAY_PROLOGUE[:24]  # s_mov s12, s7; s_mov s13, 0; s_load_dwordx8 s[24:31]; v_lshl_add_u32 v8, s10, 2, v0
 STORE_1D = bytes.fromhex('000f20f0080e0600')  # image_store v[14:17], v8, s[24:31] dmask:0xf dim:SQ_RSRC_IMG_1D
 STORE_3D = bytes.fromhex('100f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D
+# Partial dmask (compute read-modify-write, as the pixel stage does): dmask 0x5 stores v14 to x and v15 to z of the
+# texel and keeps y and w. Words: dword 0 bits 11:8 are the dmask, the data is v[14:15].
+STORE_1D_X_Z = bytes.fromhex('000520f0080e0600')  # image_store v[14:15], v8, s[24:31] dmask:0x5 dim:SQ_RSRC_IMG_1D
+PARTIAL_1D = '{ t = w0[v8]; t.x = asfloat(v14); t.z = asfloat(v15); w0[v8] = t; }'
 LINE_1D = 'w0[v8] = asfloat(uint4(v14, v15, v16, v17));'
 LINE_3D = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
 TEXTURE_1D_FLAG = 1 << 23  # tests/compute_check.cpp texture_1d_flag
@@ -87,6 +91,19 @@ def program_1d():
 
 def program_3d(z):
     return ARRAY_PROLOGUE + ARRAY_SLICE.get(z, bytes.fromhex('8102147e' if z == 1 else '8302147e')) + ARRAY_DATA + STORE_3D + ARRAY_END
+
+
+def pipeline_1d_partial():
+    return G.ComputePipeline(HEAD + ARRAY_DATA + STORE_1D_X_Z + ARRAY_END, root_blob(3), RSRC2, fixture.GROUP)
+
+
+def reference_1d_partial():
+    """Initial then expected words of the 1D image when only x and z of the stored texels change (v14, v15)."""
+    initial, expected = reference_1d()
+    for texel in range(4 * fixture.GROUPS):
+        base = texel * 4
+        expected[base:base + 4] = [ARRAY_VALUES[0], initial[base + 1], ARRAY_VALUES[1], initial[base + 3]]
+    return initial, expected
 
 
 def pipeline_1d():
@@ -243,13 +260,22 @@ def controls(llvm_mc):
             lambda: pipe.cs.op_image_store(['v[14:17]', 'v[8:9]', 's[28:35]'], mods))
 
     for asm, code, reason in (
-        (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
-         '080320f0080e0600', 'typed UAV store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
 
+
+    # A partial dmask on a compute store is a read-modify-write of the texel (a 2D store with dmask 0x3, v[14:15]) and
+    # the manifest asks the runtime for typed UAV load; a full mask has no such line.
+    partial = pipeline(bytes.fromhex('080320f0080e0600'))
+    partial_hlsl = partial.hlsl_cs()
+    assert '{ t = w0[uint2(v8, v9)]; t.x = asfloat(v14); t.y = asfloat(v15); w0[uint2(v8, v9)] = t; }' in partial_hlsl, partial_hlsl
+    assert partial.manifest().splitlines()[-2:] == ['uav 0 tex2d float table 1 64 channels 4', 'uavload 0'], partial.manifest()
+    assert 'uavload' not in pipe.manifest()
+    assert PARTIAL_1D in pipeline_1d_partial().hlsl_cs() and 'uavload 0' in pipeline_1d_partial().manifest().splitlines()
+    for mask, reason in (('0x0', 'no channel selected'), ('0x10', 'out of range')):
+        refused(reason, lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:9]', 's[24:31]'], ['dmask:' + mask, 'dim:SQ_RSRC_IMG_2D']))
 
     wait = encoded('s_waitcnt lgkmcnt(0)', '7fc08cbf')
     changed = encoded('s_mov_b32 s26, 0', '80039abe')
@@ -360,6 +386,22 @@ def dispatch(directory, compiler, renderer, adapter):
         ('1D, full EXEC', source, 0, None),
         ('1D, omit store', source.replace(LINE_1D, ''), 32, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
         ('1D, one texel off', source.replace('w0[v8]', 'w0[v8 + 1]'), 8, 'mip=0 word=0 expected=3f400000 actual=bf000000'),
+    )
+    if draw_cases(directory, compiler, renderer, adapter, initial + expected + [0] * len(initial), cases,
+                  selector=fixture.GROUPS | TEXTURE_1D_FLAG, compared=len(initial)) == 77:
+        return 77
+    # 1D partial dmask 0x5: only x and z of the stored texels change, y and w keep their starting words. Controls: no
+    # read-back (the kept channels become zero), the two data registers swapped, and a full-mask overwrite.
+    initial, expected = reference_1d_partial()
+    source = pipeline_1d_partial().hlsl_cs()
+    assert source.count(PARTIAL_1D) == 1
+    cases = (
+        ('1D dmask 0x5', source, 0, None),
+        ('1D dmask 0x5, no read-back', source.replace('t = w0[v8];', 't = 0;'), 16, 'mip=0 word=1 expected=bf000001 actual=00000000'),
+        ('1D dmask 0x5, data swapped', source.replace('t.x = asfloat(v14); t.z = asfloat(v15);', 't.x = asfloat(v15); t.z = asfloat(v14);'),
+         16, 'mip=0 word=0 expected=3f400000 actual=3e800000'),
+        ('1D dmask 0x5, all four written', source.replace(PARTIAL_1D, 'w0[v8] = asfloat(uint4(v14, v15, v16, v17));'),
+         16, 'mip=0 word=1 expected=bf000001 actual=3e800000'),
     )
     if draw_cases(directory, compiler, renderer, adapter, initial + expected + [0] * len(initial), cases,
                   selector=fixture.GROUPS | TEXTURE_1D_FLAG, compared=len(initial)) == 77:
