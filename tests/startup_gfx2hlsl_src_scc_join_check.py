@@ -162,32 +162,32 @@ check('SCC write in one arm refuses the read at the join',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)                       # 0x00
                      + branch(SOPP_CBRANCH_SCC0, 0x04, 0x0c)             # 0x04 -> 0x0c
                      + sopc(SOPC_CMP_EQ_U32, S6, S7)                     # 0x08
-                     + READ + sopp(SOPP_ENDPGM)) == UNVERIFIED)          # 0x0c
+                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))          # 0x0c
 # 5. An SCC write inside a block s_cbranch_execz skips: the wave may run it while the lane skips it.
 check('SCC write in an execz-skipped block refuses the read at the join',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)
                      + branch(SOPP_CBRANCH_EXECZ, 0x04, 0x0c)
                      + sopc(SOPC_CMP_EQ_U32, S6, S7)
-                     + READ + sopp(SOPP_ENDPGM)) == UNVERIFIED)
+                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
 # 6. A back edge into the target: the loop body's SCC write is not known when the target is reached.
 check('back-edge target refuses the read',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)                       # 0x00
                      + READ                                              # 0x04 (loop head)
                      + sopc(SOPC_CMP_EQ_U32, S6, S7)                     # 0x08
                      + branch(SOPP_CBRANCH_SCC0, 0x0c, 0x04)             # 0x0c -> 0x04
-                     + sopp(SOPP_ENDPGM)) == UNVERIFIED)
+                     + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
 # 7. A lane-mask SCC: s_and_b32 with vcc_lo sets SCC from every lane's bit, which one lane does not see.
 check('lane-mask SCC across a branch refuses the read',
       refused_reason(sop2(SOP2_AND_B32, S6, S4, VCC_LO)                  # 0x00
                      + branch(SOPP_CBRANCH_EXECZ, 0x04, 0x0c)            # 0x04 -> 0x0c
                      + sopp(SOPP_NOP)                                    # 0x08
-                     + READ + sopp(SOPP_ENDPGM)) == UNVERIFIED)          # 0x0c
+                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))          # 0x0c
 # 8. An unmodelled SCC writer on one path: s_add_u32 sets the carry the model does not emit.
 check('unmodelled writer on one path refuses the read',
       refused_reason(sopc(SOPC_CMP_EQ_U32, S4, S5)
                      + branch(SOPP_CBRANCH_SCC0, 0x04, 0x0c)
                      + sop2(SOP2_ADD_U32, S6, S4, S5)
-                     + READ + sopp(SOPP_ENDPGM)) == UNVERIFIED)
+                     + READ + sopp(SOPP_ENDPGM)).startswith(UNVERIFIED))
 
 
 MASK = 0xFFFFFFFF

@@ -432,8 +432,8 @@ def controls():
         ('s_or_b32', 's_or_b32 null, vcc_lo, s0', 's_or_b32 into null on a lane mask'),
         ('s_nand_b32', 's_nand_b32 null, vcc_lo, exec_lo', 's_nand_b32 on a lane mask'),
         ('s_bfm_b32', 's_bfm_b32 null, vcc_lo, 4', 's_bfm_b32 into null on a lane mask'),
-        ('s_and_b32', 's_and_b32 null, s16, 0xff', 'scc from descriptor data'),
-        ('s_add_u32', 's_add_u32 null, s10, 4', 'scc from descriptor data'),
+        ('s_and_b32', 's_and_b32 null, s16, 0xff', 'scc from descriptor data [null destination: s_and_b32, destination null]'),
+        ('s_add_u32', 's_add_u32 null, s10, 4', 'scc from descriptor data [null destination: s_add_u32, destination null]'),
         ('s_mov_b32', 's_mov_b32 null, s16', 's_mov_b32 into null on descriptor data'),
     )
     for op, asm, expected_reason in specific_refusals:
