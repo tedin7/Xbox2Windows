@@ -26,6 +26,7 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -147,6 +148,10 @@ const char* load_compute_translation(ComputeTranslation& tr)
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
+        else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
+            tr.srvs.push_back({a, b, true});
+            tr.srvs.back().cube = true;
+        }
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
         // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
         else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
@@ -155,7 +160,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
+        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
@@ -300,8 +305,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
-                else if (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-                                   : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
+                else if (slot.cube && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
+                    reason = "an input texture view is not a cube map";
+                else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
+                    reason = "a cube map view's texture is not six 2D faces";
+                else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                                                  : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
                     reason = "an input texture view is not 2D";
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
