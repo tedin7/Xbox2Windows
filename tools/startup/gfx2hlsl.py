@@ -1446,8 +1446,13 @@ def check_lds_exchange(ins, group, words):
     All widths share the dword-indexed groupshared uint lds[N] array and require 4-byte alignment (natural 8/16-byte alignment is not required on GFX10/RDNA2 LDS).
     LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
     """
-    if not 0 < words <= 8192 or group[0] < 1 or group[1:] != (1, 1):
-        raise Unsupported('LDS exchange needs a 1D group and a nonzero allocation of at most 32 KiB')
+    # One reason per failed condition, with the measured value, so a refusal count says which limit the title exceeds.
+    if group[0] < 1 or group[1:] != (1, 1):
+        raise Unsupported('LDS exchange needs a 1D group (the group is %dx%dx%d)' % tuple(group))
+    if words == 0:
+        raise Unsupported('LDS exchange needs a nonzero LDS allocation (COMPUTE_PGM_RSRC2 allocates 0 bytes)')
+    if not 0 < words <= 8192:
+        raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
     published = False
     read = False
