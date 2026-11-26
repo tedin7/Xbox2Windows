@@ -900,10 +900,11 @@ next run. Each pass serves the requests in the order the title published them, t
 watcher started first, then the older backlog; during a pass the watcher looks for new requests about every
 second between results, so a request the title publishes while a long backlog is being translated starts next
 instead of after the backlog. The cache persists: a later run reads every published `<key>.txt` and translates only new
-requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
-requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
-ready marker is not retried during the run (the runtime writes each request once and never rewrites
-it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
+requests. The watcher's first pass and the one-shot `--pending` scan retry a failure only when it is older than the
+translator's own files (`gfx2hlsl.py` and the modules it loads from its folder), so a translator update reaches
+requests that failed with an earlier build, while a refusal this build already wrote is not translated again on every
+run; `X2W_RETRY_FAILED=1` retries every failure. After the first pass, a request whose `<key>.fail` is newer than
+its ready marker is not retried during the run (the runtime writes each request once and never rewrites it). An unexpected translator error is written
 to `<key>.fail` as `translator error: ...`, ending with the function, file name and line that raised
 it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of
 stopping the scan. An operand refusal
