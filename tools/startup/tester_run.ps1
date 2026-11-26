@@ -63,7 +63,7 @@ param(
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
-    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
+    [string]$Matrix = "",                       # indirect: two runs of -Seconds (default 240), (a) default, (b) X2W_TRANSLATED_INDIRECT_DRAW=1 (translated indirect draws on). gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
     [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = "slow": a 10 s window opened by the first slowdown (a present with a >= 500 ms gap after 120 s, fallback 180 s), 400 MiB cap, "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
     [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 400 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
     [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
@@ -140,13 +140,16 @@ $pack = Join-Path $PSScriptRoot "tester_pack.py"
 # -Matrix gray: the same script, three times as child processes (each one a full run with its own report), then ONE combined report.
 # A/B/C differ only by one environment switch each, so the logs of the gray phase can be compared side by side.
 if ($Matrix) {
-    if ($Matrix -ne "gray") { throw "tester_run: -Matrix knows only 'gray' (got '$Matrix')" }
+    if (@("gray", "indirect") -notcontains $Matrix) { throw "tester_run: -Matrix knows 'gray' and 'indirect' (got '$Matrix')" }
     if ($Record) { throw "tester_run: -Record is its own run, not with -Matrix" }
     $legSeconds = if ($PSBoundParameters.ContainsKey("Seconds")) { $Seconds } else { 240 }
-    $legs = @(
+    $legs = if ($Matrix -eq "indirect") { @(
+        @{ Label = "a"; Name = "default";                                  Env = [ordered]@{} },
+        @{ Label = "b"; Name = "X2W_TRANSLATED_INDIRECT_DRAW=1";           Env = [ordered]@{ X2W_TRANSLATED_INDIRECT_DRAW = "1" } }) } else { @(
         @{ Label = "a"; Name = "default";                          Env = [ordered]@{} },
         @{ Label = "b"; Name = "X2W_TEST_ADDRESS_UPLOAD_RING=1";   Env = [ordered]@{ X2W_TEST_ADDRESS_UPLOAD_RING = "1" } },
-        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } })
+        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } }) }
+    $lastLabel = $legs[-1].Label
     $skipOwn = @("Matrix", "Seconds", "OutDir", "FinishTranslateSeconds")
     $childArgs = @()
     foreach ($key in $PSBoundParameters.Keys) {
@@ -163,7 +166,7 @@ if ($Matrix) {
     $legRuns = @(); $worst = 0
     foreach ($leg in $legs) {
         $legOut = Join-Path $matrixRoot ("run_" + $leg.Label)
-        $finish = if ($leg.Label -eq "c") { $FinishTranslateSeconds } else { 0 }   # the translator pass once, after the last leg
+        $finish = if ($leg.Label -eq $lastLabel) { $FinishTranslateSeconds } else { 0 }   # the translator pass once, after the last leg
         Write-Host ("tester_run: matrix {0} leg {1} ({2}): {3} s, report in {4}" -f $Matrix, $leg.Label, $leg.Name, $legSeconds, $legOut)
         foreach ($name in $leg.Env.Keys) { Set-Item -Path ("Env:" + $name) -Value $leg.Env[$name] }
         try {
