@@ -3,12 +3,15 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
@@ -412,6 +415,54 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
     return binding.table != 0;
 }
 }  // namespace
+
+extern "C" __declspec(dllimport) void x2w_d3d12_draw_probe_stats(LONG64* holds, LONG64* probes, LONG* untranslated);
+
+int check_missing_draw_burst(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, DXGI_FORMAT format)
+{
+    constexpr unsigned threads = 4, rounds = 2500, bursts = 3;
+    ComPtr<ID3D12Device> desktop;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    std::array<StreamTarget, threads> targets{};
+    for (auto& target : targets)
+        if (const int rc = open_stream_target(desktop.Get(), guest, pso, 8, 4, format, 4, target)) return rc;
+
+    LONG64 holds_before, probes_before, holds, probes;
+    LONG untranslated_before, untranslated;
+    x2w_d3d12_draw_probe_stats(&holds_before, &probes_before, &untranslated_before);
+    const auto started = GetTickCount64();
+    // All lists share one PSO and key. Each recording thread owns its command list.
+    for (unsigned burst = 0; burst < bursts; ++burst) {
+        std::atomic<unsigned> ready{0};
+        std::array<std::thread, threads> workers;
+        for (unsigned i = 0; i < threads; ++i) {
+            workers[i] = std::thread([&, i] {
+                ready.fetch_add(1);
+                while (ready.load() != threads) SwitchToThread();
+                for (unsigned n = 0; n < rounds; ++n) invoke(targets[i].list, 12, 3, 1);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        if (burst + 1 < bursts) Sleep(300);
+    }
+    const auto elapsed = GetTickCount64() - started;
+    x2w_d3d12_draw_probe_stats(&holds, &probes, &untranslated);
+    std::printf("missing draw burst: holds %lld probes %lld untranslated %ld elapsed %llu ms\n",
+                holds - holds_before, probes - probes_before, untranslated - untranslated_before, elapsed);
+
+    for (unsigned i = 0; i < threads; ++i) {
+        auto& target = targets[i];
+        if (FAILED(static_cast<HRESULT>(invoke(target.list, 9)))) return 35;
+        invoke(target.queue, 10, 1, arg(&target.list));
+        if (FAILED(static_cast<HRESULT>(invoke(target.queue, 14, arg(target.fence), 1)))) return 24;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(target.fence, 8) < 1 && GetTickCount64() < deadline) Sleep(1);
+        if (invoke(target.fence, 8) != 1) return 25;
+        const auto path = std::string(pixels) + ".first." + std::to_string(i);
+        if (const int rc = read_stream_target(desktop.Get(), target, path.c_str())) return rc;
+    }
+    return 0;
+}
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)

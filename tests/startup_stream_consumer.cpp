@@ -893,8 +893,12 @@ int main(int argc, char** argv)
     wchar_t manifest[MAX_PATH];
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_PUBLISH_MANIFEST", manifest, MAX_PATH);
     if (length && length < MAX_PATH) {
-        const std::string first = std::string(argv[5]) + ".first";
-        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        if (GetEnvironmentVariableW(L"X2W_TEST_MISSING_DRAW_BURST", nullptr, 0)) {
+            if (const int rc = check_missing_draw_burst(adapter.Get(), device, pso, argv[5], format)) return rc;
+        } else {
+            const std::string first = std::string(argv[5]) + ".first";
+            if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        }
         if (!MoveFileW((std::wstring(manifest) + L".pending").c_str(), manifest)) return 61;
         Sleep(1100);
     }

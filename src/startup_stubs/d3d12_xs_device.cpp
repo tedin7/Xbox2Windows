@@ -106,6 +106,7 @@
 #include <memory>
 #include <new>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -2912,6 +2913,7 @@ struct ComputeBindingTrace {
 };
 
 // Per-list state while recording.
+struct BoundPipeline;
 struct Pass {
     struct CopyRange { ID3D12Resource* resource; u64 offset, bytes; };
     std::vector<CopyRange> copied_gpu_ranges; // exact CopyBufferRegion destinations on this recording
@@ -2942,6 +2944,8 @@ struct Pass {
     std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
+    Wrapper* draw_lookup_pipeline = nullptr;  // last bound pipeline resolved by the opt-in draw loader
+    BoundPipeline* draw_lookup_bound = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;

@@ -156,6 +156,9 @@ struct Translation {
     int state = 0;                           // 1 ready, 2 unavailable
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
+    // The opt-in loader claims the deadline before doing any I/O. The entry and key are stable.
+    static constexpr ULONGLONG probing = UINT64_MAX, published = UINT64_MAX - 1, rejected = UINT64_MAX - 2;
+    std::atomic<ULONGLONG> next_probe{0};
     std::vector<Srv> srvs;
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
@@ -539,25 +542,17 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-void load_translation(Translation& tr, const std::string& rtv_request = {})
+void note_missing_translation(const Translation& tr, const std::string& rtv_request)
 {
-    tr.state = 2;
+    InterlockedIncrement(&translation_missing);
+    static LONG missing;
+    if (rtv_request.empty() && first_calls(missing, 12))
+        log("x2w-draw no translation for pipeline %016llx", tr.key);
+}
+
+bool load_translation_files(Translation& tr, const std::string& rtv_request, const std::string& manifest)
+{
     wchar_t path[MAX_PATH];
-    std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt")) return;
-    if (!lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, false)) {
-        if (!tr.retry_manifest_at) {
-            InterlockedIncrement(&translation_missing);
-            static LONG missing;
-            if (rtv_request.empty() && first_calls(missing, 12))
-                log("x2w-draw no translation for pipeline %016llx", tr.key);
-        }
-        tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
-        return;
-    }
-    // The writer publishes this marker last. A malformed published result stays rejected.
-    const bool previously_missing = tr.retry_manifest_at != 0;
-    tr.retry_manifest_at = 0;
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -570,14 +565,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         if (line.compare(0, 5, "rtv1 ") == 0) {
             if (matched_rtv || line != rtv_request) {
                 log("x2w-draw RTV manifest mismatch for %016llx", tr.key);
-                return;
+                return false;
             }
             matched_rtv = true;
         } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
             // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
             // so a translation whose stores would be silently skipped is never drawn (#1723).
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
-            return;
+            return false;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -602,12 +597,12 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         } else if (line.compare(0, 6, "wmask ") == 0) {
             if (!tr.write_masks.read_manifest_line(line)) {
                 log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
-                return;
+                return false;
             }
         } else if (line.compare(0, 7, "d16srv ") == 0) {
             if (!tr.d16_srvs.read_manifest_line(line)) {
                 log("x2w-draw invalid d16srv manifest line for %016llx: %s", tr.key, line.c_str());
-                return;
+                return false;
             }
         } else if (line.compare(0, 8, "uavload ") == 0) {
             // The pixel program reads the stored image back (partial-dmask store); the view then needs typed load.
@@ -618,7 +613,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (well_formed) index = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
             if (!well_formed || index >= tr.uavs.size() || tr.uavs[index].load) {
                 log("x2w-draw pipeline %016llx uavload line refused: %s; translation not used", tr.key, line.c_str());
-                return;
+                return false;
             }
             tr.uavs[index].load = true;
         } else if (line.compare(0, 4, "uav ") == 0) {
@@ -630,37 +625,81 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (!refusal && tr.uavs.size() >= pixel_uav_limit) refusal = "too many views";
             if (refusal) {
                 log("x2w-draw pipeline %016llx uav line refused (%s): %s; translation not used", tr.key, refusal, line.c_str());
-                return;
+                return false;
             }
             tr.uavs.push_back(uav);
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
-            return;
+            return false;
         }
     }
     if (matched_rtv != !rtv_request.empty()) {
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
-        return;
+        return false;
     }
-    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return false;
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
-            return;
+            return false;
     }
-    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
-    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
+    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return false;
+    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return false;
     const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
         static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()));
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
-        return;
+        return false;
     }
+    return true;
+}
+
+void publish_translation(Translation& tr, bool previously_missing)
+{
     tr.state = 1;
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
+}
+
+void load_translation(Translation& tr, const std::string& rtv_request = {})
+{
+    tr.state = 2;
+    wchar_t path[MAX_PATH];
+    std::string manifest;
+    if (!cache_path(path, L"", tr.key, L".txt")) return;
+    if (!lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, false)) {
+        if (!tr.retry_manifest_at) note_missing_translation(tr, rtv_request);
+        tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
+        return;
+    }
+    // A malformed published result stays rejected.
+    const bool previously_missing = tr.retry_manifest_at != 0;
+    tr.retry_manifest_at = 0;
+    if (load_translation_files(tr, rtv_request, manifest)) publish_translation(tr, previously_missing);
+}
+
+bool draw_nolock_load()
+{
+    static const bool enabled = x2w_local::env_on("X2W_DRAW_NOLOCK_LOAD");
+    return enabled;
+}
+
+// Both modes keep stable entries. In the opt-in mode the key map also serves RTV lookups outside draw_lock.
+std::mutex draw_translation_keys;
+
+Translation& translation_entry(u64 key, bool& created)
+{
+    std::unique_lock<std::mutex> lock(draw_translation_keys, std::defer_lock);
+    if (draw_nolock_load()) lock.lock();
+    auto& entry = translation_by_key()[key];
+    created = !entry;
+    if (created) {
+        entry = new Translation;
+        entry->key = key;
+    }
+    return *entry;
 }
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
@@ -672,18 +711,17 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
-    auto& entry = translation_by_key()[key];
-    if (!entry) {
-        entry = new Translation;
-        entry->key = key;
+    bool created;
+    auto& entry = translation_entry(key, created);
+    if (created) {
         // A legacy cache hit still needs source blobs for late RTV specialization.
         if (publish_shader_request(key, L".b", b, b_bytes) &&
             publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
             (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())))
             publish_shader_request(key, L".a", a, a_bytes);
-        load_translation(*entry);
+        if (!draw_nolock_load()) load_translation(entry);
     }
-    return entry;
+    return &entry;
 }
 
 LONG compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words;
@@ -1185,31 +1223,87 @@ bool needs_rtv_variant(DXGI_FORMAT format)
     }
 }
 
+std::string rtv_request_for_targets(const Translation& base, const Pass& pass)
+{
+    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) return {};
+    std::string request = "rtv1 " + std::to_string(base.key);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
+    return request;
+}
+
+void request_rtv_translation(u64 key, const std::string& request)
+{
+    publish_shader_request(key, L".rtv", request.data(), request.size());
+    log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
+}
+
+// Legacy lookup with draw_lock held.
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+    const auto request = rtv_request_for_targets(*base, pass);
+    if (request.empty()) {
         if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
             load_translation(*base);
         return base;
     }
-    std::string request = "rtv1 " + std::to_string(base->key);
-    for (UINT i = 0; i < pass.target_count; ++i)
-        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
     const u64 key = fnv_bytes(request.data(), request.size());
-    auto& entry = translation_by_key()[key];
-    if (!entry) {
-        entry = new Translation;
-        entry->key = key;
-        load_translation(*entry, request);
-        if (entry->state != 1) {
-            publish_shader_request(key, L".rtv", request.data(), request.size());
-            log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
-        }
-    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
-        load_translation(*entry, request);
+    bool created;
+    auto& entry = translation_entry(key, created);
+    if (created) {
+        load_translation(entry, request);
+        if (entry.state != 1) request_rtv_translation(key, request);
+    } else if (entry.retry_manifest_at && GetTickCount64() >= entry.retry_manifest_at) {
+        load_translation(entry, request);
     }
-    return entry;
+    return &entry;
+}
+
+// Fixture snapshots surround the draw burst, with setup and submission out of the interval.
+volatile LONG64 draw_manifest_probes;
+extern "C" __declspec(dllexport) void x2w_d3d12_draw_probe_stats(LONG64* holds, LONG64* probes, LONG* untranslated)
+{
+    *holds = InterlockedCompareExchange64(&draw_lock_stats.hold_calls, 0, 0);
+    *probes = InterlockedCompareExchange64(&draw_manifest_probes, 0, 0);
+    *untranslated = InterlockedCompareExchange(&untranslated_draws, 0, 0);
+}
+
+// A ready result returns true with draw_lock held for the caller. Missing, in-flight
+// and permanently rejected results return false with draw_lock free.
+bool lock_for_draw_translation(Translation& tr, const std::string& request)
+{
+    auto next = tr.next_probe.load(std::memory_order_acquire);
+    if (next == Translation::published) {
+        draw_lock_acquire_exclusive();
+        return true;
+    }
+    if (next == Translation::probing || next == Translation::rejected || (next && GetTickCount64() < next) ||
+        !tr.next_probe.compare_exchange_strong(next, Translation::probing, std::memory_order_acq_rel))
+        return false;
+
+    wchar_t path[MAX_PATH];
+    std::string manifest;
+    const bool has_path = cache_path(path, L"", tr.key, L".txt");
+    if (has_path) InterlockedIncrement64(&draw_manifest_probes);
+    if (has_path && !read_text(path, manifest)) {
+        if (!next) {
+            note_missing_translation(tr, request);
+            if (!request.empty()) request_rtv_translation(tr.key, request);
+        }
+        tr.next_probe.store(GetTickCount64() + manifest_retry_ms, std::memory_order_release);
+        return false;
+    }
+    // Only the probe owner touches the translation payload until it is published.
+    if (!has_path || !load_translation_files(tr, request, manifest)) {
+        if (!next && !request.empty()) request_rtv_translation(tr.key, request);
+        tr.next_probe.store(Translation::rejected, std::memory_order_release);
+        return false;
+    }
+    draw_lock_acquire_exclusive();
+    publish_translation(tr, next != 0);
+    tr.next_probe.store(Translation::published, std::memory_order_release);
+    return true;
 }
 
 // The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
@@ -2894,11 +2988,41 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool indexed_rect = rect && indexed && indirect;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) return not_drawn(0);
-    draw_lock_acquire_exclusive();
-    DrawPhases phases;
-    BoundPipeline* bound = translation_for(pass.pipeline);
-    if (bound && bound->translation) bound->translation->use.note(process_ms());
-    Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    std::optional<DrawPhases> phases;
+    BoundPipeline* bound;
+    Translation* tr;
+    if (draw_nolock_load()) {
+        if (pass.draw_lookup_pipeline != pass.pipeline) {
+            draw_lock_acquire_exclusive();
+            pass.draw_lookup_bound = translation_for(pass.pipeline);
+            pass.draw_lookup_pipeline = pass.pipeline;
+            draw_lock_release_exclusive();
+        }
+        bound = pass.draw_lookup_bound;
+        if (!bound->translation) return not_drawn(1);
+        tr = bound->translation;
+        const auto request = rtv_request_for_targets(*tr, pass);
+        if (!request.empty()) {
+            bool created;
+            tr = &translation_entry(fnv_bytes(request.data(), request.size()), created);
+        }
+        if (!lock_for_draw_translation(*tr, request)) {
+            not_drawn_key = tr->key;
+            if (indirect) {
+                indirect->shader_key = tr->key;
+                indirect->refusal_code = indirect_refusal_code::translation_not_ready;
+            }
+            return not_drawn(1);
+        }
+        phases.emplace();
+        bound->translation->use.note(process_ms());
+    } else {
+        draw_lock_acquire_exclusive();
+        phases.emplace();
+        bound = translation_for(pass.pipeline);
+        if (bound->translation) bound->translation->use.note(process_ms());
+        tr = translation_for_targets(bound->translation, pass);
+    }
     if (indirect && tr) indirect->shader_key = tr->key;
     not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     std::uint32_t d16_unorm16[32] = {};
@@ -2989,7 +3113,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     };
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
-    phases.to(1);
+    phases->to(1);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
     if (first + views > draw_heap_size) {
         first = 0;
@@ -3053,7 +3177,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
-    phases.to(2);
+    phases->to(2);
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
@@ -3505,7 +3629,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 holder.reject, recorded_copy, indirect_copy_ranges());
         }
     }
-    phases.to(3);
+    phases->to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3535,7 +3659,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
             : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
     }
-    phases.to(4);
+    phases->to(4);
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
         const D3D12_RESOURCE_DESC target = pass.target0->GetDesc();

@@ -715,8 +715,12 @@ void report_key_use_census(Emit emit, bool only_if_changed)
         };
         for (auto& item : compute_translations())
             collect("compute", item.second.key, item.second.use);
-        for (auto& item : translation_by_key())
-            if (item.second) collect("graphics", item.second->key, item.second->use);
+        {
+            std::unique_lock<std::mutex> keys(draw_translation_keys, std::defer_lock);
+            if (draw_nolock_load()) keys.lock();
+            for (auto& item : translation_by_key())
+                if (item.second) collect("graphics", item.second->key, item.second->use);
+        }
         for (auto& item : indirect_mesh_key_uses())
             collect("mesh", item.first, item.second);
     }

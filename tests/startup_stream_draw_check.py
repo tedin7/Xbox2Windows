@@ -1,5 +1,7 @@
 """Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
 import os
+import re
+import struct
 from pathlib import Path
 import subprocess
 import sys
@@ -90,6 +92,72 @@ def check(directory, consumer, backend):
     return 0
 
 
+def missing_draw_burst(directory, consumer, enabled, typed):
+    cache = directory / "cache"
+    cache.mkdir()
+    vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
+    # The guest blobs serve as request identities. The fixture supplies its own desktop result.
+    vs.write_bytes(container(1, [0xbf810000]))
+    ps.write_bytes(container(0, [0xbf810000]))
+    args = [consumer, vs, ps, root]
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_SHADER_CACHE=str(cache), X2W_DRAW_NOLOCK_LOAD=str(int(enabled)))
+    subprocess.run(args, env=env, check=True, timeout=30)
+    base = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+    assert (cache / f"req_{base:016x}.a").read_bytes() == vs.read_bytes()
+    # DXGI_FORMAT_R32_FLOAT requests an RTV specialization. A half-width scissor
+    # leaves the other half of the target blue (RGBA8) or zero (R32_FLOAT).
+    rtv = f"rtv1 {base} 41" if typed else ""
+    key = gfx2hlsl.fnv(rtv.encode()) if typed else base
+    vertex_source = """
+float4 main(uint id : SV_VertexID) : SV_Position {
+    float2 corner = id == 0 ? float2(-1, 1) : id == 1 ? float2(3, 1) : float2(-1, -3);
+    return float4(corner, 0, 1);
+}
+"""
+    pixel_source = ("float main() : SV_Target { return 0.625; }" if typed else
+                    "float4 main() : SV_Target { return float4(1, 1, 0, 1); }")
+    fxc = gfx2hlsl.find_fxc()
+    assert fxc, "FXC is required for the synthetic desktop shaders"
+    for stage, source in (("vs", vertex_source), ("ps", pixel_source)):
+        hlsl = directory / f"{stage}.hlsl"
+        hlsl.write_text(source, encoding="ascii")
+        subprocess.run([fxc, "/nologo", "/T", f"{stage}_5_0", "/E", "main",
+                        "/Fo", cache / f"{key:016x}.{stage}.cso", hlsl], check=True, timeout=30)
+    manifest = cache / f"{key:016x}.txt"
+    manifest.with_suffix(".txt.pending").write_text(
+        f"x2w-manifest 2\n{rtv}\nudsrc 0 rect\n", encoding="ascii")
+    run = subprocess.run(
+        args + ["warp", output] + (["41"] if typed else []), capture_output=True, text=True, timeout=90,
+        env=dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest), X2W_TEST_MISSING_DRAW_BURST="1"))
+    assert run.returncode == 0, run.stdout + run.stderr
+    if typed:
+        assert (cache / f"req_{key:016x}.rtv").read_text(encoding="ascii") == rtv
+    stats = re.search(r"missing draw burst: holds (\d+) probes (\d+) untranslated (\d+) elapsed (\d+) ms", run.stdout)
+    assert stats, run.stdout
+    holds, probes, untranslated, elapsed = map(int, stats.groups())
+    assert untranslated == 30_000, stats[0]
+
+    clear = bytes(4) if typed else bytes((0, 0, 255, 255))
+    for i in range(4):
+        assert Path(f"{output}.first.{i}").read_bytes() == clear * 32, f"list {i} drew before publication"
+    expected = struct.pack("<f", 0.625) if typed else (bytes((255, 255, 0, 255)) * 4 + clear * 4) * 4
+    assert output.read_bytes() == expected, "draw after publication disagrees with CPU reference"
+    # The same lock budget must reject the switch-off control.
+    assert (holds <= 4) == enabled, stats[0]
+    if enabled:
+        assert 3 <= probes <= 1 + elapsed // 250, stats[0]
+    else:
+        assert holds == untranslated, stats[0]
+    print(f"{'R32_FLOAT' if typed else 'RGBA8'} {'opt-in' if enabled else 'legacy control'}: {stats[0]}")
+
+
 if __name__ == "__main__":
-    with tempfile.TemporaryDirectory() as temp:
-        sys.exit(check(Path(temp), *sys.argv[1:]))
+    if sys.argv[2:] == ["warp", "--missing-burst"]:
+        for typed in (False, True):
+            for enabled in (True, False):
+                with tempfile.TemporaryDirectory() as temp:
+                    missing_draw_burst(Path(temp), sys.argv[1], enabled, typed)
+    else:
+        with tempfile.TemporaryDirectory() as temp:
+            sys.exit(check(Path(temp), *sys.argv[1:]))

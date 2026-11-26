@@ -25,3 +25,5 @@ struct StartupBc7Input {
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,
                       const StartupBc7Input* bc7 = nullptr, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
                       std::uint32_t export_word = 0, bool two_targets = false);
+
+int check_missing_draw_burst(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, DXGI_FORMAT format);
