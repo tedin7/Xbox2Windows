@@ -18,9 +18,8 @@
 //             section, or on the allocation base for the private range, after
 //             D3D12_FEATURE_EXISTING_HEAPS) and a cross-adapter buffer is placed at the slot offset.
 //             The GPU reads and writes title memory; nothing is copied.
-//   copy      A default-heap buffer fed from a two-slot upload ring that wraps like reserve_upload_ring
-//             but checks each slot's fence: a slot still in flight is refused
-//             (DXGI_ERROR_WAS_STILL_DRAWING) instead of being overwritten. Title memory is copied into
+//   copy      A default-heap buffer fed from a two-slot upload ring that checks each slot's fence:
+//             a slot still in flight is refused (DXGI_ERROR_WAS_STILL_DRAWING). Title memory is copied into
 //             the ring at one named copy point: bind (upload_from_title), record (frame_copy) or submit
 //             (just before ExecuteCommandLists, the contract point). The ring slot is copied into the
 //             buffer at the start of the submission; a use that declares GPU writes copies buffer ->
@@ -190,8 +189,7 @@ struct FencedSlots {
     }
 };
 
-// The upload ring: a cursor that wraps, as reserve_upload_ring does, but a slot whose submission has not
-// completed is refused rather than reused. reuse_early (the mutant) takes it anyway, as production does.
+// The modeled ring wraps only when a slot's submission has completed.
 struct Ring {
     UINT64 state[ring_slots]{};
     unsigned cursor = 0, wraps = 0;

@@ -25,7 +25,7 @@ HLSL = ("Texture2D<float> t : register(t0);\n"
         "  return float4(t.Load(int3(uint2(p.xy) % 2, 0)), 0, 0, 1);\n}\n")
 REFUSALS = (r"x2w-d3d12 memory SRV refusals \(slot 70\): total 9; null_destination 0, unreadable_resource 0, "
             r"unreadable_view 0, null_address 8, unsupported_description 1, destination_outside_view_heaps 0, "
-            r"gpu_written_resource 0, as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 0, texture_unavailable 0, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, "
+            r"gpu_written_resource 0, as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 0, texture_unavailable 0, texture_no_resource 0, texture_unreadable 0, texture_over_64mib 0, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, "
             r"unsupported_desktop_format 0, console_layout_xg_rows 0, console_layout_without_footprints 0, "
             r"console_layout_beyond_xg_size 0, overlapping_resource 0, other 0; "
             r"distinct shapes 1 \(calls past the shape table 0\)")

@@ -14,6 +14,11 @@ Synthetic instruction text and register states only. Checked, each with the s_or
 buffer word with the restricted evaluator of startup_gfx2hlsl_bit_alu_check: an s_buffer_load, an s_load through a
 root pointer, an s_load of a descriptor, and an s_cselect_b32 into the former mask register. Controls: without the
 overwrite the OR stays a mask OR, and a compare or a mask logic op written after a load marks the register again.
+
+Scalar ALU on descriptor data (an s_mov of a descriptor word, the s_bfe_u32 and s_and_b32 of a structured-to-raw
+conversion, an s_add_u32 to a descriptor pointer) records only a symbol for its destination. It now clears the mark
+as well, in a pixel and a vertex stage, so the s_max_u32 that clamps an extracted stride is not taken as a mask read.
+Control: such a write into another SGPR keeps the mark on s6.
 """
 import struct
 import sys
@@ -38,6 +43,9 @@ def check(what, ok, detail=''):
 class Pipe:
     sampler_heap = False
     root = {'params': [{'type': 2}], 'flags': 0}
+
+    def __init__(self):
+        self.modified = set()   # descriptors written by scalar ALU (the structured-to-raw conversion marks them)
 
     def resource(self, key, kind):
         return 'r0'
@@ -103,6 +111,34 @@ def main():
     s = stage()
     run(s, 'v_cmp_eq_u32_e64 s5, v0, v1', 's_load_dwordx4 s[4:7], s[12:13], 0x20')
     check('s_load_dwordx4 of a descriptor clears the mark on s5', 5 not in s.masks, s.masks)
+
+    # Scalar ALU on descriptor data writes the destination's symbol without set_s. The register then holds
+    # descriptor data, so a later numeric read of it is not a lane-mask read (the stride clamp of a
+    # structured-to-raw conversion: s_bfe_u32 of DW1[29:16], then s_max_u32 with 1).
+    for kind in ('ps', 'vs'):
+        for text in ('s_mov_b32 s6, s17', 's_bfe_u32 s6, s17, 0xe0010', 's_and_b32 s6, s19, 0xcfffffff',
+                     's_add_u32 s6, s2, 16'):
+            s = stage()
+            s.kind = kind
+            try:
+                run(s, COMPARE, text)
+            except G.Unsupported as error:
+                check('%s %s after a compare translates' % (kind, text), False, error)
+                continue
+            check('%s %s (descriptor data) clears the mark on s6' % (kind, text), 6 not in s.masks, s.masks)
+        s = stage()
+        s.kind = kind
+        try:
+            run(s, COMPARE, 's_bfe_u32 s6, s17, 0xe0010', 's_max_u32 s6, s6, 1')
+            check('%s s_max_u32 of the extracted stride is not refused as a lane-mask read' % kind, True)
+        except G.Unsupported as error:
+            check('%s s_max_u32 of the extracted stride is not refused as a lane-mask read' % kind, False, error)
+        # Control: only the destination loses its mark; a descriptor write to another SGPR leaves the mask s6.
+        s = stage()
+        s.kind = kind
+        run(s, COMPARE, 's_bfe_u32 s8, s17, 0xe0010')
+        check('control: %s s_bfe_u32 into s8 keeps the mask mark on s6' % kind, 6 in s.masks and 8 not in s.masks,
+              s.masks)
 
     # A mask written after a load marks the register again.
     s = stage()

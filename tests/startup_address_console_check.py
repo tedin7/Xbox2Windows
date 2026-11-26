@@ -5,8 +5,9 @@
                                      and one texture whose address is announced as XG rows after it
                                      was published
   <consumer> <backend> gate          the upload lifetime control described at check_gate
-  <consumer> <backend> gate-ring     the same draws with X2W_TEST_ADDRESS_UPLOAD_RING=1, which must show the
-                                     first payload overwritten
+  <consumer> <backend> gate-ring     the same draws with X2W_TEST_ADDRESS_UPLOAD_RING=1: the 256 MiB ring
+                                     refuses the uploads past its cap, the refused draws read the null view
+                                     and the left half keeps payload 0
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
 equations of AMD addrlib's GFX10 pattern tables, written out below. Reference: addrlib as Mesa carries it
@@ -227,9 +228,9 @@ def check_gate(directory, consumer, backend, ring):
     The fixture then signals the fence, waits for the last submit and reads the target back: the left half
     must hold payload 0 and the right half payload 17.
 
-    Eighteen 16 MiB uploads are more than the 256 MiB upload ring. With X2W_TEST_ADDRESS_UPLOAD_RING=1 the
-    uploads come from the ring, the later ones pass over the bytes of payload 0 before the queue has copied
-    them, and the left half must not hold payload 0.
+    The shared ring refuses later reservations once its capacity is exhausted.
+    The left half must retain payload 0 and the final right-half draw must
+    read the null view.
     """
     hlsl = ("Texture2D<float4> t : register(t0);\n"
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
@@ -246,7 +247,8 @@ def check_gate(directory, consumer, backend, ring):
         return 77
     if len(actual) != TARGET_W * TARGET_H * 4:
         raise AssertionError(f"gate: readback length {len(actual)}")
-    first, last = gate_colour(0), gate_colour(GATE_PAYLOADS - 1)
+    first = gate_colour(0)
+    last = bytes(4) if ring else gate_colour(GATE_PAYLOADS - 1)
     wrong = {"left": 0, "right": 0}
     seen = set()
     for y in range(TARGET_H):
@@ -260,12 +262,14 @@ def check_gate(directory, consumer, backend, ring):
     released = f"x2w-draw by-address uploads: {GATE_PAYLOADS} submits completed and released"
     half = TARGET_W * TARGET_H // 2
     if ring:
-        if not wrong["left"] or wrong["right"]:
-            raise AssertionError(f"gate-ring: {wrong} wrong pixels; expected the left half overwritten and the right intact")
+        if wrong["left"] or wrong["right"]:
+            raise AssertionError(f"gate-ring: {wrong} wrong pixels; expected payload 0 left and null view right")
+        if "x2w-draw upload ring reservation refused: no unused capacity" not in log:
+            raise AssertionError("gate-ring: no upload reservation refusal")
         if "x2w-draw by-address uploads:" in log:
             raise AssertionError("gate-ring: the ring control retained upload buffers")
-        print(f"{backend} gate, uploads from the shared ring (control): {wrong['left']} of {half} left pixels do not hold "
-              f"payload 0 (found {sorted(seen)[:3]}); right half holds payload {GATE_PAYLOADS - 1}")
+        print(f"{backend} gate, uploads from the shared ring: exhaustion refused; "
+              f"{half} left pixels hold payload 0 and {half} right pixels read the null view")
         return 0
     if wrong["left"] or wrong["right"]:
         raise AssertionError(f"gate: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected {first.hex()} left, {last.hex()} right")

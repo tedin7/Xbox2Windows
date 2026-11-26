@@ -173,7 +173,7 @@ def draw(folder, consumer, backend, kind, compiler, prefix, offset):
     cmd = [consumer, vs, ps, signature]
     subprocess.run(cmd, env=env, check=True)
     subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], env=env, check=True)
-    manifest, = cache.glob('*.txt')
+    manifest, = (path for path in cache.glob('*.txt') if path.name != 'revision.txt')
     text = manifest.read_text(encoding='ascii')
     line = f'srv 0 tex2d table 0 {offset}'
     assert text.splitlines().count(line) == 1

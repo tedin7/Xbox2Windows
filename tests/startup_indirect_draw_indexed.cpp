@@ -32,6 +32,7 @@
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
 
 #if defined(OFFSCREEN_AGILITY_620)
 extern "C" {
@@ -1332,6 +1333,27 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         std::fprintf(stderr, "indirect-draw refusal census entries did not match expected per-(key, reason) rows:\n");
         for (const auto& line : entries) std::fprintf(stderr, "  %s\n", line.c_str());
         return false;
+    }
+    // The same refusals ranked by pipeline key (the lines the tester pack reads): each key carries its own draws and sites.
+    {
+        const std::size_t keyed_needed = x2w_d3d12_not_drawn_keys_report(nullptr, 0);
+        std::string keyed(keyed_needed + 1, '\0');
+        x2w_d3d12_not_drawn_keys_report(keyed.data(), keyed.size());
+        keyed.resize(std::strlen(keyed.c_str()));
+        const auto line_of = [&](const std::string& key) {
+            const std::size_t at = keyed.find("x2w-render not drawn key " + key + ":");
+            return at == std::string::npos ? std::string() : keyed.substr(at, keyed.find('\n', at) - at);
+        };
+        const std::string one = line_of(parsed[0].key), two = line_of(parsed[2].key), three = line_of(parsed[3].key);
+        const bool keyed_ok = keyed.rfind("x2w-render not drawn by pipeline key: ", 0) == 0 &&
+            one.find(": 3 (") != std::string::npos && one.find("missing_guest_root 2") != std::string::npos &&
+            one.find("sampled_texture_mismatch 1") != std::string::npos &&
+            two.find(": 1 (unsupported_resource_or_entry 1)") != std::string::npos &&
+            three.find(": 2 (incomplete_vertex_or_table_buffer 2)") != std::string::npos;
+        if (!keyed_ok) {
+            std::fprintf(stderr, "not-drawn-by-key lines did not match the per-key refusals:\n%s\n", keyed.c_str());
+            return false;
+        }
     }
     std::ifstream file(log_path, std::ios::binary);
     std::string log_line;

@@ -19,7 +19,8 @@ class DrawSkipTest(unittest.TestCase):
                     output = io.StringIO()
                     with patch.object(module, 'failures', []), redirect_stdout(output):
                         module.check('prior pixel comparison', passed)
-                        with patch.object(module.subprocess, 'run', return_value=skipped):
+                        with patch.object(module.subprocess, 'run', return_value=skipped), \
+                                patch('gpu_case_runner.run', return_value=skipped):   # the adopted checks draw through it
                             with self.assertRaises(SystemExit) as exit_status:
                                 draw('renderer', 'warp', 'vs', 'ps', 'reference')
                     self.assertEqual(exit_status.exception.code, expected)

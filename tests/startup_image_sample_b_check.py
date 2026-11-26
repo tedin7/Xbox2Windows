@@ -50,6 +50,7 @@ import gfx2hlsl as G  # noqa: E402
 import startup_sampler_heap_check as H  # noqa: E402
 from startup_image_2d_array_check import mip_cell  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
+import gpu_case_runner  # noqa: E402
 
 # Sampler words: point filters, wrap, MAX_LOD 2.0 (u4.8 at word 1 bits 23:12), mip filter point (word 2 bits 27:26).
 SAMPLER = ('0', '0x200000', '0x4000000')
@@ -631,8 +632,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     locate()
 
     def draw_once(vs, shader, slice_index, expected, sampler):
-        run = subprocess.run([renderer, adapter, operation, str(vs), str(shader), str(slice_index), expected, sampler],
-                             capture_output=True, text=True)
+        run = gpu_case_runner.run(renderer, adapter, [operation, vs, shader, slice_index, expected, sampler])
         sys.stdout.write(run.stdout)
         if run.returncode == 77:
             print(run.stdout + run.stderr)
