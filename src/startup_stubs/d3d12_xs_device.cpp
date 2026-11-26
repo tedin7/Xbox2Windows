@@ -61,6 +61,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/manifest_prefetch.h"
 #include "startup_stubs/srv_refusal_cache.h"
+#include "startup_stubs/view_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
@@ -6144,6 +6145,8 @@ bool retire_address_has_live_user(u64 address, const Wrapper* skip)
 
 void retire_note_title_release(Wrapper* w)
 {
+    // A released resource's address can be reused by another resource: views cached over it are stale (X2W_VIEW_CACHE).
+    if (x2w_view_cache::Cache::enabled()) x2w_view_cache::view_cache().note_resource_change(reinterpret_cast<u64>(w));
     const u64 address = reinterpret_cast<u64>(w->own().title_memory);
     if (!address) return;
     const bool shared_addr = retire_address_has_live_user(address, w);
@@ -7869,6 +7872,14 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
         if (x2w_budget::enabled()) report_budget(static_cast<ID3D12CommandQueue*>(self->own().real));
         report_drop_mips();
+        if (x2w_view_cache::Cache::enabled()) {
+            const x2w_view_cache::Stats cache = x2w_view_cache::view_cache().stats();
+            log("x2w-view-cache hits %llu misses %llu publishes %llu replaced %llu write_drops %llu resource_changes %llu flushes %llu",
+                static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.misses),
+                static_cast<unsigned long long>(cache.publishes), static_cast<unsigned long long>(cache.replaced),
+                static_cast<unsigned long long>(cache.write_drops), static_cast<unsigned long long>(cache.resource_drops),
+                static_cast<unsigned long long>(cache.flushes));
+        }
         if (retire_reasons_enabled()) {
             char line[1536];
             if (retire_reasons_line(line, sizeof(line))) log("%s", line);
