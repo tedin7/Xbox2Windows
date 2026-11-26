@@ -125,6 +125,7 @@ constexpr int slot_count = 512;
 // per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
 x2w_startup::TokenNullCensus token_null_census;
+x2w_startup::DestinationRefusals destination_refusals;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
 x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};

@@ -759,6 +759,7 @@ void log_layout0_texture(const char* reason, const D3D12_RESOURCE_DESC* resource
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                        const MemoryShaderResourceView* input, u64 destination)
 {
+    if (destination) destination_refusals.note(destination, reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
     const bool within_limit = first_calls(refused, 8);
     const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
@@ -769,6 +770,7 @@ void refuse_memory_srv(LONG& refused, const char* what, const char* reason, cons
 // distinct destination descriptors.
 void note_memory_srv_write(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
 {
+    destination_refusals.forget(destination);
     const u64 ordinal = memory_srv_writes.note(destination);
     if (!ordinal) return;
     char resource_text[224], view_text[256];

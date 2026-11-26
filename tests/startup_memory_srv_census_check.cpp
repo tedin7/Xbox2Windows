@@ -129,6 +129,32 @@ int main()
     report_token_entry(line, sizeof(line), 0x1000000000000001ull, 1, 0x7ff000, words);
     check("entry line", !std::strcmp(line, "x2w-draw token texture null: pipeline 1000000000000001 srv 1 entry 0x7ff000 words "
                                            "00000000 00000000 00000000 00000000 00000000 00000000 00000000 12345678"));
+    // The last refusal per destination descriptor: found, overwritten, forgotten after a write, none for an unknown entry, bounded.
+    {
+        DestinationRefusals refusals;
+        D3D12_RESOURCE_DESC texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Format = DXGI_FORMAT_R32_FLOAT;
+        texture.Width = 128;
+        texture.Height = 72;
+        texture.MipLevels = 7;
+        char text[256];
+        refusals.describe(text, sizeof(text), 0x1000);
+        check("no refusal recorded for an unknown entry", std::strstr(text, "no slot-70 refusal recorded") != nullptr);
+        refusals.note(0x1000, "unsupported_description", &texture);
+        refusals.describe(text, sizeof(text), 0x1000);
+        check("a refusal names its reason and texture", std::strstr(text, "unsupported_description") && std::strstr(text, "128x72") &&
+                                                           std::strstr(text, "mips 7"));
+        refusals.note(0x1000, "texture_unreadable", nullptr);
+        refusals.describe(text, sizeof(text), 0x1000);
+        check("the latest refusal replaces the earlier one", std::strstr(text, "texture_unreadable") && !std::strstr(text, "unsupported"));
+        refusals.forget(0x1000);
+        refusals.describe(text, sizeof(text), 0x1000);
+        check("a later write forgets the refusal", std::strstr(text, "no slot-70 refusal recorded") != nullptr);
+        for (std::uint64_t d = 0; d < DestinationRefusals::limit + 5; ++d) refusals.note(0x10000 + d, "buffer_unavailable", nullptr);
+        refusals.describe(text, sizeof(text), 0x10000 + DestinationRefusals::limit + 4);
+        check("the newest refusal survives when the table is full", std::strstr(text, "buffer_unavailable") != nullptr);
+    }
     std::printf("memory SRV census: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

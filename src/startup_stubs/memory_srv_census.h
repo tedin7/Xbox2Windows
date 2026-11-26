@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace x2w_startup {
@@ -276,5 +277,56 @@ inline int report_token_entry(char* out, std::size_t size, std::uint64_t pipelin
                          static_cast<unsigned long long>(pipeline), srv, static_cast<unsigned long long>(entry), words[0], words[1],
                          words[2], words[3], words[4], words[5], words[6], words[7]);
 }
+
+// The last slot-70 refusal for each destination descriptor. A refused view leaves its destination as the title had it, so a
+// draw that later finds no view token there can say which refusal left it that way (zeros, a free-list word, an old record).
+// Bounded: the table is cleared when it reaches its limit, so an answer is "the last of the recent refusals" or none.
+class DestinationRefusals {
+public:
+    static constexpr std::size_t limit = 8192;
+    void note(std::uint64_t destination, const char* reason, const D3D12_RESOURCE_DESC* resource)
+    {
+        Entry entry{reason, 0, 0, 0, 0, 0};
+        if (resource) entry = {reason, resource->Dimension, static_cast<unsigned>(resource->Format), resource->Width, resource->Height,
+                               resource->MipLevels};
+        AcquireSRWLockExclusive(&lock_);
+        if (table_.size() >= limit) table_.clear();
+        table_[destination] = entry;
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    void forget(std::uint64_t destination)
+    {
+        AcquireSRWLockExclusive(&lock_);
+        table_.erase(destination);
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    // Writes " last slot-70 refusal for this entry: ..." or " no slot-70 refusal recorded for this entry".
+    int describe(char* out, std::size_t size, std::uint64_t destination) const
+    {
+        Entry entry{};
+        bool found = false;
+        AcquireSRWLockShared(&lock_);
+        const auto at = table_.find(destination);
+        if (at != table_.end()) {
+            entry = at->second;
+            found = true;
+        }
+        ReleaseSRWLockShared(&lock_);
+        if (!found) return std::snprintf(out, size, " no slot-70 refusal recorded for this entry");
+        return std::snprintf(out, size, " last slot-70 refusal for this entry: %s, texture dim %u format %u %llux%u mips %u", entry.reason,
+                             static_cast<unsigned>(entry.dimension), entry.format, static_cast<unsigned long long>(entry.width),
+                             entry.height, entry.mips);
+    }
+
+private:
+    struct Entry {
+        const char* reason = "";
+        unsigned dimension = 0, format = 0;
+        std::uint64_t width = 0;
+        unsigned height = 0, mips = 0;
+    };
+    mutable SRWLOCK lock_ = SRWLOCK_INIT;
+    std::unordered_map<std::uint64_t, Entry> table_;
+};
 
 }  // namespace x2w_startup

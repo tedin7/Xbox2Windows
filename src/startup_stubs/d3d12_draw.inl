@@ -2977,8 +2977,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const auto cause = x2w_local::classify_null_binding(facts);
             count_null_binding(cause);
             if (cause == x2w_local::NullCause::unknown_token && token_null_census.note(tr->key)) {
-                char line[256];
-                x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
+                char line[384];
+                int used = x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
+                if (used > 0 && static_cast<std::size_t>(used) < sizeof(line))
+                    destination_refusals.describe(line + used, sizeof(line) - static_cast<std::size_t>(used), entry);
                 log("%s", line);
             }
             if (texture && resource && resource->own().drop_levels && desc.ViewDimension == dimension &&
