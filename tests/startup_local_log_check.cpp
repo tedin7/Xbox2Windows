@@ -655,7 +655,7 @@ void test_unmapped_no_faults()
         if (!(probe_zero && not_readable && refused_av && refused_any)) ++wrong_results;
         if (faults != 0) ++faulted;
         if (counted != 4) ++miscounted;
-        if (stable == 1) {
+        if (controls == 0) {  // retried until one control round survived the address-space churn
             // Control: the handler does see a real fault, so the zero above means something. Touch a freshly
             // released range directly, again only when it is verified free around the touch.
             void* const second = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -684,6 +684,33 @@ void test_unmapped_no_faults()
     check(faulted == 0, "free address space: zero first-chance exceptions in every judged round");
     check(miscounted == 0, "free address space: the four refusals of every judged round are counted");
     check(controls == 1 && control_faults == 1, "control: touching a verified-free range directly is one first-chance fault");
+}
+
+// A protected page before a free tail still faults in the touch loop, so the free tail is not an avoided fault.
+void test_protected_prefix_not_counted()
+{
+    constexpr std::size_t kPage = 0x1000;
+    bool judged = false;
+    for (int round = 0; round < 20 && !judged; ++round) {
+        void* const block = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+        if (!block) continue;
+        const auto base = reinterpret_cast<std::uintptr_t>(block);
+        x2w_local::forget_mapped_spans();
+        if (!range_is_free(base + kPage, kPage)) {
+            VirtualFree(block, 0, MEM_RELEASE);
+            continue;
+        }
+        const LONG before = x2w_local::faults_avoided;
+        const std::size_t got = x2w_local::probe_readable(base, 2 * kPage);
+        const LONG counted = x2w_local::faults_avoided - before;
+        const bool still_free = range_is_free(base + kPage, kPage);
+        VirtualFree(block, 0, MEM_RELEASE);
+        if (!still_free) continue;
+        judged = true;
+        check(got == 0, "a protected page before a free tail is not readable");
+        check(counted == 0, "a free tail behind a protected page is not counted as an avoided fault");
+    }
+    check(judged, "one round kept the free tail free to be judged");
 }
 
 }  // namespace
@@ -746,6 +773,7 @@ int main(int argc, char** argv)
     test_logf();
     test_probe_and_access(guard_drop_mutate);
     test_unmapped_no_faults();
+    test_protected_prefix_not_counted();
 
     if (cache_failure_mutate) {
         std::printf("startup_local_log cache-failure control: parent failures %d\n", failures);

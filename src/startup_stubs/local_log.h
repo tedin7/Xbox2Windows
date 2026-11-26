@@ -113,8 +113,11 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     std::uintptr_t at = start;
     // Free address space is refused without touching it; the touch below only sees mapped pages.
     const std::size_t mapped = mapped_prefix(start, bytes);
-    if (mapped < bytes) InterlockedIncrement(&faults_avoided);
-    if (mapped == 0) return 0;
+    const bool refused_tail = mapped < bytes;
+    if (mapped == 0) {
+        if (refused_tail) InterlockedIncrement(&faults_avoided);
+        return 0;
+    }
     const std::uintptr_t end = start + mapped;
     __try {
         volatile unsigned char sink = 0;
@@ -134,6 +137,9 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
         }
     }
     if (done < mapped) forget_mapped_spans();  // the span was cached, then freed or protected
+    // A free tail only counts as an avoided fault when the mapped prefix was walked without one: a protected page
+    // inside the prefix faults exactly as it did before the free tail was refused.
+    else if (refused_tail) InterlockedIncrement(&faults_avoided);
     return done;
 }
 
