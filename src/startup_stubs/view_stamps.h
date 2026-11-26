@@ -1,6 +1,6 @@
 #pragma once
 
-// Validity stamps for the translate-once view cache (pilot rules: when a cached translation of a descriptor must be dropped).
+// Validity stamps for the translate-once view cache (when a cached translation of a descriptor must be dropped).
 //
 // A cached translation was built from three things: the descriptor entry the title wrote (heap slot), the resource behind it,
 // and the heap the slot lives in. It is reusable only while none of them changed. Instead of erasing entries when an event
