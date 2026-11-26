@@ -32,6 +32,7 @@ def main(consumer, dxc, adapter):
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
         assert f'{key:016x}: ok' in out, out
+        env['X2W_TEST_BENCH_THREADS'] = os.environ.get('X2W_TEST_BENCH_THREADS', '1')
         got, result = dispatch(directory, consumer, env, 'dispatch-bench')
         expected = C.expected('A')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
