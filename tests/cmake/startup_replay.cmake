@@ -41,9 +41,8 @@ endfunction()
 function(x2w_replay_family_all)
     x2w_replay_family_scene(startup_view_dimension_device startup_view_dimension_@B@)
     # Copies and uploads (row c13): list copies, upload arena, arena lifetime, page reuse.
-    x2w_replay_family_scene(startup_list_copy startup_list_copy_@B@)
-    x2w_replay_family_scene(startup_upload_arena startup_upload_arena_@B@)
-    x2w_replay_family_scene(startup_upload_lifetime startup_upload_lifetime_@B@)
+    # Not family scenes (c13 Win2025 23:33): startup_list_copy makes its textures on the desktop device and the player crashes at seq 3
+    # (RTV on an unknown resource); startup_upload_arena and startup_upload_lifetime never reach the stand-in (no recording).
     x2w_replay_family_scene(startup_upload_page_reuse startup_upload_page_reuse_@B@)
     x2w_replay_family_scene(startup_list_copy_texture_warp startup_list_copy_texture_@B@)
     x2w_replay_family_scene(startup_resource_retire_views startup_resource_retire_views_@B@_debug0)
