@@ -362,6 +362,7 @@ def check_shell(shell):
         finished = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "60")
         assert finished.returncode == 0, (finished.stdout, finished.stderr)
         assert "finishing the translation: 1 request(s) pending" in finished.stdout, finished.stdout
+        assert "safe to stop now, results kept" in finished.stdout, finished.stdout
         assert "pending before 1, after 0; ok 2, refused 0 in total (0 new)" in finished.stdout, finished.stdout
         assert (fresh_cache / "aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
         assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"

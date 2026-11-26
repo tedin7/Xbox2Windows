@@ -12336,10 +12336,12 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
-        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
-        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        # --retry-lifted <dir> [seconds] [--jobs N]: before the title starts, the old refusals (lifted families first)
+        given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
+        seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
+        print(retry_lifted(out_dir, seconds, jobs=jobs).line(), flush=True)
         return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
@@ -12356,7 +12358,19 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp())
+    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+
+
+def jobs_argument(args):
+    """--jobs N among `args`: at most N workers, and never more than translation_jobs(); None when absent."""
+    if '--jobs' not in args:
+        return None
+    at = args.index('--jobs')
+    try:
+        wanted = int(args[at + 1])
+    except (IndexError, ValueError):
+        raise SystemExit('gfx2hlsl: --jobs needs a whole number')
+    return max(1, min(wanted, translation_jobs()))
 
 
 
@@ -12438,20 +12452,23 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
 
 
 def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
-    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
-    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
-    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
+    then graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
+    since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
+    family: a .fail's time does not prove which build wrote it (Run P kept a pixel MRTZ request refused by a stale
+    .fail although that build translates it), and those families are few."""
     rows = []
-    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
+    for order, key in enumerate(pending_keys(out_dir, False, None)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
-            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
-                continue
+            newer = since_translator is not None and os.path.getmtime(fail) >= since_translator
             with open(fail, encoding='utf-8', errors='replace') as handle:
                 reason = handle.readline()
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
+        if newer and not lifted:
+            continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
         rows.append((not lifted, compute, order, key, lifted))
     return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
@@ -12497,6 +12514,10 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    for key, result in results.items():
+        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+            with suppress(OSError):
+                os.remove(os.path.join(out_dir, '%016x.fail' % key))
     ok = sum(1 for result in results.values() if result == 'ok')
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
                        sum(1 for _key, lifted in rows if lifted))
