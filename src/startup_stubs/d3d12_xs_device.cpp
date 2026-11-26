@@ -2528,6 +2528,28 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
 // no recording can submit its bytes and every queue that used it has finished.
 
+volatile LONG64 upload_ring_reserved_bytes;
+volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled;
+
+struct UploadRingStats {
+    unsigned long long reserved_bytes = 0, capacity = 0;
+    long reservations = 0, refusals = 0, recycled = 0;
+    std::size_t chunks = 0;
+};
+UploadRingStats upload_ring_stats()
+{
+    UploadRingStats stats;
+    stats.reserved_bytes = static_cast<unsigned long long>(upload_ring_reserved_bytes);
+    stats.reservations = upload_ring_reservations;
+    stats.refusals = upload_ring_refusals;
+    stats.recycled = upload_ring_recycled;
+    AcquireSRWLockShared(&allocator_lock);
+    stats.chunks = upload_chunks.size();
+    for (const auto& chunk : upload_chunks) stats.capacity += chunk.capacity;
+    ReleaseSRWLockShared(&allocator_lock);
+    return stats;
+}
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
     constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
@@ -2542,6 +2564,8 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     AcquireSRWLockExclusive(&allocator_lock);
     const auto finish = [&](unsigned index) {
         active = index;
+        InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
+        InterlockedIncrement(&upload_ring_reservations);
         chunks[index].hold(list->own().upload_chunks, index);
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
@@ -2598,10 +2622,14 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            InterlockedIncrement(&upload_ring_recycled);
+            return finish(index);
+        }
     }
 
     ReleaseSRWLockExclusive(&allocator_lock);
+    InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity");
@@ -7378,12 +7406,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
@@ -7391,6 +7419,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     if (render_mode() && frame % 300 == 0) {
+        UploadRingStats ring = upload_ring_stats();
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
+            ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);

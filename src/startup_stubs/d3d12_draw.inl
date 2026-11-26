@@ -2744,6 +2744,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 static LONG copy_refused;
                 if (first_calls(copy_refused, 6))
                     log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+                count_null_binding(x2w_local::NullCause::ring_full);
                 ReleaseSRWLockExclusive(&draw_lock);
                 return not_drawn(buffer_copy_failed_site);
             }
@@ -2781,6 +2782,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             static LONG copy_refused;
             if (first_calls(copy_refused, 6))
                 log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+            count_null_binding(x2w_local::NullCause::ring_full);
             ReleaseSRWLockExclusive(&draw_lock);
             return not_drawn(buffer_copy_failed_site);
         }
