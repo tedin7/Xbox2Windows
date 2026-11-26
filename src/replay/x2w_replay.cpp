@@ -29,6 +29,7 @@
 #include <wrl/client.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -36,8 +37,10 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "replay_file.h"
@@ -534,15 +537,80 @@ bool parse(int argc, wchar_t** argv, Options& o)
     return true;
 }
 
-void write_summary(const Options& o, const Player& p, const Recording& r, double wall, bool stopped)
+using ReplayClock = std::chrono::steady_clock;
+using SlotKey = std::pair<std::uint16_t, std::uint16_t>;
+using Microseconds = std::chrono::duration<double, std::micro>;
+
+struct SlotTiming {
+    ReplayClock::duration total{}, interval{};
+    u64 calls = 0;
+};
+
+struct ReplayTiming {
+    std::map<SlotKey, SlotTiming> slots;
+    ReplayClock::time_point next_report;
+    u64 previous_played = 0, previous_presents = 0;
+
+    void add(const CallRecord& call, ReplayClock::duration duration)
+    {
+        auto& slot = slots[{call.kind, call.slot}];
+        slot.total += duration;
+        ++slot.calls;
+        slot.interval += duration;
+    }
+
+    void report(ReplayClock::time_point now, const Player& p)
+    {
+        if (now < next_report) return;
+        // A blocking call can cross multiple deadlines. Report its cost when it returns.
+        next_report += std::chrono::duration_cast<std::chrono::seconds>(now - next_report) + std::chrono::seconds(1);
+        std::vector<std::pair<SlotKey, ReplayClock::duration>> ranked;
+        for (auto& [key, timing] : slots) {
+            if (timing.interval.count() > 0) ranked.emplace_back(key, timing.interval);
+            timing.interval = {};
+        }
+        const std::size_t count = (std::min)(ranked.size(), std::size_t{5});
+        std::partial_sort(ranked.begin(), ranked.begin() + count, ranked.end(), [](const auto& a, const auto& b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        std::printf("x2w-replay timing calls %llu presents %llu top_us", p.played - previous_played,
+                    p.presents - previous_presents);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& [key, duration] = ranked[i];
+            std::printf(" %u:%u=%.3f", static_cast<unsigned>(key.first), static_cast<unsigned>(key.second),
+                        Microseconds(duration).count());
+        }
+        std::putchar('\n');
+        std::fflush(stdout);
+        previous_played = p.played;
+        previous_presents = p.presents;
+    }
+
+    void write_json(std::FILE* f) const
+    {
+        std::fprintf(f, ", \"slot_times\": [");
+        const char* separator = "";
+        for (const auto& [key, timing] : slots) {
+            std::fprintf(f, "%s{\"kind\": %u, \"slot\": %u, \"calls\": %llu, \"total_us\": %.3f}", separator,
+                         static_cast<unsigned>(key.first), static_cast<unsigned>(key.second), timing.calls,
+                         Microseconds(timing.total).count());
+            separator = ", ";
+        }
+        std::fprintf(f, "]");
+    }
+};
+
+void write_summary(const Options& o, const Player& p, const Recording& r, double wall, bool stopped,
+                   const ReplayTiming* timing)
 {
     const double fps = wall > 0 ? static_cast<double>(p.presents) / wall : 0;
     const std::wstring path = o.out + L"\\replay_summary.json";
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
-                        "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.3f, \"fps\": %.2f, \"argument_bytes\": %llu, "
+                        "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.*f, \"fps\": %.2f, \"argument_bytes\": %llu, "
                         "\"stopped_at_max_seconds\": %s, ",
-                     r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, wall, fps,
+                     r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, timing ? 9 : 3, wall, fps,
                      p.arena_bytes, stopped ? "true" : "false");
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
@@ -557,6 +625,7 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
             std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
                             "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
                          p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
+        if (timing) timing->write_json(f);
         std::fprintf(f, "}\n");
         std::fclose(f);
     }
@@ -627,6 +696,10 @@ void seed_shader_cache(const Recording& r)
 
 int run(const Options& o)
 {
+    // Read the player switch before applying settings from the recording.
+    wchar_t timing_switch[2]{};
+    const bool time_slots = GetEnvironmentVariableW(L"X2W_REPLAY_TIMING", timing_switch, 2) == 1
+                            && timing_switch[0] == L'1';
     CreateDirectoryW(o.out.c_str(), nullptr);
     const std::wstring log_path = o.out + L"\\stderr.txt";
     const HANDLE log = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -694,15 +767,25 @@ int run(const Options& o)
             break;
         }
     phase = "playing";
-    const auto started = std::chrono::steady_clock::now();
-    const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
+    const auto started = ReplayClock::now();
+    std::optional<ReplayTiming> timing;
+    if (time_slots) timing.emplace().next_report = started + std::chrono::seconds(1);
+    const auto elapsed = [&] { return std::chrono::duration<double>(ReplayClock::now() - started).count(); };
     bool stopped = false;
     for (const Step& s : r.steps) {
         if (o.max_seconds > 0 && elapsed() >= o.max_seconds) {
             stopped = true;
             break;
         }
-        play(p, r, s);
+        if (timing) {
+            const auto before = ReplayClock::now();
+            play(p, r, s);
+            const auto after = ReplayClock::now();
+            timing->add(s.call, after - before);
+            timing->report(after, p);
+        } else {
+            play(p, r, s);
+        }
     }
     current_step = nullptr;
     bool dump_ok = true;
@@ -723,7 +806,7 @@ int run(const Options& o)
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
-    write_summary(o, p, r, wall, stopped);
+    write_summary(o, p, r, wall, stopped, timing ? &*timing : nullptr);
     if (stopped) return 5;
     if (!dump_ok) return 2;
     return p.slot_result_mismatches ? 6 : 0;
