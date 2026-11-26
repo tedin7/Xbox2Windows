@@ -10997,6 +10997,33 @@ def mesh57_key(ms, ps, root):
     return value
 
 
+def kill_exit_block(pixel):
+    """True when the only null export of a decoded pixel stage is the early exit of a kill.
+
+    LLVM SILateBranchLowering and Mesa ACO place that exit after the program's s_endpgm: the block is
+    `exp null off, off, off, off done vm` then the final s_endpgm, and every branch into it enters with EXEC zero,
+    so the export writes nothing. The stage's other lanes end at the earlier s_endpgm. An entry is s_cbranch_execz,
+    or the demote form: s_cbranch_scc0 directly after `s_cselect exec, exec, 0` (s_cselect leaves SCC, so the taken
+    branch follows the select of 0) with no branch landing on the s_cbranch_scc0 itself."""
+    at = [i for i, (_, _, op, a) in enumerate(pixel) if op == 'exp' and a.split()[1] == 'null']
+    if len(at) != 1 or at[0] != len(pixel) - 2 or pixel[at[0] - 1][2] != 's_endpgm':
+        return False
+    if pixel[at[0]][3] != 'exp null off, off, off, off done vm':
+        return False
+    label = 'label_0x%x' % pixel[at[0]][0]
+    end = 'label_0x%x' % pixel[-1][0]
+    targets = {a.split()[-1] for _, _, op, a in pixel if op.startswith('s_cbranch') or op == 's_branch'}
+    entries = [i for i, (_, _, _, a) in enumerate(pixel) if a.split()[-1:] in ([label], [end])]
+
+    def zero_exec(i):
+        if pixel[i][2] == 's_cbranch_execz':
+            return True
+        return (pixel[i][2] == 's_cbranch_scc0' and i > 0
+                and pixel[i - 1][3] in ('s_cselect_b64 exec, exec, 0', 's_cselect_b32 exec_lo, exec_lo, 0')
+                and 'label_0x%x' % pixel[i][0] not in targets)
+    return bool(entries) and all(zero_exec(i) for i in entries)
+
+
 def translate_mesh57(out_dir, key):
     """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
 
@@ -11021,7 +11048,8 @@ def translate_mesh57(out_dir, key):
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
         # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
-        if 'null' in targets and not null_only:
+        # A colour stage may also hold the null export as the early exit of a kill (kill_exit_block).
+        if 'null' in targets and not null_only and not kill_exit_block(pixel):
             raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]

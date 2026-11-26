@@ -35,6 +35,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
+#include "startup_stubs/upload_reservation.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
@@ -2461,26 +2462,18 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     return pipeline;
 }
 
-// Transient data the title addresses by GPU address (fetch tables, vertices, constants) is copied
-// from its memory into a desktop upload buffer; the copy's GPU address is bound instead.
-// Chunks start at 16 MiB and append on demand (doubling up to the 256 MiB total cap), staying alive
-// for the process so previously returned (ID3D12Resource*, offset) and GPU virtual addresses remain valid.
-struct UploadRingChunk {
-    ID3D12Resource* resource = nullptr;
-    unsigned char* mapped = nullptr;
-    u64 capacity = 0;
-    u64 used = 0;
-};
+// Transient guest data is copied into mapped upload chunks. Chunks grow from
+// 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
+// refuses new reservations rather than reusing storage without completion.
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+UploadReservation reserve_upload_ring(std::size_t bytes)
 {
     constexpr u64 initial_chunk_bytes = u64{16} << 20;
     constexpr u64 max_total_bytes = u64{256} << 20;
     constexpr u64 max_alloc_bytes = max_total_bytes / 4;
-    if (resource) *resource = nullptr;
-    if (offset) *offset = 0;
-    if (bytes == 0 || bytes > max_alloc_bytes) return nullptr;
-    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
+    UploadReservation reservation;
+    if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
+    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
     static SRWLOCK lock = SRWLOCK_INIT;
     static std::vector<UploadRingChunk> chunks;
@@ -2488,18 +2481,12 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
     static u64 total_bytes = 0;
 
     AcquireSRWLockExclusive(&lock);
-    auto finish = [&](UploadRingChunk& chunk, u64 start) -> unsigned char* {
-        if (offset) *offset = start;
-        if (resource) *resource = chunk.resource;
-        ReleaseSRWLockExclusive(&lock);
-        return chunk.mapped + start;
-    };
-
-    if (!chunks.empty() && chunks[active].used + rounded <= chunks[active].capacity) {
-        UploadRingChunk& chunk = chunks[active];
-        const u64 start = chunk.used;
-        chunk.used += rounded;
-        return finish(chunk, start);
+    if (!chunks.empty()) {
+        reservation = reserve_upload_chunk(chunks[active], rounded);
+        if (reservation.mapped) {
+            ReleaseSRWLockExclusive(&lock);
+            return reservation;
+        }
     }
 
     const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
@@ -2525,10 +2512,12 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
                 auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
                 if (SUCCEEDED(created->Map(0, nullptr, &base))) {
                     try {
-                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, rounded});
+                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
                         active = chunks.size() - 1;
-                        return finish(chunks[active], 0);
+                        reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        ReleaseSRWLockExclusive(&lock);
+                        return reservation;
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
                         if (budget) budget->end_use();
@@ -2541,18 +2530,32 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
             }
         }
     }
-
-    for (std::size_t step = 1; step <= chunks.size(); ++step) {
-        const std::size_t idx = (active + step) % chunks.size();
-        if (chunks[idx].capacity >= rounded) {
-            active = idx;
-            chunks[idx].used = rounded;
-            return finish(chunks[idx], 0);
+    // Allocation failed or the cap was reached. Older unused tails are still safe.
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        reservation = reserve_upload_chunk(chunks[index], rounded);
+        if (reservation.mapped) {
+            active = index;
+            ReleaseSRWLockExclusive(&lock);
+            return reservation;
         }
     }
 
     ReleaseSRWLockExclusive(&lock);
-    return nullptr;
+    static LONG refused;
+    if (first_calls(refused, 8))
+        log("x2w-draw upload ring reservation refused: no unused capacity");
+    return reservation;
+}
+
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+{
+    if (resource) *resource = nullptr;
+    if (offset) *offset = 0;
+    const UploadReservation reservation = reserve_upload_ring(bytes);
+    if (!reservation.mapped) return nullptr;
+    if (offset) *offset = reservation.offset;
+    if (resource) *resource = reservation.resource;
+    return reservation.mapped;
 }
 
 bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
