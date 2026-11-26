@@ -5178,6 +5178,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
             "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_xg_bc_chain_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # The same draw with a 1 MiB upload ring: a level of the chain is larger than a quarter of it, so the ring refuses every
+        # level and the texture would stay empty; the chain fills a buffer of its own instead.
+        add_test(NAME startup_xg_bc_chain_small_ring_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "X2W_TEST_UPLOAD_RING_MAX_KIB=1024"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
+            "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_xg_bc_chain_small_ring_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_xg_bc_array_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_array_check.py"
             "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
