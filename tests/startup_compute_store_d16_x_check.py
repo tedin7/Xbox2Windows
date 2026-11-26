@@ -530,19 +530,21 @@ def check_controls():
     ):
         refused(frag, lambda o=bad_ops, m=bad_mods: cs.op_buffer_store_format_d16_x(o, m))
 
-    # 6. Modified descriptor refusals (including stride clear), load+store reuse, missing local reload.
+    # 6. Descriptor validation, mixed buffer binding and missing local reload.
     for inserted, frag in (
         ('800392be', 'modified descriptor'),                 # s_mov_b32 s18, 0
         ('800393be', 'modified descriptor'),                 # s_mov_b32 s19, 0
         ('11ff1187ffff00c0', 'modified descriptor'),         # s_and_b32 s17, s17, 0xc000ffff (stride clear)
         ('10841080', 'modified descriptor'),                 # s_add_u32 s16, s16, 4
-        ('000082bf', 'local table load'),                    # s_branch +0 without local reload
+        ('010082bf000080bf', 'local table load'),                    # s_branch +0 without local reload
     ):
         refused(frag, lambda ins=inserted: translate('F', code=patch(WORDS_F, store_f, ins + store_f)).hlsl_cs())
 
     store_on_read = encode_mubuf(MUBUF_STORE_FORMAT_D16_X, 5, 0, 12, 0x80, idxen=True, offset=4).hex()
-    refused('used for a load and a store',
-            lambda: translate('F', code=patch(WORDS_F, store_f, store_on_read)).hlsl_cs())
+    alias = translate('F', code=patch(WORDS_F, store_f, store_on_read))
+    hlsl = alias.hlsl_cs()
+    assert 'u0.Load(' in hlsl and 'store_format_d16_x(u0,' in hlsl, hlsl
+    assert 'uav 0 table 1 0' in alias.manifest() and 'srv ' not in alias.manifest(), alias.manifest()
 
     # Negative self-check: disabling the handler refuses Case F cleanly.
     saved = G.Stage.op_buffer_store_format_d16_x

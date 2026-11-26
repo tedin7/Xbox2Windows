@@ -379,13 +379,17 @@ def check_controls():
         (encode_mubuf(MUBUF_STORE_FORMAT_XYZW, 4, 0, 16, 0x80, idxen=True, lds=True).hex(), 'illegal MUBUF encoding'),
         (encode_mubuf(MUBUF_STORE_FORMAT_XYZW, 4, 0, 16, 0x80, idxen=True, w0_rsvd=True).hex(), 'illegal MUBUF'),
         (encode_mubuf(MUBUF_STORE_FORMAT_XYZW, 4, 0, 16, 0x80, idxen=True, w1_rsvd=True).hex(), 'illegal MUBUF'),
-        (encode_mubuf(MUBUF_STORE_FORMAT_XYZW, 4, 0, 12, 0x80, idxen=True).hex(), 'used for a load and a store'),
     ):
         refused(fragment, lambda hw=hex_word: translate('X', code=patch(WORDS_X, STORE_X, hw)).hlsl_cs())
+    store_on_read = encode_mubuf(MUBUF_STORE_FORMAT_XYZW, 4, 0, 12, 0x80, idxen=True).hex()
+    alias = translate('X', code=patch(WORDS_X, STORE_X, store_on_read))
+    hlsl = alias.hlsl_cs()
+    assert 'u0.Load(' in hlsl and 'store_format_xyzw(u0,' in hlsl, hlsl
+    assert 'uav 0 table 1 0' in alias.manifest() and 'srv ' not in alias.manifest(), alias.manifest()
     for inserted, fragment in (('800392be', 'modified descriptor'),              # s_mov_b32 s18, 0
                                ('11ff1187ffff00c0', 'modified descriptor'),      # s_and_b32 s17, s17, 0xc000ffff
                                ('10841080', 'modified descriptor'),              # s_add_u32 s16, s16, 4
-                               ('000082bf', 'local table load')):                # s_branch +0, no local reload
+                               ('010082bf000080bf', 'local table load')):                # s_branch over s_nop, no local reload
         refused(fragment, lambda i=inserted: translate('X', code=patch(WORDS_X, STORE_X, i + STORE_X)).hlsl_cs())
     for kind in ('ps', 'vs'):  # outside compute: the unknown-op refusal, the bare mnemonic
         stage = G.Stage.__new__(G.Stage)

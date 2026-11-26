@@ -409,14 +409,17 @@ def controls(llvm_mc):
     stage.kind = 'ps'
     refused('buffer_atomic_add', lambda: stage.buffer_atomic('buffer_atomic_add', ['v2', 'v0', 's[16:19]', '0'], ['offen']))
 
-    # Modified and aliased descriptor refusals.
+    # Descriptor validation and mixed buffer binding.
     mod_prefix = HEAD + bytes.fromhex('11ff118800000400')  # s_or_b32 s17, s17, 0x40000
     refused('modified descriptor', lambda: cs_pipe(single_atomic_code('add', prefix=mod_prefix)))
     refused('holding None', lambda: cs_pipe(single_atomic_code('add', srsrc=20)))
     refused('holding', lambda: cs_pipe(single_atomic_code('add')).cs.buffer_atomic(
         'buffer_atomic_add', ['v2', 'v0', 's[17:20]', '0'], ['offen']))
     alias_prefix = HEAD + bytes.fromhex('001030e000050480')  # buffer_load_dword v5, v0, s[16:19], 0 offen
-    refused('used for a load and a store', lambda: cs_pipe(single_atomic_code('add', prefix=alias_prefix)))
+    alias = cs_pipe(single_atomic_code('add', prefix=alias_prefix))
+    hlsl = alias.hlsl_cs()
+    assert 'u0.Load(' in hlsl and 'u0.InterlockedAdd(' in hlsl, hlsl
+    assert 'uav 0 table 1 32' in alias.manifest() and 'srv ' not in alias.manifest(), alias.manifest()
 
     # Out-of-scope atomics (inc/dec/float/64-bit) stay strictly refused by name.
     for op_name, opcode in UNSUPPORTED_ATOMICS.items():

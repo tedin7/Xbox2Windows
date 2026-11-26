@@ -4134,7 +4134,7 @@ class Stage:
                     elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
-                    if refusals is None:
+                    if refusals is None or (isinstance(reason, ReadWriteBuffer) and reason.lowerable):
                         if self.has_branches and ('read_vcc', None) in self.vcc_events.get(off, ()):
                             # Some operand handlers refuse VCC before emitting code. Check whether
                             # a path to this instruction has already overwritten the mask.
@@ -6872,8 +6872,8 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = self.pipe.ud(('stride', self.srv_index(key)))
-            terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
+            stride = self.buffer_load_stride(key)
+            terms.append('%s * %s' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
             if key in self.pipe.modified:
@@ -6881,8 +6881,8 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.srv_index(key)))
-            terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
+            stride = self.buffer_load_stride(key)
+            terms.append('%s * %s' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
@@ -7082,7 +7082,7 @@ class Stage:
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
         terms.append(str(offset))
-        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        return data, self.pipe.uav(key, 'raw'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -7290,11 +7290,14 @@ class Stage:
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
 
-    def srv_index(self, key):
-        """The read-only slot of a buffer descriptor, for the stride and word 3 the runtime supplies with it. A compute
-        descriptor the program also stores through has none (it is one RW view)."""
+    def buffer_load_stride(self, key):
         if key in getattr(self.pipe, 'rw_keys', ()):
-            raise Unsupported('indexed or formatted load through a read-write descriptor %s' % (key,))
+            index = self.pipe.uavs[key]['index']
+            # The runtime supplies all of DW1[31:16] for formatted stores.
+            return '(ud%d & 0x3fffu)' % self.pipe.ud(('uav_stride', index))
+        return 'ud%d' % self.pipe.ud(('stride', self.srv_index(key)))
+
+    def srv_index(self, key):
         return self.pipe.resources[key]['index']
 
     @staticmethod
@@ -7471,7 +7474,7 @@ class Stage:
         descriptor or from the title's typed buffer view (src/startup_stubs/buffer_format_word3.h) and refuses the
         draw when it has none or the FORMAT has no case here, so the default arm is not reached from a draw.
         For compute, the caller must validate the native descriptor and reachable byte addresses, and bind the
-        SRV and entry constants from that same descriptor snapshot.
+        buffer view and entry constants from that same descriptor snapshot.
         """
         buf, address = self.buffer_address(ops, mods)
         dst = reg_range(ops[0])
@@ -7488,7 +7491,11 @@ class Stage:
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
         if self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
+        key = self.descriptor(ops[2])
+        if key in getattr(self.pipe, 'rw_keys', ()):
+            word3 = 'ud%d' % self.pipe.ud(('uav_descword3', self.pipe.uavs[key]['index']))
+        else:
+            word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
@@ -11240,7 +11247,7 @@ class Pipeline:
     def stored_images(self):
         return self.uavs or {}
 
-    def uav(self, key, kind, rw=False):
+    def uav(self, key, kind):
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
         if self.uavs is None:
@@ -11869,7 +11876,7 @@ class ComputePipeline(Pipeline):
                 self.retry_entry_exec = True
 
     def _lower_read_write(self, conflict):
-        if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
+        if not conflict.lowerable:
             raise conflict
         self.rw_keys.add(conflict.key)
 
@@ -11877,7 +11884,6 @@ class ComputePipeline(Pipeline):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
         if refusals is not None:
@@ -11888,17 +11894,18 @@ class ComputePipeline(Pipeline):
         if key in self.rw_keys and kind == 'buf':
             return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
-            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
+            raise self.read_write_conflict(key, kind, self.uavs[key]['kind'])
         return super().resource(key, kind)
 
-    def uav(self, key, kind='raw', rw=False):
-        # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
-        # atomics keep the refusal.
+    def uav(self, key, kind='raw'):
         if key in self.resources:
-            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
-        if rw:
-            self.plain_stored.add(key)
+            raise self.read_write_conflict(key, self.resources[key]['kind'], kind)
         return super().uav(key, kind)
+
+    def read_write_conflict(self, key, read_kind, write_kind):
+        lowerable = (read_kind == 'buf' and write_kind == 'raw' and key[0][0] == 'table' and key[1] is not None
+                     and key not in self.rw_keys and len(self.rw_keys) < 8)
+        return ReadWriteBuffer(key, lowerable)
 
     def stored_images(self):
         return {key: r for key, r in self.uavs.items() if r['kind'] != 'raw'}
@@ -12937,7 +12944,7 @@ def raise_site(error):
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
-    ('rw-buffer', r'used for a load and a store'),
+    ('rw-buffer', r'used for a load and a store|indexed or formatted load through a read-write descriptor'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
     ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
