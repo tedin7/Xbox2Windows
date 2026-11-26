@@ -663,21 +663,9 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     desc.Alignment = 0;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     view.Format = desc.Format;
-    if (!desktop_address_view_supported(device, desc, view)) {
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        if (!desktop_address_view_supported(device, desc, view)) return nullptr;
-        // The view must agree with the desktop resource and the consuming shader declaration.
-        if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D) {
-            const auto one = view.Texture1D;
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            view.Texture2D = {one.MostDetailedMip, one.MipLevels, 0, one.ResourceMinLODClamp};
-        } else {
-            const auto one = view.Texture1DArray;
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-            view.Texture2DArray = {one.MostDetailedMip, one.MipLevels, one.FirstArraySlice, one.ArraySize,
-                                   0, one.ResourceMinLODClamp};
-        }
-    }
+    // No 2D stand-in: a translated draw binds a null view when a Texture1D shader meets a non-1D desktop resource
+    // (wrong_1d_resource in draw_translated), so a 2D fallback would only turn a refusal into a black draw.
+    if (!desktop_address_view_supported(device, desc, view)) return nullptr;
 
     auto* const desktop = device_of(device);
     const x2w_startup::SliceFootprints plan(desktop, desc, desc.MipLevels);
