@@ -73,9 +73,8 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return x2w_startup::supports_buffer_memory_srv(r, v);
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
-        static const bool enabled = x2w_local::env_on("X2W_PLACED_SRV_1D");
         const auto format = desktop_format(r.Format);
-        if (!enabled || !r.Width || r.Height != 1 || !r.DepthOrArraySize ||
+        if (!placed_srv_1d_enabled() || !r.Width || r.Height != 1 || !r.DepthOrArraySize ||
             r.SampleDesc.Count != 1 || r.SampleDesc.Quality != 0 ||
             (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             v.Format != r.Format || format == DXGI_FORMAT_UNKNOWN ||

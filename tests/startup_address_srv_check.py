@@ -93,24 +93,34 @@ def check(directory, consumer, backend):
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
     check_refusal_lines(trap_log.read_text(errors="replace"))
     print(f"{backend}: ordinary view, alternating addresses, zero/interior/mismatched updates; all 32 RGBA pixels exact")
-    if backend == "warp":
-        one_d = directory / "texture1d"
+    for array in (False, True):
+        one_d = directory / ("texture1d_array" if array else "texture1d")
         one_d.mkdir()
-        return check_1d(one_d, consumer, backend)
+        check_1d(one_d, consumer, backend, array)
     return 0
 
 
-def check_1d(directory, consumer, backend):
-    hlsl = """Texture1D<float> ramp : register(t0);
+def check_1d(directory, consumer, backend, array):
+    shape = "Texture1DArray" if array else "Texture1D"
+    coord = "float2(p.x / 8.0, 0)" if array else "p.x / 8.0"
+    hlsl = f"""{shape}<float> ramp : register(t0);
 SamplerState point_sampler : register(s0);
-float4 main(float4 p : SV_Position) : SV_Target {
-    return float4(ramp.SampleLevel(point_sampler, p.x / 8.0, 0), 0, 0, 1);
-}
+float4 main(float4 p : SV_Position) : SV_Target {{
+    uint row = uint(p.y);
+    uint lod = row < 3 ? row : (uint(p.x) & 1);
+    return float4(ramp.SampleLevel(point_sampler, {coord}, lod), 0, 0, 1);
+}}
 """
+    modes = {"X2W_TEST_ADDRESS_SRV_1D": "1"}
+    kind = "tex1da" if array else "tex1d"
+    if array:
+        modes["X2W_TEST_ADDRESS_SRV_1D_ARRAY"] = "1"
     env, args, output = prepare_draw_cache(
-        directory, consumer, hlsl, {"X2W_TEST_ADDRESS_SRV_1D": "1"},
-        "srv 0 tex1d table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
+        directory, consumer, hlsl, modes,
+        f"srv 0 {kind} table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
     )
+    if not array:
+        env.pop("X2W_TEST_ADDRESS_SRV_1D_ARRAY", None)
     env.pop("X2W_PLACED_SRV_1D", None)
     for enabled in (False, True):
         if enabled:
@@ -120,21 +130,17 @@ float4 main(float4 p : SV_Position) : SV_Target {
         print(result.stdout, end="")
         if result.returncode:
             raise RuntimeError(f"1D consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
-        expected = bytes(channel for _ in range(4) for x in range(8)
-                         for channel in (16 + 24 * x if enabled else 0, 0, 0, 255))
+        expected = bytes(channel for mip in (0, 1, 2, 1) for x in range(8)
+                         for channel in (16 + 48 * mip + 6 * (x >> mip) + 96 * array if enabled else 0,
+                                         0, 0, 255))
         actual = output.read_bytes()
         if actual != expected:
-            raise AssertionError(f"1D switch={enabled}: actual {actual.hex()} expected {expected.hex()}")
+            raise AssertionError(f"{shape} switch={enabled}: actual {actual.hex()} expected {expected.hex()}")
         refused = sum("Device::slot70" in line and "reason=unsupported_description" in line
                       for line in result.stderr.splitlines())
         if refused != (1 if enabled else 3):
-            raise AssertionError(f"1D switch={enabled}: unexpected refusal count {refused}\n{result.stderr[-5000:]}")
-        for layers in (1, 2):
-            marker = f"slot 70 texture1d layers={layers} descriptor_changed={int(enabled)}"
-            if marker not in result.stdout.splitlines():
-                raise AssertionError(f"missing descriptor check {marker!r}")
-    print(f"{backend}: 1D ramp and unset switch control; all 32 RGBA pixels exact per case")
-    return 0
+            raise AssertionError(f"{shape} switch={enabled}: unexpected refusal count {refused}\n{result.stderr[-5000:]}")
+    print(f"{backend}: {shape} full chain and restricted mip, enabled and unset; 32 RGBA pixels exact per case")
 
 
 if __name__ == "__main__":

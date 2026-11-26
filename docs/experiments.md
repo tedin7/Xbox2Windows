@@ -16149,11 +16149,13 @@ With `X2W_PLACED_SRV_1D=1`, slot 70 also accepts matching typed 1D and
 default component mapping, zero minimum LOD clamp and mip and slice ranges within
 the resource. The switch defaults to off.
 
-The WARP case also samples eight synthetic R8 ramp texels at their centers with
-`Texture1D.SampleLevel` and compares all 32 RGBA pixels with a CPU reference.
-With the switch unset, both view shapes are refused and the draw reads zeros from
-the seeded null descriptor. The enabled case also checks 1D-array descriptor
-publication and verifies that an out-of-range slice update preserves it.
+Both backends also sample synthetic R8 textures with widths 8, 4 and 2
+using `SampleLevel`. For each of the 1D and 1D-array shapes, the test compares
+32 RGBA pixels with a CPU reference. It samples all three mips, then samples
+relative LODs 0 and 1 through a one-mip view starting at mip 1. The array view
+selects the second slice, whose ramp differs from the first. An out-of-range
+update must preserve the restricted view. With the switch unset, both shapes
+read zeros from the seeded null descriptor.
 
 ```powershell
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim

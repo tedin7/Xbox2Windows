@@ -50,59 +50,66 @@ bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word ad
 
 int draw_1d_address_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
+    const bool array = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV_1D_ARRAY", nullptr, 0) != 0;
+    const UINT layers = array ? 2 : 1;
+    constexpr UINT16 mips = 3;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 8, 1,
+        static_cast<UINT16>(layers), mips, DXGI_FORMAT_R8_UNORM, {1, 0},
+        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[mips]{};
+    UINT64 bytes = 0;
+    desktop->GetCopyableFootprints(&desc, 0, mips, 0, footprints, nullptr, nullptr, &bytes);
+    if (!bytes || bytes == ~UINT64{0}) return 40;
+    // The placed-memory layout starts each array slice on a 64 KiB boundary.
+    const UINT64 stride = (bytes + 0xFFFF) & ~UINT64{0xFFFF};
+    static std::vector<unsigned char> backing;
+    backing.resize(static_cast<std::size_t>(stride * layers));
+    for (UINT layer = 0; layer < layers; ++layer)
+        for (UINT mip = 0; mip < mips; ++mip)
+            for (UINT x = 0; x < (desc.Width >> mip); ++x)
+                backing[layer * stride + footprints[mip].Offset + x] =
+                    static_cast<unsigned char>(16 + 48 * mip + 6 * x + 96 * layer);
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 41;
     Word cpu = 0;
-    if (!bind_view_table(guest, list, cpu, 2)) return 42;
-    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if (stride < 32) return 42;
+    if (!bind_view_table(guest, list, cpu)) return 42;
 
-    static std::vector<unsigned char> backing[2];
-    for (UINT layers : {1u, 2u}) {
-        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 8, 1,
-            static_cast<UINT16>(layers), 1, DXGI_FORMAT_R8_UNORM, {1, 0},
-            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};
-        UINT64 bytes = 0;
-        desktop->GetCopyableFootprints(&desc, 0, layers, 0, footprints, nullptr, nullptr, &bytes);
-        if (!bytes || bytes == ~UINT64{0}) return 40;
-        auto& texels = backing[layers - 1];
-        texels.resize(static_cast<std::size_t>(bytes));
-        for (UINT layer = 0; layer < layers; ++layer)
-            for (UINT x = 0; x < desc.Width; ++x)
-                texels[footprints[layer].Offset + x] = static_cast<unsigned char>(16 + 24 * x + 8 * layer);
-        void* placed = nullptr;
-        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(texels.data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                               0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 41;
-        const Word slot = cpu + (layers - 1) * stride;
-        ViewAt view{};
-        view.address = ptr(texels.data());
-        view.view.Format = desc.Format;
-        view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (layers == 1) {
-            view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
-            view.view.Texture1D.MipLevels = 1;
-        } else {
-            view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
-            view.view.Texture1DArray = {0, 1, 1, 1, 0};
-        }
-        invoke(guest, 18, 0, ptr(&view.view), slot);
-        const auto* descriptor = reinterpret_cast<const void*>(slot);
-        std::array<unsigned char, 32> previous;
-        std::memcpy(previous.data(), descriptor, previous.size());
-        invoke(guest, 70, ptr(&desc), ptr(&view), slot);
-        std::printf("slot 70 texture1d layers=%u descriptor_changed=%d\n", layers,
-                    std::memcmp(previous.data(), descriptor, previous.size()) != 0);
-        if (layers == 2) {
-            // The second slot is outside the draw's table entry. Check that a
-            // slice range extending beyond the placed array leaves it intact.
-            std::memcpy(previous.data(), descriptor, previous.size());
-            view.view.Texture1DArray.ArraySize = 2;
-            invoke(guest, 70, ptr(&desc), ptr(&view), slot);
-            if (std::memcmp(previous.data(), descriptor, previous.size()) != 0) return 43;
-        }
+    ViewAt view{};
+    view.address = ptr(backing.data());
+    view.view.Format = desc.Format;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (array) {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        view.view.Texture1DArray = {0, mips, 1, 1, 0};
+    } else {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.view.Texture1D = {0, mips, 0};
     }
-    const D3D12_RECT full{0, 0, 8, 4};
-    invoke(list, 22, 1, ptr(&full));
-    invoke(list, 12, 3, 1);
+    invoke(guest, 18, 0, ptr(&view.view), cpu);
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+
+    const auto draw_rows = [&](LONG top, LONG bottom) {
+        const D3D12_RECT rect{0, top, 8, bottom};
+        invoke(list, 22, 1, ptr(&rect));
+        invoke(list, 12, 3, 1);
+    };
+    draw_rows(0, 3);
+
+    // Relative LODs 0 and 1 must both resolve to resource mip 1 in this one-level view.
+    if (array) view.view.Texture1DArray = {1, 1, 1, 1, 0};
+    else view.view.Texture1D = {1, 1, 0};
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+
+    // A refused update must leave the restricted view in place.
+    if (array) view.view.Texture1DArray.ArraySize = 2;
+    else view.view.Texture1D.MipLevels = mips;
+    const auto* slot = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), slot, previous.size());
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+    if (std::memcmp(previous.data(), slot, previous.size()) != 0) return 43;
+    draw_rows(3, 4);
     return 0;
 }
 
