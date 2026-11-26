@@ -497,6 +497,17 @@ def check_shell(shell):
         assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "1" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
         assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
         assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
+        # -Matrix indirect: two legs, the second with translated indirect draws on
+        ind = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "indirect", "-Seconds", "200")
+        assert ind.returncode == 0, (ind.stdout[-1500:], ind.stderr[-800:])
+        ind_zip = sorted((tree / "out" / "tester").glob("report_matrix_indirect_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(ind_zip) as z:
+            ind_top = json.loads(z.read("matrix_manifest.json").decode("utf-8-sig"))
+            ind_names = z.namelist()
+        assert sorted(ind_top["runs"]) == ["a", "b"] and "run_c/manifest.json" not in ind_names, ind_top["runs"].keys()
+        assert "X2W_TRANSLATED_INDIRECT_DRAW" not in ind_top["runs"]["a"]["env"] and ind_top["runs"]["b"]["env"].get("X2W_TRANSLATED_INDIRECT_DRAW") == "1", ind_top["runs"]
+        assert not os.environ.get("X2W_TRANSLATED_INDIRECT_DRAW"), "the matrix must not leave its switch in this environment"
+        assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
