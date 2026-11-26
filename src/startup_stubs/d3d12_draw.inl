@@ -1584,10 +1584,18 @@ struct BigBindingCounts {
 };
 BigBindingCounts big_binding_counts;
 
+// X2W_TEST_BIGBIND_NO_RESET=1 (fixtures only): the cache is not dropped at Present, so a later frame reads the first frame's
+// bytes. The control of startup_frame_copy_once: the second frame must then show the old colour.
+bool bigbind_no_reset_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_BIGBIND_NO_RESET", nullptr, 0) != 0;
+    return on;
+}
+
 void finish_bigbind_frame(LONG frame)
 {
-    big_bindings.clear();
-    if (big_binding_chunks) {
+    if (!bigbind_no_reset_mutant()) big_bindings.clear();
+    if (big_binding_chunks && !bigbind_no_reset_mutant()) {
         AcquireSRWLockExclusive(&allocator_lock);
         discard_upload_chunks(big_binding_chunks, upload_chunks.data());
         big_binding_chunks = 0;

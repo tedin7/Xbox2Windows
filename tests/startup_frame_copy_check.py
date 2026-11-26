@@ -83,6 +83,16 @@ def check_once(directory, consumer, backend):
     if frames != expected_frames:
         raise AssertionError(f"once: frame counters {frames!r}, expected {expected_frames!r}")
     print(f"{backend} once: 32 pixels exact, 1 trim and 1 full 16 MiB copy per frame, 3 hits per frame")
+    # Control: with the reset at Present broken, the second frame reuses the first frame's snapshot and must show the old colour
+    # (red in all eight columns), which proves the check above catches a cache that outlives its frame.
+    folder = directory / "no_reset"
+    folder.mkdir()
+    pixels = draw_texture(folder, consumer, backend, shader, {
+        "X2W_TEST_FRAME_COPY": "once", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", "X2W_TEST_BIGBIND_NO_RESET": "1",
+    }, binding="srv 0 buf table 0 0")
+    if pixels != RED * 8 * 4:
+        raise AssertionError(f"once, no reset at Present: actual {pixels.hex() if pixels else pixels} expected all red")
+    print(f"{backend} once, no reset at Present (mutant): second frame shows the old bytes, as the control expects")
     return 0
 
 
