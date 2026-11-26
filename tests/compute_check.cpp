@@ -574,18 +574,15 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     std::ifstream source(reference, std::ios::binary);
     source.read(reinterpret_cast<char*>(&groups), sizeof(groups));
     source.read(reinterpret_cast<char*>(&mip), sizeof(mip));
-    const UINT selector = groups & texture_format_mask;
+    const bool uav_load = (groups & texture_uav_load_flag) != 0;
+    const UINT selector = groups & (texture_format_mask & ~texture_uav_load_flag);
     groups &= ~texture_format_mask;
-    DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
+    DXGI_FORMAT format = uav_load ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
     D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
     switch (selector) {
     case 0: break;
     case texture_rgba32_float_flag: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
-    case texture_uav_load_flag:
-        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-        break;
     case texture_1d_flag:
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         dimension = D3D12_UAV_DIMENSION_TEXTURE1D;
@@ -624,9 +621,13 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         break;
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
-    const bool uav_load = selector == texture_uav_load_flag;
+    if (uav_load) {
+        if (format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+            throw std::runtime_error("Typed load fixture requires RGBA32 float");
+        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+    }
     const bool one_dimensional = dimension == D3D12_UAV_DIMENSION_TEXTURE1D;
-    const bool separate_srv = selector == texture_rgba32_float_flag || one_dimensional;
+    const bool separate_srv = !uav_load && (selector == texture_rgba32_float_flag || one_dimensional);
     const bool layered = dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY || dimension == D3D12_UAV_DIMENSION_TEXTURE3D;
     const bool half_image = selector == texture_rgba16_float_flag;
     const UINT words_per_texel = texture_words_per_texel(format);

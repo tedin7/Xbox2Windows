@@ -8090,14 +8090,14 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute, a full 2D-array texel.
+        """Write the selected channels of a typed image texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. HLSL's typed UAV store writes every channel of the view, so only DMASK 0xf is exact here;
-        a partial mask would need a read-modify-write and is refused. The data is stored as float4, so the
-        bound view must be of a float or normalized format (the runtime side is not part of this lowering).
+        registers. A partial mask uses a typed UAV load to preserve the other channels. This assumes that
+        each active lane owns its texel, including across groups, for the duration of the read-modify-write.
+        The bound float or normalized view must support typed UAV stores and, for partial masks, loads.
         The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
         from helper lanes as the hardware drops them for lanes outside exec.
         """
@@ -8139,10 +8139,7 @@ class Stage:
         # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
         # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
         channels = [i for i in range(4) if mask >> i & 1]
-        if self.kind != 'ps' and mask != 0xf:
-            # Proven by readback in the pixel stage only; a compute store keeps the refusal.
-            raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
-        if not channels or mask > 0xf or (d16 and mask != 0xf):
+        if not channels or mask > 0xf or (self.kind == 'cs' and mask < 0) or (d16 and mask != 0xf):
             raise Unsupported('%s with dmask %s: %s' % (
                 name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
                 else 'no channel selected or out of range'))
@@ -11961,6 +11958,8 @@ class ComputePipeline(Pipeline):
                 lines.append('uav %d %s' % (r['index'], where))
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
+                if r.get('load'):
+                    lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
@@ -12948,8 +12947,8 @@ LIFTED_REASONS = (
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
-# what this build writes for the cases its lift does not cover (Run R: TG_SIZE_EN groups the wave32 lift does not prove,
-# compute image_store dmask), so a newer .fail of a lifted family is retried once per build, not at the head of every run.
+# what this build writes for some cases its lift does not cover (such as TG_SIZE_EN groups outside wave32 coverage),
+# so a newer .fail of a lifted family is retried once per build, not at the head of every run.
 RETRIED_NAME = 'pre_run_retried.txt'
 # The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
 NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')

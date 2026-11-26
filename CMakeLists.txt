@@ -11557,6 +11557,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_image_store_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_image_store_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(adapter STREQUAL "warp")
+            foreach(shape IN ITEMS 1d 2d array 3d)
+                add_test(NAME startup_compute_image_store_partial_${shape}_warp COMMAND "${INTAKE_PYTHON}" -B
+                    "${CMAKE_SOURCE_DIR}/tests/startup_compute_image_store_check.py" --dispatch "${DXC_EXECUTABLE}"
+                    "$<TARGET_FILE:offscreen_check>" warp --partial-shape ${shape})
+                set_tests_properties(startup_compute_image_store_partial_${shape}_warp
+                    PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            endforeach()
+        endif()
         add_test(NAME startup_compute_image_store_d16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
