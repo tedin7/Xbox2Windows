@@ -7,6 +7,7 @@ numbered parts instead of dropping a log when it is over the size limit.
 import json
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -219,6 +220,13 @@ def check_zip():
                 for name in z.namelist():
                     assert name not in seen, name
                     seen[name] = z.read(name)
+        # every part says which part it is and what all parts hold
+        notes = {n: seen.pop(n).decode() for n in sorted(seen) if re.match(r"^part_\d\d_of_\d\d\.txt$", n)}
+        assert sorted(notes) == ["part_%02d_of_%02d.txt" % (i, len(parts2)) for i in range(1, len(parts2) + 1)], sorted(notes)
+        first_note = notes["part_01_of_%02d.txt" % len(parts2)]
+        assert first_note.startswith("part 1 of %d: mail ALL %d parts" % (len(parts2), len(parts2))), first_note[:80]
+        assert all(("part %d of %d" % (i, len(parts2))) in first_note for i in range(1, len(parts2) + 1)), first_note
+        assert "(this one)" in first_note and "events.txt" in first_note, first_note
         assert json.loads(seen.pop("manifest.json"))["parts"] == len(parts2)
         for name in ("events.txt", "window.png", "window_180s.png", "stdout.txt"):
             assert name in seen, name
@@ -611,6 +619,30 @@ def check_request_code_files():
         assert all(files[n]["part"] == 1 for n in want), "every request file is in part 1"
 
 
+def check_mail_ready_parts():
+    """With the default limit every part is a file the tester can mail as it is (at most 9 MB), whatever the size of the logs,
+    and the shader request files stay together in part 1."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 3)
+        write(run, "stderr.txt", b"x2w-render compute census key 2000000000000001: 900 dispatches, 0 translated, first refusal: x\n" + os.urandom(20 * 1024 * 1024))
+        parts = T.pack(str(run), MANIFEST, str(tmp / "mail.zip"), cache_dir=str(cache))
+        assert len(parts) >= 3, [size for _, size in parts]
+        assert all(size <= 9 * 1024 * 1024 for _, size in parts), [size for _, size in parts]
+        for index, (path, _) in enumerate(parts, 1):
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                assert ("part_%02d_of_%02d.txt" % (index, len(parts))) in names, names
+                if index == 1:
+                    assert T.RESULTS_NAME in names and any(n.startswith(T.REQUESTS_DIR + "/") for n in names), names
+                    assert "manifest.json" in names
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -752,6 +784,7 @@ if __name__ == "__main__":
     check_key_use()
     check_request_files()
     check_request_code_files()
+    check_mail_ready_parts()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()

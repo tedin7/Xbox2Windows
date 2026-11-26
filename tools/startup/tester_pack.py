@@ -49,10 +49,10 @@ EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
 SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
                  "windows_build", "wall_seconds", "deep", "lazy_textures", "lazy_memory", "memory_gib", "shader_cache", "translations_at_start")
-DEFAULT_LIMIT_MB = 20
+DEFAULT_LIMIT_MB = 9    # each part fits a mail as it is (the tester used to re-zip a 20 MB part by hand and lost files)
 SMALL_FILE_BYTES = 512 * 1024   # a file up to this size goes into the zip before the big logs, so part 1 holds all of them
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
-CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
+CHUNK_BYTES = 6 * 1024 * 1024  # a file larger than this is cut into numbered pieces (a piece plus the bookkeeping fits one part)
 
 
 ACCEPT_MASK = "4"        # GameInput A: the only button proven accepted by the title (picker, art slides, black window). Never Start.
@@ -693,6 +693,25 @@ def end_cause(logdir):
     return cause + "; " + last_milestone(logdir)
 
 
+def part_note(index, count, groups, sizes_hint=None):
+    """Text of part_NN_of_MM.txt, written into every part of a multi-part report: which part this is and what EVERY part holds
+    (a part that arrives alone says what is missing). Request files and pictures are counted, everything else is named."""
+    lines = ["part %d of %d: mail ALL %d parts exactly as they are (do not re-zip, do not merge)." % (index, count, count), ""]
+    for number, group in enumerate(groups, 1):
+        names = [m for m, _ in group]
+        requests = [m for m in names if m.startswith(REQUESTS_DIR + "/")]
+        pictures = [m for m in names if re.match(r"^window[_.]", m)]
+        others = [m for m in names if m not in requests and m not in pictures]
+        shown = "%d files" % len(names)
+        lines.append("part %d of %d%s: %s" % (number, count, " (this one)" if number == index else "", shown))
+        if requests:
+            lines.append("  %s/: %d request files" % (REQUESTS_DIR, len(requests)))
+        if pictures:
+            lines.append("  pictures: %d (%s .. %s)" % (len(pictures), pictures[0], pictures[-1]))
+        lines += ["  " + m for m in others[:60]] + (["  ... %d more" % (len(others) - 60)] if len(others) > 60 else [])
+    return "\n".join(lines) + "\n"
+
+
 def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
@@ -751,6 +770,8 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
             for member, data in group:
                 z.writestr(member, data)
+            if count > 1:
+                z.writestr("part_%02d_of_%02d.txt" % (index, count), part_note(index, count, members))
             if index == 1:
                 body = dict(manifest, files=listing, parts=count)
                 z.writestr("manifest.json", json.dumps(body, indent=2, sort_keys=True))

@@ -17,7 +17,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
    finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
-   files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
+   files. Over -LimitMB (default 9, so each part fits a mail as it is: never re-zip; every part carries part_NN_of_MM.txt, which says what each part holds) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
 
 The launcher's job memory cap (run.ps1 -MemoryGiB, default 14) is set to 75% of physical RAM, at least 14 GiB: a run whose
@@ -61,7 +61,7 @@ param(
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
-    [int]$LimitMB = 20,
+    [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
