@@ -252,6 +252,39 @@ WAVE_LOAD_OTHER_REFUSALS = (
      "s_load with a register offset through ('table', 1)"),
 )
 
+# Inner forward SCC branch inside the wave-load block (the shape of the real slot 57 bodies, lane-exact EXEC slice):
+# the loaded word decides per wave whether the block's scalar (s40, the red) takes the loaded value or keeps the old one.
+NEST_SCC_ASM = """s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 8
+s_mov_b32 s42, 6
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cbranch_execz 7
+s_buffer_load_dword s43, s[16:19], s41 offset:0x1e0
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u32 s43, 0
+s_cbranch_scc1 1
+s_mov_b32 s40, s43
+v_mov_b32 v7, 1.0
+s_mov_b64 exec, -1"""
+NEST_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880007', 'f4200ac8', '520001e0', 'bf8cc07f', 'bf06802b', 'bf850001', 'bea8032b', '7e0e02f2', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_ACCEPTED = (('inner forward SCC branch in the wave block', NEST_SCC_MESH),)
+# The inner SCC comes from a lane mask (s_and_b64 of a per-lane compare's VCC): one lane's bit, not the wave's, so refused.
+NEST_MASK_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d840083', '87ac6a6a', 'bf850001', 'bea80380', '7e0e02f2', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_MASK = ('inner SCC from a lane mask', NEST_MASK_SCC_MESH, 'slot 57 mesh: s_and_b64 on a wave mask is not covered')
+# The inner branch goes backwards (to the s_cmp): a loop, refused with the loop text.
+NEST_LOOP = ('inner backward branch', [w if w != 'bf850001' else 'bf85fffe' for w in NEST_SCC_MESH],
+             'slot 57 mesh: a loop outside the group-memory exchanges is not covered')
+# Same block, one word changed: every one of these is refused with the wave-load text.
+NEST_REFUSALS = (
+    # s_cbranch_vccz instead of s_cbranch_scc1: not an inner branch the wave block takes
+    ('inner VCC branch', [w if w != 'bf850001' else 'bf860001' for w in NEST_SCC_MESH]),
+    # the inner branch leaves the block (past the execz target)
+    ('inner branch out of the block', [w if w != 'bf850001' else 'bf850003' for w in NEST_SCC_MESH]),
+)
+
 # Two scalar buffer loads (the second at an offset computed in the block), a dead table load, a dead per-lane VCC compare and a scalar
 # write between the EXEC reset and the compare. The second load reads the same word as WAVE_LOAD_ASM
 # (s45 + 0x1dc = s41 + 0x1e0); the first reads the next word and is dead after the join.
@@ -280,7 +313,7 @@ WAVE_BLOCK_REFUSALS = (
     ('VCC live at the join', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY, exports='7e280228 022a0e80')),
     ('src_scc in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beaf03fd')),
     ('EXEC copied in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beb0047e')),
-    ('branch inside the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY.replace('bf8cc07f', 'bf840000', 1))),
+    ('VCC branch inside the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY.replace('bf8cc07f', 'bf860000', 1))),
     ('branch from outside between the reset and the compare', wave_load_mesh('bf840006 ' + WAVE_BLOCK_PREFIX,
                                                                               WAVE_BLOCK_BODY)),
     # s_cmp_eq_u32 s43, 0; s_cbranch_scc1 to the execz branch: that path never runs the compare.
@@ -344,6 +377,11 @@ def request(directory, mesh, pixel=PIXEL):
 
 
 FAILED = []
+
+
+def refusal_head(text):
+    """The refusal of a wave-load block names the failing conditions after the fixed text; the checks compare the fixed part."""
+    return text.split(' (wave-load block:')[0]
 
 
 def expect(what, got, want):
@@ -614,13 +652,13 @@ def controls():
             expect(what + ' translates', request(tmp, mesh)[1], 'ok')
         # v_mov_b32 v8, s50 after the full EXEC restore reads the scalar the skipped arm wrote.
         live = masked_vertex_red(MASKED_DEAD_SCALAR.replace('befe04c1', 'befe04c1 7e100232'))
-        expect('scalar write in a skipped block read after the join', request(tmp, live)[1],
+        expect('scalar write in a skipped block read after the join', refusal_head(request(tmp, live)[1]),
                'unsupported: ' + WAVE_LOAD_REFUSAL)
-        for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS:
-            expect(what, request(tmp, mesh)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
-        for what, mesh in WAVE_LOAD_ACCEPTED:
+        for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS + NEST_REFUSALS:
+            expect(what, refusal_head(request(tmp, mesh)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        for what, mesh in WAVE_LOAD_ACCEPTED + NEST_ACCEPTED:
             expect(what + ' translates', request(tmp, mesh)[1], 'ok')
-        for what, mesh, reason in WAVE_LOAD_OTHER_REFUSALS:
+        for what, mesh, reason in WAVE_LOAD_OTHER_REFUSALS + (NEST_LOOP, NEST_MASK):
             expect(what, request(tmp, mesh)[1], 'unsupported: ' + reason)
         key, result = request(tmp, WAVE_BLOCK_MESH)
         expect('pre-exchange wave block translates', result, 'ok')
@@ -637,9 +675,9 @@ def controls():
 
         uniform_source = G.Stage.uniform_source
         with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's42' and uniform_source(stage, token)):
-            expect('non-uniform wave load bound', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+            expect('non-uniform wave load bound', refusal_head(request(tmp, WAVE_LOAD_MESH)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
         with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's41' and uniform_source(stage, token)):
-            expect('unproven wave load address', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+            expect('unproven wave load address', refusal_head(request(tmp, WAVE_LOAD_MESH)[1]), 'unsupported: ' + WAVE_LOAD_REFUSAL)
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, FORMATTED_MESH)
         expect('formatted mesh translates', result, 'ok')
@@ -724,6 +762,9 @@ def binary(mc):
     wave_block = mesh.replace('s_mov_b32 s13, s8', WAVE_BLOCK_ASM + '\ns_mov_b32 s13, s8')
     wave_block = wave_block.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('pre-exchange wave block words match llvm-mc', assemble(mc, wave_block), WAVE_BLOCK_MESH)
+    nest = mesh.replace('s_mov_b32 s13, s8', NEST_SCC_ASM + '\ns_mov_b32 s13, s8')
+    nest = nest.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+    expect('nested wave block words match llvm-mc', assemble(mc, nest), NEST_SCC_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -785,7 +826,8 @@ def rasterise(points, colours, indices, verts, prims):
     return image
 
 
-def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None):
+def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
+                   inner_mutant=None):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -799,7 +841,8 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     triangles = [tuple(slot + wave for slot in tri) for tri, wave in zip(indices, (32, 0, 64, 64))]
     words = [a | b << 10 | c << 20 for a, b, c in triangles]
     data = bytearray(buffer(points, colours, words))
-    struct.pack_into('<f', data, 480, 1.0)
+    struct.pack_into('<f', data, 480, word)
+    rule = rule or (lambda value: round(value * 255))   # the red a wave that runs the block ends with
     constants = bytearray(1024)
     uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
     for slot, count in enumerate((len(triangles), 128)):
@@ -813,9 +856,9 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
         if first < bound:
             address = 480 + 4 * first
             reads.append(address)
-            wave_red[first] = round(struct.unpack_from('<f', data, address)[0] * 255)
+            wave_red[first] = rule(struct.unpack_from('<f', data, address)[0])
     expect('only the mixed wave reads; the empty wave address is past the SRV',
-           (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: 255, 64: 64}))
+           (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: rule(word), 64: 64}))
 
     def reference(swap):
         rendered = list(colours)
@@ -828,25 +871,45 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
 
     correct, swapped = reference(False), reference(True)
     different = sum(a != b for a, b in zip(correct, swapped))
-    expect('swapping old and loaded red changes every covered pixel', different,
-           sum(pixel != (0, 0, 0, 255) for pixel in correct))
-    expect('the wave load covers pixels', different > 0, True)
+    if rule(word) != old:   # a word that leaves the old red in place cannot tell the two waves apart
+        expect('swapping old and loaded red changes every covered pixel', different,
+               sum(pixel != (0, 0, 0, 255) for pixel in correct))
+        expect('the wave load covers pixels', different > 0, True)
     path = Path(directory) / 'wave-load.bin'
     shader = base.with_suffix('.ms57.cso')
-    cases = [(label, shader, correct, 0, 0), ('swapped %s selection' % label, shader, swapped, 1, different)]
+    cases = [(label, shader, correct, 0, 0)]
+    if different:
+        cases.append(('swapped %s selection' % label, shader, swapped, 1, different))
     if dxc:
         # Lanes outside EXEC in the mixed wave keep the old red when the block is skipped per lane.
         per_lane = reference_per_lane(points, colours, triangles, bound, old, wave_red)
         lanes = sum(a != b for a, b in zip(correct, per_lane))
-        expect('the per-lane %s mutant changes pixels' % label, lanes > 0, True)
         source = base.with_suffix('.ms57.hlsl').read_text()
         expect('one wave predicate on the block branch', source.count('pc = (!wave_any) ?'), 1)
         mutated = Path(directory) / 'per-lane.hlsl'
         mutated.write_text(source.replace('pc = (!wave_any) ?', 'pc = ((exec & 1) == 0) ?'))
         mutant = Path(directory) / 'per-lane.cso'
         subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True, capture_output=True)
-        cases += [('per-lane %s against the wave image' % label, mutant, correct, 1, lanes),
-                  ('per-lane %s against its own image' % label, mutant, per_lane, 0, 0)]
+        if lanes:   # a word that leaves the old red in place cannot tell the per-lane block from the wave block
+            cases += [('per-lane %s against the wave image' % label, mutant, correct, 1, lanes),
+                      ('per-lane %s against its own image' % label, mutant, per_lane, 0, 0)]
+        if inner_mutant:
+            # The inner branch is dropped: every wave that runs the block takes the loaded word.
+            expect('one inner SCC branch', source.count('pc = (scc) ? 3 : 2;'), 1)
+            inner_hlsl = Path(directory) / 'inner.hlsl'
+            inner_hlsl.write_text(source.replace('pc = (scc) ? 3 : 2;', 'pc = 2;'))
+            inner_cso = Path(directory) / 'inner.cso'
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', inner_cso, inner_hlsl], check=True, capture_output=True)
+            wrong = {first: (inner_mutant(struct.unpack_from('<f', data, 480 + 4 * first)[0]) if first < bound else old)
+                     for first in range(0, 128, 64)}
+            rendered = list(colours)
+            for tri in triangles:
+                for tid in tri:
+                    first, slot = tid & ~63, tid & 15
+                    rendered[slot] = (wrong[first], 255 if tid < bound else 0, *colours[slot][2:])
+            wrong_image = rasterise(points, rendered, triangles, 128, len(triangles))
+            dropped = sum(a != b for a, b in zip(correct, wrong_image))
+            cases += [('dropped inner branch %s against the correct image' % label, inner_cso, correct, 1 if dropped else 0, dropped)]
     for what, shader, image, status, mismatches in cases:
         path.write_bytes(bytes(constants) + bytes(data) + b'\xcd' * 80 + b''.join(map(bytes, image)))
         run = subprocess.run([renderer, adapter, '--mesh-indexed', shader,
@@ -986,7 +1049,16 @@ def draw(dxc, renderer, adapter, publisher=None):
             status = draw_wave_load(tmp, renderer, adapter)
             if status:
                 return status
-            return draw_wave_load(tmp, renderer, adapter, WAVE_BLOCK_MESH, 'wave block', dxc)
+            status = draw_wave_load(tmp, renderer, adapter, WAVE_BLOCK_MESH, 'wave block', dxc)
+            if status:
+                return status
+            nest = lambda value: 64 if value == 0 else round(value * 255)   # the inner branch keeps the old red on a zero word
+            for word in (1.0, 0.0):
+                status = draw_wave_load(tmp, renderer, adapter, NEST_SCC_MESH, 'nested scc block (word %g)' % word, dxc,
+                                        word=word, rule=nest, inner_mutant=lambda value: round(value * 255))
+                if status:
+                    return status
+            return 0
     return 0
 
 
