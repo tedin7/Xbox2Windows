@@ -59,3 +59,7 @@ Gate = the independent check recorded before the PR was closed.
   `startup_gfx2hlsl_f16_alu_draw_warp` and `startup_gfx2hlsl_cvt_pk_int16_hardware` (`PermissionError` replacing an
   entry of the shared DXC cache that another test held open), `startup_resource_retire_title_{warp,hardware}_debug0`
   (the warp one passed when run again alone). Release was not reached in that run.
+- Windows Server 2025, D3D12 WARP, on `4c1feffa7` (translator PRs, stage branches, the `revision.txt` test fixes; a
+  second host), CTest regex `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute`: dev 470/470 and release
+  470/470. The `pixel_heap_srv`, `gather_lz` and DXC cache failures above did not appear there; the first host's
+  build is suspect for them.
