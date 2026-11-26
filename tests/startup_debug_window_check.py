@@ -25,9 +25,10 @@ DEBUG = HERE.parent / "tools/startup/debug_launch.py"
 RED, BLUE = (200, 30, 30), (30, 30, 200)
 
 
-def run(probe, work, name, *options):
+def run(probe, work, name, *options, extra_env=None):
     logdir = work / name
     env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_")}
+    env.update(extra_env or {})
     command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--console", "0", *options]
     result = subprocess.run(command, capture_output=True, text=True, timeout=120, env=env)
     return result, logdir
@@ -88,6 +89,17 @@ def main(probe):
             for bad in ("-1", "abc", "1.5"):
                 refused, _ = run(probe, work, "badhead", "--timeout", "1", option, bad)
                 assert refused.returncode == 2 and option in refused.stdout, (option, bad, refused.returncode, refused.stdout)
+        # A title whose window thread is stuck (the probe stops pumping messages 1.5 s in): PrintWindow waits for it, the
+        # run must still end at its timeout, with finished.txt written, the title gone and under 20 s in all.
+        for name, options in (("hung_window", ()), ("hung_window_periodic", ("--capture-every", "1"))):
+            started = time.monotonic()
+            hung, hung_dir = run(probe, work, name, "--timeout", "5", *options, extra_env={"STARTUP_WINDOW_PROBE_HANG_MS": "1500"})
+            took = time.monotonic() - started
+            assert hung.returncode == 0 and (hung_dir / "finished.txt").exists(), (name, hung.returncode, hung.stdout, hung.stderr)
+            assert took < 20, (name, took, hung.stdout)
+            pid = int((hung_dir / "title.pid").read_text())
+            alive = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"], capture_output=True, text=True).stdout
+            assert str(pid) not in alive, (name, "the title is still running", alive)
     print("startup_debug_window: PASS (red then blue saved once each, unchanged frames skipped, change time reported, "
           "window.png unchanged, off by default, bad interval refused; commit headroom ends a run, one MiB does not)")
     return 0

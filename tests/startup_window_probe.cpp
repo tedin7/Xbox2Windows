@@ -3,6 +3,8 @@
 // A 160x120 popup window at the top left corner of the screen, painted red; after STARTUP_WINDOW_PROBE_FLIP_MS
 // milliseconds (default 3500) it is painted blue. The probe keeps running until the debugger ends the run
 // (or for one minute), so the debugger's end-of-run window.png shows the last picture.
+// STARTUP_WINDOW_PROBE_HANG_MS=<ms>: after that long the window thread stops pumping messages (a title whose window thread
+// is stuck): PrintWindow and every other call that needs the window's thread then waits until the process is killed.
 #include <windows.h>
 
 #include <cstdio>
@@ -42,6 +44,8 @@ int main()
     ULONGLONG flip_ms = 3500;
     char text[32];
     if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_FLIP_MS", text, sizeof(text)) && text[0]) flip_ms = strtoull(text, nullptr, 10);
+    ULONGLONG hang_ms = 0;
+    if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_HANG_MS", text, sizeof(text)) && text[0]) hang_ms = strtoull(text, nullptr, 10);
     const ULONGLONG begin = GetTickCount64();
     bool flipped = false;
     std::printf("window-probe shown\n");
@@ -56,6 +60,11 @@ int main()
             flipped = true;
             std::printf("window-probe flipped\n");
             std::fflush(stdout);
+        }
+        if (hang_ms && GetTickCount64() - begin >= hang_ms) {
+            std::printf("window-probe hung\n");
+            std::fflush(stdout);
+            Sleep(120000);  // no more messages: the window thread is stuck
         }
         Sleep(10);
     }
