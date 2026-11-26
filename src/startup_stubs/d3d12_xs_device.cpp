@@ -6948,6 +6948,8 @@ void report_budget(ID3D12CommandQueue* queue)
     // whether the pool (sections, slots) or the resources above grew (#1199).
     char commit[80];
     x2w_local::format_commit(commit, sizeof(commit), x2w_local::system_commit());
+    char job[64];
+    x2w_local::format_job(job, sizeof(job), x2w_local::job_memory());
     char pool[96] = "sections=n/a slabs=n/a slots=n/a";
     using PageStats = BOOL(WINAPI*)(ULONGLONG*);
     using SlabStats = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*, ULONGLONG*);
@@ -6960,7 +6962,7 @@ void report_budget(ID3D12CommandQueue* queue)
             std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
         FreeLibrary(xmem);
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s", local, nonlocal, text, counts.unmeasured, commit, pool);
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output

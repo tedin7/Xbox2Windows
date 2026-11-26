@@ -91,7 +91,8 @@ RE_GPU_BUDGET = re.compile(
     + rf" unmeasured={BUDGET_DECIMAL}"
     # Added with the system commit and pool counters (absent in older logs): commit=<used>/<limit> avail=<free> in MiB.
     + rf"(?: commit=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a) avail=(?:{BUDGET_DECIMAL}|n/a)"
-    + rf" sections=(?:{BUDGET_DECIMAL}|n/a) slabs=(?:{BUDGET_DECIMAL}|n/a) slots=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a))?"
+    + rf" sections=(?:{BUDGET_DECIMAL}|n/a) slabs=(?:{BUDGET_DECIMAL}|n/a) slots=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
+    + rf" job_peak=(?:{BUDGET_DECIMAL}|n/a) job_limit=(?:{BUDGET_DECIMAL}|none|n/a))?"
 )
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")

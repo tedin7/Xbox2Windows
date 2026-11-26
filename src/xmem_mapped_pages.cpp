@@ -928,8 +928,8 @@ void log_apply_failure(const char* what, const MapFailure& failure, ULONG_PTR co
         if (InterlockedIncrement(&reported) <= 3) {
             char line[384];
             x2w_local::format_exhausted(line, sizeof(line), what, static_cast<unsigned long>(failure.error),
-                                        x2w_local::system_commit(), memory.backings.size(), memory.slots.slab_count(),
-                                        memory.slots.slots_in_use(), memory.slots.slots_free());
+                                        x2w_local::system_commit(), x2w_local::job_memory(), memory.backings.size(),
+                                        memory.slots.slab_count(), memory.slots.slots_in_use(), memory.slots.slots_free());
             x2w_local::logf("%s", line);
         }
     }

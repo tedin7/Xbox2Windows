@@ -581,8 +581,8 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
         )
 
     # The system commit and pool counters report_budget() appends (known, and unavailable).
-    with_commit = " commit=14335/16100 avail=1765 sections=113609 slabs=3 slots=113000/609"
-    commit_n_a = " commit=n/a avail=n/a sections=n/a slabs=n/a slots=n/a"
+    with_commit = " commit=14335/16100 avail=1765 sections=113609 slabs=3 slots=113000/609 job_peak=14250 job_limit=14336"
+    commit_n_a = " commit=n/a avail=n/a sections=n/a slabs=n/a slots=n/a job_peak=n/a job_limit=none"
 
     high_usage = sample("2500/3000", "100/5+40/2")
     high_ratio = sample("1800/1000", "150/7+50/3")
