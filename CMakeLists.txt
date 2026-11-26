@@ -4692,6 +4692,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_commit_headroom_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_commit_headroom_check.py")
     set_tests_properties(startup_commit_headroom_check PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_stall_watchdog_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stall_watchdog_check.py")
+    set_tests_properties(startup_stall_watchdog_check PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
