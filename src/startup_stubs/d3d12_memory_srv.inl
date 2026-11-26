@@ -570,6 +570,7 @@ std::mutex unreadable_texture_mutex;
 UnreadableTextureRange unreadable_textures[64];
 unsigned unreadable_texture_next;
 volatile LONG unreadable_texture_skips;
+volatile LONG untouched_texture_refusals;  // ranges refused by VirtualQuery state without touching them
 
 bool texture_range_readable(u64 address, u64 bytes)
 {
@@ -585,7 +586,12 @@ bool texture_range_readable(u64 address, u64 bytes)
             }
         }
     }
-    if (x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return true;
+    // Not touched: a range the title has not committed yet (lazily committed memory is MEM_RESERVE until the title writes it)
+    // is refused from its VirtualQuery state alone, so it costs no first-chance exception however many distinct ranges ask.
+    if (x2w_local::committed_range(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return true;
+    const LONG refusals = InterlockedIncrement(&untouched_texture_refusals);
+    if (refusals == 1 || (refusals & (refusals - 1)) == 0)
+        log("x2w-d3d12 slot70 texture ranges refused without touching them (not committed yet): %ld", refusals);
     std::lock_guard lock(unreadable_texture_mutex);
     unreadable_textures[unreadable_texture_next++ % 64] = UnreadableTextureRange{address, bytes, now};
     return false;
