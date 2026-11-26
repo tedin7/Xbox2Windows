@@ -263,7 +263,7 @@ int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char
     invoke(list, 22, 1, arg(&scissor));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
-    // (with X2W_TEST_PIXEL_HISTORY=1) X2W_TEST_PRESENT_SOURCE=draw|clear: the `x2w-render present source` line (the read-back happens at present 6). `clear` leaves the
+    // (with X2W_TEST_PIXEL_HISTORY=1) X2W_TEST_PRESENT_SOURCE=draw|clear|wall: the `x2w-render present source` line (the read-back happens at present 6). `clear` leaves the
     // target with its clear colour only: no translated draw writes the presented surface.
     char present_source[16] = "";
     GetEnvironmentVariableA("X2W_TEST_PRESENT_SOURCE", present_source, sizeof(present_source));
@@ -282,6 +282,10 @@ int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char
     // Second present invokes draw_dump_flush() once the frame-1 draw copy has completed.
     invoke(queue, 32, 1, arg(plane), 0);
     if (present_source[0]) for (int i = 0; i < 4; ++i) invoke(queue, 32, 1, arg(plane), 0);  // presents 3..6: the 6th reads the surface back
+    if (std::strcmp(present_source, "wall") == 0) {  // a slow title: no 300th frame, but 10 s of wall time pass between presents
+        Sleep(10500);
+        invoke(queue, 32, 1, arg(plane), 0);
+    }
 
     if (FAILED(static_cast<HRESULT>(invoke(allocator, 8))) ||
         FAILED(static_cast<HRESULT>(invoke(list, 139, arg(allocator))))) return 35;

@@ -7745,9 +7745,20 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
+    // The render totals and the censuses print every 300 frames AND at least every 10 s of wall time: after the cliff (0.3 fps in Run S)
+    // 300 frames take 17 minutes and nothing printed while the dispatch storm ran.
+    static ULONGLONG last_wall_census;
+    if (!last_wall_census) last_wall_census = now;   // the first wall tick comes 10 s after the first present
+    const bool census_frames = render_mode() && frame % 300 == 0;
+    const bool census_wall = render_mode() && !census_frames && now - last_wall_census >= 10000;
+    const bool census_due = census_frames || census_wall;
+    if (census_due) {
+        last_wall_census = now;
+        log("x2w-render census tick at %.1f s, frame %ld (%s)", process_ms() / 1000.0, frame, census_frames ? "every 300 frames" : "10 s of wall time");
+    }
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
@@ -7756,7 +7767,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
-    if (render_mode() && frame % 300 == 0)
+    if (census_due)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
@@ -7770,7 +7781,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
-    if (render_mode() && frame % 300 == 0) {
+    if (census_due) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);

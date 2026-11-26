@@ -41,6 +41,17 @@ def check(directory, consumer, backend):
                       r"\(target 0, format \d+, (\d+) draws into it\)", lines["draw"][0])
     assert named and named.group(1) == drawn_key and int(named.group(2)) >= 1, (drawn_key, lines["draw"])
     assert "no translated draw wrote the presented surface" in lines["clear"][0] and "last translated draw" not in lines["clear"][0], lines["clear"]
+    # Census every 10 s of wall time: a title that presents too slowly to reach frame 300 still prints its totals and censuses.
+    result = subprocess.run(args + [backend, output], env=dict(env, X2W_TEST_PRESENT_SOURCE="wall"), capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stderr[-2000:]
+    err = result.stderr.splitlines()
+    ticks = [i for i, l in enumerate(err) if "x2w-render census tick" in l]
+    assert len(ticks) == 1 and "10 s of wall time" in err[ticks[0]] and "frame 7" in err[ticks[0]], [err[i] for i in ticks]
+    after = err[ticks[0]:]
+    for marker in ("x2w-render totals:", "x2w-render compute dispatches:", "x2w-render upload ring:"):
+        assert any(marker in l for l in after), f"{marker} missing after the wall tick"
+    fast = subprocess.run(args + [backend, output], env=dict(env, X2W_TEST_PRESENT_SOURCE="draw"), capture_output=True, text=True, timeout=60)
+    assert "census tick" not in fast.stderr, "a fast run (7 presents in under 10 s) has no census tick"
     print(f"{backend}: present source names the drawn key {drawn_key}; a clear-only target says no translated draw")
     return 0
 
