@@ -169,6 +169,7 @@ def check_shell(shell):
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
+        assert manifest["gpu_time"] is True and manifest["env"].get("X2W_GPU_TIME") == "1", manifest  # GPU time per frame on
         assert args["InputScript"].startswith("80@5+1.2,80@7+1.2,4@9+1.2,80@11+1.2"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
@@ -224,14 +225,15 @@ def check_shell(shell):
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
         assert plain_args["Sysmem"] == "1" and plain_manifest["sysmem_fallback"] is True  # -NoLazyTextures leaves it on
 
-        # -NoSysmemFallback leaves its variable unset and the manifest says so.
-        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback")
+        # -NoSysmemFallback and -NoGpuTime leave their variables unset and the manifest says so.
+        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback", "-NoGpuTime")
         assert nosys.returncode == 0, (nosys.stdout, nosys.stderr)
         newest_nosys = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_nosys) as z:
             nosys_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             nosys_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not nosys_args["Sysmem"] and nosys_manifest["sysmem_fallback"] is False
+        assert nosys_manifest["gpu_time"] is False and "X2W_GPU_TIME" not in nosys_manifest["env"], nosys_manifest
         assert "X2W_D3D12_SYSMEM_FALLBACK" not in nosys_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.

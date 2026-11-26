@@ -72,6 +72,7 @@ param(
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
     [int]$CommitWarnMiB = 2048                  # a warning line in the log when the system commit has less than this free; 0 = off
 )
@@ -210,6 +211,8 @@ $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
 if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
+$GpuTime = -not $NoGpuTime
+if ($GpuTime) { $env:X2W_GPU_TIME = "1" } else { Remove-Item Env:X2W_GPU_TIME -ErrorAction SilentlyContinue }
 $StartupBelow40 = -not $NoStartupBelow40
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" } else { Remove-Item Env:X2W_XMEM_STARTUP_BELOW_40 -ErrorAction SilentlyContinue }
 $LowAddresses = -not $NoLowAddresses
@@ -265,7 +268,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     pretranslate = $preTranslate
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }

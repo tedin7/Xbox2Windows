@@ -80,6 +80,9 @@ The system-memory fallback is on too (`X2W_D3D12_SYSMEM_FALLBACK=1`): when a slo
 once more in system memory instead of returning an error, and the `x2w-budget` line ends with `sysmem-fallback=N bytes=M`.
 `-NoSysmemFallback` turns it off; the manifest records the choice.
 
+GPU time per frame is on too (`X2W_GPU_TIME=1`): every 300 frames an `x2w-gpu-time` line gives the average and longest
+GPU time of a frame and how long the GPU sat idle. `-NoGpuTime` turns it off; the manifest records it as `gpu_time`.
+
 Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
