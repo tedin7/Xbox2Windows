@@ -848,13 +848,50 @@ def main():
         return status.page_free >> 20 if k32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
 
     headroom = HeadroomGuard(headroom_mib, free_commit_mib, warn_mib)
-    while not timeout or time.time() - start < timeout:
-        if time.time() >= stop_next:
+    # Shutdown (timeout, stop request, debugger stop): the title is still debugged, so the next debug event (a thread, a DLL,
+    # OutputDebugString, an exception) freezes the thread that raised it until it is continued, and anything that needs
+    # that thread (PrintWindow on its window) waits for ever. The final window capture and thread dump therefore run on a
+    # side thread with a deadline WHILE this thread keeps serving debug events, until they are done; only then the loop ends
+    # and the title is terminated. Detaching is not an option: offline mode, the file log and --continue-asserts live in
+    # debugger breakpoints.
+    shut = {"dumped": None, "window_stuck": False}
+    ended_at = None
+    shutdown_done = threading.Event()
+    shutdown_started = None   # time.time() when the shutdown steps were started
+
+    def shutdown_steps():
+        try:
+            if capture_thread:
+                capture_done.set()
+                capture_thread.join(SHUTDOWN_STEP_SECONDS)
+                shut["window_stuck"] = capture_thread.is_alive()
+            if shut["window_stuck"]:
+                print("  window capture: skipped (the periodic capture is still waiting on the title's window)")
+            else:
+                limited(capture_window)
+            if not stop:
+                shut["dumped"] = limited(dump_threads, os.path.join(logdir, "threads.txt"))
+        finally:
+            shutdown_done.set()
+
+    def begin_shutdown():
+        nonlocal shutdown_started
+        shutdown_started = time.time()
+        threading.Thread(target=shutdown_steps, name="shutdown-steps", daemon=True).start()
+
+    while True:
+        if shutdown_started is None and timeout and time.time() - start >= timeout:
+            ended_at = time.time()
+            begin_shutdown()
+        if shutdown_started is not None and (shutdown_done.is_set() or time.time() - shutdown_started > 3 * SHUTDOWN_STEP_SECONDS + 2):
+            break
+        if shutdown_started is None and time.time() >= stop_next:
             stop_next = time.time() + 0.5
             if os.path.exists(stop_file):
                 stop_requested = True
                 log(f"{time.time() - start:7.3f} stop file found: ending the run")
-                break
+                ended_at = time.time()
+                begin_shutdown()
             if os.path.exists(dump_request):
                 os.remove(dump_request)
                 limited(dump_threads, os.path.join(logdir, "threads_stall.txt"))
@@ -866,7 +903,8 @@ def main():
             if low:
                 stop_requested, stop_reason = True, "commit headroom: " + low
                 log(f"{time.time() - start:7.3f} {stop_reason}: ending the run")
-                break
+                ended_at = time.time()
+                begin_shutdown()
         if dump_at and time.time() - start >= dump_at[0]:
             limited(dump_threads, os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
         if watches and time.time() >= watch_next:
@@ -1014,11 +1052,13 @@ def main():
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
                 status = DBG_CONTINUE  # rip is already past the int3
-            elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
-                                                  main_base <= ex_addr < main_base + 0x10000000):
+            elif shutdown_started is None and ((not first) or stop_first or (ex_code == 0x80000003 and main_base and
+                                                  main_base <= ex_addr < main_base + 0x10000000)):
                 stop = (ex_code, ex_addr, tid, first, params)
                 log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
-                break
+                ended_at = time.time()
+                begin_shutdown()
+                continue   # the stopped thread stays stopped; every other debug event is still served
             elif ex_code in (0x406D1388, 0x40010006):
                 status = DBG_CONTINUE
             else:
@@ -1026,7 +1066,7 @@ def main():
         k32.ContinueDebugEvent(pid, tid, status)
 
     window.abandon()
-    elapsed = time.time() - start
+    elapsed = ended_at - start if ended_at else time.time() - start
     if stop and stop_at:
         limited(dump_threads, os.path.join(logdir, "threads_stop.txt"))
     if stop:
@@ -1108,7 +1148,7 @@ def main():
     else:
         print(f"stopped by request after {elapsed:.2f} s ({stop_reason})" if stop_requested
               else f"timeout after {elapsed:.2f} s")
-        dumped = limited(dump_threads, os.path.join(logdir, "threads.txt")) or []
+        dumped = shut["dumped"] or []
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
             rva, _, size = item.partition(":")
             blob = read(main_base + int(rva, 16), int(size or "64", 16)) or b""
@@ -1155,13 +1195,7 @@ def main():
         print("  " + headroom.summary())
     if capture_thread:
         capture_done.set()
-        capture_thread.join(SHUTDOWN_STEP_SECONDS)
         print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
-    window_stuck = bool(capture_thread and capture_thread.is_alive())
-    if exit_code is None and window_stuck:
-        print("  window capture: skipped (the periodic capture is still waiting on the title's window)")
-    elif exit_code is None:
-        limited(capture_window)
     # The title ends here, whatever state its threads and window are in: the job, then the process itself.
     k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0002)
     if k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000) != 0:

@@ -46,6 +46,8 @@ int main()
     if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_FLIP_MS", text, sizeof(text)) && text[0]) flip_ms = strtoull(text, nullptr, 10);
     ULONGLONG hang_ms = 0;
     if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_HANG_MS", text, sizeof(text)) && text[0]) hang_ms = strtoull(text, nullptr, 10);
+    ULONGLONG debug_ms = 0;
+    if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_DEBUG_MS", text, sizeof(text)) && text[0]) debug_ms = strtoull(text, nullptr, 10);
     const ULONGLONG begin = GetTickCount64();
     bool flipped = false;
     std::printf("window-probe shown\n");
@@ -61,6 +63,9 @@ int main()
             std::printf("window-probe flipped\n");
             std::fflush(stdout);
         }
+        // STARTUP_WINDOW_PROBE_DEBUG_MS=<ms>: from then on the window thread raises a debug event (OutputDebugString) every pass;
+        // it is frozen until the debugger continues it, which the debugger must keep doing while it ends the run.
+        if (debug_ms && GetTickCount64() - begin >= debug_ms) OutputDebugStringA("window-probe debug event\n");
         if (hang_ms && GetTickCount64() - begin >= hang_ms) {
             std::printf("window-probe hung\n");
             std::fflush(stdout);
