@@ -380,6 +380,8 @@ int main(int argc, char** argv)
         auto* zlib_status = static_cast<Object*>(zlib_status_ptr);
         auto* zlib_queue = static_cast<Object*>(zlib_queue_ptr);
         std::vector<unsigned char> zlib_destination[zlib_requests];
+        const LONG enqueued_before = requests_enqueued;
+        const LONG64 read_before = bytes_read_total, inflated_before = bytes_inflated_total;
         for (unsigned i = 0; i < zlib_requests; ++i) {
             zlib_destination[i].assign(piece, 0xA5);
             alignas(8) unsigned char request[0x48] = {};
@@ -407,6 +409,30 @@ int main(int argc, char** argv)
         std::snprintf(want_counts, sizeof want_counts, "raw=0 inflated=%u failed=0 bcpack-blank=0 completed=%u", finished, finished);
         std::snprintf(what, sizeof what, "zlib-only run: %u finished, counts \"%s\", expected \"%s\"", finished, counts, want_counts);
         ok = expect(finished == zlib_requests && std::strcmp(counts, want_counts) == 0, what) && ok;
+        // Loading progress: every request is counted at its enqueue, its compressed bytes as read and what it wrote as inflated.
+        std::snprintf(what, sizeof what, "progress counters: enqueued +%ld (want %u), read +%lld (want %llu), inflated +%lld (want %llu)",
+                      requests_enqueued - enqueued_before, zlib_requests, static_cast<long long>(bytes_read_total - read_before),
+                      static_cast<unsigned long long>(zlib_requests) * stream_size,
+                      static_cast<long long>(bytes_inflated_total - inflated_before), static_cast<unsigned long long>(zlib_requests) * piece);
+        ok = expect(requests_enqueued - enqueued_before == static_cast<LONG>(zlib_requests) &&
+                        bytes_read_total - read_before == static_cast<LONG64>(zlib_requests) * stream_size &&
+                        bytes_inflated_total - inflated_before == static_cast<LONG64>(zlib_requests) * piece, what) && ok;
+        {
+            // The progress line: 10 enqueued, 7 completed, the request numbered 7 waited 1234 ms, 2 s window.
+            enqueue_ring_tick[7 & (enqueue_ring_size - 1)] = static_cast<LONG>(100000 - 1234);
+            char progress[256];
+            format_progress(progress, sizeof progress, 20, 10, 7, 2 << 20, 4 << 20, 5 << 20, 9 << 20, 2.0, 100000);
+            const char* const want_progress =
+                "x2w-dstorage progress 20 s: pending 3 (oldest 1234 ms), read 1.0 MB/s, inflated 2.0 MB/s, "
+                "enqueued 10 completed 7, total read 5120 KiB inflated 9216 KiB";
+            if (!expect(std::strcmp(progress, want_progress) == 0, "progress line differs")) {
+                std::fprintf(stderr, "  got:  %s\n  want: %s\n", progress, want_progress);
+                ok = false;
+            }
+            format_progress(progress, sizeof progress, 30, 10, 10, 0, 0, 5 << 20, 9 << 20, 10.0, 100000);
+            ok = expect(std::strstr(progress, "pending 0 (oldest none), read 0.0 MB/s, inflated 0.0 MB/s") != nullptr,
+                        "an idle queue must read pending 0, oldest none") && ok;
+        }
         const std::string status_text = read_text(log_path);
         ok = expect(status_text.find("(requests raw=") != std::string::npos &&
                         status_text.find(" completed=") != std::string::npos &&
