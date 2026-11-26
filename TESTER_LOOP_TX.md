@@ -60,5 +60,10 @@ Gate = the independent check recorded before the PR was closed.
   `startup_gfx2hlsl_f16_alu_draw_warp` and `startup_gfx2hlsl_cvt_pk_int16_hardware` (`PermissionError` replacing an
   entry of the shared DXC cache that another test held open), `startup_resource_retire_title_{warp,hardware}_debug0`
   (the warp one passed when run again alone). Release was not reached in that run.
+- Known issue: `startup_pixel_heap_srv{,_word}_{fxc,dxc}_{warp,hardware}` (8 draws of #2763) pass when run alone
+  (CTest regex `^startup_pixel_heap_srv`, `148786973`, dev and release 9/9) but fail inside the large
+  `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute` run: there the request the consumer publishes reaches the
+  translator with a root signature without the heap-indexing flag (0x400), so it is refused (`s_load through s10`).
+  The cause under parallel load is not found yet.
 - A later Windows run reported 470/470 for `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute`, but it built
   another head, not this branch, so it does not count; a run of that regex on `4d8b44580` is pending.
