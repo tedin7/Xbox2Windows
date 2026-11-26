@@ -30,7 +30,7 @@ BUTTON_A = "4"
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
 SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
-                 "windows_build", "wall_seconds", "deep", "lazy_textures", "lazy_memory", "shader_cache", "translations_at_start")
+                 "windows_build", "wall_seconds", "deep", "lazy_textures", "lazy_memory", "memory_gib", "shader_cache", "translations_at_start")
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
@@ -66,6 +66,15 @@ def validate_manifest(manifest):
 
 READY_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:ms57\.)?txt$")
 REQUEST_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:a|rtv|c67|m57)$")
+
+
+MEMORY_FRACTION = 0.75     # of physical RAM: the launcher's job memory cap (debug_launch --memory-gib)
+MEMORY_MIN_GIB = 14        # run.ps1's own default
+
+
+def memory_gib(physical_bytes):
+    """Job memory cap for the run: 75% of physical RAM, whole GiB, never below run.ps1's default of 14."""
+    return max(MEMORY_MIN_GIB, int(physical_bytes / float(1 << 30) * MEMORY_FRACTION))
 
 
 def cache_tag(translator):
@@ -181,6 +190,8 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
+    m = sub.add_parser("memory-gib")
+    m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
     n.add_argument("translator")
     c = sub.add_parser("cache-stats")
@@ -195,6 +206,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds))
+        return 0
+    if args.cmd == "memory-gib":
+        print(memory_gib(args.physical_bytes))
         return 0
     if args.cmd == "cache-tag":
         print(cache_tag(args.translator))

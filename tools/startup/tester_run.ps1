@@ -17,6 +17,9 @@ One command for a tester: check the build, run the title offline with a per-comm
    files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
 
+The launcher's job memory cap (run.ps1 -MemoryGiB, default 14) is set to 75% of physical RAM, at least 14 GiB: a run whose
+commit passes the cap dies with error 1455. -MemoryGiB overrides it; the summary prints it and the manifest records it.
+
 Lazy memory commit is ON by default (run.ps1 -LazyMemory): physical pages and the large startup blocks are committed on
 first touch, which cuts the section commit. -NoLazyMemory turns it off. The manifest records it.
 
@@ -45,6 +48,7 @@ param(
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
+    [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures                     # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
 )
@@ -133,12 +137,15 @@ $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-
 $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
+$physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+if ($MemoryGiB -le 0) { $MemoryGiB = [int](& $python -B $pack memory-gib $physicalBytes) }
+Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir
-    ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
+    MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
@@ -171,7 +178,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; lazy_memory = (-not $NoLazyMemory); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$stamp.json"

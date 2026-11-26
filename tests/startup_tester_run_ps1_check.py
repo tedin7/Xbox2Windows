@@ -27,14 +27,14 @@ REPO = Path(__file__).resolve().parent.parent
 STARTUP = REPO / "tools" / "startup"
 STUB_RUN = r"""
 param([string]$Exe, [string]$DataDir, [string]$LogDir, [int]$Seconds, [string]$BuildDir, [string]$ShaderCache,
-      [int]$ContinueAsserts, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
+      [int]$ContinueAsserts, [int]$MemoryGiB, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
       [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi, [switch]$LazyMemory)
 $seen = @(Get-ChildItem -LiteralPath $ShaderCache -Force | ForEach-Object { $_.Name })
 $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -129,6 +129,8 @@ def check_shell(shell):
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
+        assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
+        assert "job memory cap %d GiB" % args["MemoryGiB"] in ok.stdout, ok.stdout
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
@@ -170,6 +172,13 @@ def check_shell(shell):
             mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
+        assert big.returncode == 0, (big.stdout, big.stderr)
+        newest_big = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_big) as z:
+            big_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            big_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert big_args["MemoryGiB"] == 33 and big_manifest["memory_gib"] == 33
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.

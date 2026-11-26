@@ -17,7 +17,7 @@ import tester_pack as T  # noqa: E402
 
 MANIFEST = {"commit": "abcdef12", "build_commit": "abcdef12", "dirty": False, "seconds": 300,
             "input_script": "4@70", "env": {"X2W_D3D12_BUDGET": "1"}, "gpu": "GPU", "gpu_driver": "1.0",
-            "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "lazy_textures": True, "lazy_memory": True, "shader_cache": "shader_cache_abcdef12",
+            "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "lazy_textures": True, "lazy_memory": True, "memory_gib": 14, "shader_cache": "shader_cache_abcdef12",
             "translations_at_start": 0}
 
 
@@ -154,6 +154,13 @@ def check_cache_tag():
         assert T.cache_tag(str(translator)) == "29-29-x", "a missing literal must not crash"
 
 
+def check_memory_gib():
+    gib = 1 << 30
+    assert T.memory_gib(8 * gib) == 14 and T.memory_gib(16 * gib) == 14, "never below run.ps1's default"
+    assert T.memory_gib(32 * gib) == 24 and T.memory_gib(64 * gib) == 48 and T.memory_gib(128 * gib) == 96
+    assert T.memory_gib(int(31.9 * gib)) == 23, "whole GiB, rounded down"
+
+
 def check_first_poll():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -183,5 +190,6 @@ if __name__ == "__main__":
     check_first_poll()
     check_cache_stats()
     check_cache_tag()
+    check_memory_gib()
     check_zip()
     print("startup_tester_pack_check: preset, manifest and zip checks pass")
