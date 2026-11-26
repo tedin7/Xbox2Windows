@@ -9,6 +9,7 @@ import bisect
 from contextlib import suppress
 import functools
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -34,6 +35,8 @@ class Unsupported(Exception):
 
 
 PREFETCH = bytes.fromhex('0300a0bf')
+
+COMPUTE_DPP_FLOAT = frozenset(('v_min_f32', 'v_max_f32', 'v_add_f32'))
 
 # DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
 # a quad are the pixels 0 1 / 2 3, row by row; lane i reads lane quad_perm[i].
@@ -3662,7 +3665,7 @@ class Stage:
                 out.add(reg)
         return out
 
-    def entry_exec_sites(self, cfg):
+    def entry_exec_sites(self, cfg, *, compute_dpp=False):
         """Prove entry EXEC and its saved copies on every incoming CFG edge."""
         bounds, _, succ, _ = cfg
         if not bounds or any(name.startswith(('s_wqm', 's_swappc', 's_call', 's_rfe'))
@@ -3674,6 +3677,7 @@ class Stage:
         mask = ('exec_lo', 'exec') if wave32 else ('exec',)
         copy_op = 's_mov_b32' if wave32 else 's_mov_b64'
 
+        suffix = '_b32' if wave32 else '_b64'
         operations = []
         for _, _, name, asm in self.ins:
             _, ops, mods = parse(asm)
@@ -3690,10 +3694,25 @@ class Stage:
                         move = ('save', words)
                     elif dst in mask:
                         move = ('restore', words)
-            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move))
+            narrows = compute_dpp and name == 's_and_saveexec' + suffix and len(ops) == 2 and not mods
+            if narrows:
+                words = mask_words(ops[0], width)
+                if words and all(re.fullmatch(r's\d+', word) for word in words):
+                    move = ('save', tuple(words))
+            elif compute_dpp and name == 's_or' + suffix and len(ops) == 3 and not mods and ops[0] in mask:
+                src0, src1 = ops[1:]
+                if src1 in mask:
+                    src0, src1 = src1, src0
+                words = mask_words(src1, width)
+                if src0 in mask and words:
+                    move = ('restore_or', tuple(words))
+            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move, narrows))
 
         # Missing blocks are unreachable so far. At a join or back edge keep only facts common to all paths.
-        before = {0: {()}}  # () is current EXEC; other facts name the SGPRs of an entry mask copy.
+        # () proves exact EXEC. The subset fact allows an OR restore after an AND narrowed it.
+        # Other facts name the SGPRs of an entry mask copy.
+        subset = ('subset',)
+        before = {0: {(), subset} if compute_dpp else {()}}
         pending = {0}
         known = set()
         while pending:
@@ -3706,14 +3725,20 @@ class Stage:
                     known.add(off)
                 else:
                     known.discard(off)
-                exec_write, writes, move = operations[i]
+                exec_write, writes, move, narrows = operations[i]
                 entry = () in facts
-                restore = move is not None and move[0] == 'restore' and move[1] in facts
+                within_entry = subset in facts
+                restore = (move is not None and move[1] in facts and
+                           (move[0] == 'restore' or (move[0] == 'restore_or' and within_entry)))
                 facts = {copy for copy in facts if writes.isdisjoint(copy)}
                 if exec_write:
                     facts.discard(())
+                    if not narrows:
+                        facts.discard(subset)
                 if restore:
                     facts.add(())
+                    if compute_dpp:
+                        facts.add(subset)
                 if entry and move is not None and move[0] == 'save':
                     facts.add(move[1])
             for target in succ[b]:
@@ -3722,6 +3747,25 @@ class Stage:
                     before[target] = merged
                     pending.add(target)
         return known
+
+    def compute_dpp_sites(self, branches, names):
+        """Map proven EXEC sites to blocks reached once by every group thread."""
+        bounds, _, succ, _ = self.spill_cfg
+        if not bounds or any(target <= pc or target not in names for pc, target in branches):
+            return {}
+        if any(name == 's_setpc_b64' and self.calculated_pc.get(pc) is None for pc, name in names.items()):
+            return {}
+        # Forward-only control flow. Intersect the blocks guaranteed on each successor path.
+        # A final conditional also has a fall-through exit, even if its taken edge has a target.
+        always = [set() for _ in bounds]
+        for b in range(len(bounds) - 1, -1, -1):
+            _, hi = bounds[b]
+            always[b].add(b)
+            if succ[b] and not (hi == len(self.ins) and self.ins[hi - 1][2].startswith('s_cbranch')):
+                always[b].update(set.intersection(*(always[target] for target in succ[b])))
+        entry = self.entry_exec_sites(self.spill_cfg, compute_dpp=True)
+        return {self.ins[i][0]: self.ins[lo][0] for b in always[0] for lo, hi in (bounds[b],)
+                for i in range(lo, hi) if self.ins[i][0] in entry}
 
     def uniform_entry_exec(self):
         sites = getattr(self, 'entry_exec_proof', None)
@@ -3810,6 +3854,11 @@ class Stage:
                         lo, hi = bounds[block]
                         reached.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
                         pending.extend(succ[block])
+        self.compute_dpp_entry = {}
+        if (getattr(self, 'kind', None) == 'cs' and
+                any(name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT
+                    for name in names.values())):
+            self.compute_dpp_entry = self.compute_dpp_sites(branches, names)
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
                                  if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
@@ -3886,6 +3935,7 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.compute_dpp_blocks = set()
             self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
             self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
             self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
@@ -5411,16 +5461,21 @@ class Stage:
         # source lane is disabled and it decides nothing.
         fetch_inactive = 'fi:1' in mods
         mods = [m for m in mods if m != 'fi:1']
-        if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
+        compute_float = getattr(self, 'kind', None) == 'cs' and base in COMPUTE_DPP_FLOAT
+        if not compute_float and any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
             return self.dpp_broadcast(base, ops, mods, fetch_inactive=fetch_inactive)
         perm = None
         row_ror8 = False
+        row = None
         for m in mods:
             match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
-            if match and perm is None and not row_ror8:
+            if match and perm is None and not row_ror8 and row is None:
                 perm = tuple(int(x) for x in match.groups())
-            elif m == 'row_ror:8' and perm is None and not row_ror8:
+            elif m == 'row_ror:8' and perm is None and not row_ror8 and row is None:
                 row_ror8 = True
+            elif (compute_float and perm is None and not row_ror8 and row is None and
+                  re.fullmatch(r'(?:row_shr:(?:[1-9]|1[0-5])|row_share:(?:[0-9]|1[0-5]))', m)):
+                row = m
             elif m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
                 raise Unsupported('%s_dpp with %s' % (base, m))
         if row_ror8:
@@ -5429,11 +5484,12 @@ class Stage:
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported('%s_dpp with row_ror:8 outside a compute program' % base)
             intrinsic = ROW_ROR8
-        elif perm in DPP_PAIR:
+        elif perm in DPP_PAIR and not compute_float:
             return self.dpp_pair(base, '%s %s' % (base, ', '.join(ops)), ops, mods)
         else:
             intrinsic = QUAD_SWAPS.get(perm)
-        if not intrinsic:
+        indexed = compute_float and (row is not None or (perm is not None and intrinsic is None))
+        if not intrinsic and not indexed:
             raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
                               % (base, perm))
         if base == 'v_mov_b32':
@@ -5463,7 +5519,9 @@ class Stage:
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         compute = getattr(self, 'kind', None) == 'cs'
         if compute:
-            self.compute_quad_gate(base, row_ror8)
+            self.compute_quad_gate(base, row_ror8, allow_flow=compute_float)
+            if row is not None and math.prod(self.pipe.group) % 16:
+                raise Unsupported('%s_dpp %s requires a group of whole rows (a multiple of 16 threads)' % (base, row))
         else:
             if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
                 raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
@@ -5473,9 +5531,16 @@ class Stage:
             self.note_quad_flow(base)
             self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
+        valid = None
         if kind == 'f':
             neg0, abs0, base0 = src_neg_abs[0]
-            swapped = self.quad_source(intrinsic, self.u(base0), compute)
+            if indexed:
+                swapped, valid = self.compute_dpp_source(self.u(base0), perm, row)
+                if valid and 'bound_ctrl:1' in mods:
+                    swapped = '(%s ? %s : 0u)' % (valid, swapped)
+                    valid = None
+            else:
+                swapped = self.quad_source(intrinsic, self.u(base0), compute)
             first = 'F(%s)' % swapped
             if abs0:
                 first = 'abs(%s)' % first
@@ -5486,36 +5551,61 @@ class Stage:
             swapped = self.quad_source(intrinsic, self.u(ops[1]), compute)
             args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
-        self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+        dst = reg_range(ops[0])[1]
+        value = 'U(%s)' % expr if kind == 'f' else expr
+        if valid:
+            value = '(%s ? %s : %s)' % (valid, value, self.u(ops[0]))
+        self.set_v(dst, value)
         if compute:
             self.emit('GroupMemoryBarrierWithGroupSync();')  # the next exchange may rewrite the array
 
-    def compute_quad_gate(self, base, row_ror8=False):
+    def compute_dpp_source(self, source, perm, row):
+        """Stage source words and select a lane within the same logical quad or row."""
+        flat = self.stage_quad_source(source)
+        if row is None:
+            control = sum(lane << (2 * i) for i, lane in enumerate(perm))
+            return 'x2w_quad[(%s & ~3u) | ((%du >> (2u * (%s & 3u))) & 3u)]' % (flat, control, flat), None
+        kind, lane = row.split(':')
+        if kind == 'row_share':
+            return 'x2w_quad[(%s & ~15u) | %su]' % (flat, lane), None
+        valid = '(%s & 15u) >= %su' % (flat, lane)
+        # Keep even the unselected read inside this row.
+        return 'x2w_quad[(%s & ~15u) | ((%s - %su) & 15u)]' % (flat, flat, lane), valid
+
+    def compute_quad_gate(self, base, row_ror8=False, *, allow_flow=False):
         """A DPP quad swap in a compute program is exchanged through groupshared memory (no quad intrinsic: SM 6 leaves the
         quad of a compute thread to the implementation). Lane i of an aligned group of four reads lane perm[i] (RDNA 2 ISA,
         DPP16 quad_perm); a wave holds 32 or 64 consecutive threads in x-major order, so lane bits 1:0 are the bits 1:0
-        of the flat thread index whatever the wave size. Taken only when every thread reaches the exchange with exec equal
-        to the entry mask (straight-line code, no exec write: the barrier is then uniform and each source lane is active)
-        and the group is made of whole quads."""
+        of the flat thread index whatever the wave size. A group of whole quads must reach the exchange with
+        entry EXEC. Keep the original straight-line path and use the CFG proof for the selected float ALU."""
         x, y, z = self.pipe.group
         if x * y * z % 4:
             raise Unsupported('%s_dpp in a compute program requires a group of whole quads (a multiple of 4 threads)' % base)
         if row_ror8 and x * y * z % 16:
             raise Unsupported('%s_dpp row_ror:8 in a compute program requires a group of whole rows (a multiple of 16 threads)' % base)
-        if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC%s' % (base, self.quad_exec_cause()))
+        if self.quad_flow_straight() and getattr(self, 'exec_known', False):
+            return
+        block = getattr(self, 'compute_dpp_entry', {}).get(getattr(self, 'pc', None))
+        if allow_flow and block is not None:
+            self.compute_dpp_blocks.add(block)
+            return
+        raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC%s' % (base, self.quad_exec_cause()))
 
     def quad_source(self, intrinsic, source, compute):
         """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
         a groupshared slot, wait for the group, and read the slot of the lane the swap names."""
         if not compute:
             return '%s(%s)' % (intrinsic, source)
-        x, y, _z = self.pipe.group
+        flat = self.stage_quad_source(source)
+        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3, ROW_ROR8: 8}[intrinsic])
+
+    def stage_quad_source(self, source):
+        x, y, _ = self.pipe.group
         flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
         self.uses_quad_shared = True
         self.emit('x2w_quad[%s] = %s;' % (flat, source))
         self.emit('GroupMemoryBarrierWithGroupSync();')
-        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3, ROW_ROR8: 8}[intrinsic])
+        return flat
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
@@ -10309,6 +10399,9 @@ class Stage:
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
         loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
+        compute_dpp_blocks = getattr(self, 'compute_dpp_blocks', ())
+        if any(off not in index for off in compute_dpp_blocks):
+            raise Unsupported('compute DPP exchange lost its converged block')
         if len(self.blocks) == 1:
             return ['    ' + line for line in self.blocks[0][1]]
 
@@ -10325,7 +10418,8 @@ class Stage:
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
                            'pc == %d ? %s : 0u, false);' % (i, i, i, value))
-            if off == getattr(self, 'mesh_allocation_block', None):
+            if (off == getattr(self, 'mesh_allocation_block', None) or
+                    off in compute_dpp_blocks):
                 out.append('    {')
             else:
                 attribute = '[branch] ' if off in wave_load_blocks else ''
