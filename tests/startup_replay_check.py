@@ -7,7 +7,7 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
   - replay: with no X2W_ setting (the stand-in's settings and shader cache travel in the recording), x2w_replay
     writes the same picture names, every one equal to the recorded run's, every call played on an
     object it knows, and one "x2w-replay score" line;
-  - a window in the middle (f6,6) replays to the same pictures from its second present on, every object known
+  - a window in the middle (f6,6: frames 7-12) replays to the same pictures, every object known
     (the state-making calls before the window are recorded too);
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
@@ -161,7 +161,8 @@ def main(scene, player, backend):
         assert mutated[names[-1]] != recorded[names[-1]], "a changed clear colour replayed to the same last picture"
         assert all(mutated[n] == recorded[n] for n in names[:-1]), "the change reached other presents"
 
-        # A window in the middle (presents 6 to 12, the last one ends it): the calls before it that make the state
+        # A window in the middle: present 6 opens it (that Present call itself is before it), so frames 7 to 12 are in
+        # it, each with its own commands; the last present ends it. The calls before it that make the state
         # (creations, views, heap starts, signals) are recorded too, so every object the window names is known.
         window_dir, windowed = directory / "window_recorded", directory / "window.x2wr"
         window_dir.mkdir()
@@ -170,12 +171,12 @@ def main(scene, player, backend):
                               X2W_PRESENT_PICTURES=str(window_dir)))
         assert code == 0, text[-3000:]
         whole = pictures(window_dir)
-        _score, played = replay(player, windowed, directory / "window_replayed", backend, env, presents=7)
-        # Replayed present k is recorded present k + 5. The first one's frame was drawn before the window opened.
-        pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 5)) for k in range(2, 8)]
+        _score, played = replay(player, windowed, directory / "window_replayed", backend, env, presents=6)
+        # Replayed present k is recorded present k + 6.
+        pairs = [("present_%04d.png" % k, "present_%04d.png" % (k + 6)) for k in range(1, 7)]
         differ = [b for a, b in pairs if played[a] != whole[b]]
         assert not differ, "window replay differs from the recorded run at %s\n%s" % (
-            differ, explain(whole[differ[0]], played["present_%04d.png" % (int(differ[0][8:12]) - 5)],
+            differ, explain(whole[differ[0]], played["present_%04d.png" % (int(differ[0][8:12]) - 6)],
                             directory / "window_replayed" / "stderr.txt"))
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal; %s" % (PRESENTS, score))
