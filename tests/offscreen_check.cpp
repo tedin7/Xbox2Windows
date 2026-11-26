@@ -580,7 +580,7 @@ OperationResult run_compute_store_dpp_case(const OperationContext& ctx)
 // descriptor-table signature, because a texture SRV cannot be a root descriptor.
 OperationResult run_compute_texture_case(const OperationContext& ctx)
 {
-    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4]);
+    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1708,7 +1708,7 @@ const OperationSpec kOperations[] = {
     {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
-    {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
+    {"--compute-texture-case", 5, 6, nullptr, kNoGate, run_compute_texture_case},
     {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
     {"--compute-texture-store-case", 5, 5, nullptr, kNoGate, run_compute_texture_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},

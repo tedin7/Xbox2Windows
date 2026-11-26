@@ -15242,7 +15242,12 @@ ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hard
 ### Compute mip-zero gather
 
 The startup compute translator accepts `image_gather4_lz` on a 2D texture with
-the same constant sampler and one-hot component selection as the pixel form.
+one-hot component selection and a constant sampler. It keeps the sampler words
+for wrap, mirror, clamp, mirror-once and predefined border colors. For
+unnormalized coordinates, it divides X and Y by the extent of view mip zero
+before gathering. Non-sequential address encodings supply X and Y in operand
+order. Half-border modes, mirror-once-border and register border colors still
+have explicit refusals.
 The eight image descriptor words must come from one intact descriptor at a
 fixed table offset. The compute manifest records the texture SRV, sampler and
 raw output UAV. The fixture binds these on the standalone D3D12 compute runner.
@@ -15255,6 +15260,19 @@ starting at resource mip 0 and each RGBA component with the view starting at
 mip 1. The controls drop the gather, select red in place of green, bind mip 0
 in place of mip 1, or swap the first and last taps. The reference predicts
 4, 4, 4 and 2 mismatching words respectively.
+
+Ten additional synthetic dispatches check address modes, three predefined
+border colors, linear mip filtering, both ways to request unnormalized
+coordinates, and X/Y in non-sequential registers. The runner decodes the
+translated static sampler from the manifest. Each dispatch also has a control
+with wrong addressing, coordinate interpretation or view mip. The CPU reference
+specifies the first wrong word and mismatch count for each control.
+
+On Linux x64, `python3 -B tests/startup_compute_gather_lz_check.py --llvm-mc llvm-mc-19`
+passed the translation and encoding checks. All ten new programs were refused
+at the base revision `e8015da7a`. HLSL and manifests matched byte for byte
+for 16 existing channel fixtures across the pixel and compute gather paths.
+The expanded dispatch suite awaits Windows WARP readback.
 
 ```powershell
 cmake --build --preset release --target offscreen_check

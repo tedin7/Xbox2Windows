@@ -8189,7 +8189,10 @@ class Stage:
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
+        compute_lz = self.kind == 'cs' and name == 'image_gather4_lz'
         for modifier in mods:
+            if compute_lz and modifier == 'unorm':
+                continue
             if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
                 raise Unsupported('%s modifier %s' % (name, modifier))
         if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
@@ -8202,7 +8205,7 @@ class Stage:
         if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
             raise Unsupported('%s requires four destination registers' % name)
         if regs_out is not None and ops[1].startswith('['):
-            # Non-sequential address: each registers is named, in address order.
+            # Non-sequential address: each register is named, in address order.
             listed = [reg_range(c.strip()) for c in ops[1][1:-1].split(',')]
             if (len(listed) != addr_count or not all(r and r[0] == 'v' and r[1] == r[2] and r[2] <= 255 for r in listed)):
                 raise Unsupported('%s requires %s' % (name, addr_label))
@@ -8217,6 +8220,21 @@ class Stage:
             raise Unsupported('%s requires a constant sampler' % name)
         from pixel_aot import check_gather_sampler
         profiled = gather_2d_profile_words(words)
+        if compute_lz:
+            w0, w1, w2, w3 = profiled
+            # The static sampler decoder directly represents these RDNA 2 address modes.
+            # Half-border and mirror-once-border have no matching D3D12 address mode.
+            for shift in (0, 3):
+                if ((w0 >> shift) & 7) not in (0, 1, 2, 3, 6):
+                    raise Unsupported('%s sampler: unsupported X/Y address mode' % name)
+            if w3 >> 30 == 3:
+                raise Unsupported('%s sampler: register border color requires a palette' % name)
+            # Check the remaining fields against the original profile. The real words are
+            # still bound, and FORCE_UNNORMALIZED is handled by the coordinate lowering.
+            if ((w2 >> 26) & 3) == 2:
+                # At LOD zero the linear mip filter has no second contributing level.
+                w2 = (w2 & ~(3 << 26)) | (1 << 26)
+            profiled = ((w0 & ~(0x3f | (1 << 15))) | 0x12, w1, w2, w3 & 0x3fffffff)
         if not mip_preclamp and (words[2] & (1 << 28)):
             profiled = (profiled[0], profiled[1], profiled[2] | (1 << 28), profiled[3])
         try:
@@ -8224,6 +8242,8 @@ class Stage:
             # the 2D gather profile and enforces words[1] MAX_LOD plus view mip bounds in HLSL.
             check_gather_sampler(profiled, 1, comparison=False)
         except ValueError as error:
+            if compute_lz:
+                raise Unsupported('%s sampler: unsupported filter, LOD or descriptor flags' % name) from error
             raise Unsupported('%s sampler: %s' % (name, error)) from error
         key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
         tex = self.pipe.resource(key, 'tex2d')
@@ -8233,11 +8253,19 @@ class Stage:
         raise Unsupported('image_gather4 requires the guest implicit mip level')
 
     def op_image_gather4_lz(self, ops, mods):
+        regs = [] if self.kind == 'cs' else None
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
-            'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
+            'image_gather4_lz', ops, mods, 2, 'two VGPR address registers' if regs is not None else
+            'two contiguous address registers', mip_preclamp=True, regs_out=regs)
         smp = self.pipe.sampler(tuple(words))
-        u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
-        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
+        u, v = (self.f('v%d' % i) for i in (regs if regs is not None else range(addr[1], addr[2] + 1)))
+        coords = 'float2(%s, %s)' % (u, v)
+        if regs is not None and (words[0] & (1 << 15) or 'unorm' in mods):
+            # GetDimensions with no mip argument returns the extent at view mip zero.
+            self.emit('{ uint gw, gh; %s.GetDimensions(gw, gh); t = %s.Gather%s(%s, %s / float2(gw, gh)); }' %
+                      (tex, tex, channel_name, smp, coords))
+        else:
+            self.emit('t = %s.Gather%s(%s, %s);' % (tex, channel_name, smp, coords))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 

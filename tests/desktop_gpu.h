@@ -52,7 +52,8 @@ struct ComputeReadbackProgram {
 };
 ComputeReadbackProgram load_compute_store_program(ID3D12Device* device, const char* shader);
 void check_compute_store_reference(ID3D12Device* device, const ComputeReadbackProgram& program, const char* reference);
-void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference,
+                                const char* sampler_manifest = nullptr);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
 bool check_compute_texture_store_file(ID3D12Device* device, const char* path, const char* reference);
