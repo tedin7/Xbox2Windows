@@ -160,10 +160,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
+        else {
+            // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
+            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
+            log("x2w-draw compute pipeline %016llx manifest line %u rejected (%s; %zu inputs and %zu outputs read so far): %.120s", tr.key,
+                line_number, why, tr.srvs.size(), tr.uavs.size(), line.c_str());
+            return why;
+        }
     }
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
@@ -400,12 +406,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
         // One reason per condition, so a census says which one an output failed on.
         if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
-        else if (!bytes || bytes % 4 || bytes > (16u << 20)) reason = "an output range is empty, over 16 MiB or not whole dwords";
+        else if (!bytes) reason = "an output range has zero bytes";
+        else if (bytes % 4) reason = "an output range is not a whole number of dwords";
+        else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
         else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer was created without unordered access";
+        static LONG size_logged;
+        if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
+            log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
+                stride, words[2], reason);
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
