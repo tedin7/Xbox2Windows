@@ -16,6 +16,7 @@ BLUE = bytes((0, 0, 255, 255))
 
 
 def run(directory, consumer, backend, mode):
+    print(f"mode {mode}", flush=True)
     folder = directory / mode
     folder.mkdir()
     log = folder / "trap.log"
