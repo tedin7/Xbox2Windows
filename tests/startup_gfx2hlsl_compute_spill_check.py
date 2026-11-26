@@ -402,14 +402,14 @@ def probe_refusals():
         text = reason(spill, sym)
         check('refused: %s (%s)' % (label, text), isinstance(text, str) and 'modified descriptor or pointer word' in text)
     for label, sym in (('a table pointer', ('ptr', ('table', 0))), ('a descriptor word', ('desc', ('table', 0), 0, 1))):
-        text = reason(spill, sym, kind='ps')
-        check('refused: %s in a pixel stage (%s)' % (label, text),
-              isinstance(text, str) and 'holds a lane mask or descriptor' in text)
+        stage = reason(spill, sym, kind='ps')
+        check('pixel stage spills %s and reloads the same symbol' % label,
+              not isinstance(stage, str) and stage.sym.get(21) == sym, stage)
 
 
 # Each translator mutation must turn at least one control red.
 MUTATIONS = {
-    'the reload restores no symbol': ('        self.set_s(dst[1], \'sp%d_%d\' % (n, lane), sym=sym, uniform=uniform)',
+    'the reload restores no symbol': ('        self.set_s(dst[1], \'sp%d_%d\' % (n, lane), sym=None if mask else sym, uniform=uniform)',
                                       '        self.set_s(dst[1], \'sp%d_%d\' % (n, lane), sym=None, uniform=uniform)'),
     'the reload drops the provenance': ("            return all(\n                getattr(self, 'reload_proven', {}).get(reloads[w], False)",
                                         "            return all(\n                False and getattr(self, 'reload_proven', {}).get(reloads[w], False)"),

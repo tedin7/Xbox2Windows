@@ -286,13 +286,13 @@ def controls(module=G, quiet=False):
     for name, (_, _, fragment, why) in VARIANTS.items():
         reason = refusal(name, module)
         verdict('refused: %s (%s)' % (why, reason), reason is not None and fragment in reason, reason)
-    verdict('mask spills stay refused in a pixel stage (%s)' % probe_pixel(module), 'holds a lane mask or descriptor' in
+    verdict('mask spills stay refused in a pixel stage of unknown wave size (%s)' % probe_pixel(module), 'holds a lane mask or descriptor' in
             probe_pixel(module))
     return red
 
 
 def probe_pixel(module):
-    """A pixel stage that spills a lane mask keeps the refusal of step 1: only compute stages model the mask this way."""
+    """A graphics spill of a mask requires a known wave32 source."""
     stage = module.Stage.__new__(module.Stage)
     stage.kind, stage.lines, stage.sym = 'ps', [], {}
     stage.used_s, stage.used_v, stage.uniform_v, stage.varying_s = set(), set(), set(), set()
@@ -317,14 +317,14 @@ MUTATIONS = {
                             "            elif ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi'):"),
     'exec is a mask source': ("            elif ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):",
                               "            elif ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'm0'):"),
-    'vcc_hi is a mask source': ("            if ops[1] == 'vcc_lo' and self.spills_lane_masks():",
-                                "            if ops[1] in ('vcc_hi', 'vcc_lo') and self.spills_lane_masks():"),
+    'vcc_hi is a mask source': ("            if ops[1] == 'vcc_lo' and self.kind == 'cs':",
+                                "            if ops[1] in ('vcc_hi', 'vcc_lo') and self.kind == 'cs':"),
     'a mask not proven on every path is spilled': ('                if src[1] in self.join_masks:', '                if False:'),
     'the write stores the inverted bit': ("value, sym, uniform, proven, mask = 'vcc', None",
                                          "value, sym, uniform, proven, mask = '(vcc ^ 1u)', None"),
     'the reload restores the neighbouring slot': ("        self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=None if mask else sym,",
                                                   "        self.set_s(dst[1], 'sp%d_%d' % (n, lane ^ int(mask)), sym=None if mask else sym,"),
-    'every stage spills masks': ("        return getattr(self, 'kind', None) == 'cs'", '        return True'),
+    'every stage spills masks': ("        return kind == 'cs' or getattr(self, 'spill_wave', None) == 32", '        return True'),
     'a number is reloaded into vcc_lo': ("            if not (mask and ops[0] == 'vcc_lo'):", "            if ops[0] != 'vcc_lo':"),
     'no loop-carried refusal': ("        if max(writes) > i:", "        if False:"),
     'no write-before-read refusal': ("        if writes is None:\n            raise Unsupported('v_readlane_b32 reads v%d lane %d with no",

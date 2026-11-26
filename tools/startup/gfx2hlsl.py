@@ -8945,8 +8945,8 @@ class Stage:
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
     # Lanes 0..63 cover a wave64 program. A wave32 program uses only bits 4:0 of the lane select (RDNA 2 ISA,
     # v_readlane/v_writelane: the lane is taken modulo the wave size), so k and k + 32 name one slot there and two in
-    # wave64; the translator does not know the wave size, so a VGPR whose lanes include such a pair is refused.
-    # Slot 57 mesh is wave64 (#2127). Vertex stages use the same model: the two instructions touch no other lane and no stage input.
+    # wave64. Resolve such pairs using the source wave size, keeping the existing slot names for unpaired lanes.
+    # Slot 57 mesh is wave64 (#2127).
     #
     # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
     # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
@@ -8956,10 +8956,10 @@ class Stage:
     # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
     # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
     # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
-    # Compute stages (cs) use the same proof, branches included. A spilled descriptor or pointer word (SPILL_SYMBOLS) is a
+    # A spilled descriptor or pointer word (SPILL_SYMBOLS) is a
     # symbol with no run-time value: the slot carries the symbol, the reload restores it, and the word keeps the
     # provenance the formatted loads require (formatted_descriptor_from_block follows a reload to the writes that supply it).
-    # Lane masks (compute only). The translator models a lane mask (vcc_lo, or an SGPR in self.masks) per invocation
+    # Lane masks (compute and wave32 pixel/vertex). The translator models a lane mask (vcc_lo, or an SGPR in self.masks) per invocation
     # as that invocation's own bit: `vcc` / `sN` hold bit 0 of the wave mask, and a v_cmp stores `w` (all lanes active)
     # or `exec & w`, so an inactive lane's bit is already 0 in the variable. `v_writelane_b32 vN, M, k` copies the whole
     # wave mask into lane k whatever EXEC is, `v_readlane_b32 D, vN, k` copies it back to every lane, so a mask that is
@@ -8993,7 +8993,18 @@ class Stage:
                     lane = int(ops[2], 0)  # 3 and 0x3 are one slot
                 except ValueError:
                     lane = ops[2]  # an SGPR lane, refused by spill_operands
-                lane_ops[i] = (base == 'v_writelane_b32', ops[0 if base == 'v_writelane_b32' else 1], lane)
+                vreg = reg_range(ops[0 if base == 'v_writelane_b32' else 1])
+                if vreg and vreg[0] == 'v':
+                    lane_ops[i] = (base == 'v_writelane_b32', vreg[1], lane)
+        lanes = {}
+        for _, n, lane in lane_ops.values():
+            if isinstance(lane, int):
+                lanes.setdefault(n, set()).add(lane)
+        self.spill_wave = self.graphics_spill_wave_size() if lanes else None
+        self.spill_aliases = {
+            (n, lane): lane - 32 for n, used in lanes.items() for lane in used
+            if self.spill_wave == 32 and 32 <= lane < 64 and lane - 32 in used
+        }
         into = [{}] + [None] * (len(bounds) - 1)  # None: no path reaches the block yet
         reach = {}
         changed = True
@@ -9006,6 +9017,7 @@ class Stage:
                 for i in range(lo, hi):
                     if i in lane_ops:
                         write, vreg, lane = lane_ops[i]
+                        lane = self.spill_aliases.get((vreg, lane), lane)
                         if write:
                             state[vreg, lane] = frozenset([i])
                         else:
@@ -9080,8 +9092,17 @@ class Stage:
             if target is not None:
                 todo.append(target)
 
+    def graphics_spill_wave_size(self):
+        if self.kind == 'ms':
+            return 64
+        if self.kind not in ('ps', 'vs'):
+            return None
+        wave = getattr(self.pipe, 'stage_wave_sizes', {}).get(self.kind)
+        return wave if wave is not None else (32 if wave32_exec_proof(self.ins) else None)
+
     def spills_lane_masks(self):
-        return getattr(self, 'kind', None) == 'cs'
+        kind = getattr(self, 'kind', None)
+        return kind == 'cs' or getattr(self, 'spill_wave', None) == 32
 
     def spill_operands(self, name, ops, mods):
         if mods or len(ops) != 3:
@@ -9104,9 +9125,9 @@ class Stage:
                                             (kind not in ('ps', 'cs') or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
-        if kind in ('ps', 'vs', 'cs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+        if kind != 'ms' and getattr(self, 'spill_wave', None) is None:
             self.require_spill_lanes_apart(vreg[1], name)
-        return vreg[1], sreg, lane
+        return vreg[1], sreg, getattr(self, 'spill_aliases', {}).get((vreg[1], lane), lane)
 
     def require_spill_lanes_apart(self, n, name):
         """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
@@ -9142,10 +9163,10 @@ class Stage:
         n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
         mask = False
         if src is None:
-            # Slot 57 mesh keeps ordinary scalar spills only (R0Y00 on #2637). Raw EXEC words are not
+            # Raw EXEC words are not
             # proven under the one-lane model (exec_hi would be wrong under full EXEC; exec_lo under
             # a lane-0 mask would reload per thread). mesh_entry_aot still models EXEC for #2127.
-            if ops[1] == 'vcc_lo' and self.spills_lane_masks():
+            if ops[1] == 'vcc_lo' and self.kind == 'cs':
                 value, sym, uniform, proven, mask = 'vcc', None, False, False, True
             elif ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
                 raise Unsupported('v_writelane_b32 source %s is a lane mask or m0' % ops[1])
@@ -9155,7 +9176,7 @@ class Stage:
                     sym = ('const', int(value[2:-1], 16))
         else:
             held = self.sym.get(src[1]) or ('',)
-            carried = held[0] in self.SPILL_SYMBOLS and getattr(self, 'kind', None) == 'cs'
+            carried = held[0] in self.SPILL_SYMBOLS
             mask = self.spills_lane_masks() and src[1] in self.masks
             if mask:
                 if src[1] in self.join_masks:
@@ -9164,7 +9185,7 @@ class Stage:
             elif not carried and (self.is_lane_mask(ops[1]) or held[0] not in ('', 'const', 'ud', 'fixed_buffer_word')):
                 raise Unsupported('v_writelane_b32 source s%d holds a lane mask or descriptor' % src[1])
             elif carried:
-                # A descriptor or pointer word of a compute stage: the slot holds the symbol itself, so the reload
+                # A descriptor or pointer word: the slot holds the symbol itself, so the reload
                 # restores the same word. Nothing is emitted: the translation has no run-time value for it.
                 if not names_one_value(held):
                     raise Unsupported('v_writelane_b32 source s%d holds a modified descriptor or pointer word' % src[1])
@@ -11153,7 +11174,11 @@ class Pipeline:
         self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
+                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), *, stage_wave_sizes=None):
+        # Source wave sizes are independent of the desktop wave width. Absent metadata, spills use the EXEC proof.
+        self.stage_wave_sizes = dict(stage_wave_sizes or {})
+        if any(wave not in (None, 32, 64) for wave in self.stage_wave_sizes.values()):
+            raise Unsupported('graphics spill wave size must be 32 or 64')
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
         self.rect = self.ud(('rect',))
@@ -11971,7 +11996,10 @@ class MeshPixelStage(Pipeline):
     """Pixel stage paired with a mesh shader exporting param0..param12 (#2413 T4)."""
 
     def __init__(self, mesh_params, ps_code, root_blob, *, rtv_formats=(), ps_hw_inputs=None, ps_attr_map=None,
-                 sampler_heap=None, srv_formats=(), refusals=None, decoded=None):
+                 sampler_heap=None, srv_formats=(), refusals=None, decoded=None, wave_size=None):
+        if wave_size not in (None, 32, 64):
+            raise Unsupported('graphics spill wave size must be 32 or 64')
+        self.stage_wave_sizes = {'ps': wave_size}
         from mesh_param_link import MAX_PARAM, validate_linkage
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, None,
                                  ps_attr_map, srv_formats)
