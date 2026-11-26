@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -69,8 +70,21 @@ def main(probe):
         for bad in ("0.5", "-1", "abc"):
             refused, _ = run(probe, work, "bad", "--timeout", "1", "--capture-every", bad)
             assert refused.returncode == 2 and "--capture-every" in refused.stdout, (bad, refused.returncode, refused.stdout)
+        # The commit headroom (--commit-headroom-mib): more than any machine has free ends the run long before the timeout,
+        # with the reason in the summary and the end-of-run window.png still written; one MiB never fires.
+        started = time.monotonic()
+        ended, ended_dir = run(probe, work, "headroom", "--timeout", "40", "--commit-headroom-mib", "1000000000")
+        took = time.monotonic() - started
+        assert "stopped by request" in ended.stdout and "(commit headroom: system commit has " in ended.stdout, ended.stdout
+        assert "under the headroom of 1000000000 MiB" in ended.stdout and took < 25, (took, ended.stdout)
+        assert (ended_dir / "window.png").exists() and "commit headroom: 1000000000 MiB, lowest free commit" in ended.stdout
+        roomy, _ = run(probe, work, "roomy", "--timeout", "4", "--commit-headroom-mib", "1")
+        assert "timeout after" in roomy.stdout and "commit headroom: 1 MiB, lowest free commit" in roomy.stdout, roomy.stdout
+        for bad in ("-1", "abc", "1.5"):
+            refused, _ = run(probe, work, "badhead", "--timeout", "1", "--commit-headroom-mib", bad)
+            assert refused.returncode == 2 and "--commit-headroom-mib" in refused.stdout, (bad, refused.returncode, refused.stdout)
     print("startup_debug_window: PASS (red then blue saved once each, unchanged frames skipped, change time reported, "
-          "window.png unchanged, off by default, bad interval refused)")
+          "window.png unchanged, off by default, bad interval refused; commit headroom ends a run, one MiB does not)")
     return 0
 
 
