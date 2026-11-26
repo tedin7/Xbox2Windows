@@ -70,6 +70,9 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_refusals_cached;  // refusals answered from refusal_cache without taking draw_lock
+x2w_local::RefusalCache& compute_refusals() { static x2w_local::RefusalCache cache; return cache; }
+constexpr int refusal_untranslated = 1, refusal_unmodelled = 2;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
@@ -229,6 +232,17 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
+    {
+        // A pipeline without a usable translation refuses every dispatch for the same reason until its manifest is retried: answer
+        // from the cache, without draw_lock (a flood of such dispatches held the lock for seconds).
+        const char* cached = nullptr;
+        int cached_kind = 0;
+        if (compute_refusals().hit(key, GetTickCount64(), &cached, &cached_kind)) {
+            InterlockedIncrement(cached_kind == refusal_unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated);
+            InterlockedIncrement(&compute_refusals_cached);
+            return cached;
+        }
+    }
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
     draw_lock_acquire_exclusive();
@@ -250,7 +264,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             tr->unmodelled = load_compute_translation(*tr);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
+        if (tr->state == 1) compute_refusals().forget(key);
         if (tr->state != 1) {
+            compute_refusals().put(key, tr->unmodelled ? tr->unmodelled : "no translation", tr->unmodelled ? refusal_unmodelled : refusal_untranslated,
+                                   tr->unmodelled ? 0 : tr->retry_manifest_at);
+            tr->dispatches += compute_refusals().take_hits(key);
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
             reason = tr->unmodelled ? tr->unmodelled : "no translation";
             counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;

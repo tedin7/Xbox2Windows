@@ -22,6 +22,7 @@
 #include "startup_stubs/copy_cache_trim.h"
 #include "startup_stubs/lock_sites.h"
 #include "startup_stubs/key_profile.h"
+#include "startup_stubs/refusal_cache.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -7800,6 +7801,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
+        log("x2w-render compute refusals answered from the cache without draw_lock: %ld", compute_refusals_cached);
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
