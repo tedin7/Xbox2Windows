@@ -22,10 +22,12 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.SuspendThread.restype = ctypes.c_uint32
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
 from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
+from step_gate import StepGate  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -454,7 +456,23 @@ def main():
     retired = set()  # X2W_LOG_AT breakpoints removed at their hit limit
     late_hits = {}  # retired addr -> INT3 events that arrived after the removal
     returns = {}  # addr -> list of (tid, rsp after return, description)
-    stepping = {}  # tid -> addr to re-arm
+    live_threads = set()
+
+    def suspend_thread(thread_id):
+        handle = k32.OpenThread(0x0002, False, thread_id)  # SUSPEND_RESUME
+        if not handle:
+            return False
+        suspended = k32.SuspendThread(wt.HANDLE(handle)) != 0xFFFFFFFF
+        k32.CloseHandle(wt.HANDLE(handle))
+        return suspended
+
+    def resume_thread(thread_id):
+        handle = k32.OpenThread(0x0002, False, thread_id)
+        if handle:
+            k32.ResumeThread(wt.HANDLE(handle))
+            k32.CloseHandle(wt.HANDLE(handle))
+
+    gate = StepGate(suspend_thread, resume_thread, lambda: live_threads)
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
 
     def arm(addr, *, skip_int3=False):
@@ -569,15 +587,17 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
+        # Suspend every peer first; only then open the byte. If a peer cannot be suspended the byte stays
+        # patched and the thread re-executes the breakpoint, so no call runs through the restored byte.
+        if gate.begin(tid, addr) is None:
+            set_ctx(thread)
+            return True
         # Step over the original instruction, then re-arm.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])
-        stepping[tid] = addr
         return True
-
-    live_threads = set()
 
     def dump_threads(path):
         """At a timeout: every thread's rip and the module addresses found on its stack."""
@@ -781,6 +801,9 @@ def main():
             live_threads.add(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            addr = gate.forget(tid)
+            if addr in breakpoints:
+                write(addr, b"\xcc")
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")
@@ -812,8 +835,8 @@ def main():
                     continue
                 log(f"{time.time() - start:7.3f} X2W_LOG_AT late hit at {where(ex_addr)} on thread {tid}: "
                     f"thread context unavailable (error {ctx_error[0]}), handled as a breakpoint")
-            if ex_code == 0x80000004 and tid in stepping:
-                addr = stepping.pop(tid)
+            if ex_code == 0x80000004 and tid in gate.stepping:
+                addr = gate.finish(tid)
                 if addr in breakpoints:
                     write(addr, b"\xcc")
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -871,6 +894,8 @@ def main():
         k32.ContinueDebugEvent(pid, tid, status)
 
     elapsed = time.time() - start
+    if gate.dropped:
+        log(f"{elapsed:7.3f} concurrent hook hits held for a step: {gate.dropped}")
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
     if stop:
