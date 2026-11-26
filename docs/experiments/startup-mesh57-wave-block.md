@@ -95,3 +95,22 @@ On a local capture, 407 slot 57 requests stop at the refusal above on main `96a7
   covered`.
 - No new complete translation results from either change.
 - The other 316 have a branch inside the block, `src_scc`, or the `v_cmpx_lt_u32 v, v` compare form.
+
+## Preloaded count inputs and uniform quadmask
+
+The slot 57 count exchange can omit a vector move when a preceding full-EXEC move
+already put the same count or zero address in the VGPR. The matcher checks both
+LDS arms and their branch destinations against the shorter layout.
+
+A pre-exchange wave-load block can apply `s_quadmask_b64` to proven wave-uniform
+scalar data. The block still skips an empty wave, which retains its incoming
+scalar values. The quadmask's SCC result must be dead at the join.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_mesh57_(skeleton|count_and_scalar_warp)$' -V
+```
+
+The WARP fixture compares the DispatchMesh render target with a CPU rasterizer.
+Its count mutant removes one primitive and its EXEC mutant skips per lane. Each
+must fail against the original reference and match its own CPU reference. The
+Python check also refuses a preloaded vertex count with the wrong value.

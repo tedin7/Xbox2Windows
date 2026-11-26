@@ -1597,6 +1597,74 @@ MESH_COUNTS = [
 ]
 
 
+# Each optional move feeds one of the LDS operations. Bind its operands at
+# their remaining uses when the move is missing.
+MESH_COUNT_MOVES = {5: ('b_p', 'prims'), 6: ('b_zero', None),
+                    7: ('b_v', 'verts'), 20: ('b_zero2', None)}
+
+
+def mesh_count_run(ins, at, env):
+    try:
+        matched = env.copy()
+        end = mesh_run(ins, at, 'count exchange', MESH_COUNTS, matched)
+    except Unsupported as original:
+        matched = env.copy()
+        indices, omitted = [], []
+        end = at
+        for slot, pattern in enumerate(MESH_COUNTS):
+            indices.append(end)
+
+            def operand(ref):
+                key = ref[1]
+                if key in matched:
+                    return re.escape(matched[key])
+                return r'(?P<%s>%s\d+)' % (key, 'v' if key.startswith('b_') else 's')
+
+            text = ins[end][3] if end < len(ins) else ''
+            match = re.fullmatch(re.sub(r'\{(\w+)\}', operand, pattern), text)
+            # The zero move and vertex move may both be VMOVs but use
+            # distinct source classes (literal versus SGPR).
+            if not match and slot in MESH_COUNT_MOVES:
+                omitted.append(MESH_COUNT_MOVES[slot])
+                continue
+            if not match:
+                raise original
+            matched.update(match.groupdict())
+            end += 1
+        env.update(matched)
+        return end, indices, omitted
+    env.update(matched)
+    return end, list(range(at, end)), []
+
+
+def mesh_count_input(ins, lo, hi, vector, scalar):
+    """Prove the omitted move's value under full EXEC in the straight-line prefix."""
+    source = scalar or '0'
+    reg = int(vector[1:])
+    targets = {int(label, 16) for _, _, name, asm in ins if name.startswith(('s_branch', 's_cbranch'))
+               for label in re.findall(r'label_([0-9a-f]+)\b', asm)}
+    if ins[hi][0] in targets:
+        return False
+    found = False
+    for index in range(hi - 1, lo - 1, -1):
+        off, _, name, asm = ins[index]
+        _, ops, _ = parse(asm)
+        if writes_exec(name, ops):
+            return found and asm == 's_mov_b64 exec, -1'
+        if off in targets or name.startswith(('s_branch', 's_cbranch', 's_call', 's_setpc', 's_swappc')):
+            return False
+        if not found:
+            if scalar and ({int(scalar[1:]), 'any'} & scalar_destinations(name, asm)):
+                return False
+            if name.startswith('v_movrel'):
+                return False
+            if reg in mesh_vregs(ops[:2] if name.startswith('v_swap') else destinations(name, ops)):
+                if asm != 'v_mov_b32_e32 %s, %s' % (vector, source):
+                    return False
+                found = True
+    return False
+
+
 def mesh_vregs(tokens):
     out = set()
     for m in MESH_VREG.finditer(' '.join(tokens)):
@@ -1638,9 +1706,11 @@ MESH_WAVE_BLOCK_LOADS = ('s_buffer_load_dword', 's_buffer_load_dwordx2', 's_buff
                          's_load_dwordx4', 's_load_dwordx8', 's_load_dwordx16')
 
 
-def mesh_wave_block_scalar(name, asm):
+def mesh_wave_block_scalar(name, asm, *, wave_guard=False):
     """True for an instruction of a pre-exchange execz block that the lowering may run for every lane of a wave with
     an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
+    if name == 's_quadmask_b64' and not wave_guard:
+        return False
     if name in MESH_WAVE_BLOCK_LOADS:
         pass
     elif name == 'v_readfirstlane_b32':
@@ -1650,7 +1720,7 @@ def mesh_wave_block_scalar(name, asm):
         return not re.search(r'\b(exec|m0|src_)', asm) and scalar_effects(name, asm)[2] <= VCC_KEYS
     elif not name.startswith('s_') or name.startswith(EXECZ_REFUSED + NO_SCALAR_DESTINATION + (
             's_load', 's_getpc', 's_setpc', 's_swappc', 's_call', 's_get', 's_set', 's_movrel', 's_rfe', 's_trap',
-            's_memtime', 's_memrealtime', 's_buffer_load', 's_scratch', 's_dcache', 's_gl1', 's_wqm', 's_quadmask',
+            's_memtime', 's_memrealtime', 's_buffer_load', 's_scratch', 's_dcache', 's_gl1', 's_wqm',
             's_denorm_mode', 's_round_mode')):
         return name.startswith(('s_cmp_', 's_bitcmp')) and not re.search(r'\b(exec|vcc|m0|src_)', asm)
     if re.search(r'\b(exec|m0|src_|ttmp|tba|tma|flat_scratch|xnack)', asm) or 'saveexec' in name:
@@ -1826,17 +1896,21 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     start = next((i for i in range(first, len(ins)) if ins[i][3] == 's_mov_b64 exec, 1'), first)
     a_end = mesh_run(ins, start, 'group-index exchange', MESH_EXCHANGE, env)
     count_at = next((i for i in range(a_end, len(ins)) if ins[i][2] == 's_barrier'), len(ins))
-    b_end = mesh_run(ins, count_at, 'count exchange', MESH_COUNTS, env)
+    b_end, count_slots, omitted = mesh_count_run(ins, count_at, env)
+    omitted_vectors = {vector for vector, _ in omitted}
+    for vector, scalar in omitted:
+        if not mesh_count_input(ins, a_end, count_at, env[vector], env[scalar] if scalar else None):
+            raise Unsupported('slot 57 mesh count exchange: omitted vector move has no proven input value')
 
     def lands(key, index, what):
         if index >= len(ins) or int(env[key], 16) != ins[index][0]:
             raise Unsupported('slot 57 mesh %s: a branch leaves the accepted shape' % what)
     lands('a_other', start + 10, 'group-index exchange')
     lands('a_join', a_end, 'group-index exchange')
-    lands('b_reader', count_at + 17, 'count exchange')
-    lands('b_wskip', count_at + 10, 'count exchange')
+    lands('b_reader', count_slots[17], 'count exchange')
+    lands('b_wskip', count_slots[10], 'count exchange')
     lands('b_join', b_end, 'count exchange')
-    lands('b_rskip', count_at + 27, 'count exchange')
+    lands('b_rskip', count_slots[27], 'count exchange')
     lane = set(range(*(lambda r: (r[1], r[2] + 1))(reg_range(env['lane']))))
     a_bits = int(env['a_bits'][1:])
     sreg = {key: int(env[key][1:]) for key in ('wave', 'prims', 'verts', 'b_tmp')}
@@ -2029,6 +2103,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                         reads, must, may = scalar_effects(*ins[i][2:])
                         written |= {reg for reg in must | may if re.fullmatch(r's\d+', reg)}
                         masks |= ((must | may) & VCC_KEYS) | (must & {'scc'})  # every s_ op may-writes SCC
+                        if ins[i][2] == 's_quadmask_b64':
+                            masks.add('scc')
                     live = sorted((reg for reg in written if live_at_join(reg, target)), key=lambda r: int(r[1:]))
                     # Keep the prefix fast path for its original reset shape. Otherwise vote on the
                     # actual EXEC bits after the compare, including any earlier narrowing.
@@ -2062,7 +2138,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
-                         any(not mesh_wave_block_scalar(*ins[i][2:]) for i in scalar))) if failed]
+                         any(not mesh_wave_block_scalar(*ins[i][2:], wave_guard=True) for i in scalar))) if failed]
                     if causes:
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
@@ -2157,7 +2233,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
             out.append(span(count_at, b_end - 2) + (
                 'x2w_mesh_counts', 'x2w_mesh_counts %s, %s, %s' % (env['prims'], env['verts'], env['b_tmp'])))
             out.append(ins[b_end - 1])
-            stale |= pending | {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+            stale |= pending | {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')
+                                if k not in omitted_vectors}
             pending.clear()
             mask, scc_stale = None, True
             wave_known = wave_known and sreg['wave'] != sreg['b_tmp']
@@ -4065,6 +4142,12 @@ class Stage:
                             raise Unsupported(execz_effects)
                         # Capture the bound at the compare, before any intervening SGPR write.
                         self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if base == 's_quadmask_b64' and any(
+                            branch in wave_loads and branch < off < jump for branch, jump in branches):
+                        regs = scalar_registers(' '.join(parse(asm)[1][1:]))
+                        if any(not self.uniform_source('s%d' % reg) or reg not in self.defined_uniform_s
+                               for reg in regs):
+                            raise Unsupported(execz_effects)
                     if off in wave_load_sites:
                         offset = smem_offset(parse(asm)[1][2])
                         if not self.uniform_source(offset) or (

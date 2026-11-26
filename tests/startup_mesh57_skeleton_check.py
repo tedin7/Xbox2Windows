@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py count_and_scalar <dxc> <offscreen_check> <warp>
        startup_mesh57_skeleton_check.py wave_collectives <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
@@ -224,6 +225,37 @@ def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e2
 
 
 WAVE_LOAD_MESH = wave_load_mesh()
+# Source for the synthetic words below. The loaded 1.0 has three nonzero nibbles.
+# The quadmask becomes red on both active and inactive lanes of the mixed wave.
+# s_buffer_load_dword s44, s[16:19], s41 offset:0x1e0
+# s_waitcnt lgkmcnt(0)
+# s_mov_b32 s45, 0
+# s_quadmask_b64 s[46:47], s[44:45]
+# s_cmp_eq_i32 s46, 0xe0
+# s_cselect_b32 s40, 1.0, 0
+# v_mov_b32 v7, 1.0
+WAVE_QUADMASK_MESH = wave_load_mesh(body=(
+    'f4200b08 520001e0 bf8cc07f bead0380 beae2d2c bf00ff2e 000000e0 852880f2 7e0e02f2'
+))
+
+
+def preloaded_count_mesh():
+    # Under full EXEC, copy the counts and the two arms' shared zero address
+    # before the exchange. Shorten the three branches that cross removed moves.
+    mesh = list(WAVE_LOAD_MESH)
+    at = mesh.index('bf008006') - 1
+    preloaded = '7e02020d 7e040280 7e06020e'.split()
+    exchange = mesh[at:]
+    exchange = mutate('bf840010', 'bf84000d', mesh=exchange)
+    exchange = mutate('bf880007', 'bf880004', mesh=exchange)
+    exchange = mutate('bf82000d', 'bf82000c', mesh=exchange)
+    exchange = mutate('bf880009', 'bf880008', mesh=exchange)
+    for word in (*preloaded, '7e040280'):
+        exchange.remove(word)
+    return mesh[:at] + preloaded + exchange
+
+
+PRELOADED_COUNT_MESH = preloaded_count_mesh()
 WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 WAVE_LOAD_REFUSALS = (
     ('different EXEC compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7d28002a'))),
@@ -665,6 +697,13 @@ def depth_only_controls():
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
+        for label, mesh in (('preloaded counts and address', PRELOADED_COUNT_MESH),
+                            ('uniform quadmask', WAVE_QUADMASK_MESH)):
+            expect(label, request(tmp, mesh)[1], 'ok')
+        bad = mutate('7e06020e', '7e060280', mesh=PRELOADED_COUNT_MESH)
+        expect('missing vertex move with the wrong preloaded value', request(tmp, bad)[1],
+               'unsupported: slot 57 mesh count exchange: omitted vector move has no proven input value')
+    with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
         names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
@@ -897,7 +936,8 @@ def rasterise(points, colours, indices, verts, prims):
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
-                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6):
+                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6,
+                   count_mutant=False):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -931,14 +971,14 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     expect('only the mixed wave reads; the empty wave address is past the SRV',
            (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: rule(word), 64: 64}))
 
-    def reference(swap):
+    def reference(swap, count=len(triangles)):
         rendered = list(colours)
         for tri in triangles:
             for tid in tri:
                 first, slot = tid & ~63, tid & 15
                 red = wave_red[first ^ (64 if swap else 0)]
                 rendered[slot] = (red, green(tid), *colours[slot][2:])
-        return rasterise(points, rendered, triangles, 128, len(triangles))
+        return rasterise(points, rendered, triangles, 128, count)
 
     correct, swapped = reference(False), reference(True)
     different = sum(a != b for a, b in zip(correct, swapped))
@@ -955,6 +995,18 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
         # Lanes outside EXEC in the mixed wave keep the old red when the block is skipped per lane.
         source = base.with_suffix('.ms57.hlsl').read_text()
         expect('one wave predicate on the block branch', source.count('pc = (!wave_any) ?'), 1)
+        if count_mutant:
+            store = 'lds[0] = s13;'
+            expect('one primitive count store', source.count(store), 1)
+            mutated = Path(directory) / 'one-fewer-primitive.hlsl'
+            mutated.write_text(source.replace(store, 'lds[0] = s13 - 1u;'))
+            mutant = Path(directory) / 'one-fewer-primitive.cso'
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True, capture_output=True)
+            fewer = reference(False, len(triangles) - 1)
+            missing = sum(a != b for a, b in zip(correct, fewer))
+            expect('reducing the primitive count removes covered pixels', missing > 0, True)
+            cases += [('reduced count against the correct image', mutant, correct, 1, missing),
+                      ('reduced count against its own image', mutant, fewer, 0, 0)]
         if wave_mutants:
             per_lane = reference_per_lane(points, colours, triangles, bound, old, wave_red)
             lanes = sum(a != b for a, b in zip(correct, per_lane))
@@ -1010,6 +1062,23 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
         expect(what, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
         print('%s: %d pixels differ from the reference' % (what, mismatches))
     return 0
+
+
+def draw_count_and_scalar(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    with tempfile.TemporaryDirectory() as tmp:
+        status = draw_wave_load(tmp, renderer, adapter, PRELOADED_COUNT_MESH, 'preloaded counts', dxc,
+                                wave_mutants=False, count_mutant=True)
+        if status:
+            return status
+        def quadmask_red(word):
+            bits, = struct.unpack('<I', struct.pack('<f', word))
+            mask = sum(1 << nibble for nibble in range(8) if (bits >> (4 * nibble)) & 15)
+            return 255 if mask == 0xe0 else 0
+
+        return draw_wave_load(tmp, renderer, adapter, WAVE_QUADMASK_MESH, 'uniform quadmask', dxc,
+                              rule=quadmask_red)
 
 
 def draw_wave_collectives(dxc, renderer, adapter):
@@ -1427,6 +1496,8 @@ def main(argv):
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['count_and_scalar'] and len(argv) == 5:
+        status = draw_count_and_scalar(*argv[2:])
     elif argv[1:2] == ['wave_collectives'] and len(argv) == 5:
         status = draw_wave_collectives(*argv[2:])
     elif argv[1:2] == ['depth'] and len(argv) == 5:
