@@ -3100,7 +3100,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
-            if (trace_inputs && texture) sampled_textures[sampled_count++] = texture;
+            if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
         }
         if (indirect) {
