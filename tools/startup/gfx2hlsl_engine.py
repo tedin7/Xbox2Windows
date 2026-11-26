@@ -9962,7 +9962,7 @@ class Stage:
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
         loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
-        marked = getattr(self, 'cs_tick', False) and any(line.startswith('X2W_') for b in self.blocks for line in b[1])
+        marked = (getattr(self, 'cs_tick', False) or getattr(self, 'kind', None) == 'ms' or getattr(self, 'cs_linear', False)) and any(line.startswith('X2W_') for b in self.blocks for line in b[1])
         if len(self.blocks) == 1 and not marked:
             return ['    ' + line for line in self.blocks[0][1]]
         if getattr(self, 'cs_tick', False):

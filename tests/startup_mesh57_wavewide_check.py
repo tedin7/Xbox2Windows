@@ -106,6 +106,7 @@ def controls():
     for name in WORDS:
         with tempfile.TemporaryDirectory() as tmp:
             key, result = request(tmp, name)
+            leftover = [p.name for p in Path(tmp).glob('*.hlsl') if 'X2W_' in p.read_text(errors='ignore')]
         if name in REFUSED:
             T.expect('%s is refused' % name, result != 'ok', True)
             if REFUSED[name]:
@@ -113,6 +114,7 @@ def controls():
             print('%s: refused (%s)' % (name, str(result).splitlines()[0][:100]))
         else:
             T.expect('%s translates' % name, result, 'ok')
+            T.expect('%s leaves no lowering marker in its HLSL' % name, leftover, [])
             print('%s: translates' % name)
     points, colours, indices = T.geometry()
     for name, (rule, wrong) in CASES.items():
