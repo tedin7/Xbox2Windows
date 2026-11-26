@@ -34,16 +34,27 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 
+DISPATCH_TIMEOUT_SECONDS = 60
+
+
 def dispatch(directory, consumer, env, mode):
     out = directory / 'out.bin'
     out.unlink(missing_ok=True)
     args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
             directory / 'program', directory / 'data', directory / 'state', mode]
-    result = subprocess.run(args, env=dict(env, X2W_TEST_DISPATCH_OUT=str(out)), capture_output=True, text=True)
+    try:
+        result = subprocess.run(args, env=dict(env, X2W_TEST_DISPATCH_OUT=str(out)), capture_output=True, text=True,
+                                timeout=DISPATCH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as hung:
+        tail = hung.stderr.decode(errors='replace') if isinstance(hung.stderr, bytes) else (hung.stderr or '')
+        raise AssertionError(f'{mode}: the consumer did not finish in {DISPATCH_TIMEOUT_SECONDS} s\n{tail[-3000:]}') from None
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
     assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
+    if env.get('X2W_D3D12_DEBUG') == '1':  # every mode, not only the first: the debug layer reports a bad call at once
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, f'{mode}: debug layer error: {errors[0]}'
     return list(struct.unpack('<%dI' % C.WORDS, out.read_bytes())), result
 
 
@@ -51,7 +62,7 @@ def lines(result, text):
     return [line for line in result.stderr.splitlines() if text in line]
 
 
-def prepare_case(directory, adapter):
+def prepare_case(directory, adapter, case='A'):
     cache, env = prepare(directory)
     env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
     if adapter == 'hardware':
@@ -60,7 +71,7 @@ def prepare_case(directory, adapter):
         env.pop('X2W_TEST_DISPATCH_HARDWARE', None)
     (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
     env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
-    _, words, rsrc2, group, groups = C.CASES['A']
+    _, words, rsrc2, group, groups = C.CASES[case]
     assert groups == (3, 2, 2) and (C.KEY, C.STRIDE) == (0x01234567, 0x9e3779b9), 'the consumer hard-codes case A'
     (directory / 'program').write_bytes(words)
     (directory / 'data').write_bytes(DATA)

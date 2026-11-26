@@ -60,6 +60,23 @@ def main(consumer, dxc):
                 validated = True
             errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
             assert not errors, errors
+        # A view destination inside a descriptor slot is refused (a tagged-handle driver reads wild memory); the dispatch is unchanged.
+        got, result = dispatch(directory, consumer, env, 'dispatch-view-misaligned')
+        assert got == C.expected('A'), 'a misaligned view destination changed the dispatch\n' + result.stderr[-3000:]
+        assert len(lines(result, 'is not on a descriptor slot boundary, refused')) == 1, result.stderr[-3000:]
+        plain = lines(dispatch(directory, consumer, env, 'dispatch')[1], 'is not on a descriptor slot boundary')
+        assert not plain, plain
+
+        # Case I clears the stride before it stores: the token's raw output then counts records in bytes (1280), not words.
+        raw_directory = directory / 'raw'
+        raw_directory.mkdir()
+        raw_cache, raw_env = prepare_case(raw_directory, 'warp', 'I')
+        dispatch(raw_directory, consumer, raw_env, 'dispatch')
+        subprocess.run([sys.executable, '-B', G.__file__, '--pending', raw_cache], check=True, capture_output=True,
+                       text=True, env=dict(os.environ, X2W_DXC=dxc))
+        got, result = dispatch(raw_directory, consumer, dict(raw_env, X2W_VIEW_TOKEN_UAV='1'), uav_mode)
+        mismatch = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b), None)
+        assert mismatch is None, f'raw token output: first differing word {mismatch}\n{result.stderr[-3000:]}'
         print(f'WARP: {C.WORDS} words match for SRV and slot-19 reads, including switch-off controls; '
               f'GPU-based validation {"on" if validated else "unavailable (no graphics tools)"}')
 

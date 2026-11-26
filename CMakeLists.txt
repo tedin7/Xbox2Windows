@@ -4996,6 +4996,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # wrong-group control must mismatch.
     add_test(NAME startup_compute_translate_requests COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py")
+    add_test(NAME startup_dispatch_helper COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_dispatch_helper_check.py")
     add_test(NAME startup_view_token_uav_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_view_token_uav_check.py"
         "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")

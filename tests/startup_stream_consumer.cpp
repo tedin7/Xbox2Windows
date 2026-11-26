@@ -385,6 +385,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
     }
+    if (mode == "dispatch-view-misaligned") {
+        // A view destination 16 bytes into slot 0 is not a descriptor: the stand-in refuses it and the dispatch is unchanged.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+        uav.Buffer = {0, words, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        invoke(device, 19, word(placed[1]), 0, word(&uav), cpu + sizeof(descriptors[0]));
+    }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
     invoke(list, 39, 0, 1, word(&constants[1]), 1);
