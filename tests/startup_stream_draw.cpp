@@ -142,11 +142,26 @@ bool populate_tiled_bc7(const StartupBc7Input& input, const D3D12_RESOURCE_DESC&
 // Clear colour of the packed-target case; its 8-, 5- and 4-bit roundings differ (tests/startup_packed_target_draw_check.py).
 const float packed_clear[] = {0.45f, 0.0f, 0.8f, 1.0f};
 
+// The 16-bit texel the "fill" variant of the packed case writes into the title's memory at (x, y): distinct in every
+// bit field of both 16-bit layouts (tests/startup_packed_target_draw_check.py computes the same).
+std::uint16_t packed_fill_texel(UINT x, UINT y)
+{
+    return static_cast<std::uint16_t>((x * 257u + y * 131u + 0x1234u) & 0xffffu);
+}
+
+// True when the packed spec ends in ":1": the title memory holds known 16-bit texels and nothing clears the texture.
+bool packed_fill(const char* spec)
+{
+    unsigned a = 0, b = 0, c = 0, fill = 0;
+    return std::sscanf(spec, "%u:%x:%u:%u", &a, &b, &c, &fill) == 4 && fill == 1;
+}
+
 // 0: the texture, both views and the table exist. Otherwise an exit code that names the step.
 int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
 {
     unsigned resource_format = 0, flags = 0, view_format = 0;
     if (std::sscanf(input.packed, "%u:%x:%u", &resource_format, &flags, &view_format) != 3) return 2;
+    const bool fill = packed_fill(input.packed);
     D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
         static_cast<DXGI_FORMAT>(resource_format), {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, static_cast<D3D12_RESOURCE_FLAGS>(flags)};
     // What the adapter says about the description, and what the helper makes of it.
@@ -159,6 +174,16 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
                 support(desc.Format), view_format, static_cast<unsigned>(created));
     std::fflush(stdout);
     binding.backing.resize(static_cast<std::size_t>(input.width) * input.height * 4 + 0x10000);
+    if (fill) {
+        // Tight rows of 16-bit texels, as a title writes them for a linear texture of that description.
+        for (UINT y = 0; y < input.height; ++y)
+            for (UINT x = 0; x < input.width; ++x) {
+                const std::uint16_t texel = packed_fill_texel(x, y);
+                const std::size_t at = (static_cast<std::size_t>(y) * input.width + x) * 2;
+                binding.backing[at] = static_cast<unsigned char>(texel & 0xff);
+                binding.backing[at + 1] = static_cast<unsigned char>(texel >> 8);
+            }
+    }
     void* texture = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
         D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture)))) || !texture) return 40;
@@ -184,7 +209,7 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
     srv.Texture2D.MipLevels = 1;
     const D3D12_RENDER_TARGET_VIEW_DESC rtv{static_cast<DXGI_FORMAT>(view_format), D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     binding.rtv = invoke(rtv_heap, 9);
-    invoke(guest, 20, arg(texture), arg(&rtv), binding.rtv);
+    if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) invoke(guest, 20, arg(texture), arg(&rtv), binding.rtv);
     invoke(guest, 18, arg(texture), arg(&srv), cpu);
     binding.table = invoke(heap, 10);
     return binding.table ? 0 : 41;
@@ -426,7 +451,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
     } else {
-        if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
+        if (bc7 && bc7->packed && !packed_fill(bc7->packed)) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
     }
