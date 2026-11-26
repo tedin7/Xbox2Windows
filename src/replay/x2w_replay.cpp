@@ -481,7 +481,7 @@ u64 count_inversions(const std::vector<u64>& order)
     u64 late = 0, highest = 0;
     for (const u64 seq : order) {
         if (seq < highest) ++late;
-        highest = std::max(highest, seq);
+        highest = (std::max)(highest, seq);
     }
     return late;
 }
@@ -515,7 +515,7 @@ bool play_threads(Player& p, const Recording& r, const Options& o, const std::ch
                         const auto ready = [&] { return gate.stop || (plan.ordered[i] ? gate.done == plan.need[i] : gate.done >= plan.need[i]); };
                         if (!gate.cv.wait_for(lock, std::chrono::seconds(30), ready)) {
                             ++p.order_timeouts;  // a step it waited for never ran: go on, the count says so
-                            gate.done = std::max(gate.done, plan.need[i]);
+                            gate.done = (std::max)(gate.done, plan.need[i]);
                         }
                     }
                     if (gate.stop) {
