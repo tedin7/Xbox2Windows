@@ -40,6 +40,11 @@ function(x2w_replay_family_scene scene own_test)
 endfunction()
 function(x2w_replay_family_all)
     x2w_replay_family_scene(startup_view_dimension_device startup_view_dimension_@B@)
+    # Copies and uploads (row c13): list copies, upload arena, arena lifetime, page reuse.
+    x2w_replay_family_scene(startup_list_copy startup_list_copy_@B@)
+    x2w_replay_family_scene(startup_upload_arena startup_upload_arena_@B@)
+    x2w_replay_family_scene(startup_upload_lifetime startup_upload_lifetime_@B@)
+    x2w_replay_family_scene(startup_upload_page_reuse startup_upload_page_reuse_@B@)
     x2w_replay_family_scene(startup_list_copy_texture_warp startup_list_copy_texture_@B@)
     x2w_replay_family_scene(startup_resource_retire_views startup_resource_retire_views_@B@_debug0)
     # startup_clear_uav is not a family scene: its textures come from the desktop device, outside the recording.
