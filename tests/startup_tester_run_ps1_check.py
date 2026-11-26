@@ -172,7 +172,7 @@ def check_shell(shell):
         assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
-                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt"]), names
+                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt", "janitor.txt"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
