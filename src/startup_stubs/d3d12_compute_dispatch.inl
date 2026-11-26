@@ -241,13 +241,21 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
 x2w_phase::Totals dispatch_phase_totals;
 
+// The fixture installs a one-shot callback on its recording thread to exercise the unlocked interval.
+using DispatchUpgradeHook = void (*)();
+thread_local DispatchUpgradeHook dispatch_upgrade_hook = nullptr;
+extern "C" __declspec(dllexport) void x2w_d3d12_dispatch_upgrade_hook(DispatchUpgradeHook hook)
+{
+    dispatch_upgrade_hook = hook;
+}
+
 // Every 300 frames with the render totals: where translated dispatches spent their time since the last line.
 void log_dispatch_phases()
 {
     const auto window = dispatch_phase_totals.take();
     if (!window.calls[x2w_phase::direct] && !window.calls[x2w_phase::indirect] && !window.calls[x2w_phase::refused]) return;
     char line[1024];
-    x2w_phase::format_window(window, line, sizeof(line));
+    x2w_phase::format_window(window, line, sizeof(line), dispatch_walk_shared_enabled());
     log("%s", line);
 }
 
@@ -278,32 +286,55 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
+        int source;
+        u64 entry, snapshot_address;
+        bool input_refused;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
-    draw_lock_acquire_exclusive();
-    timer.got_lock();
-    DispatchPhases phases;
-    ComputeTranslation* const tr = &compute_translations()[key];
-    tr->key = key;
-    ++tr->dispatches;
-    tr->use.note(process_ms());
-    std::uint32_t words[8] = {};
-    if (!valid_type) reason = "the list type has no Dispatch";
-    else if (!valid_groups) reason = "a group count is over the limit";
-    else if (!valid_root)
-        reason = "the compute root set is not the one the pipeline was created with";
-    else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
-    else {
-        if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            tr->unmodelled = load_compute_translation(*tr, manifest);
-            if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+    const bool shared_enabled = dispatch_walk_shared_enabled();
+    bool shared = shared_enabled;
+    ComputeTranslation* tr = nullptr;
+    if (shared) {
+        AcquireSRWLockShared(&draw_lock);
+        const auto found = compute_translations().find(key);
+        if (valid_type && valid_groups && valid_root && draw_heap && draw_heap_device == self->own().list_device &&
+            draw_heap_device == the_device && found != compute_translations().end() && found->second.state == 1) {
+            tr = &found->second;
+        } else {
+            ReleaseSRWLockShared(&draw_lock);
+            shared = false;
         }
-        if (tr->state != 1) {
-            // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
-            reason = tr->unmodelled ? tr->unmodelled : "no translation";
-            counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
+    }
+    if (!shared) draw_lock_acquire_exclusive();
+    timer.got_lock();
+    if (shared_enabled && !shared) timer.exclusive_acquired();
+    DispatchPhases phases;
+    if (!shared) tr = &compute_translations()[key];
+    const auto note_dispatch = [&] {
+        tr->key = key;
+        ++tr->dispatches;
+        tr->use.note(process_ms());
+    };
+    if (!shared) note_dispatch();
+    std::uint32_t words[8] = {};
+    if (!shared) {
+        if (!valid_type) reason = "the list type has no Dispatch";
+        else if (!valid_groups) reason = "a group count is over the limit";
+        else if (!valid_root)
+            reason = "the compute root set is not the one the pipeline was created with";
+        else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
+        else {
+            if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
+                tr->unmodelled = load_compute_translation(*tr, manifest);
+                if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+            }
+            if (tr->state != 1) {
+                // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
+                reason = tr->unmodelled ? tr->unmodelled : "no translation";
+                counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
+            }
         }
     }
     // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
@@ -312,196 +343,298 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     phases.to(1);
-    for (std::size_t i = 0; i < count && !reason; ++i) {
-        const bool output = i >= inputs;
-        const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture)) {
-            reason = "translated indirect Dispatch requires fixed-table raw buffers";
-            break;
+    const auto note_input = [&](std::size_t i, const ComputeTranslation::Slot& slot, const View& view) {
+        if (unfilled_heap_slot(view.words) && !tr->unfilled_heap_slot_logged) {
+            tr->unfilled_heap_slot_logged = true;
+            log("x2w-draw unfilled heap slot %u key %016llx", view.words[0] - 1, key);
         }
-        std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
-        std::memset(words, 0, sizeof(words));
-        if (slot.word_param >= 0) {
-            // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
-            // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
-            const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
-            if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
-                reason = "a table descriptor is not bound";
+        if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
+        if (view.source == 2) {
+            InterlockedIncrement(&compute_inputs_snapshot);
+            InterlockedExchangeAdd(&compute_inputs_snapshot_kib, static_cast<LONG>((view.bytes + 1023) / 1024));
+        }
+        if (view.source && !tr->input_path_logged) {
+            tr->input_path_logged = true;
+            log("x2w-draw compute %016llx input %zu (%s %d %d) comes from %s (%llu bytes)", key, i, slot.heap ? "heap" : "table", slot.a, slot.b,
+                view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for a null descriptor" : "a snapshot of title memory", view.bytes);
+        }
+        if (view.input_refused && !tr->first_refusal)
+            log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
+                slot.heap ? "heap" : "table", slot.a, slot.b, view.entry);
+    };
+    const auto walk = [&]() -> bool {
+        for (std::size_t i = 0; i < count && !reason; ++i) {
+            const bool output = i >= inputs;
+            const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
+            if (dispatch.signature && (slot.heap || slot.texture)) {
+                reason = "translated indirect Dispatch requires fixed-table raw buffers";
                 break;
             }
-            std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
-            const std::uint32_t at = slot.at + index * slot.times;
-            const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-            const UINT stride = (words[1] >> 16) & 0x3fff;
-            if (!(words[0] | words[1] | words[2] | words[3])) {
-                // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
-                // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
-                index = 0;
-            } else {
-                if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
-                    reason = "a heap index word is not in the list's upload memory";
+            std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
+            std::memset(words, 0, sizeof(words));
+            if (slot.word_param >= 0) {
+                // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
+                // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
+                const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
+                if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
+                    reason = "a table descriptor is not bound";
                     break;
                 }
-                if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
-                    reason = "a heap index word is outside its table buffer";
-                    break;
+                std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+                const std::uint32_t at = slot.at + index * slot.times;
+                const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+                const UINT stride = (words[1] >> 16) & 0x3fff;
+                if (!(words[0] | words[1] | words[2] | words[3])) {
+                    // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
+                    // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
+                    index = 0;
+                } else {
+                    if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                        reason = "a heap index word is not in the list's upload memory";
+                        break;
+                    }
+                    if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                        reason = "a heap index word is outside its table buffer";
+                        break;
+                    }
+                    std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
                 }
-                std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
             }
-        }
-        // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
-        // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
-            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
-        const std::size_t entry_bytes = slot.texture ? 32 : 16;
-        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
-            reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
-            break;
-        }
-        std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
-        if (slot.texture) {
-            // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
-            // a null view would read zeros or drop the program's stores without a trace.
-            ViewRecord record{};
-            bool known = false, created = false;
-            if (words[0] == view_token_magic) {
-                note_lock_acquire(false);
-                known = words[1] < view_records().size();
-                if (known) {
-                    record = view_records()[words[1]];
-                    created = view_materialized()[words[1]] != 0;
+            // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
+            // title memory of the list's view heap: a literal byte offset, as a table's is.
+            const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+                : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
+            const std::size_t entry_bytes = slot.texture ? 32 : 16;
+            if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
+                reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
+                break;
+            }
+            std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
+            if (slot.texture) {
+                // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
+                // a null view would read zeros or drop the program's stores without a trace.
+                ViewRecord record{};
+                bool known = false, created = false;
+                if (words[0] == view_token_magic) {
+                    note_lock_acquire(false);
+                    known = words[1] < view_records().size();
+                    if (known) {
+                        record = view_records()[words[1]];
+                        created = view_materialized()[words[1]] != 0;
+                    }
+                    ReleaseSRWLockShared(&note_lock);
                 }
-                ReleaseSRWLockShared(&note_lock);
-            }
-            Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
-            ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr
-                : output ? static_cast<ID3D12Resource*>(wrapper->own().real) : sampled_address_texture(wrapper);
-            const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
-            if (!output) {
-                D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+                bool needs_materialization = false;
+                ID3D12Resource* texture = nullptr;
+                if (wrapper && wrapper->own().kind == resource_kind) {
+                    if (!output) {
+                        texture = sampled_address_texture(wrapper, shared ? &needs_materialization : nullptr);
+                    } else if (shared && wrapper->own().lazy_slot133_texture) {
+                        std::lock_guard lock(lazy_texture_mutex);
+                        texture = static_cast<ID3D12Resource*>(wrapper->own().real);
+                    } else {
+                        texture = static_cast<ID3D12Resource*>(wrapper->own().real);
+                    }
+                }
+                if (needs_materialization) return false;
+                const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+                if (!output) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                    const bool described = record.desc_bytes >= sizeof(desc);
+                    if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+                    if (desc.Format) desc.Format = desktop_format(desc.Format);
+                    words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
+                    if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
+                    else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+                        reason = "an input texture has no desktop texture to sample";
+                    else if (slot.cube && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
+                        reason = "an input texture view is not a cube map";
+                    else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
+                        reason = "a cube map view's texture is not six 2D faces";
+                    else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                                                      : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
+                        reason = "an input texture view is not 2D";
+                    // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
+                    else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                    views[i] = {texture, 0, 0, true, true, described};
+                    std::memcpy(views[i].desc, &desc, sizeof(desc));
+                    views[i].wrapper = wrapper;
+                    continue;
+                }
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
                 const bool described = record.desc_bytes >= sizeof(desc);
                 if (described) std::memcpy(&desc, record.desc, sizeof(desc));
                 if (desc.Format) desc.Format = desktop_format(desc.Format);
-                words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
-                if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
-                else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
-                    reason = "an input texture has no desktop texture to sample";
-                else if (slot.cube && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
-                    reason = "an input texture view is not a cube map";
-                else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
-                    reason = "a cube map view's texture is not six 2D faces";
-                else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-                                                  : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
-                    reason = "an input texture view is not 2D";
-                // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
-                else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
+                words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
+                if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
+                else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                    reason = "an output texture view was not created on the desktop";
+                else if (slot.array) {
+                    // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
+                    const auto& a = desc.Texture2DArray;
+                    if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                        reason = "an output texture view is not a 2D array";
+                    else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
+                             a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
+                             !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
+                        reason = "an output texture array view is outside the resource";
+                } else if (slot.dimension == 1) {
+                    if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE1D)
+                        reason = "an output texture view is not 1D";
+                    else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Texture1D.MipSlice >= resource.MipLevels)
+                        reason = "an output texture view is outside the resource";
+                } else if (slot.dimension == 3) {
+                    // The W coordinate in HLSL is relative to FirstWSlice: retain the caller's complete view.
+                    const auto& v = desc.Texture3D;
+                    if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D)
+                        reason = "an output texture view is not 3D";
+                    else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || v.MipSlice >= resource.MipLevels ||
+                             !v.WSize || v.FirstWSlice >= (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) ||
+                             (v.WSize != 0xffffffffu && v.WSize > (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) - v.FirstWSlice))
+                        reason = "an output texture view is outside the resource";
+                } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
+                                   : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
+                    reason = "an output texture view is not 2D";
+                if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
+                if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+                // One state per resource here: a texture read and written by the same call is refused. Two outputs
+                // of one texture (two mips) share the unordered access state.
+                for (std::size_t input = 0; input < inputs && !reason; ++input)
+                    if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
                 views[i] = {texture, 0, 0, true, true, described};
                 std::memcpy(views[i].desc, &desc, sizeof(desc));
                 views[i].wrapper = wrapper;
                 continue;
             }
-            D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-            const bool described = record.desc_bytes >= sizeof(desc);
-            if (described) std::memcpy(&desc, record.desc, sizeof(desc));
-            if (desc.Format) desc.Format = desktop_format(desc.Format);
-            const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
-            words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
-            if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
-            else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-                reason = "an output texture view was not created on the desktop";
-            else if (slot.array) {
-                // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
-                const auto& a = desc.Texture2DArray;
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
-                    reason = "an output texture view is not a 2D array";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
-                         a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
-                         !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
-                    reason = "an output texture array view is outside the resource";
-            } else if (slot.dimension == 1) {
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE1D)
-                    reason = "an output texture view is not 1D";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Texture1D.MipSlice >= resource.MipLevels)
-                    reason = "an output texture view is outside the resource";
-            } else if (slot.dimension == 3) {
-                // The W coordinate in HLSL is relative to FirstWSlice: retain the caller's complete view.
-                const auto& v = desc.Texture3D;
-                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D)
-                    reason = "an output texture view is not 3D";
-                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || v.MipSlice >= resource.MipLevels ||
-                         !v.WSize || v.FirstWSlice >= (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) ||
-                         (v.WSize != 0xffffffffu && v.WSize > (resource.DepthOrArraySize >> v.MipSlice ? resource.DepthOrArraySize >> v.MipSlice : 1u) - v.FirstWSlice))
-                    reason = "an output texture view is outside the resource";
-            } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
-                               : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
-                reason = "an output texture view is not 2D";
-            if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            // One state per resource here: a texture read and written by the same call is refused. Two outputs
-            // of one texture (two mips) share the unordered access state.
+            if (!output) {
+                // Each condition of a complete GPU-backed buffer range has its own reason.
+                const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true, shared);
+                if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
+                // buffer_view creates a native null SRV when the token has no resource.
+                views[i] = {view.resource, view.offset, view.bytes, !view.upload && !view.null_token};
+                views[i].stride = view.stride;
+                views[i].source = view.source;
+                views[i].entry = entry;
+                views[i].input_refused = reason != nullptr;
+                views[i].snapshot_address = view.snapshot_address;
+                if (shared_enabled) views[i].wrapper = const_cast<Wrapper*>(view.owner);
+                std::memcpy(views[i].words, words, sizeof(views[i].words));
+                if (!shared) note_input(i, slot, views[i]);
+                continue;
+            }
+            // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
+            // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+            const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+            const UINT stride = (words[1] >> 16) & 0x3fff;
+            const u64 bytes = u64{stride ? stride : 1} * words[2];
+            const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
+                ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
+            const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
+            const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
+            // One reason per condition, so a census says which one an output failed on.
+            if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
+            else if (!bytes) reason = "an output range has zero bytes";
+            else if (bytes % 4) reason = "an output range is not a whole number of dwords";
+            else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
+            else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
+            else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
+            else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
+            else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                reason = "an output buffer was created without unordered access";
+            static LONG size_logged;
+            if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
+                log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
+                    stride, words[2], reason);
             for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
-            views[i] = {texture, 0, 0, true, true, described};
-            std::memcpy(views[i].desc, &desc, sizeof(desc));
-            views[i].wrapper = wrapper;
-            continue;
-        }
-        if (!output) {
-            // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
-            if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
-                tr->unfilled_heap_slot_logged = true;
-                log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
-            }
-            if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
-            if (view.source == 2) {
-                InterlockedIncrement(&compute_inputs_snapshot);
-                InterlockedExchangeAdd(&compute_inputs_snapshot_kib, static_cast<LONG>((view.bytes + 1023) / 1024));
-            }
-            if (view.source && !tr->input_path_logged) {
-                tr->input_path_logged = true;
-                log("x2w-draw compute %016llx input %zu (%s %d %d) comes from %s (%llu bytes)", key, i, slot.heap ? "heap" : "table", slot.a, slot.b,
-                    view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for a null descriptor" : "a snapshot of title memory", view.bytes);
-            }
-            if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
-            if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
-                log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
-                    slot.heap ? "heap" : "table", slot.a, slot.b, entry);
-            // buffer_view creates a native null SRV when the token has no resource.
-            views[i] = {view.resource, view.offset, view.bytes, !view.upload && !view.null_token};
-            views[i].stride = view.stride;
+                if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
+            views[i] = {placed.alias, offset, bytes, true};
+            if (shared_enabled) views[i].wrapper = const_cast<Wrapper*>(placed.owner);
             std::memcpy(views[i].words, words, sizeof(views[i].words));
-            continue;
         }
-        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
-        const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-        const UINT stride = (words[1] >> 16) & 0x3fff;
-        const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
-            ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
-        const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
-        const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
-        // One reason per condition, so a census says which one an output failed on.
-        if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
-        else if (!bytes) reason = "an output range has zero bytes";
-        else if (bytes % 4) reason = "an output range is not a whole number of dwords";
-        else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
-        else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
-        else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
-        else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
-        else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-            reason = "an output buffer was created without unordered access";
-        static LONG size_logged;
-        if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
-            log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
-                stride, words[2], reason);
-        for (std::size_t input = 0; input < inputs && !reason; ++input)
-            if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
-        views[i] = {placed.alias, offset, bytes, true};
-        std::memcpy(views[i].words, words, sizeof(views[i].words));
+        return true;
+    };
+    const bool walked = walk();
+    // Native references keep the backing alive independently of the guest's logical reference count.
+    struct Pin {
+        Wrapper* wrapper;
+        IUnknown* original_backing;
+        x2w_startup::ComPtr<ID3D12Resource> resource;
+        std::size_t view_index;
+    };
+    std::optional<std::array<Pin, 40>> pinned_views;
+    std::size_t pinned = 0;
+    if (shared) {
+        auto& pins = pinned_views.emplace();
+        if (walked && !reason) {
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& view = views[i];
+                if (!view.wrapper) continue;
+                auto* const backing = view.wrapper->own().real;
+                auto* const resource = view.snapshot_address ? static_cast<ID3D12Resource*>(backing) : view.resource;
+                const auto same_view = [&](const Pin& pin) {
+                    return pin.wrapper == view.wrapper && pin.resource.Get() == resource;
+                };
+                if (std::none_of(pins.begin(), pins.begin() + pinned, same_view)) {
+                    auto& pin = pins[pinned++];
+                    pin.wrapper = view.wrapper;
+                    pin.original_backing = backing;
+                    pin.resource = resource;
+                    pin.view_index = i;
+                }
+            }
+        }
+        // The ready PSO is immutable. Carry its identity, then look up the cache entry again.
+        auto* const pipeline_identity = tr->pipeline.Get();
+        tr = nullptr;
+        if (walked) timer.resolved();
+        timer.upgrade_start();
+        ReleaseSRWLockShared(&draw_lock);
+        if (auto hook = std::exchange(dispatch_upgrade_hook, nullptr)) hook();
+        draw_lock_acquire_exclusive();
+        timer.exclusive_acquired();
+        phases.exclude_wait(timer.t_exclusive - timer.t_upgrade);
+        tr = &compute_translations()[key];
+        note_dispatch();
+        if (tr->state != 1 || tr->pipeline.Get() != pipeline_identity)
+            reason = "the compute translation changed during descriptor resolution";
+        if (!walked && !reason) {
+            shared = false;
+            for (auto& view : views) view = {};
+            walk();
+        }
+        for (std::size_t i = 0; i < pinned && !reason; ++i) {
+            const auto& pin = pins[i];
+            if (InterlockedCompareExchange(&pin.wrapper->own().refs, 0, 0) <= 0 ||
+                pin.original_backing != pin.wrapper->own().real) {
+                reason = "a compute view's resource was released during descriptor resolution";
+                std::memcpy(words, views[pin.view_index].words, sizeof(views[pin.view_index].words));
+            }
+        }
+        if (shared && tr->state == 1 && tr->pipeline.Get() == pipeline_identity) {
+            for (std::size_t i = 0; i < inputs; ++i) {
+                const auto& view = views[i];
+                if (view.source || view.input_refused || unfilled_heap_slot(view.words))
+                    note_input(i, tr->srvs[i], view);
+            }
+            for (std::size_t i = 0; i < inputs && !reason; ++i) {
+                auto& view = views[i];
+                if (view.source == 2) {
+                    if (readable_window(view.snapshot_address, static_cast<std::size_t>(view.bytes)) < view.bytes)
+                        reason = "an input range in title memory is not readable";
+                    else if (!ring_copy(self, view.snapshot_address, static_cast<std::size_t>(view.bytes), &view.offset, &view.resource)
+                        || !view.resource)
+                        reason = "an input range could not be copied from title memory";
+                } else if (view.source == 3) {
+                    auto* bytes = reserve_upload_ring(self, 16, &view.offset, &view.resource);
+                    if (!bytes || !view.resource) reason = "a null input could not get its zero bytes";
+                    else std::memset(bytes, 0, 16);
+                }
+            }
+        }
     }
-    timer.resolved();
+    if (!shared || !walked) timer.resolved();
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
             if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
@@ -560,15 +693,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
+    for (std::size_t i = 0; i < pinned; ++i) {
+        const auto& pin = (*pinned_views)[i];
+        if (!pin.wrapper->own().tiled_address_srv) retire_hold(self, pin.wrapper);
+    }
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
+        if (shared_enabled && !shared && view.wrapper && !view.wrapper->own().tiled_address_srv)
+            retire_hold(self, view.wrapper);
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
-            if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
+            if (!shared_enabled && view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
         }
         if (i < inputs) {
@@ -734,6 +873,11 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
     log_key_use_census();
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_dispatch_walk_phases()
+{
+    log_dispatch_phases();
 }
 
 // Fixtures: snapshot the counters without acquiring or resetting draw_lock.

@@ -23,6 +23,8 @@ Exit 77 when the adapter is not available.
 from math import prod
 import os
 from pathlib import Path
+import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -43,11 +45,87 @@ CONTROLS = (
 )
 
 
+def walk_reference(threads, rounds):
+    return [
+        (r ^ sum((i + 3) * (109 + 17 * (i * 8 + lane) if i % 2 else
+                            31 + 101 * t + 23 * (i * 8 + lane)) for i in range(32)))
+        for t in range(threads) for r in range(rounds) for lane in range(8)
+    ]
+
+
+def check_shared_walk(directory, cache, env, key, consumer, dxc):
+    # Use an original desktop artifact under the synthetic request's key. This isolates
+    # the stand-in's binding and recording from the instruction translator.
+    manifest = cache / f'{key:016x}.txt'
+    shader = directory / 'walk.hlsl'
+    declarations = [f'ByteAddressBuffer input{i} : register(t{i});' for i in range(32)]
+    terms = [f'{i + 3}u * input{i}.Load(lane * 4)' for i in range(32)]
+    shader.write_text('\n'.join(declarations + [
+        'RWByteAddressBuffer output : register(u0);',
+        'cbuffer Offset : register(b0) { uint roundIndex; }',
+        '[numthreads(8, 1, 1)]',
+        'void main(uint lane : SV_GroupIndex) {',
+        f'    uint sum = {" + ".join(terms)};',
+        '    output.Store((roundIndex * 8 + lane) * 4, sum ^ roundIndex);',
+        '}',
+    ]), encoding='ascii')
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key:016x}.cs.cso', shader],
+                   check=True, capture_output=True, text=True)
+    manifest.write_text('x2w-manifest 2\nstage cs\ngroup 8 1 1\nud 1\nudsrc 0 rootconst 0 0\n'
+                        + ''.join(f'srv {i} buf table 1 {i * 16}\n' for i in range(32))
+                        + 'uav 0 table 1 512\n', encoding='ascii')
+
+    def run(mode, shared, debug=False):
+        out = directory / 'walk.bin'
+        out.unlink(missing_ok=True)
+        args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
+                directory / 'program', directory / 'data', directory / 'state', f'dispatch-walk-{mode}']
+        run_env = dict(env, X2W_TEST_DISPATCH_OUT=str(out), X2W_DISPATCH_WALK_SHARED=str(int(shared)),
+                       X2W_D3D12_DEBUG=str(int(debug)), X2W_D3D12_RELEASE_RETIRED='0')
+        result = subprocess.run(args, env=run_env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, (mode, result.returncode, result.stderr[-5000:])
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors and not lines(result, 'DEVICE REMOVED'), result.stderr[-5000:]
+        if debug:
+            assert lines(result, 'debug layer: 0x00000000 enabled'), result.stderr[-5000:]
+        return out.read_bytes(), result
+
+    expected = walk_reference(4, 500)
+    expected_bytes = struct.pack(f'<{len(expected)}I', *expected)
+    serial, result = run('serial', True)
+    assert serial == expected_bytes, 'single-thread bytes differ from the CPU reference'
+    assert lines(result, f'{key:016x}: 2000 dispatches, 2000 translated'), result.stderr[-5000:]
+    off, baseline = run('parallel', False)
+    on, parallel = run('parallel', True)
+    assert off == on == serial, 'parallel readback differs from the CPU reference or switch-OFF control'
+    for result in (baseline, parallel):
+        assert lines(result, f'{key:016x}: 2000 dispatches, 2000 translated'), result.stderr[-5000:]
+        assert not lines(result, ' refused:'), result.stderr[-5000:]
+
+    def phase(result, pattern):
+        report = lines(result, 'x2w-render dispatch phases')
+        assert len(report) == 1 and '; dispatch 2000 calls:' in report[0], report
+        match = re.search(pattern, report[0])
+        assert match, report
+        return float(match[1])
+
+    off_us = phase(baseline, r' hold (\d+)/') / 2000
+    on_us = phase(parallel, r' exclusive-hold ([\d.]+) us/call')
+    # Run the lifetime assertion even when the performance gate regresses.
+    stale, released = run('release', True, debug=True)
+    assert lines(released, f'{key:016x}: 2 dispatches, 1 translated'), released.stderr[-5000:]
+    assert len(lines(released, "refused: a compute view's resource was released during descriptor resolution")) == 1, released.stderr[-5000:]
+    assert stale == struct.pack('<16I', *walk_reference(1, 1), *([C.SENTINEL] * 8)), 'a stale view wrote the second output range'
+    print(f'WARP shared walk: 2000 translated, 0 refused; exclusive hold {on_us:.3f} vs {off_us:.3f} us/call')
+    assert 0 < on_us < 0.30 * off_us, 'shared walk must hold the exclusive lock for under 30% of the baseline'
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
         env.pop('X2W_NULL_TOKEN_ZERO', None)
+        env['X2W_DISPATCH_WALK_SHARED'] = '0'
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -146,6 +224,16 @@ def main(consumer, dxc, adapter):
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
+        if adapter == 'warp':
+            for mode, base_env, reference in (
+                ('dispatch-input-snapshot', snapshot_env, expected),
+                ('dispatch-input-null', env, zero_expected),
+                ('dispatch-input-memory-view', env, expected),
+            ):
+                got, result = dispatch(directory, consumer, dict(base_env, X2W_DISPATCH_WALK_SHARED='1'), mode + '-repeat')
+                assert got == reference and not lines(result, 'refused: '), result.stderr[-3000:]
+                assert lines(result, f'{key:016x}: 2 dispatches, 2 translated'), result.stderr[-3000:]
+            check_shared_walk(directory, cache, env, key, consumer, dxc)
 
 
 if __name__ == '__main__':

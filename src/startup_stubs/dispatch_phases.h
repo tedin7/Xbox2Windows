@@ -1,5 +1,5 @@
 // Experimental (docs/startup-runtime.md): where the time of a translated Dispatch / ExecuteIndirect goes, per phase, and
-// how many threads queue for the draw lock. record_translated_dispatch holds that lock for the whole call, so a flood of
+// how many threads queue for the draw lock. the baseline holds that lock for the whole call, so a flood of
 // dispatches from several recording threads serialises on it; these counters say whether the wait is long, which phase
 // holds the lock, and how deep the queue gets. Counts are atomics, read once per report window.
 #pragma once
@@ -45,6 +45,7 @@ struct Totals {
     volatile LONG64 calls[kind_count] = {};
     volatile LONG64 ticks[kind_count][phase_count] = {};
     volatile LONG64 max_ticks[kind_count][phase_count] = {};
+    volatile LONG64 exclusive_ticks[kind_count] = {};
     volatile LONG queued = 0, queued_max = 0;  // threads between "asked for the lock" and "got it"
 
     void add(Kind kind, Phase phase, std::uint64_t t) noexcept
@@ -72,6 +73,7 @@ struct Totals {
     struct Window {
         std::uint64_t calls[kind_count] = {};
         double us[kind_count][phase_count] = {}, max_us[kind_count][phase_count] = {};
+        double exclusive_us[kind_count] = {};
         LONG queued_max = 0;
     };
     // The numbers since the last take(), then a new window.
@@ -80,6 +82,7 @@ struct Totals {
         Window w;
         for (int k = 0; k < kind_count; ++k) {
             w.calls[k] = static_cast<std::uint64_t>(InterlockedExchange64(&calls[k], 0));
+            w.exclusive_us[k] = static_cast<double>(InterlockedExchange64(&exclusive_ticks[k], 0)) / ticks_per_us();
             for (int p = 0; p < phase_count; ++p) {
                 w.us[k][p] = static_cast<double>(InterlockedExchange64(&ticks[k][p], 0)) / ticks_per_us();
                 w.max_us[k][p] = static_cast<double>(InterlockedExchange64(&max_ticks[k][p], 0)) / ticks_per_us();
@@ -94,6 +97,7 @@ struct Totals {
 // finish() right before the lock is released.
 struct Timer {
     std::uint64_t t_start = 0, t_lock = 0, t_resolve = 0, t_values = 0;
+    std::uint64_t t_upgrade = 0, t_exclusive = 0;
     Totals* totals = nullptr;
 
     void start(Totals& t) noexcept
@@ -107,25 +111,38 @@ struct Timer {
         t_lock = now_ticks();
         totals->leave();
     }
+    void upgrade_start() noexcept
+    {
+        totals->enter();
+        t_upgrade = now_ticks();
+    }
+    void exclusive_acquired() noexcept
+    {
+        t_exclusive = now_ticks();
+        if (t_upgrade) totals->leave();
+    }
     void resolved() noexcept { t_resolve = now_ticks(); }
     void valued() noexcept { t_values = now_ticks(); }
     void finish(Kind kind) noexcept
     {
         const std::uint64_t end = now_ticks();
         InterlockedIncrement64(&totals->calls[kind]);
-        totals->add(kind, lock_wait, t_lock - t_start);
+        const auto upgrade_wait = t_upgrade ? t_exclusive - t_upgrade : 0;
+        totals->add(kind, lock_wait, t_lock - t_start + upgrade_wait);
+        if (t_exclusive) InterlockedExchangeAdd64(&totals->exclusive_ticks[kind], static_cast<LONG64>(end - t_exclusive));
         // A refused call stops part-way: the marks it did not reach are the end time, so the time is not lost.
         const std::uint64_t r = t_resolve ? t_resolve : end, v = t_values ? t_values : end;
-        totals->add(kind, resolve, r - t_lock);
-        totals->add(kind, values, v - r);
+        const bool resolution_crossed_upgrade = t_upgrade && r >= t_exclusive;
+        totals->add(kind, resolve, r - t_lock - (resolution_crossed_upgrade ? upgrade_wait : 0));
+        totals->add(kind, values, v - r - (resolution_crossed_upgrade ? 0 : upgrade_wait));
         totals->add(kind, record, end - v);
-        totals->add(kind, hold, end - t_lock);
+        totals->add(kind, hold, end - t_lock - upgrade_wait);
     }
 };
 
 // "x2w-render dispatch phases (us: total / worst per call, calls): ..." for the kinds that ran in the window; the
 // queue depth is the most threads waiting for the lock at once.
-inline int format_window(const Totals::Window& w, char* out, std::size_t size) noexcept
+inline int format_window(const Totals::Window& w, char* out, std::size_t size, bool report_exclusive = false) noexcept
 {
     int n = std::snprintf(out, size, "x2w-render dispatch phases (queue max %ld)", static_cast<long>(w.queued_max));
     for (int k = 0; k < kind_count && n > 0 && static_cast<std::size_t>(n) < size; ++k) {
@@ -133,6 +150,9 @@ inline int format_window(const Totals::Window& w, char* out, std::size_t size) n
         n += std::snprintf(out + n, size - static_cast<std::size_t>(n), "; %s %llu calls:", kind_name(k), static_cast<unsigned long long>(w.calls[k]));
         for (int p = 0; p < phase_count && n > 0 && static_cast<std::size_t>(n) < size; ++p)
             n += std::snprintf(out + n, size - static_cast<std::size_t>(n), " %s %.0f/%.0f", phase_name(p), w.us[k][p], w.max_us[k][p]);
+        if (report_exclusive && n > 0 && static_cast<std::size_t>(n) < size)
+            n += std::snprintf(out + n, size - static_cast<std::size_t>(n),
+                " exclusive-hold %.3f us/call", w.exclusive_us[k] / w.calls[k]);
     }
     return n;
 }

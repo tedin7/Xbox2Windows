@@ -4481,7 +4481,7 @@ struct TextureWrite {
     bool desktop_rows = false;  // the last XG copy wrote desktop-footprint rows (not the opt-in BC7 tiles)
 };
 std::unordered_map<u64, TextureWrite>& written_textures();
-ID3D12Resource* sampled_address_texture(Wrapper* resource);
+ID3D12Resource* sampled_address_texture(Wrapper* resource, bool* needs_materialization = nullptr);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
 #include "startup_stubs/d3d12_compute_dispatch.inl"
@@ -6402,7 +6402,13 @@ void drain_retired_resources()
     } catch (const std::bad_alloc&) {
         return;
     }
-    if (!TryAcquireSRWLockExclusive(&retire_lock)) return;
+    // Shared descriptor walkers read the native backing before taking their temporary reference.
+    const bool guard_backings = dispatch_walk_shared_enabled();
+    if (guard_backings && !TryAcquireSRWLockExclusive(&draw_lock)) return;
+    if (!TryAcquireSRWLockExclusive(&retire_lock)) {
+        if (guard_backings) ReleaseSRWLockExclusive(&draw_lock);
+        return;
+    }
     for (std::size_t i = 0; i < retired_resources.size() && dropped.size() < batch;) {
         RetiredResource& item = retired_resources[i];
         Wrapper* w = item.wrapper;
@@ -6446,6 +6452,7 @@ void drain_retired_resources()
         InterlockedDecrement(&retire_pending);
     }
     ReleaseSRWLockExclusive(&retire_lock);
+    if (guard_backings) ReleaseSRWLockExclusive(&draw_lock);
     for (const RetiredDrop& drop : dropped) {
         if (drop.wrapper->own().title_memory) {
             const u64 address = reinterpret_cast<u64>(drop.wrapper->own().title_memory);

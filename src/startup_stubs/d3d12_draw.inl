@@ -237,6 +237,12 @@ inline void draw_lock_note_max(volatile LONG64& max, LONG64 value)
         seen = before;
     }
 }
+bool dispatch_walk_shared_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_DISPATCH_WALK_SHARED");
+    return enabled;
+}
+
 inline void draw_lock_acquire_exclusive()
 {
     LARGE_INTEGER start, end, frequency;
@@ -272,6 +278,7 @@ struct DispatchPhases {
     int current = 0;
     bool open = true;
     DispatchPhases() { QueryPerformanceCounter(&last); }
+    void exclude_wait(u64 ticks) { last.QuadPart += static_cast<LONG64>(ticks); }
     void to(int next)
     {
         if (!open) return;
@@ -2450,6 +2457,8 @@ struct IndirectBufferView {
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
     bool null_token = false;
+    const Wrapper* owner = nullptr;
+    u64 snapshot_address = 0;
 };
 
 bool unfilled_heap_slot(const std::uint32_t* words)
@@ -2471,7 +2480,7 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool compute_input = false)
+                                         bool compute_input = false, bool defer_upload = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2537,6 +2546,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
     // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
     if (!bytes && compute_input && !words[0] && !words[1] && !words[2] && !words[3]) {
+        if (defer_upload) return {nullptr, 0, 16, 0, true, 3};
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
@@ -2587,6 +2597,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 ID3D12Resource* ring = nullptr;
                 if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
                     return refuse("an input range in title memory is not readable");
+                if (defer_upload) return {nullptr, 0, bytes, stride, true, 2, false, owner, address};
                 if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
                     return refuse("an input range could not be copied from title memory");
                 return {ring, ring_offset, bytes, stride, true, 2};
@@ -2617,7 +2628,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload, input_source};
+    return {native, offset, bytes, stride, upload, input_source, false, owner};
 }
 
 struct FormattedBufferDescriptor {

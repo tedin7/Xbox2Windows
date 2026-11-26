@@ -683,11 +683,20 @@ ID3D12Resource* texture_for_reader(Wrapper* resource, ID3D12Resource* texture)
     return nullptr;
 }
 
-ID3D12Resource* sampled_address_texture(Wrapper* resource)
+ID3D12Resource* sampled_address_texture(Wrapper* resource, bool* needs_materialization)
 {
     if (!resource || resource->own().kind != resource_kind) return nullptr;
-    if (resource->own().lazy_slot133_texture && !resource->own().real)
-        return texture_for_reader(resource, materialize_lazy_texture(resource));
+    if (resource->own().lazy_slot133_texture) {
+        if (needs_materialization) {
+            // Publishing a lazy texture uses this mutex even when the caller has no draw lock.
+            std::lock_guard lock(lazy_texture_mutex);
+            auto* const existing = static_cast<ID3D12Resource*>(resource->own().real);
+            *needs_materialization = !existing;
+            return texture_for_reader(resource, existing);
+        }
+        if (!resource->own().real)
+            return texture_for_reader(resource, materialize_lazy_texture(resource));
+    }
     if (!resource->own().tiled_address_srv)
         return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
@@ -697,6 +706,10 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         latest_texture_write_is_rows(reinterpret_cast<u64>(resource->own().title_memory)))
         return nullptr;
     if (!sampled.desktop) {
+        if (needs_materialization) {
+            *needs_materialization = true;
+            return nullptr;
+        }
         const auto desc = sanitized(sampled.desc);
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         const HRESULT hr = device_of(sampled.device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
