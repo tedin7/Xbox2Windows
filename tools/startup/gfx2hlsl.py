@@ -3029,6 +3029,8 @@ class Stage:
                 any(self.sym.get(104 + i) != desc_word(s, s[3] + i) for i in range(1, 4))):
             raise Unsupported('descriptor operand %s needs four consecutive words of the same descriptor' % tok)
         if s and s[0] == 'desc':
+            if s[-2:-1] == ('base_add',):
+                raise Unsupported('read through a descriptor with an advanced base')
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
@@ -3756,6 +3758,12 @@ class Stage:
                 branches.append((off, target))
         if getattr(self, 'kind', None) == 'cs':
             self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
+        if getattr(self.pipe, 'retry_raw_uav', False):
+            self.descriptor_carry_pairs = {
+                low_pc: high_pc
+                for ((low_pc, _, low, _), (high_pc, _, high, _)) in zip(self.ins, self.ins[1:])
+                if low == 's_add_u32' and high == 's_addc_u32' and high_pc not in targets
+            }
         # Forward edges reach each block in disassembly order. A back edge could
         # repeat a pointer advance before the next table load.
         self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
@@ -5250,10 +5258,12 @@ class Stage:
         if base in SCA:
             return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
         if base == 's_addc_u32':
-            # Only the high word of an advanced descriptor pointer; the carry is not modelled.
+            # These symbolic address pairs account for the carry without storing SCC in HLSL.
             hi = reg_range(ops[1]) if len(ops) == 3 else None
             if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
                 self.scc_uniform = False
+            if self.kind == 'cs' and self.writable_descriptor_carry(ops):
+                return None
             if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
                 return None
             raise Unsupported(base)
@@ -5961,6 +5971,9 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
+            elif (getattr(self.pipe, 'retry_raw_uav', False) and raw is None
+                  and self.writable_descriptor_alu(base, d, srcs, syms)):
+                pass
             elif (own and own[0] == 'ptr' and base in ('s_add_u32', 's_addc_u32')
                   and not getattr(self, 'has_branches', False)):
                 # With branches the offset is not tracked: the 'added' mark below stays, and the join refuses it.
@@ -6125,6 +6138,11 @@ class Stage:
             high_source = 's%d' % high if high is not None else srcs[0]
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
+        if (getattr(self.pipe, 'retry_raw_uav', False) and base == 's_mov_b32'
+                and syms[0] and syms[0][0] == 'ud'):
+            # Keep the ordinary scalar assignment and remember its entry-constant provenance
+            # for count replacement, subject to the sole-reaching-writer proof at the store.
+            self.__dict__.setdefault('write_count_copies', {})[self.descriptor_instruction_index] = syms[0]
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
         self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
         if deferred_scc is not None:
@@ -7046,32 +7064,190 @@ class Stage:
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
+    def writable_descriptor_alu(self, op, dst, srcs, syms):
+        """Keep the original descriptor identity and the operand of a supported edit."""
+        if op not in ('s_add_u32', 's_min_u32', 's_or_b32') or len(syms) != 2:
+            return False
+        for i, word in enumerate(syms):
+            if not word or word[0] != 'desc' or word[1][0] != 'table':
+                continue
+            other = 1 - i
+            value = self.const_u32(srcs[other])
+            arg = ('const', value) if value is not None else syms[other]
+            if not arg or arg[0] not in ('const', 'ud'):
+                continue
+            if (op == 's_or_b32' and word[3] % 4 == 1 and word[-1] == 'stride0'
+                    and value is not None and value & ~0x3fff0000 == 0):
+                edited = word[:-1] + ('stride_set', value >> 16)
+            elif names_one_value(word) and (op, word[3] % 4) in (('s_add_u32', 0), ('s_min_u32', 2)):
+                edited = word + (('base_add' if op == 's_add_u32' else 'count_min'), arg)
+            else:
+                continue
+            if self.sym.get(dst) == word:
+                self.pipe.modified.add(desc_key(word))
+                # Preserve the legacy global veto for uses of any other copy of this descriptor.
+                self.pipe.other_modified.add(desc_key(word))
+            self.sym[dst] = edited
+            if op == 's_add_u32':
+                self.write_base_carry = (getattr(self, 'descriptor_carry_pairs', {}).get(self.pc), dst, edited)
+            return True
+        return False
+
+    def writable_descriptor_carry(self, ops):
+        pair = getattr(self, 'write_base_carry', None)
+        if not pair or pair[0] != self.pc or len(ops) != 3 or ops[2] != '0':
+            return False
+        _, low, edited = pair
+        high = reg_range(ops[1])
+        first = edited[:-2]
+        if (ops[0] != 's%d' % (low + 1) or not high or high[0] != 's' or high[1] != high[2]
+                or self.sym.get(low) != edited
+                or self.sym.get(high[1]) != desc_word(first, first[3] + 1)):
+            return False
+        self.sym[low + 1] = self.sym[high[1]] + ('base_carry', edited)
+        self.masks.discard(low + 1)
+        self.mask_high.discard(low + 1)
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
+        self.scc_effect, self.scc_verified = 'descriptor', False
+        return True
+
+    def writable_descriptor(self, token, what, idxen):
+        """Prove the four words of an edited MUBUF descriptor and return its binding and edits."""
+        r = reg_range(token)
+        if not r or r[0] != 's' or r[2] - r[1] != 3 or r[2] > 105:
+            raise Unsupported('%s descriptor %s' % (what, token))
+        actual = tuple(self.sym.get(r[1] + i) for i in range(4))
+        def edited_word(i):
+            raise Unsupported('%s through a modified descriptor (word %d)' % (what, i))
+
+        first = actual[0]
+        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
+            if any(word and word[0] == 'desc' and word[3] % 4 == i for i, word in enumerate(actual[1:], 1)):
+                edited_word(0)
+            raise Unsupported('%s through %s holding %s' % (what, token, first))
+        base = None
+        if first[-2:-1] == ('base_add',):
+            base, first = first[-1], first[:-2]
+        loaded = tuple(desc_word(first, first[3] + i) for i in range(4))
+        if not names_one_value(first):
+            edited_word(0)
+        stride, limit, raw = None, None, False
+        if base is not None and actual[1] == loaded[1] + ('base_carry', actual[0]):
+            base = (base, True)
+        elif base is not None:
+            base = (base, False)
+        if actual[1] == loaded[1] + ('stride0',):
+            stride = 0
+        elif idxen and actual[1] and actual[1][:-2] == loaded[1] and actual[1][-2] == 'stride_set':
+            stride = actual[1][-1]
+        elif actual[1] != loaded[1] and not (base and base[1]):
+            edited_word(1)
+        if stride == 0 and actual[2:] == (
+                loaded[2] + ('byte_count',), loaded[3] + ('oob3',)):
+            raw = True
+        else:
+            if actual[2] and actual[2][0] in ('const', 'ud'):
+                limit = actual[2]
+            elif actual[2] and actual[2][:-1] == loaded[2] + ('count_min',):
+                limit = actual[2][-1]
+            elif actual[2] != loaded[2]:
+                if actual[2] is None and getattr(self, 'write_count_copies', None):
+                    writer = self.formatted_sole_writer(r[1] + 2, self.descriptor_instruction_index)
+                    limit = self.write_count_copies.get(writer)
+                if limit is None:
+                    edited_word(2)
+            if actual[3] != loaded[3]:
+                edited_word(3)
+        if base is None and limit is None and (stride is None or stride == 0):
+            # Do not let a different copy bypass the legacy global descriptor veto.
+            return self.store_descriptor(token, 4, what, stride0_ok=True, raw_conversion_ok=True), base, stride, limit, raw
+        return desc_key(first), base, stride, limit, raw
+
+    def bounded_uav_address(self, key, base, stride, limit, raw, idx, terms, size, what):
+        """Check the full access before forming a 32-bit raw UAV address."""
+        slot = self.pipe.uavs[key]['index']
+
+        def entry(name):
+            return 'ud%d' % self.pipe.ud((name, slot))
+        def operand(sym):
+            return '%du' % sym[1] if sym[0] == 'const' else 'ud%d' % sym[1]
+
+        advance = operand(base[0]) if base else '0u'
+        if base and base[0][0] == 'const' and base[0][1] % 4:
+            raise Unsupported('%s at unaligned descriptor base advance' % what)
+        if idx and stride is not None and (not stride or stride % 4):
+            raise Unsupported('%s with invalid indexed stride %d' % (what, stride))
+        original_stride = entry('uav_stride')
+        count = entry('uav_numrecords')
+        word3 = entry('uav_descword3')
+        stride_expr = original_stride if stride is None else '%du' % stride
+        records = 'min(%s, %s)' % (count, operand(limit)) if limit else count
+        self.emit('{')
+        self.emit('uint write_stride = %s, write_count = %s;' % (stride_expr, records))
+        # Check each uint sum and the index product before using their potentially wrapped result.
+        checks = ['(%s & 0xc000u) == 0u' % original_stride, '(%s & 0x00800000u) == 0u' % word3]
+        extra = '%su' % terms[-1]
+        for i, term in enumerate(terms[:-1]):
+            name = 'write_extra%d' % i
+            self.emit('uint %s = %s + %s;' % (name, extra, term))
+            checks.append('%s >= %s' % (name, extra))
+            extra = name
+        if idx:
+            checks += ['write_stride != 0u', '(write_stride & 3u) == 0u', '%s < write_count' % idx,
+                       '%s <= (0xffffffffu - %s) / max(1u, write_stride)' % (idx, extra)]
+        offset = '%s * write_stride + %s' % (idx, extra) if idx else extra
+        self.emit('uint write_offset = %s;' % offset)
+        self.emit('uint write_address = write_offset + %s;' % advance)
+        checks += ['(write_address & 3u) == 0u', 'write_address >= write_offset']
+        if base and not base[1]:
+            checks.append('%s <= 0xffffffffu - %s' % (advance, entry('uav_base_lo')))
+        # Dividing the final byte index avoids overflow in count * stride.
+        # Dword vector stores check each component independently. Atomics write one word.
+        divisor = original_stride if raw else 'write_stride'
+        guards = []
+        for last_byte in range(3, size, 4):
+            guards.append(' && '.join(checks + [
+                'write_address <= 0xffffffffu - %du' % last_byte,
+                '(write_offset + %du) / max(1u, %s) < write_count' % (last_byte, divisor)]))
+        return guards
+
     def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
                             raw_conversion_ok=False, uniform_off=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
+        extended = getattr(self.pipe, 'retry_raw_uav', False)
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
                 offset += int(m[7:], 0)
             elif m == 'glc' and allow_glc:
                 glc = True
-            elif m != 'offen':
+            elif m != 'offen' and (m != 'idxen' or not extended):
                 raise Unsupported('%s modifier %s' % (kind_label, m))
-        offen = 'offen' in mods
-        if len(ops) != 4 or not (offen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
+        offen, idxen = 'offen' in mods, 'idxen' in mods
+        if offen and idxen:
+            raise Unsupported('%s with idxen and offen' % kind_label)
+        if len(ops) != 4 or not (offen or idxen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
             raise Unsupported('%s data %s' % (kind_label, ops[0]))
-        if offen:
+        if offen or idxen:
             vaddr = reg_range(ops[1])
             if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
-                raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
-        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
+                raise Unsupported('%s vaddr %s for %s' % (kind_label, ops[1], 'idxen' if idxen else 'offen'))
+        bounded = idxen
+        try:
+            key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
+        except Unsupported:
+            if not extended:
+                raise
+            bounded = True
+        if bounded:
+            key, base, stride, limit, raw = self.writable_descriptor(ops[2], kind_label, idxen)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            if not offen and not uniform_off:
+            if not offen and not idxen and not uniform_off:
                 raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
@@ -7082,18 +7258,24 @@ class Stage:
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
         terms.append(str(offset))
-        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        uav = self.pipe.uav(key, rw=kind_label == 'buffer store')
+        if bounded:
+            address = 'write_address'
+            size = 4 if kind_label == 'buffer atomic' else 4 * data_count
+            guards = self.bounded_uav_address(key, base, stride, limit, raw,
+                                              self.u(ops[1]) if idxen else None, terms, size, kind_label)
+        else:
+            address, guards = '(%s) & 0xfffffffcu' % ' + '.join(terms), []
+        return data, uav, address, glc, guards
 
     def op_buffer_store_dword(self, ops, mods, count=1):
-        # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
-        # through a descriptor read from a fixed root-table slot, to a RWByteAddressBuffer (manifest `uav` line).
-        # Like the loads, this assumes a raw descriptor (no swizzle or stride). Out-of-range stores: assumes a future
-        # runtime sizes the view to the descriptor's range so both sides drop them; nothing binds or checks that yet.
+        # Compute raw UAV store through a fixed table slot. Legacy byte-address stores use the
+        # bound view for bounds. Indexed and edited descriptors also check the guest range.
         if self.kind == 'vs':
             return self.op_buffer_store_vs(ops, mods, count)
         if self.kind != 'cs':
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
-        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
+        src, uav, address, _, guards = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
                                                         uniform_off=True)
         # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
         # lanes race; with one proven value in all of them any order stores the same words.
@@ -7101,18 +7283,23 @@ class Stage:
             raise Unsupported('buffer store off with data not proven wave-uniform')
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
-        # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
-        # an assumption that a dword access ignores the low two address bits, not a measurement.
+        # Legacy stores round the run-time offset down to a dword. The bounded path checks alignment.
         self.emit('a = %s;' % address)
         store = '%s.Store%s(a, %s);' % (uav, '' if count == 1 else count, data)
-        self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
+        if guards:
+            for i, (guard, word) in enumerate(zip(guards, words)):
+                store_word = 'if (%s) %s.Store(a + %du, %s);' % (guard, uav, 4 * i, word)
+                self.emit(store_word if self.exec_known else 'if (exec & 1) ' + store_word)
+            self.emit('}')
+        else:
+            self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
     def buffer_atomic(self, name, ops, mods):
         """Lower 32-bit compute MUBUF atomics with optional glc pre-atomic return."""
         if self.kind != 'cs':
             raise Unsupported(name)
         method, signed, is_sub, data_count = MUBUF_ATOMIC_OPS[name]
-        data, uav, address, glc = self.raw_table_uav_store(
+        data, uav, address, glc, guards = self.raw_table_uav_store(
             'buffer atomic', ops, mods, data_count, allow_glc=True, allow_scalar_address=name == 'buffer_atomic_add')
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         self.emit('a = %s;' % address)
@@ -7137,9 +7324,17 @@ class Stage:
                 call = '%s.Interlocked%s(a, %s, %s);' % (uav, method, arg, out_var)
             else:
                 call = '%s.Interlocked%s(a, %s);' % (uav, method, arg)
+        if guards:
+            self.emit('if (%s) {' % guards[0])
         self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
         if glc:
             self.set_v(data[1], 'asuint(ai)' if signed else 'ao')
+        if guards:
+            if glc:
+                self.emit('} else {')
+                self.set_v(data[1], '0u')
+            self.emit('}')
+            self.emit('}')
 
     def _lds_general_barrier_ok(self):
         """True when a compute stage uses dual/atomic LDS ops in straight-line code without legacy exchange ops."""
@@ -11842,7 +12037,7 @@ class ComputePipeline(Pipeline):
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
-        self.retry_entry_exec = False
+        self.retry_entry_exec = self.retry_raw_uav = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -11850,23 +12045,32 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
+        Retry uniform-entry proofs or writable descriptor edits after the relevant legacy refusal.
+        This preserves successful translations byte for byte.
+        """
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if (not self.retry_entry_exec and refusals is not None
-                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
-                    self.retry_entry_exec = True
+                if refusals is not None and any(self._retry_reason(reason)
+                                                for reason, _ in refusals[self._refusals_before:]):
                     continue
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                if not self._retry_reason(str(reason)):
                     raise
-                # Keep the original lowering for every shader that already translates.
-                self.retry_entry_exec = True
+
+    def _retry_reason(self, reason):
+        if not self.retry_entry_exec and reason == READFIRSTLANE_UNIFORM:
+            self.retry_entry_exec = True
+            return True
+        if not self.retry_raw_uav and (reason in ('buffer atomic modifier idxen', 'buffer store modifier idxen', 's_addc_u32')
+                                       or reason.startswith(('buffer atomic through ', 'buffer store through '))):
+            self.retry_raw_uav = True
+            return True
+        return False
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
@@ -12938,6 +13142,7 @@ def raise_site(error):
 LIFTED_REASONS = (
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
+    ('raw-uav-write', r'^(?:buffer atomic modifier idxen|buffer (?:atomic|store) through a modified descriptor)$'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
     ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),

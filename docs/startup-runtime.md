@@ -208,6 +208,14 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
+Compute raw UAV writes can use a lane index multiplied by the descriptor stride, or a descriptor
+with a proven base advance or record-count limit. The runtime binds the original buffer and supplies
+its stride, record count and any other descriptor words requested by the shader. The shader adds
+the base advance to the byte address and checks the effective range before each write.
+The WARP fixtures compare full-buffer readback with CPU references and exercise deliberately wrong
+stride, missing bounds and ignored base advance. Run them with
+`ctest --preset dev --no-tests=error -R '^(startup_compute_buffer_atomics|startup_gfx2hlsl_buffer_store)_warp$'`.
+
 Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
 Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
 Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.

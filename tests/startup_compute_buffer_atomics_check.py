@@ -5,6 +5,7 @@
   dispatch <dxc> <offscreen_check> <adapter>  translate, compile DXC cs_6_0, dispatch and verify GPU readback
 """
 import argparse
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -322,6 +323,69 @@ def single_atomic_code(op_name, *, glc=False, offen=True, idxen=False, slc=False
     return prefix + body + insn + bytes.fromhex('000081bf')
 
 
+def indexed_atomics(constant_stride=False, stride=12):
+    # Two 32-thread groups, eight counters, one contended exchange, one out-of-range add.
+    setup = b''
+    if constant_stride:
+        # Clear only STRIDE, then insert the known value.
+        setup = struct.pack('<4I', 0x8711ff11, 0xc000ffff, 0x8811ff11, stride << 16)
+
+    def atomic(op, value, index, offset=0):
+        return mubuf(ATOMIC_OPCODES[op][0], value, index, 16, 128, offen=False, idxen=True, offset=offset)
+
+    code = (HEAD + setup + vop2(0x1b, 5, 135, 0) + v_mov_imm(6, 1)
+            + atomic('add', 6, 5, 4)
+            + v_mov_imm(7, 8) + vop2(0x25, 8, 192, 0) + atomic('swap', 8, 7)
+            + vop2(0x1c, 9, 144, 0) + atomic('add', 6, 9, 4)
+            + struct.pack('<I', 0xbf810000))
+    return cs_pipe(code, group=(32, 1, 1))
+
+
+def check_indexed_atomics(directory, compiler, renderer, adapter):
+    initial = [SENTINEL] * WORDS
+    for record in range(8):
+        initial[3 * record + 1] = 0
+    expected = initial.copy()
+    for thread in range(64):
+        expected[3 * (thread % 8) + 1] += 1
+
+    # Use the harness's exact comparison for every word except the exchange winner.
+    # For that word, the single expected mismatch must report a value written by a lane.
+    exchange_word = 3 * 8
+    entry = {('rootconst', 0, 0): 0, ('rootconst', 0, 1): 0,
+             ('uav_stride', 0): 12, ('uav_numrecords', 0): 9, ('uav_descword3', 0): 0}
+    for constant_stride in (False, True):
+        pipe = indexed_atomics(constant_stride)
+        hlsl = pipe.hlsl_cs()
+        # Leave a different stride in the original descriptor to distinguish the proven constant.
+        bound = {**entry, ('uav_stride', 0): 16} if constant_stride else entry
+        constants = [bound[source] for source in pipe.uds]
+        result = run_case(directory, compiler, renderer, adapter, f'indexed_{constant_stride}',
+                          hlsl, (2, 1, 1), expected, constants=constants, initial=initial)
+        match = re.search(rf'word={exchange_word} expected={SENTINEL:08x} actual=([0-9a-f]{{8}})', result.stderr)
+        assert (result.returncode == 1 and f'compared_words={WORDS} mismatches=1' in result.stdout
+                and match and 64 <= int(match[1], 16) < 96), (result.stdout, result.stderr)
+
+    pipe = indexed_atomics()
+    hlsl = pipe.hlsl_cs()
+    constants = [entry[source] for source in pipe.uds]
+    no_bounds, guards_removed = re.subn(r'if \(.*write_count\) \{', 'if (true) {', hlsl)
+    assert guards_removed == 3
+    for name, mutant in (('indexed_wrong_stride', hlsl.replace('* write_stride', '* 4u')),
+                         ('indexed_no_bounds', no_bounds)):
+        assert mutant != hlsl
+        result = run_case(directory, compiler, renderer, adapter, name, mutant, (2, 1, 1), expected,
+                          constants=constants, initial=initial)
+        # The exchange winner already differs from the placeholder. The mutant must
+        # introduce additional mismatches in the otherwise exact CPU comparison.
+        mismatches = re.search(r'compared_words=320 mismatches=(\d+)', result.stdout)
+        assert result.returncode == 1 and mismatches and int(mismatches[1]) > 1, (name, result.stdout, result.stderr)
+        if name == 'indexed_no_bounds':
+            assert int(mismatches[1]) == 17, result.stdout
+        else:
+            assert f'word=2 expected={SENTINEL:08x} actual={SENTINEL + 8:08x}' in result.stderr, result.stderr
+
+
 def controls(llvm_mc):
     # Verify multi-op reduction and exchange/glc/EXEC/cmpswap fixtures.
     if llvm_mc:
@@ -391,10 +455,11 @@ def controls(llvm_mc):
     refused('without the offen address form', lambda: cs_pipe(single_atomic_code('sub', offen=False, glc=True, soffset_enc=13)))
     refused('off requires a scalar register soffset', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True)))
     refused('unaligned immediate offset', lambda: soffset_pipe(2))
-    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', offen=False, idxen=True, glc=True, soffset_enc=13)))
+    refused('buffer atomic with idxen and offen', lambda: cs_pipe(single_atomic_code('add', idxen=True)))
     refused('buffer soffset vcc_lo', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True, soffset_enc=0x6a)))
-    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True)))
-    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True, offen=True)))
+    indexed_atomics().hlsl_cs()
+    indexed_atomics(constant_stride=True).hlsl_cs()
+    refused('invalid indexed stride 6', lambda: indexed_atomics(constant_stride=True, stride=6))
     refused('buffer atomic modifier slc', lambda: cs_pipe(single_atomic_code('add', slc=True)))
     refused('buffer atomic modifier dlc', lambda: cs_pipe(single_atomic_code('add', dlc=True)))
     refused('buffer soffset vcc_lo', lambda: cs_pipe(single_atomic_code('add', soffset_enc=0x6a)))
@@ -426,15 +491,25 @@ def controls(llvm_mc):
     print('buffer_atomic controls (11 ops, scalar byte offset, glc/non-glc, alignment, modifiers, descriptors, refusals) passed')
 
 
-def run_case(directory, compiler, renderer, adapter, name, hlsl, groups, want):
+def run_case(directory, compiler, renderer, adapter, name, hlsl, groups, want, *, constants=None, initial=None):
     src = directory / f'{name}.hlsl'
     cso = directory / f'{name}.cso'
     case = directory / f'{name}.case'
     src.write_text(hlsl, encoding='ascii')
     subprocess.run([compiler, '-Gis', '-WX', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-    case.write_bytes(struct.pack('<321I', groups[0] | (groups[1] << 8) | (groups[2] << 16), *want))
-    return subprocess.run([renderer, adapter, '--compute-store-case', str(cso), str(case)],
-                          capture_output=True, text=True)
+    header = groups[0] | (groups[1] << 8) | (groups[2] << 16)
+    if initial is not None:
+        header |= 1 << 31
+    payload = struct.pack('<321I', header, *want)
+    if initial is not None:
+        payload += struct.pack('<320I', *initial)
+    if constants is not None:
+        assert len(constants) <= 16
+        payload += struct.pack('<16I', *constants, *([0] * (16 - len(constants))))
+    case.write_bytes(payload)
+    mode = '--compute-store-sized-case' if constants is not None else '--compute-store-case'
+    return subprocess.run([renderer, adapter, mode, str(cso), str(case)], capture_output=True, text=True)
+
 
 
 def dispatch(directory, compiler, renderer, adapter):
@@ -500,6 +575,7 @@ def dispatch(directory, compiler, renderer, adapter):
         first = next(i for i, (a, b) in enumerate(zip(expected, actual_ref)) if a != b)
         assert r.returncode == 1 and f'word={first} expected={expected[first]:08x} actual={actual_ref[first]:08x}' in r.stderr, (
             name, first, r.returncode, r.stdout, r.stderr)
+    check_indexed_atomics(directory, compiler, renderer, adapter)
     return 0
 
 

@@ -6,7 +6,8 @@
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
-// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
+// count and low base word of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`, `uav_base_lo`).
+// Any other manifest line makes the translation
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
@@ -16,7 +17,7 @@ struct ComputeTranslation {
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
     // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
-    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records, output_base_low };
     struct Slot {
         int a, b;
         bool texture, heap;
@@ -145,8 +146,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
         // The manifest names of the Source values after root_constant, in their order.
         const auto source = [&] {
-            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords"};
-            for (int s = 0; s < 5; ++s)
+            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords", "uav_base_lo"};
+            for (int s = 0; s < static_cast<int>(sizeof(names) / sizeof(names[0])); ++s)
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
@@ -526,6 +527,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
+        case ComputeTranslation::output_base_low: values[i] = view.words[0]; break;
         }
     }
     phases.to(3);
