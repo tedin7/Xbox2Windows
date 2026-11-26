@@ -100,6 +100,15 @@ def main(probe):
             pid = int((hung_dir / "title.pid").read_text())
             alive = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"], capture_output=True, text=True).stdout
             assert str(pid) not in alive, (name, "the title is still running", alive)
+        # The tester's case (Run M): after the timeout the title's window thread raises a debug event (OutputDebugString) on every
+        # pass. The debugger must keep serving debug events while it takes the last picture and ends the title.
+        started = time.monotonic()
+        busy, busy_dir = run(probe, work, "debug_events", "--timeout", "5", "--capture-every", "1",
+                             extra_env={"STARTUP_WINDOW_PROBE_DEBUG_MS": "3000"})
+        took = time.monotonic() - started
+        assert busy.returncode == 0 and (busy_dir / "finished.txt").exists(), (busy.returncode, busy.stdout, busy.stderr)
+        assert took < 20 and (busy_dir / "window.png").exists(), (took, busy.stdout)
+        assert "window capture: 160x120 -> window.png" in busy.stdout and "skipped" not in busy.stdout, busy.stdout
     print("startup_debug_window: PASS (red then blue saved once each, unchanged frames skipped, change time reported, "
           "window.png unchanged, off by default, bad interval refused; commit headroom ends a run, one MiB does not)")
     return 0
