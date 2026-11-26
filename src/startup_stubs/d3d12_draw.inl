@@ -2874,6 +2874,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
+    const bool trace_inputs = red_producers().onset();
+    ID3D12Resource* sampled_textures[32];
+    unsigned sampled_count = 0;
+    const auto follow_inputs = [&] {
+        red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
+    };
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
@@ -3094,6 +3100,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            if (trace_inputs && texture) sampled_textures[sampled_count++] = texture;
             continue;
         }
         if (indirect) {
@@ -3422,6 +3429,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     if (indirect) {
+        follow_inputs();
+        const auto red_samples = trace_inputs
+            ? red_producer_draw_before(self, list, "translated-indirect-draw", tr->key) : RedDrawSamples{};
         if (validated) {
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
@@ -3429,6 +3439,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
         }
+        red_producer_draw_after(self, red_samples);
         // The translated root invalidated the desktop arguments of the tracked guest root.
         if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
         pass.srv_bound = 0;
@@ -3452,12 +3463,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);
+            follow_inputs();
             const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
             red_producer_draw_after(self, red_samples);
             drawn = true;
         }
     } else {
+        follow_inputs();
         const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         red_producer_draw_after(self, red_samples);

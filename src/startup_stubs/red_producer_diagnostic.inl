@@ -28,13 +28,15 @@ class RedProducers {
         u64 key;
     };
     std::mutex lock_;
-    std::vector<Resource> surfaces_;
+    std::vector<Resource> surfaces_, inputs_;
     std::vector<Entry> entries_;
     LONG first_ = 0, last_ = 0;
     LONG auto_min_ = 0, auto_count_ = 0;
     volatile LONG auto_first_ = 0, auto_last_ = 0;
     unsigned target_rgb_[3]{255, 0, 0};
-    bool auto_last_match_ = false;
+    bool auto_last_match_ = false, onset_ = false;
+    LONG64 previous_sample_ = 0;
+    unsigned char previous_rgba_[4]{};
     History history_[history_limit]{};
     std::size_t history_next_ = 0, history_count_ = 0;
     unsigned submit_order_ = 0;
@@ -47,6 +49,7 @@ public:
     RedProducers()
     {
         char value[48]{};
+        onset_ = GetEnvironmentVariableA("X2W_RED_PRODUCER_ONSET", value, sizeof(value)) == 1 && value[0] == '1';
         if (GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", value, sizeof(value)) &&
             std::sscanf(value, "%ld,%ld", &first_, &last_) == 2 && first_ >= 1 && last_ >= first_) {
             log("x2w-red producer capture frames %ld..%ld; max 512 center texels from known present targets", first_, last_);
@@ -76,9 +79,18 @@ public:
     }
 
     bool enabled() const { return first_ || auto_count_; }
-    bool matches(const unsigned char* rgba) const
+    bool onset() const { return enabled() && onset_; }
+    bool matches(const unsigned char* rgba, bool flat) const
     {
-        return rgba[0] == target_rgb_[0] && rgba[1] == target_rgb_[1] && rgba[2] == target_rgb_[2];
+        if (onset_ && !flat) return false;
+        const int tolerance = onset_ ? x2w_present_signature::onset_rgb_tolerance : 0;
+        for (unsigned c = 0; c < 3; ++c)
+            if (std::abs(int(rgba[c]) - int(target_rgb_[c])) > tolerance) return false;
+        return true;
+    }
+    bool wants_history() const
+    {
+        return auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_ - (onset_ ? 1 : 0);
     }
     bool interested() const
     {
@@ -87,21 +99,30 @@ public:
     }
     bool may_record() const
     {
-        return interested() || (auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_);
+        return interested() || wants_history();
     }
 
-    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, bool matched)
+    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, const unsigned char* rgba, bool matched)
     {
         if (!auto_count_ || auto_last_) return;
         std::lock_guard<std::mutex> guard(lock_);
-        const bool became_matched = matched && !auto_last_match_;
+        const LONG64 previous = previous_sample_;
+        const bool became_matched = matched && !auto_last_match_ && (!onset_ || previous);
         auto_last_match_ = matched;
-        if (auto_last_ || !became_matched || sampled_frame < auto_min_ || published_frame > LONG_MAX - auto_count_) return;
+        if (auto_last_ || !became_matched || sampled_frame < auto_min_ || published_frame > LONG_MAX - auto_count_) {
+            if (onset_) {
+                previous_sample_ = sampled_frame;
+                std::copy_n(rgba, 4, previous_rgba_);
+            }
+            return;
+        }
         InterlockedExchange(&auto_first_, published_frame + 1);
         InterlockedExchange(&auto_last_, published_frame + auto_count_);
         log("x2w-red auto armed sampled_present=%lld published_at=%ld target=%p capture=%ld..%ld rgb=%u,%u,%u",
             sampled_frame, published_frame, surface, static_cast<LONG>(auto_first_), static_cast<LONG>(auto_last_),
             target_rgb_[0], target_rgb_[1], target_rgb_[2]);
+        if (onset_) log("x2w-red flat onset previous_present=%lld sampled_present=%lld previous_rgba=%u,%u,%u,%u",
+            previous, sampled_frame, previous_rgba_[0], previous_rgba_[1], previous_rgba_[2], previous_rgba_[3]);
         for (std::size_t i = 0; i < history_count_; ++i) {
             const auto& e = history_[(history_next_ + history_limit - history_count_ + i) % history_limit];
             log("x2w-red history record=%ld list=%p target=%p op=%s key=%016llx rt=%u",
@@ -121,14 +142,34 @@ public:
         }
     }
 
+    void follow_inputs(const Pass& pass, ID3D12Resource* const* textures, std::size_t count, u64 key)
+    {
+        if (!count || !pass.targets_bound) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        for (UINT i = 0; i < pass.target_count; ++i) {
+            auto* target = pass.trace_targets[i];
+            if (std::none_of(surfaces_.begin(), surfaces_.end(), [=](const Resource& r) { return r.Get() == target; }))
+                continue;
+            for (std::size_t j = 0; j < count; ++j) {
+                auto* input = textures[j];
+                if (input == target || std::any_of(inputs_.begin(), inputs_.end(),
+                    [=](const Resource& r) { return r.Get() == input; })) continue;
+                if (inputs_.size() == 32) return;
+                inputs_.emplace_back(input);
+                log("x2w-red input record=%ld target=%p source=%p key=%016llx", frame_number + 1, target, input, key);
+            }
+        }
+    }
+
     unsigned before(Wrapper* owner, ID3D12GraphicsCommandList* list, ID3D12Resource* surface,
                     const char* operation, u64 key, unsigned attachment)
     {
         if (!may_record() || !surface || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return 0;
         std::lock_guard<std::mutex> guard(lock_);
         const auto found = std::find_if(surfaces_.begin(), surfaces_.end(), [=](const Resource& r) { return r.Get() == surface; });
-        if (found == surfaces_.end()) return 0;
-        if (auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_) {
+        if (found == surfaces_.end() && std::none_of(inputs_.begin(), inputs_.end(),
+            [=](const Resource& r) { return r.Get() == surface; })) return 0;
+        if (wants_history()) {
             history_[history_next_] = {list, surface, frame_number + 1, attachment, operation, key};
             history_next_ = (history_next_ + 1) % history_limit;
             if (history_count_ < history_limit) ++history_count_;
@@ -149,7 +190,7 @@ public:
         buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
         buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         const auto ordinal = static_cast<unsigned>(entries_.size() + 1);
-        Entry entry{list, {}, *found, {}, nullptr, frame_number + 1, 0, attachment, ordinal, 0, operation, key};
+        Entry entry{list, {}, Resource(surface), {}, nullptr, frame_number + 1, 0, attachment, ordinal, 0, operation, key};
         const HRESULT hr = device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readback));
         if (FAILED(hr)) {

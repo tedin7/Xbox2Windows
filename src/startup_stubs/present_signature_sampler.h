@@ -23,6 +23,7 @@
 
 #include <d3d12.h>
 
+#include <cstdlib>
 #include <initializer_list>
 
 namespace x2w_present_signature {
@@ -42,10 +43,12 @@ inline bool layout_of(DXGI_FORMAT format, Layout& layout)
     }
 }
 
+inline constexpr int onset_rgb_tolerance = 4;
+
 class Sampler {
 public:
-    explicit Sampler(int every, bool always = true, bool capture_center = false)
-        : capture_center_(capture_center), every_(every), always_(always) {}
+    explicit Sampler(int every, bool always = true, bool capture_center = false, bool check_flat = false)
+        : capture_center_(capture_center || check_flat), check_flat_(check_flat), every_(every), always_(always) {}
 
     // Called once per present with the presented surface. Returns true when this call published a sample.
     bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
@@ -65,6 +68,17 @@ public:
                 const auto* base = static_cast<const unsigned char*>(mapped);
                 if (capture_center_)
                     std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
+                if (check_flat_ && last_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                    last_flat_ = true;
+                    for (int band = 0; band < cells_y && last_flat_; ++band) {
+                        const auto* row = base + row_stride_ * band;
+                        for (UINT x = 0; x < width_ && last_flat_; ++x) {
+                            for (unsigned c = 0; c < 3; ++c)
+                                if (std::abs(int(row[x * 4 + c]) - int(last_rgba_[c])) > onset_rgb_tolerance)
+                                    last_flat_ = false;
+                        }
+                    }
+                }
                 std::uint8_t luma[cells];
                 for (int band = 0; band < cells_y; ++band) reduce_row(base + row_stride_ * band, width_, layout_, luma + band * cells_x);
                 if (rows_ > cells_y)
@@ -134,6 +148,7 @@ public:
         return published;
     }
 
+    bool last_flat() const { return last_flat_; }
     DXGI_FORMAT last_format() const { return last_format_; }
     LONG64 last_present() const { return last_present_; }
     const unsigned char* last_rgba() const { return last_rgba_; }
@@ -213,7 +228,8 @@ private:
         list_->ResourceBarrier(1, &b);
     }
 
-    const bool capture_center_;
+    const bool capture_center_, check_flat_;
+    bool last_flat_ = false;
     DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN, last_format_ = DXGI_FORMAT_UNKNOWN;
     LONG64 last_present_ = 0;
     unsigned char last_rgba_[4]{};

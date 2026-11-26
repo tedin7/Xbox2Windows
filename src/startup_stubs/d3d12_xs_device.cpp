@@ -7469,7 +7469,8 @@ void log_gpu_time(LONG frame, ULONGLONG now_ms)
 
 // Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
 // present_signature_sampler.h). The block always counts presents; samples are taken every 4 presents
-// only while a script with a picture wait has asked for them (request_sampling). X2W_PRESENT_SIGNATURE_EVERY=<n>
+// while a picture wait has asked for them (request_sampling), or while the red-producer diagnostic is enabled.
+// Flat-onset mode defaults to every present. X2W_PRESENT_SIGNATURE_EVERY=<n>
 // samples every n presents from the start without a request, and 0 turns the signature off.
 // 18 one-texel rows are copied on the presenting queue and read back on a later present; nothing waits.
 void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
@@ -7479,24 +7480,28 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
         return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : -1;
     }();
     if (explicit_every == 0) return;
-    static const int every = explicit_every > 0 ? explicit_every : 4;
+    static const bool producer_enabled = red_producers().enabled();
+    static const bool always = explicit_every > 0 || producer_enabled;
+    static const bool onset = red_producers().onset();
+    static const int every = explicit_every > 0 ? explicit_every : (onset ? 1 : 4);
     static x2w_present_signature::Block* const block = [] {
         auto* created = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
         log("x2w-present picture signature: Local\\x2w_present_signature_%lu, every %d presents %s",
             static_cast<unsigned long>(GetCurrentProcessId()), every,
-            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" : "once a script wait asks for it");
+            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" :
+            producer_enabled ? "from the start (red producer diagnostic)" : "once a script wait asks for it");
         return created;
     }();
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
-    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0, red_producers().enabled());
+    static auto* const sampler = new x2w_present_signature::Sampler(every, always, producer_enabled, onset);
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
     if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* rgba = sampler->last_rgba();
         const bool red = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0;
-        const bool matched = red_producers().matches(rgba);
-        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), matched);
+        const bool matched = red_producers().matches(rgba, sampler->last_flat());
+        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, matched);
         static bool was_matched;
         if (matched != was_matched || red_producers().interested()) {
             log("x2w-red sample present=%lld published_at=%ld target=%p rgba=%u,%u,%u,%u red=%u match=%u tick=%llu",

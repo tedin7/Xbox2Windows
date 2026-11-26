@@ -28,7 +28,9 @@ int main(int argc, char** argv)
 {
     const bool reverse = argc >= 2 && std::strcmp(argv[1], "reverse") == 0;
     const bool use_magenta = argc >= 2 && std::strcmp(argv[1], "auto-magenta") == 0;
-    const bool automatic = use_magenta || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
+    const bool default_cadence = argc >= 2 && std::strcmp(argv[1], "auto-default") == 0;
+    const bool flat_onset = argc >= 2 && std::strcmp(argv[1], "auto-onset") == 0;
+    const bool automatic = use_magenta || default_cadence || flat_onset || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
     const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
@@ -100,10 +102,10 @@ int main(int argc, char** argv)
     constexpr float red[]{1, 0, 0, 1}, near_red[]{254.0f / 255.0f, 0, 0, 1}, green[]{0, 1, 0, 1}, blue[]{0, 0, 1, 1};
     constexpr float magenta[]{1, 0, 1, 1}, near_magenta[]{254.0f / 255.0f, 0, 1, 1};
     const float* chosen = use_magenta ? magenta : red;
-    const auto emit = [&](const float* first, const float* last = nullptr) {
+    const auto emit = [&](const float* first, const float* last = nullptr, const D3D12_RECT* rect = nullptr) {
         if (!ok(call(list, 139, arg(allocator)))) return false;
         call(list, 52, rtv, arg(first));
-        if (last) call(list, 52, rtv, arg(last));
+        if (last) call(list, 52, rtv, arg(last), rect ? 1 : 0, arg(rect));
         if (!ok(call(list, 9))) return false;
         void* lists[]{list};
         call(queue, 10, 1, arg(lists));
@@ -129,8 +131,13 @@ int main(int argc, char** argv)
         void* lists[]{list};
         call(queue, 10, 1, arg(lists));
         if (!finish()) return 17;
-    } else if (!emit(automatic ? chosen : blue) || !present()) {
+    } else if (!emit(automatic && !default_cadence && !flat_onset ? chosen : blue) || !present()) {
         return 8; // discover the title's present surface
+    } else if (flat_onset) {
+        // #4 has a near-red center but a blue corner. #5 is uniformly near red.
+        const D3D12_RECT corner{0, 0, 4, 4};
+        if (!present() || !emit(green) || !present() || !emit(near_red, blue, &corner) || !present() ||
+            !emit(near_red) || !present() || !present() || !emit(green, near_red) || !present() || !present()) return 18;
     } else if (automatic) {
         // #1 matches too early; #3 changes color, #4 almost matches and #5 matches again.
         // The delayed sample at #6 arms #7 and #8, then a blue write at #9 is out of range.
