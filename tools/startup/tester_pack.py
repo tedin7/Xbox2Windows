@@ -16,6 +16,9 @@ Not in it: sub-folders such as a shader cache, memory dumps and game files; with
 of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason, and for a key the
 run used its first and last use in seconds since the process started (the refused keys used latest are listed first). Never
 shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
+`shader_requests/`: the request files (req_<key>.*) of the 40 worst refused keys, ranked by draws not drawn (graphics) or dispatches
+without a translation (compute) from stderr.txt, at most 4 MB in all, listed in the manifest (`request_files`). Private data: mailed, never posted.
+
 `d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
 d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
@@ -426,6 +429,45 @@ def format_results(rows, use=None):
     return "\n".join(lines) + "\n"
 
 
+# The request files of the worst refused keys, so a translator can be fixed from the zip alone (private data: mailed, never posted).
+REQUESTS_DIR = "shader_requests"
+REQUESTS_TOP = 40                   # keys
+REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
+REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86")
+NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
+CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
+
+
+def key_weights(stderr_text):
+    """{key: draws not drawn (graphics) or dispatches without a translation (compute)}: each key's newest cumulative line."""
+    weights = {}
+    for m in NOT_DRAWN_KEY_RE.finditer(stderr_text):
+        weights[m.group(1)] = int(m.group(2))
+    for m in CENSUS_KEY_RE.finditer(stderr_text):
+        weights[m.group(1)] = max(0, int(m.group(2)) - int(m.group(3)))
+    return weights
+
+
+def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES):
+    """[(key, kind, weight, [(file name, bytes)])] for the refused keys ranked by weight (ties by key), at most `top`
+    keys, whole keys only, request files of all together within `cap` bytes. Keys without weight are not ranked."""
+    names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
+    chosen, used = [], 0
+    ranked = sorted((r for r in rows if r[2] == "refused" and weights.get(r[0], 0) > 0), key=lambda r: (-weights[r[0]], r[0]))
+    for key, kind, _, _ in ranked:
+        if len(chosen) >= top:
+            break
+        files = []
+        for name in sorted(n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS):
+            files.append((name, os.path.getsize(os.path.join(cache_dir, name))))
+        size = sum(b for _, b in files)
+        if not files or used + size > cap:
+            continue
+        used += size
+        chosen.append((key, kind, weights[key], files))
+    return chosen
+
+
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
 MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
 MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
@@ -614,6 +656,19 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
         add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
+        stderr_path = os.path.join(logdir, "stderr.txt")
+        weights = {}
+        if os.path.isfile(stderr_path):
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
+                weights = key_weights(handle.read())
+        chosen = select_requests(cache_dir, rows, weights)
+        for key, kind, weight, files in chosen:
+            for name, _ in files:
+                with open(os.path.join(cache_dir, name), "rb") as handle:
+                    add(REQUESTS_DIR + "/" + name, handle.read())
+        manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
+                                     "bytes": sum(b for c in chosen for _, b in c[3]),
+                                     "ranked": [{"key": k, "kind": kd, "weight": w} for k, kd, w, _ in chosen]}
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             rows = parse_symbols(handle.read())
