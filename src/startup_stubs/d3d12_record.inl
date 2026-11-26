@@ -20,6 +20,7 @@ constexpr std::size_t flush_bytes = 1u << 20;
 constexpr std::size_t blob_follow_bytes = 0x400;  // pointer words looked at inside an argument's memory
 constexpr std::size_t blob_default_bytes = 0x100;
 constexpr std::size_t blob_max_bytes = 4u << 20;
+constexpr int record_depth = 2;  // argument memory, the memory it points at (a pipeline stream), and one more (its shaders)
 
 void* original[kind_count][wide_slots];
 bool armed;
@@ -115,12 +116,14 @@ u64 content_hash(const unsigned char* data, std::size_t bytes)
 }
 
 // Records the memory at `address` (an argument, or a pointer found in an argument's memory) as an ARGM chunk, and its
-// content once as a BLOB. `size_hint` 0: a default window. depth > 0 follows pointer words in its first bytes, taking
-// the next word as the size when it is a plausible one (a shader: pointer, then byte count).
+// content once as a BLOB. The window is the larger of a default and `size_hint` (the word after the pointer, when it is a
+// plausible size: a shader is a pointer, then its byte count). depth > 0 follows pointer words in its first bytes. A
+// followed pointer's ARGM names its direct parent: `arg` = the call's argument | 0x100 * (word index + 1), and the
+// parent is the last ARGM of the same call with depth one higher (they are written parent first).
 void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth)
 {
     if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address))) return;
-    const std::size_t wanted = size_hint ? size_hint : blob_default_bytes;
+    const std::size_t wanted = size_hint > blob_default_bytes ? size_hint : blob_default_bytes;
     const std::size_t bytes = readable_window(address, wanted);
     if (!bytes) return;
     std::vector<unsigned char> copy(bytes);
@@ -146,7 +149,7 @@ void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std
         const u64 value = words[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || (value & 3)) continue;
         const u64 next = i + 1 < scan ? words[i + 1] : 0;
-        record_memory(b, seq, arg | 0x100u * static_cast<std::uint32_t>(i + 1), value,
+        record_memory(b, seq, (arg & 0xffu) | 0x100u * static_cast<std::uint32_t>(i + 1), value,
                       next > 0 && next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, depth - 1);
     }
 }
@@ -181,7 +184,8 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
                 append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
             }
         }
-        record_memory(b, seq, i, value, 0, 1);
+        const u64 next = i + 1 < 7 ? args[i + 1] : 0;
+        record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
     }
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
@@ -322,7 +326,7 @@ void install()
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&started);
     std::vector<unsigned char> head;
-    struct { std::uint32_t version, call_bytes; u64 frequency; } header{1, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
+    struct { std::uint32_t version, call_bytes; u64 frequency; } header{2, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);
     write_raw(head.data(), head.size());
     armed = true;

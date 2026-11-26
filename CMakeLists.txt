@@ -1370,6 +1370,15 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
 
+# Replay (docs/startup-runtime.md#d3d12-replay-record): the player, next to the stand-in it loads, and the scene the
+# replay test records (tests/cmake/startup_replay.cmake).
+add_executable(x2w_replay src/replay/x2w_replay.cpp)
+target_compile_features(x2w_replay PRIVATE cxx_std_17)
+target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi)
+add_executable(startup_replay_quad tests/startup_replay_quad.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_replay_quad PRIVATE cxx_std_17)
+target_link_libraries(startup_replay_quad PRIVATE d3d12_xs_shim d3d12 dxgi)
+
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)

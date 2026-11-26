@@ -72,6 +72,7 @@
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/png_write.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
@@ -2313,6 +2314,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
 #include "startup_stubs/d3d12_record.inl"
+#include "startup_stubs/d3d12_present_pictures.inl"
 
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
@@ -7684,6 +7686,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
         replay_record::present();
+        present_pictures::present(self, surface, frame);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
