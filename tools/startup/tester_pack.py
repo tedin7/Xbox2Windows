@@ -62,9 +62,29 @@ def menus2_script():
     return ",".join(items)
 
 
-def input_preset(spec, seconds):
+def privacy_items(boxes, start, skip_down=0):
+    """The privacy screen: `skip_down` D-pad downs to reach the first checkbox, then A on each box with D-pad down to
+    the next one, D-pad down onto the confirm button after the last box and A to confirm. One press every
+    MENUS_STEP_S. Returns (items, time of the next free step). The layout (how many boxes, where the focus starts) is
+    a parameter until a run's pictures show it."""
+    items, at = [], start
+    def press(mask):
+        nonlocal at
+        items.append("%s@%d+%s" % (mask, at, MENUS_HOLD_S))
+        at += MENUS_STEP_S
+    for _ in range(skip_down):
+        press(DPAD_DOWN)
+    for _ in range(boxes):
+        press(BUTTON_A)
+        press(DPAD_DOWN)
+    press(BUTTON_A)   # confirm
+    return items, at
+
+
+def input_preset(spec, seconds, privacy_boxes=0, privacy_start=MENUS_START_S, privacy_skip_down=0):
     """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 300 s, at most 256 entries. Anything else is a raw script."""
+    `seconds` of script time, but not past 300 s, at most 256 entries. With privacy_boxes > 0 the privacy screen comes
+    first (privacy_items), then the menus pattern. Anything else is a raw script."""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
@@ -73,8 +93,9 @@ def input_preset(spec, seconds):
         if len([item for item in spec.split(",") if item.strip()]) > MAX_ENTRIES:
             raise ValueError("input script has more than %d entries" % MAX_ENTRIES)
         return spec
-    items = []
-    press, at = 0, MENUS_START_S
+    items, press, at = [], 0, MENUS_START_S
+    if privacy_boxes > 0:
+        items, at = privacy_items(privacy_boxes, privacy_start, privacy_skip_down)
     while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
         items.append("%s@%d+%s" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at, MENUS_HOLD_S))
         press += 1
@@ -417,6 +438,9 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
+    p.add_argument("--privacy-boxes", type=int, default=0)
+    p.add_argument("--privacy-start", type=int, default=MENUS_START_S)
+    p.add_argument("--privacy-skip-down", type=int, default=0)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -440,7 +464,7 @@ def main(argv):
     r.add_argument("cache")
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
-        print(input_preset(args.spec, args.seconds))
+        print(input_preset(args.spec, args.seconds, args.privacy_boxes, args.privacy_start, args.privacy_skip_down))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))

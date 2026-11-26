@@ -43,6 +43,10 @@ def check_preset():
     assert len(long_menus) <= T.MAX_ENTRIES
     long_run = T.input_preset("menus", 100000).split(",")
     assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    privacy = T.input_preset("menus", 60, 2, 5, 1).split(",")
+    assert privacy[:6] == ["80@5+1.2", "4@7+1.2", "80@9+1.2", "4@11+1.2", "80@13+1.2", "4@15+1.2"], "skip, box 1, down, box 2, down, confirm"
+    assert privacy[6:9] == ["80@17+1.2", "80@19+1.2", "4@21+1.2"], "then the menus pattern goes on"
+    assert T.input_preset("menus", 60, 0, 5, 0) == T.input_preset("menus", 60), "no boxes = the plain menus script"
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"

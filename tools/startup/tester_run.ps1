@@ -37,6 +37,9 @@ keeps video memory from running out. -NoLazyTextures turns it off. The manifest 
 
 -Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
 time counts from that poll, which the title reaches late).
+-PrivacyBoxes N (with -Input menus; -PrivacyStart S, -PrivacySkipDown K): the menus script first ticks N privacy checkboxes
+(A on a box, D-pad down to the next, down to confirm, A), then goes on with the menus pattern. The box count and the start
+are a parameter until a run shows the screen; 0 leaves it out.
 -Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
 still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
 Any other value is a raw
@@ -60,6 +63,9 @@ param(
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
     [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
+    [int]$PrivacyBoxes = 0,                     # -Input menus: first tick this many privacy checkboxes (A on a box, DOWN to the next, A on confirm); 0 = skip that screen
+    [int]$PrivacyStart = 5,                     # script second (after the first pad poll) the privacy screen starts at
+    [int]$PrivacySkipDown = 0,                  # D-pad downs needed to reach the first checkbox
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
@@ -188,7 +194,7 @@ try {
 }
 Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
-$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
+$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes --privacy-start $PrivacyStart --privacy-skip-down $PrivacySkipDown })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
