@@ -25,6 +25,7 @@ static void* create_present_queue(void* guest)
 //   same     the memory is left alone (red both times)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
+//   once-full  four draws of a 64 MiB binding per frame, reading the final 16 bytes
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
@@ -36,7 +37,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
-    const bool once = keys || !std::strcmp(mode, "once");
+    const bool full = !std::strcmp(mode, "once-full");
+    const bool once = full || keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
     if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
@@ -59,9 +61,9 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
                                            reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
-    constexpr UINT large_bytes = 16u << 20;
+    const UINT large_bytes = (full ? 64u : 16u) << 20;
     float* large = nullptr;
-    constexpr UINT large_words = large_bytes / sizeof(float);
+    const UINT large_words = large_bytes / sizeof(float);
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;

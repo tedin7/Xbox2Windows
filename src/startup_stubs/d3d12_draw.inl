@@ -1568,10 +1568,23 @@ bool bigbind_once_enabled()
     return on;
 }
 
+constexpr u64 legacy_buffer_copy_limit = 16u << 20;
+constexpr u64 raw_buffer_view_limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+
+bool big_buffer_full_enabled()
+{
+    static const bool on = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_BIG_BUFFER_FULL", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
 struct BigBinding {
     std::size_t bytes = 0;
     bool readable = false;
     UploadReservation slice;
+    x2w_startup::ComPtr<ID3D12Resource> committed;
 };
 
 // Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
@@ -1580,6 +1593,7 @@ std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
 UploadChunkMask big_binding_chunks;
 struct BigBindingCounts {
     unsigned trims = 0, copies = 0, hits = 0;
+    unsigned full_ring = 0, full_committed = 0;
     std::size_t copied_bytes = 0;
 };
 BigBindingCounts big_binding_counts;
@@ -1618,9 +1632,12 @@ void finish_bigbind_frame(LONG frame)
         GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
         return std::strncmp(mode, "once", 4) == 0;
     }();
-    if (report && big_binding_counts.trims)
+    if (report && (big_binding_counts.trims || big_binding_counts.copies))
         log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
             big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    if (report && (big_binding_counts.full_ring || big_binding_counts.full_committed))
+        log("x2w-draw full bindings frame %ld: %u ring, %u committed", frame,
+            big_binding_counts.full_ring, big_binding_counts.full_committed);
     big_binding_counts = {};
 }
 
@@ -1639,7 +1656,73 @@ bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
     return false;
 }
 
-// Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
+// draw_lock held. The frame cache owns one snapshot per address and length. The
+// recording holds it separately so it can survive Present and delayed submission.
+ID3D12Resource* full_buffer_snapshot(Wrapper* self, u64 address, std::size_t bytes, u64& offset)
+{
+    if (!address || !bytes || bytes > raw_buffer_view_limit) return nullptr;
+    const auto key = std::make_pair(address, bytes);
+    BigBinding* binding = nullptr;
+    try {
+        auto [entry, inserted] = big_bindings.try_emplace(key);
+        binding = &entry->second;
+        if (!inserted) {
+            ++big_binding_counts.hits;
+            if (binding->committed) {
+                offset = 0;
+                return retain_with_recording(self, binding->committed, true) ? binding->committed.Get() : nullptr;
+            }
+            if (!bind_upload_slice(self, binding->slice)) return nullptr;
+            offset = binding->slice.offset;
+            return binding->slice.resource;
+        }
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+    const auto fail = [&]() -> ID3D12Resource* {
+        big_bindings.erase(key);
+        return nullptr;
+    };
+    if (bytes > UINT64_MAX - address || readable_window(address, bytes) < bytes) return fail();
+
+    const std::size_t padded = (bytes + 3) & ~std::size_t{3};
+    binding->slice = reserve_upload_ring(self, padded, &big_binding_chunks);
+    void* mapped = binding->slice.mapped;
+    if (!mapped) {
+        // An upload heap can be bound directly as an SRV on any recording, including
+        // compute queues, without depending on execution order of a staging copy.
+        auto* device = device_of(self->own().list_device);
+        if (!device) return fail();
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, padded, 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        const D3D12_RANGE no_reads{0, 0};
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(binding->committed.GetAddressOf()))) ||
+            FAILED(binding->committed->Map(0, &no_reads, &mapped))) return fail();
+    }
+    if (!x2w_local::guarded_memcpy(mapped, reinterpret_cast<const void*>(address), bytes, true)) {
+        if (binding->committed) binding->committed->Unmap(0, nullptr);
+        return fail();
+    }
+    if (padded != bytes) std::memset(static_cast<unsigned char*>(mapped) + bytes, 0, padded - bytes);
+    if (binding->committed) {
+        const D3D12_RANGE written{0, padded};
+        binding->committed->Unmap(0, &written);
+        ++big_binding_counts.full_committed;
+    } else {
+        ++big_binding_counts.full_ring;
+    }
+    ++big_binding_counts.copies;
+    big_binding_counts.copied_bytes += bytes;
+    InterlockedIncrement64(&big_copies_made);
+    offset = binding->slice.offset;
+    if (binding->committed)
+        return retain_with_recording(self, binding->committed, true) ? binding->committed.Get() : nullptr;
+    return binding->slice.resource;
+}
+
+// The caller has checked readability and holds draw_lock.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
@@ -2460,7 +2543,7 @@ bool title_input_snapshot_enabled()
 // why, when given, receives the condition an empty result failed on.
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
-                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
+                                         u64 limit = raw_buffer_view_limit,
                                          bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
@@ -2472,6 +2555,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
+    const bool full_input = allow_title_snapshot && big_buffer_full_enabled();
+    if (full_input) limit = raw_buffer_view_limit;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         note_lock_acquire(false);
@@ -2536,7 +2621,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             log("x2w-draw an input buffer descriptor has %llu bytes (stride %u, limit %llu)", static_cast<unsigned long long>(bytes), stride,
                 static_cast<unsigned long long>(limit));
         if (bytes % 4) return refuse("an input buffer range is not a whole number of dwords");
-        return refuse(limit == (16u << 20) ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
+        return refuse(limit == legacy_buffer_copy_limit ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
     }
     ID3D12Resource* native = nullptr;
     bool upload = false;
@@ -2552,6 +2637,11 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
+            if (full_input && bytes > legacy_buffer_copy_limit && !in_upload) {
+                if (auto* snapshot = full_buffer_snapshot(self, address, static_cast<std::size_t>(bytes), offset))
+                    return {snapshot, offset, bytes, stride, true, 2};
+                return refuse("a full input range could not be copied from title memory");
+            }
             const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
             if (!alias.resource)
                 return refuse(in_upload ? "an input range crosses the end of its upload allocation"
@@ -2564,6 +2654,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (!placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
+            } else if (full_input && bytes > legacy_buffer_copy_limit && InterlockedCompareExchange(&owner->own().refs, 0, 0)) {
+                if (auto* snapshot = full_buffer_snapshot(self, address, static_cast<std::size_t>(bytes), offset))
+                    return {snapshot, offset, bytes, stride, true, 2};
+                return refuse("a full input range could not be copied from title memory");
             } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
                 // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
                 // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
@@ -3233,8 +3327,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
-        if (bytes > (16u << 20)) {
-            bytes = 16u << 20;
+        const bool full_binding = srv.source != 2 && bytes > legacy_buffer_copy_limit && big_buffer_full_enabled();
+        if (full_binding && bytes > raw_buffer_view_limit) {
+            draw_lock_release_exclusive();
+            return not_drawn(12);
+        }
+        if (bytes > legacy_buffer_copy_limit && !full_binding) {
+            bytes = legacy_buffer_copy_limit;
             // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
             if (formatted.entry) {
                 InterlockedIncrement(&formatted_draws_refused);
@@ -3260,7 +3359,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             count_buffer(false);
             continue;
         }
-        if (placed.owner && bytes % 4 != 0) {
+        if (!full_binding && placed.owner && bytes % 4 != 0) {
             // Preserve tight byte-sized streams. The desktop raw view is rounded
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
@@ -3284,7 +3383,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             count_buffer(target != nullptr);
             continue;
         }
-        if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
+        if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes && (!full_binding || bytes % 4 == 0)) {
             require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
@@ -3319,6 +3418,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 count_buffer(true);
                 continue;
             }
+        }
+        if (full_binding) {
+            auto* snapshot = full_buffer_snapshot(self, address, bytes, offset);
+            if (!snapshot) {
+                draw_lock_release_exclusive();
+                return not_drawn(buffer_copy_failed_site);
+            }
+            buffer_view(dest, snapshot, offset, bytes);
+            continue;
         }
         ID3D12Resource* chunk = nullptr;
         // A raw view reads zero past its end. Skip reserved pages and trim the committed zero tail.

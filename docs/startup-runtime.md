@@ -517,6 +517,19 @@ one address between two draws of a frame, such as a dynamic constant buffer, gav
 data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
 `startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
 
+With `X2W_BIG_BUFFER_FULL=1`, translated draw table bindings and compute inputs
+can use ranges larger than 16 MiB. Full snapshots of readable title memory use
+the upload ring when it has room. Otherwise the runtime creates a dedicated
+committed upload buffer that the GPU can read directly. A snapshot is shared by
+address and length until Present. Changes to those bytes become visible on the
+next frame. The original size limit applies with the switch off.
+
+`startup_frame_copy_full_{warp,hardware}` reads the last 16 bytes of a synthetic
+64 MiB binding and checks the rendered pixels against a CPU reference over two
+frames. It covers the ring, the committed fallback and the switch-off zero-read
+control. `startup_compute_dispatch_input_{warp,hardware}` checks output for a
+94,371,840-byte input and checks the legacy size refusal.
+
 ## Root signature changes and dropped root constants
 
 Command-list slot 34 (`SetGraphicsRootSignature`) clears the translated draw's cached descriptor tables, root

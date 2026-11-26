@@ -1759,7 +1759,7 @@ ID3D12Resource* recording_rect_scratch(Wrapper* self)
 
 // Keeps `resource` with this recording's desktop allocator, like the rectangle-list scratch above. False if the list
 // is not recording (the caller must not use the resource then).
-bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> resource)
+bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> resource, bool once = false)
 {
     bool retained = false;
     AcquireSRWLockExclusive(&allocator_lock);
@@ -1767,7 +1767,10 @@ bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> re
     const auto found = list_recordings.find(self);
     if (state.list_open && found != list_recordings.end() && found->second) {
         try {
-            found->second->scratches.push_back(std::move(resource));
+            auto& scratches = found->second->scratches;
+            if (!once || std::none_of(scratches.begin(), scratches.end(),
+                    [&](const auto& held) { return held.Get() == resource.Get(); }))
+                scratches.push_back(std::move(resource));
             retained = true;
         } catch (const std::bad_alloc&) {
         }
@@ -7719,7 +7722,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_FRAME_MARK;
     static LONG frames;
     static ULONGLONG started, last_report;
-    const bool reuse_large_bindings = bigbind_once_enabled();
+    const bool reuse_large_bindings = bigbind_once_enabled() || big_buffer_full_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;

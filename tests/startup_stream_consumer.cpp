@@ -272,6 +272,16 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         descriptors[0][0] = static_cast<UINT>(between);
         descriptors[0][1] = static_cast<UINT>(between >> 32) | 4u << 16;
     }
+    if (mode == "dispatch-input-full") {
+        constexpr UINT bytes = 94371840;
+        auto* full = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!full) return 70;
+        std::memcpy(full, input, sizeof(input));
+        const auto address = word(full);
+        descriptors[0][0] = static_cast<UINT>(address);
+        descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
+        descriptors[0][2] = bytes / sizeof(UINT);
+    }
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;

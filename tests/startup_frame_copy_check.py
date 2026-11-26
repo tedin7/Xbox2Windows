@@ -118,8 +118,44 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_full(directory, consumer, backend):
+    size = 64 << 20
+    shader = HLSL.replace("Load4(0)", f"Load4({size - 16})")
+    expected = (RED * 4 + BLUE * 4) * 4
+    for name, enabled, ring_kib in (("legacy", "0", 262144),
+                                    ("ring", "1", 262144),
+                                    ("committed", "1", 65536)):
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-full", "X2W_TRAP_LOG": str(log),
+            "X2W_BIG_BUFFER_FULL": enabled, "X2W_TEST_UPLOAD_RING_MAX_KIB": str(ring_kib),
+            "X2W_BIGBIND_ONCE": "0", "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        reference = expected if enabled == "1" else bytes(len(expected))
+        if pixels != reference:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {reference.hex()}")
+        if enabled == "1":
+            report = log.read_text(errors="replace")
+            counters = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
+                                  report)
+            wanted = [(str(frame), "0", "1", "3", str(size)) for frame in (1, 2)]
+            if counters != wanted:
+                raise AssertionError(f"{name}: frame counters {counters!r}, expected {wanted!r}")
+            backings = re.findall(r"full bindings frame (\d+): (\d+) ring, (\d+) committed", report)
+            wanted_backings = [(str(frame), str(int(name == "ring")), str(int(name == "committed")))
+                               for frame in (1, 2)]
+            if backings != wanted_backings:
+                raise AssertionError(f"{name}: frame backings {backings!r}, expected {wanted_backings!r}")
+        print(f"{backend} {name}: all 32 RGBA pixels match")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "full": check_full}[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))
