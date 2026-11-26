@@ -26,6 +26,8 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+WAVE_REDUCTION_BRANCHES = ('wave reduction in a program with branches: only straight-line pixel stages are '
+                           'lowered')
 READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 
 
@@ -2459,6 +2461,7 @@ class Stage:
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
+        self.retry_wave_reduction = False
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
         first_refusal = len(refusals) if refusals is not None else 0
         while True:
@@ -2482,7 +2485,20 @@ class Stage:
             self.bad_sgprs = set()
             self._uniform_written = set()
             self.setup_entry()
-            self.translate()
+            try:
+                self.translate()
+            except Unsupported as reason:
+                if kind != 'ps' or self.retry_wave_reduction or str(reason) != WAVE_REDUCTION_BRANCHES:
+                    raise
+                self.retry_wave_reduction = True
+                self.force_joined.clear()
+                continue
+            if (kind == 'ps' and not self.retry_wave_reduction and refusals is not None
+                    and (WAVE_REDUCTION_BRANCHES, kind) in refusals[first_refusal:]):
+                self.retry_wave_reduction = True
+                self.force_joined.clear()
+                del refusals[first_refusal:]
+                continue
             grown = False
             for t, regs in self.back_force.items():
                 have = self.force_joined.setdefault(t, {})
@@ -3712,14 +3728,16 @@ class Stage:
                 out.add(reg)
         return out
 
-    def entry_exec_sites(self, cfg):
+    def entry_exec_sites(self, cfg, reduction_restores=None):
         """Prove entry EXEC and its saved copies on every incoming CFG edge."""
         bounds, _, succ, _ = cfg
         if not bounds or any(name.startswith(('s_wqm', 's_swappc', 's_call', 's_rfe'))
                              for _, _, name, _ in self.ins):
             return set()
-        wave = self.pipe.wave_size
+        wave = getattr(self.pipe, 'wave_size', None)
         wave32 = wave == 32 or wave is None and wave32_exec_proof(self.ins)
+        if reduction_restores is not None and not wave32:
+            return set()
         width = 1 if wave32 else 2
         mask = ('exec_lo', 'exec') if wave32 else ('exec',)
         copy_op = 's_mov_b32' if wave32 else 's_mov_b64'
@@ -3740,6 +3758,11 @@ class Stage:
                         move = ('save', words)
                     elif dst in mask:
                         move = ('restore', words)
+            if (reduction_restores is not None and name in ('s_and_saveexec_b32', 's_or_saveexec_b32')
+                    and len(ops) == 2 and not mods):
+                reg = reg_range(ops[0])
+                if reg and reg[0] == 's' and reg[1] == reg[2] <= 105:
+                    move = ('save', ('s%d' % reg[1],))
             operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move))
 
         # Missing blocks are unreachable so far. At a join or back edge keep only facts common to all paths.
@@ -3762,6 +3785,8 @@ class Stage:
                 facts = {copy for copy in facts if writes.isdisjoint(copy)}
                 if exec_write:
                     facts.discard(())
+                if reduction_restores is not None:
+                    (reduction_restores.add if restore else reduction_restores.discard)(off)
                 if restore:
                     facts.add(())
                 if entry and move is not None and move[0] == 'save':
@@ -3836,7 +3861,13 @@ class Stage:
         # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
+        # The new proof is a retry only. Keep the dispatch and HLSL of every legacy success.
+        retry_wave = getattr(self, 'retry_wave_reduction', False)
+        self.wave_exec |= retry_wave
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        if retry_wave:
+            self.reduction_restores = set()
+            self.reduction_entry_exec = self.entry_exec_sites(self.spill_cfg, self.reduction_restores)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
@@ -3906,6 +3937,9 @@ class Stage:
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
             self.active_waterfall_loads = set()
             self.wave_unsound = None
+            if retry_wave:
+                self.reduce_plan, self.reduce_pending = {}, {}
+                self.reduction_scratch = {}
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
@@ -3980,6 +4014,8 @@ class Stage:
                     self.lines, start = [], off
                     self.descriptor_block_first = instruction_index
                 self.pc = off
+                if retry_wave:
+                    self.exec_known = off in self.reduction_entry_exec
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
                 if off in targets:
@@ -4231,6 +4267,12 @@ class Stage:
                 if refusals is not None:
                     del refusals[first_refusal:]
                 continue
+            if retry_wave and raised_unsupported is None and self.wave_unsound is None:
+                if self.lane_exec_breaks:
+                    self.wave_unsound = Unsupported('wave reduction: lane participation may change at %s'
+                                                    % self.lane_exec_breaks[0][1])
+                else:
+                    self.wave_unsound = self.wave_scratch_refusal()
             if raised_unsupported is None and self.wave_unsound is not None:
                 if refusals is None:
                     raise self.wave_unsound
@@ -5132,7 +5174,10 @@ class Stage:
                 self.needs_sm6 = True
                 word = 'exec' if base[10:].startswith('exec') else 'vcc'
                 bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
-                cond = ('!' if base[10:].endswith('z') else '') + 'WaveActiveAnyTrue(%s)' % bit
+                # Keep the legacy vote spelling on the original translation path.
+                zero = (base[10:] in ('execz', 'vccz') if getattr(self, 'retry_wave_reduction', False)
+                        else base[10:].endswith('z'))
+                cond = ('!' if zero else '') + 'WaveActiveAnyTrue(%s)' % bit
             elif base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
                 # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
                 # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
@@ -6100,7 +6145,9 @@ class Stage:
                         self.align4_v.clear()
                     return None
                 self.exec_known = self.exec_narrow_only = False
-                if hasattr(self, 'lane_exec_breaks') and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms)):
+                if (hasattr(self, 'lane_exec_breaks')
+                        and getattr(self, 'pc', None) not in getattr(self, 'reduction_restores', ())
+                        and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms))):
                     # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
                     self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
@@ -10694,32 +10741,38 @@ class Stage:
         end = items[read][0]
         targets = {int(parse(asm)[1][0].split('_')[1], 16) for _off, _n, name, asm in self.ins
                    if name.startswith('s_cbranch') or name == 's_branch'}
+        retry_wave = getattr(self, 'retry_wave_reduction', False)
+        if retry_wave:
+            targets.update(t for t in self.calculated_pc.values() if t is not None)
         inside = sorted(t for t in targets if pc < t <= end)
         if inside:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
+        if retry_wave and pc not in self.reduction_entry_exec:
+            raise Unsupported('wave reduction: EXEC is not proven to be the entry mask on every incoming path')
         if not getattr(self, 'wave_exec', False):
-            # Straight-line only: every lane of the host wave runs the chain with the entry EXEC.
             if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
-                raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are '
-                                  'lowered')
+                raise Unsupported(WAVE_REDUCTION_BRANCHES)
             if not getattr(self, 'exec_known', False):
                 raise Unsupported('wave reduction: EXEC is not the entry mask')
         if getattr(self, 'wqm_exec', False):
             raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
-        for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
-            _name, o, _m = parse(asm)
-            hits = [i for i, tok in enumerate(o) if any(
-                int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
-                for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
-            if not hits:
-                continue
-            short = re.sub(r'_e(32|64)$', '', name)
-            if hits == [0] and short.startswith('v_') and not self.WAVE_REDUCE_KEEPS.match(short):
-                break
-            raise Unsupported('wave reduction: v%d (the other row from v_permlanex16_b32) is read after the chain by %s'
-                              % (vp, asm))
+        after_restore = index + first + 7
+        if retry_wave:
+            self.reduction_scratch[index + first + 4] = (vp, after_restore)
+        else:
+            for _off, _n, name, asm in self.ins[after_restore:]:
+                _name, o, _m = parse(asm)
+                hits = [i for i, tok in enumerate(o) if any(
+                    int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
+                    for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
+                if not hits:
+                    continue
+                short = re.sub(r'_e(32|64)$', '', name)
+                if hits == [0] and short.startswith('v_') and not self.WAVE_REDUCE_KEEPS.match(short):
+                    break
+                raise self.wave_scratch_read(vp, asm)
         # Nothing of the chain is emitted until the restore, so every register read there still holds its value from
         # the fill (the only instruction lowered in between is the min chain's readlane carried here, an SGPR write
         # that is not this chain's saved EXEC). The readlane then copies vT, which nothing has rewritten since.
@@ -10737,9 +10790,42 @@ class Stage:
         plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
         return True
 
+    @staticmethod
+    def wave_scratch_read(vp, asm):
+        return Unsupported('wave reduction: v%d (the other row from v_permlanex16_b32) is read after the chain by %s'
+                           % (vp, asm))
+
+    def wave_scratch_refusal(self):
+        """Find a use of a discarded permutation result on any path after the chain's restore."""
+        bounds, block_of, succ, _ = self.spill_cfg
+        for vp, after_restore in self.reduction_scratch.values():
+            pending, seen = [after_restore], set()
+            scratch = 'v%d' % vp
+            while pending:
+                i = pending.pop()
+                if i in seen:
+                    continue
+                seen.add(i)
+                off, _, _, asm = self.ins[i]
+                name, ops, mods = parse(asm)
+                # The next recognized permutation kills the old result. Its own paths are checked separately.
+                if i in self.reduction_scratch and self.reduction_scratch[i][0] == vp:
+                    continue
+                if (name in ('v_mov_b32', 'v_mov_b32_e32', 'v_mov_b32_e64') and not mods
+                        and ops[0] == scratch and ops[1] != scratch and off in self.reduction_entry_exec):
+                    continue
+                if vp in mesh_vregs(ops):
+                    return self.wave_scratch_read(vp, asm)
+                block = block_of[i]
+                if i + 1 < bounds[block][1]:
+                    pending.append(i + 1)
+                else:
+                    pending.extend(bounds[b][0] for b in succ[block])
+        return None
+
     def lower_wave_reduction(self, op, vt, vp, ss, source):
         operand = self.u(source)
-        if not self.exec_known:
+        if not self.exec_known and not getattr(self, 'retry_wave_reduction', False):
             # Past an EXEC write the lanes outside the old EXEC take the identity (the v_cndmask of the chain).
             operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
         value = self.WAVE_REDUCE[op][0].format(operand)
