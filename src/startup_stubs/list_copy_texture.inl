@@ -28,6 +28,10 @@ bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resour
     if (location->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && w->own().lazy_slot133_texture && !w->own().real)
         materialize_lazy_texture(w);
     if (!w->own().real) return false;
+    if (w->own().drop_levels) {  // subresource indices and footprints of the title name levels that are gone
+        x2w_startup::drop_mips::counters.conflicts.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     real = static_cast<ID3D12Resource*>(w->own().real);
     const D3D12_RESOURCE_DESC desc = real->GetDesc();
     side = {};

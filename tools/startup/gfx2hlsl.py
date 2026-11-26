@@ -7193,6 +7193,8 @@ class Stage:
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
+        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+            self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
@@ -10015,7 +10017,26 @@ class Pipeline:
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
+        r['calls'] = r.get('calls', 0) + 1
         return 'r%d' % r['index']
+
+    def note_use(self, key, use):
+        """Says what the shader does with the read resource it just asked for through resource(): 'sample' (Sample,
+        SampleBias, SampleLevel, SampleGrad), 'texel' (Load) or 'lod' (CalculateLevelOfDetail). Only feeds the manifest
+        line `srvuse` (srv_use_line); the emitted HLSL does not depend on it."""
+        r = self.resources[key]
+        r.setdefault('uses', set()).add(use)
+        r['classified'] = r.get('classified', 0) + 1
+
+    @staticmethod
+    def srv_use_line(r):
+        """`srvuse N sample|texel|lod` for a read texture whose every use was classified, else None: a runtime that
+        wants to change the texture (opt-in, dropping its top mip) reads no line as unknown and leaves it alone."""
+        uses = r.get('uses')
+        if r['kind'] == 'buf' or not uses or r.get('classified', 0) != r.get('calls', 0):
+            return None
+        word = 'texel' if 'texel' in uses else 'lod' if 'lod' in uses else 'sample'
+        return 'srvuse %d %s' % (r['index'], word)
 
     def stored_images(self):
         return self.uavs or {}
@@ -10491,6 +10512,8 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+            if self.srv_use_line(r):
+                lines.append(self.srv_use_line(r))
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
