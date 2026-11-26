@@ -21,6 +21,7 @@
 #include "startup_stubs/zero_tail.h"
 #include "startup_stubs/copy_cache_trim.h"
 #include "startup_stubs/lock_sites.h"
+#include "startup_stubs/key_profile.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -2145,6 +2146,7 @@ char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
 std::uint64_t process_ms();  // d3d12_draw.inl
+bool key_profile_detail(u64 key, char* out, std::size_t size);  // d3d12_draw.inl
 
 // Which translated draw last wrote each render target, for the `x2w-render present source` line: direct-mapped by resource pointer,
 // written under the draw lock, read without a lock by the present thread (a torn read only blurs a diagnostic).
@@ -2327,6 +2329,10 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
                 else
                     log("x2w-render present source at %.1f s: no translated draw wrote the presented surface (copy, clear or untranslated writer); mean level %.2f/255",
                         process_ms() / 1000.0, sum / (3.0 * shown_width * shown_height));
+                if (w.resource == surface) {
+                    char detail[900];
+                    if (key_profile_detail(w.key, detail, sizeof(detail))) log("%s", detail);
+                }
             }
         }
         if (moved && !periodic) {

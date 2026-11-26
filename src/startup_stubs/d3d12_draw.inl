@@ -364,6 +364,10 @@ inline LONG64 step_now_us()
 LONG64 zero_tail_bytes_saved;  // bytes of buffer bindings not copied because they were zero to the end (zero_tail.h)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
+x2w_local::KeyProfiles key_profiles;  // gray-world detail per pipeline key; touched only with draw_lock held
+long not_drawn_sum();
+x2w_local::Counters key_profile_totals();
+
 void count_null_binding(x2w_local::NullCause cause)
 {
     if (cause == x2w_local::NullCause::none) return;
@@ -2755,6 +2759,22 @@ void log_not_drawn_causes()
             render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
+long not_drawn_sum()
+{
+    long total = 0;
+    for (int site = 0; site < not_drawn_sites; ++site) total += not_drawn_counts[site];
+    return total;
+}
+x2w_local::Counters key_profile_totals() { return {untranslated_draws, not_drawn_sum(), null_bindings}; }
+// For the present thread: the once-per-key detail line of a pipeline key that wrote the presented surface.
+bool key_profile_detail(u64 key, char* out, std::size_t size)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    const bool any = key_profiles.detail_once(key, out, size);
+    ReleaseSRWLockExclusive(&draw_lock);
+    return any;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -2766,6 +2786,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
         (rect && indexed && !indexed_rect)) return not_drawn(0);
     draw_lock_acquire_exclusive();
+    key_profiles.begin_draw();
     BoundPipeline* bound = translation_for(pass.pipeline);
     if (bound && bound->translation) bound->translation->use.note(process_ms());
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
@@ -3059,6 +3080,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.dimension_matches = !mismatched;
             const auto cause = x2w_local::classify_null_binding(facts);
             count_null_binding(cause);
+            key_profiles.texture(texture != nullptr, mismatched);
             if (cause == x2w_local::NullCause::unknown_token && token_null_census.note(tr->key)) {
                 char line[256];
                 x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
@@ -3153,6 +3175,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
             buffer_facts.token_known = buffer_token_known;
             buffer_facts.bound = bound;
+            key_profiles.buffer(bound);
             count_null_binding(x2w_local::classify_null_binding(buffer_facts));
         };
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
@@ -3282,6 +3305,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
+        if (have && full_bytes <= (64u << 10)) key_profiles.small_binding(reinterpret_cast<const void*>(address), bytes);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
             if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
@@ -3439,6 +3463,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (drawn)
         for (UINT t = 0; t < pass.target_count; ++t)
             if (pass.bound_targets[t]) note_target_writer(pass.bound_targets[t], tr->key, t, static_cast<unsigned>(pass.target_formats[t]));
+    if (drawn) key_profiles.end_draw(tr->key, key_profile_totals());
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
