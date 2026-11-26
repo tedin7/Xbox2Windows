@@ -91,6 +91,7 @@ def main(argv):
             target = directory / name
             target.mkdir()
             player_env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
+            player_env["X2W_REPLAY_TRACE"] = "1"
             code, out, err = run([player, path, target, "--adapter", backend], player_env)
             log = (target / "stderr.txt").read_text(errors="replace") if (target / "stderr.txt").exists() else ""
             return code, out + err, log, target

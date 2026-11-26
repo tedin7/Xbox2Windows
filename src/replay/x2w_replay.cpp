@@ -276,6 +276,9 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
+    static const bool trace = std::getenv("X2W_REPLAY_TRACE") != nullptr;
+    // X2W_REPLAY_TRACE=1: one line before each call, so a crash inside the stand-in names the call that made it.
+    if (trace) say("x2w-replay call seq=%llu kind=%u slot=%u object=%llx", c.seq, c.kind, c.slot, c.object);
     call.ret = call_slot(call.self, rcx, c.slot, a);
     if (c.kind == fence_kind && c.slot == fence_completed && call.ret < c.ret) {
         for (const ULONGLONG deadline = GetTickCount64() + 10000; call.ret < c.ret && GetTickCount64() < deadline; Sleep(1))
