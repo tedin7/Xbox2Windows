@@ -294,6 +294,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     }
     note_linear_gpu_write(self, to);
     note_placed_gpu_write(to.wrapper, destination_offset, bytes);
+    note_console_indirect_write(to.resource, destination_offset, bytes, indirect_copy_write);
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
@@ -325,6 +326,7 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
         note_linear_gpu_write(self, to);
         note_placed_gpu_write(to.wrapper, 0, to_desc.Width);
+        note_console_indirect_write(to.resource, 0, to_desc.Width, indirect_copy_write);
     } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }

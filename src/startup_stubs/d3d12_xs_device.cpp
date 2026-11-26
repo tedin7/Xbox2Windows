@@ -97,6 +97,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -224,6 +225,13 @@ struct alignas(16) WrapperOwn {
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
+    Wrapper* indirect_resource_next;
+    bool console_mesh;
+    bool console_compute;
+    UINT console_indirect_arguments;
+    bool console_indirect;
+    void* volatile console_dispatch_signature;
+    void* volatile console_mesh_signature;
     UINT list_node_mask;
     D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
@@ -507,9 +515,37 @@ u64 unwrap(u64 value)
 volatile LONG wraps_to_fail;  // fixture-only, set by x2w_d3d12_fail_wraps
 constexpr u64 out_of_memory = static_cast<std::uint32_t>(E_OUTOFMEMORY);  // for slots that return u64
 
+// Published wrapper storage is stable even after the final guest Release. The two placement
+// paths that can free a wrapper before publication register it only after setup succeeds.
+std::atomic<Wrapper*> indirect_resource_buckets[65536]{};
+
+std::atomic<Wrapper*>& indirect_resource_bucket(const void* resource)
+{
+    const auto address = reinterpret_cast<std::uintptr_t>(resource);
+    return indirect_resource_buckets[((address >> 4) ^ (address >> 20)) % std::size(indirect_resource_buckets)];
+}
+
+void register_indirect_resource(Wrapper* resource)
+{
+    auto& bucket = indirect_resource_bucket(resource);
+    auto* head = bucket.load(std::memory_order_acquire);
+    do {
+        resource->own().indirect_resource_next = head;
+    } while (!bucket.compare_exchange_weak(head, resource));
+}
+
+Wrapper* indirect_resource(const void* pointer)
+{
+    if (!pointer) return nullptr;
+    auto* resource = indirect_resource_bucket(pointer).load(std::memory_order_acquire);
+    for (; resource; resource = resource->own().indirect_resource_next)
+        if (resource == pointer) return resource;
+    return nullptr;
+}
+
 // Returns nullptr when the wrapper cannot be allocated or registered (#2653). The caller still owns
 // `real` then: it releases what it created and returns E_OUTOFMEMORY.
-Wrapper* wrap(IUnknown* real, Kind kind)
+Wrapper* wrap(IUnknown* real, Kind kind, bool defer_resource_registration = false)
 {
     for (LONG n = wraps_to_fail; n > 0; n = wraps_to_fail)
         if (InterlockedCompareExchange(&wraps_to_fail, n - 1, n) == n) return nullptr;
@@ -536,6 +572,7 @@ Wrapper* wrap(IUnknown* real, Kind kind)
         return nullptr;
     }
     ReleaseSRWLockExclusive(&registry_lock);
+    if (kind == resource_kind && !defer_resource_registration) register_indirect_resource(w);
     return w;
 }
 
@@ -1316,8 +1353,18 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
                 log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
             }
         }
-        *output = wrap(nullptr, command_signature_kind);
-        return *output ? u64{S_OK} : out_of_memory;
+        auto* signature = wrap(nullptr, command_signature_kind);
+        if (!signature) {
+            *output = nullptr;
+            return out_of_memory;
+        }
+        auto& state = signature->own();
+        state.console_indirect = true;
+        state.console_indirect_arguments = desc->NumArgumentDescs;
+        state.indirect_bytes = desc->ByteStride;
+        state.signature_device = self;
+        *output = signature;
+        return S_OK;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && root && desc->NumArgumentDescs > 1) {
@@ -2563,7 +2610,7 @@ std::size_t desktop_stream_size(UINT type)
 // Converts the supported stream layout to desktop form and creates the pipeline.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
                                           bool& compute, IndirectGraphicsPipeline& graphics, ID3D12RootSignature*& pipeline_root,
-                                          ID3D12RootSignature* cached_root = nullptr)
+                                          ID3D12RootSignature* cached_root = nullptr, bool* mesh_observed = nullptr)
 {
     const bool cached_mesh = cached_root != nullptr;
     const std::size_t bytes = desc->SizeInBytes;
@@ -2616,6 +2663,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
                     break;
                 }
                 mesh = true;
+                if (mesh_observed) *mesh_observed = true;
             }
         }
         offset += size;
@@ -3506,6 +3554,8 @@ void note_indirect_graphics_refusal(u64 key, const char* kind, const char* reaso
     indirect_graphics_refusal_census.note(key, detail);
 }
 
+#include "startup_stubs/console_indirect.inl"
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -3513,11 +3563,18 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     // Every refusal is counted under the signature's kind, including those before the signature is checked.
     Wrapper* sig = as_wrapper(signature);
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
+    const bool console = sig && sig->own().kind == command_signature_kind && sig->own().console_indirect;
+    const auto* bound = console ? static_cast<const Pass*>(self->own().pass) : nullptr;
+    const auto pipeline = bound ? console_indirect_pipeline(*bound) : ConsoleIndirectPipeline::none;
+    auto* native_list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    const int list_type = console && native_list ? static_cast<int>(native_list->GetType()) : -1;
+    Wrapper* console_buffer = console ? indirect_resource(argument) : nullptr;
     Wrapper* refusal_pipeline = nullptr;
     u64 trace_call = 0;
-    const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
-                                                               const char* code = nullptr) {
+    const auto refuse = [&](const char* reason, int outcome = indirect_other, const char* code = nullptr) {
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
+        if (console)
+            note_console_indirect_refusal(list_type, pipeline, console_buffer, offset, u64{count} * sig->own().indirect_bytes);
         if (trace_call)
             log("x2w-mesh86-trace call=%llu stage=record outcome=refused reason=%s", trace_call, reason);
         static LONG refusals;
@@ -3533,11 +3590,13 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
-    if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
+    const auto trace_mesh = [&] {
+        if (kind != IndirectCommand::dispatch_mesh || !mesh_xmem_trace_ordinal()) return;
         const auto& pass = pass_of(self);
         if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
         if (trace_call) trace_mesh_xmem_inputs(self, pass, trace_call, argument, offset);
-    }
+    };
+    trace_mesh();
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list", indirect_other, indirect_other_refusal_code::invalid_list_type);
@@ -3547,12 +3606,34 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("command count is zero or above the supported maximum", indirect_other, indirect_other_refusal_code::invalid_command_count);
     if (!count_buffer && count_offset)
         return refuse("count offset without a count buffer", indirect_other, indirect_other_refusal_code::count_offset_without_buffer);
-    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real) {
+    auto* native_signature = sig && sig->own().kind == command_signature_kind
+        ? static_cast<ID3D12CommandSignature*>(sig->own().real) : nullptr;
+    if (console && self->own().list_device && sig->own().signature_device == self->own().list_device &&
+        x2w_startup::console_indirect_dispatch_record(sig->own().indirect_bytes, sig->own().console_indirect_arguments)) {
+        // The 12-byte stride only suggests the Dispatch/DispatchMesh layout. Keep the switch off
+        // until a tester run has reported the pipeline bindings in the refusal census.
+        static const bool enabled = x2w_local::env_on("X2W_CONSOLE_INDIRECT_12");
+        if (enabled) {
+            IndirectCommand candidate = IndirectCommand::none;
+            if (pipeline == ConsoleIndirectPipeline::desktop_compute || pipeline == ConsoleIndirectPipeline::console_compute ||
+                pipeline == ConsoleIndirectPipeline::console_compute_ready) candidate = IndirectCommand::dispatch;
+            if (pipeline == ConsoleIndirectPipeline::console_mesh && type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+                candidate = IndirectCommand::dispatch_mesh;
+            if (candidate != IndirectCommand::none) {
+                native_signature = console_indirect_signature(sig->own(), candidate);
+                if (native_signature) {
+                    kind = candidate;
+                    trace_mesh();
+                }
+            }
+        }
+    }
+    if (!native_signature) {
         // A console-only signature has no desktop equivalent: show what the title put in its argument buffer so the
         // layout can be read from the log (first calls only; bytes of the argument range, at most 48 per call).
         static LONG traced;
         if (sig && sig->own().kind == command_signature_kind && first_calls(traced, 8)) {
-            const Wrapper* arg = as_wrapper(argument);
+            const Wrapper* arg = console ? console_buffer : as_wrapper(argument);
             const auto* memory = arg && arg->own().kind == resource_kind ? static_cast<const unsigned char*>(arg->own().title_memory) : nullptr;
             char bytes[3 * 48 + 1] = "unreadable";
             if (memory && readable_window(reinterpret_cast<u64>(memory) + offset, 48) >= 48) hex_text(memory + offset, 48, bytes, sizeof(bytes));
@@ -3564,7 +3645,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device", indirect_other, indirect_other_refusal_code::signature_device_mismatch);
-    const auto command = sig->own().indirect_command;
+    const auto command = kind;
     const bool indexed = command == IndirectCommand::draw_indexed;
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
@@ -3670,7 +3751,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     } else if (translated_compute) {
         if (count != 1 || count_buffer || sig->own().signature_root)
             return refuse("translated Dispatch requires one rootless command and no count buffer", indirect_compute_pipeline);
-    } else if (!pass.compute_pipeline || !pass.compute_root) {
+    } else if (!pass.compute_pipeline || !pass.compute_root ||
+               (console && pass.compute_pipeline_root != pass.compute_root)) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root", indirect_other, indirect_other_refusal_code::compute_root_mismatch);
@@ -3679,7 +3761,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("a Dispatch signature with root constants requires one command and no count buffer",
                       indirect_other, indirect_other_refusal_code::dispatch_root_multi_command);
     }
-    Wrapper* buffer = as_wrapper(argument);
+    Wrapper* buffer = console ? console_buffer : as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
         return refuse("argument has no desktop resource", indirect_other, indirect_other_refusal_code::missing_argument_resource);
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
@@ -3697,7 +3779,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("argument buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::argument_not_common_state);
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
     if (translated_compute) {
-        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset};
+        const TranslatedDispatch dispatch{{}, native_signature, resource, offset};
         if (const char* failure = record_translated_dispatch(self, dispatch)) return refuse(failure, indirect_compute_pipeline);
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
         return;
@@ -3750,7 +3832,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         }
     }
     if (translated) {
-        const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource,
+        const char* failure = draw_translated_indirect(self, native_signature, resource,
                                                        offset, index_view);
         if (failure) return refuse(failure, indirect_graphics_pipeline);
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
@@ -3859,7 +3941,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         restore_compute_root(pass, list);
         const auto first = x2w_startup::SplitIndirectDispatch::rewritten_offset(count, stride);
-        auto* command = static_cast<ID3D12CommandSignature*>(sig->own().real);
+        auto* command = native_signature;
         for (UINT i = 0; i < count; ++i)
             list->ExecuteIndirect(command, 1, rewritten.Get(), first + u64{i} * sizeof(D3D12_DISPATCH_ARGUMENTS), nullptr, 0);
         x2w_startup::SplitIndirectDispatch::finish(list, rewritten.Get());
@@ -3870,7 +3952,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         require_state(self, resource, argument_state);
     }
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
+    list->ExecuteIndirect(native_signature, count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
@@ -5661,7 +5743,7 @@ volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_qu
 HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
                               ID3D12Resource* resource, bool aliased, x2w_budget::Ticket* backing_budget, void** out)
 {
-    Wrapper* w = wrap(resource, resource_kind);
+    Wrapper* w = wrap(resource, resource_kind, true);
     if (!w) {
         if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().discard(resource);
         resource->Release();
@@ -5690,6 +5772,7 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     } else {
         w->own().budget = x2w_budget::committed(device_of(self), resource, D3D12_HEAP_TYPE_DEFAULT);
     }
+    register_indirect_resource(w);
     *out = w;
     return S_OK;
 }
@@ -5719,7 +5802,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) == 0;
         if (lazy_textures_enabled() && read_only_texture) {
-            Wrapper* w = wrap(nullptr, resource_kind);
+            Wrapper* w = wrap(nullptr, resource_kind, true);
             if (!w) return E_OUTOFMEMORY;
             const DXGI_FORMAT requested_format = desktop_format(desc->Format);
             bool stored = false;
@@ -5748,6 +5831,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                     desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->Format,
                     desc->SampleDesc.Count, desc->Flags, desc->Layout, state);
             }
+            register_indirect_resource(w);
             *out = w;
             return S_OK;
         }
@@ -6050,7 +6134,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                 created->Release();
                 return nullptr;
             }
-            w->own().real = created;
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&w->own().real), created);
             ReleaseSRWLockExclusive(&retire_lock);
         } else {
             InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&w->own().real), created);
@@ -6426,7 +6510,7 @@ void drain_retired_resources()
         // Claim the reference count so that a late AddRef cannot bring the wrapper back while its object goes.
         if (InterlockedCompareExchange(&w->own().refs, retired_refs, 0) == 0) {
             dropped.push_back({w, static_cast<ID3D12Resource*>(w->own().real)});
-            w->own().real = nullptr;
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&w->own().real), nullptr);
         } else {
             InterlockedIncrement64(&retire_kept);  // referenced again after its final Release
         }
@@ -7145,6 +7229,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     *out = wrap(nullptr, pipeline_kind);
     if (!*out) return E_OUTOFMEMORY;
     auto* pipeline = static_cast<Wrapper*>(*out);
+    pipeline->own().console_compute = true;
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
     return S_OK;
@@ -7180,12 +7265,13 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     ID3D12RootSignature* pipeline_root = nullptr;
     IndirectGraphicsPipeline graphics;
     u64 mesh86_key = 0;
+    bool mesh_observed = false;
+    bool mesh_cache_request = false;
     if (render_mode()) {
         char why[256] = "";
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
-        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics, pipeline_root);
-        bool mesh_cache_request = false;
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics, pipeline_root, nullptr, &mesh_observed);
         if (!real_pipeline)
             real_pipeline = try_cached_mesh86(*desc, why, sizeof(why), graphics, mesh_cache_request, mesh86_key);
         if (!mesh_cache_request && (!real_pipeline || graphics.root))
@@ -7201,9 +7287,11 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
         return E_OUTOFMEMORY;
     }
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
+    static_cast<Wrapper*>(*out)->own().console_compute = !real_pipeline && compute;
     static_cast<Wrapper*>(*out)->own().pipeline_root = pipeline_root;
     static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
     static_cast<Wrapper*>(*out)->own().mesh86_key = mesh86_key;
+    static_cast<Wrapper*>(*out)->own().console_mesh = mesh_observed || mesh_cache_request;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,
@@ -7261,14 +7349,16 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     }
     *out = wrap(nullptr, pipeline_kind);
     if (!*out) return E_OUTOFMEMORY;
+    auto& pipeline = static_cast<Wrapper*>(*out)->own();
+    if constexpr (N == 57) pipeline.console_mesh = is_fixed_mesh57_descriptor(desc);
     if constexpr (N == 67) {
+        pipeline.console_compute = true;
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
         Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
-            auto& pipeline = static_cast<Wrapper*>(*out)->own();
             pipeline.compute_request_key = key;
             pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
-            if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
+            pipeline.compute_manifest = &compute_manifest_for(key);
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
@@ -7299,6 +7389,11 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
     }
     *out = wrap(nullptr, pipeline_kind);
     if (!*out) return E_OUTOFMEMORY;
+    if (const Wrapper* source = as_wrapper(base); source && source->own().kind == pipeline_kind) {
+        auto& state = static_cast<Wrapper*>(*out)->own();
+        state.console_mesh = source->own().console_mesh;
+        state.console_compute = source->own().console_compute;
+    }
     note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
     return S_OK;
 }
@@ -7763,6 +7858,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;
+    console_indirect_frame.store(frame, std::memory_order_relaxed);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
@@ -7919,6 +8015,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     if (render_mode() && frame % 300 == 0) {
+        log_console_indirect_refusals();
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
                                                "placeholder-signature", "other"};

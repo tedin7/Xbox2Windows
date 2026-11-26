@@ -2423,12 +2423,18 @@ foreach(mutation IN ITEMS off-by-one first-only)
 endforeach()
 # Device slot 41 through the startup device wrapper with the debug layer on: a desktop-valid argument
 # list is created, a console type gets the placeholder, and the debug layer reports no error for either.
-add_executable(startup_command_signature tests/startup_command_signature.cpp)
+add_executable(startup_command_signature tests/startup_command_signature.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_command_signature PRIVATE cxx_std_17)
-target_link_libraries(startup_command_signature PRIVATE d3d12_xs_shim d3d12 dxgi)
+target_link_libraries(startup_command_signature PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_command_signature_${backend} COMMAND startup_command_signature ${backend})
     set_tests_properties(startup_command_signature_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+foreach(mode IN ITEMS indirect-off indirect-on offset-control)
+    string(REPLACE "-" "_" test_mode "${mode}")
+    add_test(NAME startup_command_signature_${test_mode}_warp COMMAND startup_command_signature warp ${mode})
+    set_tests_properties(startup_command_signature_${test_mode}_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
 endforeach()
 # GameInput stand-in timestamps: a performance-counter reading in microseconds without a product

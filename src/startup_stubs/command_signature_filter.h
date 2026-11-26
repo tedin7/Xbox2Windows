@@ -17,4 +17,14 @@ inline bool has_console_indirect_arg_type(const Description* arguments, std::siz
         if (static_cast<unsigned>(arguments[i].Type) == 0x69) return true;
     return false;
 }
+constexpr bool console_indirect_dispatch_record(unsigned stride, unsigned arguments)
+{
+    return stride == 12 && arguments == 1;
+}
+
+constexpr bool indirect_ranges_overlap(unsigned long long first, unsigned long long bytes,
+                                       unsigned long long other, unsigned long long other_bytes)
+{
+    return bytes && other_bytes && (first <= other ? other - first < bytes : first - other < other_bytes);
+}
 }  // namespace x2w_startup

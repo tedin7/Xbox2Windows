@@ -311,7 +311,7 @@ void clear_unplaced_buffers(Wrapper* device)
                 retire_placement(it->wrapper);
                 if (it->wrapper->own().budget) it->wrapper->own().budget->end_use();
                 if (it->wrapper->own().backing_budget) it->wrapper->own().backing_budget->end_use();
-                it->wrapper->own().real = nullptr;
+                InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&it->wrapper->own().real), nullptr);
                 InterlockedDecrement(&it->wrapper->own().refs);
             }
             it->resource.Reset();

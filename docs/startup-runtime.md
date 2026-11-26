@@ -1298,6 +1298,18 @@ x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawin
 
 `graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
 
+The cumulative `x2w-render indirect console-signature:` rows break down refusals
+for type `0x69` by list type, bound pipeline, desktop argument backing and
+overlap with translated dispatch or list copy writes recorded in the current
+frame. Write history is bounded. The report folds lower-volume combinations
+into an `other` row when more than eight combinations occur.
+
+Keep `X2W_CONSOLE_INDIRECT_12` off while collecting this census. Setting it to
+`1` lets a one-argument signature with stride 12 use the existing Dispatch or
+DispatchMesh path for a matching pipeline. The mapping is a hypothesis based
+on record size. The WARP fixture tests the compute path against a CPU
+reference, including the shift from byte offset 0 to 4 as a negative control.
+
 ### Optional: Tracy zones
 
 For a timeline instead of the counters, configure a separate build tree with `-DX2W_TRACY=ON`. This is a developer-only build, off by default and in every preset and workflow. Do not use it for a run that must stay offline: the Tracy client opens a TCP listener (from port 8086 up, on 127.0.0.1 only) in each instrumented process.

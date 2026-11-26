@@ -68,6 +68,18 @@ int main(int argc, char** argv)
     expect("no arguments", draw_indexed, 0, false);
     expect("a null list", nullptr, 3, false);
 
+    using x2w_startup::console_indirect_dispatch_record;
+    using x2w_startup::indirect_ranges_overlap;
+    static_assert(console_indirect_dispatch_record(12, 1));
+    static_assert(!console_indirect_dispatch_record(16, 1));
+    static_assert(!console_indirect_dispatch_record(12, 2));
+    static_assert(!console_indirect_dispatch_record(12, 0));
+    static_assert(indirect_ranges_overlap(8, 12, 16, 4));
+    static_assert(indirect_ranges_overlap(16, 4, 8, 12));
+    static_assert(!indirect_ranges_overlap(8, 12, 20, 4));
+    static_assert(!indirect_ranges_overlap(8, 0, 8, 4));
+    static_assert(indirect_ranges_overlap(~0ull - 3, 4, ~0ull - 1, 2));
+
     if (failures) return 1;
     std::printf("startup_command_signature_filter: PASS\n");
     return 0;

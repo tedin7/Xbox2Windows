@@ -77,7 +77,13 @@ LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot
 struct ComputeManifest {
     x2w_startup::ManifestPrefetch::Publication publication;
     std::once_flag probe;
+    std::atomic<bool> translation_ready{};
 };
+
+bool console_compute_ready(const ComputeManifest* manifest)
+{
+    return manifest && manifest->translation_ready.load(std::memory_order_acquire);
+}
 
 bool nolock_compute_refuse()
 {
@@ -259,7 +265,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const u64 key = pipeline.compute_request_key;
     const auto [x, y, z] = dispatch.groups;
     const auto type = list->GetType();
-    ComputeManifest* const manifest = pipeline.compute_manifest;
+    ComputeManifest* const manifest = nolock_compute_refuse() ? pipeline.compute_manifest : nullptr;
     const bool valid_type = type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
     const bool valid_groups = x <= x2w_startup::max_dispatch_groups && y <= x2w_startup::max_dispatch_groups &&
                               z <= x2w_startup::max_dispatch_groups;
@@ -300,6 +306,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             tr->unmodelled = load_compute_translation(*tr, manifest);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
+        if (pipeline.compute_manifest && tr->state == 1)
+            pipeline.compute_manifest->translation_ready.store(true, std::memory_order_release);
         if (tr->state != 1) {
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
             reason = tr->unmodelled ? tr->unmodelled : "no translation";
@@ -606,6 +614,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         list->Dispatch(x, y, z);
     }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+        if (!views[i].texture)
+            note_console_indirect_write(views[i].resource, views[i].offset, views[i].bytes, indirect_dispatch_write);
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;
