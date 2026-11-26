@@ -23,9 +23,9 @@ endif()
 
 if(TARGET startup_resource_budget AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
     foreach(backend IN ITEMS warp hardware)
-        add_test(NAME startup_replay_creations_${backend} COMMAND "${INTAKE_PYTHON}" -B
-            "${CMAKE_SOURCE_DIR}/tests/startup_replay_creations_check.py"
+        add_test(NAME startup_replay_placedheap_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_replay_placedheap_check.py"
             "$<TARGET_FILE:startup_resource_budget>" "$<TARGET_FILE:x2w_replay>" "${backend}")
-        set_tests_properties(startup_replay_creations_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_replay_placedheap_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
