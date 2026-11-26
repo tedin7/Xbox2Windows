@@ -82,7 +82,6 @@ struct Recording {
     std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
-    u64 descriptor_snapshot_seq = 0;
 
     ~Recording()
     {
@@ -165,10 +164,6 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
                                           ((arg == 1 || arg == 4) ? 8 : 4);
             if (data_bytes != expected) return "DARR size mismatch at " + std::to_string(at);
             step.descriptor_arrays = out.base + data_at;
-        } else if (name == "DSNP" && header_bytes == 8 && !data_bytes) {
-            if (out.descriptor_snapshot_seq) return "duplicate DSNP at " + std::to_string(at);
-            std::memcpy(&out.descriptor_snapshot_seq, h, 8);
-            if (!out.descriptor_snapshot_seq) return "zero DSNP sequence at " + std::to_string(at);
         } else if (name == "OUTP" && header_bytes >= 24) {
             u64 seq;
             Output o{};

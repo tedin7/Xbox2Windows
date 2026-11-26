@@ -1906,15 +1906,14 @@ passed first, the object second), its memory after the call is `ARGM` argument 1
 argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
 Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
 
-Set `X2W_REPLAY_DESCRIPTOR_SNAPSHOT=1` for a capture window that starts after descriptor setup.
-The descriptor snapshot is a call recipe. The prefix records heap creation, view creation and copies
-in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
-destination starts, destination sizes, source starts and source sizes for each prefix
-`CopyDescriptors` call. Its header is the call sequence (u64). The payload omits null arrays and
-uses the counts from the call. At the opening present, `DSNP` publishes the recipe (header is the
-opening sequence, u64, with an empty payload). The player relocates descriptor handles in the
-arrays and runs the recipe in prefix order, before window calls. Direct CPU writes to descriptor
-backing memory are outside this call recipe.
+The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
+creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
+destination starts, destination sizes, source starts and source sizes of every `CopyDescriptors` call, in the prefix and in
+the window (the generic argument memory is cut at a few hundred bytes). Its header is the call sequence (u64); the payload
+omits null arrays and uses the counts from the call. The player relocates the descriptor handles in the arrays and runs the
+call from them. An array that cannot be read or is over the size cap is logged (`CopyDescriptors arrays of call N not
+recorded exactly`) and the call falls back to the generic memory. Direct CPU writes to descriptor backing memory are outside
+this recipe: the pages of the heap's title memory carry them.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a

@@ -339,10 +339,8 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
-    // The prefix reconstructs descriptors in call order, including copies from heaps retired
-    // before the window. DSNP publishes the complete prefix at the window boundary.
+    // A CopyDescriptors call whose arrays were recorded exactly (DARR) runs from them, in the prefix and in the window.
     if (const auto* arrays = step.descriptor_arrays) {
-        if (!r.descriptor_snapshot_seq) return true;
         std::vector<u64> handles[2];
         std::vector<std::uint32_t> sizes[2];
         for (unsigned side = 0; side < 2; ++side) {
