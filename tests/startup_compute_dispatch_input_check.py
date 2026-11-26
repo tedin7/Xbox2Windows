@@ -67,6 +67,8 @@ def main(consumer, dxc, adapter):
 
         got, result = dispatch(directory, consumer, env, 'dispatch')
         assert got == expected and not lines(result, 'refused'), result.stderr[-3000:]
+        used = lines(result, f'x2w-render key use compute {key:016x} first ')
+        assert len(used) == 1 and used[0].endswith(' uses 1') and ' last ' in used[0], (used, result.stderr[-3000:])
         layer = lines(result, 'x2w-d3d12 debug layer: ')
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
