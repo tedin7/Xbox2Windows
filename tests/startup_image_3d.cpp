@@ -222,7 +222,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 //   depth16 == false: DXGI_FORMAT_R32G32B32A32_FLOAT covering four distinct channels per texel, halfway ties
 //                     to even, 1-ULP midpoint neighbours, subnormals, signed zero, overflow and quiet NaNs.
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64], bool array)
+                                  bool depth16, std::uint32_t words[64], bool array, bool sampled)
 {
     constexpr UINT width = 8, height = 2, d16_mips = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
@@ -261,9 +261,11 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     constexpr UINT d16_entry_constants = 5;  // ud0..ud3 from FULLSCREEN_VS plus ud4 ('d16unorm16 0')
-    const x2w_startup::TranslatedSamplers no_samplers{};
+    x2w_startup::TranslatedSamplers samplers;
+    if (sampled && !samplers.read_manifest_line("smpl 0 0x0 0x100000 0x4000000 0x0"))
+        throw std::runtime_error("invalid image_sample_lz d16 fixture sampler");
     ComPtr<ID3D12RootSignature> root;
-    check(x2w_startup::create_translated_root(device, d16_entry_constants, 1, no_samplers, &root),
+    check(x2w_startup::create_translated_root(device, d16_entry_constants, 1, samplers, &root),
           "Create translated image_load d16 root signature");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};

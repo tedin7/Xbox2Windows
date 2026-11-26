@@ -40,7 +40,6 @@ from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hl
 IMG_LOAD = 0x00
 IMG_LOAD_MIP = 0x01
 IMG_SAMPLE = 0x20
-IMG_SAMPLE_LZ = 0x27
 DIM_1D = 0
 DIM_2D = 1
 DIM_3D = 2
@@ -957,13 +956,11 @@ def check_refusals():
     expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, a16=1, d16=1, nsa=1, extra_addrs=(1,))), 'invalid_nsa', 'a16+d16 fake NSA')
 
     sample_pre = PRE_WORDS + bytes.fromhex('800398be800399be80039abe80039bbe')
-    for name, op in (('image_sample', IMG_SAMPLE), ('image_sample_lz', IMG_SAMPLE_LZ)):
-        expect_refused(
-            lambda o=op: G.Pipeline(VS_WORDS, sample_pre + encode_mimg(o, ssamp=24, d16=1) + POST_WORDS,
-                                    root_blob(), ps_hw_inputs=PACKED_INPUT),
-            f'{name} modifier d16',
-            f'{name} d16',
-        )
+    expect_refused(
+        lambda: G.Pipeline(VS_WORDS, sample_pre + encode_mimg(IMG_SAMPLE, ssamp=24, d16=1) + POST_WORDS,
+                           root_blob(), ps_hw_inputs=PACKED_INPUT),
+        'image_sample modifier d16', 'implicit-LOD D16 sample',
+    )
 
     pipe = G.Pipeline(VS_WORDS, PS_WORDS_A, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
     expect_refused(
@@ -1009,7 +1006,7 @@ def check_refusals():
         'compute d16 image load',
         'compute image_load_mip d16',
     )
-    print('refusals: sample/sample_lz, 1D/cube, mip/3D/array a16, compute d16, tfe/lwe/r128/reserved and bad tuple widths refused')
+    print('refusals: implicit-LOD sample d16, 1D/cube, mip/3D/array a16, compute d16, tfe/lwe/r128/reserved and bad tuple widths refused')
 
 
 def controls():

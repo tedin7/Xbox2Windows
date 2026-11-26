@@ -7822,6 +7822,7 @@ class Stage:
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or (how != 'sample' and m in ('dlc', 'glc', 'slc'))):
                     raise Unsupported('1D image %s modifier %s' % (how, m))
+        sample_d16 = not one and how == 'lz' and 'd16' in mods
         lod = bias = None
         grads = None
         if how == 'd':
@@ -7938,6 +7939,8 @@ class Stage:
                 op_name = 'image_sample' if how == 'sample' else 'image_sample_lz'
                 packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
                 allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ())
+                if sample_d16:
+                    allowed += ('d16',)
                 for m in mods:
                     if not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                         raise Unsupported('%s modifier %s' % (op_name, m))
@@ -7946,6 +7949,10 @@ class Stage:
                 expected = 1 if packed_2d else (3 if three else 2)
                 if len(cs) != expected:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
+            if sample_d16:
+                expected_dst = (bin(dmask).count('1') + 1) // 2
+                if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
+                    raise Unsupported('image_sample_lz d16 destination %s for dmask %#x' % (ops[0], dmask))
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
@@ -8023,12 +8030,18 @@ class Stage:
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
-        if how in ('load', 'load_mip') and 'd16' in mods:
-            res = self.pipe.resources[desc_key]
-            res['d16_exact'] = True
-            mode_arg = 'ud%d' % self.pipe.ud(('d16unorm16', res['index']))
+        if sample_d16 or (how in ('load', 'load_mip') and 'd16' in mods):
             self.pipe.uses_pack16_rne = True
-            halves = ['pack16_d16(t.%s, %s)' % (comp, mode_arg) for bit, comp in enumerate('xyzw') if dmask & (1 << bit)]
+            if sample_d16:
+                # Narrow the filtered float result. The exact UNORM16 load path reconstructs an
+                # individual texel and would quantize filtered samples before converting them.
+                pack = 'pack16_rne(t.%s)'
+            else:
+                res = self.pipe.resources[desc_key]
+                res['d16_exact'] = True
+                mode_arg = 'ud%d' % self.pipe.ud(('d16unorm16', res['index']))
+                pack = 'pack16_d16(t.%s, ' + mode_arg + ')'
+            halves = [pack % comp for bit, comp in enumerate('xyzw') if dmask & (1 << bit)]
             for i in range(0, len(halves), 2):
                 odd_tail = i + 1 == len(halves)
                 expr = halves[i] if odd_tail else '%s | (%s << 16)' % (halves[i], halves[i + 1])
