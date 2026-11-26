@@ -11008,7 +11008,7 @@ class ComputePipeline(Pipeline):
 
 
 class MeshPixelStage(Pipeline):
-    """Pixel stage paired with a mesh shader exporting param0..param12 (#2413 T4)."""
+    """Pixel stage paired with a mesh shader exporting param0..param31 (#2413 T4)."""
 
     def __init__(self, mesh_params, ps_code, root_blob, *, rtv_formats=(), ps_hw_inputs=None, ps_attr_map=None,
                  sampler_heap=None, srv_formats=(), refusals=None, decoded=None):
