@@ -379,7 +379,32 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
-    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    else if (mode == "dispatch-bench") {
+        // The speed bench: X2W_TEST_BENCH_CALLS (default 3000) rounds of the cliff's pattern, each a descriptor table (slot 35), a root
+        // constant (slot 39) and a Dispatch (slot 14), every call timed here. Prints the totals in the shape of the stand-in's own
+        // `command-list slots over 20 ms` line, so tools/startup/slot_compare.py can diff a bench run against a tester log.
+        char text[16]{};
+        GetEnvironmentVariableA("X2W_TEST_BENCH_CALLS", text, sizeof(text));
+        const int rounds = text[0] ? std::atoi(text) : 3000;
+        LARGE_INTEGER frequency, a, b;
+        QueryPerformanceFrequency(&frequency);
+        double ms[3] = {};
+        const auto timed = [&](int which, auto&& call) {
+            QueryPerformanceCounter(&a);
+            call();
+            QueryPerformanceCounter(&b);
+            ms[which] += 1000.0 * static_cast<double>(b.QuadPart - a.QuadPart) / static_cast<double>(frequency.QuadPart);
+        };
+        for (int i = 0; i < rounds; ++i) {
+            timed(0, [&] { invoke(list, 35, 1, gpu); });
+            timed(1, [&] { invoke(list, 39, 0, 1, word(&constants[1]), 1); });
+            timed(2, [&] { invoke(list, 14, 3, 2, 2); });
+        }
+        std::printf("x2w-bench rounds %d: slot35 %.2f us/call, slot39 %.2f us/call, slot14 %.2f us/call\n", rounds, ms[0] * 1000.0 / rounds,
+                    ms[1] * 1000.0 / rounds, ms[2] * 1000.0 / rounds);
+        std::fprintf(stderr, "x2w-d3d12 command-list slots over 20 ms: slot35 %.0f ms/%d slot39 %.0f ms/%d slot14 %.0f ms/%d\n", ms[0], rounds,
+                     ms[1], rounds, ms[2], rounds);
+    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
