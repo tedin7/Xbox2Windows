@@ -49,6 +49,7 @@
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
@@ -1010,14 +1011,20 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
     *out = nullptr;
     HRESULT hr = E_NOINTERFACE;
     if (is_base_iid(*iid) || kind_for(*iid) == self->own().kind) {
-        InterlockedIncrement(&self->own().refs);
+        const auto refs = InterlockedIncrement(&self->own().refs);
+        if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
         *out = self;
         hr = S_OK;
     }
     log("x2w-d3d12 %s::QueryInterface riid=%s -> 0x%08lx", kind_names[self->own().kind], text, static_cast<unsigned long>(hr));
     return hr;
 }
-ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
+ULONG __stdcall add_ref(Wrapper* self)
+{
+    const auto refs = InterlockedIncrement(&self->own().refs);
+    if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
+    return static_cast<ULONG>(refs);
+}
 // X2W_D3D12_LINEAR_BUFFERS (opt-in): the shared or copied backing of slot 133's linear buffers
 // (src/startup_stubs/linear_buffer_backing.h). Unused while the switch is off.
 x2w_startup::LinearBuffers& linear_buffers()
@@ -1083,6 +1090,9 @@ ULONG __stdcall release(Wrapper* self)
         if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
+            // The last release ends the resource for existing_memory_buffer and address_resource_overlap (they skip
+            // refs <= 0) whether or not it has a placement entry: a refusal cached while it was live is stale.
+            x2w_startup::note_placement_change();
             retire_placement(self);
             if (self->own().retire_when_idle) retire_note_title_release(self);
             if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
@@ -5114,7 +5124,7 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
     auto& group = placement_group(desc->Width);
     const HRESULT hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
-        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); });
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); x2w_startup::note_placement_change(); });
     if (FAILED(hr)) {
         // The caller has never received this wrapper; release its desktop resource and storage.
         AcquireSRWLockExclusive(&registry_lock);
@@ -5864,6 +5874,7 @@ void drain_retired_resources()
             {
                 x2w_startup::ExclusiveNoteLock guard(note_lock);
                 resource_address_index().erase(address, drop.wrapper);
+                x2w_startup::note_placement_change();
             }
             if (drop.wrapper->own().retire_has_written_gen && !retire_address_has_live_user(address, drop.wrapper)) {
                 AcquireSRWLockExclusive(&written_lock);

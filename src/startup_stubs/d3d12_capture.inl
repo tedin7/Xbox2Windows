@@ -281,11 +281,13 @@ void index_resource(const Wrapper* w, const ResourceInfo& info)
     const u64 base = reinterpret_cast<u64>(w->own().title_memory);
     if (!base || resource_index_check_mode() == 2) return;
     resource_address_index().insert(base, resource_index_extent(info), w);
+    x2w_startup::note_placement_change();
 }
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
+    x2w_startup::note_placement_change();
     const ResourceInfo info{*console, bytes};
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
@@ -306,6 +308,7 @@ void retire_placement(Wrapper* w)
             }
         }
         found->second.placement = Placement::none;
+        x2w_startup::note_placement_change();
     }
     ReleaseSRWLockExclusive(&note_lock);
 }

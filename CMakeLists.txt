@@ -2170,6 +2170,15 @@ foreach(mutation IN ITEMS height exact-fit first-32 unplaced-extent unplaced-cov
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Negative cache of refused buffer memory SRVs (src/startup_stubs/srv_refusal_cache.h); the mutated runs are negative controls.
+add_executable(startup_srv_refusal_cache_check tests/startup_srv_refusal_cache_check.cpp)
+target_include_directories(startup_srv_refusal_cache_check PRIVATE src)
+target_compile_features(startup_srv_refusal_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_srv_refusal_cache COMMAND startup_srv_refusal_cache_check)
+foreach(mutation IN ITEMS generation witness stamp key device age hits unproven)
+    add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
+    set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Descriptor word 3 for formatted buffer loads (src/startup_stubs/buffer_format_word3.h); the mutated run must fail.
 add_executable(startup_buffer_format_word3_check tests/startup_buffer_format_word3_check.cpp)
 target_include_directories(startup_buffer_format_word3_check PRIVATE src)

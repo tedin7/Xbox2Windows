@@ -287,26 +287,49 @@ void clear_unplaced_buffers(Wrapper* device)
             }
             it->resource.Reset();
             it = unplaced_buffers.erase(it);
+            x2w_startup::note_placement_change();
         } else {
             ++it;
         }
     }
 }
 
-Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc)
+// refusal (out, optional): when a nullptr answer is exactly provable, the proof that keeps a cached copy of it exact
+// (srv_refusal_cache.h): decided by the request and stand-in state alone (independent), by a fully committed
+// allocation the buffer does not fit (fully_committed), or by one page that is not committed (witness_page).
+// A nullptr from a later step carries no proof (proven stays false).
+Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
+                                x2w_startup::SrvRefusalProof* refusal = nullptr)
 {
-    if (address_resource_overlap(address, span_bytes)) return nullptr;
-    u64 page_start = 0, page_span = 0;
-    if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span))
+    if (refusal) *refusal = x2w_startup::SrvRefusalProof{};
+    const auto prove = [&](x2w_startup::SrvRefusalKind kind, u64 witness = 0, u64 base = 0) {
+        if (refusal) *refusal = x2w_startup::SrvRefusalProof{kind, witness, base, true};
+    };
+    if (address_resource_overlap(address, span_bytes)) {
+        prove(x2w_startup::SrvRefusalKind::independent);
         return nullptr;
+    }
+    u64 page_start = 0, page_span = 0;
+    if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span)) {
+        prove(x2w_startup::SrvRefusalKind::independent);
+        return nullptr;
+    }
 
     x2w_startup::PlacedBufferRange memory{};
     if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
-        !memory.covered)
+        !memory.covered) {
+        if (memory.region_info)
+            prove(x2w_startup::SrvRefusalKind::fully_committed);
+        else if (memory.witness)
+            prove(x2w_startup::SrvRefusalKind::witness_page, memory.witness, reinterpret_cast<u64>(memory.base));
         return nullptr;
+    }
 
     const auto nearby = placed_buffer_range(device, page_start, page_span, true);
-    if (nearby.reject || nearby.owner) return nullptr;
+    if (nearby.reject || nearby.owner) {
+        prove(x2w_startup::SrvRefusalKind::independent);
+        return nullptr;
+    }
 
     auto* desktop = device_of(device);
     if (!desktop) return nullptr;
@@ -435,6 +458,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     }
 
     unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, native_resource, w});
+    x2w_startup::note_placement_change();
     return w;
 }
 
@@ -546,6 +570,8 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     note_resource(resource, &desc, bytes);
     tiled_srv_textures.emplace(resource, TiledAddressTexture{device, resource, desc, {}});
     tiled_srv_addresses.emplace(address, resource);
+    // address_resource_overlap reads tiled_address_srv: a buffer refused for overlap may be publishable now.
+    x2w_startup::note_placement_change();
     return resource;
 }
 
@@ -671,6 +697,47 @@ void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const Me
     view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&resolved), destination, 0);
 }
 
+// Refused buffer SRVs are remembered for a short time (srv_refusal_cache.h): the same view of the same address is
+// published every frame, and each refusal used to repeat the placement scans and the memory questions.
+x2w_startup::SrvRefusalCache& buffer_refusal_cache()
+{
+    static x2w_startup::SrvRefusalCache cache;
+    return cache;
+}
+
+x2w_startup::SrvRefusalKey buffer_refusal_key(const Wrapper* device, const D3D12_RESOURCE_DESC& resource,
+                                              const MemoryShaderResourceView& input, u64 span_bytes)
+{
+    const auto& view = input.view;
+    x2w_startup::SrvRefusalKey key;
+    key.device = reinterpret_cast<u64>(device);
+    key.address = input.address;
+    key.span_bytes = span_bytes;
+    key.view_a = (u64{static_cast<UINT>(view.Format)} << 32) | (u64{static_cast<UINT>(view.ViewDimension)} << 16) | view.Shader4ComponentMapping;
+    key.view_b = view.Buffer.FirstElement;
+    key.view_c = (u64{view.Buffer.NumElements} << 32) | (u64{view.Buffer.StructureByteStride} << 8) | static_cast<UINT>(view.Buffer.Flags);
+    key.resource_a = (u64{static_cast<UINT>(resource.Dimension)} << 32) | static_cast<UINT>(resource.Flags);
+    key.resource_b = resource.Width;
+    return key;
+}
+
+// The generation first, then the allocation: a change between the two reads makes the entry stale, never fresh.
+x2w_startup::SrvRefusalStamp buffer_refusal_stamp(u64 address)
+{
+    x2w_startup::SrvRefusalStamp stamp;
+    stamp.generation = x2w_startup::srv_placement_generation().load(std::memory_order_acquire);
+    stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size, stamp.commit, stamp.flags);
+    return stamp;
+}
+
+// A cached witness_page refusal still holds while its page is not committed in the allocation the walk started from.
+bool buffer_refusal_page_still_uncommitted(const x2w_startup::SrvRefusalProof& proof)
+{
+    MEMORY_BASIC_INFORMATION page{};
+    if (VirtualQuery(reinterpret_cast<const void*>(proof.witness), &page, sizeof(page)) != sizeof(page)) return true;
+    return page.State != MEM_COMMIT || (proof.base != 0 && reinterpret_cast<u64>(page.AllocationBase) != proof.base);
+}
+
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
@@ -702,15 +769,26 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
+        const auto refusal_stamp = buffer_refusal_stamp(input->address);
+        if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted)) {
+            refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
+                              destination);
+            return;
+        }
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
+        x2w_startup::SrvRefusalProof refusal_proof;
         if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, &refusal_proof);
         }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
+            // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
+            if (buffer) refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
+            buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), refusal_proof);
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
