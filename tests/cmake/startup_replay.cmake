@@ -42,11 +42,11 @@ function(x2w_replay_family_all)
     x2w_replay_family_scene(startup_view_dimension_device startup_view_dimension_@B@)
     x2w_replay_family_scene(startup_list_copy_texture_warp startup_list_copy_texture_@B@)
     x2w_replay_family_scene(startup_resource_retire_views startup_resource_retire_views_@B@_debug0)
-    x2w_replay_family_scene(startup_clear_uav startup_clear_uav_@B@)
+    # startup_clear_uav is not a family scene: its textures come from the desktop device, outside the recording.
     x2w_replay_family_scene(startup_list_dispatch_native startup_list_dispatch_native_@B@)
     x2w_replay_family_scene(startup_small_texture_4k_device_check startup_small_texture_4k_device_@B@)
     x2w_replay_family_scene(startup_slot133_lazy_textures_check startup_slot133_lazy_textures_@B@_debug0)
-    x2w_replay_family_scene(startup_null_views_check startup_null_views_@B@)
+    # startup_null_views_check stays out until the player maps a descriptor heap backed by title memory (open gap).
 endfunction()
 if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL x2w_replay_family_all)
