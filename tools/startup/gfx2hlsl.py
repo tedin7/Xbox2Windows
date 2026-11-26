@@ -7839,6 +7839,7 @@ class Stage:
         else:
             sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
             body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
+            self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
@@ -11145,6 +11146,8 @@ class Pipeline:
             if source[0] != 'table':
                 raise Unsupported('stored image through %s' % (source,))
             lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
+            if r.get('load'):
+                lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))

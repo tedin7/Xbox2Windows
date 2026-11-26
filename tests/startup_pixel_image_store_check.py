@@ -101,7 +101,7 @@ def controls():
     assert 'RWTexture2D<float4> w0 : register(u0);' in ps, ps
     assert '    ' + STORE_LINE in ps, ps
     assert 'register(t' not in ps, ps
-    assert 'uav 0 tex2d table 0 0' in manifest and 'srv ' not in manifest, manifest
+    assert 'uav 0 tex2d table 0 0' in manifest and 'srv ' not in manifest and 'uavload' not in manifest, manifest
     assert manifest.startswith('x2w-manifest 2\n'), manifest
     print('store: %s manifest uav 0 tex2d table 0 0' % STORE_LINE)
 
@@ -150,8 +150,11 @@ def controls():
         store = patched(1, 0, mask)
         decoded = D.decode_instruction(store, 0)[2]
         assert decoded.startswith('image_store %s, ' % data) and 'dmask:%#x' % mask in decoded, decoded
-        ps = translate(with_store(store)).hlsl_ps()
+        partial_pipe = translate(with_store(store))
+        ps = partial_pipe.hlsl_ps()
         assert '    { %s }' % line in ps and STORE_LINE not in ps, ps
+        # The read-back needs typed UAV load, so the manifest says so right after the uav line.
+        assert 'uav 0 tex2d table 0 0\nuavload 0\n' in partial_pipe.manifest(), partial_pipe.manifest()
         print('partial dmask %#x: { %s }' % (mask, line))
     # The mask must match the data registers, and an empty mask or a 16-bit partial store stays refused.
     for mask, data, needle in ((0x7, 'v[4:7]', 'three VGPRs expected'), (0x3, 'v4', 'two VGPRs expected'),
