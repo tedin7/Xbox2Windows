@@ -4632,6 +4632,15 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    # gfx2hlsl live s_and_b64 across a compute EXECZ join.
+    add_test(NAME startup_gfx2hlsl_execz_mask_and_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_execz_mask_and_check.py")
+    foreach(mode IN ITEMS dispatch mutant)
+        add_test(NAME startup_gfx2hlsl_execz_mask_and_${mode}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_execz_mask_and_check.py" ${mode} "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>")
+        set_tests_properties(startup_gfx2hlsl_execz_mask_and_${mode}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl v_mad_u64_u32 / v_mad_i64_i32: helper math against a 64-bit reference, carry-out mask, refusals (Part of #1723).
     add_test(NAME startup_gfx2hlsl_mad64 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad64_check.py")

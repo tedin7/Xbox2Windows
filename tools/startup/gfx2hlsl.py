@@ -8,6 +8,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 import bisect
 from contextlib import suppress
 import functools
+import math
 import os
 import re
 import struct
@@ -3069,7 +3070,8 @@ class Stage:
         so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
         the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
         the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
-        shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
+        shape below. A live mask AND can also use a guest-wave vote when every thread reaches the branch (prove_compute_execz_vote).
+        Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
         or a backward s_cbranch_execz is refused.
 
         The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
@@ -3118,6 +3120,7 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        self.compute_execz_vote = {}
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -3189,7 +3192,71 @@ class Stage:
                         reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+            if straight:
+                self.prove_compute_execz_vote(b, t, jumps, index, effects, succ, live_in, refused)
         return refused
+
+    def prove_compute_execz_vote(self, b, t, jumps, index, effects, succ, live_in, refused):
+        """Use a workgroup rendezvous for a live mask AND when all threads reach the branch."""
+        candidates = [i for i in range(b + 1, t) if self.ins[i][0] in refused]
+        if len(candidates) != 1:
+            return
+        i = candidates[0]
+        at, _, name, asm = self.ins[i]
+        words = effects[i][1] - {'scc'}
+        if name != 's_and_b64' or not words & live_in[t] or 'scc' in live_in[i + 1]:
+            return
+        _, ops, mods = parse(asm)
+        dst = reg_range(ops[0]) if len(ops) == 3 else None
+        if mods or not dst or dst[0] != 's' or dst[1] % 2 or dst[2] != dst[1] + 1 or dst[2] > 105:
+            return
+        threads = math.prod(self.pipe.group)
+        width = self.pipe.wave_size or (32 if threads <= 32 or wave32_exec_proof(self.ins) else None)
+        if width not in (32, 64) or any(k != b and (k < t or index.get(target, -1) < t) for k, target in jumps):
+            return
+        if (any(n.startswith(('s_setpc', 's_swappc')) for _, _, n, _ in self.ins)
+                or any(n == 's_endpgm' for _, _, n, _ in self.ins[:b])):
+            return
+        for k in range(b + 1, t):
+            _, _, op, operands = self.ins[k]
+            if k != i and (effects[k][2] or not (self.vector_only_instruction(op, operands)
+                                                or op in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt'))):
+                return
+
+        # Both arms must carry the same representation of a mask. A b64 destination tag alone
+        # does not prove that its old value was projected correctly (e.g. a move of literal 16).
+        mask_sources = {'exec', 'vcc', '0', '-1'}
+
+        def initialized_pair(token):
+            keys = scalar_tokens(token)
+            last = next((k for k in range(b - 1, -1, -1) if keys & effects[k][2]), None)
+            if last is None:
+                return False
+            _, _, op, a = self.ins[last]
+            _, operands, modifiers = parse(a)
+            return (not modifiers and len(operands) == 2 and operands[0] == token
+                    and (op == 's_mov_b64' and operands[1] in mask_sources or op == 's_and_saveexec_b64'))
+
+        if not initialized_pair(ops[0]) or not all(
+                src in mask_sources or (reg_range(src) and initialized_pair(src)) for src in ops[1:]):
+            return
+
+        # The AND produces one projection of the shared scalar mask in every invocation.
+        # Check that no path consumes either architectural word as numeric data.
+        for word in words:
+            seen, pending = set(), [i + 1]
+            while pending:
+                k = pending.pop()
+                if k in seen:
+                    continue
+                seen.add(k)
+                reads, writes, _ = effects[k]
+                if word in reads and not self.per_lane_read(k, word):
+                    return
+                if word not in writes:
+                    pending.extend(succ[k])
+        self.compute_execz_vote[self.ins[b][0]] = width
+        del refused[at]
 
     def execz_read_cause(self, j, word, b, t, effects, into):
         """Why the read at instruction j of `word` after the join t of an execz block is not proven (execz_live_read),
@@ -4984,7 +5051,23 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
-            if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
+            if width := getattr(self, 'compute_execz_vote', {}).get(self.pc):
+                # All group threads visit this once. Reduce only the guest wave's entry EXEC bits.
+                x, y, _ = self.pipe.group
+                self.emit('uint x2w_thread = tid.x + %du * (tid.y + %du * tid.z);' % (x, y))
+                self.emit('uint x2w_wave_start = x2w_thread / %du * %du;' % (width, width))
+                self.emit('x2w_exec_entry[x2w_thread] = exec & 1u;')
+                self.emit('GroupMemoryBarrierWithGroupSync();')
+                self.emit('if (x2w_thread == x2w_wave_start) {')
+                self.emit('    uint any_exec = 0u;')
+                self.emit('    for (uint lane = x2w_wave_start; lane < min(x2w_wave_start + %du, %du); ++lane)' %
+                          (width, math.prod(self.pipe.group)))
+                self.emit('        any_exec |= x2w_exec_entry[lane];')
+                self.emit('    x2w_exec_entry[x2w_wave_start] = any_exec;')
+                self.emit('}')
+                self.emit('GroupMemoryBarrierWithGroupSync();')
+                cond = 'x2w_exec_entry[x2w_wave_start] == 0u'
+            elif getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
                 # The guest skips the block when no lane of the wave has the bit; here every thread of the host wave
                 # takes the same decision (convergence rule C2).
                 self.needs_sm6 = True
@@ -11807,6 +11890,8 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if getattr(s, 'compute_execz_vote', None):
+            shared.append('groupshared uint x2w_exec_entry[%d];' % math.prod(self.group))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'

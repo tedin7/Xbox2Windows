@@ -2,6 +2,24 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## Compute mask AND at an EXECZ join
+
+The compute translator accepts a live `s_and_b64` mask result across a
+straight-line EXECZ block when it can prove that every group thread reaches the
+branch, the AND operands and previous destination are lane masks, and the
+result's reads use lane bits. The workgroup shares the entry EXEC bits. Each
+guest wave enters the block if any of its bits are set, and every invocation in
+that wave updates its projection of the scalar mask. An empty wave keeps its
+previous value. The translator requires a dead SCC result.
+
+The WARP fixture compares readback against a CPU mask reference for empty,
+partial, full, and neighboring guest waves. The per-lane branch control must
+produce a mismatch in the partial wave.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_execz_mask_and_(controls|(dispatch|mutant)_warp)$'
+```
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
