@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
@@ -383,6 +384,30 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
+    // dispatch-race: a second recording thread issues the same first Dispatch of the key while this thread's Dispatch is
+    // still reading the key's manifest (X2W_TEST_MANIFEST_READ_DELAY_MS holds that read), so the second one finds the
+    // translation being loaded: with X2W_LOCK_SPLIT it waits for it, without it is refused.
+    void* race_allocator = nullptr;
+    void* race_list = nullptr;
+    int race_status = 0;
+    std::thread racer;
+    if (mode == "dispatch-race") {
+        if (FAILED(static_cast<HRESULT>(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&race_allocator)))) ||
+            FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(race_allocator), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&race_list)))))
+            return 72;
+        racer = std::thread([&] {
+            invoke(race_list, 32, 1, word(&heap));
+            invoke(race_list, 25, word(slot67_pipeline));
+            invoke(race_list, 33, word(slot67_root));
+            invoke(race_list, 37, 0, constants[0], 0);
+            invoke(race_list, 40, 0, 2, word(graphics), 0);
+            invoke(race_list, 39, 0, 1, word(&constants[1]), 1);
+            invoke(race_list, 35, 1, gpu);
+            Sleep(150);
+            invoke(race_list, 14, 3, 2, 2);
+            if (FAILED(static_cast<HRESULT>(invoke(race_list, 9)))) race_status = 75;
+        });
+    }
     if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
@@ -396,6 +421,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     if (mode == "dispatch-twice" || mode == "dispatch-twice-narrow") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+    if (racer.joinable()) {
+        racer.join();
+        if (race_status) return race_status;
+        invoke(queue, 10, 1, word(&race_list));
+    }
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
     for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {

@@ -132,6 +132,15 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, fast, 'dispatch-twice-narrow')
         assert len(lines(result, 'x2w-render compute views: descriptors reused 0 of')) == 1, result.stderr[-3000:]
 
+        # X2W_LOCK_SPLIT: a second recording thread that reaches the key while the first is still reading its manifest waits for
+        # the answer. Without the switch it is refused as untranslated (the race the switch removes); the held read makes it certain.
+        held = dict(env, X2W_TEST_MANIFEST_READ_DELAY_MS='500')
+        got, result = dispatch(directory, consumer, dict(held, X2W_LOCK_SPLIT='1'), 'dispatch-race')
+        assert got == expected and not lines(result, 'refused'), result.stderr[-3000:]
+        assert lines(result, 'dispatches that waited for a claimant 1 (X2W_LOCK_SPLIT=1)'), result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, held, 'dispatch-race')
+        assert len(lines(result, 'no translation')) >= 1 and lines(result, 'waited for a claimant 0 (X2W_LOCK_SPLIT=0)'), result.stderr[-3000:]
+
         unset = 'an entry value was not set since the compute root'
         for mode, reason in (('dispatch-missing-word', unset), ('dispatch-root-changed', unset), ('dispatch-reset', unset),
                              ('dispatch-wrong-root', 'the compute root set is not the one the pipeline was created with'),

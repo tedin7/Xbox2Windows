@@ -446,6 +446,13 @@ bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
     if (retry || !source.claim_first(key)) return source.load_retry(key, out, GetTickCount64());
     if (!may_unlock) return source.read_first(key, out);
     draw_lock_release_exclusive();
+    // Test hook: hold the first read so a second recording thread can arrive while it is in flight.
+    static const DWORD test_delay_ms = [] {
+        char text[16];
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_MANIFEST_READ_DELAY_MS", text, sizeof(text));
+        return n && n < sizeof(text) ? static_cast<DWORD>(std::strtoul(text, nullptr, 10)) : 0u;
+    }();
+    if (test_delay_ms) Sleep(test_delay_ms);
     const bool read = source.read_first(key, out);
     draw_lock_acquire_exclusive();
     return read;

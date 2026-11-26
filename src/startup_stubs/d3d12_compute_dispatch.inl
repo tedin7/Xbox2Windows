@@ -40,6 +40,7 @@ struct ComputeTranslation {
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     KeyUse use;                            // when a Dispatch first and last had this key bound
     const char* first_refusal = nullptr;   // reason of the first refused call
+    bool loading = false;                  // a recording thread is reading this key's manifest (draw_lock may be down meanwhile)
     bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
@@ -71,6 +72,12 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_waited_for_claimant;  // dispatches that waited for another thread's first load of their key (X2W_LOCK_SPLIT)
+bool lock_split()
+{
+    static const bool on = x2w_local::env_on("X2W_LOCK_SPLIT");
+    return on;
+}
 LONG compute_views_reused;  // dispatches that reused the previous dispatch's descriptors (X2W_FAST_COMPUTE)
 bool fast_compute()
 {
@@ -257,8 +264,19 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
         if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
+            tr->loading = true;
             tr->unmodelled = load_compute_translation(*tr);
+            tr->loading = false;
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+        } else if (lock_split() && tr->loading) {
+            // Another recording thread claimed this key's first load and is reading its manifest with draw_lock down: wait
+            // for its answer (at most a second) instead of refusing this Dispatch as untranslated.
+            InterlockedIncrement(&compute_waited_for_claimant);
+            for (const ULONGLONG until = GetTickCount64() + 1000; tr->loading && GetTickCount64() < until;) {
+                draw_lock_release_exclusive();
+                Sleep(1);
+                draw_lock_acquire_exclusive();
+            }
         }
         if (tr->state != 1) {
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
@@ -728,8 +746,8 @@ void log_key_use_census()
 
 void log_compute_views()
 {
-    log("x2w-render compute views: descriptors reused %ld of %ld translated dispatches (X2W_FAST_COMPUTE=%d)", compute_views_reused,
-        compute_dispatches_translated, fast_compute() ? 1 : 0);
+    log("x2w-render compute views: descriptors reused %ld of %ld translated dispatches (X2W_FAST_COMPUTE=%d); dispatches that waited for a claimant %ld (X2W_LOCK_SPLIT=%d)",
+        compute_views_reused, compute_dispatches_translated, fast_compute() ? 1 : 0, compute_waited_for_claimant, lock_split() ? 1 : 0);
 }
 
 // Fixtures: the census without waiting for the frame that logs it.
