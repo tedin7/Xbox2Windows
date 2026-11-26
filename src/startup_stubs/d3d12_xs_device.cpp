@@ -2791,7 +2791,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+        log("x2w-draw upload ring reservation refused: no unused capacity (asked %zu bytes, ring %llu MiB in %zu chunks, %ld reservations, %ld recycled so far)",
+            bytes, static_cast<unsigned long long>(total_bytes >> 20), chunks.size(), static_cast<long>(upload_ring_reservations),
+            static_cast<long>(upload_ring_recycled));
     return reservation;
 }
 
@@ -4981,8 +4983,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         }
     }
     const bool has_resource = args[0] != 0 || is_unmaterialized_lazy;
+    // args[0] is a resource only for the resource views (slots 18 to 21). For the constant buffer view (17) and the
+    // sampler (22) it is the address of a description: it must not be called as a resource.
     const D3D12_RESOURCE_DESC resource_desc_for_check = is_unmaterialized_lazy ? lazy_rec.desc
-        : (args[0] ? reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc() : D3D12_RESOURCE_DESC{});
+        : (N >= 18 && N <= 21 && args[0] ? reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc() : D3D12_RESOURCE_DESC{});
     const char* skip = nullptr;
     bool default_view = false;
     bool uav_denied = false;  // a UAV of a resource without unordered access: recorded as not created, as before #2649

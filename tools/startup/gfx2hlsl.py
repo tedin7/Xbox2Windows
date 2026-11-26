@@ -487,7 +487,7 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('%s reserved bit 16 set at +0x%x' % (name, off))
         if word1 & LDS_UNUSED_W1_MASK[name]:
             raise Unsupported('%s unused operand field set at +0x%x' % (name, off))
-    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_[iu]16_e64', name):
+    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_([iu]16|u64)_e64', name):
         # The decoder prints NEG on an inline integer as a sign (inline 1 with NEG reads `-1`, the same text as
         # inline -1), and LLVM 15 rejects `-v1` and `|v1|` on these sources: refuse either bit (VOP3 w0[10:8] ABS,
         # w1[31:29] NEG) so a printed -N is always a genuine inline integer.
@@ -9860,6 +9860,17 @@ class Stage:
                 reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
             raise Unsupported('%s into %s' % (base, ops[0]))
 
+    def _u64_source(self, base, tok):
+        """(low, high) words of a source of an unsigned 64-bit compare: a VGPR pair, an even SGPR pair or an inline
+        integer (-16..64, sign-extended to 64 bits as the hardware reads it). Literals, floats, vcc/exec pairs,
+        lane-mask SGPRs (u() would give the per-lane 0/1 projection, not the architectural mask) and the neg/abs
+        spellings are refused."""
+        reg = reg_range(tok)
+        if tok in FLOATS or tok in ('vcc', 'exec') or (
+                reg and reg[0] == 's' and any(w in self.masks for w in range(reg[1], reg[2] + 1))):
+            raise Unsupported('%s source %s' % (base, tok))
+        return self.i64_words(tok)
+
     def _low16_source(self, base, tok, signed):
         """A source of a 16-bit integer compare: bits 15:0 of the operand, sign- or zero-extended (RDNA 2 VOPC
         S0.i16 / S0.u16). A float token is refused: on a 16-bit operand the inline constants 240-248 are binary16
@@ -9970,10 +9981,13 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16|u64)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
+        # The unsigned 64-bit compares: six relations on register pairs and inline integers (no SDWA form exists).
+        if typ == 'u64' and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
         # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
@@ -10009,6 +10023,8 @@ class Stage:
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         elif typ in ('i16', 'u16'):
             x, y = (self._low16_source(base, t, typ == 'i16') for t in (a, b))
+        elif typ == 'u64':
+            x, y = (self._u64_source(base, t) for t in (a, b))
         else:
             x, y = self.u(a), self.u(b)
         def word(tok):
@@ -10020,7 +10036,11 @@ class Stage:
         ordered = ''
         if '{2}' in table[cond]:
             ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
-        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
+        if typ == 'u64':
+            condition = U64_COMPARE[cond].format(al=x[0], ah=x[1], bl=y[0], bh=y[1])
+        else:
+            condition = table[cond].format(x, y, ordered)
+        expr = '((%s) ? 1u : 0u)' % condition
         if not self.exec_known:
             expr = '(exec & %s)' % expr
         if writes_exec or dst in ('exec', 'exec_lo'):
@@ -10691,6 +10711,17 @@ VEC_U.update({
 })
 
 VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
+
+# Unsigned 64-bit VOPC relations on (low, high) uint words: the high words decide, the low words only on a tie.
+# Bitwise & and | on the bool results: both sides are plain words, so nothing needs short-circuit evaluation.
+U64_COMPARE = {
+    'lt': '(({ah} < {bh}) | (({ah} == {bh}) & ({al} < {bl})))',
+    'le': '(({ah} < {bh}) | (({ah} == {bh}) & ({al} <= {bl})))',
+    'gt': '(({ah} > {bh}) | (({ah} == {bh}) & ({al} > {bl})))',
+    'ge': '(({ah} > {bh}) | (({ah} == {bh}) & ({al} >= {bl})))',
+    'eq': '(({ah} == {bh}) & ({al} == {bl}))',
+    'ne': '(({ah} != {bh}) | ({al} != {bl}))',
+}
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
 # no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
@@ -12617,10 +12648,12 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
-        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
-        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        # --retry-lifted <dir> [seconds] [--jobs N]: before the title starts, the old refusals (lifted families first)
+        given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
+        seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
+        print(retry_lifted(out_dir, seconds, jobs=jobs).line(), flush=True)
         return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
@@ -12637,7 +12670,19 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp())
+    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+
+
+def jobs_argument(args):
+    """--jobs N among `args`: at most N workers, and never more than translation_jobs(); None when absent."""
+    if '--jobs' not in args:
+        return None
+    at = args.index('--jobs')
+    try:
+        wanted = int(args[at + 1])
+    except (IndexError, ValueError):
+        raise SystemExit('gfx2hlsl: --jobs needs a whole number')
+    return max(1, min(wanted, translation_jobs()))
 
 
 
@@ -12719,20 +12764,23 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
 
 
 def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
-    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
-    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
-    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
+    then graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
+    since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
+    family: a .fail's time does not prove which build wrote it (Run P kept a pixel MRTZ request refused by a stale
+    .fail although that build translates it), and those families are few."""
     rows = []
-    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
+    for order, key in enumerate(pending_keys(out_dir, False, None)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
-            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
-                continue
+            newer = since_translator is not None and os.path.getmtime(fail) >= since_translator
             with open(fail, encoding='utf-8', errors='replace') as handle:
                 reason = handle.readline()
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
+        if newer and not lifted:
+            continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
         rows.append((not lifted, compute, order, key, lifted))
     return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
@@ -12778,6 +12826,10 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    for key, result in results.items():
+        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+            with suppress(OSError):
+                os.remove(os.path.join(out_dir, '%016x.fail' % key))
     ok = sum(1 for result in results.values() if result == 'ok')
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
                        sum(1 for _key, lifted in rows if lifted))
