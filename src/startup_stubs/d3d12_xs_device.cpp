@@ -3009,7 +3009,7 @@ ID3D12Resource* large_compute_input_snapshot(Wrapper* list, u64 address, u64 byt
     // Fixture mutant deliberately leaves every piece after the first zero.
     static const bool first_chunk_only = x2w_local::env_on("X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY");
     for (u64 offset = 0; offset < bytes; offset += compute_input_chunk_bytes) {
-        const auto piece = static_cast<std::size_t>(std::min(compute_input_chunk_bytes, bytes - offset));
+        const auto piece = static_cast<std::size_t>((std::min)(compute_input_chunk_bytes, bytes - offset));
         if (offset && first_chunk_only) {
             std::memset(snapshot->mapped + offset, 0, piece);
         } else if (!x2w_local::guarded_memcpy(snapshot->mapped + offset,
