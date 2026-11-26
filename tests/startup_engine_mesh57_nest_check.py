@@ -73,12 +73,12 @@ def mutants(source):
     """HLSL text of each wrong lowering of the wave decision (the gather sites and the outer skip)."""
     gather = re.compile(r'(x2w_any_\d+) = x2w_any\[b\]\[x2w_wave\];')
     assert gather.search(source), 'no wave gather in the translation'
-    outer = re.search(r'\{ skip = true; skip_to = \d+; \}', source)
-    assert outer, 'no wave skip in the translation'
+    skips = re.compile(r'\{ skip = true; skip_to = \d+; \}')
+    assert skips.search(source), 'no wave skip in the translation'
     return {
         'per-thread decision': gather.sub(r'\1 = (exec & 1u);', source),
         'per-group decision': gather.sub(r'\1 = x2w_any[b][0] | x2w_any[b][1];', source),
-        'range run by an empty wave': source.replace(outer[0], '{ }', 1),
+        'range run by an empty wave': skips.sub('{ }', source),
     }
 
 
