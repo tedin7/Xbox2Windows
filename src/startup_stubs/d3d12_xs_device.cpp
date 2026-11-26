@@ -492,7 +492,7 @@ Wrapper* as_wrapper(const void* p)
 {
     const auto value = reinterpret_cast<std::uintptr_t>(p);
     if (value < 0x10000 || (value & 7)) return nullptr;
-    AcquireSRWLockShared(&registry_lock);
+    x2w_phase::acquire_copy_lock(&registry_lock);
     const bool known = registry().count(p) != 0;
     ReleaseSRWLockShared(&registry_lock);
     return known ? const_cast<Wrapper*>(static_cast<const Wrapper*>(p)) : nullptr;
@@ -3051,7 +3051,7 @@ void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
     const auto* info = resource_info(buffer);
     if (!info || info->placement != Placement::copied_buffer) return;
     const u64 address = reinterpret_cast<u64>(buffer->own().title_memory);
-    AcquireSRWLockExclusive(&placed_gpu_writes_lock);
+    x2w_phase::acquire_copy_lock(&placed_gpu_writes_lock, true);
     try {
         auto& writes = placed_gpu_writes()[buffer];
         if (!writes.empty() && writes.front().address != address) writes.clear();  // a new buffer at a reused wrapper
@@ -3062,17 +3062,22 @@ void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
     ReleaseSRWLockExclusive(&placed_gpu_writes_lock);
 }
 // True when a recorded copy wrote any byte of [offset, offset + bytes) of the buffer.
+bool placed_gpu_written_locked(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    const auto found = placed_gpu_writes().find(buffer);
+    if (found != placed_gpu_writes().end() && !found->second.empty() && buffer->own().title_memory &&
+        found->second.front().address == reinterpret_cast<u64>(buffer->own().title_memory)) {
+        for (const auto& write : found->second)
+            if (offset < write.offset + write.bytes && write.offset < offset + bytes) return true;
+    }
+    return false;
+}
+
 bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
 {
     if (!InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) return false;
-    bool written = false;
-    AcquireSRWLockShared(&placed_gpu_writes_lock);
-    const auto found = placed_gpu_writes().find(buffer);
-    if (found != placed_gpu_writes().end() && buffer->own().title_memory &&
-        found->second.front().address == reinterpret_cast<u64>(buffer->own().title_memory)) {
-        for (const auto& write : found->second)
-            if (offset < write.offset + write.bytes && write.offset < offset + bytes) written = true;
-    }
+    x2w_phase::acquire_copy_lock(&placed_gpu_writes_lock);
+    const bool written = placed_gpu_written_locked(buffer, offset, bytes);
     ReleaseSRWLockShared(&placed_gpu_writes_lock);
     return written;
 }
@@ -7757,7 +7762,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_ZONE("Present");
     X2W_FRAME_MARK;
     static LONG frames;
-    static ULONGLONG started, last_report;
+    static ULONGLONG started, last_report, last_copy15_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
@@ -7814,7 +7819,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
-    if (frame == 1) started = last_report = now;
+    if (frame == 1) started = last_report = last_copy15_report = now;
     if (frame <= 2) {
         char a[3 * 0x50 + 1], b[3 * 0x40 + 1];
         hex_text(plane_parameters, 0x50, a, sizeof(a));
@@ -7987,6 +7992,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                 InterlockedCompareExchange(&list_buffer_copies, 0, 0), InterlockedCompareExchange(&list_resource_copies, 0, 0),
                 InterlockedCompareExchange(&list_resolves, 0, 0), InterlockedCompareExchange(&list_copies_refused, 0, 0),
                 InterlockedCompareExchange(&list_title_memory_copies, 0, 0));
+            if (now - last_copy15_report >= 10000) {
+                last_copy15_report = now;
+                log_copy15_phases();
+            }
             used = 0;
             text[0] = 0;
             for (int i = 0; i < 256; ++i) {

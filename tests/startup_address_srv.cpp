@@ -547,16 +547,45 @@ int draw_copied_vertex_buffer_srv(void* guest, void* list)
 {
     constexpr UINT full_bytes = 512;
     constexpr UINT short_bytes = 256;
-    static std::array<std::uint8_t, 65536 + full_bytes> storage{};
-    auto* records = reinterpret_cast<std::uint32_t*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
-    records[224 / sizeof(*records)] = 57;
-    records[288 / sizeof(*records)] = 181;
-
     const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, full_bytes, 1, 1, 1,
         DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    std::uint32_t* records = nullptr;
     void* placed = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+
+    char mode[16]{};
+    GetEnvironmentVariableA("X2W_TEST_COPIED_VERTEX_SRV", mode, sizeof(mode));
+    if (std::strcmp(mode, "copy15") == 0) {
+        // Use fresh, deliberately unaligned placements so the draw snapshots
+        // the title destination. Give the untouched destination a different
+        // color so a skipped copy fails the pixel comparison.
+        static constexpr std::size_t page = 4096;
+        auto allocate = [] {
+            auto* base = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * page,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            return base ? reinterpret_cast<std::uint32_t*>(base + page) : nullptr;
+        };
+        auto* source = allocate();
+        records = allocate();
+        void* from = nullptr;
+        if (!source || !records ||
+            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(source), ptr(&buffer),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&from)))) ||
+            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+        source[224 / sizeof(*source)] = 73;
+        source[288 / sizeof(*source)] = 149;
+        for (unsigned i = 0; i < 2000; ++i) {
+            const Word offset = (i % 8) * 64;
+            invoke(list, 15, ptr(placed), offset, ptr(from), offset, 64);
+        }
+    } else {
+        static std::array<std::uint8_t, 65536 + full_bytes> storage{};
+        records = reinterpret_cast<std::uint32_t*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
+        records[224 / sizeof(*records)] = 57;
+        records[288 / sizeof(*records)] = 181;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
+                                               0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    }
 
     const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     alignas(64) static std::array<std::uint8_t, 256> descriptors{};
