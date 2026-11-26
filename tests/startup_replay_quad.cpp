@@ -114,9 +114,10 @@ int draw_frame(void* device, Scene& s, void* pso, UINT frame, UINT frames, bool 
     invoke(s.list, 12, 3, 1);
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     if (array_fixture) {
-        // Only the last entry names a closed list. It must survive capture for the frame to be drawn.
-        void* lists[33]{};
-        lists[32] = s.list;
+        // 33 entries (264 bytes, past the old 256-byte window), each the closed list: executing it again draws the
+        // same frame. A null entry is not a list the stand-in executes.
+        void* lists[33];
+        for (void*& list : lists) list = s.list;
         invoke(s.queue, 10, 33, arg(lists));
     } else {
         invoke(s.queue, 10, 1, arg(&s.list));
