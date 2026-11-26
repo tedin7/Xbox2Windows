@@ -2304,6 +2304,9 @@ def mrtz_covers_every_path(ins, at):
 
 
 
+# Inline float constants of a packed binary16 operation and their binary16 words.
+PK_INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00, '2.0': 0x4000, '-2.0': 0xc000, '4.0': 0x4400, '-4.0': 0xc400}
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -9189,8 +9192,8 @@ class Stage:
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR or a literal read
-        through its low half in both lanes (an inline constant, or a literal's high half, reaches a lane in a way that is not proven).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR, or a literal or
+        inline float constant read through its low half in both lanes (a high-half read and inline integers are not proven).
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -9215,6 +9218,13 @@ class Stage:
                 if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
                     raise Unsupported('%s literal source %s read through its high half' % (base, tok))
                 literal[i - 1] = int(tok, 16) & 0xffff
+                continue
+            if i >= 1 and tok in PK_INLINE_F16:
+                # Inline float constants (0.5, 1.0, 2.0, 4.0 and negatives) are the binary16 value in the low half; accepted on the same
+                # terms as a literal: both lanes read the low half. Inline integers and a high-half read stay refused.
+                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                    raise Unsupported('%s inline constant %s read through its high half' % (base, tok))
+                literal[i - 1] = PK_INLINE_F16[tok]
                 continue
             raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
         lanes = []
