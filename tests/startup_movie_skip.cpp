@@ -102,6 +102,9 @@ int main(int argc, char** argv)
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const unsigned char*>(self) + dos->e_lfanew);
     const int patched = hook ? patch_movie_imports(reinterpret_cast<unsigned char*>(self), nt->OptionalHeader.SizeOfImage) : 0;
 
+    // BinkPause is never called, so the linker would drop its import: take its address to keep all eight slots.
+    static int (*volatile keep_pause_import)(void*, int) = BinkPause;
+    (void)keep_pause_import;
     void* movie = BinkOpenWithOptions("movie.bk2", nullptr, 0);
     int shown = 0, playbacks = 0;
     if (movie) {
