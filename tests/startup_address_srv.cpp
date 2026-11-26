@@ -333,6 +333,19 @@ int draw_console_address_srv(void* guest, void* list)
     std::ifstream input(path, std::ios::binary);
     input.read(backing.data(), backing.size());
     if (!input.gcount() || !input.eof()) return 43;
+    const auto payload_bytes = static_cast<std::size_t>(input.gcount());
+    char* source = backing.data();
+    if (GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_SHORT_BACKING", nullptr, 0)) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        const std::size_t page = info.dwPageSize;
+        const std::size_t committed = (payload_bytes + page - 1) / page * page;
+        auto* allocation = static_cast<char*>(VirtualAlloc(nullptr, committed + page, MEM_RESERVE, PAGE_NOACCESS));
+        if (!allocation || !VirtualAlloc(allocation, committed, MEM_COMMIT, PAGE_READWRITE)) return 43;
+        // Keep the backing live through upload and draw. Its end abuts the reserved page.
+        source = allocation + committed - payload_bytes;
+        std::memcpy(source, backing.data(), payload_bytes);
+    }
     const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, static_cast<UINT16>(mips),
         static_cast<DXGI_FORMAT>(format), {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
     ViewAt v{};
@@ -341,15 +354,16 @@ int draw_console_address_srv(void* guest, void* list)
     v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     v.view.Texture2D.MostDetailedMip = viewed;
     v.view.Texture2D.MipLevels = 1;
-    v.address = ptr(backing.data());
+    v.address = ptr(source);
+    const auto announced_bytes = source == backing.data() ? backing.size() : payload_bytes;
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
     wchar_t rows[8]{};
     GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_XG_ROWS", rows, 8);
-    if (!std::wcscmp(rows, L"1")) x2w_d3d12_texture_written(backing.data(), backing.size());
+    if (!std::wcscmp(rows, L"1")) x2w_d3d12_texture_written(source, announced_bytes);
     invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     // "after": the announcement follows the publication, before the draw samples the view.
-    if (!std::wcscmp(rows, L"after")) x2w_d3d12_texture_written(backing.data(), backing.size());
+    if (!std::wcscmp(rows, L"after")) x2w_d3d12_texture_written(source, announced_bytes);
     const D3D12_RECT whole{0, 0, 512, 128};
     invoke(list, 22, 1, ptr(&whole));
     invoke(list, 12, 3, 1);

@@ -26,6 +26,16 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
            r.Width && r.Height && r.Width % 4 == 0 && r.Height % 4 == 0;
 }
 
+// Keep the padded allocation size for resource bookkeeping and cap checks. Only reads can omit trailing padding.
+u64 short_tiled_bc_read_bytes(const D3D12_RESOURCE_DESC& desc)
+{
+    static const bool enabled = x2w_local::env_on("X2W_SLOT70_DETILE_MORE");
+    if (!enabled || !tiled_bc_srv(desc)) return 0;
+    const x2w_startup::Bc16Surface surface(desc);
+    const auto used = surface.used_bytes();
+    return used < surface.size() ? used : 0;
+}
+
 // One line for the first publication of a view whose last tile row or column is partial. A published
 // view gets a content summary, so a title run can tell console-tiled data from zeros; a held one names
 // why it stays refused.
@@ -41,15 +51,17 @@ void log_partial_tile_view(const D3D12_RESOURCE_DESC& r, u64 address, const char
     }
     if (!first_calls(lines, 64)) return;
     const auto* data = reinterpret_cast<const unsigned char*>(address);
+    const auto short_bytes = short_tiled_bc_read_bytes(r);
+    const auto read_bytes = short_bytes ? short_bytes : bytes;
     const auto nonzero = [&](u64 from) {
         unsigned count = 0;
-        for (u64 i = from; i < from + 4096; ++i) count += data[i] != 0;
+        for (u64 i = from; i < (std::min)(from + 4096, read_bytes); ++i) count += data[i] != 0;
         return count;
     };
     // publish_tiled_texture already found the whole range readable.
     log("x2w-d3d12 Device::slot70 partial-tile BC view %llux%u format %d layout 0x%x: published, %llu tiled bytes, "
         "nonzero first/last 4 KiB %u/%u hash %016llx", r.Width, r.Height, r.Format, static_cast<unsigned>(r.Layout),
-        bytes, nonzero(0), nonzero(bytes - 4096), hash_memory(data, static_cast<std::size_t>(bytes)));
+        bytes, nonzero(0), nonzero(bytes - 4096), hash_memory(data, static_cast<std::size_t>(read_bytes)));
 }
 
 // The size the XG stand-in reports for a description: desktop copyable footprints rounded to 64 KiB.
@@ -634,7 +646,8 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
     if (!published) return "texture_no_resource";
     const auto bytes = address_texture_bytes(device, desc);
     if (bytes > max_published_texture_bytes) return "texture_over_64mib";
-    if (!texture_range_readable(address, bytes)) return "texture_unreadable";
+    const auto short_bytes = short_tiled_bc_read_bytes(desc);
+    if (!texture_range_readable(address, short_bytes ? short_bytes : bytes)) return "texture_unreadable";
     return "texture_unavailable";  // publication failed for another reason (no wrapper)
 }
 
@@ -643,7 +656,9 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     const auto bytes = address_texture_bytes(device, desc);
     // A console layout is read only up to its last addressed element: a small texture in a big block need not have the
     // block's padding mapped.
-    const auto read_bytes = console_layout_srv(desc) ? x2w_startup::gfx10::Layout(desc).used_bytes() : bytes;
+    const auto short_bytes = short_tiled_bc_read_bytes(desc);
+    const auto read_bytes = console_layout_srv(desc) ? x2w_startup::gfx10::Layout(desc).used_bytes()
+        : short_bytes ? short_bytes : bytes;
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > max_published_texture_bytes || !texture_range_readable(address, read_bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);

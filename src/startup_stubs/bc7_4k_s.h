@@ -48,6 +48,12 @@ struct Bc16Surface {
         return tile * tile_bytes + block * block_bytes;
     }
 
+    // Tile indices increase row-major, and each axis contributes disjoint address bits.
+    std::uint64_t used_bytes() const
+    {
+        return block_offset(columns - 1, rows - 1) + block_bytes;
+    }
+
     void detile(const unsigned char* source, unsigned char* dest, UINT row_pitch) const
     {
         for (UINT y = 0; y < rows; ++y) {

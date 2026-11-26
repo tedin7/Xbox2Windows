@@ -1847,7 +1847,8 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         x2w_startup::drop_mips::counters.upload_unsupported.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->used_bytes()
+    const u64 short_bc = tiled_address && original ? short_tiled_bc_read_bytes(original->console) : 0;
+    const u64 total = short_bc ? short_bc : tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->used_bytes()
         : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
@@ -1858,7 +1859,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
-        if (console) return false;
+        if (console || short_bc) return false;
         state.done = true;
         state.staged = false;
         state.generation = generation;
