@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py wave_collectives <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py killexit <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
@@ -226,7 +227,6 @@ WAVE_LOAD_MESH = wave_load_mesh()
 WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 WAVE_LOAD_REFUSALS = (
     ('different EXEC compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7d28002a'))),
-    ('missing full EXEC reset', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'befe0404'))),
     ('different compare index', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7da80e2a'))),
     ('EXEC write between compare and branch', wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0380', 'befe04c1'))),
     ('branch into load block', wave_load_mesh('bf840009 ' + WAVE_LOAD_PREFIX)),
@@ -248,6 +248,8 @@ WAVE_LOAD_ACCEPTED = (
 )
 # A table load is accepted by the wave block; this one then stops at the register-offset rule of s_load.
 WAVE_LOAD_OTHER_REFUSALS = (
+    ('unmodelled EXEC write before the compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'befe0404')),
+     'slot 57 mesh: s_mov_b64 on a wave mask is not covered'),
     ('ordinary SMEM load with a register offset', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05')),
      "s_load with a register offset through ('table', 1)"),
 )
@@ -338,6 +340,11 @@ s_mov_b64 exec, -1"""
 WAVE_BLOCK_PREFIX = WAVE_LOAD_PREFIX.replace('befe04c1 7da8002a', 'befe04c1 beab0380 7da8002a')
 WAVE_BLOCK_BODY = 'f4200b08 520001e4 f4080c05 fa000000 802d8429 bf8cc07f f4200a08 5a0001dc 7d100ec1 7e0e02f2 bf8cc07f'
 WAVE_BLOCK_MESH = wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY)
+WAVE_LOAD_OTHER_REFUSALS += (
+    ('unmodelled EXEC write within the reset range',
+     wave_load_mesh(WAVE_BLOCK_PREFIX.replace('beab0380', 'befe0404'), WAVE_BLOCK_BODY),
+     'slot 57 mesh: s_mov_b64 on a wave mask is not covered'),
+)
 WAVE_BLOCK_REFUSALS = (
     ('VCC live at the join', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY, exports='7e280228 022a0e80')),
     ('src_scc in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beaf03fd')),
@@ -348,8 +355,35 @@ WAVE_BLOCK_REFUSALS = (
     # s_cmp_eq_u32 s43, 0; s_cbranch_scc1 to the execz branch: that path never runs the compare.
     ('branch from between the reset and the compare past the compare',
      wave_load_mesh(WAVE_BLOCK_PREFIX.replace('beab0380', 'beab0380 bf06802b bf850002'), WAVE_BLOCK_BODY)),
-    ('EXEC write between the reset and the compare',
-     wave_load_mesh(WAVE_BLOCK_PREFIX.replace('beab0380', 'befe0404'), WAVE_BLOCK_BODY)),
+)
+
+
+# The loaded word decides whether any active lane sets VCC. The inner scalar write
+# must reach a provoking thread outside EXEC when the wave takes the fall-through.
+INNER_VCC_ASM = NEST_SCC_ASM.replace('s_cmp_eq_u32 s43, 0\ns_cbranch_scc1 1',
+                                     'v_cmp_gt_u32_e32 vcc, s43, v0\ns_cbranch_vccz 1')
+INNER_VCC_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf860001 bea8032b 7e0e02f2')
+
+# The second bound alone would let wave 1 load from beyond the SRV. Keep the
+# earlier EXEC narrowing to threads 0..2 when applying this bound.
+NO_RESET_ASM = WAVE_LOAD_ASM.replace('s_mov_b32 s42, 6', 's_mov_b32 s42, 0x46').replace(
+    's_mov_b64 exec, -1\nv_cmpx', 'v_cmp_gt_u32_e32 vcc, 3, v0\ns_and_saveexec_b64 s[44:45], vcc\nv_cmpx')
+NO_RESET_MESH = wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0386', 'beaa03ff 00000046').replace(
+    'befe04c1', '7d880083 beac246a'))
+
+# Select lane 1, which holds red 1.0. Lane 0 and the inactive provoking threads
+# hold 0 in v7, and the scalar load gives s40 a different value.
+FIRST_LANE_ASM = WAVE_LOAD_ASM.replace(
+    's_mov_b64 exec, -1\nv_cmpx', 'v_cmp_lt_u32_e32 vcc, 0, v0\ns_and_saveexec_b64 s[44:45], vcc\nv_cmpx').replace(
+    's_cbranch_execz 4', 's_cbranch_execz 5').replace(
+    's_waitcnt lgkmcnt(0)\ns_mov_b64', 's_waitcnt lgkmcnt(0)\nv_readfirstlane_b32 s40, v7\ns_mov_b64')
+FIRST_LANE_MESH = wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', '7d820080 beac246a'),
+                                 WAVE_LOAD_BODY + ' 7e500507')
+
+WAVE_COLLECTIVES = (
+    ('inner VCC branch', INNER_VCC_ASM, INNER_VCC_MESH),
+    ('no full EXEC reset', NO_RESET_ASM, NO_RESET_MESH),
+    ('readfirstlane broadcast', FIRST_LANE_ASM, FIRST_LANE_MESH),
 )
 
 
@@ -797,6 +831,10 @@ def binary(mc):
     nest_execz = mesh.replace('s_mov_b32 s13, s8', NEST_EXECZ_ASM + '\ns_mov_b32 s13, s8')
     nest_execz = nest_execz.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('nested if wave block words match llvm-mc', assemble(mc, nest_execz), NEST_EXECZ_MESH)
+    for label, assembly, words in WAVE_COLLECTIVES:
+        fixture = mesh.replace('s_mov_b32 s13, s8', assembly + '\ns_mov_b32 s13, s8')
+        fixture = fixture.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+        expect(label + ' words match llvm-mc', assemble(mc, fixture), words)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -859,7 +897,7 @@ def rasterise(points, colours, indices, verts, prims):
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
-                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True):
+                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -880,7 +918,7 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     for slot, count in enumerate((len(triangles), 128)):
         struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
 
-    bound, old = 6, 64
+    old = 64
     green = green or (lambda tid: 255 if tid < bound else 0)   # the green a thread ends with (v7 exported)
     wave_red = {}
     reads = []
@@ -971,6 +1009,24 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
             return 77
         expect(what, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
         print('%s: %d pixels differ from the reference' % (what, mismatches))
+    return 0
+
+
+def draw_wave_collectives(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    cases = (
+        (INNER_VCC_MESH, 'inner VCC branch falls through', {}),
+        (INNER_VCC_MESH, 'inner VCC branch taken', {'word': 0.0, 'rule': lambda _: 64}),
+        (NO_RESET_MESH, 'no full EXEC reset', {'bound': 3}),
+        (FIRST_LANE_MESH, 'readfirstlane broadcast',
+         {'word': 0.25, 'rule': lambda _: 255, 'green': lambda tid: 255 if 0 < tid < 6 else 0}),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        for mesh, label, options in cases:
+            status = draw_wave_load(tmp, renderer, adapter, mesh, label, **options)
+            if status:
+                return status
     return 0
 
 
@@ -1371,6 +1427,8 @@ def main(argv):
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['wave_collectives'] and len(argv) == 5:
+        status = draw_wave_collectives(*argv[2:])
     elif argv[1:2] == ['depth'] and len(argv) == 5:
         status = draw_depth(*argv[2:])
     elif argv[1:2] == ['killexit'] and len(argv) == 5:

@@ -1638,6 +1638,8 @@ def mesh_wave_block_scalar(name, asm):
     an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
     if name in MESH_WAVE_BLOCK_LOADS:
         pass
+    elif name == 'v_readfirstlane_b32':
+        return bool(re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm))
     elif name.startswith('v_cmp_'):
         # A per-lane compare whose only scalar effect is its VCC destination; the caller refuses a VCC live at the join.
         return not re.search(r'\b(exec|m0|src_)', asm) and scalar_effects(name, asm)[2] <= VCC_KEYS
@@ -1790,13 +1792,15 @@ def mesh_constant_trip(ins, header, latch, offsets):
     return (trips,) if trips is not None else None
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
     - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
-    - Code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+    - Code up to the next barrier. Its only read of the exchanged v5 may be a v_readfirstlane_b32 under exec = -1.
+      Other first-lane reads require a defined source and wave-coherent control flow. Wave-load blocks can use
+      the original prefix test or vote on the current EXEC after an unsigned thread comparison.
       After a full EXEC reset, an unsigned GT or LT EXEC compare with defined operands may guard a forward
       execz branch to that barrier. The skipped instructions only affect active lanes or dead scalars, and
       both exchange arms replace EXEC, so a per-lane skip has the same visible effects as a per-wave skip.
@@ -1962,6 +1966,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         _, must, may = scalar_effects(name, asm)
         return not any(live_at_join(reg, join) for reg in must | may)
 
+    inner_vcc = set()
+    load_branches = {}
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
@@ -1975,9 +1981,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
-                    match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    prefix = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    vector_limit = re.fullmatch(r'v_cmpx_lt_u32_e32 v(\d+), v\d+', ins[compare][3])
                     # Inner forward scalar branches of the block (decided by SCC) stay inside it: the translation takes them
                     # per lane, which is the wave's decision when the SCC is wave-uniform (the emitter checks that).
+                    vcc_edges = {
+                        i for i in range(source + 2, target)
+                        if ins[i][2] in MESH_VCC_BRANCHES and i < edges[i] <= target and i not in targets
+                        and re.fullmatch(r'v_cmp_\w+_e(?:32|64) vcc(?:_lo)?, .+', ins[i - 1][3])
+                    }
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
@@ -2000,7 +2012,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                             continue
                         nested |= {i - 1, i, edges[i]}
                         nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
-                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    inner += sorted(vcc_edges | {i for i in nested if ins[i][2] == 's_cbranch_execz'})
                     scalar = [i for i in range(source + 1, target)
                               if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
@@ -2013,16 +2025,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         written |= {reg for reg in must | may if re.fullmatch(r's\d+', reg)}
                         masks |= ((must | may) & VCC_KEYS) | (must & {'scc'})  # every s_ op may-writes SCC
                     live = sorted((reg for reg in written if live_at_join(reg, target)), key=lambda r: int(r[1:]))
-                    # EXEC is full at the compare when a reset precedes it with no EXEC or VCC use and no branch
-                    # target in between.
+                    # Keep the prefix fast path for its original reset shape. Otherwise vote on the
+                    # actual EXEC bits after the compare, including any earlier narrowing.
                     reset = compare - 1
                     while (reset > a_end and ins[reset][3] != 's_mov_b64 exec, -1'
                            and not writes_exec(ins[reset][2], parse(ins[reset][3])[1])
                            and not re.search(r'\b(exec|vcc)', ins[reset][3])):
                         reset -= 1
                     # A branch may land between the reset and the compare only from inside that range, none may
-                    # land between the compare and the execz branch, and the block itself is straight-line code.
-                    entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
+                    # land between the compare and the execz branch.
+                    full_reset = ins[reset][3] == 's_mov_b64 exec, -1'
+                    entries = [s for s, d in edges.items()
+                               if (full_reset and reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
                     def branch_kinds():
                         """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
@@ -2035,12 +2049,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
-                        ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
-                        ('compare is not v_cmpx_gt_u32 sN, vK', not match),
+                        ('compare is not a supported unsigned thread comparison', not (prefix or vector_limit)),
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
+                        ('an unsupported branch inside the block (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
@@ -2048,8 +2061,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     if causes:
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
-                    load_compares[compare] = int(match[2])
-                    wave_loads[ins[source][0]] = (ins[compare][0], match[1],
+                    inner_vcc.update(vcc_edges)
+                    load_compares[compare] = int(prefix[2] if prefix else vector_limit[1])
+                    load_branches.setdefault(compare, []).append(source)
+                    wave_loads[ins[source][0]] = (ins[compare][0], prefix[1] if prefix and full_reset else None,
                                                   tuple(ins[i][0] for i in loads), tuple(live))
                     continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
@@ -2163,7 +2178,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 if mask != index - 1 or not cmp or int(cmp[2]) != thread:
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
-            if name in MESH_VCC_BRANCHES:
+            if index in inner_vcc:
+                wave_votes[off] = ('vcc', name.endswith('z'))
+            elif name in MESH_VCC_BRANCHES:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                 vcc_branches[off] = vcc_compares
@@ -2182,11 +2199,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             raise Unsupported('slot 57 mesh: lane spills are not covered')
         keep = ins[index]
         if base_name == 'v_readfirstlane_b32':
-            if (not a_end <= index < count_at or asm != 'v_readfirstlane_b32 %s, v5' % ops[0]
-                    or mask is not None or 5 not in stale):
-                raise Unsupported('slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered')
-            keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
-            ops = ops[:1]
+            if (a_end <= index < count_at and asm == 'v_readfirstlane_b32 %s, v5' % ops[0]
+                    and mask is None and 5 in stale):
+                keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
+                ops = ops[:1]
+            elif re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm):
+                keep = (off, size, 'x2w_mesh_firstlane', 'x2w_mesh_firstlane ' + ', '.join(ops))
+            else:
+                raise Unsupported('slot 57 mesh: unsupported v_readfirstlane_b32 operands')
         writes_s = set()
         if not base_name.startswith(('v_cmpx', 'exp', 'ds_write', 'buffer_store')):
             for tok in destinations(name, ops):
@@ -2195,7 +2215,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     writes_s.update(range(r[1], r[2] + 1))
         if 3 in writes_s or writes_s & lane:
             raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
-        if (writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group'
+        if (writes_s and name.startswith('v_') and keep[2] not in ('x2w_mesh_group', 'x2w_mesh_firstlane')
                 and base_name != 'v_readlane_b32'):
             raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
         # Only the wave index of s3 is modelled.
@@ -2239,8 +2259,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 raise Unsupported(exchange_branch_refusal)
             mask = 'count_entry'
         elif index in load_compares:
-            if mask is not None or thread != load_compares[index] or thread in stale:
+            if thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
+            for source in load_branches[index]:
+                branch_off = ins[source][0]
+                compare_off, bound, loads, live = wave_loads[branch_off]
+                if mask is not None or bound is None:
+                    wave_loads[branch_off] = (compare_off, None, loads, live)
+                    wave_votes[branch_off] = ('exec', True)
             mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
@@ -2409,10 +2435,12 @@ class Stage:
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
+            self.mesh_wave_votes = {}
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
+                                     self.mesh_wave_loads, self.mesh_wave_votes)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
@@ -3627,7 +3655,9 @@ class Stage:
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
         wave_limits = getattr(self, 'mesh_wave_limits', {})
         wave_loads = getattr(self, 'mesh_wave_loads', {})
-        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
+        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values() if bound is not None}
+        mesh_votes = getattr(self, 'mesh_wave_votes', {})
+        mesh_reads = {off for off, _, name, _ in self.ins if name == 'x2w_mesh_firstlane'}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
@@ -3660,8 +3690,8 @@ class Stage:
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
         self.mesh_allocation_block = None
-        splits = set(targets)
-        if getattr(self, 'kind', None) == 'ms' and targets:
+        splits = targets | mesh_reads
+        if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads):
             at = next(i for i, item in enumerate(self.ins) if item[2] == 'x2w_mesh_counts')
             self.mesh_allocation_block = self.ins[at][0]
             # The exchange and its EXEC restore always run. Keep the group barrier and allocation outside
@@ -3805,6 +3835,7 @@ class Stage:
             falls = True
             start = 0
             raised_unsupported = None
+            self.mesh_collect_reads, self.mesh_collect_votes = {}, {}
             self.exec_keep = {}  # registers whose body-arm descriptor symbol is kept after an execz join (rule R1)
 
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
@@ -3972,7 +4003,7 @@ class Stage:
                                     raise Unsupported(execz_effects)
                                 self.u(dst)  # declare the variable; refuses a symbol with no run-time value
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
-                                        or off in wave_limits or off in wave_loads)
+                                        or off in wave_limits or off in wave_loads or off in mesh_votes)
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -4014,7 +4045,11 @@ class Stage:
                     term = self.one(name, asm)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
-                    if off in wave_loads:
+                    if off in mesh_votes:
+                        word, zero = mesh_votes[off]
+                        self.mesh_collect_votes[start] = word
+                        term = ('branch', 'mesh_vote %s 0u' % ('==' if zero else '!='), term[2])
+                    elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
                     if refusals is None:
@@ -4076,6 +4111,8 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+        if mesh_reads or mesh_votes:
+            self.check_mesh_collectives(mesh_reads | mesh_votes.keys(), branches)
         if self.lines:
             self.blocks.append((start, self.lines, None))
         for at, reason in self.quad_flow_refusals(branches, targets):
@@ -8660,6 +8697,31 @@ class Stage:
         # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
         self.sym[reg_range(ops[0])[1]] = ('the mesh group index',)
 
+    def op_x2w_mesh_firstlane(self, ops, mods):
+        self.mesh_collect_reads[self.pc] = self.u(ops[1])
+        self.set_s(reg_range(ops[0])[1], 'mesh_first', uniform=True)
+
+    def check_mesh_collectives(self, sites, branches):
+        # A logical wave must reach a collective with all its lanes or none. A lane-only
+        # branch is safe before the collective if both paths reconverge there or both miss it.
+        offsets = [off for off, _, _, _ in self.ins]
+        indices = {off: i for i, off in enumerate(offsets)}
+        jumps = dict(branches)
+        for site in sites:
+            if offsets.count(site) != 1 or any(target <= source for source, target in branches):
+                raise Unsupported('slot 57 mesh: a wave collective in a loop is not covered')
+            at = indices[site]
+            reach = [0] * (len(offsets) + 1)
+            reach[at] = 1
+            for i in range(at - 1, -1, -1):
+                off, _, name, _ = self.ins[i]
+                paths = [] if name in ('s_branch', 's_endpgm') else [reach[i + 1]]
+                if off in jumps:
+                    paths.append(reach[indices[jumps[off]]])
+                if off in self.divergent_branches and paths and (min(paths) != max(paths) or 2 in paths):
+                    raise Unsupported('slot 57 mesh: a wave collective can be bypassed by part of a wave')
+                reach[i] = paths[0] if paths and min(paths) == max(paths) else 2 if paths else 0
+
     def op_x2w_mesh_counts(self, ops, mods):
         prims, verts, temporary = (reg_range(tok)[1] for tok in ops)
         self.emit('if (tid == 0u) { lds[0] = %s; lds[1] = %s; }' % (self.S(prims), self.S(verts)))
@@ -10149,12 +10211,25 @@ class Stage:
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(self.blocks):
+            if off in getattr(self, 'mesh_collect_reads', {}):
+                value = self.mesh_collect_reads[off]
+                out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
+                           'pc == %d ? %s : 0u, false);' % (i, i, i, value))
             if off == getattr(self, 'mesh_allocation_block', None):
                 out.append('    {')
             else:
                 attribute = '[branch] ' if off in wave_load_blocks else ''
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
+            if off in getattr(self, 'mesh_collect_reads', {}):
+                out.append('        uint mesh_first = mesh_first_%d;' % i)
             out += ['        ' + line for line in lines]
+            if off in getattr(self, 'mesh_collect_votes', {}):
+                word = self.mesh_collect_votes[off]
+                out += ['    }',
+                        '    uint mesh_vote_%d = mesh_first_active(tid, pc == %d && (%s & 1u) != 0u, 0u, true);'
+                        % (i, i, word),
+                        '    if (pc == %d) {' % i,
+                        '        uint mesh_vote = mesh_vote_%d;' % i]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
                 out.append('        pc = %d;' % nxt)
@@ -10183,7 +10258,7 @@ class Stage:
         if getattr(self, 'uniform_load_temps', None):
             lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in sorted(self.uniform_load_temps)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
-        if getattr(self, 'mesh_wave_loads', {}):
+        if any(bound is not None for _, bound, _, _ in getattr(self, 'mesh_wave_loads', {}).values()):
             lines.append('    bool wave_any = false;')
         if getattr(self, 'used_atomic', None):
             if 'uint' in self.used_atomic:
@@ -11825,8 +11900,29 @@ class MeshPipeline(Pipeline):
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
             lines = [re.sub(r' o\.param\d+ = [^;]*;', '', line) for line in lines]
+        collectives = []
+        if s.mesh_collect_reads or s.mesh_collect_votes:
+            # One logical wave spans 64 guest threads regardless of the desktop wave width.
+            # Every group thread calls each site, including threads whose guest PC skips it.
+            collectives = [
+                'groupshared uint mesh_first_lane[2];',
+                'groupshared uint mesh_lane_value[%d];' % MESH_THREADS,
+                'uint mesh_first_active(uint tid, bool active, uint value, bool vote) {',
+                '    uint wave = tid >> 6u, base = tid & ~63u;',
+                '    if (tid == base) mesh_first_lane[wave] = 64u;',
+                '    mesh_lane_value[tid] = value;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    if (active) InterlockedMin(mesh_first_lane[wave], tid & 63u);',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint first = mesh_first_lane[wave];',
+                # With empty EXEC, the guest read uses lane zero. 64 maps to zero here.
+                '    uint result = vote ? uint(first < 64u) : mesh_lane_value[base + (first & 63u)];',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return result;',
+                '}',
+            ]
         return '\n'.join(
-            self.common() + ['struct VSOut {'] + self.interface(False) + [
+            self.common() + collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
                 % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
@@ -12722,6 +12818,8 @@ LIFTED_REASONS = (
     ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
+    ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),
+    ('mesh57-firstlane', r'^slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
