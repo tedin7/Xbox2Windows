@@ -109,10 +109,10 @@ with tempfile.TemporaryDirectory() as tmp:
                4 in [key for key, _ in G.old_failures(str(d), built)], True)
         (d / G.RETRIED_NAME).write_text('build-0.0\n%016x\n' % 4, encoding='ascii')
         expect('the record of another build is ignored', G.retried_by_build(str(d), built), frozenset())
-        # The last run's use ranks each group: lifted 3 (50), 2 (10), then 1 and 4; then compute 5 (100) before 6.
+        # The last run's use ranks first, in any family: 5 (100), 3 (50), 2 (10); then the unused lifted 1 and 4; then 6.
         fixture(d, built)
         expect('retry order with the last run\'s draws/dispatches',
-               [key for key, _ in G.old_failures(str(d), built, weights={3: 50, 2: 10, 5: 100})], [3, 2, 1, 4, 5, 6])
+               [key for key, _ in G.old_failures(str(d), built, weights={3: 50, 2: 10, 5: 100})], [5, 3, 2, 1, 4, 6])
         # The time cap: no new request after it, the rest is left for the pass after the run.
         called.clear()
         now = [0.0]
@@ -146,6 +146,12 @@ with tempfile.TemporaryDirectory() as tmp:
                       'x2w-render compute census key %016x: 7 dispatches, 7 translated\n' % 2 +
                       'x2w-render key use %016x 1.0 2.0 3\nother line\n' % 1, encoding='utf-8')
     expect('weights from the last run', G.run_weights(str(stderr)), {6: 40, 5: 90, 2: 0})
+    killed = d.parent / ('%s_killed.txt' % d.name)
+    killed.write_text('x2w-render key use compute %016x first 1.0 s last 9.0 s uses 1443\n' % 7 +
+                      'x2w-render key use graphics %016x first 1.0 s last 9.0 s uses 12\n' % 6 +
+                      'x2w-render not drawn key %016x: 40\n' % 6, encoding='utf-8')
+    expect('a run killed before its census ranks by key use; draw lines win', G.run_weights(str(killed)), {7: 1443, 6: 40})
+    killed.unlink()
     expect('no stderr: no weights', G.run_weights(str(d / 'missing.txt')), {})
     started = time.time()
     run = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--retry-lifted', str(d),
@@ -304,6 +310,11 @@ with tempfile.TemporaryDirectory() as tmp:
             (run / 'stderr.txt').write_text(content, encoding='ascii')
             os.utime(run, (100 + index,) * 2)
         expect('newest run with both telemetry types supplies weights', G.run_weights(root), {11: 90})
+        killed_runs = root / 'killed'
+        (killed_runs / 'run_0').mkdir(parents=True)
+        (killed_runs / 'run_0' / 'stderr.txt').write_text(
+            'x2w-render key use graphics 0000000000000001 first 0.0 s last 1.0 s uses 5\n', encoding='ascii')
+        expect('no run has a census: the key-use lines rank', G.run_weights(killed_runs), {1: 5})
     finally:
         G.translate_one = translate
         if saved_retry is None:
