@@ -5,7 +5,7 @@ For the covered numeric SGPR operations, a forward EXECZ branch can use
 fall-through edge each thread updates its scalar state. On the taken edge it
 retains its previous state. The runtime register join selects the value on the
 executed edge for every destination dword. Vector writes keep their per-lane
-EXEC guard. The fallback requires a group of at most 32 threads, a host wave
+EXEC guard. The fallback requires a group of at most 4 threads (the SM 6 minimum host wave), a host wave
 wide enough for the group, and wave-uniform control flow. It uses the existing
 scalar ALU and SMEM emitters.
 

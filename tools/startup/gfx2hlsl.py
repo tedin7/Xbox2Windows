@@ -3805,10 +3805,10 @@ class Stage:
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         # Use the existing wave-uniform branch path only for a compute shader the lane proof rejected.
-        # A group of at most 32 threads fits one compute wave under the runtime's wave model.
+        # At most 4 threads always share one host wave (SM 6 minimum); a larger group could split across waves and vote per wave.
         scalar_vote = (bool(refused) and all(self.execz_scalar_votes.get(at) for at in refused)
                        and all(target > pc for pc, target in branches)
-                       and math.prod(getattr(self.pipe, 'group', (33,))) <= 32)
+                       and math.prod(getattr(self.pipe, 'group', (5,))) <= 4)
         if scalar_vote:
             self.wave_exec = True
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
