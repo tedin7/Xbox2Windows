@@ -43,6 +43,16 @@ def frame_hash(width, height, bgra):
     return hashlib.blake2b(bgra, digest_size=16, key=struct.pack("<II", width, height)).digest()
 
 
+def pick_window(windows):
+    """windows: (handle, title text) of the visible windows of the process, in enumeration order. The window to photograph
+    is the stand-in's output window (its title ends in "- output": the presented picture is shown there), else the first
+    one. The title's own window is another, often wrong-sized window (Run H: a 1920x1080 picture of it)."""
+    for handle, text in windows:
+        if text.endswith("- output"):
+            return handle
+    return windows[0][0]
+
+
 class Series:
     """The periodic frames of one run. Frames are offered in time order and every one is saved, until the file cap is
     reached: a frame identical to the previous one is saved too (a dark loading screen that looks "unchanged" is still a

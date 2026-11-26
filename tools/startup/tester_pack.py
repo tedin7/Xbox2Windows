@@ -33,7 +33,9 @@ MENUS_STEP_S = 6
 MENUS_END_S = 500          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
 BUTTON_A = "4"
-MENUS2_GAP_S = "1"         # between the presses of one cycle; the first press follows the previous wait by the same gap
+MENUS_HOLD_S = "1.5"       # a press is held this long: at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS2_HOLD_S = "1.2"
+MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
 MENUS2_TIMEOUT_S = 90      # a screen that never changes (or loads slower) lets the script go on after this
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
@@ -51,10 +53,11 @@ def menus2_script():
     so nothing is pressed blind while a screen loads. Each press is timed from the previous item (`@+`). A wait that
     times out logs it and the script goes on. Needs render mode, which tester_run.ps1 always uses. The cycle count fills
     the entry limit; the run's own length ends the script."""
-    items = ["%s@%d" % (DPAD_DOWN, MENUS_START_S)]
-    cycle = ["%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S), "%s@+%s" % (BUTTON_A, MENUS2_GAP_S), "wait=%d/%d/go" % (MENUS2_SETTLE_S, MENUS2_TIMEOUT_S)]
+    items = ["%s@%d+%s" % (DPAD_DOWN, MENUS_START_S, MENUS2_HOLD_S)]
+    press = lambda mask: "%s@+%s+%s" % (mask, MENUS2_GAP_S, MENUS2_HOLD_S)
+    cycle = [press(DPAD_DOWN), press(BUTTON_A), "wait=%d/%d/go" % (MENUS2_SETTLE_S, MENUS2_TIMEOUT_S)]
     while len(items) + 1 + len(cycle) <= MAX_ENTRIES:
-        items.append("%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S))   # first down of the cycle
+        items.append(press(DPAD_DOWN))   # first down of the cycle
         items.extend(cycle)
     return ",".join(items)
 
@@ -73,7 +76,7 @@ def input_preset(spec, seconds):
     items = []
     press, at = 0, MENUS_START_S
     while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
-        items.append("%s@%d" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at))
+        items.append("%s@%d+%s" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at, MENUS_HOLD_S))
         press += 1
         at += MENUS_STEP_S
     return ",".join(items)

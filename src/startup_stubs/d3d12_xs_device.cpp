@@ -89,6 +89,7 @@
 #include <array>
 #include <cctype>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2143,7 +2144,22 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    // Also whenever the picture's mean level moved by more than 2 since the last line (a screen change shows in the log
+    // with its time; at most 300 such lines), not only for the first 3 readbacks and every 40th.
+    static double last_logged_mean = -1000;
+    static LONG change_lines;
+    const double mean_level = sum / (3.0 * shown_width * shown_height);
+    const bool periodic = (count > 0 && count <= 3) || count % 40 == 0;
+    const bool moved = std::fabs(mean_level - last_logged_mean) > 2 && change_lines < 300;
+    if (periodic || moved) {
+        if (moved && !periodic) {
+            ++change_lines;
+            log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
+        } else {
+            log("x2w-render presented %s", shown_note);
+        }
+        last_logged_mean = mean_level;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
