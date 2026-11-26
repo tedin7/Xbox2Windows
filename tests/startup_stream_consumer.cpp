@@ -219,7 +219,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
-    const bool token_pair = mode == "dispatch-view-token-srv" || mode == "dispatch-view-token-uav";
+    const bool placed_token = mode == "dispatch-view-token-placed";
+    const bool token_pair = mode == "dispatch-view-token-srv" || mode == "dispatch-view-token-uav" || placed_token;
     constexpr UINT view_offset = 16, buffer_bytes = words * sizeof(UINT);
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -299,11 +300,25 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     void* intermediate = nullptr;
     void* upload = nullptr;
     void* readback = nullptr;
+    void* later_copy = nullptr;
     StreamWord read_token = 0;
     if (token_pair) {
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, buffer_bytes + view_offset, 1, 1, 1,
             DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
-        intermediate = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+        if (placed_token) {
+            // Both buffers are placed (device slot 133) over memory the desktop cannot alias, so each keeps a desktop copy and
+            // title memory that is stale; the title memory of the token's buffer holds a sentinel the GPU never wrote.
+            auto* const stale = reinterpret_cast<UINT*>(reinterpret_cast<UINT64>(memory) + 0x8000);
+            for (UINT i = 0; i < (buffer_bytes + view_offset) / sizeof(UINT); ++i) stale[i] = 0xdddddddd;
+            D3D12_RESOURCE_DESC plain = desc;
+            plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(stale), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                    word(&__uuidof(ID3D12Resource)), word(&intermediate)))) ||
+                FAILED(static_cast<HRESULT>(invoke(device, 133, word(reinterpret_cast<void*>(reinterpret_cast<UINT64>(memory) + 0xc000)),
+                    word(&plain), D3D12_RESOURCE_STATE_COMMON, 0, word(&__uuidof(ID3D12Resource)), word(&later_copy))))) return 85;
+        } else {
+            intermediate = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+        }
         desc.Flags = D3D12_RESOURCE_FLAG_NONE;
         upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
         readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -427,8 +442,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu), reinterpret_cast<const void*>(read_token), 16);
         std::memcpy(reinterpret_cast<void*>(cpu + 16), descriptors[1], sizeof(descriptors[1]));
         invoke(list, 14, 3, 2, 2);
-        invoke(list, 15, word(readback), 0, word(placed[1]), 0, buffer_bytes);
-        invoke(list, 15, word(readback), buffer_bytes, word(intermediate), 0, view_offset);
+        if (placed_token) {
+            // A later copy of the token's buffer must carry what the dispatch wrote, not the stale title memory.
+            invoke(list, 15, word(later_copy), 0, word(intermediate), 0, buffer_bytes + view_offset);
+            invoke(list, 15, word(readback), 0, word(later_copy), view_offset, buffer_bytes);
+            invoke(list, 15, word(readback), buffer_bytes, word(later_copy), 0, view_offset);
+        } else {
+            invoke(list, 15, word(readback), 0, word(placed[1]), 0, buffer_bytes);
+            invoke(list, 15, word(readback), buffer_bytes, word(intermediate), 0, view_offset);
+        }
     }
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
