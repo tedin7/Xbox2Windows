@@ -32,8 +32,9 @@ param(
     [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
     [switch]$NoNullIdentity,                   # with -Render: do not set X2W_DRAW_NULL_IDENTITY (an empty buffer slot then keeps its real address in the log)
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
-    [int]$TraceFiles = 1,                      # 1 = debug_launch.py lists every file open in files.txt (--trace-files 1; slow on a hard disk), 0 = only denied/redirected ones
+    [int]$TraceFiles = 1,                      # 1 = the debugger lists every file open in files.txt (--trace-files 1; slow on a hard disk), 0 = only denied/redirected ones
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [double]$CaptureMenuEvery = 0,             # --capture-menu-every: pictures this often until the first loading-like picture (0 = off), then every -CaptureEvery
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
     [int]$CommitHeadroomMiB = 0,               # --commit-headroom-mib: end the run cleanly when the system commit has less than this free (0 = off)
     [int]$CommitWarnMiB = 0,                   # --commit-warn-mib: log a warning when the system commit has less than this free (0 = off)
@@ -97,15 +98,13 @@ $translator = $null
 if ($Translate -and -not $Render) { Write-Warning "-Translate needs -Render (no shader cache without it); ignored" }
 if ($Translate -and $Render) {
     $revisionWarned = & $checkRevision
-    # translate.txt lines end with [t=N s], seconds since the title started: the watcher reads title.pid's time.
-    $env:X2W_TITLE_START_FILE = Join-Path $LogDir "title.pid"
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
         -RedirectStandardOutput (Join-Path $LogDir "translate.txt") -RedirectStandardError (Join-Path $LogDir "translate_err.txt")
     # The translator and its process pool (every core but one) must never run above the title. A venv or launcher python is a
     # process tree (launcher + real interpreter), so the class is set on the root and on every descendant, for about two
     # seconds so a child that appears a little later is caught; the pool workers the interpreter creates later inherit it.
-    $lowerTree = {
+    $treeOf = {
         param([int]$RootId)
         $ids = @($RootId)
         for ($i = 0; $i -lt $ids.Count; $i++) {
@@ -113,6 +112,11 @@ if ($Translate -and $Render) {
                 if ($ids -notcontains [int]$child.ProcessId) { $ids += [int]$child.ProcessId }
             }
         }
+        return $ids
+    }
+    $lowerTree = {
+        param([int]$RootId)
+        $ids = @(& $treeOf $RootId)
         foreach ($id in $ids) {
             try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
         }
@@ -127,6 +131,7 @@ $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
+if ($CaptureEvery -ne 0 -and $CaptureMenuEvery -ne 0) { $captureArgs += @("--capture-menu-every", "$CaptureMenuEvery") }
 if ($CommitHeadroomMiB -gt 0) { $captureArgs += @("--commit-headroom-mib", "$CommitHeadroomMiB") }
 if ($CommitWarnMiB -gt 0) { $captureArgs += @("--commit-warn-mib", "$CommitWarnMiB") }
 try {
@@ -143,9 +148,16 @@ try {
     if ($translator -and -not $translator.HasExited) {
         # Stop the workers as well. The watcher or a worker can exit during taskkill;
         # in Windows PowerShell 5.1 its redirected stderr would then abort the launcher.
+        $treeIds = @(& $treeOf $translator.Id)
         & {
             $ErrorActionPreference = "Continue"
             & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null
+        }
+        # taskkill returns before the processes are gone, and the watcher and its workers hold translate.txt and
+        # translate_err.txt open: wait until every one has ended, so the log files are free when this script exits
+        # (a caller that removes the run folder right after would otherwise meet a sharing violation).
+        foreach ($id in $treeIds) {
+            try { [void](Get-Process -Id $id -ErrorAction Stop).WaitForExit(10000) } catch { }
         }
     }
 }

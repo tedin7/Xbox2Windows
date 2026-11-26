@@ -122,8 +122,20 @@ v_mov_b32_dpp v2, v1 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf
 exp mrt0 v2, v1, v0, v0 done vm
 s_endpgm
 ''', '800380be008006bf010085bf8102007e7e0afebeff0002165d9b0000fa02047e010000ff0f1800f802010000000081bf'),
+    # A quad min inside an if: the read meets the EXEC the saveexec narrowed (refused; the reason names the write).
+    'MIN_IN_IF': ('''s_wqm_b64 exec, exec
+v_mul_u32_u24_e32 v1, 0x9b5d, v0
+v_mov_b32_e32 v2, 0
+v_cmp_gt_u32_e32 vcc_lo, 0x100, v1
+s_and_saveexec_b64 s[4:5], vcc
+v_min_u32_dpp v2, v1, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+s_or_b64 exec, exec, s[4:5]
+exp mrt0 v2, v1, v0, v0 done vm
+s_endpgm
+''', '7e0afebeff0002165d9b00008002047eff02887d000100006a2484befa02042601b100ff7e04fe880f1800f802010000000081bf'),
 }
 REFUSALS = {
+    'MIN_IN_IF': 'v_min_u32_dpp requires a straight-line pixel shader with entry EXEC: EXEC written at +0x18 by s_and_saveexec_b64',
     'VCC_LOOP': 's_cbranch_vccnz at +0x24 is not proven wave-uniform',
     'MASK_SCC_LOOP': 's_cbranch_scc1 at +0x28 is not proven wave-uniform',
     'EXEC_IN_LOOP': 'the EXEC write at +0x24 reaches it',

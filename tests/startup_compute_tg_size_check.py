@@ -6,6 +6,9 @@
                                         translate, compile with DXC cs_6_0, dispatch and compare all 320 words
   control <dropped-base|swapped-mask> <dxc> <offscreen_check> <warp|hardware>
                                         mutated translation must mismatch on readback
+  waves-dispatch <dxc> <offscreen_check> <warp|hardware>
+                                        64 threads (two wave32 waves): every thread stores its wave-ID bits and the scc select
+  waves-control <wave-id-zero|wave-width-16> <dxc> <offscreen_check> <warp|hardware>
 
 For groups of at most 32 threads (one wave), TG_SIZE[11:6] (wave ID, mask 0xfc0) is identically 0.
 TG_SIZE sits in the SGPR immediately following USER_SGPR and any enabled TGID_X/Y/Z SGPRs.
@@ -176,8 +179,41 @@ EXPECTED_MAIN_ASM = [
 ]
 
 
-def translate(code=MAIN_PROGRAM, rsrc2=RSRC2, group=GROUP):
-    return G.ComputePipeline(code, root_blob(), rsrc2, group)
+# Multi-wave variant: 64 threads per group (two wave32 waves), TG_SIZE[11:6] is the wave ID. The program is stated to be wave32
+# by the caller (wave_size=32), exactly as the AOT path does. Each thread stores uint4(wave bits, 17 or 42 by scc, wave bits, index).
+WAVES_GROUP = (8, 4, 2)
+WAVES_DISPATCH_GROUPS = (1, 1, 1)
+INLINE_8 = 136
+WAVES_PROGRAM = b''.join([
+    sop1(S_MOV_B32, 10, 6),
+    sop1(S_MOV_B32, 11, INLINE_0),
+    S_LOAD_X8_S12_S10,
+    sop2(S_AND_B32, 20, 8, LIT, 0xfc0),
+    sop2(S_CSELECT_B32, 23, INLINE_17, INLINE_42),
+    vop3(V_MAD_U32_U24, 3, 256 + 2, INLINE_4, 256 + 1),
+    vop3(V_MAD_U32_U24, 3, 256 + 3, INLINE_8, 256 + 0),
+    sop2(S_LSHL_B32, 24, 7, INLINE_6),
+    vop2(V_ADD_NC_U32, 11, 24, 3),
+    vop2(V_LSHLREV_B32, 4, INLINE_4, 11),
+    vop1(V_MOV_B32, 8, 20),
+    vop1(V_MOV_B32, 9, 23),
+    vop1(V_MOV_B32, 10, 20),
+    S_WAITCNT_LGKM0,
+    BUFFER_STORE_X4_V8_V4_S16,
+    S_ENDPGM,
+])
+
+
+def waves_expected_words():
+    out = [SENTINEL] * WORDS
+    for lane in range(64):
+        wave_bits = (lane >> 5) << 6
+        out[4 * lane:4 * lane + 4] = [wave_bits, 17 if wave_bits else 42, wave_bits, lane]
+    return out
+
+
+def translate(code=MAIN_PROGRAM, rsrc2=RSRC2, group=GROUP, wave_size=None):
+    return G.ComputePipeline(code, root_blob(), rsrc2, group, wave_size=wave_size)
 
 
 def expected_words():
@@ -249,10 +285,25 @@ def check_controls():
     hi_hlsl = translate(code=hi_prog).hlsl_cs()
     assert '    v8 = 0x00000000u;' in hi_hlsl, hi_hlsl
 
-    # 4. >32 threads per group with TG_SIZE_EN is refused.
+    # 4. >32 threads per group with TG_SIZE_EN is refused unless the program is wave32 (stated or proved) and whole waves.
     for bad_group in ((8, 4, 2), (33, 1, 1), (64, 1, 1)):
         refused('TG_SIZE_EN requires at most 32 threads per group',
                 lambda g=bad_group: translate(code=S_ENDPGM, group=g))
+    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(33, 1, 1), wave_size=32))
+    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(8, 4, 2), wave_size=64))
+    wave_and = sop2(S_AND_B32, 20, 8, LIT, 0xfc0) + S_ENDPGM
+    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=wave_and, group=(8, 4, 2)))  # no wave size known
+    waves_hlsl = translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32).hlsl_cs()
+    assert '    s20 = (((tid.x + 8u * (tid.y + 4u * tid.z)) >> 5u) << 6u);\n    scc = s20 != 0u;' in waves_hlsl, waves_hlsl
+    waves_pipe = translate(code=wave_and, group=(8, 4, 2), wave_size=32)
+    assert not waves_pipe.cs.uniform_source('s20') and waves_pipe.cs.scc_uniform is False
+    # A program that writes exec_lo with a 32-bit op proves wave32; a 64-bit exec form refuses; no exec op states nothing.
+    assert G.wave32_exec_proof([(0, 4, 's_mov_b32', 's_mov_b32 exec_lo, -1')])
+    assert G.wave32_exec_proof([(0, 4, 's_and_saveexec_b32', 's_and_saveexec_b32 s4, vcc_lo')])
+    assert not G.wave32_exec_proof([(0, 4, 's_mov_b32', 's_mov_b32 s4, exec_lo')])  # a read of exec_lo states nothing
+    assert not G.wave32_exec_proof([(0, 4, 's_mov_b64', 's_mov_b64 exec, -1')])
+    assert not G.wave32_exec_proof([(0, 4, 's_mov_b32', 's_mov_b32 exec_lo, -1'), (4, 4, 's_mov_b64', 's_mov_b64 exec, -1')])
+    assert not G.wave32_exec_proof([(0, 4, 's_endpgm', 's_endpgm')])
 
     # 5. Disallowed reads of TG_SIZE are refused.
     bad_tg_reads = [
@@ -357,32 +408,48 @@ CONTROL_MISMATCH = {
     'swapped-mask': 'word=8 expected=00000001 actual=00000002',
 }
 
+# Multi-wave variant (64 threads = two wave32 waves, TG_SIZE[11:6] is the wave ID): the wave ID of a thread is its flat index / 32.
+WAVE_ID_LINE = 's20 = (((tid.x + 8u * (tid.y + 4u * tid.z)) >> 5u) << 6u);'
+WAVES_CONTROLS = {
+    # every thread gets wave 0: thread 32's record shows 0 where wave bits 0x40 belong
+    'wave-id-zero': (WAVE_ID_LINE, 's20 = 0u;'),
+    # waves of 16 threads instead of 32: thread 16 is wrongly in wave 1
+    'wave-width-16': ('>> 5u) << 6u);', '>> 4u) << 6u);'),
+}
+WAVES_MISMATCH = {
+    'wave-id-zero': 'word=128 expected=00000040 actual=00000000',
+    'wave-width-16': 'word=64 expected=00000000 actual=00000040',
+}
 
-def mutate(hlsl, control):
-    old, new = CONTROLS[control]
+
+def mutate(hlsl, control, controls=None):
+    old, new = (controls or CONTROLS)[control]
     assert hlsl.count(old) == 1, (control, hlsl)
     return hlsl.replace(old, new)
 
 
-def check_dispatch(dxc, runner, adapter, control=None):
+def check_dispatch(dxc, runner, adapter, control=None, waves=False):
     runner = str(Path(runner).resolve())
     out = ROOT / 'out'
     out.mkdir(exist_ok=True)
-    hlsl = translate().hlsl_cs()
+    controls, mismatch = (WAVES_CONTROLS, WAVES_MISMATCH) if waves else (CONTROLS, CONTROL_MISMATCH)
+    groups, group, expected = (WAVES_DISPATCH_GROUPS, WAVES_GROUP, waves_expected_words()) if waves else (
+        DISPATCH_GROUPS, GROUP, expected_words())
+    hlsl = (translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32) if waves else translate()).hlsl_cs()
     if control:
-        if control not in CONTROLS:
+        if control not in controls:
             raise SystemExit(f'unknown control {control!r}')
-        hlsl = mutate(hlsl, control)
+        hlsl = mutate(hlsl, control, controls)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         d = Path(tmp)
         src, cso, case = d / 'tg_size.hlsl', d / 'tg_size.cso', d / 'tg_size.case'
         src.write_text(hlsl, encoding='ascii')
         subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-        gx, gy, gz = DISPATCH_GROUPS
+        gx, gy, gz = groups
         constants = [0] * 16
         case.write_bytes(
             struct.pack('<I', gx | (gy << 8) | (gz << 16))
-            + struct.pack('<%dI' % WORDS, *expected_words())
+            + struct.pack('<%dI' % WORDS, *expected)
             + struct.pack('<16I', *constants)
         )
         run = subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)],
@@ -399,7 +466,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
         if control:
             first = diagnostics[:1]
             if (run.returncode != 1 or not any('expected=' in line for line in diagnostics)
-                    or first != [CONTROL_MISMATCH[control]]):
+                    or first != [mismatch[control]]):
                 raise AssertionError(
                     'control %s: unexpected result (exit %d) %s' % (control, run.returncode, run.stderr)
                 )
@@ -408,7 +475,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             raise AssertionError('tg_size dispatch: %s' % (run.stderr or 'exit %d' % run.returncode))
         else:
             print('tg_size dispatch: all %d words match (%dx%dx%d groups x %dx%dx%d threads)' % (
-                WORDS, gx, gy, gz, *GROUP))
+                WORDS, gx, gy, gz, *group))
     return 0
 
 
@@ -419,5 +486,9 @@ if __name__ == '__main__':
         sys.exit(check_dispatch(*sys.argv[2:]))
     elif len(sys.argv) == 6 and sys.argv[1] == 'control':
         sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2]))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'waves-dispatch':
+        sys.exit(check_dispatch(*sys.argv[2:], waves=True))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'waves-control':
+        sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2], waves=True))
     else:
         sys.exit(__doc__)

@@ -95,6 +95,10 @@ int overlapping_opens()
 int main(int argc, char** argv)
 {
     const char* mode = argc > 1 ? argv[1] : "report";
+    char env_mode[32];  // a debugger-hosted run passes no arguments: X2W_LAUNCH_PROBE_MODE / _CODE / _MS stand in for them
+    if (argc <= 1 && GetEnvironmentVariableA("X2W_LAUNCH_PROBE_MODE", env_mode, sizeof(env_mode)) && env_mode[0]) mode = env_mode;
+    char env_code[16];
+    const int env_exit = GetEnvironmentVariableA("X2W_LAUNCH_PROBE_CODE", env_code, sizeof(env_code)) ? std::atoi(env_code) : 0;
     char from_env[16]{};
     if (argc == 1 && GetEnvironmentVariableA("X2W_LAUNCH_PROBE_MODE", from_env, sizeof(from_env))) mode = from_env;
     if (std::strcmp(mode, "overlap") == 0) return overlapping_opens();
@@ -102,11 +106,15 @@ int main(int argc, char** argv)
         stream(stdout, "launch-probe stdout\n");
         stream(stderr, "launch-probe stderr\n");
         write_trap_log("x2w-trap launch-probe\n");
-        return argc > 2 ? std::atoi(argv[2]) : 0;
+        return argc > 2 ? std::atoi(argv[2]) : env_exit;
+    }
+    if (std::strcmp(mode, "crash") == 0) {  // an access violation nobody handles: the title ends with exception code 0xC0000005
+        *static_cast<volatile int*>(nullptr) = 1;
+        return 0;
     }
     if (std::strcmp(mode, "sleep") == 0) {
         stream(stdout, "launch-probe sleeping\n");
-        Sleep(static_cast<DWORD>(argc > 2 ? std::atoi(argv[2]) : 30000));
+        Sleep(static_cast<DWORD>(argc > 2 ? std::atoi(argv[2]) : 60000));
         return 0;
     }
     if (std::strcmp(mode, "allocate") == 0) {

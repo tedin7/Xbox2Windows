@@ -32,25 +32,31 @@ def write(folder, name, data):
 def check_preset():
     script = T.input_preset("menus", 300, 0)
     items = script.split(",")
-    assert items[:4] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2"], items[:4]
+    assert items[:4] == ["80@5+0.8", "80@6+0.8", "4@7+0.8", "80@8+0.8"], items[:4]
     times = [int(i.split("@")[1].split("+")[0]) for i in items]
-    assert times == list(range(5, 300, 2)), times
+    assert times == list(range(5, 5 + T.MAX_ENTRIES)), "one press a second until the entry limit"
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
     assert T.input_preset("menus", 5, 0) == "", "no entry before the start second"
-    assert T.input_preset("menus", 420, 0).count(",") + 1 == len(range(5, 300, 2))
-    long_menus = T.input_preset("menus", 600, 0).split(",")
-    assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 300, 2)), "the menus preset stops at 300 s"
-    assert len(long_menus) <= T.MAX_ENTRIES
+    assert T.input_preset("menus", 30, 0).count(",") + 1 == len(range(5, 30)), "stops at the run length"
     long_run = T.input_preset("menus", 100000, 0).split(",")
-    assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    assert len(long_run) == T.MAX_ENTRIES and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
     passes = T.privacy_cycles(2)
-    assert passes == [["40", "40", "40", "80", "80", "4"],
-                      ["40", "40", "40", "4", "80", "80", "4"],
-                      ["40", "40", "40", "80", "4", "80", "4"],
-                      ["40", "40", "40", "4", "80", "80", "4"]], "none, box 1, box 2, box 1; each pass ends on Conferma"
+    assert passes == [["40", "40", "4", "80", "4", "80", "4"],      # tick both boxes, Conferma
+                      ["40", "40", "4", "80", "80", "4"],           # then one box at a time (Gray code), Conferma each time
+                      ["40", "40", "80", "4", "80", "4"],
+                      ["40", "40", "4", "80", "80", "4"]], "each pass anchors with up x2 and ends on Conferma"
     flat = [i.split("@")[0] for i in T.input_preset("menus", 300).split(",")]
     assert flat[:len(sum(passes, []))] == sum(passes, []), "the menus script is those passes in order"
-    assert T.input_preset("menus", 60, 0).startswith("80@5+1.2,80@7+1.2,4@9+1.2"), "0 boxes = the plain pattern"
+    assert T.input_preset("menus", 60, 0).startswith("80@5+0.8,80@6+0.8,4@7+0.8"), "0 boxes = the plain pattern"
+    labels = T.input_labels("menus", 300)
+    assert len(labels) == len(T.input_preset("menus", 300).split(",")) and len(set(len(l) > 0 for l in labels)) == 1
+    assert len(T.privacy_labels(2)) == len(sum(passes, [])), "one label per press of the passes"
+    assert labels[:7] == ["privacy pass 1: up (anchor on box 1)", "privacy pass 1: up (anchor on box 1)", "privacy pass 1: tick box 1",
+                          "privacy pass 1: down to box 2", "privacy pass 1: tick box 2", "privacy pass 1: down to Conferma",
+                          "privacy pass 1: Conferma (Avanti on the legal notice)"], labels[:7]
+    assert labels[7:13] == ["privacy pass 2: up (anchor on box 1)"] * 2 + ["privacy pass 2: toggle box 1", "privacy pass 2: down to box 2",
+                                                                          "privacy pass 2: down to Conferma", "privacy pass 2: Conferma (Avanti on the legal notice)"]
+    assert T.input_labels("menus", 20, 0)[:3] == ["menu: down", "menu: down", "menu: A"] and T.input_labels("menus2", 600) == []
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"
@@ -79,6 +85,7 @@ def run_ui(script, arrival_delay, start, legal_focus=0, boxes_at_start=(False, F
     order = ["nav", "bright", "legal", "privacy", "loading"]
     screen, active_at = 0, start
     focus = {"legal": legal_focus, "privacy": 0}
+    privacy_opened = None
     boxes = list(boxes_at_start)
     for at, mask in presses:
         name = order[screen]
@@ -104,21 +111,32 @@ def run_ui(script, arrival_delay, start, legal_focus=0, boxes_at_start=(False, F
         if moved:
             screen += 1
             active_at = at + arrival_delay
-    return order[screen], boxes, active_at - arrival_delay if order[screen] == "loading" else None
+            if order[screen] == "privacy":
+                privacy_opened = active_at
+    return order[screen], boxes, (active_at - arrival_delay if order[screen] == "loading" else None), privacy_opened
 
 
 def check_privacy_screen():
+    """The script against the screen model, over screen-arrival delays, start offsets, initial focus and box states."""
     script = T.input_preset("menus", 300)
+    worst = worst_clean = 0
     for delay in (0, 3, 7, 15, 30):
         for start in (0, 12, 33, 70):
             for legal_focus in (0, 1):
                 for ticked in ((False, False), (True, False), (False, True), (True, True)):
-                    end, boxes, when = run_ui(script, delay, start, legal_focus, ticked)
+                    end, boxes, when, opened = run_ui(script, delay, start, legal_focus, ticked)
                     assert end == "loading" and boxes == [True, True] and when < 300, (delay, start, legal_focus, ticked, end, boxes, when)
+                    took = when - opened   # seconds from the privacy screen being usable to the press that leaves it
+                    worst = max(worst, took)
+                    if ticked == (False, False) and delay == 0:
+                        worst_clean = max(worst_clean, took)
+    # fast: a press every second; nothing ticked yet (the normal case): at most the rest of the pass the screen opened in plus two passes
+    assert worst_clean <= 34, worst_clean   # the screen opening in the middle of a pass is the worst case; aligned with a pass start it is one 7-press pass
+    assert worst <= 34, worst   # any starting state, screen opening in the middle of a pass: the rest of that pass plus one round of four passes
     # control: the old pattern walks down to Conferma without ticking both boxes and is stuck on the privacy screen
     plain = T.input_preset("menus", 300, 0)
     for delay in (0, 15):
-        end, boxes, _ = run_ui(plain, delay, 0)
+        end, boxes, _, _ = run_ui(plain, delay, 0)
         assert end == "privacy", (delay, end, boxes)   # never gets through: it cannot tick both boxes and confirm
 
 
@@ -260,6 +278,47 @@ def check_memory_gib():
     assert T.memory_gib(8 * gib) == 14 and T.memory_gib(16 * gib) == 14, "never below run.ps1's default"
     assert T.memory_gib(32 * gib) == 24 and T.memory_gib(64 * gib) == 48 and T.memory_gib(128 * gib) == 96
     assert T.memory_gib(int(31.9 * gib)) == 23, "whole GiB, rounded down"
+
+
+def check_end_cause():
+    """The end cause is recorded on every path, with the last present milestone."""
+    beats = b"x2w-d3d12 heartbeat: 100 frames presented in 30.0 s (3.3 fps overall)\nx2w-d3d12 heartbeat: 450 frames presented in 120.0 s (3.7 fps overall)\n"
+
+    def run(finished=None, files=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            write(folder, "stderr.txt", beats)
+            if finished is not None:
+                write(folder, "finished.txt", finished.encode())
+            for name, data in files:
+                write(folder, name, data)
+            return T.end_cause(str(folder))
+
+    milestone = "last present #450 at 120 s"
+    cases = [
+        ("timeout after 600.02 s\n", (), "timeout after 600.02 s (the run was not stopped early)"),
+        ("stopped by request after 90.5 s (stop file)\n", (), "stopped by request at 90.5 s (stop file, no watchdog stop)"),
+        ("stopped by request after 90.5 s (commit headroom: system commit has 100 MiB free, under the headroom of 256 MiB)\n", (),
+         "stopped by request at 90.5 s (commit headroom: system commit has 100 MiB free, under the headroom of 256 MiB, no watchdog stop)"),
+        ("process exited with 0xffffffff after 256.1 s\n", (), "title killed externally (exit code 0xffffffff, no stop file) at 256.1 s"),
+        ("process exited with 0x00000000 after 12.0 s\n", (), "title exited by itself (code 0x0) at 12.0 s"),
+        ("process exited with 0xc0000005 after 40.0 s\n", (), "title crashed (exit code 0xc0000005) at 40.0 s"),
+        ("stopped at access violation (0xc0000005) at d3d12_xs+0x10 after 33.3 s\n", (), "debugger stop: access violation (0xc0000005) at 33.3 s"),
+        ("timeout after 300.0 s\n", (("stall_stop.json", b'{"at_seconds": 300, "reason": "deadlock: no frame"}'),),
+         "watchdog at 300 s: deadlock: no frame"),
+        (None, (("hard_end.json", b'{"at_seconds": 70, "note": "title 5 gone"}'),), "debugger did not finish: title 5 gone"),
+        (None, (), "unknown: the debugger wrote no summary (killed, or still running)"),
+    ]
+    for finished, files, want in cases:
+        got = run(finished, files)
+        assert got == want + "; " + milestone, (finished, got)
+    # No heartbeat at all: the milestone says so.
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), "finished.txt", b"timeout after 5.0 s\n")
+        assert T.end_cause(tmp).endswith("; no present reported"), T.end_cause(tmp)
+    # A hard end after a finished summary is appended, not replacing it.
+    got = run("timeout after 5.0 s\n", (("hard_end.json", b'{"note": "debugger ended"}'),))
+    assert "timeout after 5.0 s" in got and "hard end: debugger ended" in got, got
 
 
 def check_first_poll():
@@ -502,6 +561,7 @@ if __name__ == "__main__":
     check_privacy_screen()
     check_manifest()
     check_first_poll()
+    check_end_cause()
     check_cache_stats()
     check_cache_tag()
     check_memory_gib()

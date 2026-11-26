@@ -119,9 +119,12 @@ def check_controls():
         refused('requires a group of whole quads', lambda g=bad: translate(code=dpp + S_ENDPGM, group=g).hlsl_cs())
     # straight-line code with entry EXEC only
     branchy = b''.join([sopc(S_CMP_EQ_U32, 7, INLINE_0), sopp(0x04, 1), vop1(V_MOV_B32, 3, 256 + 0), dpp, S_ENDPGM])
-    refused('requires a straight-line compute program with entry EXEC', lambda: translate(code=branchy).hlsl_cs())
+    # The refusal names its shape for a tester report: the first branch, or the instruction that wrote EXEC.
+    refused('requires a straight-line compute program with entry EXEC: branch at +0x4 (s_cbranch_scc0)',
+            lambda: translate(code=branchy).hlsl_cs())
     exec_write = b''.join([sop1(S_MOV_B32, EXEC_LO, INLINE_NEG1), dpp, S_ENDPGM])
-    refused('requires a straight-line compute program with entry EXEC', lambda: translate(code=exec_write).hlsl_cs())
+    refused('requires a straight-line compute program with entry EXEC: EXEC written at +0x0 by s_mov_b32',
+            lambda: translate(code=exec_write).hlsl_cs())
     # a permutation other than the three swaps keeps its refusal
     refused('only the swaps', lambda: translate(code=vop1_dpp(0x01, 8, 5, (1, 2, 3, 0)) + S_ENDPGM).hlsl_cs())
     check_ror_controls()

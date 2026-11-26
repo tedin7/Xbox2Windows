@@ -340,6 +340,11 @@ def check_controls():
         (36, 4, 's_endpgm', 's_endpgm'),
     ]
     G.check_lds_exchange(b64_to_b128, (4, 1, 1), 128)  # [8, 40): read [24, 40) fits
+    # Each limit has its own refusal naming the measured value (a census says which one the title exceeds).
+    refused('needs a 1D group (the group is 8x4x1)', lambda: G.check_lds_exchange(b64_to_b128, (8, 4, 1), 128))
+    refused('needs a 1D group (the group is 4x1x2)', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 2), 128))
+    refused('needs a nonzero LDS allocation', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 1), 0))
+    refused('at most 32 KiB (COMPUTE_PGM_RSRC2 allocates 33 KiB)', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 1), 8448))
     bad_b64_to_b128 = list(b64_to_b128)
     bad_b64_to_b128[5] = (24, 8, 'ds_read_b128', 'ds_read_b128 v[8:11], v8 offset:28')  # [28, 44) overflows 40
     refused('initialized span', lambda: G.check_lds_exchange(bad_b64_to_b128, (4, 1, 1), 128))

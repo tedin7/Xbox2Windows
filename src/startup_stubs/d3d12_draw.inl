@@ -15,7 +15,10 @@
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
     bool array = false;
+    bool load = false;  // manifest 'uavload N': the program also reads the texel back (partial-dmask store)
 };
+static_assert(x2w_startup::kSupport2UavTypedLoad == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, "typed load bit");
+static_assert(x2w_startup::kSupport2UavTypedStore == D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, "typed store bit");
 constexpr unsigned pixel_uav_limit = 8;
 
 // Returns nullptr and fills out, or the reason the line is refused.
@@ -90,8 +93,8 @@ bool srgb_uav_format(DXGI_FORMAT format)
 // the title's own view (nullptr when it passed none) with console format values already mapped, and array is true
 // for a manifest 'tex2da' view. Returns nullptr and fills out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array,
-                           D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array, D3D12_UNORDERED_ACCESS_VIEW_DESC& out,
+                           bool needs_load)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
     if (!array && resource.DepthOrArraySize != 1) return "resource is a texture array";
@@ -118,9 +121,9 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     if (srgb_uav_format(format)) return "sRGB format";
     if (!float_uav_format(format)) return "format is not a float colour format";
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
-        !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
-        return "format has no typed UAV store on this device";
+    const unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                                  ? 0u : static_cast<unsigned>(support.Support2);
+    if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, needs_load)) return unsupported;
     out = {};
     out.Format = format;
     if (array) {
@@ -412,6 +415,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 log("x2w-draw invalid d16srv manifest line for %016llx: %s", tr.key, line.c_str());
                 return;
             }
+        } else if (line.compare(0, 8, "uavload ") == 0) {
+            // The pixel program reads the stored image back (partial-dmask store); the view then needs typed load.
+            unsigned index = 0;
+            const std::string digits = line.substr(8);
+            const bool well_formed = !digits.empty() && digits.size() <= 9 &&
+                                     digits.find_first_not_of("0123456789") == std::string::npos;
+            if (well_formed) index = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
+            if (!well_formed || index >= tr.uavs.size() || tr.uavs[index].load) {
+                log("x2w-draw pipeline %016llx uavload line refused: %s; translation not used", tr.key, line.c_str());
+                return;
+            }
+            tr.uavs[index].load = true;
         } else if (line.compare(0, 4, "uav ") == 0) {
             // A pixel-stage image_store: the view is made at draw time from the title's unordered-access view at
             // that table entry (resolve_pixel_uavs).
@@ -536,7 +551,7 @@ u64 publish_compute_request(const void* desc)
         refusal = "description unreadable";
     else {
         if (Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]))) {
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             const auto found = root_blobs().find(root);
             if (found != root_blobs().end()) root_blob = found->second;
             ReleaseSRWLockShared(&note_lock);
@@ -622,7 +637,7 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
     if (!root || root_info(root) != bound_root) return;
     std::vector<unsigned char> root_blob;
     {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
@@ -787,7 +802,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     }
     if (!root || !stages[0].pShaderBytecode || !stages[1].pShaderBytecode) return nullptr;
     std::vector<unsigned char> root_blob;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto found = root_blobs().find(root);
     if (found != root_blobs().end()) root_blob = found->second;
     ReleaseSRWLockShared(&note_lock);
@@ -897,7 +912,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         bound->guest_root = root ? root_info(root) : nullptr;
         std::vector<unsigned char> root_blob;
         if (root) {
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             const auto found = root_blobs().find(root);
             if (found != root_blobs().end()) root_blob = found->second;
             ReleaseSRWLockShared(&note_lock);
@@ -1276,7 +1291,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
         sampler = x2w_startup::dynamic_sampler(words);
         return true;
     }
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto& records = view_records();
     const bool valid = words[2] == 22 && words[1] < records.size() && records[words[1]].slot == 22 &&
                        records[words[1]].desc_bytes == sizeof(sampler);
@@ -1863,7 +1878,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
         ViewRecord record{};
         bool known = false;
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         known = words[1] < view_records().size();
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
@@ -2145,7 +2160,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         if (words[1] < view_records().size()) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (record.slot == 17 && record.desc_bytes >= 12) {
@@ -2283,7 +2298,7 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
 {
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         const bool known = words[1] < view_records().size();
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
@@ -2355,7 +2370,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         const bool known = words[1] < view_records().size();
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
@@ -2373,7 +2388,8 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav.array, out[i].view);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav.array, out[i].view,
+                                            uav.load);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -2397,7 +2413,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
             std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
             if (srv_words[0] != view_token_magic) continue;
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
             ReleaseSRWLockShared(&note_lock);
             if (srv_resource && srv_resource == record.resource) return refuse(i, "the texture is also an SRV of this draw", s);
@@ -2715,7 +2731,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ViewRecord record{};
             bool known = false;
             if (words[0] == view_token_magic) {
-                AcquireSRWLockShared(&note_lock);
+                note_lock_acquire(false);
                 known = words[1] < view_records().size();
                 if (known) record = view_records()[words[1]];
                 ReleaseSRWLockShared(&note_lock);
@@ -2861,7 +2877,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
             ViewRecord record{};
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             buffer_token_known = words[1] < view_records().size();
             if (buffer_token_known) record = view_records()[words[1]];
             ReleaseSRWLockShared(&note_lock);
@@ -3218,7 +3234,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::ViewTable heap_records;
     x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
@@ -3249,7 +3265,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
 x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
 {
     x2w_startup::ViewTable table;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
         if (pass.source_view_heap && heap.wrapper != pass.source_view_heap) continue;

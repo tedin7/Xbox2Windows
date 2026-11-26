@@ -36,7 +36,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
+-Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -56,6 +56,7 @@ param(
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
     [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
@@ -74,6 +75,8 @@ param(
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [switch]$FreshSave,                       # wipe the saved game folder first (out/startup/saves, or -SaveRoot): the title starts as a new profile and shows its legal/privacy screens again
+    [string]$SaveRoot = "out/startup/saves",      # X2W_STORAGE_PATH for the title: its saves and persistent local storage, kept across runs so a screen accepted once is skipped next time
     [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
     [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
@@ -222,6 +225,13 @@ Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
+# One intent label per timed press ("privacy pass 2: toggle box 1", ...), kept in the manifest next to input_script; analyze_run joins
+# them with the "x2w-input script press item N" lines (item N = label N). Empty for scripts that are not the menus preset.
+$inputLabels = @()
+try {
+    $labelJson = (Invoke-Native { & $python -B $pack input-labels $InputMode $Seconds --privacy-boxes $PrivacyBoxes } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $labelJson) { $inputLabels = @((ConvertFrom-Json $labelJson) | ForEach-Object { $_ }) }
+} catch { Write-Warning "tester_run: no input labels ($($_.Exception.Message))" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
@@ -232,10 +242,20 @@ $physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemo
 if ($MemoryGiB -le 0) { $MemoryGiB = [int](Invoke-Native { & $python -B $pack memory-gib $physicalBytes }) }
 Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
 $env:X2W_D3D12_BUDGET = "1"
+# translate.txt lines end with [t=N s], seconds since the title started: the --watch translator run.ps1 starts reads
+# the time of the title.pid debug_launch writes into the run folder.
+$env:X2W_TITLE_START_FILE = Join-Path $logDir "title.pid"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
 if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
+$saveDir = if ([System.IO.Path]::IsPathRooted($SaveRoot)) { $SaveRoot } else { Join-Path $repo $SaveRoot }
+if ($FreshSave -and (Split-Path -Leaf $saveDir) -notmatch "save") { throw "tester_run: -FreshSave only wipes a folder whose name contains save (got $saveDir)" }
+if ($FreshSave -and (Test-Path -LiteralPath $saveDir)) { Remove-Item -LiteralPath $saveDir -Recurse -Force }
+New-Item -ItemType Directory -Force $saveDir | Out-Null
+$env:X2W_STORAGE_PATH = $saveDir.TrimEnd('\', '/') + '\'
+$saveBefore = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)
+Write-Host ("tester_run: saves in {0} ({1} files kept from earlier runs{2})" -f $saveDir, $saveBefore.Count, $(if ($FreshSave) { ', -FreshSave wiped it' } else { '' }))
 $HddMode = -not $NoHddMode
 if ($HddMode) { $env:X2W_STORAGE_HDD = "1" } else { Remove-Item Env:X2W_STORAGE_HDD -ErrorAction SilentlyContinue }
 $GpuTime = -not $NoGpuTime
@@ -259,6 +279,7 @@ if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB 
 if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
+    if ($CaptureMenuEvery -gt 0 -and $runParams.ContainsKey("CaptureMenuEvery")) { $runArgs.CaptureMenuEvery = $CaptureMenuEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
 # memory.txt in the run folder (so in the zip): every 30 s the system commit and the 8 processes holding the most of it,
@@ -294,6 +315,9 @@ $stopReason = ""
 if (Test-Path -LiteralPath $stallFile) {
     try { $stall = Get-Content -LiteralPath $stallFile -Raw | ConvertFrom-Json; $stopReason = "stall watchdog at $($stall.at_seconds) s: $($stall.reason)" } catch { }
 }
+# The end cause is always recorded (manifest end_cause): watchdog, timeout, stop request, title exited, killed from outside, crashed.
+$endCause = ((Invoke-Native { & $python -B $pack end-cause $logDir }) -join " ").Trim()
+Write-Host "tester_run: the run ended: $endCause"
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
 Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 
@@ -306,14 +330,15 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 }
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
+$saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
 $manifest = [ordered]@{
     commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; stop_reason = $stopReason; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
-    pretranslate = $preTranslate; cache_repaired = $cacheRepaired
+    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
+    pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
