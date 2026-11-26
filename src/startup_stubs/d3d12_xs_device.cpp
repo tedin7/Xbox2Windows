@@ -2831,7 +2831,7 @@ bool append_upload_buffer(std::vector<UploadRingChunk>& chunks, u64 chunk_bytes)
 
 u64 large_upload_pool_limit()
 {
-    constexpr u64 mib = 1ull << 20;
+    static constexpr u64 mib = 1ull << 20;
     static const u64 limit = [] {
         char value[24]{};
         const DWORD n = GetEnvironmentVariableA("X2W_BIGBIND_POOL_MIB", value, sizeof(value));
