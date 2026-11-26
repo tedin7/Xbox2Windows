@@ -156,6 +156,8 @@ def check_shell(shell):
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
+        assert manifest["title_input_snapshot"] is True and manifest["env"].get("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT") == "1" \
+            and manifest["env"].get("X2W_TRANSLATED_INDIRECT_COPY_RANGES") == "1", manifest["env"]
         assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
         assert "job memory cap %d GiB" % args["MemoryGiB"] in ok.stdout, ok.stdout
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
@@ -198,6 +200,13 @@ def check_shell(shell):
             mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
+        assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)
+        newest_snap = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_snap) as z:
+            snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert snap_manifest["title_input_snapshot"] is False
+        assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
         newest_big = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
