@@ -48,6 +48,15 @@ def check_preset():
     flat = [i.split("@")[0] for i in T.input_preset("menus", 300).split(",")]
     assert flat[:len(sum(passes, []))] == sum(passes, []), "the menus script is those passes in order"
     assert T.input_preset("menus", 60, 0).startswith("80@5+0.8,80@6+0.8,4@7+0.8"), "0 boxes = the plain pattern"
+    labels = T.input_labels("menus", 300)
+    assert len(labels) == len(T.input_preset("menus", 300).split(",")) and len(set(len(l) > 0 for l in labels)) == 1
+    assert len(T.privacy_labels(2)) == len(sum(passes, [])), "one label per press of the passes"
+    assert labels[:7] == ["privacy pass 1: up (anchor on box 1)", "privacy pass 1: up (anchor on box 1)", "privacy pass 1: tick box 1",
+                          "privacy pass 1: down to box 2", "privacy pass 1: tick box 2", "privacy pass 1: down to Conferma",
+                          "privacy pass 1: Conferma (Avanti on the legal notice)"], labels[:7]
+    assert labels[7:13] == ["privacy pass 2: up (anchor on box 1)"] * 2 + ["privacy pass 2: toggle box 1", "privacy pass 2: down to box 2",
+                                                                          "privacy pass 2: down to Conferma", "privacy pass 2: Conferma (Avanti on the legal notice)"]
+    assert T.input_labels("menus", 20, 0)[:3] == ["menu: down", "menu: down", "menu: A"] and T.input_labels("menus2", 600) == []
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"

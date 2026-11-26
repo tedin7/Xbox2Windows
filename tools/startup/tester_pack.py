@@ -88,6 +88,39 @@ def privacy_cycles(boxes):
     return [one_pass(list(range(boxes)))] + [one_pass([b]) for b in gray]
 
 
+def privacy_labels(boxes):
+    """One label per press of privacy_cycles(boxes), in the same order: what the press is for, so a log can say
+    'privacy pass 2: toggle box 1' instead of a button mask."""
+    labels = []
+    gray = [((i & -i).bit_length() - 1) for i in range(1, 2 ** boxes)]
+    for number, toggled in enumerate([list(range(boxes))] + [[b] for b in gray], 1):
+        head = "privacy pass %d" % number
+        verb = "tick" if number == 1 else "toggle"
+        labels += ["%s: up (anchor on box 1)" % head] * boxes
+        at = 0
+        for box in sorted(toggled):
+            labels += ["%s: down to box %d" % (head, k + 2) for k in range(at, box)]
+            labels.append("%s: %s box %d" % (head, verb, box + 1))
+            at = box
+        labels += ["%s: down to %s" % (head, "Conferma" if target == boxes else "box %d" % (target + 1))
+                   for target in range(at + 1, boxes + 1)]
+        labels.append("%s: Conferma (Avanti on the legal notice)" % head)
+    return labels
+
+
+def input_labels(spec, seconds, privacy_boxes=2):
+    """One intent label per timed press of input_preset(spec, seconds, privacy_boxes), in script order (entry 1 first, as the
+    `x2w-input script press item N` log lines count). Only the `menus` preset is labelled; anything else gives []."""
+    if spec != "menus":
+        return []
+    count = len(input_preset(spec, seconds, privacy_boxes).split(",")) if input_preset(spec, seconds, privacy_boxes) else 0
+    if privacy_boxes > 0:
+        cycle = privacy_labels(privacy_boxes)
+    else:
+        cycle = ["menu: down", "menu: down", "menu: A"]
+    return [cycle[i % len(cycle)] for i in range(count)]
+
+
 def input_preset(spec, seconds, privacy_boxes=2):
     """`menus` is D-pad down, D-pad down, A, one press every second from 5 s after the first pad poll; entries run to
     `seconds` of script time, but not past 300 s, at most 256 entries (about 260 s at one press a second). With privacy_boxes > 0 (the default; the privacy
@@ -447,6 +480,10 @@ def main(argv):
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
     p.add_argument("--privacy-boxes", type=int, default=2)
+    lab = sub.add_parser("input-labels")
+    lab.add_argument("spec")
+    lab.add_argument("seconds", type=int)
+    lab.add_argument("--privacy-boxes", type=int, default=2)
     m = sub.add_parser("memory-gib")
     m.add_argument("physical_bytes", type=int)
     n = sub.add_parser("cache-tag")
@@ -471,6 +508,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds, args.privacy_boxes))
+        return 0
+    if args.cmd == "input-labels":
+        print(json.dumps(input_labels(args.spec, args.seconds, args.privacy_boxes)))
         return 0
     if args.cmd == "memory-gib":
         print(memory_gib(args.physical_bytes))

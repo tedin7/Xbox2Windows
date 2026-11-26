@@ -55,6 +55,7 @@ param(
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
     [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
@@ -196,6 +197,13 @@ Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
+# One intent label per timed press ("privacy pass 2: toggle box 1", ...), kept in the manifest next to input_script; analyze_run joins
+# them with the "x2w-input script press item N" lines (item N = label N). Empty for scripts that are not the menus preset.
+$inputLabels = @()
+try {
+    $labelJson = (Invoke-Native { & $python -B $pack input-labels $InputMode $Seconds --privacy-boxes $PrivacyBoxes } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $labelJson) { $inputLabels = @($labelJson | ConvertFrom-Json) }
+} catch { Write-Warning "tester_run: no input labels ($($_.Exception.Message))" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 $outRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
@@ -228,6 +236,7 @@ if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB 
 if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
+    if ($CaptureMenuEvery -gt 0 -and $runParams.ContainsKey("CaptureMenuEvery")) { $runArgs.CaptureMenuEvery = $CaptureMenuEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
 }
 $exitCode = 0
@@ -255,7 +264,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
-    pretranslate = $preTranslate
+    pretranslate = $preTranslate; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
