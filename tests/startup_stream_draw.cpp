@@ -519,9 +519,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (const int result = draw_bc_chain(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_control(ID3D12Device*);
-        extern int draw_root_cbv(void*, void*);
+        extern int draw_root_cbv(void*);
         if (const int result = root_heap_control(desktop.Get())) return result;
-        if (const int result = draw_root_cbv(guest, list)) return result;
+        if (const int result = draw_root_cbv(list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
         if (const int result = draw_1d_srvs(guest, list)) return result;

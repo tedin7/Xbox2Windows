@@ -257,7 +257,6 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                              srv_word || mesh_record ? from.resource : nullptr, source_offset);
     }
     note_linear_gpu_write(self, to);
-    note_placed_gpu_write(to.wrapper, destination_offset, bytes);
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
@@ -288,7 +287,6 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
         note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width, 17, "buffer");
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
         note_linear_gpu_write(self, to);
-        note_placed_gpu_write(to.wrapper, 0, to_desc.Width);
     } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }
