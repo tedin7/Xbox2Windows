@@ -49,9 +49,20 @@ Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 exit 0
 """
 TRANSLATOR = """\
+import os, sys, time
+def fnv(blob): return 0
 key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
+# one pass (argv: --once <cache>): publish a ready marker for every request that has none; STUB_HANG never ends (the cap)
+if len(sys.argv) > 2 and sys.argv[1] == '--once':
+    if os.environ.get('STUB_HANG'):
+        time.sleep(600)
+    for name in sorted(os.listdir(sys.argv[2])):
+        if name.startswith('req_') and name.endswith('.a'):
+            marker = os.path.join(sys.argv[2], name[:-2] + '.txt')
+            if not os.path.exists(marker):
+                open(marker, 'wb').write(b'ok')
 """
 DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
@@ -86,11 +97,16 @@ def make_tree(root):
     return tree, head, gen / "x2w_build_rev.cpp"
 
 
-def run_script(shell, tree, *args):
+def run_script(shell, tree, *args, extra_path=None, extra_env=None):
     env = dict(os.environ)
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    if extra_path:
+        env["PATH"] = str(extra_path) + os.pathsep + env["PATH"]
+    env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
+    if "-FinishTranslateSeconds" not in args:
+        args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tree / "tools" / "startup" / "tester_run.ps1"),
                "-Exe", "title.exe", "-DataDir", "data", *args]
     return subprocess.run(command, capture_output=True, text=True, errors="replace", env=env, timeout=300, cwd=str(tree))
@@ -207,6 +223,29 @@ def check_shell(shell):
         fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert fresh.returncode == 0 and "0 translations were already present at start" in fresh.stdout, fresh.stdout
         assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("req_*.txt"))) == 2
+
+        # F1: after the zip is packed, one translator pass finishes the pending requests (cap: -FinishTranslateSeconds).
+        fresh_cache = cache.parent / "shader_cache_29-29-7"
+        (fresh_cache / "req_aaaaaaaaaaaaaaaa.a").write_bytes(b"x")
+        (fresh_cache / "req_bbbbbbbbbbbbbbbb.a").write_bytes(b"x")
+        (fresh_cache / "req_bbbbbbbbbbbbbbbb.txt").write_bytes(b"x")
+        finished = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "60")
+        assert finished.returncode == 0, (finished.stdout, finished.stderr)
+        assert "finishing the translation: 1 request(s) pending" in finished.stdout, finished.stdout
+        assert "pending before 1, after 0; ok 2, refused 0 in total (0 new)" in finished.stdout, finished.stdout
+        assert (fresh_cache / "req_aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
+        assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
+        # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
+        (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
+        before_zips = len(list((tree / "out" / "tester").glob("report_*.zip")))
+        capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
+                            extra_env={"STUB_HANG": "1"})
+        assert capped.returncode == 0, (capped.stdout, capped.stderr)
+        assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
+        assert not (fresh_cache / "req_cccccccccccccccc.txt").exists()
+        assert len(list((tree / "out" / "tester").glob("report_*.zip"))) == before_zips + 1
+        skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
@@ -268,8 +307,16 @@ def check_build(shell):
         git(tree, "commit", "-q", "-m", "cmake")
         head = git(tree, "rev-parse", "--short=8", "HEAD")
         assert not (build / "xmem.dll").exists()
-        result = run_script(shell, tree, "-CaptureEvery", "0")
+        # cmake writes a warning to stderr (as the real one does) while this script's stderr is captured: under Windows
+        # PowerShell 5.1 that is an error record, and with $ErrorActionPreference Stop it used to end the script. The
+        # build is judged by its exit code.
+        shim = Path(root) / "shim"
+        shim.mkdir()
+        (shim / "cmake.cmd").write_text('@echo CMake Warning: stub warning on stderr 1>&2\r\n@"%s" %%*\r\n' % shutil.which("cmake"),
+                                        encoding="ascii")
+        result = run_script(shell, tree, "-CaptureEvery", "0", extra_path=shim)
         assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "stub warning on stderr" in result.stdout + result.stderr, "the shim did not run"
         assert "building startup_runtime" in result.stdout, result.stdout
         for dll in DLLS:
             assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"
