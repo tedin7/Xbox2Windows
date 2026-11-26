@@ -3060,6 +3060,176 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def nested_execz(self, b, t, effects, live, targets):
+        """Prove a linear mask region, including every value that can re-enable a lane.
+
+        Saves name the EXEC generation at issue. A restore may cross intervening compares but
+        cannot read a clobbered copy. OR may re-enable lanes within the outer mask only.
+        """
+        wave = getattr(getattr(self, 'pipe', None), 'wave_size', None)
+        width = 1 if wave == 32 or wave is None and wave32_exec_proof(self.ins) else 2
+        move = 's_mov_b%d' % (32 * width)
+        exec_operand = 'exec_lo' if width == 1 else 'exec'
+        exec_words = ('exec', 'exec_hi')[:width]
+        entry_clear = {(word, h) for h, word in enumerate(exec_words)}
+        clear = entry_clear.copy()
+        lane_bits = self.lane_bit_keys(b, effects, targets, {k: k for k in targets}) if width == 1 else set()
+        entry = current = b
+        copies, pending, lowering = {}, {}, {}
+        bool_words = set()
+        mask_scc = False
+
+        def scalar_copy(token):
+            words = mask_words(token, width)
+            reg = reg_range(token)
+            return tuple(words) if words and reg and reg[0] == 's' and reg[2] <= 105 else ()
+
+        # A linear prefix can provide an unmodified EXEC copy made before the
+        # skip. Only copies of the current generation can restore inside it.
+        prefix_copies, clobbered = set(), set()
+        for j in range(b - 1, -1, -1):
+            _, _, name, asm = self.ins[j]
+            if (name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_swappc', 's_endpgm')) or
+                    'any' in scalar_destinations(name, asm)):
+                break
+            _, args, mods = parse(asm)
+            if name == move and not mods and args[1:] == [exec_operand]:
+                saved = scalar_copy(args[0])
+                if saved and clobbered.isdisjoint(saved):
+                    prefix_copies.add(saved)
+                    if clobbered.isdisjoint(EXEC_KEYS):
+                        copies[saved] = (entry, None)
+                        clear.update((word, h) for h, word in enumerate(saved))
+                        lane_bits.update(saved)
+            clobbered.update(effects[j][2])
+            if j in targets:
+                break
+
+        for i in range(b + 1, t):
+            off, _, name, asm = self.ins[i]
+            base = re.sub(r'_e(32|64)$', '', name)
+            _, args, mods = parse(asm)
+            reads, writes, may = effects[i]
+            if ('any' in scalar_destinations(name, asm) or
+                    name.startswith(EXECZ_REFUSED) and not name.startswith('v_writelane')):
+                return {}, None
+            save = re.fullmatch(r's_(and|or)_saveexec_b%d' % (32 * width), base)
+            restore = base == move and args[:1] == [exec_operand] and len(args) == 2 and not mods
+            copy = base == move and args[1:] == [exec_operand] and not mods
+            compare = base.startswith('v_cmpx_') or (base.startswith('v_cmp_') and args[:1] in (['exec_lo'], ['exec']))
+            src = scalar_copy(args[1]) if (save or restore) and len(args) == 2 else ()
+            if may & EXEC_KEYS and not (save or compare or restore and src in copies):
+                return {}, None
+            if base.startswith('v_cmpx_'):
+                compare_sources = args[1:] if name.endswith('_e64') and len(args) == 3 else args
+                explicit_mask_reads = scalar_tokens(' '.join(compare_sources)) & EXEC_KEYS
+            else:
+                explicit_mask_reads = reads & EXEC_KEYS
+            if current != entry:
+                cross_lane = name.startswith(('v_readlane', 'v_writelane', 'v_permlane', 'ds_permute',
+                                              'ds_bpermute', 'ds_swizzle')) or 'dpp' in name or 'dpp' in asm
+                lane_reads = all(self.per_lane_read(i, word) for word in explicit_mask_reads)
+                if (cross_lane or 'src_execz' in args or 'src_vccz' in args or
+                        not (save or restore or copy or lane_reads)):
+                    return {}, (i, 'wave-wide read of a narrowed mask')
+                if name == 'v_readfirstlane_b32':
+                    lowering[off] = ('firstlane',)
+            if mask_scc and 'scc' in reads:
+                return {}, (i, 'wave-wide read of a narrowed mask')
+            if reads & bool_words and not (src in copies and (save or restore)):
+                return {}, (i, 'wave-wide read of a narrowed mask')
+            mask_scc = mask_scc and 'scc' not in writes
+
+            after = clear_after(name, asm, may, clear)
+            bool_words.difference_update(may)
+            if save and len(args) == 2 and not mods:
+                dst = scalar_copy(args[0])
+                words = mask_words(args[1], width)
+                literal = pc_word(args[1])
+                if not dst or not (words and all(word in lane_bits or word == exec_words[h]
+                                                for h, word in enumerate(words))
+                                   or literal is not None and (width == 1 or literal in (0, -1))):
+                    return {}, None
+                if save[1] == 'or' and not (words and all(word == '0' or (word, h) in clear
+                                                         for h, word in enumerate(words)) or literal == 0):
+                    return {}, None
+                previous = copies.get(src)
+                lowering[off] = ('save', save[1], dst, args[1], previous[1] if previous else None)
+                pending[off] = i
+                copies = {key: value for key, value in copies.items() if may.isdisjoint(key)}
+                copies[dst] = (current, off)
+                after = (after - {(word, h) for word in dst for h in range(width)}) | {
+                    (word, h) for h, word in enumerate(dst)}
+                current = i
+                mask_scc = True
+            elif copy and (dst := scalar_copy(args[0])):
+                lowering[off] = ('copy', dst)
+                copies = {key: value for key, value in copies.items() if may.isdisjoint(key)}
+                copies[dst] = (current, off)
+            elif restore and src in copies:
+                current, site = copies[src]
+                lowering[off] = ('legacy',) if site is None else ('restore', site)
+                pending.pop(site, None)
+                after |= entry_clear
+            elif compare:
+                lowering[off] = ('legacy',)
+                current = i
+                after |= entry_clear
+
+            if not (save or copy):
+                copies = {key: value for key, value in copies.items() if may.isdisjoint(key)}
+            lane_bits.difference_update(may)
+            if (save or copy) and off in lowering:
+                bool_words.update(dst)
+                lane_bits.update(dst)
+            if base.startswith('v_cmp_') and not compare and not mods:
+                # The compare result is ANDed with EXEC by the vector lowering.
+                dest = mask_words(args[0], width) if args else None
+                if width == 2 and args[:1] == ['vcc_lo']:
+                    dest = ['vcc', 'vcc_hi']
+                if dest:
+                    lane_bits.update(dest)
+                    after.update((word, h) for h, word in enumerate(dest))
+            clear = after | entry_clear
+
+        if bool_words & live:
+            return {}, None
+        join_name, join_args, join_mods = parse(self.ins[t][3])
+        join_src = scalar_copy(join_args[1]) if join_name == move and join_args[:1] == [exec_operand] \
+            and len(join_args) == 2 and not join_mods else ()
+        join_restores = join_src in prefix_copies and all(
+            set(join_src).isdisjoint(effects[k][2]) for k in range(b + 1, t))
+        if (pending or current != entry) and not join_restores:
+            return {}, (min(pending.values(), default=current), 'saved mask not restored before the join')
+        return lowering, None
+
+    def lower_nested_exec(self, operation):
+        kind, *args = operation
+        if kind == 'restore':
+            self.exec_known = self.exec_narrow_only = False
+            self.emit('exec = x2w_exec_%x ? 1u : 0u;' % args[0])
+            return
+        if kind == 'save':
+            op, dst, src, previous = args
+            if previous is not None:
+                bit = 'x2w_exec_%x' % previous
+            elif (literal := pc_word(src)) is not None:
+                x, y, _ = self.pipe.group
+                lane = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+                bit = '((0x%08xu >> (%s & 31u)) & 1u) != 0u' % (literal & 0xffffffff, lane)
+            else:
+                bit = '(%s & 1u) != 0u' % self.u(src)
+        else:
+            dst, = args
+        self.emit('bool x2w_exec_%x = exec != 0u;' % self.pc)
+        for word in dst:
+            reg = int(word[1:])
+            self.record_scalar_uniformity(reg, False)
+            self.set_s(reg, '', ('nested_exec',))
+            self.masks.add(reg)
+        if kind == 'save':
+            self.set_exec_scc('exec %s uint(%s)' % ('&' if op == 'and' else '|', bit))
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3118,6 +3288,8 @@ class Stage:
                     live_in[i], changed = value, True
         self.waterfall_reads = {}
         self.waterfall_scalar_loads = {}
+        self.nested_exec = {}
+        self.nested_exec_body = set()
         for close, target in jumps:
             head = index.get(target)
             if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
@@ -3166,6 +3338,20 @@ class Stage:
             def quiet(j):  # exec unchanged since the join on every path to j: a straight run from t, entered at t only
                 return t <= j and all(b <= k < t for k in into.get(t, ())) and not any(
                     effects[k][2] & EXEC_KEYS for k in range(t, j)) and not any(k in into for k in range(t + 1, j + 1))
+            nested, failure = {}, None
+            if straight and any(
+                    effects[i][2] & EXEC_KEYS and i in before and
+                    not entry <= clear_after(*self.ins[i][2:], effects[i][2], before[i])
+                    for i in range(b + 1, t)):
+                nested, failure = self.nested_execz(b, t, effects, live, {index.get(target) for target in targets})
+                if failure:
+                    i, reason = failure
+                    at, _, inner, _ = self.ins[i]
+                    refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: exec write: %s'
+                                       % (inner, reason))
+                elif nested:
+                    self.nested_exec.update(nested)
+                    self.nested_exec_body.update(self.ins[i][0] for i in range(b + 1, t))
             unread = {}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
@@ -3181,7 +3367,7 @@ class Stage:
                             t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
                             and target in index and index[target] <= b for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_cbranch_scc0'
-                elif may & EXEC_KEYS and (entered or i in before and
+                elif not (nested or failure) and may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
@@ -4124,7 +4310,14 @@ class Stage:
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
+                    first_line = len(self.lines)
                     term = self.one(name, asm)
+                    if off in getattr(self, 'nested_exec_body', ()):
+                        guard = 'if (exec & 1) '
+                        for k in range(first_line, len(self.lines)):
+                            line = self.lines[k]
+                            if line.startswith(guard) and line.endswith(';'):
+                                self.lines[k] = 'if (exec != 0u) { %s }' % line[len(guard):]
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
                     if off in mesh_votes:
@@ -4981,6 +5174,17 @@ class Stage:
 
     def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
+        nested = getattr(self, 'nested_exec', {}).get(pc)
+        if nested and nested[0] != 'legacy':
+            if nested[0] != 'firstlane':
+                return self.lower_nested_exec(nested)
+            if pc not in self.waterfall_reads:
+                try:
+                    return self.op_v_readfirstlane_b32(ops, mods)
+                except Unsupported:
+                    pass
+            raise Unsupported('%s inside a block s_cbranch_execz skips per lane: exec write: '
+                              'wave-wide read of a narrowed mask' % base)
         calculated = getattr(self, 'calculated_pc', {})
         if pc in calculated:
             target = calculated[pc]
