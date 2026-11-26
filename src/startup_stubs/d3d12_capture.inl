@@ -107,6 +107,20 @@ std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
 
+// The memory the view registry holds (records and their capacity, the id map's nodes and buckets, the materialized
+// flags), for the heartbeat: Run Q's registry grew by about 9,000 distinct views per second without a ceiling.
+// Estimate in bytes; the map is counted as one node plus one bucket pointer per entry.
+inline unsigned long long view_registry_bytes()
+{
+    AcquireSRWLockExclusive(&note_lock);
+    const unsigned long long bytes = static_cast<unsigned long long>(view_records().capacity()) * sizeof(ViewRecord) +
+                                     view_materialized().capacity() +
+                                     static_cast<unsigned long long>(view_ids().size()) * 32ull +
+                                     static_cast<unsigned long long>(view_ids().bucket_count()) * sizeof(void*);
+    ReleaseSRWLockExclusive(&note_lock);
+    return bytes;
+}
+
 // X2W_D3D12_VIEW_CENSUS=1 (diagnostic only, docs/startup-runtime.md): new distinct view records by slot, and one line
 // before an insertion that is expected to grow view_records or the view_ids buckets. All fields: note_lock held.
 bool view_census_enabled()

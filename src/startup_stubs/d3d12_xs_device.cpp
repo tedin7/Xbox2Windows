@@ -7723,9 +7723,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (now - last_report >= 5000) {
         last_report = now;
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
-            "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
-            static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
-            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
+            "(region-information proofs %lld, region queries %lld), view registry about %llu MiB", views_noted, views_distinct,
+            descriptors_copied, static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
+            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries),
+            view_registry_bytes() >> 20);
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);
