@@ -64,13 +64,26 @@ public:
         return hit;
     }
 
-    // Called after the descriptor was built into slot_of(id).
-    void publish(std::uint32_t id, std::uint64_t resource, Kind kind, std::uint64_t stamp = 0)
+    // What the descriptor is about to be built over. Take it BEFORE reading the resource and building: a release, flush or
+    // other change that lands while the build runs makes the published entry miss, because publish() records the
+    // generations seen here, not the ones current at publish time. (Recording them at publish time would stamp an entry built
+    // over a released object with the new generation and serve it.) The caller takes its own stamp at the same moment.
+    struct Ticket {
+        std::uint64_t resource_generation = 0, cache_generation = 0;
+    };
+    Ticket begin(std::uint64_t resource) const
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        return Ticket{generation_of_locked(resource), cache_generation_};
+    }
+
+    // Called after the descriptor was built into slot_of(id), with the ticket taken before the build.
+    void publish(std::uint32_t id, std::uint64_t resource, Kind kind, std::uint64_t stamp, const Ticket& ticket)
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         Entry& e = entries_[slot_of(id)];
         if (e.valid && e.id != id) ++replaced_;
-        e = Entry{true, kind, id, resource, generation_of_locked(resource), cache_generation_, stamp};
+        e = Entry{true, kind, id, resource, ticket.resource_generation, ticket.cache_generation, stamp};
         ++publishes_;
     }
 

@@ -8,7 +8,7 @@
 //   write:     the write hook drops the entry of that id only;
 //   flush:     a heap destroy / whole-cache flush drops everything built before it.
 // A rebuilt entry (publish after a miss) hits again, and concurrent lookups and publishes keep the counters consistent.
-// --mutate resource-generation|stamp|id|resource|kind|write|flush: expect the stale lookup to still hit. Each mutated run is a
+// --mutate resource-generation|stamp|id|resource|kind|write|flush|ticket: expect the stale lookup to still hit. Each mutated run is a
 // negative control and must fail.
 #include "startup_stubs/view_cache.h"
 
@@ -33,6 +33,12 @@ void check(const char* name, bool condition)
 
 using namespace x2w_view_cache;
 
+// The ordinary build: ticket, (build), publish, with nothing changing in between.
+void publish(Cache& cache, std::uint32_t id, std::uint64_t resource, Kind kind, std::uint64_t stamp = 0)
+{
+    cache.publish(id, resource, kind, stamp, cache.begin(resource));
+}
+
 // `stale` is the lookup of an entry that must miss; a mutated run expects it to hit.
 void expect_stale(const char* name, const char* mutation_name, bool lookup_hit)
 {
@@ -48,29 +54,29 @@ int main(int argc, char** argv)
     {
         Cache cache(64);
         check("a cold lookup misses", !cache.lookup(5, 0x1000, Kind::srv));
-        cache.publish(5, 0x1000, Kind::srv);
+        publish(cache, 5, 0x1000, Kind::srv);
         check("a published entry hits", cache.lookup(5, 0x1000, Kind::srv));
         check("repeated lookups keep hitting", cache.lookup(5, 0x1000, Kind::srv) && cache.lookup(5, 0x1000, Kind::srv));
         expect_stale("another resource address misses", "resource", cache.lookup(5, 0x2000, Kind::srv));
         expect_stale("another descriptor kind misses", "kind", cache.lookup(5, 0x1000, Kind::uav));
         expect_stale("another stamp misses", "stamp", cache.lookup(5, 0x1000, Kind::srv, 7));
         // A neighbour in another slot is untouched by all of the above.
-        cache.publish(6, 0x1000, Kind::srv);
+        publish(cache, 6, 0x1000, Kind::srv);
         check("a second id hits beside the first", cache.lookup(6, 0x1000, Kind::srv) && cache.lookup(5, 0x1000, Kind::srv));
     }
     {
         Cache cache(64);
-        cache.publish(5, 0x1000, Kind::srv);
-        cache.publish(5 + 64, 0x1000, Kind::srv);  // the same slot, another id
+        publish(cache, 5, 0x1000, Kind::srv);
+        publish(cache, 5 + 64, 0x1000, Kind::srv);  // the same slot, another id
         expect_stale("the replaced id misses", "id", cache.lookup(5, 0x1000, Kind::srv));
         check("the replacing id hits", cache.lookup(5 + 64, 0x1000, Kind::srv));
         check("a replacement is counted", cache.stats().replaced == 1);
     }
     {
         Cache cache(64);
-        cache.publish(1, 0x1000, Kind::srv);
-        cache.publish(2, 0x1000, Kind::uav);
-        cache.publish(3, 0x2000, Kind::srv);
+        publish(cache, 1, 0x1000, Kind::srv);
+        publish(cache, 2, 0x1000, Kind::uav);
+        publish(cache, 3, 0x2000, Kind::srv);
         cache.note_resource_change(0x1000);  // released: its address may be reused
         if (mutated("resource-generation")) {
             check("mutated: a released resource's view still hits", cache.lookup(1, 0x1000, Kind::srv));
@@ -78,15 +84,15 @@ int main(int argc, char** argv)
             check("every view over a released resource misses", !cache.lookup(1, 0x1000, Kind::srv) && !cache.lookup(2, 0x1000, Kind::uav));
         }
         check("views over another resource keep hitting", cache.lookup(3, 0x2000, Kind::srv));
-        cache.publish(1, 0x1000, Kind::srv);  // rebuilt over the new object
+        publish(cache, 1, 0x1000, Kind::srv);  // rebuilt over the new object
         check("a rebuilt entry hits again", cache.lookup(1, 0x1000, Kind::srv));
         cache.note_resource_change(0x1000);
         check("a second release drops it again", !cache.lookup(1, 0x1000, Kind::srv));
     }
     {
         Cache cache(64);
-        cache.publish(1, 0x1000, Kind::srv);
-        cache.publish(2, 0x1000, Kind::srv);
+        publish(cache, 1, 0x1000, Kind::srv);
+        publish(cache, 2, 0x1000, Kind::srv);
         cache.note_write(1);
         expect_stale("a written descriptor's entry misses", "write", cache.lookup(1, 0x1000, Kind::srv));
         check("a write to one id leaves the other", cache.lookup(2, 0x1000, Kind::srv));
@@ -95,10 +101,10 @@ int main(int argc, char** argv)
     }
     {
         Cache cache(64);
-        cache.publish(1, 0x1000, Kind::srv);
+        publish(cache, 1, 0x1000, Kind::srv);
         cache.note_flush();
         expect_stale("a flush drops what was built before it", "flush", cache.lookup(1, 0x1000, Kind::srv));
-        cache.publish(1, 0x1000, Kind::srv);
+        publish(cache, 1, 0x1000, Kind::srv);
         check("an entry built after the flush hits", cache.lookup(1, 0x1000, Kind::srv));
     }
     {
@@ -112,7 +118,7 @@ int main(int argc, char** argv)
             threads.emplace_back([&, t] {
                 for (int r = 0; r < kRounds; ++r) {
                     const std::uint32_t id = static_cast<std::uint32_t>(t * 100 + r % 50);
-                    if (!cache.lookup(id, 0x5000, Kind::srv)) cache.publish(id, 0x5000, Kind::srv);
+                    if (!cache.lookup(id, 0x5000, Kind::srv)) publish(cache, id, 0x5000, Kind::srv);
                 }
             });
         threads.emplace_back([&] {
@@ -123,9 +129,25 @@ int main(int argc, char** argv)
         check("hits plus misses equal the lookups", stats.hits + stats.misses == std::uint64_t{kThreads} * kRounds);
         check("every miss published once", stats.publishes == stats.misses);
         check("no thread failed", bad.load() == 0);
-        cache.publish(7, 0x5000, Kind::srv);
+        publish(cache, 7, 0x5000, Kind::srv);
         cache.note_resource_change(0x5000);
         check("after the storm a release still drops entries", !cache.lookup(7, 0x5000, Kind::srv));
+    }
+    {
+        // A release (or flush) that lands while the descriptor is being built: the entry was built over the old object and
+        // must not be served. The generations come from the ticket taken before the build, not from publish time.
+        Cache cache(64);
+        const Cache::Ticket before_build = cache.begin(0x1000);
+        cache.note_resource_change(0x1000);  // released during the build
+        cache.publish(1, 0x1000, Kind::srv, 0, mutated("ticket") ? cache.begin(0x1000) : before_build);
+        expect_stale("an entry built across a release misses", "ticket", cache.lookup(1, 0x1000, Kind::srv));
+        const Cache::Ticket again = cache.begin(0x1000);
+        cache.publish(1, 0x1000, Kind::srv, 0, again);
+        check("an entry built after the release hits", cache.lookup(1, 0x1000, Kind::srv));
+        const Cache::Ticket flush_ticket = cache.begin(0x2000);
+        cache.note_flush();  // heap destroyed during the build
+        cache.publish(2, 0x2000, Kind::srv, 0, mutated("ticket") ? cache.begin(0x2000) : flush_ticket);
+        expect_stale("an entry built across a flush misses", "ticket", cache.lookup(2, 0x2000, Kind::srv));
     }
     if (failures) return 1;
     std::puts("view cache checks passed");
