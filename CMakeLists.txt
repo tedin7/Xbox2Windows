@@ -4921,6 +4921,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(runtime_startup_triage_run_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
+    # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
+    add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")
+    add_test(NAME startup_tester_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_run_ps1_check.py")
+    set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 300)
     # The Linux launcher's check exits 77 on Windows; the Ubuntu job runs it.
     add_test(NAME startup_run_sh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_sh_check.py")
