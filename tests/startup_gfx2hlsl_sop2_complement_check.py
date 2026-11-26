@@ -21,10 +21,10 @@ with the operation wrapped in ~( ).
 Lane masks: vcc_lo, exec_lo or an SGPR holding a compare mask is the whole wave's mask, of which the translator keeps
 one lane's bit. Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask and an
 SGPR destination the lane's bit of the result is exact: the form is accepted and checked here on every lane of the
-edge words. SCC is set when any bit of the complemented 32-bit result is, which the other lanes decide (the bit of an
-idle lane is set); the per-lane projection cannot show that, so SCC is not emitted and a program that can read it
-before the next SCC write is refused (through branches too). A mask and a plain word mixed, a constant source, and a
-vcc_lo or exec_lo destination stay refused. The mask mark follows program order, so a mark is a proof at a branch
+edge words. NAND and NOR also accept exec_lo as the destination and can reactivate a lane. SCC is set when any bit
+of the complemented 32-bit result is set. SCC is not emitted for these forms and a program that can read it before
+the next SCC write is refused (through branches too). A mask mixed with a plain word or constant, a VCC destination,
+and XNOR into exec_lo stay refused. The mask mark follows program order, so a mark is a proof at a branch
 target only if the register's last write dominates the target and no block on a path from that write to the target
 writes the register again; otherwise the complement is refused until the register is written again. Mutations: the
 join rule disabled and the SCC read scan disabled must each accept a refused program.
@@ -53,6 +53,7 @@ import re
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -119,7 +120,10 @@ def code(name, form):
 
 
 class Probe(G.Stage):
-    """A Stage with no pipeline: enough state for decoded instructions to be translated."""
+    """A Stage with no pipeline: enough state for decoded instructions to be translated. It is a compute stage of
+    one 32-lane group (proven wave32) unless a test sets `kind` and `pipe.group`."""
+    kind = 'cs'
+    pipe = SimpleNamespace(group=(32, 1, 1))
 
     def __init__(self):
         self.lines, self.sym = [], {}
@@ -278,13 +282,45 @@ def lane_mask_controls():
         check('%s: %d all-mask forms give the lane bit of the reference on 32 lanes x %d pairs, SCC not written'
               % (name, len(forms), len(SPECIAL) ** 2), not wrong, str(wrong[:2]))
 
-    # 2. Still refused: a constant or plain-word source next to a mask, a mask destination, a high-half mask name.
-    for name in OPS:
-        wrong = []
-        for operands in ('s3, s1, s9', 's3, s9, vcc_lo', 's3, s1, -1', 's3, 0, vcc_lo', 'vcc_lo, s1, s2',
-                         'exec_lo, s1, s2', 's3, s1, vcc_hi', 'm0, s1, s2'):
+    for name in ('s_nand_b32', 's_nor_b32'):
+        reference = OPS[name][1]
+        # PR #2030 covered exec_lo, s1, s2 and all four source-bit pairs.
+        for operands, left, right in (('exec_lo, s1, s2', 's1', 's2'),
+                                      ('exec_lo, exec_lo, vcc_lo', 'exec', 'vcc')):
             stage = Probe()
             stage.masks.update((1, 2))
+            stage.one(name, '%s %s' % (name, operands))
+            expected = ['exec = (~(%s %s %s)) & 1;' % (left, operator[name], right)]
+            check('%s %s emits a one-bit EXEC write and invalidates the EXEC proof' % (name, operands),
+                  stage.lines == expected and not stage.exec_known and stage.masks == {1, 2}
+                  and stage.scc_effect == 'a lane-mask complement', str(stage.lines))
+            if stage.lines != expected:
+                continue
+            wrong = []
+            for a in (0, 1):
+                for b in (0, 1):
+                    env = {'exec': 0, left: a, right: b, 'scc': SCC_UNSET}
+                    out = run_lines(stage.lines, env)
+                    if (out['exec'], out['scc']) != (reference(a, b) & 1, SCC_UNSET):
+                        wrong.append((a, b, out))
+            check('%s %s gives the lane bit even for inactive lanes' % (name, operands), not wrong, str(wrong))
+
+    # 2. Still refused: mixed sources and destinations outside the supported forms.
+    for name in OPS:
+        wrong = []
+        # PR #2030 covered the vcc_lo constants, exec_hi constants and s3 with a mask and -1.
+        refused = ('s3, s1, s9', 's3, s9, vcc_lo', 's3, s1, -1', 's3, 0, vcc_lo', 'vcc_lo, s1, s2',
+                   'vcc_lo, 1, 0', 'vcc, s1, s2', 'exec_hi, 0, 0', 'exec, s1, s2', 's[4:5], s1, s2',
+                   'exec_lo, s1, s9', 'exec_lo, vcc_lo, 0', 'exec_lo, s[1:2], s2',
+                   's3, s1, vcc_hi', 'm0, s1, s2')
+        cases = [(operands, {1, 2}) for operands in refused]
+        # PR #2030 covered exec_lo with two plain SGPRs.
+        cases.append(('exec_lo, s1, s2', set()))
+        if name == 's_xnor_b32':
+            cases.append(('exec_lo, s1, s2', {1, 2}))
+        for operands, masks in cases:
+            stage = Probe()
+            stage.masks.update(masks)
             try:
                 stage.one(name, '%s %s' % (name, operands))
                 wrong.append((operands, stage.lines))
@@ -295,6 +331,10 @@ def lane_mask_controls():
 
     # 3. Whole programs. SCC after the complement is not the guest's: a read before the next SCC write is refused.
     masks = ('v_cmp_eq_f32_e64 s5, 0, v1', 'v_cmp_lt_f32_e64 s4, 0, v2')
+    for name in ('s_nand_b32', 's_nor_b32'):
+        got = text_refusal(*masks, '%s exec_lo, s5, s4' % name, 's_cselect_b32 s6, 1, 0', 's_endpgm')
+        check('%s into exec_lo refuses a later SCC read' % name,
+              got == 'scc from a lane-mask complement in s_cselect_b32', got)
     for name in OPS:
         complement = '%s s4, s5, s4' % name
         line = 's4 = (~(s5 %s s4)) & 1;' % operator[name]
@@ -331,6 +371,10 @@ def lane_mask_controls():
     got = [text_refusal(*skip, 's_nand_b32 s6, s5, s4', 's_endpgm'), text_refusal(*loop)]
     check('a mask that another path into the branch target changes is refused (skipped write, loop body write)',
           got == [joined, joined], str(got))
+    for name in ('s_nand_b32', 's_nor_b32'):
+        got = text_refusal(*skip, '%s exec_lo, s5, s4' % name, 's_endpgm')
+        check('%s into exec_lo refuses a joined mask source' % name,
+              got == '%s on a lane mask joined at a branch target' % name, got)
     lines = run_text(*arms)
     check('a mask written before the split and on no arm crosses the join', 's4 = (~(s5 & s4)) & 1;' in lines, str(lines))
     lines = run_text(*skip, *masks, 's_nand_b32 s6, s5, s4', 's_endpgm')
@@ -628,7 +672,7 @@ def controls():
         check('%s: %d numeric forms emit the %s lines complemented, same mask and EXEC bookkeeping'
               % (name, len(VALUE_FORMS), sibling), not wrong, str(wrong[:2]))
 
-    # 5b. Refused: a lane mask next to a plain word, or as the destination (lane_mask_controls has the accepted forms).
+    # 5b. Decoded forms with a lane mask and a plain word (lane_mask_controls covers all-mask forms).
     for name in OPS:
         accepted = []
         for form in MASK_FORMS:

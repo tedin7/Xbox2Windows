@@ -1,4 +1,4 @@
-"""Parameter export and pixel-input linkage (param0..param12) for mesh shaders (#2413 T4).
+"""Parameter export and pixel-input linkage (param0..param31) for mesh shaders (#2413 T4).
 
 AMD RDNA 2 ISA section 10.2 (EXP targets): target 32 + N encodes paramN (0 <= N <= 31).
 Desktop D3D12 SM 6.5 allows at most 32 float4 vectors in the vertex output / pixel input
@@ -8,7 +8,7 @@ flat FPARAM* and binary16 HPARAML*/HPARAMH* shadow semantics required by gfx2hls
 
 from dataclasses import dataclass
 
-MAX_PARAM = 12
+MAX_PARAM = 31
 MAX_VERTEX_VECTORS = 32
 
 

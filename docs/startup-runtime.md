@@ -208,8 +208,9 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-29` and `x2w-startup-shader-29cs`.
 Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
+Revision 29 exists only on tester-loop-tx: the translator PRs merged there change translations under the same keys, so a cache warmed on tester-loop is not reused.
 Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
 treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
@@ -1558,6 +1559,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
+| `X2W_D3D12_SO_TARGETS=1` | with `X2W_D3D12_PERMISSIVE=1`, records `SOSetTargets` (list slot 49, inferred from the desktop order 45 + 4, no independent evidence yet) on the recording list: bind, partial unbind and refused ranges. Draws do not write stream output yet (`ctest --preset dev --no-tests=error -R ^startup_stream_output_slot_warp_`) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
@@ -2442,7 +2444,7 @@ These are measured on one executable; treat them as hypotheses for others.
   column 1 at x=1.25, while the wrap control reads column 0. Run
   `ctest --preset release --no-tests=error -R "^startup_inline_sampler_"`.
 - **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
-  a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
+  a `float3` of the three address registers in order. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
 - **Pixel-stage image stores.** In a pixel stage, `image_store` with `dim:SQ_RSRC_IMG_2D` and
@@ -2499,6 +2501,13 @@ These are measured on one executable; treat them as hypotheses for others.
   `dmask`, wrong address-register counts, fake NSA extensions, and `a16` on 3D or 2D-array images
   (`ctest --preset dev --no-tests=error -R "^startup_image_sample_a16_" -V`). `image_sample_l` and 3D /
   2D-array `a16` stay refused.
+- **1D images.** `image_sample`, `image_sample_lz`, `image_sample_l`, `image_load` and `image_load_mip` with
+  `dim:SQ_RSRC_IMG_1D` use a `Texture1D<float4>` (manifest kind `tex1d`) addressed by one component, x; the
+  explicit-level and mip forms take the level or mip from the last address register (`Load(int2(x, mip))`,
+  `SampleLevel(smp, x, level)`). Before, only the implicit `image_sample` was lowered and the other forms were
+  refused. `python -B tests/startup_image_1d_check.py` translates the fixtures (words checked against `llvm-mc`).
+  No draw runs the load, mip and explicit-level forms yet, so they are not measured on WARP or hardware. Compare,
+  gather and offset forms on a 1D image stay refused.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -2506,7 +2515,7 @@ These are measured on one executable; treat them as hypotheses for others.
   Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
   hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
-  and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
+  images are still refused. Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
 - **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
   `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
@@ -2765,7 +2774,7 @@ These are measured on one executable; treat them as hypotheses for others.
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
-  gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
+  gather, clamp, cube and `unorm` forms are refused; 1D is lowered (x, then the level). Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
   first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a

@@ -303,6 +303,8 @@ nonempty component mask. The image draw test samples the alpha channel of a two-
 Texture1D at two coordinates and compares exact words. Selecting red changes both results.
 Run `ctest --preset dev -R startup_image_3d --no-tests=error` for this and the 3D controls.
 
+The same lowering now covers the other 1D forms, which were refused with `unverified 1D image sample address or modifiers`. A 1D image takes one address component, x. `image_load` becomes `Texture1D.Load(int2(x, 0))`; `image_load_mip` takes x and then the mip and becomes `Load(int2(x, mip))`; `image_sample_lz` becomes `SampleLevel(smp, x, 0)`; `image_sample_l` takes x and then the level and becomes `SampleLevel(smp, x, level)`. The mip and the level are the last address register, so the NSA lists `[v3, v1]` and `[v3, v0]` read x from `v3`. Only the cache-policy bits `glc`, `slc` and `dlc` are accepted next to `dim` and `dmask`; `unorm`, `tfe`, `a16` and the other modifiers and an empty `dmask` are refused with `unverified 1D image address or modifiers`. `python -B tests/startup_image_1d_check.py` (CTest `startup_image_1d`) translates source-built fixtures whose words are checked against `llvm-mc` and requires the exact call; reading the mip as 0, taking the level from the first register, accepting `unorm` or binding the texture as 2D each make it fail. Not covered: no draw runs a 1D load, mip load or explicit-level sample on WARP or hardware, so those forms are checked on the generated HLSL text only (the plain `image_sample` draw above is unchanged). `image_sample_c`, gather and offset forms on a 1D image are still refused.
+
 The runtime binds an explicit or default 1D view and uploads single-array-slice CPU-backed textures
 using their desktop copyable footprints. Run `ctest --preset dev -R '^startup_1d_srv_' --no-tests=error`
 to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on hardware and WARP.
@@ -4288,6 +4290,23 @@ python3 -B tests/startup_ngg_slice_check.py
 python3 -B tests/startup_ngg_slice_check.py binary llvm-mc-15
 ```
 
+### NGG vertex pass-through lowering
+
+`tools/startup/gfx2hlsl.py` translates the straight-line NGG pass-through vertex profile (#1723). `s_sendmsg` message 9 (`GS_ALLOC_REQ`) and `s_barrier` are dropped, because D3D assembles the primitives itself. The primitive export (`exp prim` / `target_20`) is accepted only as the unchanged entry `v0` word with the other channels off.
+
+An LDS round trip is forwarded as a register copy (`ds_write_b32 vA, vD offset:N` then `ds_read_b32 vR, vB offset:M` becomes `vR = vD`) only when the translator proves that no other lane can touch the slot. The entry `v0` is a packed word with no known layout, so the proof starts from the lane id: `v_mbcnt_lo_u32_b32 v, -1, 0` followed by `v_mbcnt_hi_u32_b32 v, -1, v` is the lane number 0..63. An address is accepted only as the affine form `stride * lane + offset` built from it by `v_mov_b32`, `v_lshlrev_b32`, `v_add_nc_u32`, `v_mul_u32_u24`, `v_mul_lo_u32` and `v_mad_u32_u24` with immediate operands. Each form must have a 4-byte aligned stride and offset and stay inside 64 KiB for all 64 lanes. Every `ds_write_b32` is then checked against every earlier write and against itself: for all lane pairs `i != j` the four-byte intervals must be disjoint. A read takes the register of the write with the identical form (the same stride and byte offset, whatever register holds the address) and is refused if the payload register changed since. A register that holds a lane address exists only to address LDS: any other use is refused. The proof covers the lanes of one wave. It does not analyse any per-wave base, so separation between waves is not proven here; two waves writing one address with different values would race on hardware too.
+
+Refused, naming the missing proof: the entry `v0` or a copy of it as an address, `v_mbcnt_lo` alone (lanes 32..63 share a value), a stride that lets two lanes (or two write offsets) reach one dword, or two writes of one lane meet (for example stride 4 with offsets 16 and 20, or stride 0), an unaligned or out-of-range form, any other computed address, a read without a matching write, other `s_sendmsg` messages, any branch or non-vertex stage, and every other LDS opcode.
+
+```sh
+python3 -B tests/startup_gfx2hlsl_ngg_passthrough_check.py
+python3 -B tests/startup_gfx2hlsl_ngg_passthrough_check.py binary llvm-mc-15
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ngg_passthrough' -V
+```
+
+`startup_gfx2hlsl_ngg_passthrough_warp` draws a vertex shader that parks twelve payload words in LDS (stride 48 per lane, offsets 0..44), reads them back and exports them as parameters, and compares the pixels with a CPU reference. The fixture `tests/startup_gfx2hlsl_ngg_passthrough_tail.s` assembles with `llvm-mc -mcpu=gfx1013` into the recorded words. The pure-Python controls include the disjoint case, the aliasing case with distinct per-lane payloads, a non-affine control, and a mutation control that removes the disjointness check and so lowers the aliasing case.
+
+
 ## Local compute container index
 
 `tools/compute_container_index.py` joins the digest in a recognized slot 67
@@ -8197,6 +8216,19 @@ mask and conversion expressions of the byte-extracting conversions, whose shift 
 checks before.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 
+**`v_cvt_pknorm_u16_f32` in the startup translator (#1946).** `gfx2hlsl.py` used to return `Unsupported` for this
+VOP3-only instruction. It now emits `uint(round(saturate(S0) * 65535.0)) | (uint(round(saturate(S1) * 65535.0)) << 16)`:
+each half is clamped to 0..1, scaled and rounded to nearest even, a NaN reads 0, and source `neg`/`abs` apply to the
+float inputs. Any modifier (output modifier, `op_sel`, `clamp`) and any operand count other than three are refused
+by name rather than dropped, because they would change the packed words.
+`tests/startup_gfx2hlsl_pknorm_u16_check.py` has three modes. With no arguments it checks the translation controls in
+pure Python. With an `llvm-mc` path it reassembles the pixel body and compares it with the recorded words. With
+`draw` it renders four input sets per pixel through DXC ps_6_0 and compares the result words with a reference that
+rounds the binary32 product, and three mutated lowerings (low-half rounding, upper clamp, half order) must fail.
+Verified so far: the Python and LLVM checks. The WARP and GPU draw runs are not yet verified on Windows, and no
+hardware run of the instruction itself was available. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_pknorm_u16' -V`.
+
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
 sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read
@@ -8334,7 +8366,7 @@ when every source is a mask, because bit i of the complement depends only on bit
 lowers to `(~(a op b)) & 1` into an SGPR, checked on all 32 lanes of the edge words. Guest SCC reads the whole
 32-bit result, which the per-lane projection cannot show, so SCC is not emitted and a program that can read it
 before the next SCC write is refused, through joins and back edges. A mask mixed with a plain word or a constant
-and a vcc_lo or exec_lo destination stay refused, as does a mask source whose last write does not dominate a
+and a vcc_lo destination (or an exec_lo destination of s_xnor_b32) stay refused. s_nand_b32 and s_nor_b32 also accept exec_lo as the destination when every source is a mask and the stage is proven wave32 (compute with at most 32 threads per group; pixel and vertex stages, whose wave size is unknown, the slot 57 mesh stage and any wave64 compute group keep refusing it, because a write to exec_lo leaves lanes 32..63 unchanged): the lane's new EXEC bit is the same per-lane value, including for a lane that was inactive. `startup_gfx2hlsl_s_nor_nand` and its `_dispatch_warp`/`_dispatch_hardware` variants check those forms by D3D12 UAV readback against an integer reference. A mask source is also refused whose last write does not dominate a
 branch target crossed since, or which a block on a path to that target writes again. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
 LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
 the same words.
@@ -15025,7 +15057,7 @@ For binary32 arithmetic and compare sources, the translator reads the inline int
 
 ## Startup translator: explicit-LOD image sampling
 
-`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample (and a 1D one, see above) to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
 ## Startup translator: binary32 arithmetic
 
@@ -16118,6 +16150,19 @@ arithmetic result and a key-dependent byte offset in one fixed raw buffer. A rea
 a store inside the loop, a live-out scalar that depends on the key (or is computed from it) or a key-selected
 descriptor keeps an instruction-specific refusal. The fixtures include a key-independent live-out read after the loop
 (accepted, checked against a D3D12 WARP readback) and key-dependent live-outs (refused).
+
+### Startup translator: frexp, float-to-int conversions and ldexp
+
+`tools/startup/gfx2hlsl.py` lowers five more operations: `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_cvt_flr_i32_f32`, `v_cvt_rpi_i32_f32` and `v_ldexp_f32`. This is the startup path, separate from the `pixel_aot.py` helpers of the same names. `v_cvt_rpi_i32_f32` adds one to `floor(x)` when the exact fraction `x - floor(x)` is at least 0.5, because binary32 `x + 0.5` would round `0x3effffff` up to 1 and move `8388609.0`. A NaN reads `0x7fffffff` with its sign bit clear and `0x80000000` with it set, and values outside the int32 range saturate, matching `CVT_FLR_RPI_EXCEPTIONAL` in `tests/pixel_aot_check.py`. `v_frexp_exp_i32_f32` gives 0 for zero, denormals, infinity and NaN. Output modifiers and `clamp` on the two conversions and on `v_frexp_exp_i32_f32` are refused.
+
+`tests/startup_gfx2hlsl_frexp_cvt_check.py` is CPU only: it translates each operation, runs the emitted line on a small evaluator that rounds every binary32 add, subtract and multiply, and compares with an exact reference over 51 words per unary operation (including all six NaN spellings, both infinities and the saturation edges) and 736 `v_ldexp_f32` pairs. `tests/startup_gfx2hlsl_frexp_cvt_warp_check.py` draws the same operations through D3D12 and compares the read-back with that reference on WARP and on hardware.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_frexp_cvt_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_frexp_cvt' -V
+```
+
+Not covered: denormal inputs and results of `v_ldexp_f32` (the denormal mode decides them), signalling-NaN payloads of `v_frexp_mant_f32`, and the console's own results.
 
 ## Desktop audio render sink
 
@@ -17433,10 +17478,13 @@ with such an op and no backward branch now decides its `s_cbranch_execz` / `s_cb
 (`x2w_quad_any(exec)`: some lane of the 2x2 quad has its EXEC bit, from fine derivatives of the 0/1 bit), as the guest's
 wave skips a block only when no lane is active and runs it with the other lanes masked. A voted branch parts no quad,
 so it keeps `uniform_cf` (#2659); the vote reads the quad, so it is taken only while the control flow is quad-uniform
-and no lane-exec break (`s_wqm` of a narrowed EXEC, a discard under an unknown EXEC) came first. With that, a derivative
+and no lane-exec break (a discard under an unknown EXEC, an `s_wqm` with other operands) came first. With that, a derivative
 op may sit under `v_cmpx`, inside an `execz` block, past an `execnz` kill branch, or after an EXEC restore. Still
 refused: any branch that can differ between lanes and is not an EXEC branch (VCC, SCC not proven uniform), loops with
-such a branch, and an `s_wqm` of a narrowed EXEC before the op.
+such a branch. `s_wqm_b64 exec, exec` on a narrowed EXEC turns every lane of a quad with an active lane on; it is
+lowered as `exec = x2w_quad_any(exec) ? 1u : 0u;`, the same vote written back to EXEC.
+The bias of `image_sample_b` may differ per lane (a join of two values): `SampleBias` takes it per pixel, and the draw
+fixture `bias_lane` gives the drawn lane and its helper column different biases.
 `tests/startup_image_sample_b_flow_check.py` and `tests/startup_image_get_lod_flow_check.py` draw each shape against a
 CPU reference (DXC ps_6_0 and FXC ps_5_1) with wrong-value controls.
 
@@ -17561,3 +17609,14 @@ With `X2W_D3D12_LAZY_TEXTURES=1` (Refs #2764, #2379, #1199), device slot 133 (`C
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_slot133_lazy_textures_' -V
 ```
+## Startup translator: lane-local DPP forms
+
+`tools/startup/gfx2hlsl.py` lowers a `_dpp` spelling of a VOP1/VOP2 operation that is already in its vector tables (for example `v_add_f32_dpp`, `v_or_b32_dpp`, `v_add_nc_u32_dpp`, `v_sub_f32_dpp`) only when it reads the lane's own value. The translator models one lane, so that form is the plain operation. The accepted controls are `quad_perm:[0,1,2,3]` or `dpp8:[0,1,2,3,4,5,6,7]`, with `row_mask` and `bank_mask` either absent or `0xf` (every lane enabled). Anything else is refused by name: any other `quad_perm` or `dpp8` select, `row_*` and `wave_*` controls, a partial `row_mask` or `bank_mask`, `bound_ctrl` and `fi`, a DPP spelling with no lane-local control, and a DPP spelling of an operation outside the vector tables (for example `v_swap_b32_dpp`). Lowering one of those as the plain operation would silently use the wrong value.
+
+`tests/startup_gfx2hlsl_dpp_check.py` checks that each accepted spelling translates to the same statements as the plain one and that each refusal names its control. This is a translator check. It does not show how a driver executes DPP.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_dpp_check.py
+```
+
+Expected: every line ends in `ok` and the last line is `PASS`. Result on this commit: `PASS`.

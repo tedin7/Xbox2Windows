@@ -190,9 +190,14 @@ def check_refusals():
             raise AssertionError('%s: %s' % (name, error)) from None
     # A root signature without the directly indexed heap has no heap pointer: s8 is then a plain user SGPR.
     refused('s_load through s8 holding', lambda: pipeline(root=root_blob(flags=0)))
-    # The graphics stages keep their refusal.
+    # A pixel stage takes the image record (8 dwords, see startup_gfx2hlsl_pixel_heap_image_check.py), not a buffer one.
     stage = pipeline().cs
     stage.kind = 'ps'
+    stage.heap_index[6] = ('rootconst', 0, INDEX_WORD)
+    refused('of 4 dwords', lambda: stage.op_s_load_dwordx4(['s[16:19]', 's[8:9]', 's6'], []))
+    # The vertex stage keeps the old refusal.
+    stage = pipeline().cs
+    stage.kind = 'vs'
     stage.heap_index[6] = ('rootconst', 0, INDEX_WORD)
     refused("s_load with a register offset through ('resheap',)",
             lambda: stage.op_s_load_dwordx4(['s[16:19]', 's[8:9]', 's6'], []))

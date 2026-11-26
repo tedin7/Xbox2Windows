@@ -129,10 +129,12 @@ check('dmask selects the written channels', emitted.endswith('v4 = U(t.x); v5 = 
 asm, emitted = translate(encode_mimg(IMG_SAMPLE_LZ, dmask=0xF, dim=DIM_2D, vdata=4))
 check('2D sample_lz still uses a float2 location', 'SampleLevel(smp0, float2(F(v0), F(v1)), 0)' in emitted, emitted)
 
-# 6. Refusals that must not widen: a 1D load (its address packing is a different slice), a 1D sample_lz with
+# 6. Refusals that must not widen: a unorm 1D load, a 1D sample_lz with
 #    two address dwords, and a modifier that would change the address or result layout.
-check('1D image_load stays refused',
-      refused(encode_mimg(IMG_LOAD, dmask=0xF, dim=DIM_1D, vdata=4)))
+check('1D image_load lowers to Texture1D.Load',
+      'Load(int2(' in translate(encode_mimg(IMG_LOAD, dmask=0xF, dim=DIM_1D, vdata=4))[1])
+check('a unorm 1D image_load stays refused',
+      refused(encode_mimg(IMG_LOAD, dmask=0xF, dim=DIM_1D, vdata=4, unorm=1)))
 check('1D sample_lz with two address dwords stays refused',
       refused(encode_mimg(IMG_SAMPLE_LZ, dmask=0xF, dim=DIM_1D, vdata=4, nsa=1, extra_addrs=(1,))))
 check('a unorm 1D sample_lz stays refused',

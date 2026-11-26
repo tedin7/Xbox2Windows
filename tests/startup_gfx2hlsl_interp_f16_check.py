@@ -90,6 +90,10 @@ PS_WORDS = bytes.fromhex(
 V_BODY = PS_SOURCE.split('\n', 1)[1]
 V_FIRST = 'v_interp_p1ll_f16 v4, v0, attr0.x\nv_interp_p2_f16 v4, v1, attr0.x, v4\n'
 V_TAIL = 'exp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n'
+# The four pairs of PS_SOURCE, then a v_fma_mix_f32 into v4 (the plain p2 result, whose upper half no instruction wrote).
+V_MIX_HEAD = PS_SOURCE.split('v_cvt_f32_f16 v4, v4')[0]
+V_MIX_REST = ('v_cvt_f32_f16 v5, v5\nv_cvt_f32_f16 v6, v6\nv_cvt_f32_f16 v7, v7\n'
+              'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n')
 PS_VARIANT_SOURCES = {
     'I clobbered': 's_mov_b32 m0, s2\nv_mov_b32 v0, 1.0\n' + V_BODY,
     'J clobbered': 's_mov_b32 m0, s2\nv_mov_b32 v1, 1.0\n' + V_BODY,
@@ -103,9 +107,29 @@ PS_VARIANT_SOURCES = {
     'upper half read by a shift': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_lshrrev_b32 v8, 16, v4\n'
         'v_cvt_f32_f16 v4, v4\nexp mrt0 v4, v8, v8, v8 done vm\ns_endpgm\n',
     'upper half exported': 's_mov_b32 m0, s2\n' + V_FIRST + V_TAIL,
+    # v_fma_mix_f32: op_sel_hi marks a binary16 source and op_sel picks its upper half (AMD RDNA2 ISA guide, VOP3P).
+    'fma_mix low half': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0 op_sel_hi:[1,1,0]\n' + V_MIX_REST,
+    'fma_mix upper half': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0 op_sel:[1,0,0] op_sel_hi:[1,1,0]\n' + V_MIX_REST,
+    'fma_mix binary32 source': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0\n' + V_MIX_REST,
+    # The first exported channel is a read too: the whole v4 (upper half undefined) goes out as channel x.
+    'upper half exported as first channel': V_MIX_HEAD + V_MIX_REST,
     'branch into p2': 's_mov_b32 m0, s2\ns_cbranch_vccz L0\nv_interp_p1ll_f16 v4, v0, attr0.x\nL0:\n'
         'v_interp_p2_f16 v4, v1, attr0.x, v4\nv_cvt_f32_f16 v4, v4\n' + V_TAIL,
     'unrelated read of v2': 's_mov_b32 m0, s2\nv_mov_b32 v8, v2\n' + V_BODY,
+    # A plain whole-register copy (v_mov_b32, v_cndmask_b32) hands the undefined upper half on to its destination: a low-half
+    # fma_mix read of the copy is fine, any other read of the copy (export, shift) is still a read of the undefined half.
+    'copy read as a low half': V_MIX_HEAD + 'v_mov_b32 v8, v4\nv_fma_mix_f32 v4, v8, v8, -0 op_sel_hi:[1,1,0]\n' + V_MIX_REST,
+    'cndmask copy read as a low half': 's_mov_b32 vcc_lo, 0\n' + V_MIX_HEAD + 'v_cndmask_b32 v8, v4, v4, vcc_lo\n'
+        'v_fma_mix_f32 v4, v8, v8, -0 op_sel_hi:[1,1,0]\n' + V_MIX_REST,
+    'copy exported': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_mov_b32 v8, v4\nv_cvt_f32_f16 v4, v4\n'
+        'exp mrt0 v4, v8, v8, v8 done vm\ns_endpgm\n',
+    'copy shifted': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_mov_b32 v8, v4\nv_lshrrev_b32 v9, 16, v8\nv_cvt_f32_f16 v4, v4\n'
+        'exp mrt0 v4, v9, v9, v9 done vm\ns_endpgm\n',
+    # VOP3 source modifiers still read the register (the scan used to miss `-v4` and `|v4|`).
+    'negated read of a p2 result': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_mul_f32_e64 v8, -v4, 1.0\nv_cvt_f32_f16 v4, v4\n'
+        'exp mrt0 v4, v8, v8, v8 done vm\ns_endpgm\n',
+    'absolute read of a p2 result': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_mul_f32_e64 v8, |v4|, 1.0\nv_cvt_f32_f16 v4, v4\n'
+        'exp mrt0 v4, v8, v8, v8 done vm\ns_endpgm\n',
     'unrelated write of v9': 's_mov_b32 m0, s2\nv_mov_b32 v9, 1.0\n' + V_BODY,
 }
 PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
@@ -116,7 +140,17 @@ PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
     ('p1ll result read after p2 wrote elsewhere', '0203fcbe040042d70000020008005ad7000212040817107e0403127e0f1800f808090909000081bf'),
     ('upper half read by a shift', '0203fcbe040042d70000020004005ad7000212049008102c0417087e0f1800f804080808000081bf'),
     ('upper half exported', '0203fcbe040042d70000020004005ad7000212040f1800f804040404000081bf'),
+    ('fma_mix low half', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040020cc0409021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('fma_mix upper half', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040820cc0409021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('fma_mix binary32 source', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040020cc0409020205170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('upper half exported as first channel', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e0405170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('branch into p2', '0203fcbe020086bf040042d70000020004005ad7000212040417087e0f1800f804040404000081bf'),
+    ('copy read as a low half', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040403107e040020cc0811021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('cndmask copy read as a low half', '8003eabe0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e0404091002040020cc0811021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('copy exported', '0203fcbe040042d70000020004005ad7000212040403107e0417087e0f1800f804080808000081bf'),
+    ('copy shifted', '0203fcbe040042d70000020004005ad7000212040403107e9010122c0417087e0f1800f804090909000081bf'),
+    ('negated read of a p2 result', '0203fcbe040042d70000020004005ad700021204080008d504e501200417087e0f1800f804080808000081bf'),
+    ('absolute read of a p2 result', '0203fcbe040042d70000020004005ad700021204080108d504e501000417087e0f1800f804080808000081bf'),
     ('unrelated read of v2', '0203fcbe0203107e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('unrelated write of v9', '0203fcbef202127e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
 )}
@@ -243,9 +277,21 @@ def evaluate(vs, ps, channels=None, regs=None):
             f32 = source['xyzw'.index(stmt.group(4))]
             state[stmt.group(1)] = f16_bits(struct.unpack('<f', struct.pack('<I', f32))[0])
             continue
+        # whole-register copies: v_mov_b32 and v_cndmask_b32 with vcc clear (both value sources are the same register here)
+        stmt = re.fullmatch(r' +(v\d+) = (?:\(vcc & 1\) \? (v\d+) : )?(v\d+);', line)
+        if stmt and stmt.group(3) in state:
+            state[stmt.group(1)] = state[stmt.group(3)]
+            continue
         stmt = re.fullmatch(r' +(v\d+) = U\(f16tof32\((v\d+)\)\);', line)
         if stmt:
             state[stmt.group(1)] = f16_to_f32_bits(state[stmt.group(2)] & 0xffff)
+            continue
+        # v_fma_mix_f32 a, b, 0 with both sources binary16 low halves, written through the precise mix32 helper (#2818):
+        # the f32 product (exact for two binary16 values)
+        stmt = re.fullmatch(r'    (v\d+) = U\(mix32\(f16tof32\((v\d+)\), f16tof32\((v\d+)\), F\(0x00000000u\)\)\);', line)
+        if stmt:
+            a, b = (struct.unpack('<f', struct.pack('<I', f16_to_f32_bits(state[g] & 0xffff)))[0] for g in stmt.group(2, 3))
+            state[stmt.group(1)] = struct.unpack('<I', struct.pack('<f', a * b))[0]
     return tuple(state['v%d' % n] for n in (4, 5, 6, 7))
 
 
@@ -502,6 +548,24 @@ def barycentric_controls(expected):
         assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps()) == expected, label
         print('accepted: %s' % label)
 
+    # A v_fma_mix_f32 that reads a plain p2 result only as a binary16 LOW half (op_sel_hi set, op_sel clear) sees defined
+    # bits: it translates and squares the low half. The upper half (op_sel) and a binary32 read stay refused.
+    low = struct.unpack('<f', struct.pack('<I', expected[0]))[0]
+    square = struct.unpack('<I', struct.pack('<f', low * low))[0]
+    pipe = translate(PS_VARIANTS['fma_mix low half'])
+    assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps()) == (square, *expected[1:]), 'fma_mix low half'
+    print('accepted: v_fma_mix_f32 reading the low half of a plain p2 result')
+    refused('fma_mix upper half', PS_VARIANTS['fma_mix upper half'], 'upper 16 bits')
+    refused('fma_mix binary32 source', PS_VARIANTS['fma_mix binary32 source'], 'upper 16 bits')
+    refused('upper half exported as first channel', PS_VARIANTS['upper half exported as first channel'], 'upper 16 bits')
+    pipe = translate(PS_VARIANTS['copy read as a low half'])
+    assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps()) == (square, *expected[1:]), 'copy read as a low half'
+    pipe = translate(PS_VARIANTS['cndmask copy read as a low half'])
+    assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps()) == (square, *expected[1:]), 'cndmask copy read as a low half'
+    print('accepted: a v_mov_b32 / v_cndmask_b32 copy of a plain p2 result read as a binary16 low half')
+    for label in ('copy exported', 'copy shifted', 'negated read of a p2 result', 'absolute read of a p2 result'):
+        refused(label, PS_VARIANTS[label], 'upper 16 bits')
+
     # 2. The omitted p1ll result and the upper half of the p2 result.
     refused('p1ll result read between the pair', PS_VARIANTS['p1ll result read between the pair'],
             'reads it before the matching v_interp_p2_f16')
@@ -601,6 +665,15 @@ def check_compile(dxc):
     print('dxc vs_6_0 / ps_6_0: compiled (compr pair and the plain-export pair, both halves)')
 
 
+def mix_reference():
+    """reference() with channel x replaced by the binary32 product of its binary16 low half with itself (v_fma_mix_f32 with
+    both sources op_sel_hi set, op_sel clear and src2 zero); the other channels are unchanged."""
+    words = list(reference())
+    low = struct.unpack('<f', struct.pack('<I', words[0]))[0]
+    words[0] = f32_bits(low * low)
+    return tuple(words)
+
+
 def check_draw(dxc, renderer, adapter):
     expected = ','.join('%08x' % w for w in reference())
     vs, ps = pair()
@@ -621,6 +694,27 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0:
             raise AssertionError('high inverted: control read the reference words')
         print('high inverted: fails as expected', flush=True)
+        # v_fma_mix_f32 on the low half of a plain p2 result, read back against the ISA arithmetic (binary16 low half squared).
+        mix_words = ','.join('%08x' % w for w in mix_reference())
+        mix_ps = compile_hlsl(dxc, 'dxc', translate(PS_VARIANTS['fma_mix low half']).hlsl_ps(), 'ps_mix', 'ps_6_0', directory)
+        run = draw(renderer, adapter, vs_cso, mix_ps, mix_words)
+        if run.returncode:
+            raise AssertionError('fma_mix low half\n%s\n%s' % (run.stdout, run.stderr))
+        print('fma_mix low half: %s' % mix_words, flush=True)
+        # Controls: the plain pair against the mix reference and the mix program against the plain reference must mismatch.
+        if draw(renderer, adapter, vs_cso, ps_cso, mix_words).returncode == 0:
+            raise AssertionError('fma_mix: the plain pair read the mix reference words')
+        if draw(renderer, adapter, vs_cso, mix_ps, expected).returncode == 0:
+            raise AssertionError('fma_mix: the mix program read the plain reference words')
+        print('fma_mix low half, wrong references: fail as expected', flush=True)
+        copy_ps = compile_hlsl(dxc, 'dxc', translate(PS_VARIANTS['copy read as a low half']).hlsl_ps(), 'ps_copy', 'ps_6_0', directory)
+        run = draw(renderer, adapter, vs_cso, copy_ps, mix_words)
+        if run.returncode:
+            raise AssertionError('copy read as a low half\n%s\n%s' % (run.stdout, run.stderr))
+        print('copy of the p2 result read as a low half: %s' % mix_words, flush=True)
+        if draw(renderer, adapter, vs_cso, copy_ps, expected).returncode == 0:
+            raise AssertionError('copy read as a low half: the copy program read the plain reference words')
+        print('copy read as a low half, wrong reference: fails as expected', flush=True)
         # The constant-trip loop around the pair exports the reference words; its high bit inverted does not.
         loop = translate(LOOP_WORDS['loop'])
         loop_ps = compile_hlsl(dxc, 'dxc', loop.hlsl_ps(), 'ps_loop', 'ps_6_0', directory)

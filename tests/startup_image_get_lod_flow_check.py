@@ -90,6 +90,9 @@ FIXTURES = {
     # y == 0 enters the block. (u0, u1) is (u of the drawn pixel, u + the footprint along y): 4 * 0.5 = 2, LOD 1 - 1 = 0.
     'inside_y': (PROLOGUE + 'v_mov_b32_e32 v2, 0x3e000000\nv_lshrrev_b32_e32 v7, 16, v0\nv_cvt_f32_u32_e32 v6, v7\nv_mul_f32_e32 v6, 0.5, v6\nv_add_f32_e32 v3, 0x3e800000, v6\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_mov_b32_e32 v14, 0\n'
                  + QUERY + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(1, 8), Fraction(5, 8))),
+    # s_wqm exec, exec on a narrowed EXEC turns the whole quad back on (see tests/startup_image_sample_b_flow_check.py).
+    'wqm': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\ns_wqm_b64 exec, exec\nv_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+            (Fraction(-3, 8), Fraction(1, 8))),
 }
 REFUSED = {
     # The plain s_mov_b64 exec, s[N] restore of a mask saved before s_wqm is a lane-exec break too (main accepts the form).
@@ -196,6 +199,9 @@ WORDS_HEX = {
     'restore': (
         '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e7e0cfe877fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
+    'wqm': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e8010a47d7e0afebef10404067fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
 }
 CALL = ('t = float4(r0.CalculateLevelOfDetail(q0, float2(F(v2), F(v3))), '
         'r0.CalculateLevelOfDetailUnclamped(q0, float2(F(v2), F(v3))), 0.0, 0.0);')
@@ -252,6 +258,8 @@ def mutants(name, hlsl):
         return [('without the branch write', hlsl.replace(write.group(0), ''))]
     if name in ('cmpx', 'inside', 'kill'):
         return [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
+    if name == 'wqm':
+        return [('s_wqm as a no-op', hlsl.replace('exec = x2w_quad_any(exec) ? 1u : 0u;', ''))]
     return []
 
 

@@ -127,12 +127,8 @@ PATCHES = (
      'v_readfirstlane_b32 requires a proven uniform source'),
     ('loop counter updated from lane mask',
      [(pack_hex(*sop2('s_add_u32', 's22', 's22', 1)), pack_hex(*sop1('s_mov_b32', 's22', 'vcc_lo')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
+     'reads lane mask s22 as numeric data'),
     # RF1 negative controls: the integer chain stays refused when a source differs between lanes.
-    ('integer chain from the thread id',
-     [(pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
-    # the lane-mask read as a number is refused first (#2702); the chain is not reached
     ('integer chain with a lane-mask scalar',
      [(pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 's27', 'v10')), pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 'vcc_lo', 'v10')))],
      'v_add_nc_u32 reads lane mask vcc_lo as numeric data'),
@@ -140,7 +136,18 @@ PATCHES = (
 
 
 def translate(code=None):
-    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL)
+    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL, wave=32)
+
+
+FIRST_LANE_GATHER = 'InterlockedMin(x2w_first['
+
+
+def not_proven(code):
+    """`code`'s first-lane read has no uniform proof: with the guest wave it reads the lowest enabled lane through the
+    group (WaveSync), and without the guest wave the translator refuses it (the refusal the caller expects)."""
+    text = translate(code).hlsl_cs()
+    assert FIRST_LANE_GATHER in text, text
+    return G.ComputePipeline(code, root_blob(), RSRC2, LOCAL).hlsl_cs()
 
 
 def expected():
@@ -215,6 +222,11 @@ def controls(llvm_mc=None):
             code = patch(code, old_hex, new_hex)
         refused(reason, lambda code=code: translate(code))
 
+    # A thread-id source is not wave-uniform: the read takes the lowest enabled lane of the guest wave (WaveSync).
+    code = patch(PROGRAM_WORDS, pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))
+    text = translate(code).hlsl_cs()
+    assert 'x2w_value_' in text and 'InterlockedMin(x2w_first[' in text and 'v10 = v0;' in text, text
+    refused('requires a proven uniform source', lambda: G.ComputePipeline(code, root_blob(), RSRC2, LOCAL).hlsl_cs())
     if llvm_mc:
         check_binary(llvm_mc)
     log_ceil_controls(llvm_mc)
@@ -256,18 +268,19 @@ def log_ceil_expected():
 
 def log_ceil_controls(llvm_mc=None):
     hlsl = translate(LOG_CEIL_WORDS).hlsl_cs()
+    assert FIRST_LANE_GATHER not in hlsl, hlsl  # proven uniform: a plain read, no group gather
     for snippet in ('v7 = U(log2(F(v7)));', 'v9 = U(ceil(F(v7)));', LOG_CEIL_LOG_LINE, LOG_CEIL_CEIL_LINE, 'u0.Store(a, v5);'):
         assert hlsl.count(snippet) == 1, (snippet, hlsl)
     for old_ws, new_ws in (
             (vop1('v_log_f32_e32', 'v7', 'v7'), vop1('v_log_f32_e32', 'v7', 'v0')),
             (vop1('v_ceil_f32_e32', 'v9', 'v7'), vop1('v_ceil_f32_e32', 'v9', 'v0'))):
         refused('v_readfirstlane_b32 requires a proven uniform source',
-                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code))
+                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): not_proven(code))
     saved = G.UNIFORM_VALU
     try:
         for removed in ('v_log_f32', 'v_ceil_f32'):
             G.UNIFORM_VALU = saved - {removed}
-            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(LOG_CEIL_WORDS))
+            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: not_proven(LOG_CEIL_WORDS))
     finally:
         G.UNIFORM_VALU = saved
     if llvm_mc:
@@ -379,21 +392,22 @@ def img_load_expected(texels):
 
 def img_load_controls(llvm_mc=None):
     hlsl = translate(IMG_LOAD_WORDS).hlsl_cs()
+    assert FIRST_LANE_GATHER not in hlsl, hlsl  # proven uniform: a plain read, no group gather
     for snippet in ('t = r0.Load(int3(v2, v3, 0));', IMG_LOAD_X_LINE, IMG_LOAD_Y_LINE, 'u0.Store(a, v5);'):
         assert hlsl.count(snippet) == 1, (snippet, hlsl)
     # Varying coordinate control: image_load v[7:8], v[0:1], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D.
     refused('v_readfirstlane_b32 requires a proven uniform source',
-            lambda: translate(patch(IMG_LOAD_WORDS, '080300f002070400', '080300f000070400')))
+            lambda: not_proven(patch(IMG_LOAD_WORDS, '080300f002070400', '080300f000070400')))
     # Image store on a different descriptor slot in the same dispatch must block the uniform image_load proof.
     store_prefix = (sop1('s_mov_b32', 's10', 's6') + sop1('s_mov_b32', 's11', 0)
                     + [0xf40c0605, 0xfa000040, 0xbf8cc07f]  # s_load_dwordx8 s[24:31], s[10:11], 0x40; s_waitcnt lgkmcnt(0)
                     + [0xf0200f08, 0x00060a02])             # image_store v[10:13], v[2:3], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D
     refused('v_readfirstlane_b32 requires a proven uniform source',
-            lambda: translate(struct.pack('<%dI' % len(store_prefix), *store_prefix) + IMG_LOAD_WORDS[8:]))
+            lambda: not_proven(struct.pack('<%dI' % len(store_prefix), *store_prefix) + IMG_LOAD_WORDS[8:]))
     saved = G.UNIFORM_IMAGE_LOADS
     G.UNIFORM_IMAGE_LOADS = frozenset()
     try:
-        refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(IMG_LOAD_WORDS))
+        refused('v_readfirstlane_b32 requires a proven uniform source', lambda: not_proven(IMG_LOAD_WORDS))
     finally:
         G.UNIFORM_IMAGE_LOADS = saved
     if llvm_mc:

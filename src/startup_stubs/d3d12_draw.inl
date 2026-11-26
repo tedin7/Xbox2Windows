@@ -150,7 +150,11 @@ std::uint64_t process_ms()
 }
 
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
+    // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a,
+    // 2 root parameter a, 3 a record of the title's resource heap (manifest `heap ...`, see heap_srvs_ready): the index is root
+    // constant (a, b) when word_param < 0, else the word at byte `at` + (root constant (a, b) & mask) * times of table buffer
+    // (word_param, word_byte) (a < 0: no root constant term).
+    struct Srv { int kind, source, a, b; int word_param = -1, word_byte = 0; std::uint32_t at = 0, times = 0, mask = 0xffffffffu; };
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
@@ -490,8 +494,8 @@ bool read_text(const wchar_t* path, std::string& out)
 // The revisions every request key starts with. tools/startup/gfx2hlsl.py hashes the same bytes, without a
 // trailing NUL (pipeline_key, compute_key, mesh57_key); a change of either side makes every cached request a miss.
 namespace shader_cache {
-constexpr char revision[] = "x2w-startup-shader-28";
-constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup/gfx2hlsl.py compute_key
+constexpr char revision[] = "x2w-startup-shader-29";
+constexpr char compute_revision[] = "x2w-startup-shader-29cs";  // tools/startup/gfx2hlsl.py compute_key
 constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
 }  // namespace shader_cache
 
@@ -588,6 +592,37 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
+        } else if (line.compare(0, 4, "srv ") == 0 && line.find(" heap ") != std::string::npos &&
+                   std::sscanf(line.c_str(), "srv %d %15s", &i, kind) == 2) {
+            // A texture record the title's resource heap holds (pixel s_load_dwordx8 at index << 5): the index is a root
+            // constant word, or a word read from a table buffer at a literal byte offset (+ the masked root constant
+            // word times a literal). Anything else is refused: no record is guessed.
+            const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
+            Translation::Srv srv{texture_kind, 3, -1, 0};
+            int used = 0, a = 0, b = 0, t = 0, tb = 0, c = 0, d = 0;
+            unsigned at = 0, times = 0, mask = 0;
+            const char* rest = line.c_str();
+            const auto done = [&](int n) { return n > 0 && rest[n] == 0; };
+            if (std::sscanf(rest, "srv %*d %*s heap rootconst %d %d%n", &a, &b, &used) == 2 && done(used)) {
+                srv.a = a; srv.b = b;
+            } else if (std::sscanf(rest, "srv %*d %*s heap word table %d %d at %u%n", &t, &tb, &at, &used) == 3 && done(used)) {
+                srv.word_param = t; srv.word_byte = tb; srv.at = at;
+            } else if (std::sscanf(rest, "srv %*d %*s heap word table %d %d at %u rootconst %d %d times %u%n", &t, &tb, &at, &c,
+                                   &d, &times, &used) == 6 && done(used)) {
+                srv.word_param = t; srv.word_byte = tb; srv.at = at; srv.a = c; srv.b = d; srv.times = times;
+            } else if (std::sscanf(rest, "srv %*d %*s heap word table %d %d at %u rootconst %d %d times %u mask %u%n", &t, &tb, &at,
+                                   &c, &d, &times, &mask, &used) == 7 && done(used)) {
+                srv.word_param = t; srv.word_byte = tb; srv.at = at; srv.a = c; srv.b = d; srv.times = times; srv.mask = mask;
+            } else {
+                log("x2w-draw unsupported heap srv manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
+            if (!texture_kind || static_cast<std::size_t>(i) != tr.srvs.size()) {
+                log("x2w-draw invalid heap srv manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
+            tr.srvs.push_back(srv);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
@@ -642,6 +677,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    // The writable-texture alias check (resolve_pixel_uavs) compares table SRVs only: a heap record is not checked there.
+    if (!tr.uavs.empty() && std::any_of(tr.srvs.begin(), tr.srvs.end(), [](const Translation::Srv& s) { return s.source == 3; })) {
+        log("x2w-draw heap srv with a writable texture is not bound for %016llx", tr.key);
+        return;
+    }
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
@@ -667,7 +707,10 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
                                 const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
-    const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
+    u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
+    // X2W_ENGINE=1 selects the opt-in translation engine (tools/startup/gfx2hlsl_engine.py hashes ENGINE_KEY_SUFFIX the same way).
+    static const bool engine = x2w_local::env_on("X2W_ENGINE");  // read once, not per draw
+    if (engine) seed = fnv_bytes("-engine1", 8, seed);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
@@ -783,6 +826,8 @@ u64 publish_compute_request(const void* desc)
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
     u64 key = fnv_bytes(shader_cache::compute_revision, sizeof(shader_cache::compute_revision) - 1);
+    static const bool engine = x2w_local::env_on("X2W_ENGINE");
+    if (engine) key = fnv_bytes("-engine1", 8, key);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
     // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
@@ -1792,6 +1837,16 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return true;
     }
+    // A copy recorded under the guest predicate could be skipped and leave the texture stale, and
+    // lifting the predicate for it would sample the predicate buffer a second time (desktop
+    // SetPredication samples when the GPU reaches the command), so a write in between could flip
+    // a later draw. Refuse the combination instead: nothing is recorded, the texture stays not
+    // done, and the next unpredicated draw uploads it.
+    if (list && self->own().predication_buffer) {
+        static LONG refused;
+        if (first_calls(refused, 6)) log("x2w-draw texture upload %p refused: a guest predicate is active on this list", static_cast<void*>(texture));
+        return false;
+    }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
     // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
@@ -2090,6 +2145,69 @@ void draw_dump_flush()
         dump.buffer->Unmap(0, &no_writes);
     }
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
+}
+
+// The heap records a translation's `heap` SRVs name, found now: the index is read from the draw's root constants or from the
+// word the title wrote in the recording's upload memory, and the 32-byte record at index << 5 of the list's view heap must be
+// a view the title created for a texture. Anything else refuses the whole draw (it is not translated), never a guessed texture.
+bool heap_srvs_ready(Wrapper* self, const Translation& tr, const Pass& pass, bool indirect, u64 (&entries)[32])
+{
+    const auto refuse = [&](UINT slot, const char* reason, u64 detail) {
+        static LONG refused;
+        if (first_calls(refused, 8))
+            log("x2w-draw %016llx srv %u: heap record refused (%s %llx); draw not translated", tr.key, slot, reason, detail);
+        return false;
+    };
+    for (UINT i = 0; i < tr.srvs.size() && i < 32; ++i) {
+        const Translation::Srv& srv = tr.srvs[i];
+        if (srv.source != 3) continue;
+        if (indirect) return refuse(i, "indirect draw", 0);
+        const auto constant = [&]() -> std::uint64_t {
+            return srv.a >= 0 && srv.a < 16 && srv.b >= 0 && srv.b < 8 ? pass.constants[srv.a][srv.b] : ~u64{0};
+        };
+        std::uint32_t index = 0;
+        if (srv.word_param < 0) {
+            const std::uint64_t value = constant();
+            if (value == ~u64{0}) return refuse(i, "root constant out of range", srv.a);
+            index = static_cast<std::uint32_t>(value);
+        } else {
+            std::uint32_t extra = 0;  // the shader's offset arithmetic wraps at 32 bits
+            if (srv.a >= 0) {
+                const std::uint64_t value = constant();
+                if (value == ~u64{0}) return refuse(i, "root constant out of range", srv.a);
+                extra = (static_cast<std::uint32_t>(value) & srv.mask) * srv.times;
+            }
+            if (srv.word_param >= 16 || srv.word_byte < 0) return refuse(i, "table out of range", srv.word_param);
+            const u64 table_entry = pass.view_tables[srv.word_param].record(static_cast<u64>(srv.word_byte), 16);
+            std::uint32_t table_words[4] = {};
+            if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16))
+                return refuse(i, "table buffer descriptor is not bound", srv.word_param);
+            std::memcpy(table_words, reinterpret_cast<const void*>(table_entry), 16);
+            const std::uint32_t at = srv.at + extra;
+            const u64 address = table_words[0] | (u64{table_words[1] & 0xffff} << 32);
+            const UINT stride = (table_words[1] >> 16) & 0x3fff;
+            if (table_words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource)
+                return refuse(i, "index word is not in the list's upload memory", at);
+            if (u64{at} + 4 > u64{stride ? stride : 1} * table_words[2]) return refuse(i, "index word is outside its table buffer", at);
+            std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+        }
+        const u64 entry = pass.title_view_heap.record(std::uint32_t{index << 5}, 32);  // s_lshl_b32 discards the high bits
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
+            return refuse(i, "record is outside the list's view heap", index);
+        std::uint32_t words[2] = {};
+        std::memcpy(words, reinterpret_cast<const void*>(entry), 8);
+        ViewRecord record{};
+        bool known = false;
+        if (words[0] == view_token_magic) {
+            AcquireSRWLockShared(&note_lock);
+            known = words[1] < view_records().size();
+            if (known) record = view_records()[words[1]];
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (!known || record.slot != 18) return refuse(i, "record is not a shader-resource view", index);
+        entries[i] = entry;
+    }
+    return true;
 }
 
 bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
@@ -2798,7 +2916,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;
     const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
-    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    u64 heap_entries[32] = {};
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers) &&
+                              heap_srvs_ready(self, *tr, pass, indirect != nullptr, heap_entries);
     if (!formatted_ok) {
         if (indirect && tr)
             indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
@@ -2968,7 +3088,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         const auto& formatted = formatted_buffers[i];
         const u64 entry = formatted.entry ? formatted.entry :
-            (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
+            (srv.source == 3 && i < 32 ? heap_entries[i] : srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
                 pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
         std::uint32_t words[8] = {};
         const bool entry_ok = formatted.entry ||
@@ -3626,6 +3746,31 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
     for (UINT i = 0; i < count && i < 8 - start; ++i) {
         pass.vb[start + i] = views[i];
         pass.placed_vb[start + i] = placed_buffer_range(self->own().list_device, views[i].BufferLocation, views[i].SizeInBytes);
+    }
+}
+// List slot 49 (desktop 45 + 4), SOSetTargets(start, count, views). The bindings are kept on the pass;
+// draws do not write stream output yet (opt-in: X2W_D3D12_SO_TARGETS=1), so the first calls with a bound buffer are logged.
+void __stdcall list_stream_output_targets(Wrapper* self, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+{
+    static LONG logged;
+    x2w_startup::StreamOutputView kept[x2w_startup::stream_output_slot_count] = {};
+    const bool fits = start < x2w_startup::stream_output_slot_count && count <= x2w_startup::stream_output_slot_count - start;
+    const bool have_views = views && fits && x2w_local::readable(views, std::size_t{count} * sizeof(*views));
+    if (have_views)
+        for (UINT i = 0; i < count; ++i)
+            kept[i] = {views[i].BufferLocation, views[i].SizeInBytes, views[i].BufferFilledSizeLocation};
+    // An unreadable array is refused like one that does not fit; a null array unbinds.
+    if (views && !have_views) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u, views unreadable or out of range", start, count);
+        return;
+    }
+    Pass& pass = pass_of(self);
+    const auto result = x2w_startup::set_stream_output_targets(pass.stream_output, start, count, views ? kept : nullptr);
+    if (result == x2w_startup::StreamOutputResult::refused) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u (4 slots)", start, count);
+    } else if (result == x2w_startup::StreamOutputResult::applied && first_calls(logged, 4)) {
+        log("x2w-render SOSetTargets: start %u, count %u, %u bound (draws do not write stream output yet)", start, count,
+            pass.stream_output.bound_count());
     }
 }
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).

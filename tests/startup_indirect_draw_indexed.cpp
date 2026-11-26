@@ -309,7 +309,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
                                     bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-28";
+    constexpr char revision[] = "x2w-startup-shader-29";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
     static std::uint32_t indexed_pixel_id = 0xe0000204;

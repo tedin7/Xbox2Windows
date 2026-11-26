@@ -904,7 +904,7 @@ class Wave:
             elif op in ("ds_write_b32", "ds_read_b32"):
                 self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos[0-3]|param(?:[0-9]|1[0-2])),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param(?:[0-9]|[12][0-9]|3[01])),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
                 # A position export may leave done to a later clip or cull distance export.
