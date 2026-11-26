@@ -80,7 +80,7 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
-int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
+int draw_frame(void* device, Scene& s, void* pso, UINT frame, UINT frames, bool array_fixture)
 {
     const float t = static_cast<float>(frame) / static_cast<float>(frames);
     const float colour[] = {t, 0.25f, 1.0f - t, 1.0f};
@@ -88,6 +88,23 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
+    if (array_fixture) {
+        // Zero-length ranges exercise both arrays on each side without changing any descriptors.
+        D3D12_CPU_DESCRIPTOR_HANDLE dest[65], src[66];
+        UINT dest_sizes[65]{}, src_sizes[66]{};
+        for (auto& handle : dest) handle.ptr = s.rtv;
+        for (auto& handle : src) handle.ptr = s.rtv;
+        invoke(device, 23, 65, arg(dest), arg(dest_sizes), 66, arg(src), arg(src_sizes), D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        void* heaps[]{s.rtv_heap};
+        invoke(s.list, 32, 1, arg(heaps));
+        D3D12_RESOURCE_BARRIER barriers[12]{};
+        for (auto& barrier : barriers) barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        invoke(s.list, 26, 12, arg(barriers));
+        // The legacy recorder can read 256 bytes from this backing array.
+        D3D12_VERTEX_BUFFER_VIEW views[16]{};
+        for (UINT i = 0; i < 10; ++i) views[i].StrideInBytes = 4 * (i + 1);
+        invoke(s.list, 48, 0, 10, arg(views));
+    }
     invoke(s.list, 52, s.rtv, arg(colour));
     invoke(s.list, 50, 1, arg(&s.rtv));
     invoke(s.list, 21, 1, arg(&viewport));
@@ -96,7 +113,14 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
     invoke(s.list, 25, arg(pso));
     invoke(s.list, 12, 3, 1);
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
-    invoke(s.queue, 10, 1, arg(&s.list));
+    if (array_fixture) {
+        // Only the last entry names a closed list. It must survive capture for the frame to be drawn.
+        void* lists[33]{};
+        lists[32] = s.list;
+        invoke(s.queue, 10, 33, arg(lists));
+    } else {
+        invoke(s.queue, 10, 1, arg(&s.list));
+    }
     // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
     alignas(8) unsigned char plane[0x48]{};
     const Word resources[1]{arg(s.target)};
@@ -134,9 +158,10 @@ int main(int argc, char** argv)
     unsigned pause_frame = ~0u, pause_ms = 0;
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PAUSE", pause, sizeof(pause)) && std::sscanf(pause, "%u,%u", &pause_frame, &pause_ms) != 2)
         return 2;
+    const bool array_fixture = GetEnvironmentVariableA("X2W_TEST_REPLAY_ARRAYS", nullptr, 0) != 0;
     for (UINT frame = 0; frame < frames; ++frame) {
         if (frame == pause_frame) Sleep(pause_ms);
-        if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
+        if (const int rc = draw_frame(device, scene, pso, frame, frames, array_fixture)) return rc;
     }
     std::printf("replay quad: %u presents drawn\n", frames);
     return 0;

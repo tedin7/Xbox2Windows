@@ -26,6 +26,7 @@ constexpr int record_depth = 2;  // argument memory, the memory it points at (a 
 
 void* original[kind_count][wide_slots];
 bool armed;
+bool record_arrays;  // X2W_REPLAY_RECORD_ARRAYS=1
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -137,13 +138,15 @@ u64 content_hash(const unsigned char* data, std::size_t bytes)
 
 // Records the memory at `address` (an argument, or a pointer found in an argument's memory) as an ARGM chunk, and its
 // content once as a BLOB. The window is the larger of a default and `size_hint` (the word after the pointer, when it is a
-// plausible size: a shader is a pointer, then its byte count). depth > 0 follows pointer words in its first bytes. A
+// plausible size: a shader is a pointer, then its byte count), unless a flat array supplies an exact size.
+// depth > 0 follows pointer words in its first bytes. A
 // followed pointer's ARGM names its direct parent: `arg` = the call's argument | 0x100 * (word index + 1), and the
 // parent is the last ARGM of the same call with depth one higher (they are written parent first).
-void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth)
+void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth,
+                   bool exact_size = false)
 {
     if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address))) return;
-    const std::size_t wanted = size_hint > blob_default_bytes ? size_hint : blob_default_bytes;
+    const std::size_t wanted = exact_size ? size_hint : (std::max)(size_hint, blob_default_bytes);
     const std::size_t bytes = readable_window(address, wanted);
     if (!bytes) return;
     std::vector<unsigned char> copy(bytes);
@@ -192,6 +195,39 @@ struct Call {
     std::int32_t present, pad;
 };
 
+// Counts and BOOLs occupy only the low 32 bits of the captured argument words.
+// These are flat input arrays. Replay already relocates the wrapper and handle words in their blobs.
+std::optional<std::size_t> array_bytes(int kind, int slot, std::uint32_t arg, const u64 (&args)[call_args])
+{
+    const auto bytes = [](UINT count, std::size_t stride) {
+        return (std::min)(std::size_t{count} * stride, blob_max_bytes);
+    };
+    const auto count = [&](unsigned index) { return static_cast<UINT>(args[index]); };
+    if (kind == device_kind && slot == 23) {  // CopyDescriptors
+        if (arg == 1 || arg == 4) return bytes(count(arg - 1), sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
+        if (arg == 2 || arg == 5) return bytes(count(arg - 2), sizeof(UINT));
+    }
+    if (kind == queue_kind && slot == 10 && arg == 1)  // ExecuteCommandLists
+        return bytes(count(0), sizeof(void*));
+    if (kind == list_kind) {
+        if (slot == 48 && arg == 2)  // IASetVertexBuffers
+            return bytes(count(1), sizeof(D3D12_VERTEX_BUFFER_VIEW));
+        if (arg == 1) {
+            switch (slot) {
+            case 21: return bytes(count(0), sizeof(D3D12_VIEWPORT));
+            case 22: return bytes(count(0), sizeof(D3D12_RECT));
+            case x2w_list_slots::resource_barrier_slot:
+                static_assert(sizeof(D3D12_RESOURCE_BARRIER) == 32);
+                return bytes(count(0), sizeof(D3D12_RESOURCE_BARRIER));
+            case 32: return bytes(count(0), sizeof(void*));  // SetDescriptorHeaps
+            case 50:  // OMSetRenderTargets: contiguous range supplies just its first handle.
+                return bytes(count(2) && count(0) ? 1u : count(0), sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
 void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret)
@@ -210,6 +246,12 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     for (std::uint32_t i = 0; i < call_args; ++i) {
         const u64 value = args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
+        if (record_arrays) {
+            if (const auto bytes = array_bytes(kind, slot, i, args)) {
+                if (*bytes) record_memory(b, seq, i, value, *bytes, 0, true);
+                continue;
+            }
+        }
         if (x2w_local::readable(reinterpret_cast<const void*>(value), 8)) {
             const u64 now = *reinterpret_cast<const u64*>(value);
             if (as_wrapper(reinterpret_cast<const void*>(now))) {
@@ -415,6 +457,8 @@ void install()
     char value[64]{};
     const DWORD n = GetEnvironmentVariableA("X2W_REPLAY_RECORD", value, sizeof(value));
     if (!n || n >= sizeof(value)) return;
+    char arrays[2]{};
+    record_arrays = GetEnvironmentVariableA("X2W_REPLAY_RECORD_ARRAYS", arrays, sizeof(arrays)) == 1 && arrays[0] == '1';
     if (std::strncmp(value, "slow", 4) == 0) {
         double after = slow_after_s, gap_ms = slow_gap_s * 1000, seconds = slow_seconds, fallback = slow_fallback_s;
         if (value[4] && (value[4] != ',' || std::sscanf(value + 5, "%lf,%lf,%lf,%lf", &after, &gap_ms, &seconds, &fallback) != 4 ||

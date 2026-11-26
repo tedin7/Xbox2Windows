@@ -118,7 +118,71 @@ def replay(player, recording, out, backend, env, presents=PRESENTS):
     return score[0], pictures(out)
 
 
-def main(scene, player, backend):
+def check_array_memory(recording, expected, frames):
+    data = recording.read_bytes()
+    calls, memories, blobs = {}, {}, {}
+    for tag, header, _hb, payload, size in chunks(data):
+        if tag == b"CALL":
+            seq, _thread, kind, slot = struct.unpack_from("<QIHH", data, header)
+            calls[seq] = (kind, slot)
+        elif tag == b"ARGM":
+            seq, arg, _depth, _address, length, key = struct.unpack_from("<QIIQQQ", data, header)
+            if (key_tuple := (*calls[seq], arg)) in expected:
+                memories.setdefault(key_tuple, []).append((length, key))
+        elif tag == b"BLOB":
+            blobs[struct.unpack_from("<Q", data, header)[0]] = data[payload:payload + size]
+    for key_tuple, length in expected.items():
+        entries = memories.get(key_tuple, [])
+        assert [n for n, _ in entries] == [length] * frames, (key_tuple, entries, length)
+        for _, key in entries:
+            blob = blobs[key]
+            assert len(blob) == length, (key_tuple, len(blob), length)
+            if key_tuple == (LIST_KIND, 26, 1) and length == 384:
+                assert all(struct.unpack_from("<IIQ", blob, i * 32) == (2, 0, 0) for i in range(12))
+            if key_tuple == (LIST_KIND, 48, 2) and length == 160:
+                assert all(struct.unpack_from("<QII", blob, i * 16) == (0, 0, 4 * (i + 1)) for i in range(10))
+
+
+def check_arrays(scene, player, backend, directory, env, inputs):
+    frames = 2
+    expected = {
+        (0, 23, 1): 65 * 8, (0, 23, 2): 65 * 4,  # CopyDescriptors destination
+        (0, 23, 4): 66 * 8, (0, 23, 5): 66 * 4,  # CopyDescriptors source
+        (1, 10, 1): 33 * 8,  # ExecuteCommandLists
+        (LIST_KIND, 21, 1): 24,  # RSSetViewports
+        (LIST_KIND, 22, 1): 16,  # RSSetScissorRects
+        (LIST_KIND, 26, 1): 12 * 32,  # ResourceBarrier
+        (LIST_KIND, 32, 1): 8,  # SetDescriptorHeaps
+        (LIST_KIND, 48, 2): 10 * 16,  # IASetVertexBuffers
+        (LIST_KIND, 50, 1): 8,  # OMSetRenderTargets
+    }
+    recorded_dir = directory / "array_recorded"
+    recorded_dir.mkdir()
+    for enabled in (False, True):
+        recording = directory / ("arrays.x2wr" if enabled else "legacy.x2wr")
+        capture_env = dict(env, X2W_TEST_REPLAY_ARRAYS="1", X2W_REPLAY_RECORD_ARRAYS=str(int(enabled)),
+                           X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
+                           X2W_PRESENT_PICTURES=str(recorded_dir))
+        code, log = run([scene, *inputs, backend, frames], capture_env)
+        assert code == 0, log[-3000:]
+        assert log.count("ResourceBarrier): forwarded=12 refused=0") == frames, log[-3000:]
+        # The legacy capture is the negative control. Its truncated list is unsafe to play.
+        check_array_memory(recording, expected if enabled else {
+            (1, 10, 1): 256, (LIST_KIND, 26, 1): 256, (LIST_KIND, 48, 2): 256,
+        }, frames)
+    out = directory / "array_replayed"
+    _, played = replay(player, recording, out, backend, env, presents=frames)
+    recorded = pictures(recorded_dir)
+    assert sorted(recorded) == ["present_0001.png", "present_0002.png"], sorted(recorded)
+    assert recorded["present_0001.png"] != recorded["present_0002.png"]
+    assert recorded == played, "array fixture replay differs from the recorded pictures"
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert log.count("ResourceBarrier): forwarded=12 refused=0") == frames, log[-3000:]
+    print("array replay: all 12 barriers forwarded, 10 vertex views captured, and both pictures equal")
+    return 0
+
+
+def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         cache = directory / "cache"
@@ -129,7 +193,8 @@ def main(scene, player, backend):
         env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
-        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES"):
+        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_RECORD_ARRAYS",
+                     "X2W_TEST_REPLAY_ARRAYS", "X2W_PRESENT_PICTURES"):
             env.pop(name, None)
         code, text = run([scene, vs, ps, root, backend, 1], env)
         if code == 77 and backend == "hardware":
@@ -137,6 +202,8 @@ def main(scene, player, backend):
             return 77
         assert code == 0, text[-3000:]
         subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
+        if mode == "arrays":
+            return check_arrays(scene, player, backend, directory, env, (vs, ps, root))
 
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()
