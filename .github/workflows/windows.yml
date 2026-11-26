@@ -92,6 +92,7 @@ jobs:
               (["tests/startup_gfx2hlsl_sdwa_cndmask_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_waitcnt_depctr_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_mesh57_skeleton_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_mesh57_buffer_read_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_mesh57_loop_refusal_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_mesh57_loop_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_mesh57_lane_spill_check.py", "binary", "llvm-mc-15"], {}),
@@ -307,6 +308,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \
+            tests/startup_mesh57_buffer_read_check.py \
             tests/startup_mesh57_depth_only_check.py \
             tests/startup_mesh57_loop_refusal_check.py \
             tests/startup_mesh57_loop_check.py \
