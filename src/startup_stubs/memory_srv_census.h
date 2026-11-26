@@ -71,11 +71,14 @@ struct RefusedShape {
 
 class MemorySrvCensus {
 public:
-    static constexpr unsigned max_shapes = 128;  // later distinct shapes are counted as "more"
+    // One reason cannot use the whole table: a reason with many shapes (buffer sizes) used to fill it and hide the
+    // shapes of every reason that first appeared later. Past its share a reason's new shapes are counted as "more".
+    static constexpr unsigned max_shapes_per_reason = 16;
+    static constexpr unsigned max_shapes = 12 * max_shapes_per_reason;  // later distinct shapes are counted as "more"
     static constexpr unsigned detail_shapes = 8;
 
     // Counts one refusal. True when the call is the first of one of the first detail_shapes distinct
-    // shapes: the caller then logs its detail line even when its own line limit is spent.
+    // shapes of its reason: the caller then logs its detail line even when its own line limit is spent.
     bool note(const char* reason_name, const D3D12_RESOURCE_DESC* resource)
     {
         const int reason = memory_srv_reason_index(reason_name);
@@ -91,10 +94,11 @@ public:
             while (i < shape_count_ && !same(shapes_[i], key)) ++i;
             if (i < shape_count_) {
                 ++shapes_[i].calls;
-            } else if (shape_count_ < max_shapes) {
+            } else if (shape_count_ < max_shapes && shapes_by_reason_[reason] < max_shapes_per_reason) {
                 shapes_[shape_count_] = key;
                 shapes_[shape_count_].calls = 1;
-                detail = shape_count_ < detail_shapes;
+                detail = shapes_by_reason_[reason] < detail_shapes;
+                ++shapes_by_reason_[reason];
                 ++shape_count_;
             } else {
                 ++more_shape_calls_;
@@ -152,6 +156,7 @@ private:
     std::uint64_t total_ = 0, reported_ = 0, more_shape_calls_ = 0;
     RefusedShape shapes_[max_shapes] = {};
     unsigned shape_count_ = 0;
+    unsigned shapes_by_reason_[memory_srv_reason_count + 1] = {};
 };
 
 class TokenNullCensus {

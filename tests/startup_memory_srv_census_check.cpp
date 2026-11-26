@@ -69,20 +69,23 @@ int main()
     check("fourth shape is detailed", srv.note("unsupported_description", &c));
     check("fifth shape is detailed", srv.note("unsupported_description", &d));
     check("unknown reason counts as other", !srv.note("acme_reason", &d));
-    for (UINT64 w = 1; w <= MemorySrvCensus::max_shapes; ++w) {
+    for (UINT64 w = 1; w <= 192; ++w) {
         const auto e = texture(1000 + w, DXGI_FORMAT_R8_UNORM, 1);
         const bool detailed = srv.note("unsupported_description", &e);
-        if (w <= 3) check("sixth to eighth shapes are detailed", detailed);
-        if (w == 4) check("ninth shape is not", !detailed);
+        if (w <= 5) check("fourth to eighth shapes of one reason are detailed", detailed);
+        if (w == 6) check("ninth shape of one reason is not", !detailed);
     }
+    // A reason that filled its share cannot hide a reason that shows up later.
+    const auto late = texture(777, DXGI_FORMAT_R16_UNORM, 3);
+    check("a late reason still keeps its shape", srv.note("gpu_written_resource", &late));
     auto report = lines(srv, true);
-    check("report has a summary and a line per kept shape", report.size() == 1 + MemorySrvCensus::max_shapes);
+    check("report has a summary and a line per kept shape", report.size() == 1 + 3 + MemorySrvCensus::max_shapes_per_reason);
     check("summary", !report.empty() && report[0] ==
-          "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
-          "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, gpu_written_resource 0, "
+          "x2w-d3d12 memory SRV refusals (slot 70): total 203; null_destination 1, unreadable_resource 0, unreadable_view 0, "
+          "null_address 1, unsupported_description 197, destination_outside_view_heaps 0, gpu_written_resource 1, "
           "as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
           "console_layout_xg_rows 0, console_layout_without_footprints 0, console_layout_beyond_xg_size 0, overlapping_resource 0, "
-          "other 1; distinct shapes 128 (calls past the shape table 5)");
+          "other 1; distinct shapes 19 (calls past the shape table 179)");
     check("first shape line", report.size() > 1 && report[1] ==
           "x2w-d3d12 memory SRV refused shape 1: reason=unsupported_description dim=3 fmt=71 size=64x64x1 mips=7 layout=0x0 "
           "flags=0x0 calls=2");
