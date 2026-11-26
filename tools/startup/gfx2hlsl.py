@@ -6577,7 +6577,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
@@ -6586,7 +6586,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
@@ -6787,7 +6787,7 @@ class Stage:
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
         terms.append(str(offset))
-        return data, self.pipe.uav(key), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -6990,10 +6990,17 @@ class Stage:
                 continue
             key = (('vbtab',), 16 * e['slot'])
             buf = self.pipe.resource(key, 'buf')
-            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
+
+    def srv_index(self, key):
+        """The read-only slot of a buffer descriptor, for the stride and word 3 the runtime supplies with it. A compute
+        descriptor the program also stores through has none (it is one RW view)."""
+        if key in getattr(self.pipe, 'rw_keys', ()):
+            raise Unsupported('indexed or formatted load through a read-write descriptor %s' % (key,))
+        return self.pipe.resources[key]['index']
 
     @staticmethod
     def descriptor_scalar_writes(name, ops):
@@ -7156,7 +7163,7 @@ class Stage:
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
         if self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
+        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
@@ -10636,6 +10643,7 @@ class Pipeline:
             self.uds.append(source)
         return self.uds.index(source)
 
+
     def resource(self, key, kind):
         if key in self.stored_images():
             raise Unsupported('resource %s is both read and stored to' % (key,))
@@ -10666,7 +10674,7 @@ class Pipeline:
     def stored_images(self):
         return self.uavs or {}
 
-    def uav(self, key, kind):
+    def uav(self, key, kind, rw=False):
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
         if self.uavs is None:
@@ -11187,6 +11195,15 @@ def wave32_exec_proof(ins):
     return wave32 and not wave64
 
 
+class ReadWriteBuffer(Unsupported):
+    """A compute program loads and stores through one descriptor. A raw buffer is lowered as one RWByteAddressBuffer
+    (ComputePipeline retries with the key in rw_keys); anything else keeps the refusal."""
+
+    def __init__(self, key, lowerable):
+        super().__init__('descriptor %s used for a load and a store' % (key,))
+        self.key, self.lowerable = key, lowerable
+
+
 class ComputePipeline(Pipeline):
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
@@ -11214,21 +11231,52 @@ class ComputePipeline(Pipeline):
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
-        self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
-        self.lod_unvalidated = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
+        self.rw_keys = set()
+        self._stage_args = (cs_code, refusals, decoded)
+        self._refusals_before = len(refusals) if refusals is not None else 0
+        self._build_stage()
+
+    def _build_stage(self):
+        """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
+        part-way: translate again with that descriptor as one RW view, once per such descriptor."""
+        while True:
+            try:
+                return self._reset_stage()
+            except ReadWriteBuffer as conflict:
+                self._lower_read_write(conflict)
+
+    def _lower_read_write(self, conflict):
+        if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
+            raise conflict
+        self.rw_keys.add(conflict.key)
+
+    def _reset_stage(self):
+        """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
+        cs_code, refusals, decoded = self._stage_args
+        self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
+        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
+        self.lod_unvalidated = set()
+        if refusals is not None:
+            del refusals[self._refusals_before:]
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
+        if key in self.rw_keys and kind == 'buf':
+            return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
-            raise Unsupported('descriptor %s used for a load and a store' % (key,))
+            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
         return super().resource(key, kind)
 
-    def uav(self, key, kind='raw'):
+    def uav(self, key, kind='raw', rw=False):
+        # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
+        # atomics keep the refusal.
         if key in self.resources:
-            raise Unsupported('descriptor %s used for a load and a store' % (key,))
+            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
+        if rw:
+            self.plain_stored.add(key)
         return super().uav(key, kind)
 
     def stored_images(self):
@@ -11239,9 +11287,21 @@ class ComputePipeline(Pipeline):
         for r in self.uavs.values():
             if r['kind'] == 'raw':
                 out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
+        if self.rw_keys:
+            out.insert(1, 'uint ldu(RWByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
+                          'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }')
         return out
 
     def hlsl_cs(self):
+        # The body can also meet a buffer that is both loaded and stored: translate again with it as one RW view.
+        while True:
+            try:
+                return self._hlsl_cs()
+            except ReadWriteBuffer as conflict:
+                self._lower_read_write(conflict)
+                self._build_stage()
+
+    def _hlsl_cs(self):
         s = self.cs
         if s.exports:
             raise Unsupported('export in a compute program')
