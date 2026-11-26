@@ -7435,29 +7435,75 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& sizes,
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build)
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build, x2w_startup::PlacedBuildCause* reported)
 {
-    if (build.SourceAccelerationStructureData ||
-        (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE))
+    using Cause = x2w_startup::PlacedBuildCause;
+    // One log line per cause, for the first refusal of that kind in the process.
+    static LONG logged[static_cast<std::size_t>(Cause::count)];
+    // What the resolver published for each placed build (flags per structure), see PlacedBuildLedger.
+    static SRWLOCK ledger_lock = SRWLOCK_INIT;
+    static x2w_startup::PlacedBuildLedger ledger;
+    const auto refuse = [&](Cause cause, const char* role, UINT64 address) {
+        if (reported) *reported = cause;
+        if (first_calls(logged[static_cast<std::size_t>(cause)], 1))
+            log("x2w-dxr placed build refused: %s (%s at title 0x%llx)", x2w_startup::cause_name(cause), role,
+                static_cast<unsigned long long>(address));
         return E_INVALIDARG;
-    constexpr UINT64 alignment = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
-    const auto translate = [&](UINT64 address, UINT64 bytes, D3D12_RESOURCE_STATES state) -> UINT64 {
-        if (address % alignment) return 0;
+    };
+    const bool update = (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
+    const UINT64 source = build.SourceAccelerationStructureData;
+    if (const Cause shape = x2w_startup::check_update_shape(update, source, dest, sizes.ResultDataMaxSizeInBytes);
+        shape != Cause::ok)
+        return refuse(shape, "source", source);
+    constexpr UINT64 alignment = x2w_startup::build_alignment;
+    struct Translated {
+        Cause cause;
+        UINT64 gpu;
+    };
+    const auto translate = [&](UINT64 address, UINT64 bytes, D3D12_RESOURCE_STATES state) -> Translated {
+        if (address % alignment) return {Cause::unaligned, 0};
         const auto found = placed_buffer_range(static_cast<const Wrapper*>(guest_device), address, bytes);
-        if (!found.owner || found.reject) return 0;
+        if (!found.owner || found.reject) return {Cause::not_placed, 0};
         const auto* info = resource_info(found.owner);
-        if (!info || info->initial_state != state) return 0;
+        if (!info || info->initial_state != state) return {Cause::wrong_state, 0};
         const auto base = reinterpret_cast<UINT64>(found.owner->own().title_memory);
         const auto gpu = static_cast<ID3D12Resource*>(found.owner->own().real)->GetGPUVirtualAddress();
         const auto offset = address - base;
-        if (!gpu || offset > UINT64_MAX - gpu || (gpu + offset) % alignment) return 0;
-        return gpu + offset;
+        if (const Cause usable = x2w_startup::gpu_range_cause(gpu, offset); usable != Cause::ok) return {usable, 0};
+        return {Cause::ok, gpu + offset};
     };
-    const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-    const auto temp = translate(scratch, sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (!out || !temp) return E_INVALIDARG;
-    build.DestAccelerationStructureData = out;
-    build.ScratchAccelerationStructureData = temp;
+    constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, as_state);
+    if (out.cause != Cause::ok) return refuse(out.cause, "dest", dest);
+    // An update is sized by its own scratch requirement, a full build by the build one.
+    // A device may report no update scratch at all (WARP does). Then a null scratch is fine, and a scratch the title
+    // still passes must be a placed buffer, checked over at least one byte.
+    const UINT64 scratch_bytes = update ? sizes.UpdateScratchDataSizeInBytes : sizes.ScratchDataSizeInBytes;
+    const bool no_scratch = update && !scratch_bytes && !scratch;
+    const auto temp = no_scratch ? Translated{Cause::ok, 0}
+                                 : translate(scratch, (std::max<UINT64>)(scratch_bytes, 1), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (temp.cause != Cause::ok) return refuse(temp.cause, "scratch", scratch);
+    Translated from{Cause::ok, 0};
+    if (update) {
+        from = translate(source, sizes.ResultDataMaxSizeInBytes, as_state);
+        if (from.cause != Cause::ok) return refuse(x2w_startup::as_source_cause(from.cause), "source", source);
+    }
+    // The provenance of the source and the record of this build are one step under the lock: nothing is recorded for a refusal.
+    AcquireSRWLockExclusive(&ledger_lock);
+    if (update) {
+        if (const Cause built = ledger.check_source(source); built != Cause::ok) {
+            ReleaseSRWLockExclusive(&ledger_lock);
+            return refuse(built, "source", source);
+        }
+    }
+    // The structure written here keeps ALLOW_UPDATE only if this build asked for it (an update repeats the source's flags).
+    ledger.record(dest, sizes.ResultDataMaxSizeInBytes,
+                  (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE) != 0);
+    ReleaseSRWLockExclusive(&ledger_lock);
+    build.DestAccelerationStructureData = out.gpu;
+    build.ScratchAccelerationStructureData = temp.gpu;
+    if (update) build.SourceAccelerationStructureData = from.gpu;
+    if (reported) *reported = Cause::ok;
     return S_OK;
 }
 

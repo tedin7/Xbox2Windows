@@ -2,8 +2,11 @@
 
 #include "desktop_gpu.h"
 #include "startup_stubs/placed_build.h"
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 namespace dxr_fixture {
 // These are the existing slot-133 and IUnknown contracts, called on the
@@ -16,10 +19,17 @@ class PlacedBuildScene {
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
     Microsoft::WRL::ComPtr<IUnknown> cpu_heap_;
-    std::array<Buffer, 7> buffers_;
+    std::array<Buffer, 9> buffers_;
+    UINT64 big_as_{};  // an acceleration-structure buffer larger than any scratch range the controls use
     UINT64 tlas_title_{}, scratch_title_{};
+    struct Placed {
+        UINT64 dest{}, scratch{};
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO sizes{};
+    };
+    std::array<Placed, 2> titles_; // BLAS, TLAS as built by prepare()
 
 public:
+    using Cause = x2w_startup::PlacedBuildCause;
     // Wrong-routing control (issue #874): also build a decoy BLAS from another triangle into its own placed
     // destination and scratch, and route the TLAS instance to the decoy instead of the BLAS under test.
     bool misroute = false;
@@ -70,21 +80,37 @@ public:
         constexpr auto scratch_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         if (!bottom_size.ScratchDataSizeInBytes || !top_size.ScratchDataSizeInBytes)
             throw std::runtime_error("This scratch-boundary fixture requires nonzero BLAS and TLAS scratch sizes");
+        // A scratch buffer serves the build and, later, the update, so it holds the larger of the two.
+        const auto scratch_bytes = [](const auto& sizes) {
+            return (std::max)(sizes.ScratchDataSizeInBytes, sizes.UpdateScratchDataSizeInBytes);
+        };
         const auto blas = place(0, dest_offset + bottom_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
         const auto tlas = place(1, dest_offset + top_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
-        const auto bs = place(2, scratch_offset + bottom_size.ScratchDataSizeInBytes, scratch_state) + scratch_offset;
-        const auto ts = place(3, scratch_offset + top_size.ScratchDataSizeInBytes, scratch_state) + scratch_offset;
+        const auto bs = place(2, scratch_offset + scratch_bytes(bottom_size), scratch_state) + scratch_offset;
+        const auto ts = place(3, scratch_offset + scratch_bytes(top_size), scratch_state) + scratch_offset;
+        titles_[0] = {blas, bs, bottom_size};
+        titles_[1] = {tlas, ts, top_size};
+        big_as_ = place(8, 4096, dest_state);
         const auto short_scratch = place(4, scratch_offset + top_size.ScratchDataSizeInBytes - 1, scratch_state) + scratch_offset;
         constexpr UINT64 unmapped = 0x1000; // outside the user allocation range
-        const auto must_reject = [&](UINT64 dest, UINT64 scratch) {
+        // Each refusal names its cause (not only E_INVALIDARG) and publishes nothing.
+        const auto must_reject = [&](UINT64 dest, UINT64 scratch, Cause expected, const char* what) {
             auto candidate = top;
-            if (x2w_startup::resolve_placed_build(guest_.Get(), dest, scratch, top_size, candidate) != E_INVALIDARG ||
-                candidate.DestAccelerationStructureData || candidate.ScratchAccelerationStructureData)
-                throw std::runtime_error("Invalid DXR build was accepted or partially published");
+            Cause cause = Cause::ok;
+            const HRESULT hr = x2w_startup::resolve_placed_build(guest_.Get(), dest, scratch, top_size, candidate, &cause);
+            if (hr != E_INVALIDARG || candidate.DestAccelerationStructureData || candidate.ScratchAccelerationStructureData)
+                throw std::runtime_error(std::string("Invalid DXR build was accepted or partially published: ") + what);
+            if (cause != expected)
+                throw std::runtime_error(std::string("DXR build refusal names the wrong cause (") + x2w_startup::cause_name(cause) +
+                                         " for " + what + ", expected " + x2w_startup::cause_name(expected) + ")");
         };
-        must_reject(unmapped, ts);
-        must_reject(tlas, short_scratch);
-        must_reject(ts, tlas);
+        must_reject(unmapped, ts, Cause::not_placed, "destination outside the placed buffers");
+        must_reject(tlas + 16, ts, Cause::unaligned, "unaligned destination");
+        must_reject(ts, tlas, Cause::wrong_state, "destination in a buffer that is not an acceleration structure");
+        must_reject(tlas, short_scratch, Cause::not_placed, "scratch shorter than the build needs");
+        must_reject(tlas, unmapped, Cause::not_placed, "scratch outside the placed buffers");
+        must_reject(tlas, ts + 16, Cause::unaligned, "unaligned scratch");
+        must_reject(tlas, big_as_, Cause::wrong_state, "scratch in an acceleration-structure buffer");
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS");
         tlas_title_ = tlas;
@@ -99,9 +125,130 @@ public:
         };
         verify_offset(bottom, blas, bs, bottom_size);
         verify_offset(top, tlas, ts, top_size);
+        // The base resolves above are builds over the same memory, so the resolver's record of the real builds was replaced:
+        // resolve the real ones again, then run the update controls against them.
+        check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS again");
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS again");
+        check_updates(top, top_size, tlas, ts);
+        // check_updates records the TLAS as built with ALLOW_UPDATE whatever flags the caller gave it: record the builds as given.
+        check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS as given");
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS as given");
         std::printf("Placed DXR bytes dest/scratch: BLAS=%llu/%llu TLAS=%llu/%llu; short scratch, missing dest and swapped states rejected before recording\n",
             bottom_size.ResultDataMaxSizeInBytes, bottom_size.ScratchDataSizeInBytes,
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
+    }
+
+    // PERFORM_UPDATE with SourceAccelerationStructureData, through the same resolver. The scratch of an update
+    // is sized by UpdateScratchDataSizeInBytes; the fixture sets it to the build scratch size so that the one
+    // scratch buffer placed for the build fits. Needs the BLAS/TLAS builds of prepare() to be recorded already.
+    void check_updates(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& top,
+                       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& top_size, UINT64 tlas, UINT64 scratch) {
+        constexpr auto update_flag = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        constexpr auto allow_flag = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+        constexpr UINT64 dest_offset = 512, unmapped = 0x1000;
+        auto sizes = top_size;
+        sizes.UpdateScratchDataSizeInBytes = top_size.ScratchDataSizeInBytes;
+        const auto request = [&](UINT64 source, bool update) {
+            auto build = top;
+            // A valid update repeats the source's flags, ALLOW_UPDATE included (the structure it writes stays updatable).
+            build.Inputs.Flags = update ? (build.Inputs.Flags | update_flag | allow_flag) : (build.Inputs.Flags & ~update_flag);
+            build.SourceAccelerationStructureData = source;
+            build.DestAccelerationStructureData = build.ScratchAccelerationStructureData = 0;
+            return build;
+        };
+        // Each refusal returns E_INVALIDARG, names its cause, publishes neither address and keeps the source as the title gave it.
+        const auto must_reject = [&](UINT64 dest, UINT64 source, UINT64 scratch_address, const auto& use, bool update,
+                                     Cause expected, const char* what) {
+            auto build = request(source, update);
+            Cause cause = Cause::ok;
+            const HRESULT hr = x2w_startup::resolve_placed_build(guest_.Get(), dest, scratch_address, use, build, &cause);
+            if (hr != E_INVALIDARG || build.DestAccelerationStructureData || build.ScratchAccelerationStructureData ||
+                build.SourceAccelerationStructureData != source)
+                throw std::runtime_error(std::string("Invalid DXR update was accepted or partially published: ") + what);
+            if (cause != expected)
+                throw std::runtime_error(std::string("DXR update refusal names the wrong cause (") + x2w_startup::cause_name(cause) +
+                                         " for " + what + ", expected " + x2w_startup::cause_name(expected) + ")");
+        };
+        must_reject(tlas, 0, scratch, sizes, true, Cause::update_without_source, "update without a source");
+        must_reject(tlas, tlas, scratch, sizes, false, Cause::source_without_update, "source without PERFORM_UPDATE");
+        must_reject(tlas, tlas + 1, scratch, sizes, true, Cause::source_unaligned, "unaligned source");
+        must_reject(tlas, unmapped, scratch, sizes, true, Cause::source_not_placed, "source outside the placed buffers");
+        must_reject(tlas, scratch, scratch, sizes, true, Cause::source_wrong_state,
+                    "source in a buffer that is not an acceleration structure");
+        // An aligned source one stride (256 bytes) past the destination: where the structure is longer than that the two
+        // partly overlap (the shape rule, checked by value in placed_build_causes names it); on a device that sizes it
+        // shorter, the source lies past the end of the destination's buffer.
+        const Cause stride_cause = x2w_startup::check_update_shape(true, tlas + 256, tlas, sizes.ResultDataMaxSizeInBytes);
+        must_reject(tlas, tlas + 256, scratch, sizes, true,
+                    stride_cause != Cause::ok ? stride_cause : Cause::source_not_placed, "source one stride past the destination");
+        if (stride_cause != Cause::ok && stride_cause != Cause::source_dest_partial_overlap)
+            throw std::runtime_error("The shape rule named an unexpected cause for a source one stride past the destination");
+        // The scratch rule applies to an update as to a build.
+        must_reject(tlas, tlas, big_as_, sizes, true, Cause::wrong_state, "update with a scratch in an acceleration-structure buffer");
+
+        // The update controls below need the TLAS recorded as built with ALLOW_UPDATE, whatever flags the caller built it with.
+        auto recorded = request(0, false);
+        recorded.Inputs.Flags |= allow_flag;
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, top_size, recorded), "Record the TLAS with ALLOW_UPDATE");
+
+        // In place: the source is the destination.
+        auto in_place = request(tlas, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, in_place), "Resolve in-place update");
+        if (!in_place.DestAccelerationStructureData || in_place.SourceAccelerationStructureData != in_place.DestAccelerationStructureData)
+            throw std::runtime_error("An in-place update must translate source and destination to the same address");
+
+        // A device that reports no update scratch (WARP): a placed scratch and a null scratch both resolve, and a
+        // scratch outside every placed buffer is still refused.
+        auto none = sizes;
+        none.UpdateScratchDataSizeInBytes = 0;
+        for (const UINT64 given : {scratch, UINT64{0}}) {
+            auto build = request(tlas, true);
+            check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, given, none, build), "Resolve update without scratch");
+            if (!build.DestAccelerationStructureData || bool(build.ScratchAccelerationStructureData) != bool(given))
+                throw std::runtime_error("A zero-size update scratch was not published as given");
+        }
+        must_reject(tlas, tlas, unmapped, none, true, Cause::not_placed, "a stray scratch for a zero-size update scratch");
+
+        // Provenance: an update needs a source that the resolver saw built with ALLOW_UPDATE.
+        const auto other = place(7, dest_offset + top_size.ResultDataMaxSizeInBytes,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) + dest_offset;
+        must_reject(tlas, other, scratch, sizes, true, Cause::source_not_built, "source never built");
+        const auto build_other = [&](bool allow_update) {
+            auto build = request(0, false);
+            build.Inputs.Flags = allow_update ? (build.Inputs.Flags | allow_flag) : (build.Inputs.Flags & ~allow_flag);
+            check(x2w_startup::resolve_placed_build(guest_.Get(), other, scratch, top_size, build), "Resolve a build of the other structure");
+        };
+        build_other(false);
+        must_reject(tlas, other, scratch, sizes, true, Cause::source_not_updatable, "source built without ALLOW_UPDATE");
+        // A refused update records nothing: the in-place TLAS update still works, and the other source is still refused.
+        auto again = request(tlas, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, again), "Resolve in-place update after refusals");
+        must_reject(tlas, other, scratch, sizes, true, Cause::source_not_updatable, "source built without ALLOW_UPDATE, again");
+
+        // Out of place: another placed acceleration structure built with ALLOW_UPDATE, its interior offset kept.
+        build_other(true);
+        auto moved = request(other, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, moved), "Resolve out-of-place update");
+        auto base = request(0, false);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), other - dest_offset, scratch - 768, sizes, base),
+            "Resolve the source placement base");
+        if (moved.SourceAccelerationStructureData != base.DestAccelerationStructureData + dest_offset ||
+            moved.SourceAccelerationStructureData == moved.DestAccelerationStructureData)
+            throw std::runtime_error("An out-of-place update lost the source address or aliased the destination");
+        // The update's destination (the TLAS) is a recorded build again, with the flags of the update.
+        auto after = request(tlas, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, after), "Resolve in-place update of the updated structure");
+    }
+
+    // Re-resolve one placed structure (0 = BLAS, 1 = TLAS) as an in-place PERFORM_UPDATE of itself. The source is the
+    // title address the structure was built at, so the update runs through the same slot-133 placement lookup as the
+    // build. The caller keeps ALLOW_UPDATE from the initial build; the resolver cannot see it.
+    void resolve_update(unsigned which, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build) {
+        const auto& placed = titles_.at(which);
+        build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        build.SourceAccelerationStructureData = placed.dest;
+        check(x2w_startup::resolve_placed_build(guest_.Get(), placed.dest, placed.scratch, placed.sizes, build),
+            "Resolve placed in-place update");
     }
 
     // Publishes the placed TLAS through guest device slot 70 into a CPU-only guest view heap, then three refused
