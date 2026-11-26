@@ -42,6 +42,14 @@ public:
         return true;
     }
 
+    // A key whose first lookup found no manifest: the background reader takes it as soon as it appears, so the first retry
+    // already finds it (before, only the first retry registered the key, and a second retry was needed).
+    void want(std::uint64_t key)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ready_.count(key)) wanted_.insert(key);
+    }
+
     // True when some key is waiting for its manifest (the background thread has work to do).
     bool has_wanted() const
     {
