@@ -1509,7 +1509,15 @@ def check_controls():
     # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
     refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
             'joins: read by s_and_b32 after the join',
-            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo'), wave=64).hlsl_cs())
+    # Wave32: a branch on exec names no wave size, and the compare writes vcc_lo only, so a block that holds the compare
+    # is not refused as a definition of vcc_hi.
+    wave32 = splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_lo, exec_lo')
+    assert G.guest_wave_size(wave32) == 32
+    try:
+        translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs()
+    except G.Unsupported as reason:
+        assert 'definition of vcc_hi' not in str(reason), str(reason)
     assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
     for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
