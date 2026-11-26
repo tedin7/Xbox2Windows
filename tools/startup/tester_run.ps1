@@ -191,7 +191,7 @@ $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$st
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 
 $zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
-$parts = @(& $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB)
+$parts = @(& $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache)
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
 foreach ($line in $parts) {
