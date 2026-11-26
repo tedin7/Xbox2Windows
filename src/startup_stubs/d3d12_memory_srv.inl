@@ -124,7 +124,7 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
 bool memory_srv_destination(u64 handle)
 {
     bool valid = false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     for (const auto& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.increment) continue;
         const u64 base = heap.title_cpu ? heap.title_cpu : heap.desktop_cpu;
@@ -143,7 +143,7 @@ bool memory_srv_destination(u64 handle)
 void check_resource_address_index()
 {
     if (resource_index_check_mode() == 0) return;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     std::optional<u64> missing;
     for (const auto& [wrapper, info] : resource_infos()) {
         const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
@@ -163,7 +163,7 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     X2W_ZONE("srv existing_memory_texture scan");
     Wrapper* match = nullptr;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     // A null address never gets here (memory_srv_refusal), and the index holds no null base.
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
@@ -187,7 +187,7 @@ bool address_resource_overlap(u64 address, u64 span)
 {
     X2W_ZONE("srv address_resource_overlap scan");
     bool found = false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
         if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
@@ -208,7 +208,7 @@ bool gpu_written_overlap(u64 address, UINT texel_bytes)
     constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     bool found = false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, texel_bytes, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
@@ -234,7 +234,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
         return const_cast<Wrapper*>(placed.owner);
     }
     Wrapper* match = nullptr;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||

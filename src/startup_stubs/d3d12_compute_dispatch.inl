@@ -279,7 +279,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             ViewRecord record{};
             bool known = false, created = false;
             if (words[0] == view_token_magic) {
-                AcquireSRWLockShared(&note_lock);
+                note_lock_acquire(false);
                 known = words[1] < view_records().size();
                 if (known) {
                     record = view_records()[words[1]];
