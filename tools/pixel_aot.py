@@ -130,8 +130,10 @@ def _check_decoded_exits(code, stage, decoder, *, vertex_fetch, mesh_layout):
         if pc not in visited:
             visited.add(pc)
             pending.extend(successors[pc])
-    if pcs - visited:
-        fail(f"unreachable instruction at +0x{min(pcs - visited):x}")
+    # A direct branch may skip alignment NOPs after an exit: they run nothing, so they may stay unreachable.
+    nops = {pc for pc, op, _ in instructions if op in ("s_nop", "v_nop")}
+    if pcs - visited - nops:
+        fail(f"unreachable instruction at +0x{min(pcs - visited - nops):x}")
 
 
 def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None,

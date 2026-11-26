@@ -134,7 +134,9 @@ def translator_cases(directory):
     for clear_exec in (False, True):
         translated(directory / f"kill_{clear_exec}", S.vertex(), pixel(kill_words(clear_exec)))
     refused("Unverified multi-exit program", literal, None)
-    refused("stage 0, 2 decoded exits: unreachable instruction at +0x4", pixel([END, NOP, END]))
+    refused("stage 0, 2 decoded exits: unreachable instruction at +0x8", pixel([END, NOP, END]))
+    # An alignment NOP a direct branch skips runs nothing: it may stay unreachable, an unreachable exit may not.
+    native_code(pixel([branch(4, 1), NOP, END]))
     refused("stage 0, 1 decoded exits: branch at +0x0 targets outside decoded instruction boundaries (0x44)",
             pixel([branch(4, 16), END]))
     refused("stage 0, 1 decoded exits: branch at +0x0 targets outside decoded instruction boundaries (0x8)",
