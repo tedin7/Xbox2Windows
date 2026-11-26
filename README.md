@@ -104,6 +104,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Textured mesh fallback at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^mesh_textured_fallback_' -V` |
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+| Same-texture compute mip reductions on WARP | `X2W_COMPUTE_MIP_CHAIN=1` enables disjoint SRV and UAV subresources. The fixture checks two reductions against CPU averages with the D3D12 debug layer, plus overlap and mutant controls. `ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_texture_warp$' -V` |
 | SPIR-V sampler views at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V` |
 | SPIR-V standalone sampler split for 1D and cube images, including arrays (SPIRV-Tools) | `python3 -B tests/spirv_window/check.py` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |

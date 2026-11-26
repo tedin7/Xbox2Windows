@@ -251,6 +251,50 @@ void log_dispatch_phases()
     log("%s", line);
 }
 
+bool compute_mip_chain_enabled()
+{
+    static const bool enabled = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_COMPUTE_MIP_CHAIN", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+LONG64 compute_mip_chain_pairs;
+
+enum class ComputeMipMutant { none, missing_uav, full_srv };
+
+ComputeMipMutant compute_mip_mutant()
+{
+    static const auto mutant = [] {
+        char value[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_COMPUTE_MIP_MUTANT", value, sizeof(value));
+        if (!n || n >= sizeof(value)) return ComputeMipMutant::none;
+        if (!std::strcmp(value, "missing-uav")) return ComputeMipMutant::missing_uav;
+        if (!std::strcmp(value, "full-srv")) return ComputeMipMutant::full_srv;
+        return ComputeMipMutant::none;
+    }();
+    return mutant;
+}
+
+struct ComputeMipWrite {
+    UINT mip, first_slice, slices;
+};
+
+bool disjoint_compute_mips(const D3D12_SHADER_RESOURCE_VIEW_DESC& read, const ComputeMipWrite& write, UINT mips)
+{
+    const bool cube = read.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
+    const UINT first = cube ? read.TextureCube.MostDetailedMip : read.Texture2D.MostDetailedMip;
+    if (first >= mips) return false;
+    const UINT view_levels = cube ? read.TextureCube.MipLevels : read.Texture2D.MipLevels;
+    const UINT levels = view_levels == UINT(-1) ? mips - first : view_levels;
+    if (!levels || levels > mips - first) return false;
+    // Texture2D selects slice zero. TextureCube selects all six faces.
+    const UINT slices = cube ? 6 : 1;
+    const UINT plane = cube ? 0 : read.Texture2D.PlaneSlice;
+    return plane != 0 || write.first_slice >= slices || write.mip < first || write.mip - first >= levels;
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -278,6 +322,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
+        ComputeMipWrite mip_write;
+        bool split;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     x2w_phase::Timer timer;
@@ -311,6 +357,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    const bool mip_chain = compute_mip_chain_enabled();
+    LONG64 mip_pairs = 0;
     phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
@@ -437,11 +485,28 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            // One state per resource here: a texture read and written by the same call is refused. Two outputs
-            // of one texture (two mips) share the unordered access state.
-            for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
+            for (std::size_t input = 0; input < inputs && !reason; ++input) {
+                View& read = views[input];
+                if (read.wrapper != wrapper && !(mip_chain && read.resource == texture)) continue;
+                if (!mip_chain || read.resource != texture || !read.described ||
+                    resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1) {
+                    reason = "an output texture is also an input of the dispatch";
+                    break;
+                }
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                std::memcpy(&srv, read.desc, sizeof(srv));
+                const auto& array = desc.Texture2DArray;
+                const ComputeMipWrite write = slot.array ? ComputeMipWrite{array.MipSlice, array.FirstArraySlice, array.ArraySize}
+                    : ComputeMipWrite{described ? desc.Texture2D.MipSlice : 0, 0, 1};
+                if (write.mip >= resource.MipLevels || !disjoint_compute_mips(srv, write, resource.MipLevels)) {
+                    reason = "an output texture is also an input of the dispatch";
+                    break;
+                }
+                read.split = views[i].split = true;
+                views[i].mip_write = write;
+                ++mip_pairs;
+            }
             std::memcpy(views[i].desc, &desc, sizeof(desc));
             views[i].wrapper = wrapper;
             continue;
@@ -560,14 +625,30 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
+    constexpr auto mip_read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    constexpr auto mip_write_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const auto mutant = mip_pairs ? compute_mip_mutant() : ComputeMipMutant::none;
+    std::vector<D3D12_RESOURCE_BARRIER> mip_barriers;
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
-            require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            require_state(self, view.resource, view.split || type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            device_of(the_device)->CreateShaderResourceView(view.resource,
-                view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
+            const auto* srv = view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC full_srv{};
+            if (view.split && mutant == ComputeMipMutant::full_srv) {
+                full_srv = *srv;
+                if (full_srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+                    full_srv.TextureCube.MostDetailedMip = 0;
+                    full_srv.TextureCube.MipLevels = UINT(-1);
+                } else {
+                    full_srv.Texture2D.MostDetailedMip = 0;
+                    full_srv.Texture2D.MipLevels = UINT(-1);
+                }
+                srv = &full_srv;
+            }
+            device_of(the_device)->CreateShaderResourceView(view.resource, srv, dest);
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
         }
@@ -576,7 +657,25 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
-        require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (view.split) {
+            const UINT mips = view.resource->GetDesc().MipLevels;
+            const auto& write = view.mip_write;
+            for (UINT slice = write.first_slice; slice < write.first_slice + write.slices; ++slice) {
+                const UINT subresource = write.mip + slice * mips; // UAV plane zero
+                const auto covered = [&](const View& previous) {
+                    const auto& range = previous.mip_write;
+                    return previous.split && previous.resource == view.resource && range.mip == write.mip &&
+                           slice >= range.first_slice && slice - range.first_slice < range.slices;
+                };
+                if (std::any_of(views + inputs, views + i, covered)) continue;
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition = {view.resource, subresource, mip_read_state, mip_write_state};
+                mip_barriers.push_back(barrier);
+            }
+        } else {
+            require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         if (view.texture) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
@@ -590,6 +689,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
+    // The tracker records one read state. Only the UAV subresources leave that state during Dispatch.
+    if (!mip_barriers.empty() && mutant != ComputeMipMutant::missing_uav)
+        list->ResourceBarrier(static_cast<UINT>(mip_barriers.size()), mip_barriers.data());
     if (!pass.heap_set) {
         x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
         pass.heap_set = true;
@@ -605,7 +707,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } else {
         list->Dispatch(x, y, z);
     }
+    for (auto& barrier : mip_barriers)
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    if (!mip_barriers.empty())
+        list->ResourceBarrier(static_cast<UINT>(mip_barriers.size()), mip_barriers.data());
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+        if (views[i].split) continue; // the transition orders the UAV writes
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;
@@ -618,6 +725,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (const auto address = pass.desktop_compute_upload_srvs[parameter]) list->SetComputeRootShaderResourceView(parameter, address);
     }
     ++tr->translated;
+    if (mip_pairs) InterlockedAdd64(&compute_mip_chain_pairs, mip_pairs);
     phases.end();
     timer.finish(dispatch.signature ? x2w_phase::indirect : x2w_phase::direct);
     draw_lock_release_exclusive();

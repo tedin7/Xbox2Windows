@@ -23,7 +23,10 @@ every word keeps the sentinel.
 Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
 and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
 changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
-Exit 77 when the adapter is not available.
+Mip chain (WARP): two dispatches reduce an 8x8 RGBA32_FLOAT texture to its 4x4 and 2x2 mips on one command list.
+The CPU reference checks every channel. The disabled and overlapping-view controls preserve both mips. The
+missing-UAV-transition and full-SRV mutants must produce a debug-layer error or a readback mismatch.
+Exit 77 when the adapter or the mip-chain debug layer is not available.
 """
 import os
 from pathlib import Path
@@ -40,7 +43,7 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 
-def run(directory, consumer, env, mode, layout):
+def run(directory, consumer, env, mode, layout, *, expect_gpu_error=False):
     out = directory / 'out.bin'
     out.unlink(missing_ok=True)
     args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
@@ -49,6 +52,9 @@ def run(directory, consumer, env, mode, layout):
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
+    # Invalid GPU commands can prevent the fixture from closing or completing the list.
+    if expect_gpu_error and result.returncode in (75, 76, 78) and debug_errors(result):
+        return None, result
     assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
     return list(struct.unpack(layout, out.read_bytes())), result
 
@@ -59,9 +65,13 @@ def translate(cache, dxc, key):
     assert f'{key:016x}: ok' in out, out
 
 
+def debug_errors(result):
+    return [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+
+
 def clean(result):
     assert not lines(result, 'refused'), result.stderr[-3000:]
-    errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+    errors = debug_errors(result)
     assert not errors, errors[0]
     layer = lines(result, 'x2w-d3d12 debug layer: ')
     return 'enabled, no error message' if layer and '0x00000000' in layer[0] else 'unavailable'
@@ -263,14 +273,99 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+MIP_SHADER = """\
+Texture2D<float4> sourceMip : register(t0);
+RWTexture2D<float4> destinationMip : register(u0);
+
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy) * 2;
+    destinationMip[id.xy] = (sourceMip.Load(int3(p, 0)) +
+                             sourceMip.Load(int3(p + int2(1, 0), 0)) +
+                             sourceMip.Load(int3(p + int2(0, 1), 0)) +
+                             sourceMip.Load(int3(p + int2(1, 1), 0))) * 0.25;
+}
+"""
+
+
+def mip_reference():
+    image = [[tuple(x * x + 9 * y + 2 * c for c in range(4)) for x in range(8)] for y in range(8)]
+    expected = []
+    for width in (4, 2):
+        image = [[tuple(sum(image[2 * y + dy][2 * x + dx][c]
+                                  for dy in range(2) for dx in range(2)) / 4
+                        for c in range(4)) for x in range(width)] for y in range(width)]
+        expected.extend(value for row in image for pixel in row for value in pixel)
+    return expected
+
+
+def mip_chain(directory, consumer, dxc, env):
+    cache, base = prepare(directory)
+    env = {**base, **env}
+    env.pop('X2W_COMPUTE_MIP_CHAIN', None)
+    env.pop('X2W_TEST_COMPUTE_MIP_MUTANT', None)
+    (directory / 'compute_root').write_bytes(C.root_blob(3, table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    # The synthetic request identifies the cache entry. Exercise the production translated dispatch
+    # recorder with a fixture-authored manifest and DXC program.
+    (directory / 'program').write_bytes(struct.pack('<I', 0xbf810000))  # s_endpgm
+    (directory / 'data').write_bytes(bytes(16))
+    (directory / 'state').write_bytes(state_a((1, 1, 1), 0))
+    expected = mip_reference()
+    untouched = [-65.0] * (4 * 4 * 4) + [-66.0] * (2 * 2 * 4)
+    layout = '<%df' % len(expected)
+    mode = 'texture-mip-chain'
+    got, result = run(directory, consumer, env, mode, layout)
+    if not any('0x00000000 enabled' in line for line in lines(result, 'x2w-d3d12 debug layer: ')):
+        print('mip chain: skipped, D3D12 debug layer unavailable')
+        sys.exit(77)
+    assert got == untouched and not debug_errors(result), result.stderr[-3000:]
+    assert len(lines(result, 'refused: no translation')) == 2, result.stderr[-3000:]
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    (cache / f'{key:016x}.txt').write_bytes(
+        b'x2w-manifest 2\nstage cs\ngroup 1 1 1\nud 0\n'
+        b'srv 0 tex2d table 1 0\nuav 0 tex2d float table 1 64 channels 4\n')
+    hlsl = directory / 'mips.hlsl'
+    hlsl.write_text(MIP_SHADER, encoding='ascii')
+    subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key:016x}.cs.cso', hlsl], check=True)
+
+    enabled = dict(env, X2W_COMPUTE_MIP_CHAIN='1')
+    reason = 'refused: an output texture is also an input of the dispatch'
+    for control, settings in ((mode, env), (mode + '-overlap', enabled), (mode + '-all', enabled)):
+        got, result = run(directory, consumer, settings, control, layout)
+        assert got == untouched and not debug_errors(result), (control, result.stderr[-3000:])
+        assert len(lines(result, reason)) == 2, (control, result.stderr[-3000:])
+
+    def check_recorded(result):
+        for width in (4, 2):
+            assert len(lines(result, f'Dispatch({width}, {width}, 1) translated')) == 1, result.stderr[-3000:]
+
+    got, result = run(directory, consumer, enabled, mode, layout)
+    check_recorded(result)
+    clean(result)
+    assert got == expected, [(i, a, b) for i, (a, b) in enumerate(zip(got, expected)) if a != b][:8]
+    print(f'mip chain: {len(got)} channels match the CPU averages, zero debug-layer errors')
+
+    for mutant in ('missing-uav', 'full-srv'):
+        got, result = run(directory, consumer, dict(enabled, X2W_TEST_COMPUTE_MIP_MUTANT=mutant),
+                          mode, layout, expect_gpu_error=True)
+        check_recorded(result)
+        errors = debug_errors(result)
+        assert errors or got != expected, f'{mutant} survived the WARP and debug-layer checks'
+        print(f'mip chain: {mutant} detected by ' + ('debug layer' if errors else 'readback mismatch'))
+
+
 def main(consumer, dxc, adapter):
-    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
+    env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1', X2W_COMPUTE_MIP_CHAIN='0')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        if adapter == 'warp':
+            mip_chain(Path(temporary) / 'mips', consumer, dxc, env)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
