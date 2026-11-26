@@ -1,0 +1,1 @@
+tests/startup_compute_wave64_reduce_check.py

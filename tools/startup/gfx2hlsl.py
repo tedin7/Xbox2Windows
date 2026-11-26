@@ -10403,7 +10403,7 @@ class Stage:
     # WaveActiveBitOr / WaveActiveMin / WaveActiveMax of vX over the active lanes of the desktop wave, which leaves
     # helper lanes out. Accepted only in a straight-line pixel stage whose EXEC is the entry mask, not widened by
     # s_wqm (helper lanes would then be counted on the console). Every other shape that starts like a chain is refused
-    # with its reason: wave64, another fill, a wrong identity, missing or reordered steps, other or mixed operations,
+    # with its reason: another fill, a wrong identity, missing or reordered steps, other or mixed operations,
     # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
     # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
     WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
@@ -10412,26 +10412,34 @@ class Stage:
     WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
     WAVE_REDUCE_CONTROL = re.compile(r'quad_perm:\[[0-3],[0-3],[0-3],[0-3]\]|row_half_mirror|row_mirror')
 
+    WAVE_REDUCE_DPP8 = re.compile(r'dpp8:\[[0-7](?:,[0-7]){7}\]')
+    WAVE_REDUCE_SCALAR = {
+        'v_or_b32': ('s_or_b32', '{0} | {1}'), 'v_and_b32': ('s_and_b32', '{0} & {1}'),
+        'v_xor_b32': ('s_xor_b32', '{0} ^ {1}'), 'v_add_nc_u32': ('s_add_u32', '{0} + {1}'),
+        'v_min_u32': ('s_min_u32', 'min({0}, {1})'), 'v_max_u32': ('s_max_u32', 'max({0}, {1})'),
+    }
+
     @staticmethod
-    def wave_steps_reduce(controls, op):
-        """Whether four DPP16 steps (each a quad_perm, row_half_mirror or row_mirror, every lane valid) followed by
-        v_permlanex16_b32 with lane selects 0, 0 and the combine leave lane 31 with every lane's input exactly once
-        (ISA, DPP16 and V_PERMLANEX16_B32). Each lane holds, per source lane, how often that input went into its value:
-        a step adds the permuted lane's counts to the lane's own. An idempotent operation (or, and, min, max) only needs
-        every count at least once; xor and sum need exactly once."""
+    def wave_steps_reduce(controls, op, *, whole_half=False):
+        """Prove coverage of the 32 input lanes after the DPP and permlane combines.
+        The wave32 chain only observes lane 31. Wave64 reconstructs each half's
+        VGPR in every lane and also supports DPP8. Idempotent operations need
+        every input at least once; xor and sum need each input exactly once."""
         def source(control, lane):
             if control == 'row_half_mirror':
                 return (lane & ~7) | (7 - (lane & 7))
             if control == 'row_mirror':
                 return (lane & ~15) | (15 - (lane & 15))
-            sel = [int(x) for x in control[len('quad_perm:['):-1].split(',')]
-            return (lane & ~3) | sel[lane & 3]
+            sel = [int(x) for x in control.split('[', 1)[1][:-1].split(',')]
+            mask = len(sel) - 1
+            return (lane & ~mask) | sel[lane & mask]
         held = [[int(i == lane) for i in range(32)] for lane in range(32)]
         for control in controls:
             held = [[a + b for a, b in zip(held[source(control, lane)], held[lane])] for lane in range(32)]
         held = [[a + b for a, b in zip(held[(lane & ~15 ^ 16)], held[lane])] for lane in range(32)]
-        counts = held[31]
-        return all(c == 1 for c in counts) if op in ('v_xor_b32', 'v_add_nc_u32') else all(c >= 1 for c in counts)
+        counts = held if whole_half else (held[31],)
+        exact = op in ('v_xor_b32', 'v_add_nc_u32')
+        return all(c == 1 if exact else c >= 1 for lane in counts for c in lane)
 
     @staticmethod
     def wave_reduce_cndmask_fill(stretch, ss):
@@ -10512,15 +10520,31 @@ class Stage:
                                                                              'row_half_mirror' in mods)
                    for name, _ops, mods in steps[1:]):
             return False   # not a reduction: the instruction keeps its own handler
-        if base.endswith('_b64'):
-            raise Unsupported('wave reduction in the wave64 form (%s %s): only the wave32 chain is lowered'
-                              % (base, ', '.join(ops)))
+        wide = base.endswith('_b64')
         ss = reg_range(ops[0])
-        if not ss or ss[0] != 's' or ss[1] != ss[2]:
+        if wide:
+            if getattr(self, 'kind', None) != 'cs':
+                raise Unsupported('wave reduction: wave64 requires a compute stage')
+            if self.pipe.wave_size == 32 or self.has_branches or self.blocks or self.lane_exec_breaks:
+                raise Unsupported('wave reduction: wave64 requires straight-line compute with a tracked EXEC mask')
+            for off, _, name, asm in self.ins[:index]:
+                if off in getattr(self, 'wave64_reduce_starts', ()) or name.startswith('v_cmpx_'):
+                    continue
+                _, operands, _ = parse(asm)
+                if writes_exec(name, operands) and (name != 's_mov_b64' or operands[0] != 'exec'):
+                    raise Unsupported('wave reduction: wave64 cannot track EXEC after %s' % asm)
+            if not ss or ss[0] != 's' or ss[1] % 2 or ss[2] != ss[1] + 1 or ss[2] > 105 or steps[0][2]:
+                raise Unsupported('wave reduction: wave64 saveexec requires an aligned SGPR pair')
+        elif not ss or ss[0] != 's' or ss[1] != ss[2]:
             raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
+        saved = ops[0]
         ss = ss[1]
+
+        def is_control(control):
+            return self.WAVE_REDUCE_CONTROL.fullmatch(control) or wide and self.WAVE_REDUCE_DPP8.fullmatch(control)
+
         first = next((k for k, (name, _o, m) in enumerate(steps)
-                      if name.endswith('_dpp') and any(self.WAVE_REDUCE_CONTROL.fullmatch(x) for x in m)), len(steps))
+                      if name.endswith('_dpp') and any(is_control(x) for x in m)), len(steps))
         items = self.ins[index:index + first + 10]
 
         def at(k, what):
@@ -10532,10 +10556,20 @@ class Stage:
         stretch = [at(k, 'the first quad_perm step') for k in range(1, first)]
         pending = getattr(self, 'reduce_pending', {})
         taken = None   # the later readlane of the min chain just before, which this chain carries before its fill
-        if stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
+        if not wide and stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
             taken = pending[items[1][0]]
             stretch = stretch[1:]
-        fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
+        if wide:
+            # The decoder can print the VOP3 mask operand as the pair or by its first SGPR.
+            if len(stretch) == 1:
+                b, o, m, text = stretch[0]
+                if len(o) == 4 and o[3] == saved:
+                    stretch = [(b, o[:3] + ['s%d' % ss], m, text)]
+            fill = self.wave_reduce_cndmask_fill(stretch, ss)
+        else:
+            fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
+        if wide and fill is None:
+            raise Unsupported('wave reduction: wave64 requires a cndmask identity fill using %s' % saved)
         if fill is None:
             raise Unsupported('wave reduction: the identity fill after s_or_saveexec_b32 s%d, -1 (%s) is not a known '
                               'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
@@ -10547,11 +10581,12 @@ class Stage:
             if not b.endswith('_dpp'):
                 raise Unsupported('wave reduction: missing step %d of 4 (found %s)' % (k + 1, text))
             controls = [x for x in m if not x.startswith(('row_mask:', 'bank_mask:', 'bound_ctrl:', 'fi:'))]
-            if len(controls) != 1 or not self.WAVE_REDUCE_CONTROL.fullmatch(controls[0]):
+            if len(controls) != 1 or not is_control(controls[0]):
                 raise Unsupported('wave reduction: %s in place of a quad_perm, row_half_mirror or row_mirror step'
                                   % (' '.join(controls) or 'no DPP control'))
             seen.append(controls[0])
-            if 'row_mask:0xf' not in m or 'bank_mask:0xf' not in m:
+            if not (wide and self.WAVE_REDUCE_DPP8.fullmatch(controls[0])) and (
+                    'row_mask:0xf' not in m or 'bank_mask:0xf' not in m):
                 raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
             this = b[:-len('_dpp')]
             if this not in self.WAVE_REDUCE:
@@ -10561,7 +10596,9 @@ class Stage:
             op = this
             if o != ['v%d' % vt] * 3:
                 raise Unsupported('wave reduction: %s does not combine v%d with itself' % (text, vt))
-        if not self.wave_steps_reduce(seen, op):
+        if wide and not self.wave_steps_reduce(seen, op, whole_half=True):
+            raise Unsupported('wave reduction: wave64 DPP steps do not reduce each 32-lane half')
+        if not wide and not self.wave_steps_reduce(seen, op):
             raise Unsupported('wave reduction: the steps %s do not bring every lane\'s input into lane 31%s' % (
                 ', '.join(seen), ' exactly once' if op in ('v_xor_b32', 'v_add_nc_u32') else ''))
         if identity != self.WAVE_REDUCE[op][1]:
@@ -10582,6 +10619,8 @@ class Stage:
             mixed = b in self.WAVE_REDUCE and b != op
             raise Unsupported('wave reduction %s' % ('mixes %s and %s' % (op, b) if mixed else
                                                      ': %s in place of %s v%d, v%d, v%d' % (text, op, vt, vt, vp)))
+        if wide:
+            return self.plan_wave64_reduction(at, items, index, first + 6, op, vt, vp, ss, source)
         b, o, m, text = at(first + 6, 'EXEC is restored')
         if b != 's_mov_b32' or o != ['exec_lo', 's%d' % ss] or m:
             raise Unsupported('wave reduction: %s in place of s_mov_b32 exec_lo, s%d (EXEC restored before the readlane)'
@@ -10662,6 +10701,120 @@ class Stage:
             self.reduce_pending = {**pending, items[read][0]: claim}
         plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
         return True
+
+    def plan_wave64_reduction(self, at, items, index, tail, op, vt, vp, ss, source):
+        # RDNA 2 DPP and permlanex16 form separate 32-lane reductions. A scalar ALU
+        # operation must combine readlanes from opposite halves to finish the wave.
+        steps = [at(k, 'the wave64 restore, readlanes or scalar combine') for k in range(tail, tail + 4)]
+        restores = [k for k, (b, o, m, _) in enumerate(steps)
+                    if b == 's_mov_b64' and o == ['exec', 's[%d:%d]' % (ss, ss + 1)] and not m]
+        if len(restores) != 1:
+            raise Unsupported('wave reduction: wave64 expected a full EXEC restore in the chain tail')
+        scalar_steps = [k for k in range(4) if k != restores[0]]
+        halves = {}
+        for step in scalar_steps[:2]:
+            b, o, m, text = steps[step]
+            rd = reg_range(o[0]) if len(o) == 3 else None
+            if b != 'v_readlane_b32' or m or not rd or rd[0] != 's' or rd[1] != rd[2] or rd[2] > 105 or \
+                    rd[1] in (ss, ss + 1) or o[1] != 'v%d' % vt or not re.fullmatch(r'\d+', o[2]) or int(o[2]) >= 64:
+                raise Unsupported('wave reduction: wave64 expected a half readlane, found %s' % text)
+            halves[int(o[2]) // 32] = rd[1]
+        if len(halves) != 2 or halves[0] == halves[1]:
+            raise Unsupported('wave reduction: wave64 readlanes must read opposite halves into distinct SGPRs')
+        b, o, m, text = steps[scalar_steps[2]]
+        scalar, _ = self.WAVE_REDUCE_SCALAR[op]
+        dest = reg_range(o[0]) if len(o) == 3 else None
+        if b != scalar or m or not dest or dest[0] != 's' or dest[1] != dest[2] or dest[2] > 105 or \
+                set(o[1:]) != {'s%d' % n for n in halves.values()}:
+            raise Unsupported('wave reduction: wave64 expected %s combining both halves, found %s' % (scalar, text))
+        if restores[0] > scalar_steps[2] and dest[1] in (ss, ss + 1):
+            raise Unsupported('wave reduction: wave64 scalar combine overwrites the saved EXEC before restore')
+
+        # vT is reconstructed for every lane. The permlane temporary is elided,
+        # so a later instruction must either ignore it or overwrite it in every lane.
+        full_exec = self.exec_known
+        for _, _, name, asm in self.ins[index + tail + 4:]:
+            _, ops, mods = parse(asm)
+            hits = [i for i, tok in enumerate(ops) if any(
+                int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
+                for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
+            if re.match(r'v_(?:movrel|movrels|swaprel)', name):
+                raise Unsupported('wave reduction: wave64 permlane temporary v%d may be read by %s' % (vp, asm))
+            if hits:
+                if full_exec and hits == [0] and name in ('v_mov_b32_e32', 'v_mov_b32_e64') and not mods:
+                    break
+                raise Unsupported('wave reduction: wave64 permlane temporary v%d is live at %s' % (vp, asm))
+            full_exec &= not writes_exec(name, ops)
+
+        plan = self.reduce_plan = getattr(self, 'reduce_plan', {})
+        # Readlane and the scalar combine ignore EXEC, so the restore can
+        # occur anywhere in the tail. The combine still runs after both reads.
+        for k in range(1, tail + 4):
+            if k != tail + scalar_steps[2]:
+                plan[items[k][0]] = None
+        plan[items[tail][0]] = lambda: self.lower_wave64_reduction(op, vt, vp, ss, source, halves)
+        self.wave64_reduce_starts = {*getattr(self, 'wave64_reduce_starts', ()), items[0][0]}
+        # Keep the scalar combine's handler, including its operation-specific SCC.
+        return True
+
+    def lower_wave64_reduction(self, op, vt, vp, ss, source, halves):
+        self.uses_wave64_reduce = self.needs_sm6 = True
+        x, y, z = self.pipe.group
+        count = x * y * z
+        intrinsic, value = self.WAVE_REDUCE[op]
+        identity = '0x%08xu' % value
+        _, combine = self.WAVE_REDUCE_SCALAR[op]
+        tag = 'wr%x_' % self.pc
+        flat, start, lane, operand, lo, hi, i = (tag + n for n in ('flat', 'start', 'lane', 'value', 'lo', 'hi', 'i'))
+        self.emit('uint %s = tid.x + %du * (tid.y + %du * tid.z);' % (flat, x, y))
+        self.emit('uint %s = %s & ~63u, %s = %s & 63u;' % (start, flat, lane, flat))
+        self.emit('uint %s = (exec & 1u) ? %s : %s;' % (operand, self.u(source), identity))
+        self.emit('uint %s = %s, %s = %s;' % (lo, identity, hi, identity))
+        # With more than one guest wave, use thread indices even on a wave64 host
+        # so the dispatch does not depend on the host's assignment of lanes to waves.
+        if count <= 64:
+            # Only one wave can contain all threads. If none does, every
+            # thread takes the barrier path, even with a partially filled wave.
+            self.emit('if (WaveGetLaneCount() >= 64u && WaveActiveCountBits(true) == %du) {' % count)
+            for dst, cmp in ((lo, '<'), (hi, '>=')):
+                masked = '%s %s 32u ? %s : %s' % (lane, cmp, operand, identity)
+                self.emit('    %s = %s;' % (dst, intrinsic.format(masked)))
+            self.emit('} else {')
+        indent = '    ' if count <= 64 else ''
+        acc = tag + 'acc'
+        shared = [
+            'x2w_wave64[%s] = %s;' % (flat, operand),
+            'GroupMemoryBarrierWithGroupSync();',
+            'if ((%s & 31u) == 0u) {' % lane,
+            '    uint %s = %s;' % (acc, identity),
+            '    for (uint %s = %s; %s < min(%s + 32u, %du); ++%s)' % (i, flat, i, flat, count, i),
+            '        %s = %s;' % (acc, combine.format(acc, 'x2w_wave64[%s]' % i)),
+            '    x2w_wave64[%s] = %s;' % (flat, acc),
+            '}',
+            'GroupMemoryBarrierWithGroupSync();',
+            '%s = x2w_wave64[%s];' % (lo, start),
+            'if (%s + 32u < %du) %s = x2w_wave64[%s + 32u];' % (start, count, hi, start),
+            'GroupMemoryBarrierWithGroupSync();',  # protect readers from the next chain
+        ]
+        for line in shared:
+            self.emit(indent + line)
+        if count <= 64:
+            self.emit('}')
+        self.set_s(ss, 'exec', uniform=False)
+        self.set_s(ss + 1, '0u')
+        self.masks.add(ss)
+        self.mask_high.add(ss + 1)
+        self.uniform_v.discard(vp)
+        self.align4_v.discard(vp)
+        self.uniform_expr.pop(vp, None)
+        was_known, self.exec_known = self.exec_known, True
+        try:
+            self.set_v(vt, '%s < 32u ? %s : %s' % (lane, lo, hi))
+        finally:
+            self.exec_known = was_known
+        self.set_s(halves[0], lo, uniform=False)
+        self.set_s(halves[1], hi, uniform=False)
+        self.set_scc('true')
 
     def lower_wave_reduction(self, op, vt, vp, ss, source):
         operand = self.u(source)
@@ -11930,6 +12083,13 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if getattr(s, 'uses_wave64_reduce', False):
+            count = self.group[0] * self.group[1] * self.group[2]
+            total = count + (self.lds_words if getattr(s, 'uses_lds', False) else 0)
+            total += count if getattr(s, 'uses_quad_shared', False) else 0
+            if total > 8192:
+                raise Unsupported('wave reduction: wave64 scratch exceeds the 32 KiB groupshared limit')
+            shared.append('groupshared uint x2w_wave64[%d];' % count)
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'

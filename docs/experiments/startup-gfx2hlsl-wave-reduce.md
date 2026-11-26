@@ -87,5 +87,20 @@ python -B tests/startup_gfx2hlsl_wave_reduce_check.py binary <llvm-mc>
 The `binary` mode assembles every fixture and compares the words; the programs with a branch are assembled to an
 object (`-filetype=obj`) and compared with its `.text`, because `-show-encoding` prints a branch to a label with its
 offset still unresolved. WARP runs 4-lane waves (one quad per wave), so only
-a hardware adapter reduces across quads. This does not measure console behavior or a title, and wave64 chains are
-the next slice.
+a hardware adapter reduces across quads. This measures desktop pixel fixtures.
+
+## Wave64 compute fixtures
+
+Straight-line compute chains can reduce both 32-lane halves when DPP and permlane
+cover each half, two readlanes select opposite halves, and a matching scalar
+operation combines them. One desktop wave can supply both half reductions when
+it contains the full group of up to 64 threads. Other group layouts use
+groupshared memory indexed by the guest's consecutive 64-thread waves.
+
+The WARP test dispatches 64 threads, compares all output words with a CPU
+reference, and requires a low-half-only mutant to fail for each of the six
+operations. It also dispatches with the groupshared path forced.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_wave64_reduce_(controls|warp)$' -V
+```
