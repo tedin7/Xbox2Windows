@@ -6,9 +6,11 @@
                                        draw one pixel per four input sets and compare the four result words
 
 The reference scales the exact binary64 value with math.ldexp and rounds once to binary32, so it is the product the
-ISA describes, whatever the exponent: signed zero, infinities, overflow to infinity, underflow to zero, a denormal
-result rounded once, and a denormal source scaled back into the normal range (2^-140 * 2^140 is exactly 1.0, which a
-plain exp2(n) multiply turns into infinity). The mutation takes the exponent clamped to +-127 instead.
+ISA describes, whatever the exponent: signed zero, infinities, overflow to infinity, underflow to zero, and an
+exponent beyond one scaling step (2^120 * 2^-240). Denormal sources and results are not drawn: Direct3D 11 shader
+models may flush binary32 denormals (WARP does under FXC), while the guest preserves them, so the read-back would
+test the adapter, not the lowering. The helper scales in two steps like musl's scalbnf, so a denormal result rounds
+once. The mutation takes the exponent clamped to +-127 instead.
 The fixture and runner are startup_gfx2hlsl_lane_alu.py.
 """
 import math
@@ -54,9 +56,10 @@ DRAW = {'v_ldexp_f32': [
     # Overflow, the largest exponent, a negative one and signed zeros.
     (f(1.0), 128, 0), (f(-1.0), 0x7fffffff, 0), (f(1.0), 0x80000000, 0), (f(-1.0), 0x80000000, 0),
     (f(0.0), 100, 0), (f(-0.0), EXPONENT(-100), 0), (0x7f800000, EXPONENT(-5), 0), (0xff800000, 7, 0),
-    # Denormal results and a denormal source: one rounding, and back to 1.0 exactly.
-    (f(1.0), EXPONENT(-127), 0), (f(1.0), EXPONENT(-149), 0), (f(1.0), EXPONENT(-150), 0), (f(1.5), EXPONENT(-149), 0),
-    (0x00000400, 140, 0), (f(3.0), EXPONENT(-130), 0), (f(1.0), EXPONENT(-126), 0), (f(1.99999988), EXPONENT(-1), 0),
+    # Exponents past one scaling step with a normal result: both steps of the split, up and down, and the last bit.
+    (f(2.0 ** 120), EXPONENT(-240), 0), (f(2.0 ** -120), 240, 0), (f(1.5 * 2.0 ** 100), EXPONENT(-200), 0),
+    (f(3.0 * 2.0 ** 60), EXPONENT(-130), 0),
+    (f(1.0), EXPONENT(-126), 0), (f(1.99999988), EXPONENT(-1), 0), (f(1.0), 127, 0), (f(-3.0), 0, 0),
 ]}
 MUTATIONS = {'v_ldexp_f32': (r'x2w_ldexp\((F\(v\d+\)), asint\((v\d+)\)\)', r'x2w_ldexp(\1, clamp(asint(\2), -127, 127))',
                              lambda a, n: scaled(a, n, 127))}
