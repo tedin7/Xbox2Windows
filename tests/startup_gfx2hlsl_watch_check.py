@@ -472,6 +472,32 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('the --watch first pass keeps it final', fail.stat().st_mtime, built + 50)
     expect('the reason is unchanged', fail.read_text(), reason)
 
+# The pool's peak is sampled between the log lines: a worker that grows and exits between two lines still counts, and
+# a worker that cannot be read is named in the readable count, not silently dropped.
+class FakePool:
+    def __init__(self, pids):
+        self._processes = dict.fromkeys(pids)
+
+
+now = [0.0]
+sizes = {1: 100 << 20, 2: None}
+log = io.StringIO()
+monitor = gfx2hlsl.PoolMonitor(every=30.0, clock=lambda: now[0], out=log, sample_every=2.0, read=sizes.get)
+monitor.tick(FakePool([1, 2]))                       # t=0: logged, worker 2 unreadable
+now[0] = 2.0
+sizes[3] = 700 << 20
+monitor.tick(FakePool([1, 2, 3]))                    # t=2: a short worker at 700 MiB, sampled, not logged
+now[0] = 3.0
+monitor.tick(FakePool([1, 2]))                       # t=3: before the next sample, nothing read
+now[0] = 30.0
+monitor.tick(FakePool([1, 2]))                       # t=30: worker 3 has exited; the peak still holds it
+lines = log.getvalue().splitlines()
+expect('pool monitor: two log lines', len(lines), 2)
+expect('pool monitor: readable of total workers', lines[-1].startswith('gfx2hlsl watch pool: 2 workers (1 readable), '),
+       True)
+expect('pool monitor: the exited worker is in the sampled peak', '(sampled peak 800 MiB, every 2 s)' in lines[-1], True)
+expect('pool monitor: commit now', ' commit 100 MiB ' in lines[-1], True)
+
 # Beside a running title the --watch pool translates only the requests the title is waiting for: 30 refusals an older
 # translator build wrote stay untouched in the run and are retried by the finish pass (--pending) after it. The pool
 # keeps to at most WATCH_JOBS workers (X2W_TRANSLATE_JOBS overrides) and logs its size and commit.
@@ -500,7 +526,8 @@ with tempfile.TemporaryDirectory() as tmp:
            ['%016x' % k for k in new_keys])
     expect('in-run: the pool is at most %d workers' % gfx2hlsl.WATCH_JOBS,
            'pool of at most %d workers' % min(gfx2hlsl.WATCH_JOBS, os.cpu_count() or 1) in err, True)
-    expect('in-run: the pool logs its size and commit', 'gfx2hlsl watch pool: ' in err and ' MiB (peak ' in err, True)
+    expect('in-run: the pool logs its size and commit', 'gfx2hlsl watch pool: ' in err and ' MiB (sampled peak ' in err,
+           True)
     pending_cli(d, **{'X2W_TRANSLATE_JOBS': ''})
     expect('after the run: the finish pass retries the 30',
            [(d / ('%016x.fail' % k)).stat().st_mtime > built - 100 for k in old_keys], [True] * 30)

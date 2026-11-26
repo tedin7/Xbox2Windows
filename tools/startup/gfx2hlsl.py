@@ -12376,25 +12376,41 @@ def private_bytes(pid):
         return None
 
 
-class PoolMonitor:
-    """Logs the --watch pool every POOL_LOG_SECONDS to stderr: workers alive, requests running, their committed
-    private memory now and the peak seen."""
+POOL_SAMPLE_SECONDS = 2.0  # --watch: how often the pool's commit is read for the sampled peak
 
-    def __init__(self, every=POOL_LOG_SECONDS, clock=time.monotonic, out=None):
-        self.every, self.clock, self.out = every, clock, out
-        self.next_at = clock()
+
+class PoolMonitor:
+    """Logs the --watch pool every POOL_LOG_SECONDS to stderr: workers alive and how many of them could be read,
+    requests running, their committed private memory now and the peak of the samples taken every POOL_SAMPLE_SECONDS.
+    The peak is a lower bound: a worker that grows and exits between two samples, or that cannot be read, is missed."""
+
+    def __init__(self, every=POOL_LOG_SECONDS, clock=time.monotonic, out=None, sample_every=POOL_SAMPLE_SECONDS,
+                 read=None):
+        self.every, self.clock, self.out, self.sample_every = every, clock, out, sample_every
+        self.read = read or private_bytes
+        self.next_at = self.next_sample = clock()
         self.peak = 0
 
-    def tick(self, pool, running=0):
-        if self.clock() < self.next_at:
-            return
-        self.next_at = self.clock() + self.every
+    def sample(self, pool):
+        """(workers, readable workers, their committed private bytes) now."""
         pids = list(getattr(pool, '_processes', None) or {}) if pool is not None else []
-        sizes = [size for size in map(private_bytes, pids) if size is not None]
-        total = sum(sizes)
+        sizes = [size for size in map(self.read, pids) if size is not None]
+        return len(pids), len(sizes), sum(sizes)
+
+    def tick(self, pool, running=0):
+        now = self.clock()
+        if now < self.next_sample and now < self.next_at:
+            return
+        self.next_sample = now + self.sample_every
+        workers, readable, total = self.sample(pool)
         self.peak = max(self.peak, total)
-        print('gfx2hlsl watch pool: %d workers, %d requests running, commit %.0f MiB (peak %.0f MiB)'
-              % (len(pids), running, total / 1048576.0, self.peak / 1048576.0), file=self.out or sys.stderr, flush=True)
+        if now < self.next_at:
+            return
+        self.next_at = now + self.every
+        print('gfx2hlsl watch pool: %d workers (%d readable), %d requests running, commit %.0f MiB '
+              '(sampled peak %.0f MiB, every %.0f s)' % (workers, readable, running, total / 1048576.0,
+                                                         self.peak / 1048576.0, self.sample_every),
+              file=self.out or sys.stderr, flush=True)
 
 
 def translation_jobs():
