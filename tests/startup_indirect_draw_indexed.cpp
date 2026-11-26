@@ -2098,8 +2098,9 @@ int main(int argc, char** argv) try
             return !size || (stream.read(contents.data(), size) && std::memcmp(contents.data(), bytes, size) == 0);
         };
         for (const auto& file : std::filesystem::directory_iterator(cache)) {
-            ++files;
             auto path = file.path();
+            if (path.filename() == "revision.txt") continue;  // the runtime's revisions, written with the first request
+            ++files;
             if (path.extension() != ".m57") continue;
             ++requests;
             if (!matches(path, ms, ms_size) ||

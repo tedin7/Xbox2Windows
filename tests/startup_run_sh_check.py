@@ -11,6 +11,7 @@ Exits 77 (skip) on Windows; on other hosts a missing bash or setsid is a failure
 """
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -34,6 +35,17 @@ GAME_OVERRIDES = "d3d12,d3d12core,dxgi,d3d11=n"  # docs/wine.md
 FAKE_USER_WARNING = ("WARNING: Without --fake-user, user API calls go to the host gaming runtime "
                      "(docs/startup-runtime.md).")
 TRANSLATE_WARNING = "WARNING: --translate needs --render (no shader cache without it); ignored"
+# A cache of an older build (#2815): its revision.txt and one request, against the stub translator's revisions.
+REQUEST = "req_0123456789abcdef.a"
+OLDER_CACHE = {"revision.txt": b"graphics x2w-startup-shader-89\ncompute x2w-startup-shader-89cs\n", REQUEST: b""}
+SAME_CACHE = {"revision.txt": b"graphics x2w-startup-shader-90\ncompute x2w-startup-shader-90cs\n"
+                              b"mesh57 x2w-startup-mesh-57-9\n", REQUEST: b""}
+REVISION_WARNING = re.compile(r"WARNING: shader cache \S+ was written by stand-ins of revision graphics "
+                              r"x2w-startup-shader-89, compute x2w-startup-shader-89cs, but the translator \S+ is "
+                              r"revision graphics x2w-startup-shader-90, compute x2w-startup-shader-90cs, mesh57 "
+                              r"x2w-startup-mesh-57-9: .*Fix: rebuild the stand-ins .*")
+LEGACY_WARNING = re.compile(r"WARNING: shader cache \S+ holds requests but no revision.txt, so their revision is unknown: .*Fix: .*")
+MOVED_NOTE = re.compile(r"moved the old shader cache \S+ to \S+cache\.old-[0-9]{8}-[0-9]{6}")
 HIDE_WARNING = "WARNING: --hide-title-window needs --render (no output window without it); it has no effect"
 # Synthetic package values; not any title's. Only the first of each tag counts, as in run.ps1.
 CONFIG = ("<Game>\r\n<Identity/>\r\n<TitleId>X2WTEST</TitleId>\r\n<TitleId>SECOND</TitleId>\r\n"
@@ -113,6 +125,8 @@ sys.exit(code)
 # workers are, records its own and the child's process ids, its arguments and environment, then
 # waits to be stopped. Both ignore SIGTERM, so only run.sh's SIGKILL fallback stops them.
 WATCH_STUB = """\
+# The revisions the launcher compares with the cache: fnv(b'x2w-startup-shader-90'), b'x2w-startup-shader-90cs',
+# b'x2w-startup-mesh-57-9' (synthetic, as gfx2hlsl.py spells them).
 import json
 import os
 import subprocess
@@ -153,7 +167,7 @@ def read_json(path):
 
 def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_data=False, config=CONFIG,
              translate=False, stop=None, drive_log=False, log_slash=False, expect_env=None, expect_warnings=None,
-             expect_exit=None):
+             expect_exit=None, cache_files=None, expect_moved=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong."""
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
@@ -168,6 +182,11 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     (startup / "debug_launch.py").write_text(
         STUB.format(code=code, alive=ALIVE, prefixes=ENV_PREFIXES), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(prefixes=ENV_PREFIXES), encoding="utf-8")
+    shutil.copyfile(RUN_SH.with_name("shader_cache_revision.py"), startup / "shader_cache_revision.py")
+    if cache_files is not None:  # a shader cache left by an earlier run
+        (root / "cache").mkdir()
+        for name, data in cache_files.items():
+            (root / "cache" / name).write_bytes(data)
     wine = root / "wine"
     wine.write_text(WINE_STUB, encoding="utf-8")
     wine.chmod(0o755)
@@ -245,8 +264,15 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
         expect_warnings = [] if fake else [FAKE_USER_WARNING]
         if "--hide-title-window" in switches and "--render" not in switches and not translate:
             expect_warnings.append(HIDE_WARNING)
-    if warnings != expect_warnings:
+    # A pattern stands for a line that names scratch paths.
+    if len(warnings) != len(expect_warnings) or not all(
+            want.fullmatch(got) if isinstance(want, re.Pattern) else want == got
+            for want, got in zip(expect_warnings, warnings)):
         found.append(f"{label}: warnings {warnings}, expected {expect_warnings}")
+    if expect_moved:
+        moved = [p for p in root.iterdir() if p.name.startswith("cache.old-")]
+        if len(moved) != 1 or not (moved[0] / REQUEST).is_file() or list((root / "cache").iterdir()):
+            found.append(f"{label}: --fresh-shader-cache did not move the old cache aside ({moved})")
     if stop == "term" and not debugger_done:
         found.append(f"{label}: run.sh ended before the debugger finished")
     if drive_log:
@@ -350,6 +376,13 @@ CASES = [
     dict(code=0, env_extra={"WINEPREFIX": ""}, expect_exit=64, expect_warnings=["run.sh: set WINEPREFIX"]),
     dict(code=0, env_extra={"X2W_WIN_PYTHON": ""}, expect_exit=64, expect_warnings=["run.sh: set X2W_WIN_PYTHON"]),
     dict(code=7, translate=True),
+    # A cache from another revision, or from a build that wrote no revision.txt, warns once; a matching one does not.
+    dict(code=7, translate=True, cache_files=OLDER_CACHE, expect_warnings=[FAKE_USER_WARNING, REVISION_WARNING]),
+    dict(code=7, translate=True, cache_files={REQUEST: b""}, expect_warnings=[FAKE_USER_WARNING, LEGACY_WARNING]),
+    dict(code=7, translate=True, cache_files=SAME_CACHE),
+    # --fresh-shader-cache moves the old cache aside, so the run starts empty and does not warn.
+    dict(code=7, translate=True, cache_files=OLDER_CACHE, switches=["--fresh-shader-cache"], expect_moved=True,
+         expect_warnings=[FAKE_USER_WARNING, MOVED_NOTE]),
     dict(code=7, translate=True, stop="int"),
     dict(code=7, translate=True, stop="term"),
 ]
@@ -393,6 +426,8 @@ def mutants_of(script):
                                          "title_id=$(sed -n 's/.*<TitleId>\\([^<]*\\).*/\\1/p' \"$config\" | head -n 1)"),
         "case-sensitive tags": replace(script, "grep -oi '<", "grep -o '<", count=2),
         "no hide warning": replace(script, '    echo "WARNING: --hide-title-window', '    : "WARNING: --hide-title-window'),
+        "no revision warning": replace(script, '        echo "WARNING: $note" >&2', '        : "WARNING: $note"'),
+        "fresh cache kept": replace(script, '    if [ -n "$fresh_cache" ]; then', '    if false; then'),
         "log through the raw path": replace(script, 'log_host=$(host_path "$log")', 'log_host=$log'),
         "cache through the raw path": replace(script, 'mkdir -p "$(host_path "$shader_cache")"', 'mkdir -p "$shader_cache"'),
         "trailing separator kept": drop_line(script, "do log=${log%?}; done"),

@@ -303,6 +303,7 @@ jobs:
             tests/startup_compute_request_offline_check.py \
             tests/compute_container_index_check.py \
             tests/startup_shader_cache_rekey_check.py \
+            tests/startup_shader_cache_revision_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \

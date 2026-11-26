@@ -15,6 +15,7 @@
 #   X2W_FXC          the FXC the shader watcher runs under --translate (docs/startup-runtime.md);
 #                    a host path is passed in its Z: spelling
 #   WINEDLLOVERRIDES, WINEFSYNC, WINEDEBUG  default to the docs/wine.md values when unset
+#   X2W_HOST_PYTHON  the host python that compares the shader cache with the translator (default: python3)
 # Paths may be host paths or drive paths such as 'G:\'. The debugger and the watcher get them as
 # given (host paths in their Z: spelling); this script reads and creates drive paths through the
 # prefix's dosdevices links. Needs bash 4.4 or newer, GNU realpath and setsid (Linux).
@@ -29,7 +30,7 @@ usage() {
     echo "       [--memory-gib 14] [--continue-asserts 0] [--input-script S] [--storage DIR]" >&2
     echo "       [--shader-cache out/startup/shader_cache] [--console 0|1] [--render] [--fake-user]" >&2
     echo "       [--gpu-mirror] [--host-cpu] [--translate] [--startup-below-40] [--trace-calls]" >&2
-    echo "       [--hide-title-window] [--capture-every S]" >&2
+    echo "       [--hide-title-window] [--capture-every S] [--fresh-shader-cache]" >&2
     exit 64
 }
 
@@ -37,7 +38,7 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 here="$repo/tools/startup"
 exe="" data="" log="" seconds=120 build_dir=out/build/release memory_gib=14 continue_asserts=0
 input_script="" storage="" shader_cache=out/startup/shader_cache console=1 capture_every=0
-render="" fake_user="" gpu_mirror="" host_cpu="" translate="" below_40="" trace_calls="" hide_title=""
+render="" fake_user="" gpu_mirror="" host_cpu="" translate="" below_40="" trace_calls="" hide_title="" fresh_cache=""
 while [ $# -gt 0 ]; do
     case $1 in
         --exe|--data|--log|--seconds|--build-dir|--memory-gib|--continue-asserts|--input-script|--storage|\
@@ -61,6 +62,7 @@ while [ $# -gt 0 ]; do
         --startup-below-40) below_40=1; shift ;;  # X2W_XMEM_STARTUP_BELOW_40
         --trace-calls) trace_calls=1; shift ;;    # also break on runtime and movie-player calls (slow)
         --hide-title-window) hide_title=1; shift ;;  # X2W_HIDE_TITLE_WINDOW: hide the title's own window
+        --fresh-shader-cache) fresh_cache=1; shift ;;  # with --render: move a cache that is not empty aside first
         -h|--help) usage ;;
         *) echo "run.sh: unknown argument '$1'" >&2; usage ;;
     esac
@@ -140,7 +142,14 @@ fi
 if [ -n "$hide_title" ] && [ -z "$render" ]; then
     echo "WARNING: --hide-title-window needs --render (no output window without it); it has no effect" >&2
 fi
+host_python=${X2W_HOST_PYTHON:-python3}
+if [ -n "$fresh_cache" ] && [ -z "$render" ]; then
+    echo "WARNING: --fresh-shader-cache needs --render (no shader cache without it); ignored" >&2
+fi
 if [ -n "$render" ]; then
+    if [ -n "$fresh_cache" ]; then
+        "$host_python" -B "$here/shader_cache_revision.py" "$(host_path "$shader_cache")" --fresh >&2
+    fi
     mkdir -p "$(host_path "$shader_cache")"
     export X2W_D3D12_RENDER=1 X2W_DRAW_NULL_IDENTITY=1
     X2W_SHADER_CACHE=$(win_path "$shader_cache")
@@ -177,6 +186,22 @@ on_signal() {
     kill -s "$1" $$
 }
 trap 'on_signal INT' INT
+# Requests keyed by another revision are all refused, and the translator's log does not say why: warn once,
+# before the watcher starts (revision.txt of an earlier run) or after the run (the one this run's stand-ins wrote).
+revision_warned=""
+check_cache_revision() {
+    local note rc
+    note=$("$host_python" -B "$here/shader_cache_revision.py" "$(host_path "$shader_cache")" \
+        --translator "$here/gfx2hlsl.py" 2>&1)
+    rc=$?
+    if [ $rc -eq 1 ]; then
+        echo "WARNING: $note" >&2
+        revision_warned=1
+    elif [ $rc -ne 0 ]; then
+        echo "WARNING: the shader cache revision was not checked ($host_python exit $rc)" >&2
+        revision_warned=1
+    fi
+}
 if [ -n "$translate" ] && [ -z "$render" ]; then
     echo "WARNING: --translate needs --render (no shader cache without it); ignored" >&2
 fi
@@ -187,6 +212,7 @@ if [ -n "$translate" ] && [ -n "$render" ]; then
     # before setsid, so setsid does not fork and $! is the new group's id.
     # An empty X2W_FXC (manifest only) is passed on as it is.
     if [ -n "${X2W_FXC:-}" ]; then X2W_FXC=$(win_path "$X2W_FXC"); export X2W_FXC; fi
+    check_cache_revision
     WINEDLLOVERRIDES="$WINEDLLOVERRIDES;d3dcompiler_47=n" \
         setsid "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/gfx2hlsl.py")" --watch "$X2W_SHADER_CACHE" \
         > "$log_host/translate.txt" 2> "$log_host/translate_err.txt" < /dev/null &
@@ -202,5 +228,6 @@ capture_args=()
     "$(win_path "$log")" --timeout "$seconds" --memory-gib "$memory_gib" --trace-files 1 \
     --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" "${capture_args[@]}" > "$log_host.out" 2>&1
 debugger_exit=$?
+if [ -n "$translate" ] && [ -n "$render" ] && [ -z "$revision_warned" ]; then check_cache_revision; fi
 head -n 5 "$log_host.out"
 exit $debugger_exit

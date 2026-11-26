@@ -222,10 +222,43 @@ bool read_text(const wchar_t* path, std::string& out)
     return true;
 }
 
+// The revisions every request key starts with. tools/startup/gfx2hlsl.py hashes the same bytes, without a
+// trailing NUL (pipeline_key, compute_key, mesh57_key); a change of either side makes every cached request a miss.
+namespace shader_cache {
+constexpr char revision[] = "x2w-startup-shader-28";
+constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup/gfx2hlsl.py compute_key
+constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
+}  // namespace shader_cache
+
+// Once per process, before its first request: <X2W_SHADER_CACHE>\revision.txt names this runtime's revisions, so
+// that the launchers (tools/startup/shader_cache_revision.py) can warn before they start a translator of another
+// revision. A file that already says the same is left as it is.
+void write_cache_revision()
+{
+    static LONG written;
+    if (InterlockedCompareExchange(&written, 1, 0)) return;
+    wchar_t dir[MAX_PATH], path[MAX_PATH], temporary[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    swprintf(path, MAX_PATH, L"%s\\revision.txt", dir);
+    swprintf(temporary, MAX_PATH, L"%s\\revision.txt.%lu.tmp", dir, GetCurrentProcessId());
+    const std::string text = std::string("graphics ") + shader_cache::revision + "\ncompute " + shader_cache::compute_revision +
+                             "\nmesh57 " + shader_cache::mesh57_revision + "\n";
+    std::string old;
+    if (read_text(path, old) && old == text) return;
+    HANDLE file = CreateFileW(temporary, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD done = 0;
+    const bool complete = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &done, nullptr) && done == text.size();
+    CloseHandle(file);
+    if (!complete || !MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temporary);
+}
+
 // Publish each input atomically. The callers write the request's ready marker last.
 bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::size_t bytes)
 {
     wchar_t path[MAX_PATH], temporary[MAX_PATH], suffix[32];
+    write_cache_revision();
     if (!cache_path(path, L"req_", key, ext)) return false;
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return true;
     swprintf(suffix, std::size(suffix), L"%s.%lu.tmp", ext, GetCurrentProcessId());
@@ -351,10 +384,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                                 const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
-    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
-    // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-28";
-    const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
+    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
+    const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
@@ -474,8 +505,7 @@ u64 publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup/gfx2hlsl.py compute_key
-    u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
+    u64 key = fnv_bytes(shader_cache::compute_revision, sizeof(shader_cache::compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
     // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
@@ -538,8 +568,8 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
-    constexpr char revision[] = "x2w-startup-mesh-57-3";
-    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(revision, sizeof(revision) - 1))));
+    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
+                                                                                 sizeof(shader_cache::mesh57_revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);

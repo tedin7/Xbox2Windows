@@ -1529,7 +1529,16 @@ handle returns `0x80004005`.
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
-then start the build again. The new key keeps the former bytecode and manifest
+then start the build again.
+The first request of a process also writes the runtime's revisions to `<cache-directory>/revision.txt`
+(`graphics`, `compute` and `mesh57` lines). With `-Render -Translate` (`--render --translate`),
+`run.ps1` and `run.sh` compare that file with the `gfx2hlsl.py` they start
+(`tools/startup/shader_cache_revision.py`) and print one warning naming both revisions when they differ,
+or when the cache holds requests but no `revision.txt`: every cached request would be refused as a key
+mismatch. The warning comes before the watcher starts, or after the run when the run's own stand-ins
+wrote the first `revision.txt`. Rebuild the stand-ins from the same checkout, or start with an empty cache:
+`-FreshShaderCache` (`--fresh-shader-cache`) moves a cache that is not empty to `<cache>.old-<date>-<time>` first
+([#2815](https://github.com/R0Y00/Xbox2Windows/issues/2815)). The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).

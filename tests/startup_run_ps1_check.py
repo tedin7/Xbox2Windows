@@ -55,6 +55,8 @@ sys.exit({code})
 # workers are, records the PIDs and arguments, then waits to be stopped. The early-exit case
 # publishes just the watcher's PID and arguments and returns without spawning a child.
 WATCH_STUB = """\
+# The revisions the launcher compares with the cache: fnv(b'x2w-startup-shader-90'), b'x2w-startup-shader-90cs',
+# b'x2w-startup-mesh-57-9' (synthetic, as gfx2hlsl.py spells them).
 import json
 import os
 import subprocess
@@ -135,8 +137,15 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
+# A shader cache of an older build (#2815): its revision.txt and one request, against the stub's revisions.
+OLDER_CACHE = {"revision.txt": b"graphics x2w-startup-shader-89\ncompute x2w-startup-shader-89cs\n",
+               "req_0123456789abcdef.a": b""}
+REVISION_PHRASES = ("was written by stand-ins of revision graphics x2w-startup-shader-89",
+                    "but the translator", "is revision graphics x2w-startup-shader-90", "Fix: rebuild the stand-ins")
+
+
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False):
+             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, cache_files=None):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -150,6 +159,11 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
+    shutil.copyfile(RUN_PS1.with_name("shader_cache_revision.py"), startup / "shader_cache_revision.py")
+    if cache_files is not None:  # a shader cache left by an earlier run
+        (root / "cache").mkdir()
+        for name, data in cache_files.items():
+            (root / "cache" / name).write_bytes(data)
     build = root / ("build [with spaces]" if absolute_build else "bld")
     build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
@@ -200,6 +214,13 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     want_output = STUB_LINES[:HEAD_LINES]
+    if cache_files is not None:
+        # One warning with both revisions and the fixes; PowerShell may wrap it, so compare without whitespace.
+        flat = re.sub(r"\s", "", " ".join(printed))
+        missing = [phrase for phrase in REVISION_PHRASES if re.sub(r"\s", "", phrase) not in flat]
+        if missing or flat.count("Fix:rebuildthestand-ins") != 1:
+            found.append(f"stale shader cache: no single revision warning with {missing} (printed {printed})")
+        printed = [line for line in printed if line in STUB_LINES]  # the case runs with -FakeUser: no other warning
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
         printed = unwrap_first_line(printed, want_output[0])
@@ -256,6 +277,7 @@ def run_problems(shell, script, work, first_only):
     if found and first_only:
         return found
     found += run_case(shell, script, 7, work, translate=True)
+    found += run_case(shell, script, 7, work, translate=True, switches=["-FakeUser"], cache_files=OLDER_CACHE)
     for code in (0, 7):
         found += run_case(shell, script, code, work, translate=True, early_exit=True)
     return found

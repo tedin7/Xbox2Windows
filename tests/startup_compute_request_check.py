@@ -30,6 +30,9 @@ import tempfile
 
 from startup_stream_check import container, gfx2hlsl
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "startup"))
+import shader_cache_revision  # noqa: E402
+
 PROGRAM = struct.pack("<2I", 0x7e020280, 0xbf810000)                 # v_mov_b32 v1, 0; s_endpgm
 DATA = struct.pack("<2Q", 0xfedcba9876543210, 0xffff00001111008c)     # synthetic, not addresses
 STATE = struct.pack("<3Q", 1, 0x2c, 0xfff0000000000003)                # synthetic state block A, 24 bytes
@@ -78,7 +81,8 @@ def prepare(directory):
 
 
 def names(cache):
-    return sorted(p.name for p in cache.iterdir())
+    """The request files (revision.txt, which the first request writes, is checked on its own)."""
+    return sorted(p.name for p in cache.iterdir() if p.name != shader_cache_revision.REVISION_FILE)
 
 
 def check_boundaries(directory, consumer):
@@ -114,6 +118,8 @@ def check_boundaries(directory, consumer):
 
 def check(directory, consumer, disabled):
     cache, env = prepare(directory)
+    # A revision.txt left by an older build: the first request replaces it.
+    (cache / shader_cache_revision.REVISION_FILE).write_text("graphics x2w-startup-shader-0\n", encoding="ascii")
     if disabled:
         env["X2W_D3D12_RENDER"] = "0"
     lines = run(directory, consumer, env)
@@ -137,10 +143,19 @@ def check(directory, consumer, disabled):
     assert lines == [f"x2w-draw compute request {key:016x} published {detail}",
                      f"x2w-draw compute request {key:016x} already present {detail}"], lines
 
+    # The stand-in names its revisions next to the request, and they are the ones gfx2hlsl.py at this commit hashes,
+    # so the launchers' check (tools/startup/shader_cache_revision.py) stays silent for a matching build.
+    revisions = shader_cache_revision.cache_revisions(cache)
+    assert revisions == shader_cache_revision.translator_revisions(gfx2hlsl.__file__), revisions
+    assert shader_cache_revision.warning(cache, gfx2hlsl.__file__) is None, shader_cache_revision.warning(cache, gfx2hlsl.__file__)
+    revision_file = cache / shader_cache_revision.REVISION_FILE
+
     stamps = {file: (cache / file).stat().st_mtime_ns for file in files}
+    revision_stamp = revision_file.stat().st_mtime_ns
     lines = run(directory, consumer, env)
     assert len(lines) == 2 and all("already present" in line for line in lines), lines
     assert {file: (cache / file).stat().st_mtime_ns for file in files} == stamps, "a second process rewrote the request"
+    assert revision_file.stat().st_mtime_ns == revision_stamp, "a second process rewrote an unchanged revision.txt"
     assert names(cache) == sorted(files)
 
     # Each pointed-to part is in the key.
