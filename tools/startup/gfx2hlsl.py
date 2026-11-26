@@ -7533,6 +7533,53 @@ class Stage:
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
+    def constant_vgpr_word(self, n, name):
+        """Value of VGPR v<n> when its only writer is one `v_mov_b32 v<n>, <literal>` of a straight-line program."""
+        if getattr(self, 'has_branches', True):
+            raise Unsupported('%s needs straight-line code to prove its offset register' % name)
+        value = None
+        for _, _, op, asm in getattr(self, 'ins', ()):
+            ops = parse(asm)[1]
+            base = re.sub(r'_e(32|64)$', '', op)
+            if base.startswith(('exp', 'buffer_store', 'ds_write', 'v_cmpx')) or not ops:
+                continue
+            if any(r and r[0] == 'v' and r[1] <= n <= r[2] for r in map(reg_range, destinations(op, ops))):
+                if value is not None or base != 'v_mov_b32' or len(ops) != 2:
+                    raise Unsupported('%s offset register v%d is not one literal move' % (name, n))
+                try:
+                    value = int(ops[1], 0)
+                except ValueError:
+                    raise Unsupported('%s offset register v%d is not an integer literal' % (name, n)) from None
+        if value is None:
+            raise Unsupported('%s offset register v%d is never written' % (name, n))
+        return value & 0xffffffff
+
+    def op_image_gather4_lz_o(self, ops, mods):
+        """image_gather4_lz_o: image_gather4_lz with a texel offset packed in the first address register.
+
+        RDNA 2 MIMG address order for the _o forms is offset, then the coordinates; the offset register holds
+        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). HLSL's Gather takes
+        the offset as a literal in -8..7, so the register must be one literal move and both fields in range.
+        """
+        name = 'image_gather4_lz_o'
+        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
+            name, ops, mods, 3, 'three contiguous address registers', mip_preclamp=True)
+        packed = self.constant_vgpr_word(addr[1], name)
+        if packed & ~0x3f3f:
+            raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
+        fields = []
+        for shift in (0, 8):
+            field = (packed >> shift) & 0x3f
+            field -= 64 if field & 0x20 else 0
+            if not -8 <= field <= 7:
+                raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
+            fields.append(field)
+        smp = self.pipe.sampler(tuple(words))
+        u, v = (self.f('v%d' % i) for i in (addr[1] + 1, addr[1] + 2))
+        self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
     def op_image_gather4_l(self, ops, mods):
         """image_gather4_l on a 2D texture with explicit LOD and a validated constant sampler."""
         dst, addr, words, (_, channel_index), tex = self.gather_2d_setup(
