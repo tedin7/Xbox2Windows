@@ -17350,6 +17350,8 @@ op may sit under `v_cmpx`, inside an `execz` block, past an `execnz` kill branch
 refused: any branch that can differ between lanes and is not an EXEC branch (VCC, SCC not proven uniform), loops with
 such a branch. `s_wqm_b64 exec, exec` on a narrowed EXEC turns every lane of a quad with an active lane on; it is
 lowered as `exec = x2w_quad_any(exec) ? 1u : 0u;`, the same vote written back to EXEC.
+The bias of `image_sample_b` may differ per lane (a join of two values): `SampleBias` takes it per pixel, and the draw
+fixture `bias_lane` gives the drawn lane and its helper column different biases.
 `tests/startup_image_sample_b_flow_check.py` and `tests/startup_image_get_lod_flow_check.py` draw each shape against a
 CPU reference (DXC ps_6_0 and FXC ps_5_1) with wrong-value controls.
 

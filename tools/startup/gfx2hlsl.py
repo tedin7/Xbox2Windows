@@ -4077,42 +4077,6 @@ class Stage:
                 return False
         return True
 
-    def uniform_bias(self, tok):
-        """Whether a VGPR holds one value in every lane at the op: its last earlier write is a v_mov_b32 of a constant
-        that every lane ran (no EXEC write and no branch before it, so no lane skipped it and the other lanes keep an
-        older value). No backward branch exists in a quad program, so later writes cannot reach the op."""
-        r = reg_range(tok)
-        if not r or r[0] != 'v' or r[1] != r[2]:
-            return False
-        last = None
-        for off, _n, name, asm in self.ins:
-            if off >= self.pc:
-                break
-            ops = parse(asm)[1]
-            first = reg_range(ops[0]) if ops else None
-            if first and first[0] == 'v' and first[1] <= r[1] <= first[2]:
-                const = (re.sub(r'_e(32|64)$', '', name) == 'v_mov_b32' and len(ops) == 2 and not reg_range(ops[1]))
-                last = off if const else None
-        if last is None:
-            return False
-        narrowed = 0
-        for off, _n, name, asm in self.ins:
-            if off >= last:
-                break
-            base = re.sub(r'_e(32|64)$', '', name)
-            ops = parse(asm)[1]
-            if name.startswith('s_cbranch') or name == 's_branch':
-                target = int(ops[0].split('_')[1], 16) if '_' in ops[0] else None
-                if target is None or target > last:
-                    return False  # the write can be skipped by some lanes
-            elif base in ('s_or_b64', 's_or_b32') and ops[:2] in (['exec', 'exec'], ['exec_lo', 'exec_lo']):
-                narrowed = max(narrowed - 1, 0)  # the restore that ends a saveexec region
-            elif base.startswith('s_and_saveexec') or (base.startswith('s_wqm') and ops[:2] not in (['exec', 'exec'], ['exec_lo', 'exec_lo'])):
-                narrowed += 1
-            elif writes_exec(name, ops) and not (base.startswith('s_wqm') and ops[:2] in (['exec', 'exec'], ['exec_lo', 'exec_lo'])):
-                return False
-        return narrowed == 0
-
     def derivative_exec_ok(self):
         """Whether an implicit-derivative op may rely on the EXEC the lanes hold here.
 
@@ -7142,10 +7106,6 @@ class Stage:
                                      'mask and wave-uniform control flow')
                 if hasattr(self, 'derivative_sites'):
                     self.derivative_sites.append((self.pc, 'image_sample_b'))
-                if not self.exec_known and not self.uniform_bias(cs[0]):
-                    # Past a divergent EXEC the op is only drawn with one bias for the quad (tests/startup_image_sample_b_
-                    # flow_check.py); a bias that differs per lane (a join of different values) stays refused by name.
-                    raise Unsupported('image_sample_b with a per-lane bias past a divergent EXEC')
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
