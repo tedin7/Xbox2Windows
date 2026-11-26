@@ -47,7 +47,12 @@ def main(argv):
     while W.parent_alive(args.parent):
         time.sleep(args.poll)
     note("tester_run (pid %d) has ended" % args.parent)
-    packed = os.path.exists(os.path.join(args.logdir, "pack_done"))
+    # pack_done holds the PID of the tester_run that packed: one left by an earlier run in the same folder does not count
+    try:
+        with open(os.path.join(args.logdir, "pack_done"), "r", encoding="utf-8", errors="replace") as handle:
+            packed = handle.read().strip() == str(args.parent)
+    except OSError:
+        packed = False
     if not packed:
         note("tester_run ended before it packed the report (Ctrl-C, or its window was closed): ending the run and packing it")
         if W.find_debugger(args.logdir) or W.pid_alive(W.read_pid(args.logdir)):
@@ -78,7 +83,7 @@ def main(argv):
         for path, size in parts:
             note("packed %s (%d bytes)" % (path, size))
         with open(os.path.join(args.logdir, "pack_done"), "w", encoding="utf-8") as out:
-            out.write("janitor\n")
+            out.write("%d\n" % args.parent)
     except Exception as error:  # the logs stay in the run folder
         note("packing failed: %s; the logs stay in %s" % (error, args.logdir))
         return 1

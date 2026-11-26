@@ -112,10 +112,16 @@ class Janitor(unittest.TestCase):
         self.assertIn("the debugger finished by itself", text)
         self.assertTrue(self.zip.exists())
 
+    def test_a_pack_done_of_an_earlier_run_does_not_count(self):
+        (self.logdir / "pack_done").write_text("1\n")   # left by another tester_run in the same folder
+        parent = self.start("import time;time.sleep(1)")
+        self.janitor(parent.pid)
+        self.assertTrue(self.zip.exists(), "an interrupted run was taken for a packed one")
+
     def test_a_normal_end_is_not_packed_again_but_a_leftover_translator_is_ended(self):
-        (self.logdir / "pack_done").write_text("tester_run\n")
         translator = self.fake_translator()
         parent = self.start("import time;time.sleep(1)")
+        (self.logdir / "pack_done").write_text("%d\n" % parent.pid)
         result = self.janitor(parent.pid)
         self.assertEqual(result.returncode, 0, result.stderr)
         translator.wait(timeout=10)

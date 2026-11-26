@@ -396,7 +396,7 @@ $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${s
 $parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache @mapArgs })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
-Set-Content -LiteralPath (Join-Path $logDir "pack_done") -Value "tester_run"   # the janitor then only sweeps leftovers
+Set-Content -LiteralPath (Join-Path $logDir "pack_done") -Value "$PID"   # the janitor then only sweeps leftovers
 Remove-Item -LiteralPath $janitorFile -Force -ErrorAction SilentlyContinue
 foreach ($line in $parts) {
     $path, $bytes = $line -split " (?=\d+$)"
