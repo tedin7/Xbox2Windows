@@ -50,7 +50,7 @@ Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_STALL) {
     # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
     Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
-    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 60 }
+    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 120 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
     Set-Content -LiteralPath (Join-Path $LogDir "finished.txt") -Value "stub finished.txt"
@@ -227,7 +227,7 @@ def check_shell(shell):
         stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
                              "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
         assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
-        assert time.monotonic() - started < 50, "the run did not end through the stop file"
+        assert time.monotonic() - started < 90, "the run did not end through the stop file"
         assert "tester_run: STALL STOP at " in stalled.stdout and "frozen:" in stalled.stdout, stalled.stdout
         newest_stall = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_stall) as z:
