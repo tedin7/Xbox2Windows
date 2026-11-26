@@ -1784,6 +1784,14 @@ add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
 set_tests_properties(startup_indirect_counts_control_warp PROPERTIES TIMEOUT 30
     PASS_REGULAR_EXPRESSION "got +'x2w-render indirect: forwarded: drawindexed 3. refused graphics-pipeline: drawindexed 1. compute-pipeline: dispatch 1. placeholder-signature: other 1. other: drawindexed 3'")
+add_test(NAME startup_indirect_full_warp COMMAND startup_indirect_draw_indexed warp full)
+add_test(NAME startup_indirect_full_off_warp COMMAND startup_indirect_draw_indexed warp full-off)
+add_test(NAME startup_indirect_full_sampler_mutant_warp COMMAND startup_indirect_draw_indexed warp full-mutant)
+set_tests_properties(startup_indirect_full_warp startup_indirect_full_off_warp
+    startup_indirect_full_sampler_mutant_warp PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_indirect_full_sampler_mutant_warp PROPERTIES
+    PASS_REGULAR_EXPRESSION "fallback sampler mutant changed the indirect linear readback")
+
 # Negative control for the per-(key, reason) indirect-draw refusal census: replacing the second refusal on key 1
 # with a valid draw must report the real total (5) and pair count (3) as a mismatch.
 add_test(NAME startup_indirect_translated_refusal_census_control_warp

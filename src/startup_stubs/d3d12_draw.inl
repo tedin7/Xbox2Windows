@@ -2263,7 +2263,7 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation, bool 
             const auto& ud = translation.uds[word];
             if (indexed && ud.kind == Translation::base_vertex) continue;
             if (ud.kind == Translation::stride && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
-                (translation.srvs[ud.a].source == 0 || (indexed && translation.srvs[ud.a].source == 1)) &&
+                (translation.srvs[ud.a].source == 0 || translation.srvs[ud.a].source == 1) &&
                 translation.srvs[ud.a].kind == 0) continue;
             if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16)
                 return false;
@@ -2279,7 +2279,10 @@ constexpr const char* d16_srv_not_ready = "d16_srv_not_ready";
 constexpr const char* formatted_buffer_not_ready = "formatted_buffer_not_ready";
 constexpr const char* missing_guest_root = "missing_guest_root";
 constexpr const char* live_compute_pipeline = "live_compute_pipeline";
-constexpr const char* unsupported_resource_or_entry = "unsupported_resource_or_entry";
+constexpr const char* sampler_heap = "sampler_heap";
+constexpr const char* root_parameter_resource = "root_parameter_resource";
+constexpr const char* writable_texture = "writable_texture";
+constexpr const char* draw_dependent_entry = "draw_dependent_entry";
 constexpr const char* indexed_rect_unavailable = "indexed_rect_unavailable";
 constexpr const char* pipeline_unavailable = "pipeline_unavailable";
 constexpr const char* sampler_heap_unavailable = "sampler_heap_unavailable";
@@ -2763,8 +2766,8 @@ static const char* const not_drawn_names[] = {
     "translation_or_d16_or_formatted_not_ready",
     "missing_guest_root",
     "live_compute_pipeline",
-    "writable_texture_indirect",
-    "unsupported_resource_or_entry",
+    "writable_texture",
+    "draw_dependent_entry",
     "read_only_depth_write",
     "pipeline_or_sampler_heap_unavailable",
     "pixel_uav_unresolved",
@@ -2776,10 +2779,14 @@ static const char* const not_drawn_names[] = {
     "indexed_validation_failed",
     "buffer_copy_failed",
     "index_data_unavailable",
+    "sampler_heap",
+    "root_parameter_resource",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
-constexpr int index_data_unavailable_site = not_drawn_sites - 1;
+constexpr int buffer_copy_failed_site = not_drawn_sites - 4;
+constexpr int index_data_unavailable_site = not_drawn_sites - 3;
+constexpr int sampler_heap_site = not_drawn_sites - 2;
+constexpr int root_parameter_resource_site = not_drawn_sites - 1;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -2914,6 +2921,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(1);
     }
+    const bool full_indirect = indirect && x2w_local::env_on("X2W_INDIRECT_DRAW_FULL");
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
             indirect->set_refusal("translated draw requires the guest pipeline's root signature",
@@ -2927,9 +2935,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             draw_lock_release_exclusive();
             return not_drawn(3);
         }
-        if (!tr->uavs.empty()) {
+        if (!full_indirect && !tr->uavs.empty()) {
             indirect->set_refusal("translated draw with a writable texture is not bound for indirect draws",
-                                  indirect_refusal_code::unsupported_resource_or_entry);
+                                  indirect_refusal_code::writable_texture);
             draw_lock_release_exclusive();
             return not_drawn(4);
         }
@@ -2944,16 +2952,32 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     tr->indirect_base_word = static_cast<int>(i);
                 }
             }
-            entry = found_base && indirect_shader_entry(tr->vs, *tr, indexed) && indirect_shader_entry(tr->ps, *tr, indexed) &&
-                std::all_of(tr->srvs.begin(), tr->srvs.end(), [indexed](const Translation::Srv& srv) {
-                    return srv.source == 0 || (indexed && srv.kind == 0 && srv.source == 1 && srv.a == 0);
-                });
+            entry = found_base && indirect_shader_entry(tr->vs, *tr, indexed) && indirect_shader_entry(tr->ps, *tr, indexed);
         }
-        if (!*entry || tr->samplers.heap) {
-            indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
-                                  indirect_refusal_code::unsupported_resource_or_entry);
+        if (!*entry) {
+            indirect->set_refusal("translated draw uses a draw-dependent entry value",
+                                  indirect_refusal_code::draw_dependent_entry);
             draw_lock_release_exclusive();
             return not_drawn(5);
+        }
+        for (const auto& srv : tr->srvs) {
+            if (srv.source == 0) continue;
+            if (srv.source == 2 && full_indirect && srv.kind == 0 && srv.a >= 0 && srv.a < 16) continue;
+            if (srv.source == 1 && srv.kind == 0 &&
+                (indexed ? srv.a == 0 : full_indirect && srv.a >= 0 && srv.a < 8)) continue;
+            indirect->set_refusal(
+                srv.source == 2 ? "translated draw cannot bind a root parameter resource"
+                                : "translated draw cannot bind this vertex stream",
+                srv.source == 2 ? indirect_refusal_code::root_parameter_resource
+                                : indirect_refusal_code::incomplete_vertex_stream);
+            draw_lock_release_exclusive();
+            return not_drawn(srv.source == 2 ? root_parameter_resource_site : 11);
+        }
+        if (!full_indirect && tr->samplers.heap) {
+            indirect->set_refusal("translated draw cannot bind the sampler heap",
+                                  indirect_refusal_code::sampler_heap);
+            draw_lock_release_exclusive();
+            return not_drawn(sampler_heap_site);
         }
         if (bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
             ((bound->depth_stencil.DepthEnable && bound->depth_stencil.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) ||
@@ -2978,6 +3002,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
     if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {
+        if (indirect)
+            indirect->set_refusal("translated draw could not resolve the writable texture",
+                                  indirect_refusal_code::writable_texture);
+        draw_lock_release_exclusive();
+        return not_drawn(8);
+    }
+    if (indirect && std::any_of(uav_bindings, uav_bindings + tr->uavs.size(), [&](const PixelUavBinding& binding) {
+            return binding.resource == indirect->argument || binding.resource == indirect->indices.resource;
+        })) {
+        indirect->set_refusal("translated draw writable texture aliases an indirect input",
+                              indirect_refusal_code::writable_texture);
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
@@ -3055,6 +3090,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
     UINT indexed_vertices = UINT_MAX;
+    bool root_srv_reads_argument = false;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -3210,24 +3246,25 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
         }
-        if (indirect) {
+        if (indirect && srv.source != 2) {
             IndirectBufferView view{};
-            if (srv.source == 1 && indexed) {
-                const auto& vb = pass.vb[0];
+            if (srv.source == 1) {
+                const auto& vb = pass.vb[srv.a];
                 if (vb.StrideInBytes && vb.StrideInBytes <= 0x3fff && vb.SizeInBytes % vb.StrideInBytes == 0 &&
                     vb.BufferLocation <= 0xffffffffffffull) {
                     const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
                         static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
                     view = indirect_table_buffer(self, stream, true);
-                    indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
+                    if (indexed) indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
                 }
             } else if (entry_ok) {
                 view = indirect_table_buffer(self, words);
             }
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
                 indirect->set_refusal(
-                    srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
-                                    : "translated draw requires a complete GPU-backed table buffer range",
+                    srv.source != 1 ? "translated draw requires a complete GPU-backed table buffer range"
+                                    : indexed ? "translated indexed draw requires a complete GPU-backed vertex stream"
+                                              : "translated draw requires a complete GPU-backed vertex stream",
                     srv.source == 1 ? indirect_refusal_code::incomplete_vertex_stream
                                     : indirect_refusal_code::incomplete_table_buffer);
                 draw_lock_release_exclusive();
@@ -3349,6 +3386,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw   %016llx srv %u range 0x%llx (%zu bytes) is in a placed buffer without title backing; no recorded copy wrote it (span %llu)",
                     tr->key, i, address, bytes, span);
             if (written) {
+                if (indirect && srv.source == 2 && native == indirect->argument)
+                    root_srv_reads_argument = true;
                 require_state(self, native, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 buffer_view(dest, native, inside, span);
                 static LONG bound_from_copy;
@@ -3590,7 +3629,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
         } else {
-            require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            auto state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            if (root_srv_reads_argument)
+                state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            require_state(self, indirect->argument, state);
             list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
         }
         red_producer_draw_after(self, red_samples);

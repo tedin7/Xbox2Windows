@@ -584,6 +584,21 @@ draws from the untouched entry. It then publishes a supported 1-mip R8 texture a
 expects one counted and named BC1 shape, its line past the limit, one write line for the R8 entry, one
 token null with zero words, and the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
 
+### Translated indirect draw bindings
+
+Set `X2W_INDIRECT_DRAW_FULL=1` together with `X2W_TRANSLATED_INDIRECT_DRAW=1`
+to enable translated sampler heaps, buffer resources from root parameters,
+pixel UAVs and GPU-backed vertex streams on non-indexed draws. Pixel UAVs
+must resolve through the existing view checks and be distinct from the
+argument and index resources. Used start-instance values and base-vertex
+values outside the indexed validation path still cause a refusal.
+
+Run `ctest --preset dev --no-tests=error -R '^startup_indirect_full_(warp|off_warp|sampler_mutant_warp)$' -V`
+on Windows. The synthetic WARP fixture compares direct and indirect render
+targets and pixel UAV stores with CPU references, checks the named switch-off
+refusals, and requires the fallback sampler mutant to produce the point value
+in the linear draw.
+
 ### Per-reason refusal census per pipeline key
 
 [`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
@@ -600,7 +615,7 @@ with the last refusal:
   [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
   `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
   `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
-  `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
+  `draw_dependent_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
   each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
   emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
   to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
@@ -628,7 +643,7 @@ mismatch output, and are marked `WILL_FAIL`.
 Check the runtime wiring on WARP and hardware via
 `ctest --preset dev --no-tests=error -R '^startup_indirect_(translated|other)_refusal_census_(warp|hardware|control_warp)$' -V`:
 the `translated` pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
-key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
+key alongside `draw_dependent_entry` and `incomplete_table_buffer` on two other keys plus a
 succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
 and both per-call log lines for the shared key; its control replaces the second refusal on key 1 with a
 valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.

@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -202,6 +203,30 @@ float4 pixel(Varying input) : SV_Target {
 cbuffer entry : register(b0) { uint ud0; uint ud1; uint ud2; };
 Texture2D<float4> translated_texture : register(t0);
 ByteAddressBuffer translated_buffer : register(t0);
+SamplerState indirect_samplers[2048] : register(s0, space1);
+RWTexture2D<float4> indirect_output : register(u0);
+
+float4 indirect_sample() : SV_Target {
+    return translated_texture.SampleLevel(indirect_samplers[ud0], float2(0.375, 0.5), 0);
+}
+
+float4 indirect_root_buffer() : SV_Target {
+    return asfloat(translated_buffer.Load4(0));
+}
+
+float4 indirect_write() : SV_Target {
+    indirect_output[uint2(0, 0)] = float4(0.5, 0.25, 0.75, 1);
+    return float4(0.125, 0.25, 0.5, 1);
+}
+
+float4 indirect_stream() : SV_Target {
+    return asfloat(translated_buffer.Load4(ud0));
+}
+
+float4 indirect_instance() : SV_Target {
+    return float4(ud0 * 0.125, 0, 0, 1);
+}
+
 Texture2D<float4> translated_indexed_texture : register(t1);
 
 float4 translated_vertex(uint id : SV_VertexID) : SV_Position {
@@ -304,7 +329,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
-enum class TableSample { texture, buffer, buffer_tail };
+enum class TableSample { texture, buffer, buffer_tail, heap_sampler, root_buffer, pixel_uav, vertex_stream, start_instance };
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
                                     bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
@@ -312,7 +337,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207, 0xe0000208, 0xe0000209, 0xe000020a};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
     auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
@@ -337,16 +362,37 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
     const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel"};
+    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel",
+        "indirect_sample", "indirect_root_buffer", "indirect_write", "indirect_stream", "indirect_instance"};
     const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
     write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
     write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
     constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
     constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
     constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
-    if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
-    else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
-    else write(".txt", manifest, sizeof(manifest) - 1);
+    const char* binding_manifest = manifest;
+    switch (sample) {
+    case TableSample::texture: break;
+    case TableSample::buffer:
+    case TableSample::buffer_tail: binding_manifest = buffer_manifest; break;
+    case TableSample::heap_sampler:
+        binding_manifest = "x2w-manifest 1\nud 1\nudsrc 0 rootconst 1 0\nsrv 0 tex2d table 0 0\nsmpheap 2048 1 fallback 2047\nparams 0\ntargets 0\n";
+        break;
+    case TableSample::root_buffer:
+        binding_manifest = "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 buf root 0\nparams 0\ntargets 0\n";
+        break;
+    case TableSample::pixel_uav:
+        binding_manifest = "x2w-manifest 2\nud 1\nudsrc 0 rect\nuav 0 tex2d table 0 0\nparams 0\ntargets 0\n";
+        break;
+    case TableSample::vertex_stream:
+        binding_manifest = "x2w-manifest 1\nud 1\nudsrc 0 stride 0\nsrv 0 buf vb 2\nparams 0\ntargets 0\n";
+        break;
+    case TableSample::start_instance:
+        binding_manifest = "x2w-manifest 1\nud 1\nudsrc 0 startinstance\nparams 0\ntargets 0\n";
+        break;
+    }
+    if (indexed) binding_manifest = indexed_manifest;
+    write(".txt", binding_manifest, std::strlen(binding_manifest));
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
         reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
         reinterpret_cast<UINT64>(&vertex_id), sizeof(vertex_id), 0, 0,
@@ -1327,7 +1373,7 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         parsed[1].index == 2 && parsed[1].key == parsed[0].key &&
         parsed[1].reason == "sampled_texture_mismatch" && parsed[1].calls == 1 &&
         parsed[2].index == 3 && parsed[2].key != parsed[0].key &&
-        parsed[2].reason == "unsupported_resource_or_entry" && parsed[2].calls == 1 &&
+        parsed[2].reason == "draw_dependent_entry" && parsed[2].calls == 1 &&
         parsed[3].index == 4 && parsed[3].key != parsed[0].key && parsed[3].key != parsed[2].key &&
         parsed[3].reason == "incomplete_table_buffer" && parsed[3].calls == 2;
     if (!entries_ok) {
@@ -1349,7 +1395,7 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         const bool keyed_ok = keyed.rfind("x2w-render not drawn by pipeline key: ", 0) == 0 &&
             one.find(": 3 (") != std::string::npos && one.find("missing_guest_root 2") != std::string::npos &&
             one.find("sampled_texture_mismatch 1") != std::string::npos &&
-            two.find(": 1 (unsupported_resource_or_entry 1)") != std::string::npos &&
+            two.find(": 1 (draw_dependent_entry 1)") != std::string::npos &&
             three.find(": 2 (incomplete_vertex_or_table_buffer 2)") != std::string::npos;
         if (!keyed_ok) {
             std::fprintf(stderr, "not-drawn-by-key lines did not match the per-key refusals:\n%s\n", keyed.c_str());
@@ -1739,6 +1785,285 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
     return true;
 }
 #include "startup_indirect_mesh_lease.inl"
+using FullPixel = std::array<float, 4>;
+
+void copy_full_texture(ID3D12Device* device, ID3D12Resource* texture, bool upload, FullPixel* pixels)
+{
+    const auto desc = texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    const auto buffer = make_buffer(device, bytes, upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK,
+        upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
+    const SIZE_T row = static_cast<SIZE_T>(desc.Width) * sizeof(FullPixel);
+    const D3D12_RANGE none{0, 0}, range{static_cast<SIZE_T>(footprint.Offset), static_cast<SIZE_T>(footprint.Offset) + row};
+    void* mapped = nullptr;
+    if (upload) {
+        check(buffer->Map(0, &none, &mapped), "map texture upload");
+        std::memcpy(static_cast<char*>(mapped) + footprint.Offset, pixels, row);
+        buffer->Unmap(0, &range);
+    }
+    ComputeCommands commands(device, kept_direct_queue(device), nullptr);
+    D3D12_TEXTURE_COPY_LOCATION image{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION linear{buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    linear.PlacedFootprint = footprint;
+    const auto state = upload ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+    transition(commands.list.Get(), texture, D3D12_RESOURCE_STATE_COMMON, state);
+    commands.list->CopyTextureRegion(upload ? &image : &linear, 0, 0, 0, upload ? &linear : &image, nullptr);
+    transition(commands.list.Get(), texture, state, D3D12_RESOURCE_STATE_COMMON);
+    commands.submit_and_wait(device);
+    if (!upload) {
+        check(buffer->Map(0, &range, &mapped), "map texture readback");
+        std::memcpy(pixels, static_cast<char*>(mapped) + footprint.Offset, row);
+        buffer->Unmap(0, &none);
+    }
+}
+
+bool check_full_indirect(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQueue* info,
+                         bool enabled, bool mutant)
+{
+    constexpr auto float_format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    constexpr FullPixel clear{-1, -1, -1, -1}, initial_uav{0, 0, 0, 0};
+    constexpr FullPixel root_value{0.75f, 0.5f, 0.125f, 1};
+    constexpr FullPixel stream_value{0.25f, 0.5f, 0.75f, 1};
+    constexpr FullPixel written{0.5f, 0.25f, 0.75f, 1};
+    const D3D12_DRAW_ARGUMENTS record{3, 1, 0, 7};
+    PlacedBuffer arguments(device, guest, sizeof(record), D3D12_RESOURCE_FLAG_NONE);
+    const auto upload = make_buffer(device, sizeof(record), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const D3D12_RANGE none{0, 0};
+    void* mapped = nullptr;
+    check(upload->Map(0, &none, &mapped), "map full indirect argument upload");
+    std::memcpy(mapped, &record, sizeof(record));
+    upload->Unmap(0, nullptr);
+    {
+        ComputeCommands commands(device, kept_direct_queue(device), nullptr);
+        transition(commands.list.Get(), arguments.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        commands.list->CopyBufferRegion(arguments.native.Get(), 0, upload.Get(), 0, sizeof(record));
+        transition(commands.list.Get(), arguments.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        commands.submit_and_wait(device);
+    }
+    D3D12_INDIRECT_ARGUMENT_DESC draw{};
+    draw.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const D3D12_COMMAND_SIGNATURE_DESC sig_desc{sizeof(record), 1, &draw, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    check(guest->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&signature)), "create full draw signature");
+
+    struct Case {
+        const char* label;
+        TableSample shader;
+        FullPixel color;
+        const char* disabled_reason;
+        bool linear = false;
+        bool short_stream = false;
+    };
+    constexpr float left = 0.25f, right = 0.75f;
+    const Case cases[]{
+        {"point", TableSample::heap_sampler, {left, 0, 0, 1}, "sampler_heap"},
+        // At u=3/8 for a two-texel row, the footprint is one quarter of the way from left to right.
+        {"linear", TableSample::heap_sampler, {left + (right - left) / 4, 0, 0, 1}, "sampler_heap", true},
+        {"root SRV", TableSample::root_buffer, root_value, "root_parameter_resource"},
+        {"pixel UAV", TableSample::pixel_uav, {0.125f, 0.25f, 0.5f, 1}, "writable_texture"},
+        {"vertex stream", TableSample::vertex_stream, stream_value, "incomplete_vertex_stream"},
+        {"incomplete stream", TableSample::vertex_stream, stream_value, "incomplete_vertex_stream", false, true},
+        {"start instance", TableSample::start_instance, {record.StartInstanceLocation / 8.0f, 0, 0, 1}, "draw_dependent_entry"},
+    };
+    const auto census = [] {
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
+        report.resize(std::strlen(report.c_str()));
+        return report;
+    };
+    const auto count = [](const std::string& report, const std::string& field) {
+        unsigned long long calls = 0;
+        for (std::size_t at = report.find(field); at != std::string::npos; at = report.find(field, at + field.size()))
+            calls += std::strtoull(report.c_str() + at + field.size(), nullptr, 10);
+        return calls;
+    };
+    bool mutant_detected = false;
+    for (const auto& test : cases) {
+        const bool sample = test.shader == TableSample::heap_sampler;
+        const bool store = test.shader == TableSample::pixel_uav;
+        const bool root_buffer = test.shader == TableSample::root_buffer;
+        const bool stream = test.shader == TableSample::vertex_stream;
+        const bool instance = test.shader == TableSample::start_instance;
+        const D3D12_DESCRIPTOR_RANGE range{store ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER params[2]{};
+        if (root_buffer) params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        else {
+            params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[0].DescriptorTable = {1, &range};
+        }
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants = {0, 0, 1};
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{sample ? 2u : store || root_buffer ? 1u : 0u, params, 0, nullptr,
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        ComPtr<ID3DBlob> blob;
+        const auto root = create_root(guest, root_desc, &blob);
+        const auto pipeline = translated_pipeline(guest, root.Get(), blob.Get(), false, test.shader);
+        const auto make_heap = [&](D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, UINT64 sampler_bytes) {
+            struct {
+                D3D12_DESCRIPTOR_HEAP_DESC desc;
+                UINT64 address, bytes;
+            } extended{{type, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, sampler_bytes};
+            ComPtr<ID3D12DescriptorHeap> heap;
+            using CreateHeap = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+            check(slot<CreateHeap>(guest, 14)(guest, &extended, IID_PPV_ARGS(&heap)), "create full draw heap");
+            return heap;
+        };
+        using GetHandle = UINT64(WINAPI*)(IUnknown*, void*);
+        const auto views = (sample || store) ? make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, 0)
+                                              : ComPtr<ID3D12DescriptorHeap>{};
+        const auto samplers = sample ? make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, 16)
+                                     : ComPtr<ID3D12DescriptorHeap>{};
+        if (sample) {
+            D3D12_SAMPLER_DESC sampler{};
+            sampler.Filter = test.linear ? D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_POINT;
+            sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sampler.MaxAnisotropy = 1;
+            sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            guest->CreateSampler(&sampler, {slot<GetHandle>(samplers.Get(), 9)(samplers.Get(), nullptr)});
+        }
+        FullPixel direct_color{}, direct_uav{};
+        for (bool indirect : {false, true}) {
+            if (!indirect && test.short_stream) continue;
+            const bool refused = indirect && (!enabled || instance || test.short_stream);
+            const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1,
+                float_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+            const D3D12_CLEAR_VALUE clear_value{float_format, {-1, -1, -1, -1}};
+            const auto target = resource(device, target_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &clear_value);
+            const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+            ComPtr<ID3D12DescriptorHeap> rtvs;
+            check(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtvs)), "create full draw RTV heap");
+            const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+            guest->CreateRenderTargetView(target.Get(), nullptr, rtv);
+            ComPtr<ID3D12Resource> image, native_image;
+            if (views) {
+                auto image_desc = target_desc;
+                image_desc.Width = sample ? 2 : 1;
+                image_desc.Flags = store ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+                using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*,
+                    UINT, const void*, void*, UINT, const void*, REFIID, void**);
+                check(slot<Create>(guest, 127)(guest, &heap, 0, &image_desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, nullptr, 0, nullptr, IID_PPV_ARGS(&image)), "create full draw texture");
+                native_image = native_object<ID3D12Resource>(device, guest, image.Get());
+                FullPixel texels[2]{store ? initial_uav : FullPixel{left, 0, 0, 1}, {right, 0, 0, 1}};
+                copy_full_texture(device, native_image.Get(), true, texels);
+                const D3D12_CPU_DESCRIPTOR_HANDLE cpu{slot<GetHandle>(views.Get(), 9)(views.Get(), nullptr)};
+                if (store) {
+                    const D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{float_format, D3D12_UAV_DIMENSION_TEXTURE2D};
+                    guest->CreateUnorderedAccessView(image.Get(), nullptr, &uav_desc, cpu);
+                } else {
+                    guest->CreateShaderResourceView(image.Get(), nullptr, cpu);
+                }
+            }
+            ComPtr<ID3D12CommandAllocator> allocator;
+            check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create full draw allocator");
+            const auto wrapped = begin_guest_list(guest, allocator.Get());
+            const auto list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped.Get());
+            using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+            slot<Bind>(wrapped.Get(), 25)(wrapped.Get(), pipeline.Get());
+            slot<Bind>(wrapped.Get(), 34)(wrapped.Get(), root.Get());
+            using Clear = void (WINAPI*)(IUnknown*, UINT64, const float*, UINT, const D3D12_RECT*);
+            using Targets = void (WINAPI*)(IUnknown*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+            slot<Clear>(wrapped.Get(), 52)(wrapped.Get(), rtv.ptr, clear.data(), 0, nullptr);
+            slot<Targets>(wrapped.Get(), 50)(wrapped.Get(), 1, &rtv, FALSE, nullptr);
+            using Topology = void (WINAPI*)(IUnknown*, D3D12_PRIMITIVE_TOPOLOGY);
+            slot<Topology>(wrapped.Get(), 20)(wrapped.Get(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+            const D3D12_RECT scissor{0, 0, 1, 1};
+            using Viewport = void (WINAPI*)(IUnknown*, UINT, const D3D12_VIEWPORT*);
+            using Scissor = void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*);
+            slot<Viewport>(wrapped.Get(), 21)(wrapped.Get(), 1, &viewport);
+            slot<Scissor>(wrapped.Get(), 22)(wrapped.Get(), 1, &scissor);
+            if (views) {
+                ID3D12DescriptorHeap* heaps[]{views.Get(), samplers.Get()};
+                using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+                slot<Heaps>(wrapped.Get(), 32)(wrapped.Get(), sample ? 2 : 1, heaps);
+                using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
+                slot<Table>(wrapped.Get(), 36)(wrapped.Get(), 0, slot<GetHandle>(views.Get(), 10)(views.Get(), nullptr));
+            }
+            if (sample) {
+                // The mutant selects the real, reserved fallback sampler on the indirect linear draw.
+                const UINT entry = mutant && indirect && test.linear ? 2047 : 0;
+                using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+                slot<Constants>(wrapped.Get(), 40)(wrapped.Get(), 1, 1, &entry, 0);
+            }
+            std::unique_ptr<void, FreeMemory> root_memory;
+            if (root_buffer) {
+                root_memory.reset(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!root_memory) throw std::bad_alloc();
+                std::memcpy(root_memory.get(), root_value.data(), sizeof(root_value));
+                using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
+                slot<RootSrv>(wrapped.Get(), 44)(wrapped.Get(), 0, reinterpret_cast<UINT64>(root_memory.get()));
+            }
+            if (stream) {
+                using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+                // The shader skips the first record using the bound stride, then reads the last two.
+                constexpr UINT stride = 2 * sizeof(float);
+                constexpr float words[]{-1, -1, stream_value[0], stream_value[1], stream_value[2], stream_value[3]};
+                void* memory = slot<Allocate>(wrapped.Get(), 148)(wrapped.Get(), sizeof(words), 16);
+                check(memory ? S_OK : E_FAIL, "allocate full vertex stream");
+                std::memcpy(memory, words, sizeof(words));
+                const D3D12_VERTEX_BUFFER_VIEW vb{reinterpret_cast<UINT64>(memory),
+                    static_cast<UINT>(sizeof(words)) + (test.short_stream ? stride : 0), stride};
+                using VertexBuffer = void (WINAPI*)(IUnknown*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*);
+                slot<VertexBuffer>(wrapped.Get(), 48)(wrapped.Get(), 2, 1, &vb);
+            }
+            const auto before = census();
+            if (indirect) {
+                using Execute = void (WINAPI*)(IUnknown*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+                slot<Execute>(wrapped.Get(), 61)(wrapped.Get(), signature.Get(), 1, arguments.wrapped.Get(), 0, nullptr, 0);
+            } else {
+                using Draw = void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT);
+                slot<Draw>(wrapped.Get(), 12)(wrapped.Get(), record.VertexCountPerInstance, record.InstanceCount,
+                    record.StartVertexLocation, record.StartInstanceLocation);
+            }
+            check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped.Get(), 9)(wrapped.Get()), "close full draw list");
+            submit(device, list.Get());
+            FullPixel actual{}, actual_uav{};
+            copy_full_texture(device, target.Get(), false, &actual);
+            if (store) copy_full_texture(device, native_image.Get(), false, &actual_uav);
+            const FullPixel expected = refused ? clear : test.color;
+            const FullPixel expected_uav = store && !refused ? written : initial_uav;
+            const bool matches = std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0;
+            if (!matches && mutant && indirect && test.linear && actual == cases[0].color) {
+                mutant_detected = true;
+            } else if (!matches || (indirect && !refused && actual != direct_color)) {
+                std::fprintf(stderr, "%s %s target mismatch: got (%g,%g,%g,%g), expected (%g,%g,%g,%g)\n",
+                    test.label, indirect ? "indirect" : "direct", actual[0], actual[1], actual[2], actual[3],
+                    expected[0], expected[1], expected[2], expected[3]);
+                return false;
+            }
+            if (std::memcmp(actual_uav.data(), expected_uav.data(), sizeof(actual_uav)) ||
+                (indirect && !refused && actual_uav != direct_uav)) {
+                std::fprintf(stderr, "%s UAV readback mismatch\n", test.label);
+                return false;
+            }
+            if (!indirect) {
+                direct_color = actual;
+                direct_uav = actual_uav;
+            }
+            const auto after = census();
+            const std::string reason = std::string(" reason=") + test.disabled_reason + " calls=";
+            constexpr char total[] = "x2w-d3d12 indirect-draw refusals: total ";
+            const bool expected_refusal = count(after, total) == count(before, total) + 1 &&
+                count(after, reason) == count(before, reason) + 1;
+            if (refused ? !expected_refusal : after != before) {
+                std::fprintf(stderr, "%s unexpected refusal census\n%s", test.label, after.c_str());
+                return false;
+            }
+        }
+    }
+    check_lease_debug(info);
+    if (mutant) {
+        if (mutant_detected) std::puts("fallback sampler mutant changed the indirect linear readback");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try
@@ -1778,7 +2103,9 @@ int main(int argc, char** argv) try
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const std::string_view mode = argc == 3 ? argv[2] : "";
+    const bool full_fixture = mode == "full" || mode == "full-off" || mode == "full-mutant";
+    const bool translated = full_fixture || root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2166,6 +2493,14 @@ int main(int argc, char** argv) try
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable fixture path");
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_COPY_RANGES", copy_on ? "1" : "0") ? S_OK : E_FAIL,
               "set copy-range provenance control");
+        if (full_fixture) {
+            const bool enabled = mode != "full-off";
+            check(SetEnvironmentVariableA("X2W_INDIRECT_DRAW_FULL", enabled ? "1" : nullptr) ? S_OK : E_FAIL,
+                "configure full indirect switch");
+            const bool ok = check_full_indirect(device.Get(), guest.Get(), info.Get(), enabled, mode == "full-mutant");
+            std::filesystem::remove_all(cache);
+            return ok ? 0 : 1;
+        }
         const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER table{};
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2282,7 +2617,7 @@ int main(int argc, char** argv) try
                 verify(producer.Get(), false, refusal_census_control ? Refusal::none : Refusal::missing_texture,
                        refusal_census_control ? "census control valid draw replaces second reason" : "census key1 sampled_texture_mismatch") &&
                 verify(producer.Get(), false, Refusal::wrong_root, "census key1 missing_guest_root #2") &&
-                verify(producer.Get(), false, Refusal::start_vertex, "census key2 unsupported_resource_or_entry") &&
+                verify(producer.Get(), false, Refusal::start_vertex, "census key2 draw_dependent_entry") &&
                 run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), buffer_pso.Get(), signature.Get(),
                     DrawKind::vertices, false, Refusal::upload_range_crossing, "census key3 incomplete_table_buffer #1", &raw_upload, true) &&
                 run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), buffer_pso.Get(), signature.Get(),
