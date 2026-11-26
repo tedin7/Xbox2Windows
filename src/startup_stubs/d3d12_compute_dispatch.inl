@@ -367,7 +367,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (view.source && !tr->input_path_logged) {
                 tr->input_path_logged = true;
                 log("x2w-draw compute %016llx input %zu (%s %d %d) comes from %s (%llu bytes)", key, i, slot.heap ? "heap" : "table", slot.a, slot.b,
-                    view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for a null descriptor" : "a snapshot of title memory", view.bytes);
+                    view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for an empty descriptor" : "a snapshot of title memory", view.bytes);
             }
             if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read

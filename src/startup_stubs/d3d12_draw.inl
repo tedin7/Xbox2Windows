@@ -2205,9 +2205,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
-    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
-    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
-    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+    // A compute input whose record count is zero (all four words zero, or a base with no records) is an empty buffer:
+    // every read of it is out of range and the hardware returns zeros, so the dispatch gets 16 bytes of zeros
+    // instead of being refused. A view token is not a descriptor and keeps its own reasons.
+    if (!bytes && allow_title_snapshot && words[0] != view_token_magic) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
