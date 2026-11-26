@@ -54,6 +54,24 @@ class LiveViewCheck(unittest.TestCase):
         self.assertIn(render, output)
         self.assertIn("7 chunks decompressed", output)
 
+    def test_status_lines_old_and_new_format(self):
+        # #2816: the counters of the status lines are raw= (uncompressed copies) and completed= (raw + inflated +
+        # bcpack-blank); "inflated=N failed=N" is unchanged. An old line (done=) still parses, and a run with only
+        # compressed requests reads as progressing in both.
+        new = ("x2w-dstorage Queue::EnqueueStatus array=0x1 index=3 (requests raw=0 inflated=5 failed=1 "
+               "bcpack-blank=2 completed=7)")
+        old = "x2w-dstorage Queue::EnqueueStatus array=0x1 index=3 (requests done=0 inflated=5 failed=1)"
+        beat = ("x2w-dstorage heartbeat 10 s: requests raw=0 inflated=5 failed=1 bcpack-blank=2 completed=7; "
+                "page tokens 0 at enqueue=0, still 0 at run=0; commit unknown, live physical-page sections=unknown")
+        old_beat = ("x2w-dstorage heartbeat 10 s: requests done=0 inflated=5 failed=1 bcpack-blank=2; "
+                    "page tokens 0 at enqueue=0, still 0 at run=0; commit unknown, live physical-page sections=unknown")
+        for line, completed in ((new, 7), (old, 5), (beat, 7), (old_beat, 7)):
+            output = self.view_log(line + "\n")
+            self.assertIn("5 chunks decompressed", output, line)
+            self.assertIn(f"{completed} storage requests completed", output, line)
+        self.assertIn("7 requests completed so far, 5 compressed chunks decompressed, 1 failed", self.view_log(new + "\n"))
+        self.assertIn("5 requests completed so far, 5 compressed chunks decompressed, 1 failed", self.view_log(old + "\n"))
+
     def test_unknown_and_split_heartbeat(self):
         first = "x2w-dstorage heartbeat 20 s: requests done=0 inflated=0 failed=0 bcpack-blank=0; "
         second = "page tokens 0 at enqueue=0, still 0 at run=0; commit unknown, live physical-page sections=unknown\n"

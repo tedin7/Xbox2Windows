@@ -307,7 +307,7 @@ int main(int argc, char** argv)
     std::snprintf(what, sizeof what, "the causes add up to %ld, failed total %ld, expected %ld", sum, requests_failed,
                   expected_failed);
     ok = expect(sum == requests_failed && requests_failed == expected_failed, what) && ok;
-    std::snprintf(what, sizeof what, "done=%ld inflated=%ld, expected 1 and 1", requests_done, requests_compressed);
+    std::snprintf(what, sizeof what, "raw=%ld inflated=%ld, expected 1 and 1", requests_done, requests_compressed);
     ok = expect(requests_done == 1 && requests_compressed == 1, what) && ok;
 
     // The heartbeat's line, through the stand-in's formatter, against text written out here.
@@ -349,6 +349,67 @@ int main(int argc, char** argv)
         const std::string outcome = outcome_of(plan[i].options, plan[i].offset, plan[i].size);
         std::snprintf(what, sizeof what, "request %u logged outcome \"%s\", expected \"read failed\"", i, outcome.c_str());
         ok = expect(outcome == "read failed", what) && ok;
+    }
+
+    // The status-line counters (#2816). This mixed run finished one raw copy and one zlib request and
+    // failed the rest: completed is raw + inflated + bcpack-blank, a failure is not in it, and the
+    // "inflated=%ld failed=%ld" text that tools/startup/live_view.py parses is unchanged.
+    char counts[160], want_counts[160];
+    format_request_counts(counts, sizeof counts, requests_done, requests_compressed, requests_failed,
+                          requests_bcpack_blank);
+    std::snprintf(want_counts, sizeof want_counts, "raw=1 inflated=1 failed=%ld bcpack-blank=0 completed=2", expected_failed);
+    std::snprintf(what, sizeof what, "mixed run counts \"%s\", expected \"%s\"", counts, want_counts);
+    ok = expect(std::strcmp(counts, want_counts) == 0, what) && ok;
+    char parsed_tail[64];
+    std::snprintf(parsed_tail, sizeof parsed_tail, "inflated=1 failed=%ld", expected_failed);
+    ok = expect(std::strstr(counts, parsed_tail) != nullptr, "the inflated=N failed=N text live_view.py parses changed") && ok;
+
+    // A run whose requests are all zlib: nothing is counted raw, yet completed equals the finished requests,
+    // so the status line no longer reads as if storage were stuck.
+    {
+        requests_done = requests_compressed = requests_failed = requests_bcpack_blank = 0;
+        constexpr unsigned zlib_requests = 3;
+        void *zlib_status_ptr = nullptr, *zlib_queue_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, zlib_requests, "Zlib", nullptr, &zlib_status_ptr) != 0 ||
+            reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &zlib_queue_ptr) != 0) {
+            std::fprintf(stderr, "cannot create the zlib-only queue\n");
+            return 1;
+        }
+        auto* zlib_status = static_cast<Object*>(zlib_status_ptr);
+        auto* zlib_queue = static_cast<Object*>(zlib_queue_ptr);
+        std::vector<unsigned char> zlib_destination[zlib_requests];
+        for (unsigned i = 0; i < zlib_requests; ++i) {
+            zlib_destination[i].assign(piece, 0xA5);
+            alignas(8) unsigned char request[0x48] = {};
+            *reinterpret_cast<u64*>(request + 0x00) = 1;
+            *reinterpret_cast<unsigned char**>(request + 0x08) = zlib_destination[i].data();
+            *reinterpret_cast<unsigned*>(request + 0x18) = piece;
+            *reinterpret_cast<void**>(request + 0x20) = file_ptr;
+            *reinterpret_cast<u64*>(request + 0x28) = zlib_offset;
+            *reinterpret_cast<unsigned*>(request + 0x30) = stream_size;
+            *reinterpret_cast<unsigned*>(request + 0x38) = piece;
+            reinterpret_cast<EnqueueRequestFn>(zlib_queue->vtable[3])(zlib_queue, request);
+            reinterpret_cast<EnqueueStatusFn>(zlib_queue->vtable[4])(zlib_queue, zlib_status, i);
+        }
+        Fence zlib_fence{fence_vtable, 0};
+        reinterpret_cast<EnqueueSignalFn>(zlib_queue->vtable[5])(zlib_queue, &zlib_fence, 1);
+        reinterpret_cast<SubmitFn>(zlib_queue->vtable[6])(zlib_queue);
+        const DWORD zlib_start = GetTickCount();
+        while (!zlib_fence.signaled && GetTickCount() - zlib_start < completion_timeout_ms) Sleep(2);
+        ok = expect(zlib_fence.signaled, "the fence after the zlib-only requests was never signaled") && ok;
+        unsigned finished = 0;
+        for (unsigned i = 0; i < zlib_requests; ++i)
+            finished += reinterpret_cast<IsCompleteFn>(zlib_status->vtable[3])(zlib_status, i) ? 1 : 0;
+        format_request_counts(counts, sizeof counts, requests_done, requests_compressed, requests_failed,
+                              requests_bcpack_blank);
+        std::snprintf(want_counts, sizeof want_counts, "raw=0 inflated=%u failed=0 bcpack-blank=0 completed=%u", finished, finished);
+        std::snprintf(what, sizeof what, "zlib-only run: %u finished, counts \"%s\", expected \"%s\"", finished, counts, want_counts);
+        ok = expect(finished == zlib_requests && std::strcmp(counts, want_counts) == 0, what) && ok;
+        const std::string status_text = read_text(log_path);
+        ok = expect(status_text.find("(requests raw=") != std::string::npos &&
+                        status_text.find(" completed=") != std::string::npos &&
+                        status_text.find("requests done=") == std::string::npos,
+                    "the EnqueueStatus line does not carry raw= and completed= (or still says done=)") && ok;
     }
 
     ok = check_edge_ranges() && ok;

@@ -497,6 +497,8 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // format, 1 seen), +0x08 destination pointer, +0x18 destination size (u32), +0x20 source (File object
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
+// requests_done counts the uncompressed copies only (the "raw" count of the status lines); a compressed request
+// is counted in requests_compressed ("inflated"), or in requests_bcpack_blank when its BCPack data was not decoded.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 
 // Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
@@ -590,6 +592,16 @@ LONG sample_failure_counts(StorageFailureCounts& counts) noexcept
         total += static_cast<ULONG>(counts[i]);
     }
     return static_cast<LONG>(total);
+}
+
+// The counters of the status lines: "raw=R inflated=I failed=F bcpack-blank=B completed=C". "inflated=%ld
+// failed=%ld" stays byte-for-byte what it was, because tools/startup/live_view.py parses it. completed is every
+// request that wrote its destination and finished: raw + inflated + bcpack-blank (a failed request is not in it), so
+// a run whose requests are all compressed still shows storage progressing.
+int format_request_counts(char* out, std::size_t size, LONG raw, LONG inflated, LONG failed, LONG blank) noexcept
+{
+    return std::snprintf(out, size, "raw=%ld inflated=%ld failed=%ld bcpack-blank=%ld completed=%ld", raw, inflated,
+                         failed, blank, raw + inflated + blank);
 }
 
 int format_failure_causes(char* out, std::size_t size, int second, const StorageFailureCounts& n) noexcept
@@ -1552,9 +1564,13 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || x2w_local::first_calls(calls, 8))
-        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
-            static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
+    if (!valid || x2w_local::first_calls(calls, 8)) {
+        char counts[128];
+        format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, requests_failed,
+                              requests_bcpack_blank);
+        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests %s)", static_cast<void*>(array), index,
+            valid ? "" : " INVALID ARRAY", counts);
+    }
     if (!valid) return;
     InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
     Entry entry{};
@@ -1792,12 +1808,14 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                                   static_cast<unsigned long long>(sample.sections));
                 else
                     std::snprintf(section_text, sizeof(section_text), "unknown");
-                // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
+                // The counts keep "inflated=%ld failed=%ld" for tools/startup/live_view.py (format_request_counts);
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
-                    section_text);
+                char counts[128];
+                format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, failed,
+                                      requests_bcpack_blank);
+                log("x2w-dstorage heartbeat %d s: requests %s; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, counts,
+                    zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory, section_text);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
                 char ends[384];
