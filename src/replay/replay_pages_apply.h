@@ -45,11 +45,33 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
     std::vector<ReservedSpan> wanted;
     for (const PageMap& m : r.maps)
         if (m.bytes) wanted.push_back({m.address & ~(granule - 1), (m.address + m.bytes + granule - 1) & ~(granule - 1)});
+    // Reserve whole recorded allocations, even when only interior pages were captured.
+    std::vector<u64> boundaries;
+    for (const auto& entry : r.placement_heaps) {
+        const HeapPlacement& heap = entry.second;
+        const u64 end = (heap.base + heap.bytes + granule - 1) & ~(granule - 1);
+        wanted.push_back({heap.base, end});
+        boundaries.push_back(heap.base);
+        boundaries.push_back(end);
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
     std::sort(wanted.begin(), wanted.end(), [](const ReservedSpan& a, const ReservedSpan& b) { return a.base < b.base; });
-    std::vector<ReservedSpan>& spans = page_replay().spans;
+    std::vector<ReservedSpan> merged;
     for (const ReservedSpan& s : wanted) {
-        if (!spans.empty() && s.base <= spans.back().end) spans.back().end = (std::max)(spans.back().end, s.end);
-        else spans.push_back(s);
+        if (!merged.empty() && s.base <= merged.back().end) merged.back().end = (std::max)(merged.back().end, s.end);
+        else merged.push_back(s);
+    }
+    // Do not let adjacent page ranges merge two different recorded heaps into one allocation.
+    auto& spans = page_replay().spans;
+    for (const ReservedSpan& s : merged) {
+        u64 base = s.base;
+        for (auto cut = std::upper_bound(boundaries.begin(), boundaries.end(), base);
+             cut != boundaries.end() && *cut < s.end; ++cut) {
+            spans.push_back({base, *cut});
+            base = *cut;
+        }
+        spans.push_back({base, s.end});
     }
     for (const ReservedSpan& s : spans) {
         void* const at = VirtualAlloc(reinterpret_cast<void*>(s.base), static_cast<SIZE_T>(s.end - s.base), MEM_RESERVE | MEM_COMMIT,

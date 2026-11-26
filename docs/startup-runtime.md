@@ -1915,6 +1915,11 @@ call from them. An array that cannot be read or is over the size cap is logged (
 recorded exactly`) and the call falls back to the generic memory. Direct CPU writes to descriptor backing memory are outside
 this recipe: the pages of the heap's title memory carry them.
 
+For slot 133 buffers placed on the default path's existing heaps, an optional `HPLC` header holds five u64 words:
+call sequence, creation-order heap ID, allocation base, heap size and byte offset. Replay reserves the recorded
+allocation and opens one heap per ID. Each placement uses that heap and its recorded offset. Recordings without
+`HPLC` still use the address-based call.
+
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
 GPU round trip per present. A recorded run and its replay write the same names.
