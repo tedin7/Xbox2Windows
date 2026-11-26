@@ -47,6 +47,7 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
+if ($env:STUB_KILL_SELF) { Stop-Process -Id $PID -Force }   # the tester pressed Ctrl-C / closed the window: nothing after this runs
 if ($env:STUB_STALL) {
     # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
     Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
@@ -93,7 +94,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py", "tester_janitor.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -246,6 +247,20 @@ def check_shell(shell):
             assert z.read("wait_ended.txt").decode("utf-8-sig").strip() == "stop file", "the run did not end through the stop file"
         assert stall_manifest["end_cause"].startswith("watchdog at ") and "frozen:" in stall_manifest["end_cause"], stall_manifest
         assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
+        # The tester stops the script (the stub ends the whole PowerShell process, as a closed window does) before it packed anything:
+        # the janitor, in a window of its own, still packs the report from the early manifest.
+        before = set((tree / "out" / "tester").glob("report_*.zip"))
+        killed = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
+                            "-MemoryStopPercent", "0", extra_env={"STUB_KILL_SELF": "1"})
+        assert killed.returncode != 0, ("the stub did not end the script", killed.stdout, killed.stderr)
+        waited = time.monotonic()
+        while time.monotonic() - waited < 120 and not (set((tree / "out" / "tester").glob("report_*.zip")) - before):
+            time.sleep(1)
+        packed = sorted(set((tree / "out" / "tester").glob("report_*.zip")) - before)
+        assert packed, "the janitor did not pack the report of an interrupted run"
+        with zipfile.ZipFile(packed[0]) as z:
+            cut = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
                          "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
         assert "STALL STOP" not in off.stdout, off.stdout

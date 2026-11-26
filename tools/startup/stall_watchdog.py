@@ -234,6 +234,31 @@ def find_debugger(logdir):
     return None
 
 
+def find_processes(*needles):
+    """PIDs of the processes whose command line contains every needle (case-insensitive), this process excluded."""
+    wanted = [n.lower() for n in needles if n]
+    found = []
+    if os.name == "nt":
+        import subprocess
+        tests = " -and ".join("$_.CommandLine -like '*%s*'" % n.replace("'", "''") for n in needles if n)
+        command = "Get-CimInstance Win32_Process | Where-Object { %s } | ForEach-Object { $_.ProcessId }" % tests
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True,
+                                 timeout=60).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [int(x) for x in out if x.isdigit() and int(x) != os.getpid()]
+    for entry in os.listdir("/proc"):
+        if entry.isdigit() and int(entry) != os.getpid():
+            try:
+                line = Path("/proc", entry, "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if wanted and all(n in line for n in wanted):
+                found.append(int(entry))
+    return found
+
+
 def kill_tree(pid):
     """End a process and everything it started."""
     if os.name == "nt":
