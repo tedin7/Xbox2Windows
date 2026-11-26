@@ -80,6 +80,7 @@ struct Player {
     bool use_slot_layouts = false;
     u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
     void* device = nullptr;
+    std::wstring map_dump_dir;
 
     // A recorded byte range inside a translated range: the replay's address, `bytes` clipped to that range.
     u64 page_target(u64 address, u64& bytes) const
@@ -228,6 +229,25 @@ u64 buffer_bytes(u64 resource)
     return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc.Width : 0;
 }
 
+// Dump only bytes explicitly requested by a successful buffer Map.
+void dump_mapped_range(const Player& p, const Played& call, u64 mapped, u64 span)
+{
+    if (p.map_dump_dir.empty() || !call.top[1] || !mapped || FAILED(static_cast<HRESULT>(call.ret))) return;
+    u64 written;
+    if (!call.wrote(2, written)) return;
+    D3D12_RANGE range{};
+    std::memcpy(&range, reinterpret_cast<const void*>(call.top[1]), sizeof(range));
+    if (range.Begin >= range.End || range.End > span) return;
+    const std::wstring path = p.map_dump_dir + L"\\map_" + std::to_wstring(call.step->call.seq) + L".bin";
+    if (std::FILE* out = _wfopen(path.c_str(), L"wb")) {
+        const auto* data = reinterpret_cast<const unsigned char*>(written) + range.Begin;
+        const auto bytes = range.End - range.Begin;
+        const bool wrote = std::fwrite(data, 1, bytes, out) == bytes;
+        if (std::fclose(out) == 0 && wrote) return;
+    }
+    say("x2w-replay: could not write %ls", path.c_str());
+}
+
 // What one played call teaches: new objects, and the recorded -> replay value of returned addresses.
 void learn_after(Player& p, const Recording& r, const Played& call)
 {
@@ -269,6 +289,7 @@ void learn_after(Player& p, const Recording& r, const Played& call)
         u64 new_address = call.ret;
         if (map) std::memcpy(&new_address, reinterpret_cast<const void*>(call.top[2]), 8);
         const u64 span = buffer_bytes(call.self);
+        if (map) dump_mapped_range(p, call, new_address, span);
         if (old_address && new_address && span) {
             p.handles[old_address] = Range{new_address, span};
             ++(map ? p.mapped : p.gpu_addresses);
@@ -565,6 +586,8 @@ int run(const Options& o)
             "%zu title ranges reserved (%llu bytes)", r.version, r.size, r.steps.size(), r.shader_files.size(), shader_bytes,
             r.pages.size(), r.maps.size(), page_replay().spans.size(), reserved);
     }
+    wchar_t dump_maps[4]{};
+    const bool dump_map_ranges = GetEnvironmentVariableW(L"X2W_REPLAY_DUMP_MAP_RANGES", dump_maps, 4) == 1 && dump_maps[0] == L'1';
     phase = "applying settings";
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
@@ -584,6 +607,7 @@ int run(const Options& o)
     const std::string slot_layout_setting = std::string(x2w_replay_slots::setting) + "=1";
     for (const std::string& entry : r.settings)
         if (entry == slot_layout_setting) p.use_slot_layouts = true;
+    if (dump_map_ranges) p.map_dump_dir = o.out;
     unsigned char parameters[64]{};
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters, __uuidof(ID3D12Device), &p.device)) || !p.device) {
         say("x2w-replay: the stand-in made no device");
