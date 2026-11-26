@@ -137,7 +137,7 @@ ComPtr<IDXGIAdapter1> pick_adapter(IDXGIFactory4* factory, bool warp)
     return nullptr;
 }
 
-bool load_shims(bool cap)
+bool load_shims(bool cap, bool video, bool stagefail)
 {
     SetEnvironmentVariableA("X2W_XMEM_LAZY_COMMIT", "1");
     SetEnvironmentVariableA("X2W_XMEM_LAZY_STARTUP", "1");
@@ -146,6 +146,12 @@ bool load_shims(bool cap)
     SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1");
     SetEnvironmentVariableA("X2W_D3D12_RENDER", "1");
     SetEnvironmentVariableA("X2W_D3D12_CAP_EXISTING_HEAP", cap ? "1" : nullptr);
+    // A CPU-written texture of 1 MiB or more is filled from its own upload buffer. The ring-growth check below needs a
+    // 16 MiB upload to go through the shared ring, so it runs with the fixture switch that restores the ring; the "video"
+    // variant runs without it.
+    SetEnvironmentVariableA("X2W_TEST_ADDRESS_UPLOAD_RING", video ? nullptr : "1");
+    // The "stagefail" variant: the first upload of a multi-level texture fails while staging its second level.
+    SetEnvironmentVariableA("X2W_TEST_UPLOAD_STAGING_FAIL", stagefail ? "1" : nullptr);
 
     wchar_t exe_dir[MAX_PATH]{};
     const DWORD n = GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
@@ -170,7 +176,8 @@ bool load_shims(bool cap)
 bool verify_texture_box(ID3D12Device* device, ID3D12CommandQueue* own_queue, ID3D12CommandAllocator* own_alloc,
                         ID3D12GraphicsCommandList* own_list, ID3D12Fence* own_fence, UINT64& own_val,
                         ID3D12Resource* real_tex, UINT box_x, UINT box_y, UINT box_w, UINT box_h,
-                        UINT full_w, int seed, const char* label)
+                        UINT full_w, int seed, const char* label, UINT subresource = 0, UINT64 base_index = 0,
+                        bool expect_match = true)
 {
     const UINT pitch = (box_w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     const UINT64 rb_bytes = UINT64{pitch} * box_h;
@@ -192,7 +199,7 @@ bool verify_texture_box(ID3D12Device* device, ID3D12CommandQueue* own_queue, ID3
 
     D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, box_w, box_h, 1, pitch};
-    D3D12_TEXTURE_COPY_LOCATION src{real_tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    D3D12_TEXTURE_COPY_LOCATION src{real_tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {subresource}};
     D3D12_BOX box{box_x, box_y, 0, box_x + box_w, box_y + box_h, 1};
     own_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 
@@ -217,12 +224,20 @@ bool verify_texture_box(ID3D12Device* device, ID3D12CommandQueue* own_queue, ID3
     UINT mismatches = 0;
     for (UINT y = 0; y < box_h; ++y) {
         for (UINT x = 0; x < box_w * 4; ++x) {
-            const UINT64 src_idx = (UINT64{box_y + y} * full_w * 4) + (UINT64{box_x} * 4) + x;
+            const UINT64 src_idx = base_index + (UINT64{box_y + y} * full_w * 4) + (UINT64{box_x} * 4) + x;
             const std::uint8_t expected = pattern_byte(seed, src_idx);
             if (got[UINT64{y} * pitch + x] != expected) ++mismatches;
         }
     }
     rb->Unmap(0, nullptr);
+    if (!expect_match) {
+        // The texture must NOT hold the pattern (nine in ten bytes differ): the copy from an incomplete upload was refused.
+        if (UINT64{mismatches} * 10 < UINT64{box_w} * 4 * box_h * 9) {
+            std::printf("FAIL: %s holds the pattern of an upload that failed (mismatches=%u)\n", label, mismatches);
+            return false;
+        }
+        return true;
+    }
     if (mismatches) {
         std::printf("FAIL: %s readback mismatches=%u\n", label, mismatches);
         return false;
@@ -280,7 +295,7 @@ bool verify_buffer_pattern(ID3D12Device* device, ID3D12CommandQueue* own_queue, 
     return true;
 }
 
-int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool cap)
+int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool cap, bool video, bool stagefail)
 {
     const GUID& resource_iid = __uuidof(ID3D12Resource);
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing{};
@@ -667,6 +682,130 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
                        "slot 127 dst tex");
     };
 
+    if (stagefail) {
+        // Part 4 (stagefail variant): the first upload of a three-level texture fails while staging level 1 (the fixture fault
+        // X2W_TEST_UPLOAD_STAGING_FAIL). The copy that needed the upload must not run from the half-staged texture (the
+        // destination holds none of the pattern), and the next recording, with the fault gone, uploads every level.
+        constexpr UINT sw = 256, sh = 256, levels = 3;
+        auto td = tex2d_desc(sw, sh);
+        td.MipLevels = levels;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[levels]{};
+        UINT rows[levels]{};
+        UINT64 row_bytes[levels]{}, total = 0;
+        device->GetCopyableFootprints(&td, 0, levels, 0, footprints, rows, row_bytes, &total);
+        std::vector<std::uint8_t> backing(static_cast<std::size_t>(total));
+        for (UINT64 i = 0; i < backing.size(); ++i) backing[i] = pattern_byte(30, i);
+        ComPtr<IUnknown> src, dst;
+        if (!require(invoke(guest, 133, backing.data(), &td, D3D12_RESOURCE_STATE_COMMON, nullptr, &resource_iid,
+                            src.GetAddressOf()),
+                     "slot 133 multi-level tex") ||
+            !require(invoke(guest, 127, &default_heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+                            0u, nullptr, &resource_iid, dst.GetAddressOf()),
+                     "slot 127 multi-level dst"))
+            return 4;
+        const auto dst_real = desktop_object<ID3D12Resource>(guest, device, dst.Get());
+        const auto submit_and_wait = [&](const char* what) {
+            if (!require(invoke(list.Get(), 9), what)) return false;
+            IUnknown* submitted[] = {list.Get()};
+            invoke<void>(queue.Get(), 10, 1u, submitted);
+            if (!require(invoke(queue.Get(), 14, fence.Get(), ++guest_val), "stagefail queue signal")) return false;
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!ev) return false;
+            const bool done = SUCCEEDED(real_fence->SetEventOnCompletion(guest_val, ev)) &&
+                              WaitForSingleObject(ev, wait_ms) == WAIT_OBJECT_0;
+            CloseHandle(ev);
+            return check(done, "stagefail queue wait");
+        };
+        // Attempt 1: the upload fails at level 1.
+        invoke<void>(list.Get(), 17, dst.Get(), src.Get());
+        if (!submit_and_wait("stagefail list close 1")) return 4;
+        if (!verify_texture_box(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val, dst_real.Get(),
+                                0, 0, 64, 64, sw, 30, "level 0 after the failed upload", 0, footprints[0].Offset, false))
+            return 5;
+        // Attempt 2: the fault is gone; every level is uploaded and copied.
+        ComPtr<IUnknown> second_allocator;
+        if (!require(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, &__uuidof(ID3D12CommandAllocator),
+                            second_allocator.GetAddressOf()),
+                     "stagefail allocator") ||
+            !require(invoke(list.Get(), 139, second_allocator.Get(), nullptr), "stagefail list reset"))
+            return 4;
+        invoke<void>(list.Get(), 17, dst.Get(), src.Get());
+        if (!submit_and_wait("stagefail list close 2")) return 4;
+        for (UINT level = 0; level < levels; ++level) {
+            const UINT w = sw >> level;
+            char label[64];
+            std::snprintf(label, sizeof(label), "level %u after the retry", level);
+            if (!verify_texture_box(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val,
+                                    dst_real.Get(), 0, 0, 64 > w ? w : 64, 64 > w ? w : 64, w, 30, label, level,
+                                    footprints[level].Offset))
+                return 5;
+        }
+        const UINT64 errors = debug ? debug->GetNumStoredMessages() : 0;
+        std::printf("staging failure: no copy from the half-staged texture, retry uploads all %u levels; debug_errors_or_warnings=%llu\n",
+                    levels, errors);
+        if (errors || FAILED(device->GetDeviceRemovedReason())) return 4;
+        std::puts("PASS");
+        return 0;
+    }
+
+    if (video) {
+        // Part 3 (video variant): forty video-sized CPU-written textures (1920x1080 RGBA8 = 8.3 MB, the bytes of a 3840x2160
+        // R8 plane), each copied to the desktop, submitted and read back. Every upload gets its own upload buffer: the first
+        // one shows one buffer of about the texture's size (the shared ring would show a 16 MiB chunk), and every texture
+        // reads back its own pattern at both corners.
+        constexpr UINT video_w = 1920, video_h = 1080;
+        constexpr int video_count = 40;
+        for (int i = 0; i < video_count; ++i) {
+            std::vector<std::uint8_t> backing;
+            ComPtr<IUnknown> src, dst, video_allocator;
+            if (!make_slot133_tex(video_w, video_h, 20 + i, backing, src, dst)) return 4;
+            // The first texture records into the list as created; later ones start a new recording with a fresh allocator.
+            if (i > 0 &&
+                (!require(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, &__uuidof(ID3D12CommandAllocator),
+                                 video_allocator.GetAddressOf()),
+                          "video allocator") ||
+                 !require(invoke(list.Get(), 139, video_allocator.Get(), nullptr), "video list reset")))
+                return 4;
+            invoke<void>(list.Get(), 17, dst.Get(), src.Get());
+            if (i == 0) {
+                Snapshot after_first{};
+                if (!snap(after_first)) return 4;
+                if (!check(after_first.live[upload].objects == 1 && after_first.live[upload].bytes >= UINT64{video_w} * video_h * 4 &&
+                               after_first.live[upload].bytes < 16 * mib,
+                           "a video-sized upload owns one buffer of about its size (not a 16 MiB ring chunk)")) {
+                    std::printf("  got upload=%llu/%llu\n", after_first.live[upload].bytes, after_first.live[upload].objects);
+                    return 5;
+                }
+            }
+            if (!require(invoke(list.Get(), 9), "video list close")) return 4;
+            IUnknown* video_lists[] = {list.Get()};
+            invoke<void>(queue.Get(), 10, 1u, video_lists);
+            if (!require(invoke(queue.Get(), 14, fence.Get(), ++guest_val), "video queue signal")) return 4;
+            HANDLE video_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!video_ev) return 4;
+            const bool video_done = SUCCEEDED(real_fence->SetEventOnCompletion(guest_val, video_ev)) &&
+                                    WaitForSingleObject(video_ev, wait_ms) == WAIT_OBJECT_0;
+            CloseHandle(video_ev);
+            if (!check(video_done, "video queue wait")) return 4;
+            const auto dst_real = desktop_object<ID3D12Resource>(guest, device, dst.Get());
+            char label[64];
+            std::snprintf(label, sizeof(label), "video texture %d top-left", i);
+            if (!verify_texture_box(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val,
+                                    dst_real.Get(), 0, 0, 64, 64, video_w, 20 + i, label))
+                return 5;
+            std::snprintf(label, sizeof(label), "video texture %d bottom-right", i);
+            if (!verify_texture_box(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val,
+                                    dst_real.Get(), video_w - 64, video_h - 64, 64, 64, video_w, 20 + i, label))
+                return 5;
+        }
+        const UINT64 video_errors = debug ? debug->GetNumStoredMessages() : 0;
+        std::printf("video uploads: %d textures of %ux%u read back exact; debug_errors_or_warnings=%llu\n", video_count, video_w,
+                    video_h, video_errors);
+        if (video_errors || FAILED(device->GetDeviceRemovedReason())) return 4;
+        std::puts("PASS");
+        return 0;
+    }
+
     std::vector<std::uint8_t> small_mem, small2_mem, big_mem, small3_mem;
     ComPtr<IUnknown> small_src, small_dst, small2_src, small2_dst, big_src, big_dst, small3_src, small3_dst;
     if (!make_slot133_tex(64, 64, 1, small_mem, small_src, small_dst) ||
@@ -765,13 +904,15 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
 int main(int argc, char** argv)
 {
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
-        (argc == 3 && std::strcmp(argv[2], "cap"))) {
-        std::puts("usage: startup_slot133_heap_cap_check <warp|hardware> [cap]");
+        (argc == 3 && std::strcmp(argv[2], "cap") && std::strcmp(argv[2], "video") && std::strcmp(argv[2], "stagefail"))) {
+        std::puts("usage: startup_slot133_heap_cap_check <warp|hardware> [cap|video|stagefail]");
         return 2;
     }
     const bool warp = std::strcmp(argv[1], "warp") == 0;
+    const bool video = argc == 3 && std::strcmp(argv[2], "video") == 0;
+    const bool stagefail = argc == 3 && std::strcmp(argv[2], "stagefail") == 0;
     const bool cap = argc == 3;
-    if (!load_shims(cap)) return 3;
+    if (!load_shims(cap, video, stagefail)) return 3;
 
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -814,5 +955,5 @@ int main(int argc, char** argv)
     std::printf("adapter=%ls driver=%llu.%llu.%llu.%llu debug_layer=%s\n", desc.Description,
                 driver >> 48, (driver >> 32) & 0xffff, (driver >> 16) & 0xffff, driver & 0xffff,
                 debug ? "enabled" : "off");
-    return run_check(guest.Get(), device.Get(), debug.Get(), cap);
+    return run_check(guest.Get(), device.Get(), debug.Get(), cap, video, stagefail);
 }

@@ -161,8 +161,10 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     };
     if (side_src.kind == x2w_list_copy_texture::Kind::subresource && needs_upload(src_wrapper)) {
         AcquireSRWLockExclusive(&draw_lock);
-        upload_texture(self, src_wrapper, real_src);
+        const bool uploaded = upload_texture(self, src_wrapper, real_src);
         ReleaseSRWLockExclusive(&draw_lock);
+        // A source whose upload could not be staged holds no (or half the) pixels: do not copy it; the next recording retries.
+        if (!uploaded) return refuse("source_not_uploaded");
     }
     if (side_dst.kind == x2w_list_copy_texture::Kind::subresource && needs_upload(dst_wrapper)) {
         AcquireSRWLockExclusive(&draw_lock);

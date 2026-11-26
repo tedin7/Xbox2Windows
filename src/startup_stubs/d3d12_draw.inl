@@ -1158,6 +1158,11 @@ std::vector<SubmittedAddressUploads> submitted_address_uploads;
 
 // X2W_TEST_ADDRESS_UPLOAD_RING=1 (fixtures only): fill by-address textures from the shared upload ring,
 // without the buffers above. The control of startup_address_console_gate runs with it.
+// A CPU-written texture of at least this many bytes (a video plane) is filled from its own upload buffer, like the
+// console-layout textures above, so a burst of large uploads cannot fill the bounded shared ring and starve every
+// later draw, index copy and compute input of it.
+constexpr u64 own_upload_buffer_bytes = 1u << 20;
+
 bool address_uploads_from_ring()
 {
     static const bool on = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0) != 0;
@@ -1397,6 +1402,16 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     return h;
 }
 bool list_wrote(Wrapper* list, ID3D12Resource* resource);  // list_copy.inl
+// X2W_TEST_UPLOAD_STAGING_FAIL=<n> (fixtures only): the first n uploads of a plain texture with more than one level fail while
+// staging its second level, as a full upload ring would. The upload must then report "not uploaded" and succeed when retried.
+bool upload_staging_fault()
+{
+    static LONG remaining = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_TEST_UPLOAD_STAGING_FAIL", value, sizeof(value)) ? std::atol(value) : 0L;
+    }();
+    return remaining > 0 && InterlockedDecrement(&remaining) >= 0;
+}
 bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
@@ -1532,9 +1547,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
-    if (dedicated) {
+    // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
+    const bool own_buffer = !console && !tiled && !is_compact && !address_uploads_from_ring() && total >= own_upload_buffer_bytes;
+    if (dedicated || own_buffer) {
         u64 bytes = 0;
-        for (UINT i = 0; i < mips; ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        for (UINT i = 0; i < (console ? mips : plan.count); ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
@@ -1543,7 +1560,8 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         } catch (const std::bad_alloc&) {
             return false;
         }
-        std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+        // Console layouts detile into a zeroed buffer; a plain upload overwrites every byte it names.
+        if (dedicated) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1582,7 +1600,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
                 if (!rows || !chunk) {
                     state.done = false;
-                    return true;
+                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
@@ -1596,7 +1614,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
         if (!rows || !chunk) {
             state.done = false;
-            return true;
+            return false;  // staging failed: not uploaded, so report it and retry at the next bind
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
@@ -1608,22 +1626,40 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
                 ID3D12Resource* chunk = nullptr;
+                if (i == 1 && upload_staging_fault()) {
+                    state.done = false;
+                    return false;  // fixture fault: a level could not be staged
+                }
                 if (is_compact) {
                     auto* const rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
                     if (!rows || !chunk) {
                         state.done = false;
-                        return true;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
                     }
                     const auto& level = compact.level[i];
                     for (u64 y = 0; y < level.rows; ++y)
                         std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
                                     static_cast<std::size_t>(level.row_bytes));
+                } else if (owned.cpu) {
+                    // Own buffer: copy the level's rows from the title's memory and name that buffer in the upload.
+                    if (readable_window(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes)) < bytes) {
+                        state.done = false;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                    }
+                    offset = owned.cursor;
+                    std::memcpy(owned.cpu + offset, memory + stride * s + fp.Offset, static_cast<std::size_t>(bytes));
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                    chunk = owned.resource.Get();
                 } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
                     state.done = false;
-                    return true;
+                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
                 }
                 plan.upload(list, texture, chunk, mips, slices, s, i, offset);
             }
+        if (owned.cpu) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     }
     state.hash = hash;
     state.generation = generation;
@@ -2372,8 +2408,12 @@ static const char* const not_drawn_names[] = {
     "formatted_buffer_too_large",
     "formatted_buffer_unresolved",
     "indexed_validation_failed",
+    "buffer_copy_failed",
+    "index_data_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
+constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
+constexpr int index_data_unavailable_site = not_drawn_sites - 1;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -2853,7 +2893,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
             ID3D12Resource* chunk = nullptr;
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            const bool readable_range = readable_window(address, bytes) >= bytes;
+            auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            if (readable_range && !target) {
+                // The guest memory is there; only the copy failed. A null binding would read zeros as if the title had bound nothing.
+                static LONG copy_refused;
+                if (first_calls(copy_refused, 6))
+                    log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+                count_null_binding(x2w_local::NullCause::ring_full);
+                ReleaseSRWLockExclusive(&draw_lock);
+                return not_drawn(buffer_copy_failed_site);
+            }
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
@@ -2868,7 +2918,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         ID3D12Resource* chunk = nullptr;
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &offset, &chunk);
+        const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+        bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
@@ -2880,6 +2931,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
             ReleaseSRWLockExclusive(&draw_lock);
             return not_drawn(13);
+        }
+        if (readable_range && !have) {
+            // The guest memory is readable and only the frame copy failed (upload ring full): refuse the draw instead of
+            // binding null, which would read zeros as if the title had bound nothing.
+            static LONG copy_refused;
+            if (first_calls(copy_refused, 6))
+                log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+            count_null_binding(x2w_local::NullCause::ring_full);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return not_drawn(buffer_copy_failed_site);
         }
         if (!have && identity_for_null) {
             static float identity[64];
@@ -2987,6 +3048,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        }
+        if (!view.BufferLocation) {
+            // Index data unreadable, or the index copy failed (upload ring full): count it with its own cause.
+            static LONG index_refused;
+            if (first_calls(index_refused, 6))
+                log("x2w-draw %016llx: index data unavailable (readable %d, %zu bytes), draw skipped", tr->key, indices_ok ? 1 : 0, index_total);
+            not_drawn(index_data_unavailable_site);
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);

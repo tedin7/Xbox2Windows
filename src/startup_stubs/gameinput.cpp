@@ -344,6 +344,22 @@ GamepadState sample()
         double end = -1;
         const x2w_input_script::Output out = timeline ? play_timeline(script, t, end) : x2w_input_script::play(script, t);
         s.buttons |= out.buttons;
+        // One line per button entry the first time a poll sees it due (fixed-time scripts; entries in script order): the entry,
+        // its mask, its time and how late the first poll came, so a run shows which presses the title could have seen and how
+        // often it polls. Waits shift later entries in a timeline script, so those are not logged here.
+        if (!timeline) {
+            static volatile LONG next_logged;
+            for (;;) {
+                const LONG index = next_logged;
+                if (index < 0 || static_cast<std::size_t>(index) >= script.entries.size()) break;
+                const x2w_input_script::Entry& due = script.entries[static_cast<std::size_t>(index)];
+                if (due.at > t) break;
+                if (InterlockedCompareExchange(&next_logged, index + 1, index) != index) continue;
+                if (due.axis < 0)
+                    x2w_local::logf("x2w-input script press item %ld mask 0x%x due at %.3f s for %.2f s, first poll at %.3f s (%.3f s late)",
+                                    index + 1, static_cast<unsigned>(due.mask), due.at, due.duration, t, t - due.at);
+            }
+        }
         float* const axes[x2w_input_script::axis_count] = {&s.left_trigger, &s.right_trigger, &s.left_x, &s.left_y, &s.right_x, &s.right_y};
         for (int i = 0; i < x2w_input_script::axis_count; ++i)
             if (out.active[i] && std::fabs(out.axes[i]) > std::fabs(*axes[i])) *axes[i] = out.axes[i];
