@@ -20,7 +20,7 @@ def prepare_draw_cache(directory, consumer, hlsl, modes, binding, *, vertex_hlsl
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    manifest, = cache.glob("*.txt")
+    manifest, = (path for path in cache.glob("*.txt") if path.name != "revision.txt")
     with manifest.open("a", encoding="ascii") as file:
         file.write(f"\n{binding}\n")
     source = manifest.with_suffix(".ps.hlsl")
