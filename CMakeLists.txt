@@ -1417,15 +1417,20 @@ target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_upload_page_reuse_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1")
     add_test(NAME startup_upload_page_reuse_untracked_${backend} COMMAND startup_upload_page_reuse ${backend} untracked)
     set_tests_properties(startup_upload_page_reuse_untracked_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+    # The default since Run P: no reuse (X2W_UPLOAD_PAGE_REUSE unset), the pages grow as in Run O (exit 12).
+    add_test(NAME startup_upload_page_reuse_default_off_${backend} COMMAND startup_upload_page_reuse ${backend})
+    set_tests_properties(startup_upload_page_reuse_default_off_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "1 growing: "
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
     # Control: without the reuse the pages grow (exit 12).
     add_test(NAME startup_upload_page_reuse_mutant_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_mutant_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "1 growing: "
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
 endforeach()
 
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)

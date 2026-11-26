@@ -2,7 +2,8 @@
 // list again and again on an allocator it rarely resets keeps a flat number of pages.
 //
 //   startup_upload_page_reuse <warp|hardware> [untracked]
-//       (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_RENDER=1)
+//       (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_RENDER=1 X2W_UPLOAD_PAGE_REUSE=1; without the last one
+//        the pages are not reused and step 1 fails with exit 12, the default since Run P)
 //
 // Through D3D12XboxCreateDevice one console list on one allocator, never reset, runs 10,000 cycles: Reset the list on
 // the allocator, take 0x280 bytes of upload memory through list slot 148 (the builder's request), write them, Close,
