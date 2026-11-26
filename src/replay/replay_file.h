@@ -50,6 +50,11 @@ struct Blob {
     u64 bytes;
 };
 
+struct ShaderFile {
+    std::string name;  // a file name directly in the recorded run's shader cache
+    Blob content;
+};
+
 struct Recording {
     HANDLE file = INVALID_HANDLE_VALUE, mapping = nullptr;
     const unsigned char* base = nullptr;
@@ -58,7 +63,8 @@ struct Recording {
     u64 frequency = 0;
     std::vector<Step> steps;  // sorted by seq
     std::unordered_map<u64, Blob> blobs;
-    std::vector<std::string> settings;  // XENV: the recorded process's X2W_ settings, "name=value"
+    std::vector<std::string> settings;
+    std::vector<ShaderFile> shader_files;  // SHDR  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
 
@@ -142,6 +148,8 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
                 if (length) out.settings.emplace_back(text + i, static_cast<std::size_t>(length));
                 i += length + 1;
             }
+        } else if (name == "SHDR" && header_bytes) {
+            out.shader_files.push_back({std::string(reinterpret_cast<const char*>(h), header_bytes), Blob{out.base + data_at, data_bytes}});
         } else if (name == "PRES") {
             ++out.presents_marked;
         } else if (name == "XEND" && header_bytes >= 8) {

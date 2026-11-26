@@ -1897,6 +1897,8 @@ File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version
 `CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
 `OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
 `XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
+Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
+and anything past 512 MiB in total are left out and counted in the log).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 7.
@@ -1910,7 +1912,8 @@ GPU round trip per present. A recorded run and its replay write the same names.
 
 `x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a
 device through the stand-in (loaded late, after it has set every recorded `XENV` setting this process does not set
-itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache) and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
+itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache), writes the recording's
+`SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
 (the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
 `replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
 recording, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are

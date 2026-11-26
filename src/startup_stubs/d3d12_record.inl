@@ -256,6 +256,52 @@ void flush_all(bool at_exit)
     }
 }
 
+// SHDR chunks: every file directly in X2W_SHADER_CACHE (requests and translations), header = its name (UTF-8), data =
+// its bytes, so a replay on another machine has the translations this run had. Files over 16 MiB, and the files after
+// 512 MiB in total, are left out (counted in the log). file_lock held.
+void write_shader_cache(bool at_exit)
+{
+    wchar_t dir[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!n || n >= MAX_PATH - 4) return;
+    wchar_t pattern[MAX_PATH];
+    swprintf(pattern, MAX_PATH, L"%s\\*", dir);
+    WIN32_FIND_DATAW found;
+    const HANDLE find = FindFirstFileW(pattern, &found);
+    if (find == INVALID_HANDLE_VALUE) return;
+    constexpr u64 file_max = 16ull << 20, total_max = 512ull << 20;
+    u64 files = 0, total = 0, left_out = 0;
+    std::vector<unsigned char> chunk;
+    do {
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const u64 size = (static_cast<u64>(found.nFileSizeHigh) << 32) | found.nFileSizeLow;
+        if (size > file_max || total + size > total_max) {
+            ++left_out;
+            continue;
+        }
+        wchar_t path[MAX_PATH];
+        swprintf(path, MAX_PATH, L"%s\\%s", dir, found.cFileName);
+        const HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+        DWORD got = 0;
+        const bool read = !size || (ReadFile(f, bytes.data(), static_cast<DWORD>(size), &got, nullptr) && got == size);
+        CloseHandle(f);
+        char name[MAX_PATH * 3];
+        const int name_bytes = WideCharToMultiByte(CP_UTF8, 0, found.cFileName, -1, name, sizeof(name), nullptr, nullptr) - 1;
+        if (!read || name_bytes <= 0) continue;
+        chunk.clear();
+        append_chunk(chunk, "SHDR", name, static_cast<std::size_t>(name_bytes), bytes.data(), size);
+        write_raw(chunk.data(), chunk.size());
+        ++files;
+        total += size;
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    if (!at_exit)
+        log("x2w-replay record: shader cache %llu files, %llu bytes, %llu left out", files, total, left_out);
+}
+
 // Ends the recording: every buffer is written, then the end chunk with the totals. Called once.
 void stop(bool at_exit)
 {
@@ -264,6 +310,7 @@ void stop(bool at_exit)
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
+    write_shader_cache(at_exit);
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);

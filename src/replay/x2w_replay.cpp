@@ -358,6 +358,38 @@ void apply_settings(const std::vector<std::string>& settings)
     say("x2w-replay: %d recorded settings applied, %d already set here", applied, kept);
 }
 
+// Writes the recording's shader cache files (SHDR) that the cache in use does not hold yet. A name with a path
+// separator is refused.
+void seed_shader_cache(const Recording& r)
+{
+    wchar_t dir[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    CreateDirectoryW(dir, nullptr);
+    int written = 0, present = 0, refused = 0;
+    for (const ShaderFile& file : r.shader_files) {
+        wchar_t name[MAX_PATH];
+        const int length = MultiByteToWideChar(CP_UTF8, 0, file.name.data(), static_cast<int>(file.name.size()), name, MAX_PATH - 1);
+        if (length <= 0 || file.name.find_first_of("\\/:") != std::string::npos || file.name == "..") {
+            ++refused;
+            continue;
+        }
+        name[length] = 0;
+        const std::wstring path = std::wstring(dir) + L"\\" + name;
+        const HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            ++present;
+            continue;
+        }
+        DWORD done = 0;
+        const bool ok = WriteFile(f, file.content.data, static_cast<DWORD>(file.content.bytes), &done, nullptr) && done == file.content.bytes;
+        CloseHandle(f);
+        if (ok) ++written;
+        else DeleteFileW(path.c_str());
+    }
+    say("x2w-replay: shader cache %ls: %d files from the recording, %d already there, %d refused", dir, written, present, refused);
+}
+
 int run(const Options& o)
 {
     CreateDirectoryW(o.out.c_str(), nullptr);
@@ -378,6 +410,7 @@ int run(const Options& o)
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
+    seed_shader_cache(r);
     say("x2w-replay: %zu calls, %zu blobs, %llu presents marked, %s", r.steps.size(), r.blobs.size(), r.presents_marked,
         r.ended ? "ended" : "no end chunk (the recorded process stopped early)");
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
