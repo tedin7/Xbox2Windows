@@ -24,7 +24,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
     alignas(256) static float small_constants[64] = {1.0f, 0.0f, 0.0f, 1.0f};
-    alignas(65536) static float big_constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
+    alignas(256) static float big_constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
     if (big)
         for (int i = 4; i < 16384; ++i) big_constants[i] = 0.5f;
     float* const constants = big ? big_constants : small_constants;
