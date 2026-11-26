@@ -181,7 +181,6 @@ void submit(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
     if (!replay_dump_enabled() || (replay_record::armed && !replay_record::window_open)) return;
     static u64 ordinal = 0;
-    const u64 number = ++ordinal;
     std::map<u64, Target> targets;
     for (auto* list : lists)
         if (const auto* writes = list->own().replay_writes)
@@ -190,6 +189,9 @@ void submit(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
                 if (!inserted && target.view_format != DXGI_FORMAT_UNKNOWN) it->second.view_format = target.view_format;
             }
     if (targets.empty()) return;
+    // Only a submit that wrote a target is numbered, so a record and its replay agree even where one holds more
+    // target-less submits (copies, uploads) than the other.
+    const u64 number = ++ordinal;
 
     auto batch = std::make_unique<Batch>();
     batch->number = number;
