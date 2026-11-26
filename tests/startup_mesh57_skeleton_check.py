@@ -1113,7 +1113,7 @@ def draw(dxc, renderer, adapter, publisher=None):
             # The nested if: threads below 3 run the body (v7 = 1.0), threads 3..5 of the same block keep v7 = 0.
             nested_green = lambda tid: 255 if tid < 3 else 0
             status = draw_wave_load(tmp, renderer, adapter, NEST_EXECZ_MESH, 'nested if block', dxc, green=nested_green,
-                                    wave_mutants=False,
+                                    rule=lambda value: 64, wave_mutants=False,   # s40 keeps its old red in every wave
                                     nest_mutant=('exec = (exec & vcc) & 1;', 'exec = exec & 1;', lambda tid: 255 if tid < 6 else 0))
             if status:
                 return status
