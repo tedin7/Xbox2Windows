@@ -140,14 +140,14 @@ int main(int argc, char** argv)
         const Cache::Ticket before_build = cache.begin(0x1000);
         cache.note_resource_change(0x1000);  // released during the build
         cache.publish(1, 0x1000, Kind::srv, 0, mutated("ticket") ? cache.begin(0x1000) : before_build);
-        expect_stale("an entry built across a release misses", "ticket", cache.lookup(1, 0x1000, Kind::srv));
+        check("an entry built across a release misses", !cache.lookup(1, 0x1000, Kind::srv));  // the mutant stamps at publish time: it hits
         const Cache::Ticket again = cache.begin(0x1000);
         cache.publish(1, 0x1000, Kind::srv, 0, again);
         check("an entry built after the release hits", cache.lookup(1, 0x1000, Kind::srv));
         const Cache::Ticket flush_ticket = cache.begin(0x2000);
         cache.note_flush();  // heap destroyed during the build
         cache.publish(2, 0x2000, Kind::srv, 0, mutated("ticket") ? cache.begin(0x2000) : flush_ticket);
-        expect_stale("an entry built across a flush misses", "ticket", cache.lookup(2, 0x2000, Kind::srv));
+        check("an entry built across a flush misses", !cache.lookup(2, 0x2000, Kind::srv));
     }
     if (failures) return 1;
     std::puts("view cache checks passed");
