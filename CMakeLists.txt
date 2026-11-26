@@ -1439,6 +1439,16 @@ foreach(mutant IN ITEMS ignore-in-flight ignore-unsafe no-pin early-complete)
     set_tests_properties(startup_texture_residency_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
 endforeach()
 
+# Readback after Evict / MakeResident (the calls of src/startup_stubs/d3d12_residency.inl): contents must survive; the control compares a changed reference.
+add_executable(startup_texture_residency_warp tests/startup_texture_residency_warp.cpp)
+target_compile_features(startup_texture_residency_warp PRIVATE cxx_std_17)
+target_link_libraries(startup_texture_residency_warp PRIVATE d3d12 dxgi)
+add_test(NAME startup_texture_residency_warp COMMAND startup_texture_residency_warp warp)
+add_test(NAME startup_texture_residency_warp_control COMMAND startup_texture_residency_warp warp wrong-reference)
+add_test(NAME startup_texture_residency_hardware COMMAND startup_texture_residency_warp hardware)
+set_tests_properties(startup_texture_residency_warp startup_texture_residency_warp_control startup_texture_residency_hardware PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+set_tests_properties(startup_texture_residency_warp_control PROPERTIES WILL_FAIL TRUE)
+
 # X2W_D3D12_RELEASE_RETIRED=1 frees the desktop object of a committed 2D texture only when no recorded list, no submission
 # and no release-time fence still refers to it (docs/startup-runtime.md#d3d12-resource-budget). The `off` case runs
 # without the switch and expects the lifetime of the budget fixture: every released resource stays retained.
