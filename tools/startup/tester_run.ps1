@@ -279,7 +279,9 @@ $preRunRetry = "pre-run retry skipped: no refusal in the cache"
 if ($anyFailure) { try {
     $runsRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
     $retryArgs = @("--retry-lifted", $cache, "180", "--jobs", "$backgroundJobs")
-    if ($env:X2W_PRE_RUN_FAMILY_RETRY -eq "1") {
+    # On unless X2W_PRE_RUN_FAMILY_RETRY=0 (the translator child processes inherit it).
+    if ($env:X2W_PRE_RUN_FAMILY_RETRY -ne "0") {
+        $env:X2W_PRE_RUN_FAMILY_RETRY = "1"
         $retryArgs += @("--weights", $runsRoot)
     } else {
         $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |

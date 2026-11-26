@@ -434,9 +434,8 @@ def check_shell(shell):
         # the earlier runs left their stderr.txt: the newest ranks the retry by draws/dispatches
         retry_args = (tree.parent / "retry_args.txt").read_text().splitlines()
         assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
-        weights_file = Path(retry_args[4])
-        assert weights_file.name == "stderr.txt" and weights_file.parent.name.startswith("run_") and weights_file.is_file(), \
-            retry_args
+        # on by default: the runs folder, so the retry reads the newest run that has census lines
+        assert Path(retry_args[4]) == tree / "out" / "tester", retry_args
         assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
