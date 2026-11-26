@@ -484,12 +484,20 @@ REQUESTS_COMPUTE_SHARE = 25  # of REQUESTS_TOP: compute keys are ranked by dispa
                              # so one shared ranking would never pick a graphics key; each family gets its own ranking, slack goes over
 
 
-def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE):
+REQUESTS_FAMILIES = 4      # the refusal families with the most refused keys ...
+REQUESTS_FAMILY_KEYS = 20  # ... each get their top 20 keys by uses first (on top of `top`; the byte cap still holds)
+
+
+def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE,
+                    uses=None, families=REQUESTS_FAMILIES, family_keys=REQUESTS_FAMILY_KEYS):
     """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys: compute keys ranked by dispatches
     without a translation, the other kinds by draws not drawn, `compute_share` of `top` for compute and the rest for the others
     (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
     .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
-    without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing."""
+    without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing.
+    `uses` ({key: (first s, last s, uses)}, key_use) adds a first pass per refusal family: the `families` refusal reasons
+    (normal_reason, registers and numbers ignored) with the most refused keys each contribute their `family_keys` keys with the most
+    uses, whatever their draw/dispatch weight, so "all keys of this wall" come back (c20 wanted the top 20 'branch out of the block')."""
     names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
     # An RTV variant (req_<variant>.rtv, text "rtv1 <base key in decimal> <formats>") has no code of its own: its draws count on its
     # base key, and the variant's request file travels with the base's files (Run R: be7c1a1a / ca7cec3b were never picked because
@@ -510,6 +518,33 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     groups = [[r for r in ranked if r[1] == "compute"], [r for r in ranked if r[1] != "compute"]]
     quota = [min(compute_share, top), top - min(compute_share, top)]
     taken, chosen, used = [0, 0], {}, 0
+    family_of = {}
+
+    def take(key, kind, weight):
+        nonlocal used
+        own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
+        files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
+        size = sum(b for _, b in files)
+        if not files or used + size > cap:
+            return False
+        used += size
+        have = {os.path.splitext(n)[1] for n, _ in files}
+        chosen[key] = (key, kind, weight, files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
+        return True
+
+    if uses:
+        count = {}
+        for key, kind, status, reason in rows:
+            if status == "refused":
+                family_of[key] = normal_reason(reason)
+                count[family_of[key]] = count.get(family_of[key], 0) + 1
+        for family in sorted(count, key=lambda f: (-count[f], f))[:families]:
+            members = sorted((r for r in rows if r[2] == "refused" and family_of.get(r[0]) == family and r[0] in uses),
+                             key=lambda r: (-uses[r[0]][2], r[0]))
+            for key, kind, _, _ in members[:family_keys]:
+                if key not in chosen:
+                    take(key, kind, weights.get(key, 0) or uses[key][2])
+    top += len(chosen)
     # first pass: each family up to its quota; second pass: what is left of `top` goes to whichever family still has keys
     for round_quota in (quota, [top, top]):
         for gi, group in enumerate(groups):
@@ -518,16 +553,61 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
                     continue
                 if taken[gi] >= round_quota[gi] or len(chosen) >= top:
                     break
-                own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
-                files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
-                size = sum(b for _, b in files)
-                if not files or used + size > cap:
-                    continue
-                have = {os.path.splitext(n)[1] for n, _ in files}
-                used += size
-                taken[gi] += 1
-                chosen[key] = (key, kind, weights[key], files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
+                if take(key, kind, weights[key]):
+                    taken[gi] += 1
     return sorted(chosen.values(), key=lambda c: (-c[2] if c[1] == "compute" else 0, -c[2], c[0]))
+
+
+PHASES_NAME = "phases.txt"
+MOVIE_AFTER_S = 250      # Run O's credits movie showed at 384 and 446 s; before this the loading art and intros are on screen
+MOVIE_MIN_MEAN = 20.0    # a picture with at least this mean level is content, not black
+PHASE_WINDOW_S = 30
+HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
+PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
+
+
+def movie_note(timeline_text, after=MOVIE_AFTER_S):
+    """One line for the end of phases.txt: did OUR window captures show content (mean >= 20) after 250 s, when the credits movie
+    plays in the tester's own captures? Says how many pictures, when, and that a movie shorter than the capture interval can be
+    missed, so 'not seen' means 'not in our pictures', not 'did not play'."""
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    late = [(t, m) for t, m in pictures if t > after]
+    if not late:
+        return "# credits movie: no window pictures after %d s, cannot tell" % after
+    gaps = [b[0] - a[0] for a, b in zip(late, late[1:])]
+    step = "%.0f s" % (sum(gaps) / len(gaps)) if gaps else "one picture"
+    seen = [(t, m) for t, m in late if m >= MOVIE_MIN_MEAN]
+    if seen:
+        return "# credits movie: content in %d of %d of OUR pictures after %d s (%s); capture interval %s" % (
+            len(seen), len(late), after, ", ".join("%.0f s mean %.0f" % tm for tm in seen[:8]), step)
+    return ("# credits movie: NOT seen in our %d pictures after %d s (all mean < %d); capture interval %s, a movie shorter than that can be "
+            "missed: compare with the tester's own captures" % (len(late), after, MOVIE_MIN_MEAN, step))
+
+
+def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
+    """One row per `window` seconds: frames presented and fps in that window (from the cumulative 'heartbeat' lines of the
+    stand-in) and the mean level of the last window picture inside it, so the phases of a run read in one place instead of
+    being rebuilt from stderr by hand. Windows without a heartbeat show '-'."""
+    beats = sorted({(float(t), int(f)) for f, t in HEARTBEAT_RE.findall(stderr_text)})
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    end = max([t for t, _ in beats] + [t for t, _ in pictures] + [0])
+    lines = ["# run phases per %d s: presents, fps, picture mean (0 = black, 255 = white); from stderr.txt heartbeats and timeline.txt" % window,
+             "# from_s  to_s  presents  fps  picture_mean"]
+    frames_at = lambda t: max([f for bt, f in beats if bt <= t] + [0])
+    start = 0
+    while start < end:
+        stop = start + window
+        inside = [m for t, m in pictures if start < t <= stop]
+        have = [bt for bt, _ in beats if bt <= stop]
+        if have and any(bt > start for bt in have):
+            presents = frames_at(stop) - frames_at(start)
+            fps = "%.1f" % (presents / float(window))
+        else:
+            presents, fps = "-", "-"
+        lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
+        start = stop
+    lines.append(movie_note(timeline_text))
+    return "\n".join(lines) + "\n"
 
 
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
@@ -750,7 +830,7 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         if os.path.isfile(stderr_path):
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
                 weights = key_weights(handle.read())
-        chosen = select_requests(cache_dir, rows, weights)
+        chosen = select_requests(cache_dir, rows, weights, uses=key_use(logdir))
         for key, kind, weight, files_of_key, _missing in chosen:
             for name, _ in files_of_key:
                 with open(os.path.join(cache_dir, name), "rb") as handle:
@@ -758,6 +838,14 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
                                      "bytes": sum(b for c in chosen for _, b in c[3]),
                                      "ranked": [{"key": k, "kind": kd, "weight": w, "missing_code_files": m} for k, kd, w, _, m in chosen]}
+    texts = {}
+    for name in ("stderr.txt", "timeline.txt"):
+        path = os.path.join(logdir, name)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                texts[name] = handle.read()
+    if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
+        add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
     files = log_files(logdir)
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:
@@ -775,6 +863,110 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
             if index == 1:
                 body = dict(manifest, files=listing, parts=count)
                 z.writestr("manifest.json", json.dumps(body, indent=2, sort_keys=True))
+        parts.append((path, os.path.getsize(path)))
+    return parts
+
+
+RECORD_DEFAULT_SPEC = "slow"         # `-Record auto` = the runtime trigger (c25): a 10 s window opening at the first present after 120 s with a >= 500 ms gap, fallback at 180 s.
+                                     # The tester's clock runs ~200 s later than ours, so a trigger on the slowdown beats a fixed time
+RECORD_DEFAULT_MAX_MIB = 400         # ... capped at 400 MiB so the upload stays small (c25 may change both here, one place)
+RECORD_EXPLICIT_MAX_MIB = 2048       # an explicit -Record spec keeps the old cap unless -RecordMaxMiB says otherwise
+RECORD_RE = re.compile(r"^(f)?(\d+),(\d+)$")
+RECORD_MAX_SECONDS = 120
+RECORD_MAX_FRAMES = 2000
+
+
+def parse_record_spec(spec):
+    """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `slow` (alias auto/default: the runtime opens a 10 s window at the first present after 120 s with a >= 500 ms gap, fallback 180 s), `<start s>,<seconds>` (e.g. 140,60) or `f<first frame>,<frames>`.
+    Returns {"spec": normalized text, "by": "time"|"frame", "start", "length"}. Raises ValueError for anything else, a window longer
+    than 120 s / 2000 frames (the file would not fit a disk or a Drive folder) or an empty window."""
+    if spec.strip().lower() in ("auto", "default", "slow"):
+        return {"spec": "slow", "by": "slow", "start": 120, "length": 10}   # the runtime decides the window; these are its documented defaults
+    match = RECORD_RE.match(spec.strip().lower())
+    if not match:
+        raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60) or f<first frame>,<frames> (e.g. f4000,24), got %r" % spec)
+    by = "frame" if match.group(1) else "time"
+    start, length = int(match.group(2)), int(match.group(3))
+    if length < 1 or length > (RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS):
+        raise ValueError("-Record window of %d %s is outside 1..%d" % (length, "frames" if by == "frame" else "seconds",
+                                                                      RECORD_MAX_FRAMES if by == "frame" else RECORD_MAX_SECONDS))
+    return {"spec": ("f" if by == "frame" else "") + "%d,%d" % (start, length), "by": by, "start": start, "length": length}
+
+
+PREFIX_ONLY_LINE = "the cap stopped the recording BEFORE the window opened"
+
+
+def recording_unusable(log_dir):
+    """"prefix only" when the run's stderr.txt says the cap stopped the recording before its window opened (the file holds only the
+    state-making prefix: nothing to replay), else None."""
+    try:
+        with open(os.path.join(log_dir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            return "prefix only" if any(PREFIX_ONLY_LINE in line for line in handle) else None
+    except OSError:
+        return None
+
+
+def folder_report(folder, log_dir=None):
+    """{"files": n, "bytes": total, "largest": [(name, bytes)...]} of a recording folder (size report for the manifest and console);
+    with log_dir, "unusable": "prefix only" when the run's log says the recording never reached its window."""
+    sizes = []
+    for root, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                sizes.append((os.path.relpath(path, folder).replace(os.sep, "/"), os.path.getsize(path)))
+    sizes.sort(key=lambda item: -item[1])
+    report = {"files": len(sizes), "bytes": sum(b for _, b in sizes), "largest": sizes[:3]}
+    unusable = recording_unusable(log_dir) if log_dir and sizes else None
+    if unusable:
+        report["unusable"] = unusable
+    return report
+
+
+def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
+    """One report from several runs of a matrix (tester_run -Matrix gray). `runs` is [(label, [part zip paths in order])]; every
+    member of run <label> goes in as run_<label>/<name>, its manifest.json too. Part 1 also holds matrix_manifest.json (per run:
+    env, seconds, end cause, exit code, parts, files) and the parts are mail-ready like pack()'s (limit, part_NN_of_MM.txt).
+    Small files of all runs come first, the big ones after, so a part 1 that arrives alone answers for every run."""
+    room = limit_bytes - MANIFEST_ROOM
+    summary, items = {}, []
+    for label, paths in runs:
+        folder = "run_%s/" % label
+        manifest = {}
+        for path in paths:
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    if re.match(r"^part_\d\d_of_\d\d\.txt$", name):
+                        continue
+                    data = z.read(name)
+                    if name == "manifest.json":
+                        manifest = json.loads(data.decode("utf-8-sig"))
+                    items.append((folder + name, data))
+        summary[label] = {key: manifest.get(key) for key in ("seconds", "env", "end_cause", "stop_reason", "exit_code", "parts", "input_script", "commit")}
+        summary[label]["source_parts"] = len(paths)
+    items.sort(key=lambda item: (len(item[1]) > SMALL_FILE_BYTES, item[0]))
+    members, used, listing = [[]], 0, {}
+    for member, data in items:
+        packed = len(zlib.compress(data, 6)) + 100 + 2 * len(member)
+        if used + packed > room and members[-1]:
+            members.append([])
+            used = 0
+        members[-1].append((member, data))
+        listing[member] = {"bytes": len(data), "part": len(members)}
+        used += packed
+    stem, ext = os.path.splitext(zip_path)
+    count = len(members)
+    parts = []
+    for index, group in enumerate(members, 1):
+        path = zip_path if count == 1 else "%s_part%02dof%02d%s" % (stem, index, count, ext)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            for member, data in group:
+                z.writestr(member, data)
+            if count > 1:
+                z.writestr("part_%02d_of_%02d.txt" % (index, count), part_note(index, count, members))
+            if index == 1:
+                z.writestr("matrix_manifest.json", json.dumps({"matrix": matrix, "runs": summary, "files": listing, "parts": count},
+                                                              indent=2, sort_keys=True))
         parts.append((path, os.path.getsize(path)))
     return parts
 
@@ -812,9 +1004,38 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    rs = sub.add_parser("record-spec")
+    rs.add_argument("spec")
+    sub.add_parser("record-defaults")
+    rr = sub.add_parser("record-report")
+    rr.add_argument("folder")
+    rr.add_argument("--logs", default=None)
+    cb = sub.add_parser("combine")
+    cb.add_argument("zip")
+    cb.add_argument("--matrix", default="matrix")
+    cb.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
+    cb.add_argument("--run", action="append", required=True, help="label=part1.zip,part2.zip (repeat per run)")
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
+    if args.cmd == "record-spec":
+        try:
+            print(parse_record_spec(args.spec)["spec"])
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
+        return 0
+    if args.cmd == "record-defaults":
+        print("%s %d %d" % (RECORD_DEFAULT_SPEC, RECORD_DEFAULT_MAX_MIB, RECORD_EXPLICIT_MAX_MIB))
+        return 0
+    if args.cmd == "record-report":
+        print(json.dumps(folder_report(args.folder, args.logs)))
+        return 0
+    if args.cmd == "combine":
+        runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]
+        for path, size in combine(args.zip, runs, int(args.limit_mb * 1024 * 1024), args.matrix):
+            print("%s %d" % (path, size))
+        return 0
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds, args.privacy_boxes))
         return 0

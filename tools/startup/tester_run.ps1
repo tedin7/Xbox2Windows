@@ -62,6 +62,12 @@ param(
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
+    [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
+    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
+    [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = "slow": a 10 s window opened by the first slowdown (a present with a >= 500 ms gap after 120 s, fallback 180 s), 400 MiB cap, "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
+    [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 400 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
+    [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
+    [switch]$Upload,                            # (implied by -Record) after a -Record run: cut the recording into 100 MB chunks and copy it into the synced Drive folder x2w-registrazioni, or print the list to upload by hand in the browser
     [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
@@ -130,6 +136,59 @@ function Get-MissingDlls {
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
+
+# -Matrix gray: the same script, three times as child processes (each one a full run with its own report), then ONE combined report.
+# A/B/C differ only by one environment switch each, so the logs of the gray phase can be compared side by side.
+if ($Matrix) {
+    if ($Matrix -ne "gray") { throw "tester_run: -Matrix knows only 'gray' (got '$Matrix')" }
+    if ($Record) { throw "tester_run: -Record is its own run, not with -Matrix" }
+    $legSeconds = if ($PSBoundParameters.ContainsKey("Seconds")) { $Seconds } else { 240 }
+    $legs = @(
+        @{ Label = "a"; Name = "default";                          Env = [ordered]@{} },
+        @{ Label = "b"; Name = "X2W_TEST_ADDRESS_UPLOAD_RING=1";   Env = [ordered]@{ X2W_TEST_ADDRESS_UPLOAD_RING = "1" } },
+        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } })
+    $skipOwn = @("Matrix", "Seconds", "OutDir", "FinishTranslateSeconds")
+    $childArgs = @()
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($skipOwn -contains $key) { continue }
+        $value = $PSBoundParameters[$key]
+        if ($value -is [switch]) { if ($value.IsPresent) { $childArgs += "-$key" } }
+        elseif ($value -is [array]) { $childArgs += "-$key"; $childArgs += ($value -join ",") }
+        else { $childArgs += "-$key"; $childArgs += [string]$value }
+    }
+    $matrixOut = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
+    $matrixStamp = Get-Date -Format "yyyyMMdd-HHmm"
+    $matrixRoot = Join-Path $matrixOut "matrix_$matrixStamp"
+    $shell = (Get-Process -Id $PID).Path
+    $legRuns = @(); $worst = 0
+    foreach ($leg in $legs) {
+        $legOut = Join-Path $matrixRoot ("run_" + $leg.Label)
+        $finish = if ($leg.Label -eq "c") { $FinishTranslateSeconds } else { 0 }   # the translator pass once, after the last leg
+        Write-Host ("tester_run: matrix {0} leg {1} ({2}): {3} s, report in {4}" -f $Matrix, $leg.Label, $leg.Name, $legSeconds, $legOut)
+        foreach ($name in $leg.Env.Keys) { Set-Item -Path ("Env:" + $name) -Value $leg.Env[$name] }
+        try {
+            & $shell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @childArgs -Seconds $legSeconds -OutDir $legOut -FinishTranslateSeconds $finish
+            $code = $LASTEXITCODE
+        } finally {
+            foreach ($name in $leg.Env.Keys) { Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue }
+        }
+        if ($code -gt $worst) { $worst = $code }
+        $legParts = @(Get-ChildItem -LiteralPath $legOut -Filter "report_*.zip" -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+        if ($legParts.Count -eq 0) { Write-Warning ("tester_run: matrix leg {0} wrote no report (exit code {1}); the combined report has no run_{0}" -f $leg.Label, $code) }
+        else { $legRuns += ("{0}={1}" -f $leg.Label, ($legParts -join ",")) }
+    }
+    if ($legRuns.Count -eq 0) { throw "tester_run: no matrix leg wrote a report" }
+    $combined = Join-Path $matrixOut ("report_matrix_{0}_{1}.zip" -f $Matrix, $matrixStamp)
+    $runArgs = @(); foreach ($spec in $legRuns) { $runArgs += "--run"; $runArgs += $spec }
+    $lines = @(Invoke-Native { & $python -B $pack combine $combined --matrix $Matrix --limit-mb $LimitMB @runArgs })
+    if ($LASTEXITCODE -ne 0) { throw "tester_run: combining the matrix reports failed (the single reports stay in $matrixRoot)" }
+    foreach ($line in $lines) {
+        $path, $bytes = $line -split " (?=\d+$)"
+        Write-Host ("Send this file: {0} ({1:N1} MB)" -f $path, ([double]$bytes / 1MB))
+    }
+    if ($lines.Count -gt 1) { Write-Host "The report has $($lines.Count) parts: send all of them, exactly as they are." }
+    exit $worst
+}
 
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }
@@ -275,6 +334,26 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
 if ($MemoryGiB -le 0) { $MemoryGiB = [int](Invoke-Native { & $python -B $pack memory-gib $physicalBytes }) }
 Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
+# Periodic thread snapshots (debug_launch X2W_DUMP_AT): the title is stopped for a moment at each one, so 4 by default, not one a minute.
+$dumpAt = if ($ThreadSnapshotEvery -gt 0) { @(1..([math]::Floor(480 / $ThreadSnapshotEvery)) | ForEach-Object { $_ * $ThreadSnapshotEvery }) -join "," } else { "" }
+if ($dumpAt) { $env:X2W_DUMP_AT = $dumpAt } else { Remove-Item Env:X2W_DUMP_AT -ErrorAction SilentlyContinue }
+# Replay recorder: validated first, the recording folder lives beside the reports (never inside a zip), and the disk must hold twice the cap.
+$recordDir = ""
+if ($Record) {
+    if ($Matrix) { throw "tester_run: -Record is its own run, not with -Matrix" }
+    $recordSpec = (Invoke-Native { & $python -B $pack record-spec $Record } | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "tester_run: -Record refused (see above)" }
+    $defaults = (Invoke-Native { & $python -B $pack record-defaults } | Out-String).Trim() -split " "
+    if ($RecordMaxMiB -le 0) { $RecordMaxMiB = if ($Record.Trim().ToLower() -in @("auto", "default")) { [int]$defaults[1] } else { [int]$defaults[2] } }
+    $recordDir = Join-Path $outRoot ("record_" + $stamp)
+    New-Item -ItemType Directory -Force $recordDir | Out-Null
+    $freeMiB = [math]::Floor((Get-PSDrive -Name ((Split-Path -Qualifier $recordDir).TrimEnd(":"))).Free / 1MB)
+    if ($freeMiB -lt 2 * $RecordMaxMiB) { throw ("tester_run: -Record needs twice the cap free ({0} MiB), the disk has {1} MiB: free space or lower -RecordMaxMiB" -f (2 * $RecordMaxMiB), $freeMiB) }
+    $env:X2W_REPLAY_RECORD = $recordSpec; $env:X2W_REPLAY_DIR = $recordDir; $env:X2W_REPLAY_MAX_MIB = [string]$RecordMaxMiB
+    Write-Host ("tester_run: recording {0} into {1} (cap {2} MiB, {3} MiB free): the run is slower while it records" -f $recordSpec, $recordDir, $RecordMaxMiB, $freeMiB)
+} else {
+    Remove-Item Env:X2W_REPLAY_RECORD, Env:X2W_REPLAY_DIR, Env:X2W_REPLAY_MAX_MIB -ErrorAction SilentlyContinue
+}
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
@@ -391,6 +470,17 @@ Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out
 # Files written during this run outside the save folder (first 60, at most 20 s of searching, 4 levels deep): where the title keeps
 # what it saves by itself, e.g. the privacy acceptance.
 $scanRoots = if ($ScanRoots.Count) { $ScanRoots } else { @($env:LOCALAPPDATA, $env:APPDATA, [Environment]::GetFolderPath("MyDocuments"), (Join-Path $env:USERPROFILE "Saved Games"), $env:ProgramData, $DataDir) }
+# Size report of the recording (empty when the runtime wrote nothing: an older build without the recorder).
+$recordReport = $null
+if ($recordDir) {
+    $recordReport = (Invoke-Native { & $python -B $pack record-report $recordDir --logs $logDir } | Out-String | ConvertFrom-Json)
+    $recordReport | Add-Member -NotePropertyName spec -NotePropertyValue $env:X2W_REPLAY_RECORD -Force
+    $recordReport | Add-Member -NotePropertyName dir -NotePropertyValue $recordDir -Force
+    $recordReport | Add-Member -NotePropertyName max_mib -NotePropertyValue $RecordMaxMiB -Force
+    Write-Host ("tester_run: recording: {0} files, {1:N1} MB in {2} (cap {3} MiB){4}" -f $recordReport.files, ($recordReport.bytes / 1MB), $recordDir, $RecordMaxMiB,
+        $(if ($recordReport.files -eq 0) { " - NOTHING was recorded (this build has no recorder, or the window was never reached)" } else { "" }))
+    if ($recordReport.unusable) { Write-Host ("tester_run: recording UNUSABLE: {0} (the cap stopped it BEFORE the window opened): it is not uploaded; send the report zip only." -f $recordReport.unusable) }
+}
 $scanClock = [System.Diagnostics.Stopwatch]::StartNew()
 $changedFiles = @()
 foreach ($root in $scanRoots) {
@@ -407,7 +497,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
-    pretranslate = $preTranslate; pre_run_retry = $preRunRetry; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    thread_snapshots = $dumpAt; record = $recordReport; pretranslate = $preTranslate; pre_run_retry = $preRunRetry; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
@@ -424,6 +514,17 @@ foreach ($line in $parts) {
 }
 Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
 Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
+if ($recordDir -and $recordReport -and $recordReport.files -gt 0 -and -not $recordReport.unusable -and -not $NoUpload) {
+    $transfer = Join-Path $PSScriptRoot "record_transfer.py"
+    $staging = $recordDir + "_upload"
+    $null = Invoke-Native { & $python -B $transfer pack $recordDir $staging --id $stamp }
+    if ($LASTEXITCODE -ne 0) { Write-Warning "tester_run: cutting the recording into chunks failed; it stays in $recordDir" }
+    else {
+        Invoke-Native { & $python -B $transfer upload $staging } | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -eq 0) { Write-Host ("tester_run: recording {0} uploaded to the shared Drive folder: tell Tommaso it is complete." -f $stamp) }
+        elseif ($LASTEXITCODE -eq 3) { Write-Host ("tester_run: no synced Drive folder: upload the files listed above (also in {0}\UPLOAD_THESE_FILES.txt) in the browser, the .done file last." -f $staging) }
+    }
+}
 if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send all of them." }
 
 # F1: the report is packed, now finish what the run left. One translator pass over the cache (no --watch) until nothing is

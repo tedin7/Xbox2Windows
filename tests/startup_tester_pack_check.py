@@ -643,6 +643,133 @@ def check_mail_ready_parts():
                     assert "manifest.json" in names
 
 
+def check_phase_table():
+    """phases.txt: presents, fps and picture mean per 30 s window from the stand-in heartbeats and the capture rows."""
+    beats = ("x2w-d3d12 heartbeat: 150 frames presented in 5.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 900 frames presented in 30.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1000 frames presented in 60.0 s (16.7 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1010 frames presented in 90.0 s (11.2 fps overall); x\n")
+    timeline = ("   10.0 s  picture window_010s.png mean 0.0  first\n   40.0 s  picture window_040s.png mean 85.5  changed\n"
+                "   55.0 s  picture window_055s.png mean 36.0  changed\n")
+    rows = T.phase_table(beats, timeline).splitlines()
+    assert rows[2].split() == ["0", "30", "900", "30.0", "0.0"], rows[2]
+    assert rows[3].split() == ["30", "60", "100", "3.3", "36.0"], rows[3]
+    assert rows[4].split() == ["60", "90", "10", "0.3", "-"], rows[4]
+    assert rows[-1].startswith("# credits movie: no window pictures after 250 s"), rows[-1]
+    late = timeline + "  300.0 s  picture window_300s.png mean 0.0  unchanged\n  384.0 s  picture window_384s.png mean 72.3  changed\n  400.0 s  picture window_400s.png mean 0.0  changed\n"
+    note = T.movie_note(late)
+    assert note.startswith("# credits movie: content in 1 of 3 of OUR pictures after 250 s (384 s mean 72); capture interval 50 s"), note
+    black = T.movie_note("  300.0 s  picture window_300s.png mean 0.0  first\n  315.0 s  picture window_315s.png mean 1.0  unchanged\n")
+    assert black.startswith("# credits movie: NOT seen in our 2 pictures after 250 s") and "tester's own captures" in black, black
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", beats.encode())
+        write(run, "timeline.txt", timeline.encode())
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "p.zip"))
+        with zipfile.ZipFile(Path(tmp) / "p.zip") as z:
+            assert z.read(T.PHASES_NAME).decode().splitlines()[2].split()[:4] == ["0", "30", "900", "30.0"]
+        write(run, "stderr.txt", b"no heartbeats\n")
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "q.zip"))
+        with zipfile.ZipFile(Path(tmp) / "q.zip") as z:
+            assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
+
+
+def check_request_families():
+    """The top refusal families each bring their 20 keys with the most uses, whatever their dispatch/draw weight (c20: the code of
+    the top 20 'branch out of the block' keys), on top of the weight ranking; the byte cap still holds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "cache"
+        cache.mkdir()
+        uses = {}
+        for n in range(30):   # 30 keys of one wall, no census weight at all
+            key = "d%015x" % n
+            for ext in (".c67", ".data", ".root"):
+                write(cache, "req_%s%s" % (key, ext), b"B" * 50)
+            write(cache, "%s.fail" % key, ("branch out of the block %d is not covered\n" % n).encode())
+            uses[key] = (1.0, 2.0, 100 + n)
+        for n in range(5):    # a small other wall
+            key = "e%015x" % n
+            write(cache, "req_%s.c67" % key, b"E" * 50)
+            write(cache, "%s.fail" % key, b"v_readfirstlane_b32 requires a proven uniform source\n")
+            uses[key] = (1.0, 2.0, 5)
+        rows = T.cache_results(str(cache))
+        assert T.select_requests(str(cache), rows, {}) == [], "without uses nothing is ranked (no weights)"
+        chosen = T.select_requests(str(cache), rows, {}, uses=uses)
+        wall = [c[0] for c in chosen if c[0].startswith("d")]
+        assert sorted(wall) == sorted("d%015x" % n for n in range(10, 30)), "the 20 most used keys of the wall: %r" % wall
+        assert all(any(n.endswith(".c67") for n, _ in c[3]) and any(n.endswith(".data") for n, _ in c[3]) for c in chosen if c[0].startswith("d"))
+        assert len([c for c in chosen if c[0].startswith("e")]) == 5, "a second wall brings its keys too"
+        assert len(T.select_requests(str(cache), rows, {}, uses=uses, cap=700)) < len(chosen), "the byte cap still holds"
+        capped = T.select_requests(str(cache), rows, {}, uses=uses, cap=700)
+        assert sum(b for c in capped for _, b in c[3]) <= 700
+
+
+def check_combine():
+    """A matrix report: three runs in one mail-ready report, run_<label>/ folders, a matrix manifest with each run's env."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        runs = []
+        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "0"})):
+            run = tmp / ("run_" + label)
+            run.mkdir()
+            make_run(run, 2)
+            write(run, "stderr.txt", ("stderr of " + label + "\n").encode() + os.urandom(3 * 1024 * 1024))
+            manifest = dict(MANIFEST, seconds=240, env=dict(MANIFEST["env"], **extra_env), end_cause="timeout", exit_code=0)
+            parts = T.pack(str(run), manifest, str(tmp / ("report_" + label + ".zip")))
+            runs.append((label, [p for p, _ in parts]))
+        out = T.combine(str(tmp / "matrix.zip"), runs, 9 * 1024 * 1024, "gray")
+        assert len(out) >= 2 and all(size <= 9 * 1024 * 1024 for _, size in out), out
+        seen = {}
+        for index, (path, _) in enumerate(out, 1):
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    assert name not in seen, name
+                    seen[name] = z.read(name)
+                assert ("part_%02d_of_%02d.txt" % (index, len(out))) in z.namelist()
+                if index == 1:
+                    assert "matrix_manifest.json" in z.namelist() and "run_a/manifest.json" in z.namelist() and "run_c/events.txt" in z.namelist()
+        top = json.loads(seen["matrix_manifest.json"])
+        assert top["matrix"] == "gray" and sorted(top["runs"]) == ["a", "b", "c"] and top["parts"] == len(out), top
+        assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and top["runs"]["b"]["env"]["X2W_TEST_ADDRESS_UPLOAD_RING"] == "1"
+        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "0" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
+        for label in "abc":
+            assert seen["run_%s/stderr.txt" % label].startswith(("stderr of " + label).encode()), label
+            assert json.loads(seen["run_%s/manifest.json" % label])["env"] == top["runs"][label]["env"]
+        assert all(top["files"][n]["part"] == 1 for n in top["files"] if n.endswith("manifest.json") and n.startswith("run_")), "manifests in part 1"
+
+
+def check_record_spec():
+    """-Record values for the replay recorder and the size report of a recording folder."""
+    assert T.parse_record_spec("140,60") == {"spec": "140,60", "by": "time", "start": 140, "length": 60}
+    assert T.parse_record_spec(" F4000,24 ")["spec"] == "f4000,24" and T.parse_record_spec("f4000,24")["by"] == "frame"
+    assert T.parse_record_spec("auto")["spec"] == T.RECORD_DEFAULT_SPEC == "slow" and T.parse_record_spec("Default")["by"] == "slow" and T.parse_record_spec("SLOW")["spec"] == "slow"
+    assert T.RECORD_DEFAULT_MAX_MIB == 400 < T.RECORD_EXPLICIT_MAX_MIB and T.parse_record_spec("140,20")["by"] == "time"
+    for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1"):
+        try:
+            T.parse_record_spec(bad)
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % bad)
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), "a.bin", b"x" * 1000)
+        (Path(tmp) / "sub").mkdir()
+        write(Path(tmp) / "sub", "b.bin", b"y" * 5000)
+        report = T.folder_report(tmp)
+        assert report["files"] == 2 and report["bytes"] == 6000 and report["largest"][0] == ("sub/b.bin", 5000), report
+        assert T.folder_report(str(Path(tmp) / "none")) == {"files": 0, "bytes": 0, "largest": []}
+        # A run whose log says the cap stopped the recording before its window opened: the file is a prefix, not a recording.
+        logs = Path(tmp) / "logs"
+        logs.mkdir()
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "no stderr: nothing to say"
+        write(logs, "stderr.txt", b"x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, 20 calls\n")
+        assert T.folder_report(tmp, str(logs))["unusable"] == "prefix only"
+        assert "unusable" not in T.folder_report(tmp), "no log folder given"
+        write(logs, "stderr.txt", b"x2w-replay record: stopped after 900 calls, 3 blobs\n")
+        assert "unusable" not in T.folder_report(tmp, str(logs)), "a window that opened is usable"
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -785,6 +912,10 @@ if __name__ == "__main__":
     check_request_files()
     check_request_code_files()
     check_mail_ready_parts()
+    check_phase_table()
+    check_request_families()
+    check_combine()
+    check_record_spec()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()

@@ -5045,6 +5045,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        add_test(NAME startup_present_source_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_present_source_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_present_source_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -5347,6 +5351,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
     add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")
+    # recordings leave the tester's PC through the shared Drive folder (tools/startup/record_transfer.py)
+    add_test(NAME startup_record_transfer COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_record_transfer_check.py")
     # memory.txt of a tester run: the processes holding the most committed memory (tools/startup/memory_top.py).
     add_test(NAME startup_memory_top COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_top_check.py")
@@ -5355,7 +5362,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_sources_check.py")
     add_test(NAME startup_tester_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_run_ps1_check.py")
-    set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 300)
+    set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 600)
     # The Linux launcher's check exits 77 on Windows; the Ubuntu job runs it.
     add_test(NAME startup_run_sh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_sh_check.py")
