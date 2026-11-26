@@ -734,8 +734,8 @@ void report_compute_key_use(Emit emit, bool only_if_changed)
         const u64 first = InterlockedCompareExchange64(&pipeline->compute_first_ms, 0, 0) - 1;
         const u64 last = InterlockedCompareExchange64(&pipeline->compute_last_ms, 0, 0) - 1;
         auto& use = rows[pipeline->compute_request_key].use;
-        use.first_ms = use.uses ? std::min(use.first_ms, first) : first;
-        use.last_ms = std::max(use.last_ms, last);
+        use.first_ms = use.uses ? (std::min)(use.first_ms, first) : first;
+        use.last_ms = (std::max)(use.last_ms, last);
         use.uses += count;
     }
     if (only_if_changed) {
