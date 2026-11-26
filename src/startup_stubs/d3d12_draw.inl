@@ -1811,7 +1811,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
     const bool tiled = tiled_bc7 || tiled_address || tiled_chain;
     std::optional<x2w_startup::gfx10::Layout> console_layout;
-    if (console) console_layout.emplace(original->console);
+    std::optional<x2w_startup::gfx10::Volume64> console_volume;
+    if (console) {
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) console_volume.emplace(original->console);
+        else console_layout.emplace(original->console);
+    }
     const auto generation = written.generation;
     const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
                                          tiled_bc7 ? written.bc7_height : desc.Height);
@@ -1823,7 +1827,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     if (tiled && !tiled_chain && !single && !console && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return true;
-    if (console) {
+    if (console_volume) {
+        if (plan.count != 1 || !plan.bytes(0) || plan.rows[0] != console_volume->height ||
+            plan.placed[0].Footprint.Depth != console_volume->depth ||
+            plan.row_bytes[0] != u64{console_volume->width} * console_volume->element_bytes) return false;
+    } else if (console_layout) {
         // The desktop footprints must hold exactly the elements the console layout addresses.
         if (console_layout->mips != mips || console_layout->slices != slices || plan.count != mips) return false;
         for (UINT i = 0; i < mips; ++i)
@@ -1847,7 +1855,8 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         x2w_startup::drop_mips::counters.upload_unsupported.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->used_bytes()
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console_volume ? console_volume->used_bytes()
+        : console_layout ? console_layout->used_bytes()
         : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
@@ -1913,7 +1922,10 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     }
                     std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
-                console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
+                if (console_volume)
+                    console_volume->detile(memory, rows, plan.placed[i].Footprint.RowPitch);
+                else
+                    console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
                 plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }

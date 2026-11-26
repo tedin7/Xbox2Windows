@@ -223,4 +223,53 @@ struct Layout {
                             bytes_per_element);
     }
 };
+// Single-mip 32-bit 64 KiB standard-swizzle volume. The D3D12_TEXTURE_LAYOUT
+// standard swizzle diagram specifies XYZXYZXYZZYYXX-- (most significant bit first).
+// Macrotiles are ordered with X fastest, then Y, then Z.
+struct Volume64 {
+    static constexpr UINT tile_width = 32, tile_height = 32, tile_depth = 16;
+    static constexpr UINT tile_bytes = 65536, element_bytes = 4;
+    UINT width, height, depth, tiles_x, tiles_y;
+
+    explicit Volume64(const D3D12_RESOURCE_DESC& d)
+        : width(static_cast<UINT>(d.Width)), height(d.Height), depth(d.DepthOrArraySize),
+          tiles_x((width + tile_width - 1) / tile_width), tiles_y((height + tile_height - 1) / tile_height)
+    {}
+
+    static UINT deposit(UINT coordinate, UINT mask)
+    {
+        UINT result = 0;
+        while (mask) {
+            const UINT bit = mask & (0u - mask);
+            if (coordinate & 1) result |= bit;
+            coordinate >>= 1;
+            mask &= mask - 1;
+        }
+        return result;
+    }
+
+    std::uint64_t offset(UINT x, UINT y, UINT z) const
+    {
+        const auto tile = x / tile_width + std::uint64_t{tiles_x} * (y / tile_height +
+                          std::uint64_t{tiles_y} * (z / tile_depth));
+        return tile * tile_bytes + deposit(x, 0x920c) + deposit(y, 0x4930) + deposit(z, 0x24c0);
+    }
+
+    std::uint64_t bytes() const
+    {
+        return std::uint64_t{tiles_x} * tiles_y * ((depth + tile_depth - 1) / tile_depth) * tile_bytes;
+    }
+
+    std::uint64_t used_bytes() const { return offset(width - 1, height - 1, depth - 1) + element_bytes; }
+
+    void detile(const unsigned char* source, unsigned char* target, UINT pitch) const
+    {
+        for (UINT z = 0; z < depth; ++z)
+            for (UINT y = 0; y < height; ++y) {
+                auto* row = target + (std::uint64_t{z} * height + y) * pitch;
+                for (UINT x = 0; x < width; ++x)
+                    std::memcpy(row + x * element_bytes, source + offset(x, y, z), element_bytes);
+            }
+    }
+};
 } // namespace x2w_startup::gfx10

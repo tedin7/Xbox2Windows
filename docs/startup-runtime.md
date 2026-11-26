@@ -3426,11 +3426,11 @@ draw that samples the view copies each mip of each array slice from that layout 
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
 after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
 
-The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+For the 2D path the description allows up to 16384 texels a side, 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
+the linear mode `0x100` without a live texture, cube views, multisampled
 textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 
@@ -3595,6 +3595,26 @@ element, widths, addresses and first elements above 4 GiB, page extent calculati
 coverage. Its `_control` runs (`height`, `exact-fit`, `first-32`, `unplaced-extent`, `unplaced-covers`)
 expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises placed and unplaced buffer
 views with valid addresses on a device (WARP and hardware), and verifies the refusal lines.
+
+With `X2W_VOLUME_TEXTURE=1`, slot 70 also accepts an address-only, single-mip
+`R32_FLOAT` Texture3D with layout `0x109`. Its 64 KiB standard swizzle
+interleaves X, Y and Z within 32×32×16 tiles. The upload writes every depth slice
+into one desktop copyable footprint. The address path retains the allocation
+size, overlap, readable range and latest-write checks. The switch defaults off
+and preserves the destination descriptor on refusal. The first detail line for
+each refused shape and reason reports details such as `volume_texture_disabled`
+or `volume_unsupported_swizzle`.
+[D3D12 standard swizzle diagram](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_texture_layout#remarks)
+
+`startup_address_tiled_volume_warp` builds two 64 KiB tiles for a synthetic
+17×17×17 volume and reads back 32 RGBA pixels per run. It compares five voxel
+centers and three interpolated coordinates to a CPU reference. One interpolation
+crosses the depth tile boundary. The default-switch run must preserve the null
+descriptor, and reversed source slices must fail the original CPU comparison.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_address_(tiled_volume|volume_srv)_warp$' -V
+```
 
 `startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
 device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).

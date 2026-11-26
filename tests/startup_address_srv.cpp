@@ -1101,3 +1101,37 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
 
     return 0;
 }
+
+// The independent CPU tiler supplies two 64 KiB tiles for a single 17-cubed mip.
+int draw_tiled_volume_address_srv(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_TILED_VOLUME", path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return 53;
+    static std::array<unsigned char, 2 * 65536> backing;
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(reinterpret_cast<char*>(backing.data()), backing.size())) return 54;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 17, 17, 17, 1,
+        DXGI_FORMAT_R32_FLOAT, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x109), D3D12_RESOURCE_FLAG_NONE};
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture3D.MipLevels = 1;
+    v.address = ptr(backing.data());
+
+    invoke(guest, 18, 0, ptr(&v.view), cpu);
+    const auto* slot = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous{};
+    std::memcpy(previous.data(), slot, previous.size());
+    for (int retry = 0; retry < 3; ++retry) invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    std::printf("tiled volume descriptor_changed=%d\n", std::memcmp(previous.data(), slot, previous.size()) != 0);
+
+    const D3D12_RECT full{0, 0, 8, 4};
+    invoke(list, 22, 1, ptr(&full));
+    invoke(list, 12, 3, 1);
+    return 0;
+}

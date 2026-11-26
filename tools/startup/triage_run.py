@@ -62,6 +62,15 @@ SLOT70_REASONS = {
     "console_layout_without_footprints",
     "console_layout_beyond_xg_size",
     "overlapping_resource",
+    "volume_texture_disabled",
+    "volume_unsupported_swizzle",
+    "volume_unsupported_format",
+    "volume_requires_one_mip",
+    "volume_invalid_dimensions",
+    "volume_invalid_samples",
+    "volume_unsupported_flags",
+    "volume_unsupported_alignment",
+    "volume_incompatible_view",
 }
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",

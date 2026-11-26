@@ -527,10 +527,19 @@ bool latest_texture_write_is_rows(u64 address)
     return rows;
 }
 
-// A texture slot 70 reads in a console layout of gfx10_layout.h: not one of the shapes it read before
-// (the single texel, the 0x105 BC3/BC7 surface and the 0x109 BC chains keep their own paths).
+bool volume_texture_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_VOLUME_TEXTURE");
+    return enabled;
+}
+
+// Slot 70 uses the generic console upload for these layouts. Single texels and the special BC paths
+// have their own uploaders.
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc)
 {
+    if (x2w_startup::console_volume_description(desc))
+        return volume_texture_enabled() && !x2w_startup::single_element_bytes(desc) &&
+               !x2w_startup::console_volume_layout_refusal(desc);
     return x2w_startup::console_address_texture(desc) && !x2w_startup::single_element_bytes(desc) &&
            !tiled_bc_srv(desc) && !x2w_startup::bc64::supports(desc);
 }
@@ -558,7 +567,9 @@ u64 address_texture_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 {
     if (const UINT element = x2w_startup::single_element_bytes(desc)) return element;
     if (x2w_startup::bc64::supports(desc)) return x2w_startup::bc64::Chain(desc).bytes();
-    if (console_layout_srv(desc)) return x2w_startup::gfx10::Layout(desc).bytes();
+    if (console_layout_srv(desc))
+        return x2w_startup::console_volume_description(desc) ? x2w_startup::gfx10::Volume64(desc).bytes()
+                                                           : x2w_startup::gfx10::Layout(desc).bytes();
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
         if (device) {
             const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels ? desc.MipLevels : 1);
@@ -581,6 +592,9 @@ const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOU
     if (latest_texture_write_is_rows(address)) return "console_layout_xg_rows";
     const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels);
     if (plan.size == UINT64_MAX || !plan.size) return "console_layout_without_footprints";
+    if (x2w_startup::console_volume_description(desc))
+        return x2w_startup::gfx10::Volume64(desc).bytes() > ((plan.size + 0xFFFF) & ~u64{0xFFFF})
+            ? "console_layout_beyond_xg_size" : nullptr;
     const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * desc.DepthOrArraySize;
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
@@ -634,7 +648,9 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
     if (!published) return "texture_no_resource";
     const auto bytes = address_texture_bytes(device, desc);
     if (bytes > max_published_texture_bytes) return "texture_over_64mib";
-    if (!texture_range_readable(address, bytes)) return "texture_unreadable";
+    const auto read_bytes = x2w_startup::console_volume_description(desc) && console_layout_srv(desc)
+        ? x2w_startup::gfx10::Volume64(desc).used_bytes() : bytes;
+    if (!texture_range_readable(address, read_bytes)) return "texture_unreadable";
     return "texture_unavailable";  // publication failed for another reason (no wrapper)
 }
 
@@ -643,7 +659,9 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     const auto bytes = address_texture_bytes(device, desc);
     // A console layout is read only up to its last addressed element: a small texture in a big block need not have the
     // block's padding mapped.
-    const auto read_bytes = console_layout_srv(desc) ? x2w_startup::gfx10::Layout(desc).used_bytes() : bytes;
+    const auto read_bytes = !console_layout_srv(desc) ? bytes
+        : x2w_startup::console_volume_description(desc) ? x2w_startup::gfx10::Volume64(desc).used_bytes()
+                                                        : x2w_startup::gfx10::Layout(desc).used_bytes();
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > max_published_texture_bytes || !texture_range_readable(address, read_bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
@@ -726,7 +744,14 @@ const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const Memory
         if (!x2w_startup::supports_as_memory_srv(input->view)) return "unsupported_description";
     } else {
         if (!input->address) return "null_address";
-        if (!supports_memory_srv(*resource, input->view)) return "unsupported_description";
+        if (x2w_startup::console_volume_description(*resource) &&
+            !x2w_startup::single_element_bytes(*resource)) {
+            if (const auto* reason = x2w_startup::console_volume_layout_refusal(*resource)) return reason;
+            if (!volume_texture_enabled()) return "volume_texture_disabled";
+            if (!x2w_startup::address_view_fits(*resource, input->view)) return "volume_incompatible_view";
+        } else if (!supports_memory_srv(*resource, input->view)) {
+            return "unsupported_description";
+        }
     }
     if (!memory_srv_destination(destination)) return "destination_outside_view_heaps";
     return nullptr;
@@ -782,14 +807,40 @@ void log_layout0_texture(const char* reason, const D3D12_RESOURCE_DESC* resource
         nonzero_rows[1], nonzero_rows[2], nonzero_rows[3]);
 }
 
+bool first_volume_refusal(const D3D12_RESOURCE_DESC& desc, const char* reason, bool census_first)
+{
+    struct Refusal {
+        D3D12_RESOURCE_DESC desc;
+        const char* reason;
+    };
+    static std::mutex mutex;
+    static std::vector<Refusal> seen;
+    std::lock_guard lock(mutex);
+    for (const auto& entry : seen)
+        if (same_texture_description(entry.desc, desc) && std::strcmp(entry.reason, reason) == 0)
+            return false;
+    try {
+        seen.push_back({desc, reason});
+    } catch (const std::bad_alloc&) {
+        return census_first;
+    }
+    return true;
+}
+
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                        const MemoryShaderResourceView* input, u64 destination)
 {
     const bool within_limit = first_calls(refused, 8);
-    const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
-    if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
+    const auto* desc = x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr;
+    const char* census_reason = std::strncmp(reason, "volume_", 7) == 0 ? "unsupported_description" : reason;
+    const bool volume = desc && x2w_startup::console_volume_description(*desc) &&
+                        !x2w_startup::single_element_bytes(*desc) &&
+                        x2w_startup::memory_srv_reason_has_shape(x2w_startup::memory_srv_reason_index(census_reason));
+    const bool new_shape = memory_srv_census.note(census_reason, desc);
+    if (volume ? first_volume_refusal(*desc, reason, new_shape) : (within_limit || new_shape))
+        log_refused_memory_srv(what, reason, resource, input, destination);
     log_layout0_texture(reason, resource, input);
 }
 
@@ -958,7 +1009,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     }
     Wrapper* texture = held ? nullptr
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
-                                              : existing_memory_texture(input->address, *resource);
+        : x2w_startup::console_volume_description(*resource) ? nullptr
+                                                            : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
     // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
@@ -980,7 +1032,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : texture_unavailable_reason(self, input->address, *resource,
                                      tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) || console_layout_srv(*resource));
     if (!texture) outcome = held ? held : unavailable;
-    log_address_kind(outcome, *resource, input->view, input->address);
+    if (texture || !x2w_startup::console_volume_description(*resource))
+        log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
         refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : unavailable,
                           resource, input, destination);

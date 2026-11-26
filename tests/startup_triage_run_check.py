@@ -218,6 +218,15 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unavailable texture at the supplied base and layout", "console_layout_without_footprints"),
         ("unavailable texture at the supplied base and layout", "console_layout_beyond_xg_size"),
         ("unavailable texture at the supplied base and layout", "overlapping_resource"),
+        ("unsupported memory SRV arguments", "volume_texture_disabled"),
+        ("unsupported memory SRV arguments", "volume_unsupported_swizzle"),
+        ("unsupported memory SRV arguments", "volume_unsupported_format"),
+        ("unsupported memory SRV arguments", "volume_requires_one_mip"),
+        ("unsupported memory SRV arguments", "volume_invalid_dimensions"),
+        ("unsupported memory SRV arguments", "volume_invalid_samples"),
+        ("unsupported memory SRV arguments", "volume_unsupported_flags"),
+        ("unsupported memory SRV arguments", "volume_unsupported_alignment"),
+        ("unsupported memory SRV arguments", "volume_incompatible_view"),
     ]
     reasons = [reason for _, reason in cases]
     lines = [

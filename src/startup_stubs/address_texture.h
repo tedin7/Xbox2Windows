@@ -1,13 +1,8 @@
 #pragma once
 
-// Textures a title publishes by address (device slot 70): a resource description, a view and the
-// address of the texels, with no resource object behind them. This header decides, without a
-// device, which of those descriptions the startup renderer reads from the address: a sampled-only,
-// two-dimensional, single-sample texture whose Layout field holds a console swizzle mode that
-// gfx10_layout.h addresses. Its texels are in that console layout.
-// Everything else is refused here: the desktop's unknown layout and the console's linear mode (the
-// extent of such rows is not established), other dimensions, multisampled textures, textures that
-// are also targets, formats without a known element size and swizzle modes without an equation.
+// Device-free validation for textures published by address (device slot 70). Sample-only 2D and
+// opt-in volume textures use the console equations in gfx10_layout.h. Placed volume views use the
+// desktop resource description and its copyable footprints.
 
 #include "startup_stubs/gfx10_layout.h"
 
@@ -70,7 +65,7 @@ inline bool address_component_mapping(UINT mapping)
     return true;
 }
 
-// A two-dimensional or array view that stays inside the texture and reads its texels as stored.
+// A view that stays inside the texture and reads its texels as stored.
 inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (!address_view_format(r.Format, v.Format) || !address_component_mapping(v.Shader4ComponentMapping))
@@ -95,6 +90,27 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
                mips_fit(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels) &&
                v.Texture3D.ResourceMinLODClamp == 0.0f;
     return false;
+}
+
+inline bool console_volume_description(const D3D12_RESOURCE_DESC& r)
+{
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && gfx10::swizzle_mode(r) != ~0u;
+}
+
+inline const char* console_volume_layout_refusal(const D3D12_RESOURCE_DESC& r)
+{
+    if (gfx10::swizzle_mode(r) != 9) return "volume_unsupported_swizzle";
+    if (r.Format != DXGI_FORMAT_R32_FLOAT) return "volume_unsupported_format";
+    if (r.MipLevels != 1) return "volume_requires_one_mip";
+    constexpr UINT limit = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+    if (!r.Width || !r.Height || !r.DepthOrArraySize ||
+        r.Width > limit || r.Height > limit || r.DepthOrArraySize > limit)
+        return "volume_invalid_dimensions";
+    if (r.SampleDesc.Count != 1 || r.SampleDesc.Quality) return "volume_invalid_samples";
+    if (r.Flags != D3D12_RESOURCE_FLAG_NONE) return "volume_unsupported_flags";
+    if (r.Alignment && r.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+        return "volume_unsupported_alignment";
+    return nullptr;
 }
 
 inline bool supports_volume_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
