@@ -261,9 +261,25 @@ void learn_after(Player& p, const Recording& r, const Played& call)
     }
 }
 
+// What the player is doing, for the crash line: a phase name, and the call being played.
+const char* volatile phase = "start";
+const Step* volatile current_step = nullptr;
+
+LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
+{
+    const Step* step = current_step;
+    if (step)
+        say("x2w-replay: CRASH 0x%08lx at %p while playing seq %llu (kind %u slot %u, object 0x%llx)", e->ExceptionRecord->ExceptionCode,
+            e->ExceptionRecord->ExceptionAddress, step->call.seq, step->call.kind, step->call.slot, step->call.object);
+    else
+        say("x2w-replay: CRASH 0x%08lx at %p during %s", e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress, phase);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Plays one call. false: its object was never seen (skipped).
 bool play(Player& p, const Recording& r, const Step& step)
 {
+    current_step = &step;
     const CallRecord& c = step.call;
     Played call{&step};
     if (const auto object = p.objects.find(c.object); object != p.objects.end()) {
@@ -432,6 +448,8 @@ int run(const Options& o)
         return 2;
     }
     SetStdHandle(STD_ERROR_HANDLE, log);
+    SetUnhandledExceptionFilter(note_crash);
+    phase = "reading the recording";
     Recording r;
     if (const std::string problem = read_recording(o.recording.c_str(), r); !problem.empty()) {
         say("x2w-replay: %s", problem.c_str());
@@ -444,11 +462,14 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
     }
+    phase = "applying settings";
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
+    phase = "seeding the shader cache";
     seed_shader_cache(r);
+    phase = "making the device";
     say("x2w-replay: %zu calls, %zu blobs, %llu presents marked, %s", r.steps.size(), r.blobs.size(), r.presents_marked,
         r.ended ? "ended" : "no end chunk (the recorded process stopped early)");
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -467,6 +488,7 @@ int run(const Options& o)
             p.objects[s.call.object] = reinterpret_cast<u64>(p.device);
             break;
         }
+    phase = "playing";
     const auto started = std::chrono::steady_clock::now();
     const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
     bool stopped = false;
@@ -477,8 +499,11 @@ int run(const Options& o)
         }
         play(p, r, s);
     }
+    current_step = nullptr;
+    phase = "writing the last pages";
     if (!stopped)  // the pages recorded after the last call
         apply_pages_before(r, ~0ull, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+    phase = "finishing";
     const double wall = elapsed();
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
