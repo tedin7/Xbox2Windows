@@ -48,9 +48,12 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_STALL) {
+    # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
+    Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
     $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 60 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    Set-Content -LiteralPath (Join-Path $LogDir "finished.txt") -Value "stub finished.txt"
 }
 exit 0
 """
