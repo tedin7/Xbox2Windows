@@ -3118,7 +3118,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (readable_range && !formatted.entry && bytes >= (64u << 10)) {
             // A raw view reads zero past its end and unwritten title memory is zero: copy only up to the last non-zero byte.
             // (A 16 MiB binding copied whole on every draw emptied the 256 MiB upload ring.)
-            const std::size_t used = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes);
+            static x2w_local::ZeroTailCache zero_tails;
+            const std::size_t used = zero_tails.length(static_cast<std::uint64_t>(frame_number), reinterpret_cast<const void*>(address), bytes);
             if (used < bytes) {
                 InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(bytes - used));
                 bytes = used;

@@ -1,6 +1,7 @@
 // src/startup_stubs/zero_tail.h: the copy of a bound buffer drops its trailing zeros; a view over the shorter copy reads the
 // same values as one over the full range (reads past the end of a raw view return zero).
 // --mutate keep-all: the length never shrinks (the old behaviour); the ring-use check must fail.
+// --mutate no-cache: every draw rescans the range; the scan count must fail.
 #include "startup_stubs/zero_tail.h"
 
 #include <cstdio>
@@ -48,6 +49,23 @@ int main(int argc, char** argv)
     std::vector<unsigned char> odd(1001, 0);
     odd[1000] = 3;
     check("an odd length with data in the last byte is whole", x2w_local::used_length(odd.data(), odd.size()) == odd.size());
+    // 100 draws of one frame over the same sparse 16 MiB range scan it once; a writer growing the data is seen at once.
+    {
+        const bool no_cache = argc == 3 && !std::strcmp(argv[1], "--mutate") && !std::strcmp(argv[2], "no-cache");
+        std::vector<unsigned char> b(full, 0);
+        b[5 * 4096 + 3] = 9;
+        x2w_local::ZeroTailCache cache;
+        std::size_t first = 0;
+        for (int draw = 0; draw < 100; ++draw) {
+            const std::size_t n = cache.length(7, b.data(), full, !no_cache);
+            if (!draw) first = n;
+            check("the cached length is stable", n == first);
+        }
+        check("100 draws of a frame scan the range once", cache.scans() == 1);
+        b[first + 100] = 5;  // the title appends data just past the used part
+        check("data appended after the used part is seen on the next draw", cache.length(7, b.data(), full, !no_cache) > first + 100);
+        check("a new frame scans again", (cache.length(8, b.data(), full, !no_cache), cache.scans() >= 3 || no_cache));
+    }
     if (failures) return 1;
     std::printf("startup_zero_tail: PASS\n");
     return 0;
