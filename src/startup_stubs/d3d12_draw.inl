@@ -426,12 +426,7 @@ u64 fnv_part(const std::vector<unsigned char>& part, u64 key)
 // so a title write in between cannot leave a file that does not match its key.
 bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept
 {
-    __try {
-        std::memcpy(to, from, bytes);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+    return x2w_local::guarded_memcpy(to, from, bytes, true);
 }
 
 // Aligned qwords of a published blob that name committed memory of this process (one VirtualQuery each, so
