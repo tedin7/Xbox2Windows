@@ -7,15 +7,11 @@
 
 One line per sample: the system commit (used / limit), then the N processes with the most committed private memory,
 processes of the same name summed (`python.exe x16 6.20` = 16 processes, 6.20 GiB together), then the rest, then the
-commit no process holds as private memory (`unattributed`: shared sections, drivers, the kernel). Every process is read
-from one system snapshot (NtQuerySystemInformation), which needs no handle to it, so services and protected processes
-count too; only if the snapshot fails are processes opened one by one, and those that cannot be opened are named in the
-label (`unattributed 22.34 (150 processes unreadable)`). Names and GiB only: no paths, no command lines, no window
-titles. Windows only; elsewhere it writes nothing and exits 0.
+commit no process holds as private memory (shared sections, drivers, the kernel). Names and GiB only: no paths, no
+command lines, no window titles. Windows only; elsewhere it writes nothing and exits 0.
 """
 import argparse
 import os
-import struct
 import sys
 import time
 
@@ -45,41 +41,12 @@ def format_line(label, commit, processes, top, unreadable=0):
     parts += ["%s%s %.2f" % (name, " x%d" % count if count > 1 else "", size / GIB) for name, count, size in rows]
     if rest_count:
         parts.append("%d other processes %.2f" % (rest_count, rest_bytes / GIB))
-    unread = " (%d processes unreadable)" % unreadable if unreadable else ""
     if commit:
         outside = max(0, commit[0] - sum(size for _, size in processes))
-        parts.append("unattributed %.2f%s" % (outside / GIB, unread))
-    elif unread:
-        parts.append(unread.strip(" ()"))
+        parts.append("not in any process %.2f" % (outside / GIB))
+    if unreadable:
+        parts.append("%d processes not readable" % unreadable)
     return " | ".join(parts)
-
-
-# SYSTEM_PROCESS_INFORMATION on 64-bit Windows: the offsets of the fields read here.
-SPI_NEXT, SPI_NAME_LENGTH, SPI_NAME_BUFFER, SPI_PID, SPI_PAGEFILE = 0, 56, 64, 80, 184
-SPI_SIZE = 256  # the fixed part of a record (the threads follow it)
-
-
-def parse_system_processes(buffer, base):
-    """[(pid, name, committed private bytes)] from a SystemProcessInformation snapshot. `buffer` holds the records,
-    `base` is the address the snapshot was written at (each image name is a pointer into the buffer). PagefileUsage is
-    the process's committed private memory, the PrivateUsage psapi reports. Malformed input ends the walk."""
-    out, offset = [], 0
-    while 0 <= offset <= len(buffer) - SPI_SIZE:
-        following, = struct.unpack_from("<I", buffer, offset + SPI_NEXT)
-        length, = struct.unpack_from("<H", buffer, offset + SPI_NAME_LENGTH)
-        pointer, = struct.unpack_from("<Q", buffer, offset + SPI_NAME_BUFFER)
-        pid, = struct.unpack_from("<Q", buffer, offset + SPI_PID)
-        pagefile, = struct.unpack_from("<Q", buffer, offset + SPI_PAGEFILE)
-        start = pointer - base
-        name = ""
-        if pointer and length and 0 <= start <= len(buffer) - length:
-            name = bytes(buffer[start:start + length]).decode("utf-16-le", "replace")
-        if pid:  # pid 0 is the idle process
-            out.append((pid, name or "System", pagefile))
-        if not following:
-            break
-        offset += following
-    return out
 
 
 def sample_loop(out_path, read, every, top, alive, clock=time.monotonic, sleep=time.sleep):
@@ -116,35 +83,12 @@ def windows_reader():
             "kernel_paged", "kernel_nonpaged", "page_size")] + [(n, wt.DWORD) for n in ("handles", "processes", "threads")]
 
     k32.OpenProcess.restype = wt.HANDLE
-    ntdll = ctypes.WinDLL("ntdll")
-    ntdll.NtQuerySystemInformation.restype = ctypes.c_long
-    ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
-    system_process_information, length_mismatch = 5, -0x3ffffffc  # STATUS_INFO_LENGTH_MISMATCH
-
-    def snapshot():
-        """Every process from one SystemProcessInformation snapshot, or None if the call fails."""
-        size = 1 << 20
-        for _ in range(6):
-            buffer = ctypes.create_string_buffer(size)
-            needed = ctypes.c_ulong()
-            status = ntdll.NtQuerySystemInformation(system_process_information, buffer, size, ctypes.byref(needed))
-            if status == length_mismatch:
-                size = max(size * 2, needed.value + (64 << 10))
-                continue
-            if status < 0:
-                return None
-            return [(name, pagefile) for _pid, name, pagefile in
-                    parse_system_processes(memoryview(buffer)[:needed.value or size], ctypes.addressof(buffer))]
-        return None
 
     def read():
         perf = Performance()
         perf.cb = ctypes.sizeof(perf)
         commit = ((perf.commit_total * perf.page_size, perf.commit_limit * perf.page_size)
                   if psapi.GetPerformanceInfo(ctypes.byref(perf), perf.cb) else None)
-        everyone = snapshot()
-        if everyone:
-            return commit, everyone, 0
         pids = (wt.DWORD * 8192)()
         used = wt.DWORD()
         if not psapi.EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(used)):
@@ -179,7 +123,6 @@ def windows_reader():
         finally:
             k32.CloseHandle(handle)
 
-    read.snapshot = snapshot
     return read, alive
 
 

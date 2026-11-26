@@ -98,8 +98,6 @@ $translator = $null
 if ($Translate -and -not $Render) { Write-Warning "-Translate needs -Render (no shader cache without it); ignored" }
 if ($Translate -and $Render) {
     $revisionWarned = & $checkRevision
-    # translate.txt lines end with [t=N s], seconds since the title started: the watcher reads title.pid's time.
-    $env:X2W_TITLE_START_FILE = Join-Path $LogDir "title.pid"
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
         -RedirectStandardOutput (Join-Path $LogDir "translate.txt") -RedirectStandardError (Join-Path $LogDir "translate_err.txt")
