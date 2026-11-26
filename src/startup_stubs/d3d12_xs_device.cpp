@@ -3636,7 +3636,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
-    const u64 bytes = sig->own().indirect_bytes;
+    // The record a graphics command reads is its fixed argument struct; only the root-constants signature reads more (its stride
+    // holds the constant words), and the plain signatures' stride may carry padding that is not read.
+    const u64 bytes = !graphics ? sig->own().indirect_bytes : draw_constants ? sig->own().indirect_bytes :
+        indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
     if (graphics) {
