@@ -82,8 +82,14 @@ class Janitor(unittest.TestCase):
         parent = self.start("import time;time.sleep(1)")      # tester_run, stopped a second in
         result = self.janitor(parent.pid)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for proc in (debugger, title, translator):
+        for proc in (debugger, translator):
             proc.wait(timeout=10)
+        title_pid = int((self.logdir / "title.pid").read_text())   # the real interpreter (a launcher python is a process tree)
+        for _ in range(100):
+            if not W.pid_alive(title_pid):
+                break
+            time.sleep(0.1)
+        self.assertFalse(W.pid_alive(title_pid), "the title must be gone")
         self.assertTrue(self.zip.exists(), "the report was not packed")
         with zipfile.ZipFile(self.zip) as z:
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
@@ -92,7 +98,7 @@ class Janitor(unittest.TestCase):
         self.assertIn("last present #90 at 30 s", manifest["end_cause"])
         text = (self.logdir / "janitor.txt").read_text()
         self.assertIn("ended the translator", text)
-        self.assertIn("title %d gone" % title.pid, text)
+        self.assertIn("title %d gone" % title_pid, text)
         self.assertTrue((self.logdir / "stop").exists())
 
     def test_a_debugger_that_obeys_the_stop_file_is_not_killed(self):

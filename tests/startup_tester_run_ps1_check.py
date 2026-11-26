@@ -257,7 +257,9 @@ def check_shell(shell):
         while time.monotonic() - waited < 120 and not (set((tree / "out" / "tester").glob("report_*.zip")) - before):
             time.sleep(1)
         packed = sorted(set((tree / "out" / "tester").glob("report_*.zip")) - before)
-        assert packed, "the janitor did not pack the report of an interrupted run"
+        if not packed:
+            notes = {str(f.relative_to(tree)): f.read_text(errors="replace")[-1500:] for f in (tree / "out" / "tester").glob("run_*/janitor*.txt")}
+            raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
         with zipfile.ZipFile(packed[0]) as z:
             cut = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
