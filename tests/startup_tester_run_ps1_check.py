@@ -112,7 +112,8 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
     if merge_stderr:
         # A caller that merges the script's error stream into its output (`... 2>&1`, as a tester's wrapper or a log pipe
         # does): Windows PowerShell 5.1 then turns every line a native command writes to stderr into an error record.
-        words = " ".join("'%s'" % word for word in ("-Exe", "title.exe", "-DataDir", "data", *args))
+        words = " ".join(word if word.startswith("-") and not word[1:].isdigit() else "'%s'" % word
+                         for word in ("-Exe", "title.exe", "-DataDir", "data", *args))
         command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& '%s' %s 2>&1; exit $LASTEXITCODE" % (script, words)]
     else:
         command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Exe", "title.exe", "-DataDir", "data", *args]
