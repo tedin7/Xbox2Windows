@@ -106,7 +106,17 @@ struct Played {
     u64 self = 0;
     bool buffer_first = false;
     u64 top[top_slots]{};
+    u64 before[top_slots]{};  // the first word of each argument copy before the call
     u64 ret = 0;
+
+    // The call wrote a new value into argument `arg`'s copy: what an output is. A stack word past the slot's own
+    // arguments can point at the same variable as the real output; its copy is never written.
+    bool wrote(std::uint32_t arg, u64& now) const
+    {
+        if (arg >= static_cast<std::uint32_t>(top_slots) || !top[arg]) return false;
+        std::memcpy(&now, reinterpret_cast<const void*>(top[arg]), 8);
+        return now != before[arg];
+    }
 };
 
 using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
@@ -220,16 +230,17 @@ void learn_after(Player& p, const Recording& r, const Played& call)
     const Step& step = *call.step;
     const CallRecord& c = step.call;
     // Outputs: a wrapper the call put into an argument's memory, different from what was there: a new object.
+    std::vector<u64> made;  // recorded wrappers this call made
     for (const Output& o : step.outputs) {
-        if (o.arg >= static_cast<std::uint32_t>(call_args) || !call.top[o.arg]) continue;
         u64 now;
-        std::memcpy(&now, reinterpret_cast<const void*>(call.top[o.arg]), 8);
-        if (now && (now != p.translate(o.value) || !p.objects.count(o.value))) p.objects[o.value] = now;
+        if (o.arg >= static_cast<std::uint32_t>(call_args) || !call.wrote(o.arg, now) || !now) continue;
+        p.objects[o.value] = now;
+        made.push_back(o.value);
     }
     if (c.kind == device_kind && c.slot == device_create_descriptor_heap && call.top[0]) {
         HeapInfo info{};
         std::memcpy(&info, reinterpret_cast<const void*>(call.top[0]), sizeof(info));
-        for (const Output& o : step.outputs) p.heaps[o.value] = info;
+        for (const u64 heap : made) p.heaps[heap] = info;
     }
     // Struct returns through a buffer: the value is in the buffer, on both runs.
     const u64 old_value = call.buffer_first ? recorded_word(r, step, rcx_arg) : c.ret;
@@ -314,6 +325,8 @@ bool play(Player& p, const Recording& r, const Step& step)
     apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
+    for (int i = 0; i < top_slots; ++i)
+        if (call.top[i] && i != static_cast<int>(rcx_arg)) std::memcpy(&call.before[i], reinterpret_cast<const void*>(call.top[i]), 8);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     u64 rcx = call.self;
