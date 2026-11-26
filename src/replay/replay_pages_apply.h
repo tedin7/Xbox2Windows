@@ -16,20 +16,21 @@
 namespace x2w_replay {
 
 struct ReservedSpan {
-    u64 base, end;  // 64 KiB aligned, as VirtualAlloc reserves
+    u64 base, end;
 };
 
+inline bool span_contains(const std::vector<ReservedSpan>& spans, u64 address)
+{
+    const auto at = std::upper_bound(spans.begin(), spans.end(), address,
+                                     [](u64 a, const ReservedSpan& s) { return a < s.base; });
+    return at != spans.begin() && address < std::prev(at)->end;
+}
+
 struct PageReplay {
-    std::vector<ReservedSpan> spans;  // sorted, disjoint
+    std::vector<ReservedSpan> spans;  // sorted, disjoint, 64 KiB aligned
+    std::vector<ReservedSpan> map_spans;  // only ranges whose contents are restored by MAP
     std::size_t next_map = 0;
     u64 maps_applied = 0, pages_written = 0, zero_pages = 0, missing_pages = 0, bad_maps = 0;
-
-    bool reserved(u64 address) const
-    {
-        const auto at = std::upper_bound(spans.begin(), spans.end(), address,
-                                         [](u64 a, const ReservedSpan& s) { return a < s.base; });
-        return at != spans.begin() && address < std::prev(at)->end;
-    }
 };
 
 inline PageReplay& page_replay()
@@ -38,20 +39,33 @@ inline PageReplay& page_replay()
     return state;
 }
 
-// Reserves and commits every MAP range at its recorded address. False with the address that could not be had.
+inline void merge_spans(std::vector<ReservedSpan>& spans)
+{
+    std::sort(spans.begin(), spans.end(), [](const ReservedSpan& a, const ReservedSpan& b) { return a.base < b.base; });
+    std::size_t count = 0;
+    for (const ReservedSpan s : spans) {
+        if (count && s.base <= spans[count - 1].end) spans[count - 1].end = (std::max)(spans[count - 1].end, s.end);
+        else spans[count++] = s;
+    }
+    spans.resize(count);
+}
+
+// Reserves and commits MAP and descriptor backing ranges at their recorded addresses.
 inline bool reserve_page_ranges(const Recording& r, std::string& problem)
 {
-    constexpr u64 granule = 0x10000;
-    std::vector<ReservedSpan> wanted;
+    static constexpr u64 granule = 0x10000;
+    const auto aligned = [](u64 address, u64 bytes) -> ReservedSpan {
+        return {address & ~(granule - 1), (address + bytes + granule - 1) & ~(granule - 1)};
+    };
+    auto& state = page_replay();
     for (const PageMap& m : r.maps)
-        if (m.bytes) wanted.push_back({m.address & ~(granule - 1), (m.address + m.bytes + granule - 1) & ~(granule - 1)});
-    std::sort(wanted.begin(), wanted.end(), [](const ReservedSpan& a, const ReservedSpan& b) { return a.base < b.base; });
-    std::vector<ReservedSpan>& spans = page_replay().spans;
-    for (const ReservedSpan& s : wanted) {
-        if (!spans.empty() && s.base <= spans.back().end) spans.back().end = (std::max)(spans.back().end, s.end);
-        else spans.push_back(s);
-    }
-    for (const ReservedSpan& s : spans) {
+        if (m.bytes) state.map_spans.push_back(aligned(m.address, m.bytes));
+    merge_spans(state.map_spans);
+    state.spans = state.map_spans;
+    for (const Step& step : r.steps)
+        if (step.descriptor_bytes) state.spans.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
+    merge_spans(state.spans);
+    for (const ReservedSpan& s : state.spans) {
         void* const at = VirtualAlloc(reinterpret_cast<void*>(s.base), static_cast<SIZE_T>(s.end - s.base), MEM_RESERVE | MEM_COMMIT,
                                       PAGE_READWRITE);
         if (at != reinterpret_cast<void*>(s.base)) {

@@ -48,6 +48,7 @@ struct Step {
     std::vector<ArgMemory> memory;  // in the order written: a parent before what it points at
     std::vector<Output> outputs;
     const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
+    u64 descriptor_address = 0, descriptor_bytes = 0;   // DHPM: caller-supplied CPU backing for slot 14
 };
 
 struct Blob {
@@ -164,6 +165,19 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
                                           ((arg == 1 || arg == 4) ? 8 : 4);
             if (data_bytes != expected) return "DARR size mismatch at " + std::to_string(at);
             step.descriptor_arrays = out.base + data_at;
+        } else if (name == "DHPM") {
+            u64 backing[3];
+            if (header_bytes != sizeof(backing) || data_bytes) return "invalid DHPM at " + std::to_string(at);
+            std::memcpy(backing, h, sizeof(backing));
+            const auto found = by_seq.find(backing[0]);
+            if (found == by_seq.end()) return "DHPM before its CALL at " + std::to_string(at);
+            auto& step = out.steps[found->second];
+            if (step.call.kind != 0 || step.call.slot != 14 || step.descriptor_bytes ||
+                backing[1] < 0x10000 || backing[1] >= 0x800000000000ull ||
+                !backing[2] || backing[2] > 0x800000000000ull - backing[1])
+                return "invalid descriptor backing at " + std::to_string(at);
+            step.descriptor_address = backing[1];
+            step.descriptor_bytes = backing[2];
         } else if (name == "OUTP" && header_bytes >= 24) {
             u64 seq;
             Output o{};

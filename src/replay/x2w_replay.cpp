@@ -6,7 +6,7 @@
 //                   [--from-present K] [--max-seconds S]
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
-// pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
+// recording could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
 // 77 no D3D12 adapter.
 //
 // Version 1 plays on one thread. Per call:
@@ -72,6 +72,7 @@ struct Range {
 struct Player {
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
+    std::vector<ReservedSpan> descriptor_backings;  // exact ranges of heaps created so far
     std::map<u64, Range> handles;              // recorded handle / mapped / GPU address start -> replay start, span
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
@@ -81,6 +82,11 @@ struct Player {
     u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
     void* device = nullptr;
     std::wstring map_dump_dir;
+
+    bool descriptor_backing(u64 address) const
+    {
+        return span_contains(descriptor_backings, address);
+    }
 
     // A recorded byte range inside a translated range: the replay's address, `bytes` clipped to that range.
     u64 page_target(u64 address, u64& bytes) const
@@ -98,6 +104,7 @@ struct Player {
     u64 translate(u64 value) const
     {
         if (const auto found = objects.find(value); found != objects.end()) return found->second;
+        if (descriptor_backing(value)) return value;
         auto above = handles.upper_bound(value);
         if (above == handles.begin()) return value;
         --above;
@@ -174,8 +181,8 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
     copies.assign(step.memory.size(), nullptr);
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
-        // Title memory the pages replay (reserved at its own address): passed as is, never copied.
-        if (page_replay().reserved(m.address)) {
+        // Descriptor writes rebuild the backing in place. Other arguments on the same allocation granule still need their blobs.
+        if (p.descriptor_backing(m.address) || span_contains(page_replay().map_spans, m.address)) {
             copies[i] = reinterpret_cast<unsigned char*>(m.address);
             ++p.title_memory_args;
             continue;
@@ -403,7 +410,21 @@ bool play(Player& p, const Recording& r, const Step& step)
     u64 token = ~expected_token;
     // The recording holds the post-call token. Start with a different value to prove that replay writes it.
     if (wait && c.args[token_arg]) a[token_arg] = reinterpret_cast<u64>(&token);
+    struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        u64 address, bytes;
+    } heap_desc{};
+    if (step.descriptor_bytes && call.top[0]) {
+        std::memcpy(&heap_desc.desc, reinterpret_cast<const void*>(call.top[0]), sizeof(heap_desc.desc));
+        heap_desc.address = step.descriptor_address;
+        heap_desc.bytes = step.descriptor_bytes;
+        a[0] = reinterpret_cast<u64>(&heap_desc);
+    }
     call.ret = call_slot(call.self, rcx, c.slot, a);
+    if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
+        p.descriptor_backings.push_back({step.descriptor_address, step.descriptor_address + step.descriptor_bytes});
+        merge_spans(p.descriptor_backings);
+    }
     if (wait || barrier_noop) {
         p.frame_waits += wait;
         p.barrier_noops += barrier_noop;
@@ -572,7 +593,7 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 2;
     }
-    // First, before the stand-in or anything else can map there: the title ranges the pages replay.
+    // Reserve title ranges before the stand-in can allocate at those addresses.
     if (std::string problem; !reserve_page_ranges(r, problem)) {
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
