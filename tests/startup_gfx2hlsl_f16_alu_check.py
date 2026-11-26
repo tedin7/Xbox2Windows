@@ -95,7 +95,7 @@ def run(asm, regs):
         mul16=lambda a, b: a * b,
         f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
         minmax_zero32=lambda a, b, mx: (max if mx else min)(a, b),
-        abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
+        exp2=lambda x: 2.0 ** x, abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
     py = expr.replace('0u', '0').replace('&&', 'and').replace('false', 'False').replace('true', 'True')
@@ -201,6 +201,25 @@ try:
 except G.Unsupported:
     check('SDWA binary16 refuses the undefined upper half of a d16 load as a source', True)
 check('clamp saturates the binary16 result', run('v_add_f16 v3, v0, v1 clamp', [THREE, TWO, 0, 0])[1] == ONE)
+
+for op, low_result, high_result in (('v_exp_f16', TWO, f2h(8.0)),
+                                    ('v_rcp_f16', ONE, f2h(1.0 / 3.0))):
+    regs = [(THREE << 16) | ONE, 0, 0, 0xabcd1234]
+    check(op + ' plain low half', run(op + '_e32 v3, v0', regs)[1] == low_result)
+    for src, result in (('DWORD', low_result), ('WORD_0', low_result), ('WORD_1', high_result)):
+        for dst, shift, kept in (('WORD_0', 0, 0xabcd0000), ('WORD_1', 16, 0x1234)):
+            for unused, preserved in (('UNUSED_PAD', 0), ('UNUSED_PRESERVE', kept)):
+                asm = f'{op}_sdwa v3, v0 dst_sel:{dst} dst_unused:{unused} src0_sel:{src}'
+                check(asm, run(asm, regs)[1] == ((result << shift) | preserved))
+    for suffix in ('src0_sel:BYTE_1', 'src0_sel:WORD_0 src1_sel:WORD_0',
+                   'src0_sel:WORD_0 clamp'):
+        asm = f'{op}_sdwa v3, v0 dst_sel:WORD_0 dst_unused:UNUSED_PAD {suffix}'
+        try:
+            stage().one(op + '_sdwa', asm)
+            check('refuses ' + asm, False)
+        except G.Unsupported as reason:
+            check('refuses ' + asm, op in str(reason))
+
 
 for asm in ('v_add_f16 v3, v0, v1 op_sel:[1,0]', 'v_cvt_i16_f16 v3, v0 clamp', 'v_add_f16 v3, v0',
             'v_fmaak_f16 v3, v0, v1', 'v_mul_f16 v3, v0, v1 mul:2',
