@@ -4617,6 +4617,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_shift64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # The high half of an unsigned 32x32 product (#1792).
+    add_test(NAME startup_gfx2hlsl_mul_hi_u32 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_u32_check.py")
     # gfx2hlsl signed multiply-high (v_mul_hi_i32, s_mul_hi_i32): helper math, refusals, mutations and draws.
     add_test(NAME startup_gfx2hlsl_mul_hi_i32_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_i32_check.py")
