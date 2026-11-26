@@ -2238,6 +2238,16 @@ set_tests_properties(startup_present_view_identity_control startup_present_view_
 set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Buffer memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_buffer.h); the mutated
 # runs are negative controls.
+# Translation manifests are read by a background thread, never with draw_lock held (src/startup_stubs/manifest_prefetch.h);
+# the mutated run opens the file inside the draw-path call and must fail the lock-hold measurement.
+add_executable(startup_manifest_prefetch_check tests/startup_manifest_prefetch_check.cpp)
+target_include_directories(startup_manifest_prefetch_check PRIVATE src)
+target_compile_features(startup_manifest_prefetch_check PRIVATE cxx_std_17)
+add_test(NAME startup_manifest_prefetch COMMAND startup_manifest_prefetch_check)
+add_test(NAME startup_manifest_prefetch_open_under_lock_control COMMAND startup_manifest_prefetch_check --mutate open-under-lock)
+set_tests_properties(startup_manifest_prefetch_open_under_lock_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_manifest_prefetch_retry_under_lock_control COMMAND startup_manifest_prefetch_check --mutate retry-under-lock)
+set_tests_properties(startup_manifest_prefetch_retry_under_lock_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)

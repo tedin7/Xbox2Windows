@@ -53,6 +53,7 @@
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/manifest_prefetch.h"
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
@@ -7512,6 +7513,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        log("x2w-render manifest lookups: file opens under draw_lock, first lookups %lld, retries %lld (must be 0); manifests read by the background thread %lld",
+            manifest_source().first_opens_under_lock(), manifest_source().retry_opens_under_lock(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);

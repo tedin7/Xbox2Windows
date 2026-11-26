@@ -230,6 +230,56 @@ bool cache_path(wchar_t* out, const wchar_t* prefix, u64 key, const wchar_t* ext
     return true;
 }
 
+bool read_text(const wchar_t* path, std::string& out);
+
+// Translation manifests are read by a background thread, never with draw_lock held (see manifest_prefetch.h). A manifest
+// the thread has not read yet counts as absent and is asked for again soon; the thread lists the cache directory about
+// four times a second while any key is waiting.
+constexpr ULONGLONG manifest_retry_ms = 250;
+x2w_startup::ManifestPrefetch::Io manifest_io()
+{
+    x2w_startup::ManifestPrefetch::Io io;
+    io.list = [] {
+        std::vector<u64> keys;
+        wchar_t dir[MAX_PATH], pattern[MAX_PATH + 8];
+        const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+        if (!n || n >= MAX_PATH) return keys;
+        swprintf(pattern, MAX_PATH + 8, L"%s\\*.txt", dir);
+        WIN32_FIND_DATAW found;
+        HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return keys;
+        do {
+            // <16 hex digits>.txt only; the other manifests (.mesh86.txt, ...) have longer names.
+            if (wcslen(found.cFileName) != 20) continue;
+            wchar_t* end = nullptr;
+            const u64 key = wcstoull(found.cFileName, &end, 16);
+            if (end == found.cFileName + 16) keys.push_back(key);
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+        return keys;
+    };
+    io.read = [](u64 key, std::string& text) {
+        wchar_t path[MAX_PATH];
+        return cache_path(path, L"", key, L".txt") && read_text(path, text);
+    };
+    return io;
+}
+x2w_startup::ManifestSource& manifest_source()
+{
+    static x2w_startup::ManifestSource source(manifest_io());
+    static const HANDLE worker = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        for (;;) {
+            const std::size_t loaded = manifest_source().prefetch().has_wanted() ? manifest_source().prefetch().scan() : 0;
+            Sleep(loaded ? 50 : 250);
+        }
+    }, nullptr, 0, nullptr);
+    (void)worker;
+    return source;
+}
+// draw_lock held. The first lookup of a key opens the file (once); a retry of an absent key takes what the background
+// thread has read and opens nothing.
+bool fetch_manifest(u64 key, bool retry, std::string& out) { return manifest_source().load(key, retry, out); }
+
 bool read_text(const wchar_t* path, std::string& out)
 {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -298,14 +348,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
-    if (!read_text(path, manifest)) {
+    if (!fetch_manifest(tr.key, tr.retry_manifest_at != 0, manifest)) {
         if (!tr.retry_manifest_at) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
         }
-        tr.retry_manifest_at = GetTickCount64() + 1000;
+        tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return;
     }
     // The writer publishes this marker last. A malformed published result stays rejected.
