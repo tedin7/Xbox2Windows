@@ -3494,6 +3494,14 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
 x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
 {
+    // X2W_SPEED_ROOT=1: a table found before is answered from a per-thread cache (resolved_table_cache.h); the heap list only
+    // grows and a found entry never changes, so no lock and no walk. A miss is looked up again every time.
+    static const bool speed_root = [] { wchar_t v[4]; return GetEnvironmentVariableW(L"X2W_SPEED_ROOT", v, 4) && v[0] == L'1'; }();
+    static thread_local x2w_startup::ResolvedTableCache cache;
+    const u64 view_heap = reinterpret_cast<u64>(pass.source_view_heap);
+    if (speed_root) {
+        if (const auto kept = cache.find(view_heap, gpu_handle); kept.address) return kept;
+    }
     x2w_startup::ViewTable table;
     note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
@@ -3504,6 +3512,7 @@ x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
         if (table.address) break;
     }
     ReleaseSRWLockShared(&note_lock);
+    if (speed_root) cache.keep(view_heap, gpu_handle, table);
     return table;
 }
 
