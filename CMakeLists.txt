@@ -1433,6 +1433,15 @@ endforeach()
 
 # List upload pages stay flat over 10,000 record/execute cycles on an allocator that is never reset, are not reused
 # while the GPU has not passed them, and are never reused when no submit can be tracked.
+# The rule that gives an arena's pages back (Arena::finished): the recording's own submits and two later submits of every queue.
+add_executable(startup_upload_arena_guard tests/startup_upload_arena_guard.cpp)
+target_include_directories(startup_upload_arena_guard PRIVATE src)
+target_compile_features(startup_upload_arena_guard PRIVATE cxx_std_17)
+target_link_libraries(startup_upload_arena_guard PRIVATE d3d12 dxgi)
+add_test(NAME startup_upload_arena_guard COMMAND startup_upload_arena_guard)
+set_tests_properties(startup_upload_arena_guard PROPERTIES SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "startup_upload_arena_guard: PASS")
+add_test(NAME startup_upload_arena_guard_own_only_control COMMAND startup_upload_arena_guard --own-only)
+set_tests_properties(startup_upload_arena_guard_own_only_control PROPERTIES SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "FAIL: ")
 add_executable(startup_upload_page_reuse tests/startup_upload_page_reuse.cpp)
 target_compile_features(startup_upload_page_reuse PRIVATE cxx_std_17)
 target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -1443,11 +1452,11 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_upload_page_reuse_untracked_${backend} COMMAND startup_upload_page_reuse ${backend} untracked)
     set_tests_properties(startup_upload_page_reuse_untracked_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
-    # The default since Run P: no reuse (X2W_UPLOAD_PAGE_REUSE unset), the pages grow as in Run O (exit 12).
+    # X2W_UPLOAD_PAGE_REUSE=0 (reuse is on by default again, behind the queue guard): the pages grow as in Run O (exit 12).
     add_test(NAME startup_upload_page_reuse_default_off_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_default_off_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "1 growing: "
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_UPLOAD_PAGE_REUSE=0")
     # Control: without the reuse the pages grow (exit 12).
     add_test(NAME startup_upload_page_reuse_mutant_${backend} COMMAND startup_upload_page_reuse ${backend})
     set_tests_properties(startup_upload_page_reuse_mutant_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77

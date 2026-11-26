@@ -1593,11 +1593,22 @@ LONG64 arenas_recycled_early;  // arenas recycled before their allocator's Reset
 // that allocator's submits do not cover): the pages are then released at the allocator's Reset, as before.
 bool upload_page_reuse()
 {
+    // On unless X2W_UPLOAD_PAGE_REUSE=0: a page is given back only when the recording's own submits and, for every queue, two
+    // later submits have passed (Arena::finished).
     static const bool on = [] {
         char value[4]{};
-        return GetEnvironmentVariableA("X2W_UPLOAD_PAGE_REUSE", value, sizeof(value)) == 1 && value[0] == '1';
+        return !(GetEnvironmentVariableA("X2W_UPLOAD_PAGE_REUSE", value, sizeof(value)) == 1 && value[0] == '0');
     }();
     return on;
+}
+
+// X2W_TEST_UPLOAD_PAGES_MUTANT=own-only (fixtures only): an arena is finished by its own recording's submits alone, as in
+// Run P; unfenced: it is finished as soon as it is retired.
+bool upload_mutant_is(const char* name)
+{
+    static char value[16]{};
+    static const DWORD n = GetEnvironmentVariableA("X2W_TEST_UPLOAD_PAGES_MUTANT", value, sizeof(value));
+    return n && n < sizeof(value) && std::strcmp(value, name) == 0;
 }
 
 bool upload_reuse_mutant()
@@ -1615,7 +1626,17 @@ bool upload_reuse_mutant()
 void retire_list_arena(Wrapper* list)
 {
     auto& state = list->own();
-    if (state.list_uploads) state.list_uploads->retired = true;
+    if (state.list_uploads) {
+        state.list_uploads->retired = true;
+        auto& guards = state.list_uploads->guards;
+        guards.clear();
+        try {
+            for (auto& entry : queue_submits)
+                if (entry.second.fence) guards.push_back({entry.second.fence, entry.second.value, &entry.second.value});
+        } catch (const std::bad_alloc&) {
+            state.list_uploads->untracked = true;  // never reused
+        }
+    }
     state.list_uploads = nullptr;
 }
 
@@ -1623,8 +1644,10 @@ void retire_list_arena(Wrapper* list)
 // submits) goes back to the free pages.
 void recycle_arenas(DesktopAllocator& allocator)
 {
-    if (upload_page_reuse())
-        for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
+    // An arena the other queues may still read (Arena::finished) is released instead of given back.
+    if (upload_page_reuse() && !upload_reuse_mutant())
+        for (auto& arena : allocator.uploads)
+            if (upload_mutant_is("unfenced") || arena->finished(!upload_mutant_is("own-only"))) arena->recycle(free_upload_pages);
     allocator.uploads.clear();
 }
 
@@ -1636,7 +1659,8 @@ void reclaim_finished_arenas(DesktopAllocator& allocator)
     if (!upload_page_reuse() || upload_reuse_mutant()) return;
     auto& arenas = allocator.uploads;
     for (auto it = arenas.begin(); it != arenas.end();) {
-        if (!(*it)->finished()) {
+        const bool done = upload_mutant_is("unfenced") ? (*it)->retired : (*it)->finished(!upload_mutant_is("own-only"));
+        if (!done) {
             ++it;
             continue;
         }
