@@ -2016,7 +2016,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 continue
             if a_end <= source < target < count_at:
                 loads = [i for i in range(source + 1, target) if ins[i][2] in MESH_WAVE_BLOCK_LOADS]
-                if loads:
+                if len(loads) == 1:
+                    load = loads[0]   # the single-load shape has its own proof; several loads take the general wave-wide skip
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
