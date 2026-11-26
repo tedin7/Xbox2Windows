@@ -25,6 +25,7 @@ static void* create_present_queue(void* guest)
 //   same     the memory is left alone (red both times)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
+//   verify-write / verify-same  two draws in one frame with verification of the 64 KiB snapshot
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
@@ -35,10 +36,12 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
     const bool big = !std::strncmp(mode, "big-", 4);
+    const bool verify = !std::strncmp(mode, "verify-", 7);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool once = keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
-    if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
+    if (verify && std::strcmp(mode, "verify-write") && std::strcmp(mode, "verify-same")) return 2;
+    if (!verify && !once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
     alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
@@ -70,7 +73,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     }
     const auto* memory = once ? large : constants;
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory),
-        once ? large_bytes : big ? static_cast<UINT>(sizeof(constants)) : 256u};
+        once ? large_bytes : (big || verify) ? static_cast<UINT>(sizeof(constants)) : 256u};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
     if (keys) {
         // The second view: the same address, 64 KiB long.
@@ -128,8 +131,17 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
         if (!queue) return 44;
         invoke(queue, 32, 0, 0, 0);
     }
+    if (verify && !std::strcmp(mode, "verify-write")) {
+        // The first draw trims this zero tail. The second draw still sees the cached zero.
+        constants[16384 - 3] = 1.0f;
+    }
     const D3D12_RECT right{static_cast<LONG>(width / 2), 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&right));  // RSSetScissorRects
     invoke(list, 12, 3, 1);                                         // draw into the right half
+    if (verify) {
+        void* queue = create_present_queue(guest);
+        if (!queue) return 44;
+        invoke(queue, 32, 0, 0, 0);
+    }
     return 0;
 }

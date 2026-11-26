@@ -118,8 +118,70 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def verify_counts(log, expected_changed):
+    totals = re.findall(
+        r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes(?:, (\d+) changed hits)?",
+        log,
+    )
+    expected = [] if expected_changed is None else [("1", "1", "1", "1", "256", str(expected_changed))]
+    if totals != expected:
+        raise AssertionError(f"frame totals {totals!r}, expected {expected!r}")
+    changes = re.findall(r"large binding changed: address=(0x[0-9a-f]+) size=(\d+) frame=(\d+)", log)
+    if len(changes) != (expected_changed or 0) or any(
+        not int(address, 16) or size != "65536" or frame != "1" for address, size, frame in changes
+    ):
+        raise AssertionError(f"changed ranges {changes!r}, expected {expected_changed or 0} for frame 1, 65536 bytes")
+
+
+def check_verify(directory, consumer, backend):
+    shader = """ByteAddressBuffer constants : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    float3 head = asfloat(constants.Load3(0));
+    float tail_green = asfloat(constants.Load(65524));
+    return float4(head + float3(0, tail_green, 0), 1);
+}
+"""
+    for name, rewrite, verify, mutant in (
+        ("rewrite", True, True, False),
+        ("unchanged", False, True, False),
+        ("off", True, False, False),
+        ("wrong_copy", True, True, True),
+    ):
+        folder = directory / name
+        folder.mkdir()
+        trap = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "verify-write" if rewrite else "verify-same",
+            "X2W_TRAP_LOG": str(trap),
+            "X2W_BIGBIND_ONCE": "1",
+            "X2W_BIGBIND_VERIFY": str(int(verify)),
+            "X2W_TEST_BIGBIND_VERIFY_WRONG_COPY": str(int(mutant)),
+            "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        # CPU reference: both halves read the first snapshot (red head, zero tail).
+        expected = RED * 32
+        if pixels != expected:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {expected.hex()}")
+        log = trap.read_text(errors="replace")
+        expected_changed = int(rewrite) if verify else None
+        if mutant:
+            try:
+                verify_counts(log, expected_changed)
+            except AssertionError:
+                verify_counts(log, 0)
+            else:
+                raise AssertionError("wrong-copy mutant passed the rewrite check")
+        else:
+            verify_counts(log, expected_changed)
+        print(f"{backend} {name}: 32 pixels exact, diagnostic check passed")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        mode = sys.argv[3] if len(sys.argv) > 3 else ""
+        check_mode = {"once": check_once, "verify": check_verify}.get(mode, check)
         sys.exit(check_mode(Path(temporary), consumer, backend))

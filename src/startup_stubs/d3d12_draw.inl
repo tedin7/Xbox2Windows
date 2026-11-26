@@ -1572,10 +1572,50 @@ bool bigbind_once_enabled()
     return on;
 }
 
+// Debug instrumentation for the once-per-frame snapshot. Enable explicitly in any build.
+bool bigbind_verify_enabled()
+{
+    static const bool on = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_BIGBIND_VERIFY", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
+// Hash the whole binding up to 256 KiB. For larger bindings, sample 16 evenly spaced
+// 4 KiB blocks, including both ends. Bytes beyond the backed prefix read as zero.
+bool bigbind_fingerprint(const void* data, std::size_t backed, std::size_t size, u64* result)
+{
+    static constexpr unsigned char zeroes[4096]{};
+    constexpr std::size_t samples = 16;
+    const bool sampled = size > (256u << 10);
+    const std::size_t block = sampled ? sizeof(zeroes) : size;
+    const std::size_t count = sampled ? samples : 1;
+    u64 hash = 1469598103934665603ull;
+    __try {
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t offset = sampled ? (size - block) * i / (samples - 1) : 0;
+            const std::size_t present = offset < backed ? (std::min)(block, backed - offset) : 0;
+            if (present) hash = fnv_bytes(static_cast<const unsigned char*>(data) + offset, present, hash);
+            for (std::size_t missing = block - present; missing;) {
+                const std::size_t chunk = (std::min)(missing, sizeof(zeroes));
+                hash = fnv_bytes(zeroes, chunk, hash);
+                missing -= chunk;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    *result = hash;
+    return true;
+}
+
 struct BigBinding {
     std::size_t bytes = 0;
     bool readable = false;
     UploadReservation slice;
+    u64 fingerprint = 0;
+    bool fingerprint_valid = false;
 };
 
 // Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
@@ -1583,7 +1623,7 @@ struct BigBinding {
 std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
 UploadChunkMask big_binding_chunks;
 struct BigBindingCounts {
-    unsigned trims = 0, copies = 0, hits = 0;
+    unsigned trims = 0, copies = 0, hits = 0, changed_hits = 0;
     std::size_t copied_bytes = 0;
 };
 BigBindingCounts big_binding_counts;
@@ -1608,6 +1648,31 @@ std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
     return {address, bigbind_key_address_mutant() ? 0 : full_bytes};
 }
 
+void verify_bigbind_hit(const BigBinding& cached, u64 address, std::size_t size)
+{
+    if (!cached.fingerprint_valid) return;
+    const auto* title = reinterpret_cast<const void*>(address);
+    bool extent_ok = false;
+    const auto extent = x2w_local::committed_extent(title, size, &extent_ok);
+    // A reserved suffix reads as zero. An unreadable interior cannot be compared safely.
+    if (!extent_ok || x2w_local::committed_prefix(title, extent) != extent) return;
+    u64 current;
+    if (!bigbind_fingerprint(title, extent, size, &current)) return;
+    // Fixture control: read the snapshot again instead of comparing against title memory.
+    static const bool wrong_copy = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_TEST_BIGBIND_VERIFY_WRONG_COPY", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    if (wrong_copy && !bigbind_fingerprint(cached.slice.mapped, cached.bytes, size, &current)) return;
+    if (current == cached.fingerprint) return;
+    ++big_binding_counts.changed_hits;
+    static unsigned logged;
+    if (logged < 8) {
+        ++logged;
+        log("x2w-draw large binding changed: address=0x%llx size=%zu frame=%ld", address, size, frame_number + 1);
+    }
+}
+
 void finish_bigbind_frame(LONG frame)
 {
     if (!bigbind_no_reset_mutant()) big_bindings.clear();
@@ -1622,7 +1687,11 @@ void finish_bigbind_frame(LONG frame)
         GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
         return std::strncmp(mode, "once", 4) == 0;
     }();
-    if (report && big_binding_counts.trims)
+    if (bigbind_verify_enabled() && (big_binding_counts.hits || big_binding_counts.trims))
+        log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes, %u changed hits", frame,
+            big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits,
+            big_binding_counts.copied_bytes, big_binding_counts.changed_hits);
+    else if (report && big_binding_counts.trims)
         log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
             big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
     big_binding_counts = {};
@@ -3381,6 +3450,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = cached->bytes;
             readable_range = cached->readable;
             ++big_binding_counts.hits;
+            if (bigbind_verify_enabled()) verify_bigbind_hit(*cached, address, full_bytes);
         } else {
             if (address && large_raw) {
                 bool extent_ok = false;
@@ -3409,6 +3479,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
                 if (slice.mapped) {
                     std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
+                    if (bigbind_verify_enabled())
+                        cached->fingerprint_valid = bigbind_fingerprint(slice.mapped, bytes, full_bytes, &cached->fingerprint);
                     ++big_binding_counts.copies;
                     big_binding_counts.copied_bytes += bytes;
                     InterlockedIncrement64(&big_copies_made);

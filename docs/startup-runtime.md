@@ -3649,3 +3649,21 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+### Verify once-per-frame large bindings
+
+Set `X2W_BIGBIND_VERIFY=1` with `X2W_BIGBIND_ONCE=1` to diagnose title-memory
+writes after a large raw binding has been cached. The diagnostic is off by default.
+Each frame's large-binding totals report changed hits, and the first eight changed
+hits in the process log the binding address, declared byte size and frame number.
+The draw continues to use the cached snapshot.
+
+Verification hashes the full range through 256 KiB, including the zero tail
+omitted from the upload. Above 256 KiB it samples 16 evenly spaced 4 KiB blocks
+and can miss writes outside them. Hits without a readable snapshot or a safely
+readable current range are skipped.
+
+The Windows WARP fixture checks the two draws against a CPU pixel reference and
+checks the diagnostic for a rewrite, unchanged bytes, the disabled switch and a
+wrong-copy control. Run
+`ctest --preset dev --no-tests=error -R '^startup_frame_copy_verify_warp$' -V`.
