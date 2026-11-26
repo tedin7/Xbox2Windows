@@ -2147,6 +2147,13 @@ void write_file(const wchar_t* path, const void* data, std::size_t bytes);
 // logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
 // plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
 // copy, the note and the dump alone. Neither is the composited window picture.
+// Gray world (x2w-gray lines): the time the first flat picture was read back, and the last readback (ticks since the process
+// start; 0 = not yet). The onset line in gray_onset_poll compares it with the first ring refusal and the first draw not drawn.
+const ULONGLONG gray_t0 = GetTickCount64();
+volatile LONG64 gray_flat_at_ms = 0, gray_last_readback_ms = 0, gray_last_line_ms = 0;
+volatile LONG64 gray_flat_mean_x100 = 0, gray_flat_spread_x100 = 0;
+volatile LONG gray_flat_episodes = 0;  // times the picture turned flat (bright, no spread); each is logged once, at most 8
+
 void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int raw_plane = -1)
 {
     const bool raw = raw_plane >= 0;
@@ -2235,7 +2242,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         AcquireSRWLockExclusive(&shown_lock);
         shown_pixels.resize(shown_width * shown_height);
     }
-    std::uint64_t sum = 0, alpha_sum = 0;
+    std::uint64_t sum = 0, alpha_sum = 0, luma_squares = 0;  // luma_squares: for the spread of the picture (flat fill or detail)
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -2244,6 +2251,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
             if (!raw) shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
             sum += r + g + b;
+            { const unsigned luma = (r + g + b) / 3; luma_squares += static_cast<std::uint64_t>(luma) * luma; }
             alpha_sum += texel[3];
         }
     }
@@ -2286,8 +2294,12 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         return;
     }
     const LONG count = InterlockedIncrement(&shown_frames);
-    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
-                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
+    // Spread of the luma over the picture: near 0 is a flat fill or fade, a lit scene is tens.
+    const double pixels_seen = 1.0 * shown_width * shown_height;
+    const double luma_mean = sum / (3.0 * pixels_seen);
+    const double luma_spread = std::sqrt((std::max)(0.0, luma_squares / pixels_seen - luma_mean * luma_mean));
+    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255, spread %.2f",
+                  desc.Width, desc.Height, desc.Format, count, luma_mean, luma_spread);
     // Also whenever the picture's mean level moved by more than 2 since the last line (a screen change shows in the log
     // with its time; at most 300 such lines), not only for the first 3 readbacks and every 40th.
     static double last_logged_mean = -1000;
@@ -2295,7 +2307,22 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     const double mean_level = sum / (3.0 * shown_width * shown_height);
     const bool periodic = (count > 0 && count <= 3) || count % 40 == 0;
     const bool moved = std::fabs(mean_level - last_logged_mean) > 2 && change_lines < 300;
-    if (periodic || moved) {
+    // By time as well: a slow run reads the picture back tens of seconds apart, so a line at least every 5 s.
+    const LONG64 tick_ms = static_cast<LONG64>(GetTickCount64() - gray_t0);
+    InterlockedExchange64(&gray_last_readback_ms, tick_ms);
+    const bool timed = tick_ms - gray_last_line_ms >= 5000;
+    if (timed) InterlockedExchange64(&gray_last_line_ms, tick_ms);
+    // A flat picture: bright and nearly no spread. The first one is the onset the interval lines are compared with.
+    static bool was_flat = false;
+    const bool flat_now = luma_mean > 100 && luma_spread < 4;
+    if (flat_now && !was_flat) {
+        InterlockedIncrement(&gray_flat_episodes);
+        gray_flat_at_ms = tick_ms ? tick_ms : 1;
+        gray_flat_mean_x100 = static_cast<LONG64>(luma_mean * 100);
+        gray_flat_spread_x100 = static_cast<LONG64>(luma_spread * 100);
+    }
+    was_flat = flat_now;
+    if (periodic || moved || timed) {
         if (moved && !periodic) {
             ++change_lines;
             log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
@@ -7614,6 +7641,22 @@ PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
     return out;
 }
 
+// One line when the first flat picture, the first upload ring refusal and the first draw not drawn have all happened (or at the
+// first flat picture, listing what has not happened yet): which came first names the branch of the gray world.
+void gray_onset_poll(LONG frame, ULONGLONG)
+{
+    static LONG64 first_refusal_ms = 0, first_not_drawn_ms = 0;
+    static LONG logged_episodes = 0;
+    const LONG64 now_ms = static_cast<LONG64>(GetTickCount64() - gray_t0);
+    if (!first_refusal_ms && upload_ring_refusals) first_refusal_ms = now_ms ? now_ms : 1;
+    if (!first_not_drawn_ms && untranslated_draws) first_not_drawn_ms = now_ms ? now_ms : 1;
+    if (logged_episodes >= gray_flat_episodes || logged_episodes >= 8) return;
+    logged_episodes = gray_flat_episodes;
+    log("x2w-gray onset %ld (frame %ld): flat picture from %.1f s (mean %.2f, spread %.2f); first upload ring refusal at %s%.1f s; first draw not drawn at %s%.1f s",
+        logged_episodes, frame, gray_flat_at_ms / 1000.0, gray_flat_mean_x100 / 100.0, gray_flat_spread_x100 / 100.0, first_refusal_ms ? "" : "NONE yet, ",
+        first_refusal_ms / 1000.0, first_not_drawn_ms ? "" : "NONE yet, ", first_not_drawn_ms / 1000.0);
+}
+
 // The first presents and every 300th: each plane's first resource and its shape.
 void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
 {
@@ -7707,7 +7750,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         hex_text(present_parameters, 0x40, b, sizeof(b));
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
-    if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
+    gray_onset_poll(frame, now);
+    // Also at least every 5 s of run time, so a slow run (a present every second or two) still has a picture line.
+    const bool readback_due = frame % (shown_in_window ? 60 : 6) == 0 ||
+        static_cast<LONG64>(GetTickCount64() - gray_t0) - gray_last_readback_ms >= 5000;
+    if (render_mode() && readback_due && planes && plane_parameters) {
         // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
@@ -7757,6 +7804,22 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
+        // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
+        static long last[9];
+        const UploadRingStats ring_now = upload_ring_stats();
+        const long now_values[9] = {ring_now.refusals, null_total, null_causes[5], untranslated_draws, translated_draws,
+                                    compute_dispatches_translated, compute_dispatches_refused, textures_unreadable, list_copies_refused};
+        char text[360];
+        std::snprintf(text, sizeof(text),
+                      "x2w-gray interval (frame %ld): ring refusals +%ld, null bindings +%ld (ring_full +%ld), draws not drawn +%ld, translated draws +%ld, "
+                      "compute translated +%ld, compute refused +%ld, textures unreadable +%ld, list copies refused +%ld",
+                      frame, now_values[0] - last[0], now_values[1] - last[1], now_values[2] - last[2], now_values[3] - last[3],
+                      now_values[4] - last[4], now_values[5] - last[5], now_values[6] - last[6], now_values[7] - last[7], now_values[8] - last[8]);
+        std::memcpy(last, now_values, sizeof(last));
+        log("%s", text);
+    }
     if (render_mode() && frame % 300 == 0) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
