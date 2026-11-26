@@ -67,11 +67,17 @@ def check_preset():
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
     accept = T.input_preset("accept", 600)
     presses = accept.split(",")
-    assert presses[:3] == ["4@35+0.3", "4@45+0.3", "4@55+0.3"] and presses[-1] == "4@595+0.3" and len(presses) == 57, (presses[:3], presses[-1], len(presses))
+    assert presses[:4] == ["4@35+0.3", "4@45+0.3", "4@55+1.5", "4@65+0.3"], presses[:4]
+    assert presses[-1] == "4@415+0.3" and len(presses) == 39, (presses[-1], len(presses))
     assert {p.split("@")[0] for p in presses} == {"4"}, "only A (mask 4): never Start (1), D-pad or the other buttons"
+    holds = [p for p in presses if p.endswith("+1.5")]
+    assert holds and len(holds) == len(presses) // 3 and all(p.endswith("+0.3") for i, p in enumerate(presses) if (i + 1) % 3), "every 3rd press is the hold"
+    assert max(int(p.split("@")[1].split("+")[0]) for p in presses) < T.ACCEPT_END_S == 420, "no press after the cutoff"
+    assert max(int(p.split("@")[1].split("+")[0]) for p in T.input_preset("accept", 100000).split(",")) < 420, "a long run still stops pressing at 420 s"
     assert T.input_preset("accept", 35) == "" and T.input_preset("accept", 36) == "4@35+0.3", "presses stop with the run"
-    assert len(T.input_preset("accept", 100000).split(",")) == T.MAX_ENTRIES and len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
-    assert T.input_labels("accept", 600) == ["press A #%d (accept)" % n for n in range(1, 58)], "one label per press"
+    assert len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
+    labels = T.input_labels("accept", 600)
+    assert len(labels) == 39 and labels[:3] == ["press A #1 (accept, tap)", "press A #2 (accept, tap)", "press A #3 (accept, hold 1.5 s)"], labels[:3]
     assert T.input_labels("accept", 20) == []
     for none in ("none", "off", "OFF", ""):
         assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none

@@ -36,7 +36,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input accept (the default): ONLY the A button (mask 4), 0.3 s, first at 35 s after the first pad poll, then every 10 s until the end of the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input accept (the default): ONLY the A button (mask 4), first at 35 s after the first pad poll, then every 10 s; a 0.3 s tap, every 3rd press held 1.5 s (movie skips); no press from 420 s on (gameplay) or after the run; never Start (it opens the pause menu in the game). -Input none (also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",

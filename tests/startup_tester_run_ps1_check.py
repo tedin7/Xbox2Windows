@@ -256,8 +256,8 @@ def check_shell(shell):
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
         # No -Input given: the default is accept, only A (never Start)
-        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
-        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept)", "press A #2 (accept)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
+        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+1.5,4@65+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
+        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept, tap)", "press A #2 (accept, tap)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
