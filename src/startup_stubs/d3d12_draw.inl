@@ -2025,7 +2025,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
-        unsigned char* zero_bytes = reserve_upload_ring(16, &zero_offset, &zero_ring);
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
         if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
         std::memset(zero_bytes, 0, 16);
         return {zero_ring, zero_offset, 16, 0, true, 3};
