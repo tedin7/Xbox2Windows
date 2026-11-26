@@ -17,19 +17,21 @@
 namespace x2w_replay {
 
 using u64 = std::uint64_t;
-constexpr std::uint32_t file_version = 2;
+constexpr std::uint32_t file_version = 3;  // 2 is read too: 7 argument words, rcx memory at ARGM 7
+constexpr int call_args = 11;
 
 struct CallRecord {
     u64 seq;
     std::uint32_t thread;
     std::uint16_t kind, slot;
     u64 object;
-    u64 args[7];
+    u64 args[call_args];
     u64 ret;
     double seconds;
     std::int32_t present, pad;
 };
-static_assert(sizeof(CallRecord) == 104, "CALL header layout");
+static_assert(sizeof(CallRecord) == 136, "CALL header layout");
+constexpr std::size_t call_v2_bytes = 104;  // format 2: args[7]
 
 struct ArgMemory {
     std::uint32_t arg, depth;  // arg: the call's argument (low byte) | 0x100 * (word in the parent + 1) when nested
@@ -119,11 +121,18 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&out.version, h, 4);
             std::memcpy(&call_bytes, h + 4, 4);
             std::memcpy(&out.frequency, h + 8, 8);
-            if (out.version != file_version) return "recording version " + std::to_string(out.version) + ", this replayer reads " + std::to_string(file_version);
-            if (call_bytes != sizeof(CallRecord)) return "unexpected CALL size " + std::to_string(call_bytes);
-        } else if (name == "CALL" && header_bytes == sizeof(CallRecord)) {
+            if (out.version != file_version && out.version != 2)
+                return "recording version " + std::to_string(out.version) + ", this replayer reads 2 and " + std::to_string(file_version);
+            if (call_bytes != (out.version == 2 ? call_v2_bytes : sizeof(CallRecord))) return "unexpected CALL size " + std::to_string(call_bytes);
+        } else if (name == "CALL" && (header_bytes == sizeof(CallRecord) || (out.version == 2 && header_bytes == call_v2_bytes))) {
             Step step{};
-            std::memcpy(&step.call, h, sizeof(CallRecord));
+            if (header_bytes == sizeof(CallRecord)) {
+                std::memcpy(&step.call, h, sizeof(CallRecord));
+            } else {
+                // Format 2: seven argument words, then ret, seconds, present; rcx's memory is ARGM 7 (moved to 15 below).
+                std::memcpy(&step.call, h, 24 + 7 * 8);
+                std::memcpy(&step.call.ret, h + 24 + 7 * 8, call_v2_bytes - 24 - 7 * 8);
+            }
             by_seq[step.call.seq] = out.steps.size();
             out.steps.push_back(step);
         } else if (name == "ARGM" && header_bytes >= 40) {
@@ -135,6 +144,7 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&m.address, h + 16, 8);
             std::memcpy(&m.bytes, h + 24, 8);
             std::memcpy(&m.hash, h + 32, 8);
+            if (out.version == 2 && (m.arg & 0xffu) == 7) m.arg = (m.arg & ~0xffu) | 15u;  // format 2's rcx index
             const auto found = by_seq.find(seq);
             if (found == by_seq.end()) return "ARGM before its CALL at " + std::to_string(at);
             out.steps[found->second].memory.push_back(m);

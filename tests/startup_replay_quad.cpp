@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <windows.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,8 @@ template <class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
 namespace {
 
 constexpr UINT width = 64, height = 32;
+constexpr UINT colour_offset = 4096, cbv_bytes = 8192;
+enum class TitleRange { none, root, generated, supplied };
 
 struct Scene {
     void* target = nullptr;
@@ -32,6 +35,11 @@ struct Scene {
     void* list = nullptr;
     void* fence = nullptr;
     SIZE_T rtv = 0;
+    TitleRange title_range = TitleRange::none;
+    unsigned char* constants = nullptr;
+    void* view_heap = nullptr;
+    Word view_cpu = 0, view_gpu = 0;
+    UINT view_stride = 0;
 };
 
 int create_scene(void* device, Scene& s)
@@ -40,9 +48,21 @@ int create_scene(void* device, Scene& s)
     const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                    {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
-    if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target)
+    // X2W_TEST_REPLAY_CREATE127=1: the target comes from device slot 127 (the console CreateCommittedResource: ten
+    // arguments after the device, the output last), so a recording must carry more than seven argument words. The
+    // word after them (the caller's stack, which the slot ignores) points at the output variable too, as a title's
+    // stack can: the replay must take the new object from the output the call wrote, not from that copy.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
+        using Create = HRESULT (*)(void*, const void*, UINT, const void*, UINT, const void*, void*, UINT, const void*, const GUID*, void**,
+                                   void**);
+        const auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[127]);
+        if (FAILED(create(device, &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear, nullptr, 0, nullptr,
+                          &__uuidof(ID3D12Resource), &s.target, &s.target)) || !s.target)
+            return 25;
+    } else if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                                  arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
+    }
     // The title's heap descriptor: the desktop one, then a title CPU address and its size (none here).
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -68,12 +88,50 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
+int create_title_range(void* device, Scene& s)
+{
+    if (s.title_range == TitleRange::none) return 0;
+    s.constants = static_cast<unsigned char*>(VirtualAlloc(nullptr, cbv_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!s.constants) return 40;
+    if (s.title_range == TitleRange::root) {
+        std::printf("title ranges: %llx 0\n", arg(s.constants));
+        return 0;
+    }
+    s.view_stride = static_cast<UINT>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (s.view_stride < 32) return 41;
+    struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word cpu, bytes;
+    } info{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    if (s.title_range == TitleRange::supplied) {
+        info.bytes = 2 * s.view_stride;
+        info.cpu = arg(VirtualAlloc(nullptr, info.bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!info.cpu) return 42;
+    }
+    if (FAILED(static_cast<HRESULT>(invoke(device, 14, arg(&info), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&s.view_heap)))))
+        return 43;
+    s.view_cpu = invoke(s.view_heap, 9);
+    s.view_gpu = invoke(s.view_heap, 10);
+    if (!s.view_cpu || !s.view_gpu || (info.cpu && s.view_cpu != info.cpu)) return 44;
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{arg(s.constants), cbv_bytes};
+    invoke(device, 17, arg(&view), s.view_cpu);
+    // Copy the descriptor through CPU memory. No recorded call populates the slot used by the draw.
+    std::memcpy(reinterpret_cast<void*>(s.view_cpu + s.view_stride),
+                reinterpret_cast<const void*>(s.view_cpu), s.view_stride);
+    std::printf("title ranges: %llx %llx\n", arg(s.constants), s.view_cpu);
+    return 0;
+}
+
 int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
 {
-    const float t = static_cast<float>(frame) / static_cast<float>(frames);
+    const float t = s.constants ? 0.0f : static_cast<float>(frame) / static_cast<float>(frames);
+    if (s.constants) {
+        const float colour[] = {float(frame % 2 == 0), float(frame % 2 != 0), 0.0f, 1.0f};
+        std::memcpy(s.constants + colour_offset, colour, sizeof(colour));
+    }
     const float colour[] = {t, 0.25f, 1.0f - t, 1.0f};
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT scissor{0, 0, static_cast<LONG>(4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(s.constants ? width : 4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
     invoke(s.list, 52, s.rtv, arg(colour));
@@ -82,6 +140,15 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
     invoke(s.list, 22, 1, arg(&scissor));
     invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(s.list, 25, arg(pso));
+    if (s.constants) {
+        invoke(s.list, 34, arg(stream_root_signature()));
+        if (s.title_range == TitleRange::root) {
+            invoke(s.list, 42, 0, arg(s.constants));
+        } else {
+            invoke(s.list, 32, 1, arg(&s.view_heap));
+            invoke(s.list, 36, 0, s.view_gpu + s.view_stride);
+        }
+    }
     invoke(s.list, 12, 3, 1);
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     invoke(s.queue, 10, 1, arg(&s.list));
@@ -112,11 +179,20 @@ int main(int argc, char** argv)
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
     void* device = nullptr;
     void* pso = nullptr;
-    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], std::strcmp(argv[4], "hardware") == 0, false, adapter,
+    Scene scene;
+    char mode[16]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_TITLE_RANGE", mode, sizeof(mode))) {
+        if (!std::strcmp(mode, "root")) scene.title_range = TitleRange::root;
+        else if (!std::strcmp(mode, "generated")) scene.title_range = TitleRange::generated;
+        else if (!std::strcmp(mode, "supplied")) scene.title_range = TitleRange::supplied;
+        else return 2;
+    }
+    const bool table = scene.title_range == TitleRange::generated || scene.title_range == TitleRange::supplied;
+    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], std::strcmp(argv[4], "hardware") == 0, table, adapter,
                                                device, pso))
         return rc;
-    Scene scene;
     if (const int rc = create_scene(device, scene)) return rc;
+    if (const int rc = create_title_range(device, scene)) return rc;
     // X2W_TEST_REPLAY_PAUSE=<frame>,<ms>: a pause before that frame (a slowdown for the recorder's "slow" trigger).
     char pause[32]{};
     unsigned pause_frame = ~0u, pause_ms = 0;

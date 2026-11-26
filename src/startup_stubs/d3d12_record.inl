@@ -6,8 +6,8 @@
 //
 // Each thread appends to its own buffer (no lock shared between title threads per call: a shared lock would serialise
 // them and hide the cost being recorded); full buffers are written under the file lock. Calls are ordered by a global
-// sequence number taken before the call; nothing else runs before the real slot, so float arguments in xmm registers
-// reach it unchanged (their values are not recorded yet).
+// sequence number taken before the call. The opt-in page scan only runs before slots without float arguments.
+// Float arguments in xmm registers reach the real slot unchanged (their values are not recorded yet).
 //
 // File: the capture chunk framing (tag, header bytes, data bytes). XREC (version, timer frequency), CALL, ARGM (argument
 // memory: seq, arg, address, bytes, blob hash), BLOB (hash, bytes; once per content), OUTP (seq, arg, the pointer an
@@ -26,6 +26,7 @@ constexpr int record_depth = 2;  // argument memory, the memory it points at (a 
 
 void* original[kind_count][wide_slots];
 bool armed;
+bool scan_submit_pages;
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -174,12 +175,19 @@ void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std
     }
 }
 
+constexpr int call_args = 11;      // argument words after rcx, all recorded (format 3)
+constexpr std::uint32_t rcx_arg = 15;  // ARGM argument index of rcx when it is not an object
+// Argument words followed in full: memory sized by the next word, and the pointers inside it. The words after them are
+// mostly the caller's stack (few slots take more than seven arguments): a short look each, so a stale pointer and size
+// pair there cannot pull megabytes into the file. A late real argument (an output, an interface id) fits in it.
+constexpr std::uint32_t followed_args = 7;
+
 struct Call {
     u64 seq;
     std::uint32_t thread;
     std::uint16_t kind, slot;
     u64 object;
-    u64 args[7];
+    u64 args[call_args];
     u64 ret;
     double seconds;
     std::int32_t present, pad;
@@ -187,17 +195,20 @@ struct Call {
 
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
-void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], u64 ret)
+void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
-    const Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object,
-                    {args[0], args[1], args[2], args[3], args[4], args[5], args[6]}, ret, seconds_now(), presents, 0};
+    Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object, {}, ret,
+              seconds_now(), presents, 0};
+    std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
     // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
-    // memory after the call is the returned value; ARGM argument 7.
-    if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, 7, object, 0, 0);
-    for (std::uint32_t i = 0; i < 7; ++i) {
+    // memory after the call is the returned value; ARGM argument 15 (rcx_arg).
+    if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, rcx_arg, object, 0, 0);
+    // Words past a slot's own arguments are the caller's stack: recorded too (a replay passes them on, the slot ignores
+    // them), the ones after followed_args with a short look only.
+    for (std::uint32_t i = 0; i < call_args; ++i) {
         const u64 value = args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
         if (x2w_local::readable(reinterpret_cast<const void*>(value), 8)) {
@@ -207,7 +218,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
                 append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
             }
         }
-        const u64 next = i + 1 < 7 ? args[i + 1] : 0;
+        if (i >= followed_args) {
+            record_memory(b, seq, i, value, 0, 0);
+            continue;
+        }
+        const u64 next = i + 1 < followed_args ? args[i + 1] : 0;
         record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
     }
     InterlockedIncrement64(&calls_written);
@@ -221,6 +236,10 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
 }
 
 void stop(bool at_exit);
+bool extra_title_pages;  // set before installing the recording thunks
+void remember_heap_start(u64 object, u64 second);
+u64 pages_before_call(bool root, u64 address, bool submit);
+void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
 __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6,
@@ -228,15 +247,29 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
 {
     // Eleven arguments after rcx reach the real slot (D3D12's longest, UpdateTileMappings, has ten): stack words past
     // the caller's own arguments are read and passed on unused, which the x64 convention allows (the caller reserves
-    // the home area; a slot reads only what it declares). The first seven are recorded.
+    // the home area; a slot reads only what it declares). All eleven are recorded.
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
     if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    // Nothing but the sequence number (an interlocked instruction) before the real call.
-    const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
+    // ranges X2W_REPLAY_TITLE_RANGES, or a scan before each submit X2W_REPLAY_PAGES_AT_SUBMIT).
+    constexpr bool root = K == list_kind && N >= 41 && N <= 46;
+    constexpr bool submit = K == queue_kind && N == 10;
+    constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
+                                    (K == device_kind && (N == 23 || N == 24)) || submit;
+    u64 seq;
+    if constexpr (consumes_pages)
+        seq = (extra_title_pages || (submit && scan_submit_pages && window_open)) ? pages_before_call(root, r8, submit)
+                                                                                   : static_cast<u64>(InterlockedIncrement64(&next_seq));
+    else
+        seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    if constexpr (K == device_kind && N == 17)
+        if (extra_title_pages) remember_cbv_pages(rdx);
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    const u64 args[7] = {rdx, r8, r9, s0, s1, s2, s3};
+    const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
     record_call(K, N, seq, rcx, args, ret);
+    if constexpr (K == descriptor_heap_kind && N == 9)
+        if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
     return ret;
 }
@@ -376,8 +409,10 @@ void present()
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (window_open && !was_open) pages_at_window_open(b, seq, present);
-        else if (window_open) pages_at_present(b, seq, present);
+        if (!extra_title_pages) {
+            if (window_open && !was_open) pages_at_window_open(b, seq, present);
+            else if (window_open) pages_at_present(b, seq, present);
+        }
         ReleaseSRWLockExclusive(&b.lock);
     }
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
@@ -451,7 +486,7 @@ void install()
         started.QuadPart -= static_cast<LONGLONG>(alive / 10000 * static_cast<u64>(frequency.QuadPart) / 1000);
     }
     std::vector<unsigned char> head;
-    struct { std::uint32_t version, call_bytes; u64 frequency; } header{2, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
+    struct { std::uint32_t version, call_bytes; u64 frequency; } header{3, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);
     // XENV: the process's X2W_ settings (name=value, NUL-separated), so a replay runs the stand-in as it ran here.
     if (wchar_t* block = GetEnvironmentStringsW()) {
@@ -466,6 +501,10 @@ void install()
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
     write_raw(head.data(), head.size());
+    scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
+    char ranges[8]{}, pages[8]{};
+    extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
+        !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
     armed = true;
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();

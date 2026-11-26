@@ -50,8 +50,8 @@ enum Kind : std::uint16_t { device_kind = 0, queue_kind = 1, fence_kind = 2, des
 constexpr std::uint16_t device_create_descriptor_heap = 14, device_increment_size = 15;
 constexpr std::uint16_t heap_cpu_start = 9, heap_gpu_start = 10, fence_completed = 8, queue_present = 32;
 constexpr std::uint16_t resource_map = 8, resource_get_desc = 10, resource_gpu_address = 11;
-constexpr std::uint32_t rcx_arg = 7;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
-constexpr int top_slots = 8;
+constexpr std::uint32_t rcx_arg = 15;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
+constexpr int top_slots = 16;
 
 struct Options {
     std::wstring recording, out;
@@ -74,7 +74,22 @@ struct Player {
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
+    mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     void* device = nullptr;
+    std::wstring map_dump_dir;
+
+    // A recorded byte range inside a translated range: the replay's address, `bytes` clipped to that range.
+    u64 page_target(u64 address, u64& bytes) const
+    {
+        auto above = handles.upper_bound(address);
+        if (above == handles.begin()) return address;
+        --above;
+        const u64 offset = address - above->first;
+        if (offset >= above->second.span) return address;
+        if (bytes > above->second.span - offset) bytes = above->second.span - offset;
+        ++page_translated;
+        return above->second.to + offset;
+    }
 
     u64 translate(u64 value) const
     {
@@ -92,19 +107,29 @@ struct Played {
     u64 self = 0;
     bool buffer_first = false;
     u64 top[top_slots]{};
+    u64 before[top_slots]{};  // the first word of each argument copy before the call
     u64 ret = 0;
+
+    // The call wrote a new value into argument `arg`'s copy: what an output is. A stack word past the slot's own
+    // arguments can point at the same variable as the real output; its copy is never written.
+    bool wrote(std::uint32_t arg, u64& now) const
+    {
+        if (arg >= static_cast<std::uint32_t>(top_slots) || !top[arg]) return false;
+        std::memcpy(&now, reinterpret_cast<const void*>(top[arg]), 8);
+        return now != before[arg];
+    }
 };
 
-using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
+using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
 
 // Calls `slot` of `object`'s table with `rcx` as the first register (the object itself, or a struct-return buffer
 // when the title passed the buffer first and the object second).
-u64 call_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[7])
+u64 call_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[call_args])
 {
     const auto table = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<Slot>(table[slot])(rcx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    return reinterpret_cast<Slot>(table[slot])(rcx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]);
 }
-u64 call_slot(u64 object, std::uint16_t slot, const u64 (&a)[7])
+u64 call_slot(u64 object, std::uint16_t slot, const u64 (&a)[call_args])
 {
     return call_slot(object, object, slot, a);
 }
@@ -139,7 +164,7 @@ u64 recorded_word(const Recording& r, const Step& step, std::uint32_t arg)
 }
 
 // The argument memory of one call, copied into the replay's arena. Fills the copy of each top-level argument
-// (top[0..6]: the stack and register arguments after rcx; top[7]: rcx when it is not an object).
+// (top[0..10]: the register and stack arguments after rcx; top[15]: rcx when it is not an object).
 void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_slots], std::vector<unsigned char*>& copies)
 {
     copies.assign(step.memory.size(), nullptr);
@@ -195,9 +220,28 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
 u64 buffer_bytes(u64 resource)
 {
     D3D12_RESOURCE_DESC desc{};
-    const u64 a[7] = {reinterpret_cast<u64>(&desc)};
+    const u64 a[call_args] = {reinterpret_cast<u64>(&desc)};
     call_slot(resource, resource_get_desc, a);
     return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc.Width : 0;
+}
+
+// Dump only bytes explicitly requested by a successful buffer Map.
+void dump_mapped_range(const Player& p, const Played& call, u64 mapped, u64 span)
+{
+    if (p.map_dump_dir.empty() || !call.top[1] || !mapped || FAILED(static_cast<HRESULT>(call.ret))) return;
+    u64 written;
+    if (!call.wrote(2, written)) return;
+    D3D12_RANGE range{};
+    std::memcpy(&range, reinterpret_cast<const void*>(call.top[1]), sizeof(range));
+    if (range.Begin >= range.End || range.End > span) return;
+    const std::wstring path = p.map_dump_dir + L"\\map_" + std::to_wstring(call.step->call.seq) + L".bin";
+    if (std::FILE* out = _wfopen(path.c_str(), L"wb")) {
+        const auto* data = reinterpret_cast<const unsigned char*>(written) + range.Begin;
+        const auto bytes = range.End - range.Begin;
+        const bool wrote = std::fwrite(data, 1, bytes, out) == bytes;
+        if (std::fclose(out) == 0 && wrote) return;
+    }
+    say("x2w-replay: could not write %ls", path.c_str());
 }
 
 // What one played call teaches: new objects, and the recorded -> replay value of returned addresses.
@@ -206,16 +250,17 @@ void learn_after(Player& p, const Recording& r, const Played& call)
     const Step& step = *call.step;
     const CallRecord& c = step.call;
     // Outputs: a wrapper the call put into an argument's memory, different from what was there: a new object.
+    std::vector<u64> made;  // recorded wrappers this call made
     for (const Output& o : step.outputs) {
-        if (o.arg >= 7 || !call.top[o.arg]) continue;
         u64 now;
-        std::memcpy(&now, reinterpret_cast<const void*>(call.top[o.arg]), 8);
-        if (now && (now != p.translate(o.value) || !p.objects.count(o.value))) p.objects[o.value] = now;
+        if (o.arg >= static_cast<std::uint32_t>(call_args) || !call.wrote(o.arg, now) || !now) continue;
+        p.objects[o.value] = now;
+        made.push_back(o.value);
     }
     if (c.kind == device_kind && c.slot == device_create_descriptor_heap && call.top[0]) {
         HeapInfo info{};
         std::memcpy(&info, reinterpret_cast<const void*>(call.top[0]), sizeof(info));
-        for (const Output& o : step.outputs) p.heaps[o.value] = info;
+        for (const u64 heap : made) p.heaps[heap] = info;
     }
     // Struct returns through a buffer: the value is in the buffer, on both runs.
     const u64 old_value = call.buffer_first ? recorded_word(r, step, rcx_arg) : c.ret;
@@ -226,7 +271,7 @@ void learn_after(Player& p, const Recording& r, const Played& call)
         const auto heap = p.heaps.find(recorded_object);
         u64 span = 1ull << 20;
         if (heap != p.heaps.end()) {
-            const u64 a[7] = {heap->second.type};
+            const u64 a[call_args] = {heap->second.type};
             const u64 increment = call_slot(reinterpret_cast<u64>(p.device), device_increment_size, a) & 0xffffffffu;
             span = static_cast<u64>(heap->second.count) * (increment ? increment : 64);
         }
@@ -240,6 +285,7 @@ void learn_after(Player& p, const Recording& r, const Played& call)
         u64 new_address = call.ret;
         if (map) std::memcpy(&new_address, reinterpret_cast<const void*>(call.top[2]), 8);
         const u64 span = buffer_bytes(call.self);
+        if (map) dump_mapped_range(p, call, new_address, span);
         if (old_address && new_address && span) {
             p.handles[old_address] = Range{new_address, span};
             ++(map ? p.mapped : p.gpu_addresses);
@@ -247,9 +293,45 @@ void learn_after(Player& p, const Recording& r, const Played& call)
     }
 }
 
+// What the player is doing, for the crash line: a phase name, and the call being played.
+const char* volatile phase = "start";
+const Step* volatile current_step = nullptr;
+
+// The crash line: the exception, the module and offset it happened in, the address an access violation touched, and
+// what the player was doing. Written from a vectored handler (it runs first, before any frame or filter): an
+// exception some code handles itself is reported too, so the line says "first chance" and at most four are written.
+LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
+{
+    const EXCEPTION_RECORD& x = *e->ExceptionRecord;
+    if (x.ExceptionCode < 0xC0000000ul || x.ExceptionCode == 0xE06D7363ul) return EXCEPTION_CONTINUE_SEARCH;  // C++ throw
+    static volatile LONG reported = 0;
+    if (InterlockedIncrement(&reported) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    char module[MAX_PATH] = "?";
+    HMODULE owner = nullptr;
+    u64 offset = reinterpret_cast<u64>(x.ExceptionAddress);
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<const char*>(x.ExceptionAddress), &owner) &&
+        GetModuleFileNameA(owner, module, MAX_PATH)) {
+        offset -= reinterpret_cast<u64>(owner);
+    }
+    const char* base = std::strrchr(module, '\\');
+    base = base ? base + 1 : module;
+    const u64 touched = x.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && x.NumberParameters >= 2 ? x.ExceptionInformation[1] : 0;
+    const Step* step = current_step;
+    if (step)
+        say("x2w-replay: CRASH (first chance) 0x%08lx at %s+0x%llx touching 0x%llx while playing seq %llu (kind %u slot %u, "
+            "object 0x%llx)", x.ExceptionCode, base, offset, touched, step->call.seq, step->call.kind, step->call.slot,
+            step->call.object);
+    else
+        say("x2w-replay: CRASH (first chance) 0x%08lx at %s+0x%llx touching 0x%llx during %s", x.ExceptionCode, base, offset,
+            touched, phase);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Plays one call. false: its object was never seen (skipped).
 bool play(Player& p, const Recording& r, const Step& step)
 {
+    current_step = &step;
     const CallRecord& c = step.call;
     Played call{&step};
     if (const auto object = p.objects.find(c.object); object != p.objects.end()) {
@@ -261,11 +343,13 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.unknown_object;
         return false;
     }
-    apply_pages_before(r, c.seq);
+    apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
-    u64 a[7];
-    for (int i = 0; i < 7; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
+    for (int i = 0; i < top_slots; ++i)
+        if (call.top[i] && i != static_cast<int>(rcx_arg)) std::memcpy(&call.before[i], reinterpret_cast<const void*>(call.top[i]), 8);
+    u64 a[call_args];
+    for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     u64 rcx = call.self;
     if (call.buffer_first) {
         if (!call.top[rcx_arg]) {
@@ -418,6 +502,8 @@ int run(const Options& o)
         return 2;
     }
     SetStdHandle(STD_ERROR_HANDLE, log);
+    AddVectoredExceptionHandler(1, note_crash);
+    phase = "reading the recording";
     Recording r;
     if (const std::string problem = read_recording(o.recording.c_str(), r); !problem.empty()) {
         say("x2w-replay: %s", problem.c_str());
@@ -430,11 +516,24 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
     }
+    {
+        u64 shader_bytes = 0, reserved = 0;
+        for (const ShaderFile& f : r.shader_files) shader_bytes += f.content.bytes;
+        for (const ReservedSpan& s : page_replay().spans) reserved += s.end - s.base;
+        say("x2w-replay: recording format %u, %llu bytes: %zu calls, %zu shader files (%llu bytes), %zu pages, %zu page maps; "
+            "%zu title ranges reserved (%llu bytes)", r.version, r.size, r.steps.size(), r.shader_files.size(), shader_bytes,
+            r.pages.size(), r.maps.size(), page_replay().spans.size(), reserved);
+    }
+    wchar_t dump_maps[4]{};
+    const bool dump_map_ranges = GetEnvironmentVariableW(L"X2W_REPLAY_DUMP_MAP_RANGES", dump_maps, 4) == 1 && dump_maps[0] == L'1';
+    phase = "applying settings";
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
         SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
+    phase = "seeding the shader cache";
     seed_shader_cache(r);
+    phase = "making the device";
     say("x2w-replay: %zu calls, %zu blobs, %llu presents marked, %s", r.steps.size(), r.blobs.size(), r.presents_marked,
         r.ended ? "ended" : "no end chunk (the recorded process stopped early)");
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -443,6 +542,7 @@ int run(const Options& o)
         return 77;
     }
     Player p;
+    if (dump_map_ranges) p.map_dump_dir = o.out;
     unsigned char parameters[64]{};
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters, __uuidof(ID3D12Device), &p.device)) || !p.device) {
         say("x2w-replay: the stand-in made no device");
@@ -453,6 +553,7 @@ int run(const Options& o)
             p.objects[s.call.object] = reinterpret_cast<u64>(p.device);
             break;
         }
+    phase = "playing";
     const auto started = std::chrono::steady_clock::now();
     const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
     bool stopped = false;
@@ -463,7 +564,11 @@ int run(const Options& o)
         }
         play(p, r, s);
     }
-    if (!stopped) apply_pages_before(r, ~0ull);  // the pages recorded after the last call
+    current_step = nullptr;
+    phase = "writing the last pages";
+    if (!stopped)  // the pages recorded after the last call
+        apply_pages_before(r, ~0ull, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+    phase = "finishing";
     const double wall = elapsed();
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
