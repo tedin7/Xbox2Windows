@@ -54,9 +54,9 @@ def check_argument_memory(path):
         elif tag == "DARR":
             seq, = struct.unpack("<Q", header)
             memory[seq].append((None, 0, len(payload)))
-    assert len(calls) == 22, calls
+    assert len(calls) == 24, calls
     assert all(sum(length for _, _, length in ranges) <= budget for ranges in memory.values())
-    expected_blob_sizes = [[], [64]] + [[] for _ in range(20)]
+    expected_blob_sizes = [[], [64], [], [64]] + [[] for _ in range(20)]
     actual_blob_sizes = [[length for arg, depth, length in memory[seq] if (arg, depth) == (1, 0)] for seq in calls]
     assert actual_blob_sizes == expected_blob_sizes, actual_blob_sizes
     assert all(arg in (1, 3) and depth == 0 for seq in calls for arg, depth, _ in memory[seq])
@@ -64,7 +64,7 @@ def check_argument_memory(path):
     assert [(arg, length) for arg, depth, length in memory[stream_call] if depth == 0 and arg >= 256] == [(512, 600 << 10)]
     size = path.stat().st_size
     assert size < budget, "argument capture fixture wrote %d bytes" % size
-    print("replay argument memory: 23 calls, zero access exceptions, %d bytes" % size)
+    print("replay argument memory: 25 calls, zero access exceptions, %d bytes" % size)
 
 
 def timed(args, env):

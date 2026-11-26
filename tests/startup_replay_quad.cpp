@@ -67,6 +67,11 @@ bool record_memory_cases(void* device)
                                                large_size)) == E_NOINTERFACE;
         };
         ok = root(reserved, 64, arg(large)) && root(committed, 64, arg(reserved));
+        // Reserved when first named, committed and written before it is named again: the second call holds it.
+        auto* late = reserved + 2 * system.dwPageSize;
+        ok = ok && root(late, 64, 0) && VirtualAlloc(late, system.dwPageSize, MEM_COMMIT, PAGE_READWRITE);
+        if (ok) std::memset(late, 0x5a, 64);
+        ok = ok && root(late, 64, 0);
         for (unsigned i = 0; i < 20 && ok; ++i) {
             large[0] = static_cast<unsigned char>(i);
             ok = root(large, large_size, arg(reserved));

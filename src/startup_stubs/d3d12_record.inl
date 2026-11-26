@@ -161,9 +161,12 @@ std::size_t committed_readable_prefix(u64 start, std::size_t bytes)
             const bool readable = info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) &&
                 (protection == PAGE_READONLY || protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
                  protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
-            region = {(std::max)(first, base), (std::min)(first + info.RegionSize, base + granule), readable};
+            const Region found{(std::max)(first, base), (std::min)(first + info.RegionSize, base + granule), readable};
+            // Only readable spans are kept: memory reserved now is often committed later (a title heap grows inside a
+            // granule), and the prefix can run for minutes without a present to expire the cache.
+            if (!found.readable) break;
+            region = found;
         }
-        if (!region.readable) break;
         at = (std::min)(end, region.end);
     }
     return static_cast<std::size_t>(at - start);
@@ -539,11 +542,21 @@ void write_shader_cache(bool at_exit)
 }
 
 // Ends the recording: every buffer is written, then the end chunk with the totals. Called once.
+// Puts the title's slots back: after the recording ends no call goes through a thunk. A thread already inside one finds
+// active cleared and calls straight through.
+void unwrap_all()
+{
+    for (int k = 0; k < kind_count; ++k)
+        for (int i = 0; i < wide_slots; ++i)
+            if (original[k][i]) tables[k][i] = original[k][i];
+}
+
 void stop(bool at_exit)
 {
     if (!active.exchange(false)) return;
     window_open = false;
     prefix_open = false;
+    unwrap_all();
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
