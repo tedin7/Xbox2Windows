@@ -705,7 +705,7 @@ def check_combine():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         runs = []
-        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "0"})):
+        for label, extra_env in (("a", {}), ("b", {"X2W_TEST_ADDRESS_UPLOAD_RING": "1"}), ("c", {"X2W_BIG_COPY_REUSE": "1"})):
             run = tmp / ("run_" + label)
             run.mkdir()
             make_run(run, 2)
@@ -727,7 +727,7 @@ def check_combine():
         top = json.loads(seen["matrix_manifest.json"])
         assert top["matrix"] == "gray" and sorted(top["runs"]) == ["a", "b", "c"] and top["parts"] == len(out), top
         assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and top["runs"]["b"]["env"]["X2W_TEST_ADDRESS_UPLOAD_RING"] == "1"
-        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "0" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
+        assert top["runs"]["c"]["env"]["X2W_BIG_COPY_REUSE"] == "1" and top["runs"]["a"]["seconds"] == 240 and top["runs"]["a"]["end_cause"] == "timeout"
         for label in "abc":
             assert seen["run_%s/stderr.txt" % label].startswith(("stderr of " + label).encode()), label
             assert json.loads(seen["run_%s/manifest.json" % label])["env"] == top["runs"][label]["env"]

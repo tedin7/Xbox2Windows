@@ -63,7 +63,7 @@ param(
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
-    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
+    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=1, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
     [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
@@ -142,7 +142,7 @@ if ($Matrix) {
     $legs = @(
         @{ Label = "a"; Name = "default";                          Env = [ordered]@{} },
         @{ Label = "b"; Name = "X2W_TEST_ADDRESS_UPLOAD_RING=1";   Env = [ordered]@{ X2W_TEST_ADDRESS_UPLOAD_RING = "1" } },
-        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } })
+        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=1";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "1" } })
     $skipOwn = @("Matrix", "Seconds", "OutDir", "FinishTranslateSeconds")
     $childArgs = @()
     foreach ($key in $PSBoundParameters.Keys) {

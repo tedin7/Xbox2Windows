@@ -462,7 +462,7 @@ def check_shell(shell):
         assert all(top["runs"][l]["seconds"] == 200 for l in "abc"), top["runs"]
         assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and "X2W_BIG_COPY_REUSE" not in top["runs"]["a"]["env"], top["runs"]["a"]["env"]
         assert top["runs"]["b"]["env"].get("X2W_TEST_ADDRESS_UPLOAD_RING") == "1" and "X2W_BIG_COPY_REUSE" not in top["runs"]["b"]["env"]
-        assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "0" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
+        assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "1" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
         assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
         assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
