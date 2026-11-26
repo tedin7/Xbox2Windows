@@ -380,6 +380,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    // dispatch-twice: the same Dispatch again (X2W_FAST_COMPUTE reuses its descriptors); dispatch-twice-narrow: the input
+    // descriptor names fewer records first, so its view differs and the descriptors are written again.
+    if (mode == "dispatch-twice-narrow") {
+        auto* const heap_words = reinterpret_cast<UINT*>(cpu);
+        heap_words[2] = words / 2;
+    }
+    if (mode == "dispatch-twice" || mode == "dispatch-twice-narrow") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;

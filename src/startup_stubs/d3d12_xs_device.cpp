@@ -2912,6 +2912,11 @@ struct Pass {
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
     ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
+    // X2W_FAST_COMPUTE: the views the last translated Dispatch on this recording wrote into the draw heap, so an identical
+    // next Dispatch reuses those descriptors instead of creating them again (valid while nothing else took heap slots).
+    std::vector<unsigned char> last_compute_views;
+    UINT last_compute_first = 0;
+    LONG last_compute_cursor = -1;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
@@ -7771,6 +7776,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
+        log_compute_views();
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);

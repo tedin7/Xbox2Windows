@@ -121,6 +121,17 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, env, 'dispatch-same-root')
         assert got == expected and not lines(result, 'refused'), 'setting the same compute root again lost the constants'
 
+        # X2W_FAST_COMPUTE: a second identical Dispatch on the list reuses the first one's descriptors (the output is the same);
+        # with the switch off nothing is reused; a changed input view is written again.
+        fast = dict(env, X2W_FAST_COMPUTE='1')
+        got, result = dispatch(directory, consumer, fast, 'dispatch-twice')
+        assert got == expected and not lines(result, 'refused'), result.stderr[-3000:]
+        assert len(lines(result, 'x2w-render compute views: descriptors reused 1 of 2 translated dispatches (X2W_FAST_COMPUTE=1)')) == 1, result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, env, 'dispatch-twice')
+        assert got == expected and len(lines(result, 'descriptors reused 0 of 2 translated dispatches (X2W_FAST_COMPUTE=0)')) == 1, result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, fast, 'dispatch-twice-narrow')
+        assert len(lines(result, 'x2w-render compute views: descriptors reused 0 of')) == 1, result.stderr[-3000:]
+
         unset = 'an entry value was not set since the compute root'
         for mode, reason in (('dispatch-missing-word', unset), ('dispatch-root-changed', unset), ('dispatch-reset', unset),
                              ('dispatch-wrong-root', 'the compute root set is not the one the pipeline was created with'),

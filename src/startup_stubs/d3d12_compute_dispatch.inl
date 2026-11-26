@@ -70,6 +70,12 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_views_reused;  // dispatches that reused the previous dispatch's descriptors (X2W_FAST_COMPUTE)
+bool fast_compute()
+{
+    static const bool on = x2w_local::env_on("X2W_FAST_COMPUTE");
+    return on;
+}
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
@@ -492,10 +498,48 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         return reason;
     }
     const UINT n = static_cast<UINT>(count);
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
-    if (first + n > draw_heap_size) {
-        first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+    // The descriptors this dispatch needs are the ones the previous translated dispatch of this list wrote when every
+    // view is the same (same resource at the same GPU address, range, kind and description) and no other draw or
+    // dispatch took heap slots since: then they are not created again.
+    std::vector<unsigned char> signature;
+    bool reuse = false;
+    if (fast_compute()) {
+        signature.reserve(count * 80 + 16);
+        const auto put = [&signature](const void* data, std::size_t bytes) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            signature.insert(signature.end(), p, p + bytes);
+        };
+        put(&count, sizeof(count));
+        put(&inputs, sizeof(inputs));
+        for (std::size_t i = 0; i < count; ++i) {
+            const View& view = views[i];
+            const u64 gpu = view.resource && !view.texture ? view.resource->GetGPUVirtualAddress() : 0;
+            put(&view.resource, sizeof(view.resource));
+            put(&gpu, sizeof(gpu));
+            put(&view.offset, sizeof(view.offset));
+            put(&view.bytes, sizeof(view.bytes));
+            const unsigned char flags = static_cast<unsigned char>(view.texture | view.described << 1 | view.transition << 2);
+            put(&flags, 1);
+            if (view.texture) put(view.desc, sizeof(view.desc));
+        }
+        reuse = pass.last_compute_cursor == InterlockedCompareExchange(&draw_heap_cursor, 0, 0) &&
+                pass.last_compute_views == signature;
+    }
+    UINT first = 0;
+    if (reuse) {
+        first = pass.last_compute_first;
+        InterlockedIncrement(&compute_views_reused);
+    } else {
+        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
+        if (first + n > draw_heap_size) {
+            first = 0;
+            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+        }
+        if (fast_compute()) {
+            pass.last_compute_views = std::move(signature);
+            pass.last_compute_first = first;
+            pass.last_compute_cursor = InterlockedCompareExchange(&draw_heap_cursor, 0, 0);
+        }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
@@ -505,17 +549,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // A compute list accepts no pixel-shader or depth state in a transition.
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            device_of(the_device)->CreateShaderResourceView(view.resource,
+            if (!reuse) device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
         }
         if (i < inputs) {
             if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
+            if (!reuse) buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (reuse) continue;
         if (view.texture) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
@@ -629,9 +674,16 @@ void log_key_use_census()
             row.use.last_ms / 1000.0, row.use.uses);
 }
 
+void log_compute_views()
+{
+    log("x2w-render compute views: descriptors reused %ld of %ld translated dispatches (X2W_FAST_COMPUTE=%d)", compute_views_reused,
+        compute_dispatches_translated, fast_compute() ? 1 : 0);
+}
+
 // Fixtures: the census without waiting for the frame that logs it.
 extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
     log_key_use_census();
+    log_compute_views();
 }
