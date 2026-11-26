@@ -267,7 +267,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->state == 1) compute_refusals().forget(key);
         if (tr->state != 1) {
             compute_refusals().put(key, tr->unmodelled ? tr->unmodelled : "no translation", tr->unmodelled ? refusal_unmodelled : refusal_untranslated,
-                                   tr->unmodelled ? 0 : tr->retry_manifest_at);
+                                   tr->unmodelled ? 0 : tr->retry_manifest_at ? tr->retry_manifest_at : GetTickCount64() + 50);
+            // retry_manifest_at is 0 while another thread has the first read of this key in flight (draw_lock is down around the read):
+            // that is not "absent for good", so the entry expires and the next dispatch looks again.
             tr->dispatches += compute_refusals().take_hits(key);
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
             reason = tr->unmodelled ? tr->unmodelled : "no translation";
