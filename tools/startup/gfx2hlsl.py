@@ -12569,10 +12569,13 @@ def main():
             print('pso %x -> request %016x' % (w & 0xffffff, key))
     jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds] [--jobs N]: before the title starts, the old refusals (lifted families first)
+        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <last run's stderr.txt>]: before the title starts, the
+        # old refusals (lifted families first, then what the last run used most)
         given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
         seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
-        print(retry_lifted(out_dir, seconds, jobs=jobs).line(), flush=True)
+        at = sys.argv.index('--weights') if '--weights' in sys.argv[3:] else None
+        weights = run_weights(sys.argv[at + 1]) if at is not None and at + 1 < len(sys.argv) else None
+        print(retry_lifted(out_dir, seconds, jobs=jobs, weights=weights).line(), flush=True)
         return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
@@ -12669,6 +12672,13 @@ LIFTED_REASONS = (
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
+# In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
+# what this build writes for the cases its lift does not cover (Run R: TG_SIZE_EN groups the wave32 lift does not prove,
+# compute image_store dmask), so a newer .fail of a lifted family is retried once per build, not at the head of every run.
+RETRIED_NAME = 'pre_run_retried.txt'
+# The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
+NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')
+CENSUS_LINE = re.compile(r'x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated')
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
@@ -12682,12 +12692,14 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
     return [key for key, lifted in old_failures(out_dir, since_translator, families) if lifted]
 
 
-def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
+def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=frozenset(), weights=None):
     """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
-    then graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
+    then the requests the last run used most (`weights`: draws not drawn or dispatches without a translation), then
+    graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
     since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
-    family: a .fail's time does not prove which build wrote it (Run P kept a pixel MRTZ request refused by a stale
-    .fail although that build translates it), and those families are few."""
+    family and this build has not retried it yet (`final`): a .fail's time does not prove which build wrote it (Run P
+    kept a pixel MRTZ request refused by a stale .fail although that build translates it)."""
+    weights = weights or {}
     rows = []
     for order, key in enumerate(pending_keys(out_dir, False, None)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
@@ -12698,31 +12710,79 @@ def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
-        if newer and not lifted:
+        if newer and (not lifted or key in final):
             continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
-        rows.append((not lifted, compute, order, key, lifted))
-    return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
+        rows.append((not lifted, -weights.get(key, 0), compute, order, key, lifted))
+    return [(key, lifted) for _l, _w, _c, _o, key, lifted in sorted(rows)]
+
+
+def retried_by_build(out_dir, stamp):
+    """The keys this translator build (stamp) already retried before a run and left refused (RETRIED_NAME); an empty
+    set when another build wrote the file, or there is none."""
+    try:
+        with open(os.path.join(out_dir, RETRIED_NAME), encoding='ascii') as handle:
+            words = handle.read().split()
+    except (OSError, UnicodeDecodeError):
+        return frozenset()
+    if stamp is None or not words or words[0] != 'build-%r' % stamp:
+        return frozenset()
+    return frozenset(int(word, 16) for word in words[1:] if re.fullmatch(r'[0-9a-f]{16}', word))
+
+
+def note_retried(out_dir, stamp, keys):
+    """Record that this build retried `keys` and left them refused (replaces the record of another build)."""
+    if stamp is None:
+        return
+    path = os.path.join(out_dir, RETRIED_NAME)
+    with suppress(OSError):
+        with open(path + '.tmp', 'w', encoding='ascii') as handle:
+            handle.write('build-%r\n' % stamp + ''.join('%016x\n' % key for key in sorted(keys)))
+        os.replace(path + '.tmp', path)
+
+
+def run_weights(path):
+    """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
+    key's newest cumulative line; {} when the file cannot be read."""
+    weights = {}
+    try:
+        with open(path, encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if not line.startswith('x2w-render '):
+                    continue
+                drawn, census = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line)
+                if drawn:
+                    weights[int(drawn.group(1), 16)] = int(drawn.group(2))
+                elif census:
+                    weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
+    except OSError:
+        return {}
+    return weights
 
 
 class RetryReport:
-    def __init__(self, keys, ok, refused, left, seconds, lifted=0):
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0):
         self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
-        self.lifted = lifted
+        self.lifted, self.used = lifted, used
 
     def line(self):
         """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
         the pass after the run."""
         left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
-        return 'pre-run retry: %d keys (%d in lifted families), ok %d, still refused %d%s, %.0f s' % (
-            self.keys, self.lifted, self.ok, self.refused, left, self.seconds)
+        used = ', %d used in the last run' % self.used if self.used else ''
+        return 'pre-run retry: %d keys (%d in lifted families%s), ok %d, still refused %d%s, %.0f s' % (
+            self.keys, self.lifted, used, self.ok, self.refused, left, self.seconds)
 
 
-def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic):
-    """Translate again, on every core, the old refusals (old_failures: lifted families first) before the title starts.
-    No new request is started after `seconds`; what is left keeps its .fail for the pass after the run."""
+def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic,
+                 weights=None):
+    """Translate again the old refusals (old_failures: lifted families first, then by the last run's use `weights`)
+    before the title starts. No new request is started after `seconds`; what is left keeps its .fail for the pass after
+    the run. What this build retried and still refuses is recorded (RETRIED_NAME) and not retried again by it."""
     start = clock()
-    rows = old_failures(out_dir, translator_stamp(), families)
+    stamp = translator_stamp()
+    already = retried_by_build(out_dir, stamp)
+    rows = old_failures(out_dir, stamp, families, already, weights)
     keys = [key for key, _lifted in rows]
     results = {}
     if keys:
@@ -12749,9 +12809,11 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
         if result == 'ok':  # the stale refusal would still count as one in the cache's totals
             with suppress(OSError):
                 os.remove(os.path.join(out_dir, '%016x.fail' % key))
+    if results:
+        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
     ok = sum(1 for result in results.values() if result == 'ok')
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
-                       sum(1 for _key, lifted in rows if lifted))
+                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
 
 
 def translate_one(out_dir, key):

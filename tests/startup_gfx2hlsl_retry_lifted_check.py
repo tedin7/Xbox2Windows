@@ -7,7 +7,11 @@ build wrote), on every core, for at most 180 s, in this order: the families rece
 then graphics and mesh requests before compute:
 
   - every old refusal is retried, lifted families first; a refusal newer than this build is final unless its reason is
-    in a lifted family (a stale .fail of a lifted family, as the MRTZ request Run P kept refused);
+    in a lifted family (a stale .fail of a lifted family, as the MRTZ request Run P kept refused) and this build has
+    not retried it yet: what it retried and still refuses (Run R: TG_SIZE_EN and compute dmask, the cases the lifts do
+    not cover, write the family's own text) is not retried again by the same build;
+  - inside each group the requests the last run used most go first (--weights <stderr.txt>: draws not drawn,
+    dispatches without a translation);
   - the time cap stops new requests; what is left keeps its .fail for the pass after the run;
   - the log line says how many keys, how many translate now, how many are still refused, and the seconds;
   - the command line form rewrites every .fail it retried;
@@ -63,6 +67,9 @@ def fixture(d, built):
     and 6: an old graphics refusal, other reasons."""
     reasons = {1: LIFTED['cube'], 2: LIFTED['tg-size'], 3: LIFTED['dmask'], 4: LIFTED['rw-buffer'], 5: OTHER[0],
                6: OTHER[1]}
+    retried = d / G.RETRIED_NAME  # a fresh cache: no build retried anything in it yet
+    if retried.exists():
+        retried.unlink()
     for key, reason in reasons.items():
         touch(d / ('req_%016x.%s' % (key, 'c67' if key == 5 else 'rtv')), b'not a request', built - 200)
         touch(d / ('%016x.fail' % key), (reason + '\n').encode(), built + 50 if key == 4 else built - 100)
@@ -91,6 +98,21 @@ with tempfile.TemporaryDirectory() as tmp:
         line = report.line()
         expect('log line', line.startswith('pre-run retry: 6 keys (4 in lifted families), ok 1, still refused 5, ')
                and line.endswith(' s'), True)
+        # Key 4's .fail is newer than this build and keeps its lifted-family text (the fake does not rewrite it, as a
+        # refusal of a case the lift does not cover): retried once by this build, then final for it.
+        called.clear()
+        again = G.retry_lifted(str(d), jobs=1)
+        # (keys 2, 3, 5 and 6 keep the old .fail the fake left: still old; key 1 has none after its 'ok')
+        expect('the same build does not retry its own lifted-family refusal again', (called, again.keys),
+               ([2, 3, 6, 5], 4))
+        expect('without the record it would be retried every run (mutant)',
+               4 in [key for key, _ in G.old_failures(str(d), built)], True)
+        (d / G.RETRIED_NAME).write_text('build-0.0\n%016x\n' % 4, encoding='ascii')
+        expect('the record of another build is ignored', G.retried_by_build(str(d), built), frozenset())
+        # The last run's use ranks each group: lifted 3 (50), 2 (10), then 1 and 4; then compute 5 (100) before 6.
+        fixture(d, built)
+        expect('retry order with the last run\'s draws/dispatches',
+               [key for key, _ in G.old_failures(str(d), built, weights={3: 50, 2: 10, 5: 100})], [3, 2, 1, 4, 5, 6])
         # The time cap: no new request after it, the rest is left for the pass after the run.
         called.clear()
         now = [0.0]
@@ -117,14 +139,24 @@ with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     reasons = fixture(d, built)
     before = {key: (d / ('%016x.fail' % key)).stat().st_mtime for key in reasons}
+    # The last run's stderr: cumulative per-key lines (the newest counts), a fully translated compute key, other lines.
+    stderr = d.parent / ('%s_stderr.txt' % d.name)
+    stderr.write_text('x2w-render not drawn key %016x: 3\n' % 6 + 'x2w-render not drawn key %016x: 40\n' % 6 +
+                      'x2w-render compute census key %016x: 90 dispatches, 0 translated\n' % 5 +
+                      'x2w-render compute census key %016x: 7 dispatches, 7 translated\n' % 2 +
+                      'x2w-render key use %016x 1.0 2.0 3\nother line\n' % 1, encoding='utf-8')
+    expect('weights from the last run', G.run_weights(str(stderr)), {6: 40, 5: 90, 2: 0})
+    expect('no stderr: no weights', G.run_weights(str(d / 'missing.txt')), {})
     started = time.time()
     run = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--retry-lifted', str(d),
-                          '180'], capture_output=True, text=True, timeout=300)
+                          '180', '--jobs', '4', '--weights', str(stderr)], capture_output=True, text=True, timeout=300)
+    stderr.unlink()
     expect('cli exit code', run.returncode, 0)
     lines = [line for line in run.stdout.splitlines() if line.strip()]
     expect('cli prints one line', len(lines), 1)
-    expect('cli line', bool(lines) and lines[0].startswith('pre-run retry: 6 keys (4 in lifted families), ok 0, '
-                                                           'still refused 6, '), True)
+    expect('cli line %r %r' % (lines, run.stderr[-600:]),
+           bool(lines) and lines[0].startswith('pre-run retry: 6 keys (4 in lifted families, 2 used in the last run), '
+                                               'ok 0, still refused 6, '), True)
     rewritten = {key: (d / ('%016x.fail' % key)).stat().st_mtime != before[key] for key in reasons}
     expect('cli rewrites every refusal it retried', rewritten, {1: True, 2: True, 3: True, 4: True, 5: True, 6: True})
     expect('cli well under the cap', time.time() - started < 120, True)

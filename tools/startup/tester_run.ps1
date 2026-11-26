@@ -218,12 +218,23 @@ $backgroundJobs = 4
 # Never blocks the run.
 # A cache without any refusal has nothing to retry: the translator is not even started (it takes seconds to load).
 $anyFailure = Get-ChildItem -LiteralPath $cache -Filter "*.fail" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+# It is not the re-keying below ("the new cache already holds requests" is that step's skip): it always runs when the
+# cache holds a .fail, and its line goes into the manifest as pre_run_retry.
+$preRunRetry = "pre-run retry skipped: no refusal in the cache"
 if ($anyFailure) { try {
-    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 --jobs $backgroundJobs } | Out-String).Trim()
-    if ($retryLine) { Write-Host "tester_run: $retryLine" }
+    # The last run's stderr.txt ranks the retry by draws/dispatches (the per-key census lines), when there is one.
+    $runsRoot = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
+    $lastStderr = Get-ChildItem -LiteralPath $runsRoot -Directory -Filter "run_*" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | ForEach-Object { Join-Path $_.FullName "stderr.txt" } |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $retryArgs = @("--retry-lifted", $cache, "180", "--jobs", "$backgroundJobs")
+    if ($lastStderr) { $retryArgs += @("--weights", $lastStderr) }
+    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") @retryArgs } | Out-String).Trim()
+    $preRunRetry = if ($retryLine) { $retryLine } else { "pre-run retry: no output (translator exit code $LASTEXITCODE)" }
 } catch {
-    Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"
+    $preRunRetry = "pre-run retry skipped: $($_.Exception.Message)"
 } }
+Write-Host "tester_run: $preRunRetry"
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
@@ -393,7 +404,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
-    pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
+    pretranslate = $preTranslate; pre_run_retry = $preRunRetry; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
