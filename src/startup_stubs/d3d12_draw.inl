@@ -1539,12 +1539,13 @@ LONG frame_copies_frame = -1;
 
 LONG64 big_copies_reused, big_copies_made;
 
-// X2W_BIG_COPY_REUSE=0 turns the cross-frame reuse of large copies off (every copy ends with its frame, as before).
+// X2W_BIG_COPY_REUSE=1 turns the cross-frame reuse of large copies on. Off by default (every copy ends with its frame): a measured
+// run with it on showed no speed gain but null and not-drawn bindings that the same run with it off did not have.
 bool big_copy_reuse_enabled()
 {
     static const bool on = [] {
         char value[8]{};
-        return !GetEnvironmentVariableA("X2W_BIG_COPY_REUSE", value, sizeof(value)) || value[0] != '0';
+        return GetEnvironmentVariableA("X2W_BIG_COPY_REUSE", value, sizeof(value)) && value[0] == '1';
     }();
     return on;
 }

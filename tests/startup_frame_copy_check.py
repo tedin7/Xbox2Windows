@@ -19,7 +19,9 @@ def run(directory, consumer, backend, mode):
     folder = directory / mode
     folder.mkdir()
     log = folder / "trap.log"
-    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log)},
+    # The cross-frame reuse is off by default: the big-* cases switch it on, the controls below leave it off or break it.
+    reuse = {"X2W_BIG_COPY_REUSE": "1"} if mode.startswith("big-") else {}
+    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), **reuse},
                           binding="srv 0 buf table 0 0")
     refreshed = [line for line in log.read_text(errors="replace").splitlines() if "frame copy of" in line] if log.exists() else []
     return pixels, refreshed
@@ -46,8 +48,8 @@ def check(directory, consumer, backend):
     # The controls of the cross-frame reuse: reuse off still shows the new bytes; a reuse that never compares (the mutant) must show
     # the OLD bytes, which proves the big-changed case above would catch it.
     for name, extra, expected in (
-        ("big-changed with reuse off", {"X2W_BIG_COPY_REUSE": "0"}, (RED * 4 + BLUE * 4) * 4),
-        ("big-changed, never-refill mutant", {"X2W_TEST_FRAME_COPY_STALE": "1"}, RED * 8 * 4),
+        ("big-changed with reuse off (default)", {}, (RED * 4 + BLUE * 4) * 4),
+        ("big-changed, never-refill mutant", {"X2W_BIG_COPY_REUSE": "1", "X2W_TEST_FRAME_COPY_STALE": "1"}, RED * 8 * 4),
     ):
         folder = directory / name.replace(" ", "_").replace(",", "")
         folder.mkdir()
