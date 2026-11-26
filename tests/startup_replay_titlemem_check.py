@@ -106,17 +106,18 @@ def main(scene, player, backend):
         for number, name in enumerate(names):
             expect_colour(recorded[name], number, "recorded " + name)
 
-        score, replayed = replay(player, recording, directory / "replayed", backend, env)
-        assert sorted(replayed) == names, sorted(replayed)
-        differ = [n for n in names if replayed[n] != recorded[n]]
-        assert not differ, "replayed pictures differ from the recorded run: %s\n%s" % (
-            differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt"))
-
         data = recording.read_bytes()
         assert pages_log, "the recorder never ran its page scan (no 'x2w-replay pages:' line):\n" + text[-1500:]
         ranges = re.search(r"ranges (\d+)", pages_log[0]) if pages_log else None
         assert ranges and int(ranges.group(1)) >= 1, "the page scan found no title-memory range: " + (pages_log[0] if pages_log else "no log")
         assert data.count(b"PAGE") >= 1 and data.count(b"MAP ") >= 1, "the recording holds no PAGE/MAP chunk"
+        score, replayed = replay(player, recording, directory / "replayed", backend, env)
+        assert sorted(replayed) == names, sorted(replayed)
+        differ = [n for n in names if replayed[n] != recorded[n]]
+        assert not differ, "replayed pictures differ from the recorded run: %s\n%s" % (
+            differ, explain(recorded[differ[0]], replayed[differ[0]], directory / "replayed" / "stderr.txt")) + "\nrecorder: " + pages_log[0] + "\nreplay page lines:\n" + "\n".join(
+            l for l in (directory / "replayed" / "stderr.txt").read_text(errors="replace").splitlines() if "page" in l.lower() or "MAP" in l)[-1500:]
+
         note = "page control skipped (page bytes not stored by value)"
         last = struct.pack("<4f", *colour_of(PRESENTS - 1))
         if data.count(last) >= 1:
