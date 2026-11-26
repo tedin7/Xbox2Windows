@@ -286,8 +286,11 @@ extern "C" HRESULT WINAPI d3d12_xs_ConfigureVirtualMemoryX(const void* config)
 // it runs the table on detach, which the cpu_native_crt_lifecycle fixture measures (a global destructor
 // runs after DllMain(DLL_PROCESS_DETACH), docs/experiments.md), so the destructors see the flag below.
 // startup_stubs/d3d12_teardown.h has the details.
+extern "C" void x2w_d3d12_replay_record_stop(int at_exit);
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_DETACH && reserved) x2w_startup::d3d12_process_terminating = true;
+    // A replay recording still open is closed with its end chunk (docs/startup-runtime.md#d3d12-replay-record).
+    if (reason == DLL_PROCESS_DETACH) x2w_d3d12_replay_record_stop(reserved ? 1 : 0);
     return TRUE;
 }

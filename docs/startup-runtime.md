@@ -1876,6 +1876,31 @@ allow unordered access are never in the retire class.
 ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
 ```
 
+## D3D12 replay record
+
+`X2W_REPLAY_RECORD=all`, `<start s>,<seconds>` or `f<first present>,<presents>` records every call the title
+makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `replay.x2wr`), so a replayer can feed the
+same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
+Unset, no slot is wrapped and nothing changes.
+
+Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
+the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, seven argument words, return value, time,
+present count), each pointer argument's memory (one level of pointers followed, a pointer followed by a plausible size
+is read at that size, as a shader is), and the wrapper an argument's memory holds after the call (a creation's
+result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
+written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
+closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
+
+File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
+`CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
+`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents).
+Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_record_' --output-on-failure
+```
+
 ## D3D12 view census
 
 The stand-in keeps one record per distinct view: slot, resource, counter,
