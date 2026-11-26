@@ -22,10 +22,18 @@ def check(label, condition, detail=''):
 
 class Pipe:
     resources = {(('table', 0), 0): {'index': 0}}  # the formatted load reads the stride and FORMAT words by index
-    modified = set()
+
+    def __init__(self):
+        self.modified, self.other_modified, self.uavs = set(), set(), {}
 
     def resource(self, key, kind):
         return 'r0'
+
+    def uav(self, key, kind='raw'):
+        return 'w0'
+
+    def stored_images(self):
+        return self.uavs
 
     def ud(self, key):
         return 0
@@ -39,6 +47,8 @@ def run(*instructions, kind='cs', descriptor_proven=False):
         s.formatted_descriptor_from_block = lambda reg, first: True
     s.pipe, s.lines, s.attrs = Pipe(), [], {}
     s.sym = {4 + i: ('desc', ('table', 0), 0, i) for i in range(4)}
+    s.sym.update({16 + i: ('desc', ('table', 0), 32, i) for i in range(8)})
+    s.sym.update({24 + i: ('desc', ('table', 0), 64, i) for i in range(8)})
     s.used_s, s.used_v, s.masks = set(), set(), set()
     s.exec_known, s.kind = True, kind
     s.ins = [(4 * i, 4, asm.split()[0], asm) for i, asm in enumerate(instructions)]
@@ -145,6 +155,53 @@ try:
         check(f'control: {label} refused without the load proof', got == REFUSAL, repr(got))
 finally:
     G.UNIFORM_LOADS = original
+
+IMG_LOAD = 'image_load v7, [v2, v3], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'
+IMG_COORDS = ('v_mov_b32_e32 v2, s3', 'v_mov_b32_e32 v3, 1')
+IMG_ACCEPTED = [
+    ('image_load past entry block', JOIN + (SCALAR,) + IMG_COORDS + (IMG_LOAD, READ),
+     ['t = r0.Load(int3(v2, v3, 0));', 'v7 = U(t.x);', 'ul14_7 = U(t.x);', 's9 = ul14_7;']),
+    ('two-channel image_load past entry block converted',
+     JOIN + (SCALAR,) + IMG_COORDS + (
+         'image_load v[7:8], v[2:3], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D',
+         'v_cvt_f32_u32_e32 v9, v8', 'v_readfirstlane_b32 s9, v9'),
+     ['t = r0.Load(int3(v2, v3, 0));', 'v7 = U(t.x);', 'ul14_7 = U(t.x);',
+      'v8 = U(t.y);', 'ul14_8 = U(t.y);', 'v9 = U(float(v8));', 's9 = U(float((ul14_8)));']),
+]
+for label, instructions, lines in IMG_ACCEPTED:
+    got = run(*instructions)
+    check(f'{label} accepted', isinstance(got, list) and got[-len(lines):] == lines, repr(got))
+
+for label, instructions in (
+        ('image_load past entry block with image_store in dispatch',
+         JOIN + (SCALAR,) + IMG_COORDS + (
+             'v_mov_b32_e32 v10, 0', 'v_mov_b32_e32 v11, 0',
+             'v_mov_b32_e32 v12, 0', 'v_mov_b32_e32 v13, 0',
+             'v_mov_b32_e32 v14, 0', 'v_mov_b32_e32 v15, 0',
+             IMG_LOAD, 'image_store v[12:15], v[10:11], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D', READ)),
+        ('image_load in EXEC-modifying loop',
+         JOIN + (SCALAR,) + IMG_COORDS + (
+             IMG_LOAD, READ, 's_add_u32 s3, s3, 4',
+             'v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 exec_lo, exec_lo, vcc_lo',
+             's_cmp_lt_u32 s3, 64', 's_cbranch_scc1 label_000c', 's_endpgm')),
+        ('image_load inside a skipped execz block',
+         JOIN + (SCALAR,) + IMG_COORDS + (
+             's_and_saveexec_b32 s8, vcc_lo', 's_cbranch_execz label_0020',
+             IMG_LOAD, 's_mov_b32 exec_lo, s8', READ, 's_endpgm')),
+        ('join of image_load and another definition',
+         ('s_cbranch_scc0 label_001c', SCALAR) + IMG_COORDS + (
+             IMG_LOAD, 's_branch label_001c', 'v_mov_b32_e32 v7, 0', READ, 's_endpgm'))):
+    got = run(*instructions)
+    check(f'{label} refused', got == REFUSAL, repr(got))
+
+original_img = G.UNIFORM_IMAGE_LOADS
+G.UNIFORM_IMAGE_LOADS = frozenset()
+try:
+    for label, instructions, _ in IMG_ACCEPTED:
+        got = run(*instructions)
+        check(f'control: {label} refused without image_load proof', got == REFUSAL, repr(got))
+finally:
+    G.UNIFORM_IMAGE_LOADS = original_img
 
 print('Readfirstlane load recompute checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

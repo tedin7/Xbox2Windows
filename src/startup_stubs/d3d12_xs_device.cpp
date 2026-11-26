@@ -22,10 +22,12 @@
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/pixel_history.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
+#include "startup_stubs/pixel_uav_support.h"
 #include "startup_stubs/formatted_buffer.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
@@ -47,10 +49,12 @@
 #include "startup_stubs/linear_buffer_backing.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
+#include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/manifest_prefetch.h"
 #include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
@@ -1514,6 +1518,18 @@ x2w_startup::DrawReadbacks& draw_dumps()
 }
 
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
+// X2W_GPU_TIME=1: GPU time per frame of the title's direct queue (gpu_time_probe.h). Frame = the present count.
+LONG gpu_time_frame;
+x2w_gpu_time::Probe& gpu_time_probe()
+{
+    static x2w_gpu_time::Probe probe;
+    return probe;
+}
+bool gpu_time_on()
+{
+    static const bool on = x2w_local::env_on("X2W_GPU_TIME");
+    return on;
+}
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
 
@@ -2813,6 +2829,50 @@ void note_copy_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u6
         if (first_calls(reports, 16)) log("x2w-render recorded GPU buffer copy range: offset 0x%llx, %llu bytes", offset, bytes);
     }
 }
+// Placed buffers that do not alias title memory (copied placement) and that a recorded copy has written. The title's memory
+// never receives those bytes, so a draw that reads the buffer's range from title memory reads what the title wrote before the
+// copy, or nothing. The ranges outlive the recording: the copy and the draw that reads it are often in different lists.
+// A range is dropped with its wrapper's title address changing; a recording that is discarded still leaves its range here,
+// which only makes a later draw read the buffer's own copy.
+struct PlacedGpuWrite { u64 address, offset, bytes; };
+SRWLOCK placed_gpu_writes_lock = SRWLOCK_INIT;
+LONG placed_gpu_write_buffers = 0;
+std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>>& placed_gpu_writes()
+{
+    static std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>> m;
+    return m;
+}
+void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    if (!buffer || !buffer->own().title_memory || !bytes) return;
+    const auto* info = resource_info(buffer);
+    if (!info || info->placement != Placement::copied_buffer) return;
+    const u64 address = reinterpret_cast<u64>(buffer->own().title_memory);
+    AcquireSRWLockExclusive(&placed_gpu_writes_lock);
+    try {
+        auto& writes = placed_gpu_writes()[buffer];
+        if (!writes.empty() && writes.front().address != address) writes.clear();  // a new buffer at a reused wrapper
+        if (writes.size() < 64) writes.push_back({address, offset, bytes});
+        placed_gpu_write_buffers = static_cast<LONG>(placed_gpu_writes().size());
+    } catch (const std::bad_alloc&) {
+    }
+    ReleaseSRWLockExclusive(&placed_gpu_writes_lock);
+}
+// True when a recorded copy wrote any byte of [offset, offset + bytes) of the buffer.
+bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    if (!InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) return false;
+    bool written = false;
+    AcquireSRWLockShared(&placed_gpu_writes_lock);
+    const auto found = placed_gpu_writes().find(buffer);
+    if (found != placed_gpu_writes().end() && buffer->own().title_memory &&
+        found->second.front().address == reinterpret_cast<u64>(buffer->own().title_memory)) {
+        for (const auto& write : found->second)
+            if (offset < write.offset + write.bytes && write.offset < offset + bytes) written = true;
+    }
+    ReleaseSRWLockShared(&placed_gpu_writes_lock);
+    return written;
+}
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
@@ -3257,8 +3317,20 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("command count is zero or above the supported maximum", indirect_other, indirect_other_refusal_code::invalid_command_count);
     if (!count_buffer && count_offset)
         return refuse("count offset without a count buffer", indirect_other, indirect_other_refusal_code::count_offset_without_buffer);
-    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
+    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real) {
+        // A console-only signature has no desktop equivalent: show what the title put in its argument buffer so the
+        // layout can be read from the log (first calls only; bytes of the argument range, at most 48 per call).
+        static LONG traced;
+        if (sig && sig->own().kind == command_signature_kind && first_calls(traced, 8)) {
+            const Wrapper* arg = as_wrapper(argument);
+            const auto* memory = arg && arg->own().kind == resource_kind ? static_cast<const unsigned char*>(arg->own().title_memory) : nullptr;
+            char bytes[3 * 48 + 1] = "unreadable";
+            if (memory && readable_window(reinterpret_cast<u64>(memory) + offset, 48) >= 48) hex_text(memory + offset, 48, bytes, sizeof(bytes));
+            log("x2w-render ExecuteIndirect placeholder signature: count=%u offset=%llu count_buffer=%p argument title memory=%p bytes [%s]",
+                count, static_cast<unsigned long long>(offset), count_buffer, static_cast<const void*>(memory), bytes);
+        }
         return refuse("missing or placeholder signature", indirect_placeholder);
+    }
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device", indirect_other, indirect_other_refusal_code::signature_device_mismatch);
@@ -4204,6 +4276,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
+            const int gpu_slot = gpu_time_on() ? gpu_time_probe().before(queue, static_cast<std::uint64_t>(gpu_time_frame)) : -1;
             red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
                     const HRESULT hr = draw_dumps().execute(queue, ready_count, native_lists.data());
@@ -4212,6 +4285,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
@@ -6358,6 +6432,35 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_view_census_line(char* ou
     return view_census_line(out, capacity);
 }
 
+// Fixture only (startup_view_alloc): see view_allocation_gate.
+extern "C" __declspec(dllexport) void x2w_d3d12_fail_view_allocations(int site, LONG count)
+{
+    if (site >= 0 && site < view_allocation_sites) InterlockedExchange(&view_allocations_to_fail[site], count);
+}
+
+// Fixture probe (startup_view_alloc): the sizes of the three view containers, the id + 1 that the tracked slot of a
+// title descriptor handle names (0: none), and whether a resource is still in the retire class.
+struct ViewStoreProbe {
+    unsigned long long records, materialized, ids, records_capacity, materialized_capacity;
+    unsigned shadow, view_refs, retire_when_idle;
+};
+extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long title_handle, void* resource, ViewStoreProbe* out)
+{
+    *out = {};
+    out->shadow = shadow_id(desktop_cpu_handle(title_handle));
+    AcquireSRWLockShared(&note_lock);
+    out->records = view_records().size();
+    out->materialized = view_materialized().size();
+    out->ids = view_ids().size();
+    out->records_capacity = view_records().capacity();
+    out->materialized_capacity = view_materialized().capacity();
+    ReleaseSRWLockShared(&note_lock);
+    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
+        out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
+        out->retire_when_idle = r->own().retire_when_idle;
+    }
+}
+
 // Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
 extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
 {
@@ -7105,6 +7208,21 @@ void draw_overlay(LONG frame, double seconds)
     ReleaseDC(window, dc);
 }
 
+// Every 300 frames: GPU ms per frame (average and worst) and the share of the wall time the queue sat idle.
+// The probe's submit side runs under draw_lock, so the read takes it too.
+void log_gpu_time(LONG frame, ULONGLONG now_ms)
+{
+    static ULONGLONG last_ms;
+    AcquireSRWLockExclusive(&draw_lock);
+    auto& probe = gpu_time_probe();
+    probe.harvest(static_cast<std::uint64_t>(frame));
+    const auto r = probe.stats.take(last_ms ? static_cast<double>(now_ms - last_ms) : 0);
+    const unsigned skipped = probe.skipped, failed = probe.failed;
+    ReleaseSRWLockExclusive(&draw_lock);
+    last_ms = now_ms;
+    log("x2w-gpu-time frame %ld: %llu frames, avg %.2f ms, max %.2f ms, busy %.0f ms of %.0f ms, GPU idle %.0f%% (stamps skipped %u, failed %u)", frame,
+        static_cast<unsigned long long>(r.frames), r.avg_ms, r.max_ms, r.busy_ms, r.wall_ms, r.idle_share * 100.0, skipped, failed);
+}
 #include "startup_stubs/d3d12_present.inl"
 
 // Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
@@ -7330,6 +7448,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
+    gpu_time_frame = frame;
     frame_number = frame;
     draw_dump_flush();
     red_producers().flush();
@@ -7418,6 +7537,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
@@ -7438,6 +7558,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        log("x2w-render manifest lookups: file opens under draw_lock, first lookups %lld, retries %lld (must be 0); manifests read by the background thread %lld",
+            manifest_source().first_opens_under_lock(), manifest_source().retry_opens_under_lock(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
