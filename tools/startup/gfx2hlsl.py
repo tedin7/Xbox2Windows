@@ -11483,14 +11483,17 @@ def main():
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
-        # The first pass retries the failures an older translator build wrote (the runtime never rewrites a
-        # request, so a translator fix would otherwise not reach them); a failure this build already wrote is final
-        # (translator_stamp). Later passes skip every failure already written.
-        skip_failed = False
+        # In-run the pool translates only requests without a result or a failure: a failure an older translator
+        # build wrote is retried by the pass after the run (--pending, translator_stamp), never here, so a translator
+        # update does not turn the run into a retry of every old refusal (Run Pi: 1,823 retries, 28 workers, 5.8 GiB).
+        # The pool is small (watch_jobs) and logs its size and commit every POOL_LOG_SECONDS.
         started = time.time()  # requests published after this are the running title's: they go first
+        jobs, monitor = watch_jobs(), PoolMonitor()
+        print('gfx2hlsl watch: pool of at most %d workers, old failures left for the pass after the run' % jobs,
+              file=sys.stderr, flush=True)
         while True:
-            if watch_pass(out_dir, skip_failed, started, translator_stamp()):
-                skip_failed = True
+            watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
+            monitor.tick(None)
             time.sleep(interval)
     translate_pending(out_dir, since_translator=translator_stamp())
 
@@ -11510,13 +11513,14 @@ def translator_stamp():
     return max(os.path.getmtime(name) for name in files if os.path.isfile(name))
 
 
-def watch_pass(out_dir, skip_failed, since=None, since_translator=None):
+def watch_pass(out_dir, skip_failed, since=None, since_translator=None, jobs=None, monitor=None, recycle=False):
     """One --watch pass: translate_pending with rescans, so a request the title publishes during a long pass starts
     within about RESCAN_SECONDS. A worker killed from outside (out of memory) breaks the pool; the pass is
     reported and its requests are retried on the next pass instead of ending the watcher."""
     from concurrent.futures.process import BrokenProcessPool
     try:
-        translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since, since_translator=since_translator)
+        translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since, since_translator=since_translator,
+                          jobs=jobs, monitor=monitor, recycle=recycle)
         return True
     except BrokenProcessPool as error:
         print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
@@ -11561,6 +11565,76 @@ def translate_one(out_dir, key):
         return reason
 
 
+WATCH_JOBS = 4          # --watch: workers beside a running title (X2W_TRANSLATE_JOBS overrides)
+RECYCLE_AFTER = 50      # requests per pool worker before it is replaced, so its memory growth is given back
+POOL_LOG_SECONDS = 30.0  # --watch: how often the pool's size and commit are logged
+
+
+def watch_jobs():
+    """Workers of the in-run (--watch) pool: X2W_TRANSLATE_JOBS when set, else at most WATCH_JOBS."""
+    return translation_jobs() if os.environ.get('X2W_TRANSLATE_JOBS') else min(WATCH_JOBS, translation_jobs())
+
+
+def new_pool(jobs, recycle=False):
+    """A process pool; with recycle (the --watch command line, whose workers live as long as the run) each worker is
+    replaced after RECYCLE_AFTER requests (Python 3.11 and later; it needs a spawning start method, which an in-process
+    caller with a fork context does not have)."""
+    from concurrent.futures import ProcessPoolExecutor
+    if recycle and sys.version_info >= (3, 11):
+        return ProcessPoolExecutor(max_workers=jobs, max_tasks_per_child=RECYCLE_AFTER)
+    return ProcessPoolExecutor(max_workers=jobs)
+
+
+def private_bytes(pid):
+    """Committed private memory of a process in bytes (Windows PrivateUsage; elsewhere RssAnon + VmSwap), or None."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes as wt
+
+        class Counters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX
+            _fields_ = [('cb', wt.DWORD), ('faults', wt.DWORD)] + [(n, ctypes.c_size_t) for n in (
+                'peak_ws', 'ws', 'peak_paged', 'paged', 'peak_nonpaged', 'nonpaged', 'pagefile', 'peak_pagefile',
+                'private')]
+        k32, psapi = ctypes.WinDLL('kernel32'), ctypes.WinDLL('psapi')
+        k32.OpenProcess.restype = wt.HANDLE
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            counters = Counters()
+            counters.cb = ctypes.sizeof(counters)
+            return counters.private if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb) else None
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        with open('/proc/%d/status' % pid) as status:
+            fields = dict(line.split(':', 1) for line in status if ':' in line)
+        return sum(int(fields.get(name, '0 kB').split()[0]) for name in ('RssAnon', 'VmSwap')) * 1024
+    except (OSError, ValueError):
+        return None
+
+
+class PoolMonitor:
+    """Logs the --watch pool every POOL_LOG_SECONDS to stderr: workers alive, requests running, their committed
+    private memory now and the peak seen."""
+
+    def __init__(self, every=POOL_LOG_SECONDS, clock=time.monotonic, out=None):
+        self.every, self.clock, self.out = every, clock, out
+        self.next_at = clock()
+        self.peak = 0
+
+    def tick(self, pool, running=0):
+        if self.clock() < self.next_at:
+            return
+        self.next_at = self.clock() + self.every
+        pids = list(getattr(pool, '_processes', None) or {}) if pool is not None else []
+        sizes = [size for size in map(private_bytes, pids) if size is not None]
+        total = sum(sizes)
+        self.peak = max(self.peak, total)
+        print('gfx2hlsl watch pool: %d workers, %d requests running, commit %.0f MiB (peak %.0f MiB)'
+              % (len(pids), running, total / 1048576.0, self.peak / 1048576.0), file=self.out or sys.stderr, flush=True)
+
+
 def translation_jobs():
     try:
         jobs = int(os.environ.get('X2W_TRANSLATE_JOBS') or 0)
@@ -11593,7 +11667,8 @@ def request_order(stamps, since=None):
     return sorted(stamps, key=lambda key: (since is None or stamps[key] < since, stamps[key], key))
 
 
-def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None):
+def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None,
+                      monitor=None, recycle=False):
     """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
     the ready markers last.
 
@@ -11624,8 +11699,8 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     last_scan = time.monotonic()
     pool = running = None
     if jobs >= 2:
-        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-        pool, running = ProcessPoolExecutor(max_workers=jobs), {}
+        from concurrent.futures import FIRST_COMPLETED, wait
+        pool, running = new_pool(jobs, recycle), {}
     try:
         while True:
             while queue and (pool is None or len(running) < jobs):
@@ -11639,6 +11714,8 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
                 for future in done:
                     print('%016x: %s' % (running.pop(future), future.result()), flush=True)
+            if monitor is not None:
+                monitor.tick(pool, len(running or ()))
             idle = not queue and not running
             if rescan and (idle or time.monotonic() - last_scan >= RESCAN_SECONDS):
                 queue = refill(queue)

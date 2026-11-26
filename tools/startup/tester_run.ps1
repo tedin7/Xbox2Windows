@@ -173,10 +173,11 @@ New-Item -ItemType Directory -Force $cache | Out-Null
 $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
 # Pre-translation: after a revision bump the new cache folder is empty and the title would be black until the --watch
 # translator caught up. The requests of the older shader_cache_* folders are copied under the new keys first (the translator
-# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through in
-# its process pool (all cores but one) while the title boots; what the title asks for meanwhile goes first. Never blocks the run.
+# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through
+# while the title boots; what the title asks for meanwhile goes first. Never blocks the run. The re-keying uses all cores
+# but one; the --watch pool beside the title keeps to 4 workers and leaves old refusals alone (gfx2hlsl.py watch_jobs),
+# and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
-if (-not $env:X2W_TRANSLATE_JOBS) { $env:X2W_TRANSLATE_JOBS = "$translateJobs" }
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
