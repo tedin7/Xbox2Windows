@@ -1433,6 +1433,16 @@ endforeach()
 
 # List upload pages stay flat over 10,000 record/execute cycles on an allocator that is never reset, are not reused
 # while the GPU has not passed them, and are never reused when no submit can be tracked.
+# Record + replay page store (pure C++, no D3D): a range captured twice is rebuilt byte for byte; each mutant stream must fail.
+add_executable(startup_replay_pages tests/startup_replay_pages.cpp)
+target_compile_features(startup_replay_pages PRIVATE cxx_std_17)
+add_test(NAME startup_replay_pages COMMAND startup_replay_pages)
+set_tests_properties(startup_replay_pages PROPERTIES TIMEOUT 60)
+foreach(mutant drop-map drop-page corrupt)
+    add_test(NAME startup_replay_pages_mutant_${mutant} COMMAND startup_replay_pages ${mutant})
+    set_tests_properties(startup_replay_pages_mutant_${mutant} PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+endforeach()
+
 add_executable(startup_upload_page_reuse tests/startup_upload_page_reuse.cpp)
 target_compile_features(startup_upload_page_reuse PRIVATE cxx_std_17)
 target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
