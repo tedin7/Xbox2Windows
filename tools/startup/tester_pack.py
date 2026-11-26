@@ -464,7 +464,7 @@ def format_results(rows, use=None):
 REQUESTS_DIR = "shader_requests"
 REQUESTS_TOP = 40                   # keys
 REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
-REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86")
+REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86", ".rtv")
 NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
 CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
 
@@ -491,6 +491,21 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
     without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing."""
     names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
+    # An RTV variant (req_<variant>.rtv, text "rtv1 <base key in decimal> <formats>") has no code of its own: its draws count on its
+    # base key, and the variant's request file travels with the base's files (Run R: be7c1a1a / ca7cec3b were never picked because
+    # their draws were counted under variant keys).
+    weights, variants = dict(weights), {}
+    for name in names:
+        match = re.match(r"^req_([0-9a-f]{16})\.rtv$", name)
+        if not match:
+            continue
+        try:
+            with open(os.path.join(cache_dir, name), "r", encoding="ascii", errors="replace") as handle:
+                base = "%016x" % int(handle.read(200).split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        variants.setdefault(base, []).append(name)
+        weights[base] = weights.get(base, 0) + weights.get(match.group(1), 0)
     ranked = sorted((r for r in rows if r[2] == "refused" and weights.get(r[0], 0) > 0), key=lambda r: (-weights[r[0]], r[0]))
     groups = [[r for r in ranked if r[1] == "compute"], [r for r in ranked if r[1] != "compute"]]
     quota = [min(compute_share, top), top - min(compute_share, top)]
@@ -503,8 +518,8 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
                     continue
                 if taken[gi] >= round_quota[gi] or len(chosen) >= top:
                     break
-                files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(names)
-                         if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
+                own = [n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
+                files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(set(own + variants.get(key, [])))]
                 size = sum(b for _, b in files)
                 if not files or used + size > cap:
                     continue

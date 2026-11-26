@@ -584,6 +584,17 @@ def check_request_code_files():
         few = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)), top=40, compute_share=40)
         broken = [c for c in few if c[0] == "c%015x" % 29]
         assert broken and broken[0][4] == [".data"], broken
+
+        # RTV variants: draws counted under a variant key count on its base, whose code ships with the variants' request files
+        base = "a%015x" % 19                       # the weakest graphics key by its own draws (5000 - 19 = 4981 < the others' 4999..)
+        for n, (variant, drawn) in enumerate((("b000000000000001", 4000), ("b000000000000002", 3000))):
+            write(cache, "req_%s.rtv" % variant, ("rtv1 %d 28" % int(base, 16)).encode())
+            stderr.append("x2w-render not drawn key %s: %d (translation_not_ready)" % (variant, drawn))
+        chosen = T.select_requests(str(cache), T.cache_results(str(cache)), T.key_weights("\n".join(stderr)))
+        graphics = [c for c in chosen if c[1] == "graphics"]
+        assert graphics[0][0] == base and graphics[0][2] == 4981 + 7000, graphics[0][:3]
+        assert {n for n, _ in graphics[0][3]} == {"req_%s%s" % (base, e) for e in (".a", ".b", ".root", ".psin")} | {"req_b000000000000001.rtv", "req_b000000000000002.rtv"}
+        assert all(not c[0].startswith("b") for c in chosen), "a variant is never a key of its own"
         run = tmp / "run"
         run.mkdir()
         make_run(run, 1)
