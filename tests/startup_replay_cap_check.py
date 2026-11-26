@@ -78,6 +78,13 @@ def main(scene, backend):
         assert "X2W_REPLAY_MAX_MIB reached" in text, text[-3000:]
         presents = end_presents(capped)
         assert presents < PRESENTS, "the capped file holds every present (%d): the cap did not stop it" % presents
+        assert "SHDR" in capped.read_bytes().decode("latin-1"), "the capped file holds no shader cache"
+        # X2W_REPLAY_SHADERS=0: the same recording without SHDR chunks.
+        bare = directory / "bare.x2wr"
+        code, text, _ = timed(args + [12], dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(bare), X2W_REPLAY_SHADERS="0"))
+        assert code == 0 and "shader cache not written (X2W_REPLAY_SHADERS=0)" in text, text[-2000:]
+        end_presents(bare)
+        assert b"SHDR" not in bare.read_bytes(), "X2W_REPLAY_SHADERS=0 still wrote shader chunks"
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
 

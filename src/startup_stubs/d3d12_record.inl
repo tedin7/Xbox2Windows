@@ -285,6 +285,12 @@ void flush_all(bool at_exit)
 // so a large cache cannot hold the exit up. file_lock held.
 void write_shader_cache(bool at_exit)
 {
+    // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
+    char shaders[8]{};
+    if (GetEnvironmentVariableA("X2W_REPLAY_SHADERS", shaders, sizeof(shaders)) && shaders[0] == '0') {
+        if (!at_exit) log("x2w-replay record: shader cache not written (X2W_REPLAY_SHADERS=0)");
+        return;
+    }
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH - 4) return;
