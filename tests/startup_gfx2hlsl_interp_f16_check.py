@@ -261,8 +261,9 @@ def evaluate(vs, ps, channels=None, regs=None):
         if stmt:
             state[stmt.group(1)] = f16_to_f32_bits(state[stmt.group(2)] & 0xffff)
             continue
-        # v_fma_mix_f32 a, b, 0 with both sources binary16 low halves: the f32 product (exact for two binary16 values)
-        stmt = re.fullmatch(r'    (v\d+) = U\(f16tof32\((v\d+)\) \* f16tof32\((v\d+)\) \+ F\(0x00000000u\)\);', line)
+        # v_fma_mix_f32 a, b, 0 with both sources binary16 low halves, written through the precise mix32 helper (#2818):
+        # the f32 product (exact for two binary16 values)
+        stmt = re.fullmatch(r'    (v\d+) = U\(mix32\(f16tof32\((v\d+)\), f16tof32\((v\d+)\), F\(0x00000000u\)\)\);', line)
         if stmt:
             a, b = (struct.unpack('<f', struct.pack('<I', f16_to_f32_bits(state[g] & 0xffff)))[0] for g in stmt.group(2, 3))
             state[stmt.group(1)] = struct.unpack('<I', struct.pack('<f', a * b))[0]
