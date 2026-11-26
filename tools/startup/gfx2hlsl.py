@@ -2592,11 +2592,36 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'joined at a branch target':
+                edges = getattr(self, 'numeric_joins', {}).get((s, n))
+                if edges is not None:
+                    for pred, value in edges:
+                        stores = self.edge_scalar_stores.setdefault((pred, s[1]), {})
+                        if value[0] == 'ud':
+                            stores[n] = 'ud%d' % value[1]
+                        elif value[0] == 'const':
+                            stores[n] = '0x%08xu' % (value[1] & 0xffffffff)
+                        else:
+                            stores[n] = self.descriptor_word3(value)
+                    self.numeric_joins[s, n] = []
+                    self.used_s.add(n)
+                    return 's%d' % n
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
+
+    @staticmethod
+    def is_buffer_word3(sym):
+        # A compute load through a table pointer with an explicit zero high word has tag -1.
+        return bool(sym and sym[0] == 'desc' and (len(sym) == 4 or sym[4:] == (-1,)) and
+                    sym[1][0] == 'table' and sym[2] is not None and sym[3] % 4 == 3)
+
+    def descriptor_word3(self, sym):
+        key = desc_key(sym)
+        self.pipe.resource(key, 'buf')
+        return 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
 
     def note_whole_read(self, reg):
         if reg in self.low16_only_v:
@@ -3910,6 +3935,9 @@ class Stage:
             tentative_kept = set()
             materialize = {}
             incoming = {}
+            incoming_blocks = {}
+            self.numeric_joins = {}
+            self.edge_scalar_stores = {}
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -3961,6 +3989,8 @@ class Stage:
                     here = joined.get(off, set())
                     arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
                         incoming.get(off, [])
+                    fall_edge = [(self.blocks[-1][0], self.masks | self.mask_high)] if falls and self.blocks else []
+                    predecessors = fall_edge + incoming_blocks.get(off, [])
                     written = (written - here) | set().union(*(w for _, w in arriving))
                     for reg in here:
                         paths = [s[reg] for s, w in arriving if reg in w]
@@ -3979,6 +4009,20 @@ class Stage:
                             continue
                         if force == 'refuse' or any(p and not run_time_symbol(p) for p in paths):
                             self.sym[reg] = ('joined at a branch target',)
+                            if (getattr(self, 'kind', None) in ('cs', 'vs', 'ps') and isinstance(reg, int) and
+                                    not back_targets and force is None and
+                                    len(paths) == len(arriving) == len(predecessors) and
+                                    all(reg not in masks for _, masks in predecessors) and
+                                    any(self.is_buffer_word3(p) for p in paths) and
+                                    all(p is None or (run_time_symbol(p) and p[0] != 'execcopy')
+                                        or self.is_buffer_word3(p) for p in paths)):
+                                # Keep the symbolic refusal until a numeric consumer actually needs the edge stores.
+                                sym = ('joined at a branch target', off)
+                                self.sym[reg] = sym
+                                self.numeric_joins[sym, reg] = [
+                                    (pred, p) for (pred, _), p in zip(predecessors, paths)
+                                    if p is not None and p[0] != 'fixed_buffer_word'
+                                ]
                             continue
                         if reg in entry_ud:
                             materialize[reg] = 'ud%d' % entry_ud[reg][1]
@@ -4036,6 +4080,7 @@ class Stage:
                     there = joined.get(b_target, set())
                     if b_target > off:
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        incoming_blocks.setdefault(b_target, []).append((start, self.masks | self.mask_high))
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                     else:
                         for reg in there & written:
@@ -5803,6 +5848,45 @@ class Stage:
                 return i
         return None
 
+    def descriptor_vcc_mask(self, lo, words):
+        """Project an unaligned numeric VCC onto each logical compute lane."""
+        wave = getattr(self.pipe, 'wave_size', None)
+        if getattr(self, 'kind', None) != 'cs' or self.has_branches:
+            return False
+        if wave is None and wave32_exec_proof(self.ins):
+            wave = 32
+        if wave not in (32, 64):
+            return False
+        if not self.is_buffer_word3(words[0]):
+            return False
+        if wave == 64 and not (self.is_buffer_word3(words[1]) or
+                               words[1] and words[1][0] in ('const', 'ud') and run_time_symbol(words[1])):
+            return False
+        reads_mask = False
+        for j in range(self.descriptor_instruction_index + 1, len(self.ins)):
+            _, _, name, asm = self.ins[j]
+            used, writes, _ = scalar_effects(name, asm)
+            if used & {'vcc_hi', 's106', 's107'}:
+                return False
+            if 'vcc' in used:
+                if not name.startswith('v_') or not self.per_lane_read(j, 'vcc'):
+                    return False
+                reads_mask = True
+            if 'vcc' in writes:
+                break
+        if not reads_mask:
+            return False
+        x, y, _ = self.pipe.group
+        lane = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        low = self.descriptor_word3(words[0])
+        if wave == 64:
+            high = self.descriptor_word3(words[1]) if self.is_buffer_word3(words[1]) else self.S(lo + 1)
+            low = '((%s & 32u) ? %s : %s)' % (lane, high, low)
+        self.emit('vcc = (%s >> (%s & 31u)) & 1u;' % (low, lane))
+        self.sym.pop(106, None)
+        self.sym.pop(107, None)
+        return True
+
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -5878,10 +5962,18 @@ class Stage:
         if base == 's_mov_b64' and ops[0] == 'vcc' and len(ops) == 2:
             source = reg_range(ops[1])
             if source and source[0] == 's':
-                words = (syms[0], self.sym.get(source[2]))
+                lo, hi = source[1:]
+                # The decoder spells an unaligned 64-bit source as its low SGPR.
+                odd = lo < 105 and lo % 2 == 1
+                if odd and lo == hi and syms[0] and syms[0][0] == 'desc':
+                    hi = lo + 1
+                words = (syms[0], self.sym.get(hi))
                 if any(word and word[0] == 'desc' for word in words):
-                    if (source[1] % 2 or source[2] != source[1] + 1 or
-                            any(not word or word[0] != 'desc' for word in words)):
+                    if hi != lo + 1:
+                        raise Unsupported('mask from descriptor data: vcc needs an even pair of descriptor words')
+                    if odd and self.descriptor_vcc_mask(lo, words):
+                        return None
+                    if any(not word or word[0] != 'desc' for word in words):
                         raise Unsupported('mask from descriptor data: vcc needs an even pair of descriptor words')
                     self.sym[106], self.sym[107] = words
                     self.mark_vcc_descriptor()
@@ -10320,6 +10412,11 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
+        edge_stores = getattr(self, 'edge_scalar_stores', {})
+
+        def assign(stores, indent):
+            out.extend('%ss%d = %s;' % (indent, reg, expr) for reg, expr in stores.items())
+
         for i, (off, lines, term) in enumerate(self.blocks):
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
@@ -10341,12 +10438,24 @@ class Stage:
                         '    if (pc == %d) {' % i,
                         '        uint mesh_vote = mesh_vote_%d;' % i]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
+            fall_stores = edge_stores.get((off, offsets[nxt]), {}) if nxt != 0xffff else {}
+            taken_stores = edge_stores.get((off, term[-1]), {}) if term and term[0] in ('branch', 'jump') else {}
+
             if not term:
+                assign(fall_stores, '        ')
                 out.append('        pc = %d;' % nxt)
             elif term[0] == 'end':
                 out.append('        pc = 0xffffu;')
             elif term[0] == 'jump':
+                assign(taken_stores, '        ')
                 out.append('        pc = %d;' % goto(term[1]))
+            elif taken_stores or fall_stores:
+                out.append('        if (%s) {' % term[1])
+                assign(taken_stores, '            ')
+                out.append('            pc = %d;' % goto(term[2]))
+                out.append('        } else {')
+                assign(fall_stores, '            ')
+                out.extend(('            pc = %d;' % nxt, '        }'))
             else:
                 out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
             out.append('    }')

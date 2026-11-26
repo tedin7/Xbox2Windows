@@ -43,7 +43,12 @@ def mov64(dst, src):
 def pixel_words(alias):
     # s_load x4 into s[40:43] from the root table at s[8:9], then wait for the descriptor.
     words = [*smem(2, 40, 8, 0x20), 0xbf8c0000]
-    if alias:
+    if alias == 2:
+        # The descriptor is in s[39:42]. Copy its low words separately, then
+        # use the unaligned s41:s42 source for the high words.
+        words = [*smem(2, 39, 8, 0x20), 0xbf8c0000,
+                 0xbee80327, 0xbee90328, mov64(106, 41)]
+    elif alias:
         words += [mov64(104, 40), mov64(106, 42), *smem(10, 40, 40, 0x10), 0xbf8c0000]
     words += [*smem(10, 12, 104 if alias else 40, 0), 0xbf8c0000]
     # v_mov_b32_e32 v12..v15 from s12..s15, then export the four words.
@@ -61,6 +66,8 @@ def main():
     assert not any('vcc =' in line for _, lines, _ in stage.blocks for line in lines)
     decoded = [asm for _, _, _, asm in G.decode(pixel_words(True))]
     assert COPY in decoded and LOW in decoded, decoded
+    odd = G.Pipeline(vs_words([(0, 0, 0)] * 4), pixel_words(2), TABLE_ROOT)
+    assert odd.ps.sym[106] == stage.sym[106] and odd.ps.sym[107] == stage.sym[107]
 
     # Manual mutant: dropping the vcc_lost marking must fail the straight-line mask refusals.
     for read in (
@@ -92,7 +99,6 @@ def main():
         's_mov_b64 exec, s[42:43]',
         's_mov_b32 vcc_lo, s42',
         's_and_b64 vcc, s[42:43], -1',
-        's_mov_b64 vcc, s[41:42]',
     ):
         refuse('mask from descriptor data', LOAD, operation)
     refuse('even pair of descriptor words', LOAD, 's_mov_b32 s43, 0', COPY)
@@ -116,12 +122,12 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     payload = [0x3f100000, 0x3f200000, 0x3f300000, 0x3f400000]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        for alias in (False, True):
+        for alias in (0, 1, 2):
             pipe = G.Pipeline(vs_code, pixel_words(alias), TABLE_ROOT)
             source = pipe.hlsl_ps()
             assert set(pipe.resources) == {(('table', 0), 0x20)}, pipe.resources
             assert source.count('ByteAddressBuffer r0 : register(t0);') == 1
-            assert source.count('r0.Load(') == (8 if alias else 4)
+            assert source.count('r0.Load(') == (8 if alias == 1 else 4)
             # The flat-param runner only binds b0. Supply the test SRV's bytes in HLSL while
             # keeping the translated load addresses, scalar assignments and export in the draw.
             fixture = ('uint fixture_load(uint address) {\n'
@@ -137,6 +143,12 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                   'ps_' + profile, directory)
                 result = draw(renderer, adapter, vs, ps, words_text(payload))
                 assert result.returncode == 0, (kind, alias, result.stdout, result.stderr)
+                if alias == 2:
+                    # Perturb the descriptor-backed read address. The same CPU reference must reject it.
+                    mutant = source.replace('return words[address >> 2];', 'return words[(address >> 2) + 1u];')
+                    ps = compile_hlsl(compiler, kind, mutant, 'ps_odd_offset_' + kind, 'ps_' + profile, directory)
+                    result = draw(renderer, adapter, vs, ps, words_text(payload))
+                    assert result.returncode == 1 and 'startup_flat_param mismatch expected=' in result.stderr, (result.stdout, result.stderr)
 
 
 if __name__ == '__main__':
