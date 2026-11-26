@@ -11872,9 +11872,9 @@ def log_unvalidated_lod(key, pipe):
 def translate_compute(out_dir, key):
     """One front door for a compute request: this translator first; when it refuses, the engine (tools/startup/gfx2hlsl_engine.py)
     gets the same request under the same key (no cache wipe). Graphics and mesh requests never reach the engine.
-    X2W_COMPUTE_FALLBACK=0 switches the second try off."""
+    Opt-in: X2W_ENGINE_FALLBACK=1 switches the second try on; unset or anything else keeps today's behaviour (default only)."""
     result = translate_compute_default(out_dir, key)
-    if not result.startswith('unsupported:') or os.environ.get('X2W_COMPUTE_FALLBACK') == '0':
+    if not result.startswith('unsupported:') or os.environ.get('X2W_ENGINE_FALLBACK') != '1':
         return result
     return translate_compute_via_engine(out_dir, key, result)
 

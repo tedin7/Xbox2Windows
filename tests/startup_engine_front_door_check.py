@@ -2,7 +2,7 @@
 
 tools/startup/gfx2hlsl.py translate_compute() runs the default translator; on an `unsupported:` refusal it hands the same request,
 under the same key, to tools/startup/gfx2hlsl_engine.py and writes whichever translation succeeds (it prints
-"translated via engine"). Graphics and mesh requests never reach the engine. X2W_COMPUTE_FALLBACK=0 turns the second try off.
+"translated via engine"). Graphics and mesh requests never reach the engine. Opt-in: the second try runs only with X2W_ENGINE_FALLBACK=1 (default off = today's behaviour).
 
 Part 1 (routing, stand-in engine): the engine is called only after a default refusal, with an empty key suffix during the call (the
 request keeps the default key) and the real suffix restored after; a default translation never reaches it; a crash or a refusal
@@ -65,7 +65,7 @@ def routing_checks():
     engine.translate_compute = translate
     real = sys.modules.get('gfx2hlsl_engine')
     sys.modules['gfx2hlsl_engine'] = engine
-    os.environ.pop('X2W_COMPUTE_FALLBACK', None)
+    os.environ['X2W_ENGINE_FALLBACK'] = '1'
     os.environ['X2W_FXC'] = ''
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,10 +94,10 @@ def routing_checks():
             expect('the default reason stays after an engine refusal', 'unreadable' in Path(cache, '%016x.fail' % missing).read_text(), True)
             # Kill switch.
             seen.clear()
-            os.environ['X2W_COMPUTE_FALLBACK'] = '0'
+            os.environ.pop('X2W_ENGINE_FALLBACK', None)
             result, _ = run(lambda: G.translate_compute(str(cache), missing))
             expect('fallback off: the engine is never asked', (result.startswith('unsupported:'), seen), (True, []))
-            os.environ.pop('X2W_COMPUTE_FALLBACK')
+            os.environ['X2W_ENGINE_FALLBACK'] = '1'
             # A graphics key never reaches the engine.
             result, _ = run(lambda: G.translate_request(str(cache), 0x5678))
             expect('a graphics request does not reach the engine', seen, [])
@@ -113,9 +113,9 @@ def real_engine_checks():
     sys.modules.pop('gfx2hlsl_engine', None)
     for fallback in ('on', 'off'):
         if fallback == 'off':
-            os.environ['X2W_COMPUTE_FALLBACK'] = '0'
+            os.environ.pop('X2W_ENGINE_FALLBACK', None)
         else:
-            os.environ.pop('X2W_COMPUTE_FALLBACK', None)
+            os.environ['X2W_ENGINE_FALLBACK'] = '1'
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
             key = write_request(cache, JOIN_WORDS, state_a(JOIN_GROUP, JOIN_RSRC2))
@@ -131,7 +131,7 @@ def real_engine_checks():
                 expect('fallback off: the default refusal stands', result.startswith('unsupported:'), True)
                 expect('fallback off: nothing is published', (manifest.exists(), hlsl.exists()), (False, False))
                 expect('fallback off: the refusal is the live-at-join text', 'live where the block joins' in (cache / ('%016x.fail' % key)).read_text(), True)
-    os.environ.pop('X2W_COMPUTE_FALLBACK', None)
+    os.environ.pop('X2W_ENGINE_FALLBACK', None)
 
 
 def main():
