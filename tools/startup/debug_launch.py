@@ -969,15 +969,19 @@ def main():
                             arm(base + (address - local))
             if h_file:
                 k32.CloseHandle(wt.HANDLE(h_file))
+        elif code == UNLOAD_DLL:
+            base = struct.unpack_from("<Q", event, 16)[0]
+            log(f"{time.time() - start:7.3f} unload {modules.pop(base, '?')} at {base:#x}")  # the mapping is gone: where() must not name it
         elif code == CREATE_THREAD:
-            log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} created ({len(live_threads)} live)")
             h_thread = struct.unpack_from("<Q", event, 16)[0]
             if h_thread:
                 os_handles[tid] = h_thread
             window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} exited ({len(live_threads)} live)")
             window.finish(tid)
             os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:

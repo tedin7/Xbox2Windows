@@ -86,6 +86,7 @@ GPU time of a frame and how long the GPU sat idle. `-NoGpuTime` turns it off; th
 HDD mode is on (`X2W_STORAGE_HDD=1`, because the title package is read from a hard disk, Run M: about 125 reads per second at 3 MB/s): the
 DirectStorage stand-in plans the file reads of its next queue entries, merges neighbours and reads them ahead in file order on a second
 thread. `-NoHddMode` turns it off; the manifest records it as `hdd_mode`. Its effect shows on the `x2w-dstorage disk` and
+Saves: the title's saves and persistent local storage live in `out/startup/saves` (`-SaveRoot`), kept across runs so a legal/privacy screen accepted once is skipped next time. `-FreshSave` wipes that folder (new profile). The manifest records `save_root`, `fresh_save`, `saves_at_start`, `saves_at_end`, `saves_files` (the first 40 files with sizes), and `files_written` (files the run wrote under AppData, LocalAppData, Documents, Saved Games, ProgramData or the data folder, `-ScanRoots` to change the list): that is where the title keeps a choice of its own, such as the privacy acceptance. The log lines `x2w-runtime game save write #N` and `storage path -> ... (exists)` show whether the writes reached the disk.
 `x2w-dstorage hdd` lines (reads per second, MB/s while reading, cache hits).
 
 Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.

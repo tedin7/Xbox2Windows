@@ -31,8 +31,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 }  // namespace
 
+DWORD WINAPI short_thread(void*) { return 0; }
+
 int main()
 {
+    // STARTUP_WINDOW_PROBE_CHURN=1: load and free a DLL, start a thread that ends at once (the debugger logs the unload, and
+    // the thread's creation and exit with the live thread count).
+    char churn[8];
+    if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_CHURN", churn, sizeof(churn)) && churn[0] == '1') {
+        if (HMODULE module = LoadLibraryW(L"msimg32.dll")) FreeLibrary(module);
+        if (HANDLE thread = CreateThread(nullptr, 0, short_thread, nullptr, 0, nullptr)) {
+            WaitForSingleObject(thread, 5000);
+            CloseHandle(thread);
+        }
+    }
     WNDCLASSW wc{};
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpfnWndProc = window_proc;

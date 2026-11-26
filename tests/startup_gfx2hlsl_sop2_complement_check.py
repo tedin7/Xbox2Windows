@@ -653,7 +653,7 @@ def controls():
             stage.one(name, '%s s3, s1, s2' % name)
         except G.Unsupported as error:
             check('%s refuses a descriptor before writing SCC' % name,
-                  str(error) == 'scc from descriptor data' and not stage.lines, str(error))
+                  str(error).startswith('scc from descriptor data') and not stage.lines, str(error))
         else:
             check('%s refuses a descriptor before writing SCC' % name, False, str(stage.lines))
 
