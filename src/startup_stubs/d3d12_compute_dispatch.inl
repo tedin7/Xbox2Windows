@@ -605,7 +605,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             values[i] = word[3];
             break;
         case ComputeTranslation::output_word3:
-            if (view.wrapper && !view.texture && view.words[0] == view_token_magic)
+            if (view.wrapper && !view.texture && view.words[0] == view_token_magic && !view.words[3])  // word 3 is filled from the UAV description
                 reason = "a UAV buffer view token has no hardware word 3";
             values[i] = view.words[3];
             break;
