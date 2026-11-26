@@ -135,13 +135,13 @@ struct Arena {
         return true;
     }
 
-    Allocation range(UINT64 cpu, UINT64 bytes) const {
+    Allocation range(UINT64 cpu, UINT64 bytes, bool remaining = false) const {
         if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
             if (offset < it->bytes && bytes <= it->bytes - offset)
-                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, remaining ? it->bytes - offset : bytes, it->resource, it->offset + offset};
         }
         return {};
     }

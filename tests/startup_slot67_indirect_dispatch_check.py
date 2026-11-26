@@ -6,12 +6,14 @@ both caught, and that the 2-group and 5-group references differ only at indices 
 """
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 
 import startup_gfx2hlsl_compute_check as C
 from startup_compute_dispatch_check import dispatch, lines
+from startup_compute_dispatch_texture_check import SAMPLED, XOR
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_flat_param_check import assemble
@@ -48,6 +50,7 @@ def compare_words(actual, expected):
 
 def setup(directory, adapter):
     cache, env = prepare(directory)
+    env.pop('X2W_INDIRECT_DISPATCH_TABLES', None)
     env.update(X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'), X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -60,10 +63,10 @@ def setup(directory, adapter):
     return cache, env
 
 
-def check(directory, consumer, env, mode, groups, written, direct=False):
+def check(directory, consumer, env, mode, groups, written, direct=False, reference=None):
     actual, result = dispatch(directory, consumer, env, ('dispatch-reference-' if direct else 'dispatch-indirect-') + mode)
     print(result.stdout, end='')
-    expected = expected_words(written)
+    expected = expected_words(written) if reference is None else reference
     if direct:
         assert len(lines(result, f'Dispatch({groups}, 1, 1) translated')) == 1, result.stderr[-2500:]
     else:
@@ -109,11 +112,110 @@ def check_mutation():
 def run_mutation():
     try:
         check_mutation()
+        root = C.G.ComputePipeline(ROOT_PROGRAM, root_srv_blob(), ROOT_RSRC2, (1, 1, 1))
+        assert 'r0.Load(0)' in root.hlsl_cs()
+        assert root.manifest().endswith('srv 0 buf root 2\nuav 0 table 1 16\n')
     except AssertionError as error:
         print(f'FAIL: {error}', file=sys.stderr)
         return 1
-    print('slot67 indirect mutation oracle: PASS (device-free)')
+    print('slot67 indirect mutation oracle and root SRV translation: PASS (device-free)')
     return 0
+
+
+FIXED_TABLE_REFUSAL = 'translated indirect Dispatch requires fixed-table raw buffers'
+
+
+def check_refusal(directory, consumer, env, mode, reason):
+    result = check(directory, consumer, env, mode, 5, 0)
+    refusals = lines(result, 'ExecuteIndirect refused')
+    assert len(refusals) == 1 and refusals[0].endswith(reason), result.stderr[-2500:]
+
+
+def publish(directory, consumer, dxc, cache, env, mode):
+    check_refusal(directory, consumer, env, mode, 'no translation')
+    req, = cache.glob('req_*.c67')
+    key = req.stem.removeprefix('req_')
+    result = subprocess.run([sys.executable, '-B', C.G.__file__, '--pending', cache], check=True,
+                            capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc))
+    assert f'{key}: ok' in result.stdout, result.stdout
+    return cache / f'{key}.txt'
+
+
+def with_binding(manifest, replacement):
+    text = manifest.read_text()
+    original = 'srv 0 buf table 1 0'
+    assert text.count(original) == 1
+    manifest.write_text(text.replace(original, replacement))
+
+
+ROOT_SOURCE = """s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx4 s[16:19], s[12:13], 16
+s_load_dword s20, s[8:9], 0
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v3, s10
+v_lshlrev_b32 v4, 2, v3
+v_mov_b32 v5, s20
+v_xor_b32 v5, s4, v5
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+ROOT_PROGRAM = bytes.fromhex('07038cbe80038dbe060408f4100000fa040500f4000000fa7fc08cbf0a02067e'
+                             '8206083414020a7e040a0a3a001070e004050480000081bf')
+ROOT_RSRC2 = (10 << 1) | C.TGID_X
+
+
+def root_srv_blob():
+    # RTS0 v1.1: constants at parameter 0, a table at parameter 1, and a root SRV at parameter 2.
+    words = (2, 3, 24, 0, 116, 0,
+             1, 0, 60, 0, 0, 72, 3, 0, 104,
+             0, 0, 3,
+             1, 80, 0, 1, 0, 0, 0, 0xffffffff,
+             1, 0, 0)
+    part = b'RTS0' + struct.pack('<I', 4 * len(words)) + struct.pack('<29I', *words)
+    return b'DXBC' + bytes(16) + struct.pack('<4I', 1, 36 + len(part), 1, 36) + part
+
+
+def check_bindings(directory, consumer, dxc, adapter):
+    enabled = {'X2W_INDIRECT_DISPATCH_TABLES': '1'}
+
+    heap = directory / 'heap'
+    cache, env = setup(heap, adapter)
+    manifest = publish(heap, consumer, dxc, cache, env, 'table-token')
+    with_binding(manifest, 'srv 0 buf heap rootconst 0 1')
+    check_refusal(heap, consumer, env, 'table-token', FIXED_TABLE_REFUSAL)
+    result = check(heap, consumer, dict(env, **enabled), 'table-token', 5, 5)
+    assert not lines(result, 'ExecuteIndirect refused'), result.stderr[-2500:]
+
+    texture = directory / 'texture'
+    cache, env = setup(texture, adapter)
+    C.SPLICE[XOR] = '05190a3a'
+    (texture / 'program').write_bytes(C.splice(*SAMPLED))
+    _, _, rsrc2, group, _ = C.CASES['A']
+    (texture / 'state').write_bytes(state_a(group, rsrc2))
+    manifest = publish(texture, consumer, dxc, cache, env, 'sampled')
+    assert 'srv 1 tex2d table 1 64' in manifest.read_text()
+    check_refusal(texture, consumer, env, 'sampled', FIXED_TABLE_REFUSAL)
+    written = 5 * 24
+    reference = [word ^ 0x3f800000 for word in C.expected('A')[:written]] + [C.SENTINEL] * (C.WORDS - written)
+    result = check(texture, consumer, dict(env, **enabled), 'sampled', 5, written, reference=reference)
+    assert not lines(result, 'ExecuteIndirect refused'), result.stderr[-2500:]
+
+    root = directory / 'root-srv'
+    cache, env = setup(root, adapter)
+    (root / 'compute_root').write_bytes(root_srv_blob())
+    (root / 'program').write_bytes(ROOT_PROGRAM)
+    (root / 'state').write_bytes(state_a((1, 1, 1), ROOT_RSRC2))
+    manifest = publish(root, consumer, dxc, cache, env, 'root-srv')
+    assert 'srv 0 buf root 2' in manifest.read_text()
+    check_refusal(root, consumer, env, 'root-srv',
+                  'a resource that is not a raw table buffer, a 2D texture or a cube map')
+    reference = [C.input_word(0) ^ C.KEY] * 5 + [C.SENTINEL] * (C.WORDS - 5)
+    for mode in ('root-srv', 'root-srv-upload'):
+        result = check(root, consumer, dict(env, **enabled), mode, 5, 5, reference=reference)
+        assert not lines(result, 'ExecuteIndirect refused'), result.stderr[-2500:]
+    check_refusal(root, consumer, dict(env, **enabled), 'root-srv-unbound',
+                  'a compute root SRV address is missing, misaligned or out of range')
 
 
 def main(consumer, dxc, adapter):
@@ -159,9 +261,13 @@ if __name__ == '__main__':
         sys.exit(run_mutation())
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         assert assemble(sys.argv[2], SOURCE) == PROGRAM
-        print('slot 67 indirect consumer matches LLVM gfx1013 assembly')
+        assert assemble(sys.argv[2], ROOT_SOURCE) == ROOT_PROGRAM
+        print('slot 67 indirect consumers match LLVM gfx1013 assembly')
+    elif len(sys.argv) == 5 and sys.argv[3] in ('hardware', 'warp') and sys.argv[4] == 'bindings':
+        with tempfile.TemporaryDirectory() as tmp:
+            check_bindings(Path(tmp), *sys.argv[1:4])
     elif len(sys.argv) == 4 and sys.argv[3] in ('hardware', 'warp'):
         main(*sys.argv[1:])
     else:
-        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware> | '
+        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware> [bindings] | '
                  'binary <llvm-mc> | mutation')

@@ -1809,11 +1809,11 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_distinct_rect_scratch(void* firs
     return distinct;
 }
 
-x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes)
+x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes, bool remaining = false)
 {
     AcquireSRWLockShared(&allocator_lock);
     const auto& state = self->own();
-    const auto allocation = state.list_open && state.list_uploads ? state.list_uploads->range(address, bytes) : x2w_upload::Allocation{};
+    const auto allocation = state.list_open && state.list_uploads ? state.list_uploads->range(address, bytes, remaining) : x2w_upload::Allocation{};
     ReleaseSRWLockShared(&allocator_lock);
     return allocation;
 }
@@ -2948,6 +2948,7 @@ struct Pass {
     u64 requested_mesh_key = 0;
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
+    std::array<u64, 64> compute_root_srv_addresses{};
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
@@ -3248,6 +3249,12 @@ void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
     }
 }
 
+bool indirect_dispatch_tables_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_INDIRECT_DISPATCH_TABLES");
+    return enabled;
+}
+
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -3255,7 +3262,10 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
     // A different root signature invalidates the title's cached compute root arguments.
-    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    if (pass.compute_root_wrapper != w) {
+        pass.compute_constants.clear();
+        pass.compute_root_srv_addresses.fill(0);
+    }
     pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
@@ -4343,6 +4353,12 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     auto* list = recording(self);
     auto& pass = pass_of(self);
     const auto* params = pass.compute_params;
+    if (list && indirect_dispatch_tables_enabled() && parameter < pass.compute_root_srv_addresses.size()) {
+        const auto* guest_params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
+        if (guest_params && parameter < guest_params->size() &&
+            (*guest_params)[parameter].type == D3D12_ROOT_PARAMETER_TYPE_SRV)
+            pass.compute_root_srv_addresses[parameter] = address;
+    }
     if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
     const auto gpu = list_upload_gpu(self, address, 1);

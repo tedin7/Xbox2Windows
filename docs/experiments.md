@@ -16957,6 +16957,25 @@ ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispat
 python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
 
+#### Indirect Dispatch input bindings
+
+Set `X2W_INDIRECT_DISPATCH_TABLES=1` to resolve heap-indexed buffer inputs and texture
+view tokens through the direct Dispatch binder. The switch defaults to off. It
+also accepts the translator's `srv <index> buf root <parameter>` manifest form for
+compute root SRVs set by list slot 43. The raw view extends from the bound address
+to the end of its placed buffer or recording upload allocation, capped at 16 MiB
+and rounded down to a dword. The caller still supplies one rootless Dispatch
+record and raw table-buffer outputs.
+
+The bindings fixture compares all 320 output words with CPU references for a
+heap-indexed buffer view token, a sampled texture from a descriptor table, and
+root SRVs backed by placed and upload buffers. It checks the refusal text and
+sentinel readback with the switch off and with a missing root SRV binding.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch(_bindings)?_warp$' -V
+```
+
 ### Entry values from a buffer descriptor
 
 A formatted buffer load passes the input's stride and word 3 as entry values (`udsrc <i> stride <srv>`, `udsrc <i> descword3 <srv>`), and a formatted buffer store (`buffer_store_format_d16_x`, and `buffer_store_format_xyzw` of #2530) passes the output's word 3, the upper half of word 1 and the record count (`uav_descword3`, `uav_stride`, `uav_numrecords`). At Dispatch the stand-in takes each from the descriptor words the same call binds the view from: the stride as the draw path takes it (from the hardware descriptor, or from the title's buffer view for a token), word 3 through the draw path's formatted-buffer check (a token's word is built from its view; a FORMAT the program does not decode refuses the dispatch with `a formatted input has no word 3 the program decodes`), and the output words unmasked, since the store helper checks the swizzle bits itself. A descriptor that is not bound refuses the dispatch as before; an entry value naming a texture slot leaves the pipeline untranslated, and so does any other source.

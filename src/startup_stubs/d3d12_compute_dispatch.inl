@@ -26,6 +26,7 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool root_srv = false;  // raw SRV at title compute root parameter a
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
@@ -159,6 +160,12 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (indirect_dispatch_tables_enabled() &&
+                 std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 &&
+                 whole() && i == tr.srvs.size() && a >= 0) {
+            tr.srvs.push_back({a, 0});
+            tr.srvs.back().root_srv = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
@@ -218,7 +225,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     for (const ComputeTranslation::Slot& ud : tr.uds) {
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
-            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
+            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || (slots[ud.a].texture || slots[ud.a].root_srv)))
             return "an entry value names a descriptor that is not a buffer input or output";
     }
     x2w_startup::ComPtr<ID3DBlob> code;
@@ -311,16 +318,54 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    const bool indirect_tables = dispatch.signature && indirect_dispatch_tables_enabled();
     phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture)) {
+        if (dispatch.signature && (slot.heap || slot.texture) && (!indirect_tables || output)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
+        if (slot.root_srv) {
+            if (!indirect_tables) {
+                reason = "a root SRV input requires indirect Dispatch table bindings";
+                break;
+            }
+            const auto parameter = static_cast<std::size_t>(slot.a);
+            const u64 address = parameter < pass.compute_root_srv_addresses.size() ?
+                pass.compute_root_srv_addresses[parameter] : 0;
+            if (!address || address >> 48 || address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
+                reason = "a compute root SRV address is missing, misaligned or out of range";
+                break;
+            }
+            // Root SRVs carry an address without a size. Bound the raw view to the containing
+            // upload allocation or buffer, with the same size ceiling as table-based inputs.
+            u64 bytes = list_upload_range(self, address, 1, true).bytes;
+            if (!bytes) {
+                const auto placed = placed_buffer_range(self->own().list_device, address, 1);
+                const auto* info = placed.owner ? resource_info(placed.owner) : nullptr;
+                if (info && info->console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    const u64 offset = address - reinterpret_cast<u64>(placed.owner->own().title_memory);
+                    if (offset < info->console.Width) bytes = info->console.Width - offset;
+                }
+            }
+            bytes = (std::min)(bytes, u64{16} << 20) & ~u64{3};
+            if (!bytes) {
+                reason = "a compute root SRV does not address a backed dword range";
+                break;
+            }
+            words[0] = static_cast<UINT>(address);
+            words[1] = static_cast<UINT>(address >> 32);
+            words[2] = static_cast<UINT>(bytes);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                reason = "an input buffer range is not 16-byte aligned in its resource";
+            views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            continue;
+        }
         if (slot.word_param >= 0) {
             // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
             // writes there), at the dword-aligned 32-bit byte offset the program reads it at.

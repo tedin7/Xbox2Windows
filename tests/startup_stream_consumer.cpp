@@ -280,7 +280,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (mode == "dispatch-input-empty") {
         const UINT view[4] = {0x32c, 0, 0, 0};
         std::memcpy(descriptors[0], view, sizeof(view));
-    } else if (mode == "dispatch-input-null") {
+    } else if (mode == "dispatch-input-null" || mode == "dispatch-indirect-table-token") {
         std::memset(descriptors[0], 0, sizeof(descriptors[0]));  // an unbound buffer: all four words zero
     } else if (mode == "dispatch-input-past") {
         descriptors[0][2] = words + 4;
@@ -316,7 +316,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
                         sizeof(descriptors[0]));
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
-    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
+    const UINT constants[3] = {0x01234567, mode == "dispatch-indirect-table-token" ? 2u : 0x9e3779b9u, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));
@@ -327,7 +327,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     Slot67Indirect record;
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
-    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
+    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || mode == "dispatch-indirect-sampled") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
         const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -349,6 +349,20 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         view.Texture2D.MipLevels = 1;
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
+    }
+    if (mode == "dispatch-indirect-table-token") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        view.Buffer = {0, words, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+        invoke(device, 18, word(placed[0]), word(&view), cpu + 64);
+    }
+    if (mode == "dispatch-indirect-root-srv")
+        invoke(list, 43, 2, word(buffers[0]));
+    if (mode == "dispatch-indirect-root-srv-upload") {
+        auto* const upload = reinterpret_cast<void*>(invoke(list, 148, sizeof(input), 256));
+        if (!upload) return 81;
+        std::memcpy(upload, input, sizeof(input));
+        invoke(list, 43, 2, word(upload));
     }
     if (mode == "dispatch-input-null-token") {
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
@@ -385,7 +399,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind(list);
     }
-    if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (heap_record || mode.rfind("dispatch-indirect-root-srv", 0) == 0) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     if (mode == "dispatch-heap-word-null")
         std::memset(reinterpret_cast<void*>(cpu + 96), 0, 16);  // the index buffer's descriptor stays null: the word reads as 0
     else if (heap_word) {
