@@ -7415,8 +7415,6 @@ void build_tables()
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
         list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
         list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
-
-        list_typed[38] = reinterpret_cast<ListTyped>(&list_root_constant);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);

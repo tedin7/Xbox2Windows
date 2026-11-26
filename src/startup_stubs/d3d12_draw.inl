@@ -2826,14 +2826,6 @@ void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count,
 {
     store_root_constants(pass_of(self).compute_constants, "compute", parameter, count, data, offset);
 }
-// List slot 38 (desktop 34 + 4), SetGraphicsRoot32BitConstant(parameter, value, offset): one word of a root
-// constant. The word is kept for the draw like the ones of slot 40; a parameter of 16 or more or an offset of 8 or
-// more has no storage and the call is dropped. Nothing is forwarded to the desktop list.
-void __stdcall list_root_constant(Wrapper* self, UINT parameter, std::uint32_t value, UINT offset)
-{
-    if (!self || parameter >= 16 || offset >= 8) return;
-    pass_of(self).constants[parameter][offset] = value;
-}
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)
 {
