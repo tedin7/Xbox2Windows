@@ -117,7 +117,7 @@ VARIANTS = {
     'exec-source': (SOURCE_M, [('v_writelane_b32 v40, s26, 1\n', 'v_writelane_b32 v40, exec_lo, 1\n')],
                     'source exec_lo is a lane mask or m0', 'exec is refused as a spill source'),
     'vcc-hi-source': (SOURCE_M, [('v_writelane_b32 v40, vcc_lo, 0\n', 'v_writelane_b32 v40, vcc_hi, 0\n')],
-                      'requires one VGPR and one plain SGPR', 'vcc_hi is an ordinary scalar register in wave32 (renamed above s103), not a spillable mask'),
+                      'source vcc_hi is a lane mask or m0', 'vcc_hi is not the wave64 mask half a caller states (wave_size=64 skips the wave32 rename)'),
     'numeric-use': (SOURCE_M, [(M_RELOAD, M_RELOAD + 'v_add_nc_u32 v9, s25, v5\n')], 'reads as data',
                     'the reloaded mask is read as numeric data'),
     'numeric-use-vcc': (SOURCE_V, [('Lskip:\n', 'Lskip:\nv_add_nc_u32 v9, vcc_lo, v5\n')], 'reads as data',
@@ -237,8 +237,12 @@ SENTINEL = C.SENTINEL
 KEY = C.KEY
 
 
+WAVE64_VARIANTS = {'vcc-hi-source'}   # the caller states wave64, so vcc_hi is the high half of VCC, not a renamed SGPR
+
+
 def translate(name, code=None, module=G):
-    return module.ComputePipeline(code or WORDS[name], C.root_blob(), ENCODING[0], ENCODING[1])
+    return module.ComputePipeline(code or WORDS[name], C.root_blob(), ENCODING[0], ENCODING[1],
+                                  wave_size=64 if name in WAVE64_VARIANTS else None)
 
 
 def refusal(name, module=G):
