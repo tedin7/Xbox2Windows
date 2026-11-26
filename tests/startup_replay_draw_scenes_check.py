@@ -2,7 +2,7 @@
 """Replay family "draws": the stream draw scenes, recorded with X2W_REPLAY_RECORD=all, replay to the same pictures.
 
 startup_stream_consumer (tests/startup_stream_draw.cpp) draws a two-triangle scene through the stand-in and presents
-its target twice. For each scene below (red or green pixel shader, and the three packed-target modes of the draw check):
+its target twice. For each scene below (a red or a green pixel shader; the pixel-history scene is the one that presents):
   - the recorded run writes present_<nnnn>.png per present (X2W_PRESENT_PICTURES);
   - x2w_replay plays the recording with no X2W_ setting and writes the same picture names, every one equal;
   - control: the green scene's recording is no replay of the red scene: the pictures of two different scenes differ,
@@ -20,14 +20,10 @@ from startup_replay_check import pictures, replay, run
 from startup_stream_check import gfx2hlsl
 from startup_stream_draw_check import pixel, vertex
 
-# name, green pixel shader, scene mode argument ("" = the plain scene)
+# name, green pixel shader. Only the pixel-history scene of the stream draw presents its target (X2W_TEST_PIXEL_HISTORY=1).
 SCENES = (
     ("red", False, ""),
     ("green", True, ""),
-    ("parent-a8", True, "parent-a8"),
-    ("child-a8", True, "child-a8"),
-    ("child-r8", True, "child-r8"),
-    ("child-r8-red", False, "child-r8"),
 )
 
 
@@ -40,7 +36,7 @@ def record(consumer, directory, backend, name, green, mode, base_env):
     vs, ps, root, output, recording = (work / n for n in ("vs", "ps", "root", "pixels", "run.x2wr"))
     vs.write_bytes(vertex())
     ps.write_bytes(pixel(green))
-    env = dict(base_env, X2W_SHADER_CACHE=str(cache))
+    env = dict(base_env, X2W_SHADER_CACHE=str(cache), X2W_TEST_PIXEL_HISTORY="1")
     args = [consumer, vs, ps, root]
     code, text = run(args, env)  # first run publishes the shader request
     assert code == 0, text[-2000:]
@@ -78,7 +74,6 @@ def main(consumer, player, backend):
             print("replay draws %s: %d presents equal" % (name, len(recorded)))
         # The control: scenes that draw different things replay to different pictures.
         assert played["red"]["present_0002.png"] != played["green"]["present_0002.png"], "red and green replay to one picture"
-        assert played["child-r8"]["present_0002.png"] != played["child-r8-red"]["present_0002.png"], "r8 scenes replay alike"
         print("replay draws: %d scenes replay equal; different scenes replay to different pictures" % len(SCENES))
     return 0
 
