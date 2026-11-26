@@ -208,8 +208,8 @@ def check_targets():
 STUB_CMAKE = """\
 cmake_minimum_required(VERSION 3.20)
 project(stub NONE)
-file(WRITE "${CMAKE_BINARY_DIR}/rev.cmake" "execute_process(COMMAND git -C \\"${CMAKE_SOURCE_DIR}\\" rev-parse --short=8 HEAD OUTPUT_VARIABLE rev OUTPUT_STRIP_TRAILING_WHITESPACE)\\nfile(WRITE \\"${CMAKE_BINARY_DIR}/generated/x2w_build_rev.cpp\\" \\"const char x2w_build_rev[] = \\\\\\"${rev}\\\\\\";\\\\n\\")\\n")
-add_custom_target(x2w_build_rev_generate COMMAND ${CMAKE_COMMAND} -P "${CMAKE_BINARY_DIR}/rev.cmake")
+add_custom_target(x2w_build_rev_generate COMMAND ${CMAKE_COMMAND} "-DSRC=${CMAKE_SOURCE_DIR}"
+    "-DOUT=${CMAKE_BINARY_DIR}/generated/x2w_build_rev.cpp" -P "${CMAKE_SOURCE_DIR}/rev.cmake")
 foreach(pair IN ITEMS xmem_shim:xmem d3d12_xs_shim:d3d12_xs startup_stub_acphal:AcpHal startup_stub_chad:chad
         startup_stub_xapu:xapu startup_stub_xcrdapi:XCRDAPI startup_stub_xg_xs:xg_xs startup_stub_gameinput:GameInput)
     string(REPLACE ":" ";" parts "${pair}")
@@ -227,6 +227,12 @@ add_custom_target(decoy_test_exe ALL COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_
 """
 
 
+REV_CMAKE = r"""
+execute_process(COMMAND git -C "${SRC}" rev-parse --short=8 HEAD OUTPUT_VARIABLE rev OUTPUT_STRIP_TRAILING_WHITESPACE)
+file(WRITE "${OUT}" "const char x2w_build_rev[] = \"${rev}\";\n")
+"""
+
+
 def check_build(shell):
     """A configured but unbuilt build directory: tester_run.ps1 builds only the run's targets (-FullBuild: all)."""
     if not shutil.which("cmake"):
@@ -237,10 +243,11 @@ def check_build(shell):
         build = tree / "out" / "build" / "release"
         shutil.rmtree(build)
         (tree / "CMakeLists.txt").write_text(STUB_CMAKE, encoding="utf-8")
+        (tree / "rev.cmake").write_text(REV_CMAKE, encoding="utf-8")
         generator = ["-G", "Ninja"] if shutil.which("ninja") else []  # as the real presets: single config, no MSBuild
         configured = subprocess.run(["cmake", *generator, "-S", str(tree), "-B", str(build)], capture_output=True, text=True)
         assert configured.returncode == 0, configured.stdout + configured.stderr
-        git(tree, "add", "CMakeLists.txt")
+        git(tree, "add", "CMakeLists.txt", "rev.cmake")
         git(tree, "commit", "-q", "-m", "cmake")
         head = git(tree, "rev-parse", "--short=8", "HEAD")
         assert not (build / "xmem.dll").exists()
