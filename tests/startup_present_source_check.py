@@ -34,7 +34,8 @@ def check(directory, consumer, backend):
         if result.returncode:
             raise RuntimeError(f"present source {mode} failed on {backend}: {result.returncode}\n{result.stderr}")
         lines[mode] = [l for l in result.stderr.splitlines() if "x2w-render present source" in l]
-        assert lines[mode], f"{mode}: no present source line\n{result.stderr[-3000:]}"
+        seen = [l[:160] for l in result.stderr.splitlines() if "slot32" in l or "x2w-present" in l or "x2w-render" in l or "heartbeat" in l]
+        assert lines[mode], f"{mode}: no present source line; present/render lines ({len(result.stderr.splitlines())} stderr lines): {seen[-12:]}"
     named = re.search(r"present source at [\d.]+ s: last translated draw into the presented surface key ([0-9a-f]{16}) "
                       r"\(target 0, format \d+, (\d+) draws into it\)", lines["draw"][0])
     assert named and named.group(1) == drawn_key and int(named.group(2)) >= 1, (drawn_key, lines["draw"])
