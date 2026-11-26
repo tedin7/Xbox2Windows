@@ -367,6 +367,7 @@ jobs:
             tests/startup_gfx2hlsl_sdwa_cvt_check.py \
             tests/startup_gfx2hlsl_sdwa_cndmask_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
+            tests/startup_gfx2hlsl_s_nor_nand_check.py \
             tests/startup_gfx2hlsl_pack_absdiff_check.py \
             tests/startup_gfx2hlsl_sopk_accum_check.py \
             tests/startup_gfx2hlsl_bfm_b64_check.py \

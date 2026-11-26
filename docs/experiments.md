@@ -8305,7 +8305,7 @@ when every source is a mask, because bit i of the complement depends only on bit
 lowers to `(~(a op b)) & 1` into an SGPR, checked on all 32 lanes of the edge words. Guest SCC reads the whole
 32-bit result, which the per-lane projection cannot show, so SCC is not emitted and a program that can read it
 before the next SCC write is refused, through joins and back edges. A mask mixed with a plain word or a constant
-and a vcc_lo or exec_lo destination stay refused, as does a mask source whose last write does not dominate a
+and a vcc_lo destination (or an exec_lo destination of s_xnor_b32) stay refused. s_nand_b32 and s_nor_b32 also accept exec_lo as the destination when every source is a mask and the stage is proven wave32 (compute with at most 32 threads per group; pixel and vertex stages, whose wave size is unknown, the slot 57 mesh stage and any wave64 compute group keep refusing it, because a write to exec_lo leaves lanes 32..63 unchanged): the lane's new EXEC bit is the same per-lane value, including for a lane that was inactive. `startup_gfx2hlsl_s_nor_nand` and its `_dispatch_warp`/`_dispatch_hardware` variants check those forms by D3D12 UAV readback against an integer reference. A mask source is also refused whose last write does not dominate a
 branch target crossed since, or which a block on a path to that target writes again. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
 LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
 the same words.

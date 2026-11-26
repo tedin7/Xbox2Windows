@@ -3631,6 +3631,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
     add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
+    # s_nand_b32 and s_nor_b32 of lane masks into exec_lo or an SGPR: CPU lines and D3D12 UAV readback (#1723).
+    add_test(NAME startup_gfx2hlsl_s_nor_nand COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_nor_nand_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_s_nor_nand_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_nor_nand_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_s_nor_nand_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # s_waitcnt_depctr is a hazard delay without architectural effect: the translation is unchanged by it (#2413).
     add_test(NAME startup_gfx2hlsl_waitcnt_depctr COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_waitcnt_depctr_check.py")
