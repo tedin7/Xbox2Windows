@@ -84,8 +84,8 @@ def check_snapshot():
 
 
 def check_left():
-    first = "    0 s commit 30.3/48.9 GiB | claude.exe x3 2.09 | unattributed 11.19"
-    after = "10 s after exit commit 31.1/48.9 GiB | claude.exe x3 2.10 | unattributed 11.93 (3 processes unreadable)"
+    first = "    0 s commit 30.3/48.9 GiB | browser.exe x3 2.09 | unattributed 11.19"
+    after = "10 s after exit commit 31.1/48.9 GiB | browser.exe x3 2.10 | unattributed 11.93 (3 processes unreadable)"
     assert M.left_text(first, after) == "memory left after exit: +0.80 GB (unattributed +0.74 GB)", M.left_text(first, after)
     # Lines of runs before the label change still compare; a line without commit gives nothing.
     old = "    0 s commit 30.3/48.9 GiB | not in any process 11.19"
