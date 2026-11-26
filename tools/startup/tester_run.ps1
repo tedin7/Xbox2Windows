@@ -77,7 +77,10 @@ param(
     [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
     [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
-    [int]$CommitWarnMiB = 2048                  # a warning line in the log when the system commit has less than this free; 0 = off
+    [int]$CommitWarnMiB = 2048,                 # a warning line in the log when the system commit has less than this free; 0 = off
+    [int]$StallSeconds = 90,                    # stall watchdog: the run ends cleanly (zip packed) when frames presented, storage read, translator output and the window picture have all stood still this long; 0 = off
+    [int]$StallMinSeconds = 150,                # the watchdog never ends a run before this many seconds
+    [int]$MemoryStopPercent = 95                # the watchdog also ends the run when the committed memory is at or above this percent of the commit limit in 2 samples in a row; 0 = off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -265,6 +268,17 @@ try {
     $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
 } catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
+# Stall watchdog (stall_watchdog.py): ends the run through the `stop` file when it is clearly stuck; the reason is printed as
+# "tester_run: STALL STOP at N s: ..." and recorded as stop_reason in the manifest.
+$stallFile = Join-Path $logDir "stall_stop.json"
+$stallWatch = $null
+if ($StallSeconds -gt 0 -or $MemoryStopPercent -gt 0) {
+    try {
+        $stallArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'stall_watchdog.py')`"", "`"$logDir`"", "--parent", "$PID", "--seconds", "$Seconds",
+            "--stall-seconds", "$StallSeconds", "--min-seconds", "$StallMinSeconds", "--memory-percent", "$MemoryStopPercent")
+        $stallWatch = Start-Process -FilePath $python -PassThru -NoNewWindow -ArgumentList $stallArgs
+    } catch { Write-Warning "tester_run: the stall watchdog is off: $($_.Exception.Message)" }
+}
 $exitCode = 0
 try {
     & $runScript @runArgs
@@ -272,6 +286,11 @@ try {
 } catch {
     Write-Warning "tester_run: the run stopped with an error: $($_.Exception.Message)"
     $exitCode = 1
+}
+if ($stallWatch) { try { Stop-Process -Id $stallWatch.Id -Force -ErrorAction SilentlyContinue; [void]$stallWatch.WaitForExit(5000) } catch { } }
+$stopReason = ""
+if (Test-Path -LiteralPath $stallFile) {
+    try { $stall = Get-Content -LiteralPath $stallFile -Raw | ConvertFrom-Json; $stopReason = "stall watchdog at $($stall.at_seconds) s: $($stall.reason)" } catch { }
 }
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
 Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
@@ -291,7 +310,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; stop_reason = $stopReason; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     pretranslate = $preTranslate; cache_repaired = $cacheRepaired
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }

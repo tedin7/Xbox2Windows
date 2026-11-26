@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -46,6 +47,11 @@ foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "fil
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
+if ($env:STUB_STALL) {
+    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 60 }
+    $deadline = (Get-Date).AddSeconds($wait)
+    while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+}
 exit 0
 """
 TRANSLATOR = """\
@@ -81,7 +87,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -211,6 +217,23 @@ def check_shell(shell):
             mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        assert mem_manifest["stop_reason"] == "" and mem_manifest["stall_seconds"] == 90, mem_manifest
+        # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
+        # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
+        started = time.monotonic()
+        stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
+                             "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
+        assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
+        assert time.monotonic() - started < 50, "the run did not end through the stop file"
+        assert "tester_run: STALL STOP at " in stalled.stdout and "frozen:" in stalled.stdout, stalled.stdout
+        newest_stall = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_stall) as z:
+            stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+            assert "stall_stop.json" in z.namelist(), z.namelist()
+        assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
+        off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
+                         "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
+        assert "STALL STOP" not in off.stdout, off.stdout
         nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
         assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)
         newest_snap = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
