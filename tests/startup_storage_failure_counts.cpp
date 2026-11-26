@@ -381,6 +381,8 @@ int main(int argc, char** argv)
         auto* zlib_queue = static_cast<Object*>(zlib_queue_ptr);
         std::vector<unsigned char> zlib_destination[zlib_requests];
         const LONG enqueued_before = requests_enqueued;
+        const LONG disk_reads_before = disk_snapshot().reads;
+        const LONG64 disk_bytes_before = disk_snapshot().bytes, disk_ticks_before = disk_snapshot().ticks;
         const LONG64 read_before = bytes_read_total, inflated_before = bytes_inflated_total;
         for (unsigned i = 0; i < zlib_requests; ++i) {
             zlib_destination[i].assign(piece, 0xA5);
@@ -417,6 +419,49 @@ int main(int argc, char** argv)
         ok = expect(requests_enqueued - enqueued_before == static_cast<LONG>(zlib_requests) &&
                         bytes_read_total - read_before == static_cast<LONG64>(zlib_requests) * stream_size &&
                         bytes_inflated_total - inflated_before == static_cast<LONG64>(zlib_requests) * piece, what) && ok;
+        {
+            // The disk statistics: the real reads were counted, and a scripted sequence of reads on a fake handle is
+            // classified first / sequential / forward / backward with its size buckets.
+            const DiskStats real = disk_snapshot();
+            std::snprintf(what, sizeof what, "disk stats: %ld reads (+%ld, want at least %u), %lld bytes", real.reads, real.reads - disk_reads_before,
+                          zlib_requests, static_cast<long long>(real.bytes));
+            ok = expect(real.reads - disk_reads_before == static_cast<LONG>(zlib_requests) &&
+                            real.bytes - disk_bytes_before == static_cast<LONG64>(zlib_requests) * stream_size &&
+                            real.ticks >= disk_ticks_before, what) && ok;
+            const DiskStats start = disk_snapshot();
+            HANDLE fake = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0xF4C0));
+            note_disk_read(fake, 0, 4096, 10, true);        // first of its file, <=4K
+            note_disk_read(fake, 4096, 70000, 10, true);    // sequential, <=256K
+            note_disk_read(fake, 900000, 2000000, 10, true);  // forward, >1M
+            note_disk_read(fake, 0, 100, 10, true);         // backward, <=4K
+            note_disk_read(fake, 5, 5, 10, false);          // a failed read is counted apart
+            const DiskStats now = disk_snapshot();
+            std::snprintf(what, sizeof what, "disk order: first %ld sequential %ld forward %ld backward %ld failed %ld; sizes %ld %ld %ld %ld %ld %ld",
+                          now.first - start.first, now.sequential - start.sequential, now.forward - start.forward,
+                          now.backward - start.backward, now.failed - start.failed, now.sizes[0] - start.sizes[0],
+                          now.sizes[1] - start.sizes[1], now.sizes[2] - start.sizes[2], now.sizes[3] - start.sizes[3],
+                          now.sizes[4] - start.sizes[4], now.sizes[5] - start.sizes[5]);
+            ok = expect(now.first - start.first == 1 && now.sequential - start.sequential == 1 && now.forward - start.forward == 1 &&
+                            now.backward - start.backward == 1 && now.failed - start.failed == 1 && now.sizes[0] - start.sizes[0] == 2 &&
+                            now.sizes[3] - start.sizes[3] == 1 && now.sizes[5] - start.sizes[5] == 1, what) && ok;
+            char disk_text[512];
+            DiskStats before{};
+            DiskStats after{};
+            after.ticks = 5000000;  // 0.5 s of reads at 10 MHz
+            after.bytes = 50 << 20;   // 50 MiB
+            after.reads = 100;
+            after.sizes[4] = 100;
+            after.sequential = 99;
+            after.first = 1;
+            format_disk(disk_text, sizeof disk_text, 20, after, before, 10.0, 10000000.0);
+            const char* const want_disk =
+                "x2w-dstorage disk 20 s: 100 reads (+100), 100.0 MB/s while reading, reading 5% of the window; "
+                "read sizes <=4K 0 <=16K 0 <=64K 0 <=256K 0 <=1M 100 >1M 0; offsets sequential 99 forward 0 backward 0 first 1; read failures 0";
+            if (!expect(std::strcmp(disk_text, want_disk) == 0, "disk line differs")) {
+                std::fprintf(stderr, "  got:  %s\n  want: %s\n", disk_text, want_disk);
+                ok = false;
+            }
+        }
         {
             // The progress line: 10 enqueued, 7 completed, the request numbered 7 waited 1234 ms, 2 s window.
             enqueue_ring_tick[7 & (enqueue_ring_size - 1)] = static_cast<LONG>(100000 - 1234);

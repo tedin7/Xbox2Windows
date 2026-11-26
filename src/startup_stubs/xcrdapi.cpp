@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 #include <cstdarg>
@@ -535,6 +536,66 @@ int format_progress(char* out, std::size_t size, int second, LONG enqueued, LONG
                          static_cast<double>(inflated_delta) / 1048576.0 / seconds, enqueued, completed,
                          static_cast<long long>(read_total >> 10), static_cast<long long>(inflated_total >> 10));
 }
+// The disk side of loading (the title package can sit on a hard disk, where seeks, not bandwidth, set the speed):
+// time spent inside the file reads (QueryPerformanceCounter ticks), their sizes in six buckets, and whether each read
+// continues the previous one of the same file (sequential), jumps forward (still in offset order), jumps back, or is
+// the first of its file. One short lock per read; the map of last end offsets is cleared past 256 files.
+constexpr unsigned disk_size_buckets = 6;
+const unsigned long long disk_bucket_limit[disk_size_buckets - 1] = {4096, 16384, 65536, 262144, 1048576};
+struct DiskStats {
+    LONG64 ticks = 0, bytes = 0;
+    LONG reads = 0, failed = 0;
+    LONG sizes[disk_size_buckets] = {};
+    LONG sequential = 0, forward = 0, backward = 0, first = 0;
+};
+DiskStats disk_stats;
+std::mutex disk_mutex;
+std::unordered_map<HANDLE, unsigned long long> disk_last_end;
+void note_disk_read(HANDLE file, unsigned long long offset, unsigned long long count, LONG64 ticks, bool ok) noexcept
+{
+    try {
+        const std::lock_guard guard(disk_mutex);
+        DiskStats& d = disk_stats;
+        d.ticks += ticks;
+        if (!ok) {
+            ++d.failed;
+            return;
+        }
+        d.bytes += static_cast<LONG64>(count);
+        ++d.reads;
+        unsigned bucket = 0;
+        while (bucket < disk_size_buckets - 1 && count > disk_bucket_limit[bucket]) ++bucket;
+        ++d.sizes[bucket];
+        if (disk_last_end.size() > 256) disk_last_end.clear();
+        const auto found = disk_last_end.find(file);
+        if (found == disk_last_end.end()) ++d.first;
+        else if (offset == found->second) ++d.sequential;
+        else if (offset > found->second) ++d.forward;
+        else ++d.backward;
+        disk_last_end[file] = offset + count;
+    } catch (...) {
+    }
+}
+DiskStats disk_snapshot()
+{
+    const std::lock_guard guard(disk_mutex);
+    return disk_stats;
+}
+// The disk line: MB/s while reading and the share of the window spent in reads (high share and low MB/s = seek-bound),
+// read sizes (<=4K <=16K <=64K <=256K <=1M >1M) and the offset order of the reads, all since the start.
+int format_disk(char* out, std::size_t size, int second, const DiskStats& now, const DiskStats& before, double seconds,
+                double ticks_per_second) noexcept
+{
+    const double busy = static_cast<double>(now.ticks - before.ticks) / ticks_per_second;
+    const double megabytes = static_cast<double>(now.bytes - before.bytes) / 1048576.0;
+    return std::snprintf(out, size,
+                         "x2w-dstorage disk %d s: %ld reads (+%ld), %.1f MB/s while reading, reading %.0f%% of the window; "
+                         "read sizes <=4K %ld <=16K %ld <=64K %ld <=256K %ld <=1M %ld >1M %ld; offsets sequential %ld "
+                         "forward %ld backward %ld first %ld; read failures %ld",
+                         second, now.reads, now.reads - before.reads, busy > 0 ? megabytes / busy : 0.0,
+                         seconds > 0 ? 100.0 * busy / seconds : 0.0, now.sizes[0], now.sizes[1], now.sizes[2], now.sizes[3],
+                         now.sizes[4], now.sizes[5], now.sequential, now.forward, now.backward, now.first, now.failed);
+}
 void note_written(bool compressed, std::size_t source_bytes, std::size_t written_bytes) noexcept
 {
     InterlockedExchangeAdd64(&bytes_read_total, static_cast<LONG64>(compressed ? source_bytes : written_bytes));
@@ -824,8 +885,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
-        if (file_object && file_object->kind == file &&
-            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
+        bool file_read = false;
+        if (file_object && file_object->kind == file) {
+            LARGE_INTEGER began, ended;
+            QueryPerformanceCounter(&began);
+            file_read = x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed);
+            QueryPerformanceCounter(&ended);
+            note_disk_read(file_object->handle, offset, source_size, ended.QuadPart - began.QuadPart, file_read);
+        }
+        if (file_read)
             input = packed.data();
         else {
             outcome = "read failed";
@@ -1819,6 +1887,7 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         LONG64 last_read = 0, last_inflated = 0;
+        DiskStats last_disk;
         MemorySample last_memory;
         const DWORD interval_ms = heartbeat_interval_ms();
         for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
@@ -1840,6 +1909,14 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 format_progress(progress, sizeof progress, second, requests_enqueued, total2, read_now - last_read,
                                 inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
                 log("%s", progress);
+                const DiskStats disk_now = disk_snapshot();
+                LARGE_INTEGER frequency{};
+                QueryPerformanceFrequency(&frequency);
+                char disk_line[512];
+                format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
+                            frequency.QuadPart > 0 ? static_cast<double>(frequency.QuadPart) : 1.0);
+                log("%s", disk_line);
+                last_disk = disk_now;
                 last_read = read_now;
                 last_inflated = inflated_now;
             }
