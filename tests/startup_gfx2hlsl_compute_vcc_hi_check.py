@@ -97,7 +97,7 @@ PAIR_PROGRAM = PROGRAM.replace(HI_INIT, PAIR_INIT, 1).replace(
     vopc(V_CMP_GT_U32, 128 + 4, 11), vopc(V_CMP_GT_I32, 128 + 4, 11), 1)
 
 
-def early_out_program(limit):
+def early_out_program(limit, stop=128):
     return b''.join([
         HEAD,
         vop1(V_MOV_B32, 8, 256 + 5),                       # v8 = flat * 7 + 1
@@ -107,7 +107,7 @@ def early_out_program(limit):
         vopc(V_CMP_GT_U32, 128 + limit, 11),                # vcc_lo = flat < limit
         sop1(S_AND_SAVEEXEC_B32, 6, VCC_LO),
         sopp(S_CBRANCH_EXECZ, 2),
-        sop1(S_MOV_B32, 20, 128),                          # stop every lane when the wave enters
+        sop1(S_MOV_B32, 20, stop),                         # stop every lane when the wave enters (0)
         sopp(S_BRANCH, 1),
         sopp(0x00),                                       # empty-mask path
         sop2(S_OR_B32, EXEC_LO, EXEC_LO, 6),
@@ -170,6 +170,15 @@ def check_controls():
     shader.ins = G.decode(early_out_program(8))
     shader.pipe = SimpleNamespace(group=(8, 4, 2), wave_size=32)
     assert any('branch out of the block' in reason for reason in shader.execz_refusals().values())
+    # The group vote takes only a stop value of zero: any other value does not stop the lanes.
+    for stop, taken in ((128, True), (193, False)):
+        voter = G.Stage.__new__(G.Stage)
+        voter.ins = G.decode(early_out_program(8, stop=stop))
+        voter.pipe = SimpleNamespace(group=(8, 4, 1), wave_size=32)
+        index = {row[0]: i for i, row in enumerate(voter.ins)}
+        jumps = [(i, int(G.parse(row[3])[1][0].split('_')[1], 16)) for i, row in enumerate(voter.ins)
+                 if row[2].startswith(('s_cbranch', 's_branch'))]
+        assert (voter.single_wave_early_out(jumps, index) is not None) == taken, stop
     print('compute EXEC early-out and vcc_hi: translation controls and refusals pass')
 
 
