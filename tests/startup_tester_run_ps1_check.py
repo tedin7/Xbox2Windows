@@ -249,21 +249,33 @@ def check_shell(shell):
         assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
         # The tester stops the script (the stub ends the whole PowerShell process, as a closed window does) before it packed anything:
         # the janitor, in a window of its own, still packs the report from the early manifest.
-        before = set((tree / "out" / "tester").glob("report_*.zip"))
         killed = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
                             "-MemoryStopPercent", "0", extra_env={"STUB_KILL_SELF": "1"})
         assert killed.returncode != 0, ("the stub did not end the script", killed.stdout, killed.stderr)
+
+        def interrupted_report():
+            # An earlier case of the same minute wrote a zip of the same name (the name has the minute only): look inside, not at names.
+            for path in sorted((tree / "out" / "tester").glob("report_*.zip")):
+                try:
+                    with zipfile.ZipFile(path) as z:
+                        found = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+                except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+                    continue
+                if found.get("interrupted"):
+                    return found
+            return None
+
         waited = time.monotonic()
-        while time.monotonic() - waited < 120 and not (set((tree / "out" / "tester").glob("report_*.zip")) - before):
-            time.sleep(1)
-        packed = sorted(set((tree / "out" / "tester").glob("report_*.zip")) - before)
-        if not packed:
+        cut = None
+        while time.monotonic() - waited < 120 and cut is None:
+            cut = interrupted_report()
+            if cut is None:
+                time.sleep(1)
+        if cut is None:
             notes = {str(f.relative_to(tree)): f.read_text(errors="replace")[-1500:] for f in (tree / "out" / "tester").glob("run_*/janitor*.txt")}
             for f in Path(tempfile.gettempdir()).glob("tester_janitor_*.json.*"):   # the janitor's own stdout/stderr
                 notes[f.name] = f.read_text(errors="replace")[-1500:]
             raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
-        with zipfile.ZipFile(packed[0]) as z:
-            cut = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
                          "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
