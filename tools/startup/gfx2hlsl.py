@@ -10024,7 +10024,8 @@ class Stage:
     # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
     # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
     WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
-                   'v_max_u32': ('WaveActiveMax({0})', 0)}
+                   'v_max_u32': ('WaveActiveMax({0})', 0), 'v_and_b32': ('WaveActiveBitAnd({0})', 0xffffffff),
+                   'v_xor_b32': ('WaveActiveBitXor({0})', 0), 'v_add_nc_u32': ('WaveActiveSum({0})', 0)}
     WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
 
     @staticmethod
@@ -10148,7 +10149,7 @@ class Stage:
                 raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
             this = b[:-len('_dpp')]
             if this not in self.WAVE_REDUCE:
-                raise Unsupported('wave reduction of %s: only v_or_b32, v_min_u32 and v_max_u32 are lowered' % this)
+                raise Unsupported('wave reduction of %s: only v_or_b32, v_and_b32, v_xor_b32, v_add_nc_u32, v_min_u32 and v_max_u32 are lowered' % this)
             if op not in (None, this):
                 raise Unsupported('wave reduction mixes %s and %s' % (op, this))
             op = this
