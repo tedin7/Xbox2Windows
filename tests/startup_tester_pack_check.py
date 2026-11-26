@@ -545,6 +545,62 @@ def check_part_one_has_the_small_files():
         assert max(v["part"] for v in files.values()) >= 3, "the big log spills over into later parts"
 
 
+def check_request_code_files():
+    """Run R: the compute keys came without .c67/.data and graphics keys were missing. Every req_<key>.* file of a chosen key ships
+    (compute: .c67 code + .data + state; graphics: .a/.b + state), compute and graphics each have their own ranking and quota,
+    and all of them sit in part 1 even when the logs fill several parts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        rows, weights, stderr = [], {}, []
+        for n in range(30):   # 30 compute keys, huge dispatch counts
+            key = "c%015x" % n
+            for ext in (".c67", ".data", ".desc", ".root", ".sa", ".sb"):
+                write(cache, "req_%s%s" % (key, ext), b"C" * 100)
+            write(cache, "%s.fail" % key, b"v_readfirstlane_b32 requires a proven uniform source\n")
+            stderr.append("x2w-render compute census key %s: %d dispatches, 0 translated, first refusal: x" % (key, 1000000 - n))
+        for n in range(20):   # 20 graphics keys, small draw counts
+            key = "a%015x" % n
+            for ext in (".a", ".b", ".root", ".psin"):
+                write(cache, "req_%s%s" % (key, ext), b"G" * 100)
+            write(cache, "%s.fail" % key, b"MRTZ requires one uncompressed depth export\n")
+            stderr.append("x2w-render not drawn key %s: %d (translation_not_ready)" % (key, 5000 - n))
+        write(cache, "req_c00000000000001e.sb", b"x")   # a compute key with no .c67/.data in the cache
+        for ext in (".c67", ".data"):
+            (cache / ("req_%s%s" % ("c%015x" % 29, ext))).unlink()
+        cache_rows = T.cache_results(str(cache))
+        chosen = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)))
+        kinds = [c[1] for c in chosen]
+        assert len(chosen) == 40 and kinds.count("compute") == 25 and kinds.count("graphics") == 15, (len(chosen), kinds.count("compute"))
+        for key, kind, weight, files, missing in chosen:
+            names = {os.path.splitext(n)[1] for n, _ in files}
+            if kind == "compute":
+                assert {".c67", ".data", ".desc", ".root", ".sa", ".sb"} == names and not missing, (key, names)
+            else:
+                assert {".a", ".b", ".root", ".psin"} == names and not missing, (key, names)
+        assert [c[0] for c in chosen[:2]] == ["c000000000000000", "c000000000000001"], "compute keys by dispatches first"
+        top_graphics = [c[0] for c in chosen if c[1] == "graphics"]
+        assert top_graphics[0] == "a000000000000000" and top_graphics == sorted(top_graphics), "graphics keys by draws"
+        # the one that lost its code files is listed with what is missing (here: it is outside the top 25, so use a small family)
+        few = T.select_requests(str(cache), cache_rows, T.key_weights("\n".join(stderr)), top=40, compute_share=40)
+        broken = [c for c in few if c[0] == "c%015x" % 29]
+        assert broken and broken[0][4] == [".c67", ".data"], broken
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", "\n".join(stderr).encode() + b"\n" + bytes(random.Random(4).randrange(256) for _ in range(900 * 1024)))
+        parts = T.pack(str(run), MANIFEST, str(tmp / "p.zip"), T.MANIFEST_ROOM + 600 * 1024, chunk_bytes=128 * 1024, cache_dir=str(cache))
+        assert len(parts) >= 3, len(parts)
+        with zipfile.ZipFile(parts[0][0]) as z:
+            first = set(z.namelist())
+            files = json.loads(z.read("manifest.json"))["files"]
+        want = {T.REQUESTS_DIR + "/" + n for c in chosen for n, _ in c[3]}
+        assert want <= first, sorted(want - first)[:5]
+        assert any(n.endswith(".c67") for n in first) and any(n.endswith(".data") for n in first)
+        assert all(files[n]["part"] == 1 for n in want), "every request file is in part 1"
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -685,6 +741,7 @@ if __name__ == "__main__":
     check_cache_results()
     check_key_use()
     check_request_files()
+    check_request_code_files()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()

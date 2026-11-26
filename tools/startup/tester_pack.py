@@ -479,24 +479,40 @@ def key_weights(stderr_text):
     return weights
 
 
-def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES):
-    """[(key, kind, weight, [(file name, bytes)])] for the refused keys ranked by weight (ties by key), at most `top`
-    keys, whole keys only, request files of all together within `cap` bytes. Keys without weight are not ranked."""
+CODE_FILES = {"compute": (".c67", ".data"), "graphics": (".a", ".b"), "mesh57": (".m57", ".ps57"), "mesh86": (".m86",)}
+REQUESTS_COMPUTE_SHARE = 25  # of REQUESTS_TOP: compute keys are ranked by dispatches (millions), the others by draws (thousands),
+                             # so one shared ranking would never pick a graphics key; each family gets its own ranking, slack goes over
+
+
+def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP_BYTES, compute_share=REQUESTS_COMPUTE_SHARE):
+    """[(key, kind, weight, [(file name, bytes)], missing code files)] for the refused keys: compute keys ranked by dispatches
+    without a translation, the other kinds by draws not drawn, `compute_share` of `top` for compute and the rest for the others
+    (a family that has fewer lends its slack to the other). Every req_<key>.* file of a key (REQUEST_PART_EXTS: code .a .b .c67 .data
+    .m57 .ps57 .m86, state .root .desc .sa .sb .ia .psin) goes in; whole keys only, all together within `cap` bytes. Keys
+    without weight are not ranked; a key whose code files (CODE_FILES) are not in the cache is still listed, with what is missing."""
     names = os.listdir(cache_dir) if os.path.isdir(cache_dir) else []
-    chosen, used = [], 0
     ranked = sorted((r for r in rows if r[2] == "refused" and weights.get(r[0], 0) > 0), key=lambda r: (-weights[r[0]], r[0]))
-    for key, kind, _, _ in ranked:
-        if len(chosen) >= top:
-            break
-        files = []
-        for name in sorted(n for n in names if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS):
-            files.append((name, os.path.getsize(os.path.join(cache_dir, name))))
-        size = sum(b for _, b in files)
-        if not files or used + size > cap:
-            continue
-        used += size
-        chosen.append((key, kind, weights[key], files))
-    return chosen
+    groups = [[r for r in ranked if r[1] == "compute"], [r for r in ranked if r[1] != "compute"]]
+    quota = [min(compute_share, top), top - min(compute_share, top)]
+    taken, chosen, used = [0, 0], {}, 0
+    # first pass: each family up to its quota; second pass: what is left of `top` goes to whichever family still has keys
+    for round_quota in (quota, [top, top]):
+        for gi, group in enumerate(groups):
+            for key, kind, _, _ in group:
+                if key in chosen:
+                    continue
+                if taken[gi] >= round_quota[gi] or len(chosen) >= top:
+                    break
+                files = [(n, os.path.getsize(os.path.join(cache_dir, n))) for n in sorted(names)
+                         if n.startswith("req_" + key + ".") and os.path.splitext(n)[1] in REQUEST_PART_EXTS]
+                size = sum(b for _, b in files)
+                if not files or used + size > cap:
+                    continue
+                have = {os.path.splitext(n)[1] for n, _ in files}
+                used += size
+                taken[gi] += 1
+                chosen[key] = (key, kind, weights[key], files, [e for e in CODE_FILES.get(kind, ()) if e not in have])
+    return sorted(chosen.values(), key=lambda c: (-c[2] if c[1] == "compute" else 0, -c[2], c[0]))
 
 
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
@@ -680,9 +696,10 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         listing[member] = {"bytes": len(data), "part": len(members)}
         used += packed
 
-    # Order = what a part 1 that arrives alone must still answer (Run Q: part 2 never came, and with it shader_results.txt, the
-    # debugger summary and every small log): the result text and the symbol table first, then every small file
-    # (SMALL_FILE_BYTES, the debugger summary included), then the big logs and the pictures, the request files last.
+    # Order = what a part 1 that arrives alone must still answer (Run Q: part 2 never came, with shader_results.txt, the debugger summary
+    # and every small log; Run R: the request files of a key were split over two parts): the result text and the symbol table first,
+    # then the request files (4 MB at most, so all of them stay in part 1), then every small file (SMALL_FILE_BYTES, the debugger
+    # summary included), then the big logs and the pictures.
     rows = []
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
@@ -693,11 +710,6 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
             symbol_rows = parse_symbols(handle.read())
         manifest["symbols"] = len(symbol_rows)
         add(SYMBOLS_NAME, format_symbols(symbol_rows).encode("utf-8"))
-    files = log_files(logdir)
-    small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
-    for name, path in small + [f for f in files if f not in small]:
-        for member, data in chunks(name, path, chunk_bytes):
-            add(member, data)
     if cache_dir:  # the request files of the worst refused keys (select_requests)
         stderr_path = os.path.join(logdir, "stderr.txt")
         weights = {}
@@ -705,13 +717,18 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
                 weights = key_weights(handle.read())
         chosen = select_requests(cache_dir, rows, weights)
-        for key, kind, weight, files_of_key in chosen:
+        for key, kind, weight, files_of_key, _missing in chosen:
             for name, _ in files_of_key:
                 with open(os.path.join(cache_dir, name), "rb") as handle:
                     add(REQUESTS_DIR + "/" + name, handle.read())
         manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
                                      "bytes": sum(b for c in chosen for _, b in c[3]),
-                                     "ranked": [{"key": k, "kind": kd, "weight": w} for k, kd, w, _ in chosen]}
+                                     "ranked": [{"key": k, "kind": kd, "weight": w, "missing_code_files": m} for k, kd, w, _, m in chosen]}
+    files = log_files(logdir)
+    small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
+    for name, path in small + [f for f in files if f not in small]:
+        for member, data in chunks(name, path, chunk_bytes):
+            add(member, data)
     stem, ext = os.path.splitext(zip_path)
     count = len(members)
     for index, group in enumerate(members, 1):
