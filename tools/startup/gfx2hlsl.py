@@ -3060,6 +3060,47 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_counted_loop(self, guard, latch, into, effects, live_in):
+        """Recognize a finite scalar loop entered at its head or, with EXEC empty, via its latch."""
+        head, end = guard + 1, latch + 1
+        if guard == 0 or latch < head + 4 or end >= len(self.ins):
+            return None
+        if self.ins[latch][2] != 's_branch' or into.get(head) != [latch] or into.get(latch) != [guard]:
+            return None
+        if any(i in into for i in range(head + 1, latch)):
+            return None
+        # The initialization must reach both paths. No instruction in the loop can change EXEC
+        # or observe other lanes, so running it with empty EXEC affects only the counter and SCC.
+        if guard in into or self.ins[guard - 1][2] != 's_mov_b32':
+            return None
+        _, init, mods = parse(self.ins[guard - 1][3])
+        if len(init) != 2 or mods:
+            return None
+        reg, initial = init
+        if not re.fullmatch(r's(?:[0-9]|[1-9][0-9]|10[0-5])', reg):
+            return None
+        if not re.fullmatch(r'0x[0-9a-f]+|[0-9]+', initial):
+            return None
+        _, _, cmp, asm = self.ins[head]
+        _, args, mods = parse(asm)
+        if (cmp != 's_cmp_lt_u32' or len(args) != 2 or mods or args[0] != reg
+                or not re.fullmatch(r'0x[0-9a-f]+|[0-9]+', args[1])):
+            return None
+        _, _, branch, asm = self.ins[head + 1]
+        if branch != 's_cbranch_scc0' or int(parse(asm)[1][0].split('_')[1], 16) != self.ins[end][0]:
+            return None
+        _, _, step, asm = self.ins[latch - 1]
+        if step != 's_add_u32' or parse(asm)[1:] != ([reg, reg, '1'], []):
+            return None
+        if {reg, 'scc'} & live_in[end]:
+            return None
+        for i in range(head + 2, latch - 1):
+            name = re.sub(r'_e(32|64)$', '', self.ins[i][2])
+            if (name not in ('v_add_nc_u32', 'v_mov_b32', 'v_xor_b32') or effects[i][2]
+                    or parse(self.ins[i][3])[2]):
+                return None
+        return head, end
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3124,6 +3165,7 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        self.execz_counted_loops = {}
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -3133,6 +3175,10 @@ class Stage:
             t = index.get(int(parse(asm)[1][0].split('_')[1], 16))
             if t is None or t <= b:
                 refused.setdefault(off, 's_cbranch_execz to a block before it')
+                continue
+            if loop := self.execz_counted_loop(b, t, into, effects, live_in):
+                head, end = loop
+                self.execz_counted_loops[offsets[t]] = (offsets[head], offsets[head + 2], offsets[end])
                 continue
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
             # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
@@ -3181,6 +3227,10 @@ class Stage:
                             t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
                             and target in index and index[target] <= b for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_cbranch_scc0'
+                    elif inner == 's_cbranch_scc0' and any(
+                            i < latch < exit_index and self.ins[latch][2] == 's_branch'
+                            and target in index and index[target] <= i for latch, target in jumps):
+                        reason = 'loop exit crosses a backward s_branch'
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
@@ -10303,14 +10353,38 @@ class Stage:
         return None
 
     # ---- output ------------------------------------------------------------------------------
+    def fold_execz_counted_loops(self):
+        loops = getattr(self, 'execz_counted_loops', {})
+        if not loops:
+            return self.blocks
+        # Only the guard can enter this region from outside. Keep the surrounding dispatch
+        # and replace its three private blocks with a structured loop on SCC.
+        blocks = {off: (lines, term) for off, lines, term in self.blocks}
+        guard_blocks = {term[2]: off for off, (_, term) in blocks.items()
+                        if term and term[:2] == ('branch', '(exec & 1) == 0')}
+        for latch, (head, body, end) in loops.items():
+            start = guard_blocks[latch]
+            before, test_exec = blocks[start]
+            compare, test_scc = blocks.pop(head)
+            iteration, _ = blocks.pop(body)
+            blocks.pop(latch)
+            lines = [*before, 'if (!(%s)) {' % test_exec[1], '    [loop] while (true) {']
+            lines.extend('        ' + line for line in compare)
+            lines.append('        if (%s) break;' % test_scc[1])
+            lines.extend('        ' + line for line in iteration)
+            lines.extend(('    }', '}'))
+            blocks[start] = lines, ('jump', end)
+        return [(off, lines, term) for off, (lines, term) in blocks.items()]
+
     def body(self):
         """Statements of the whole program as structured HLSL."""
         out = []
-        offsets = [b[0] for b in self.blocks]
+        blocks = self.fold_execz_counted_loops()
+        offsets = [b[0] for b in blocks]
         index = {off: i for i, off in enumerate(offsets)}
-        loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
-        if len(self.blocks) == 1:
-            return ['    ' + line for line in self.blocks[0][1]]
+        loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in blocks for t in [b[2]])
+        if len(blocks) == 1:
+            return ['    ' + line for line in blocks[0][1]]
 
         def goto(off):
             if off not in index:
@@ -10320,7 +10394,7 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
-        for i, (off, lines, term) in enumerate(self.blocks):
+        for i, (off, lines, term) in enumerate(blocks):
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
@@ -10340,7 +10414,7 @@ class Stage:
                         % (i, i, word),
                         '    if (pc == %d) {' % i,
                         '        uint mesh_vote = mesh_vote_%d;' % i]
-            nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
+            nxt = i + 1 if i + 1 < len(blocks) else 0xffff
             if not term:
                 out.append('        pc = %d;' % nxt)
             elif term[0] == 'end':
