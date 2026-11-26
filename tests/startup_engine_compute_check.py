@@ -35,6 +35,10 @@ reads the read buffer at that index and stores to its own destination:
   the result selects the storing lanes. Lanes tid.x < 3 store one word; lanes 6 and 7 skip the block with vcc set.
 - case O removes the lanes tid.x < 3 from the saved mask with s_andn2_b32 s0, s0, exec_lo inside the skipped block,
   and the join moves s0 into exec. Lanes 3-7 store one word; lanes 6 and 7 skip the block and keep their bit.
+- cases JOIN-S-after, JOIN-S-guarded and JOIN-S-empty read a scalar written inside the skipped block after the join: a wave with an
+  active lane runs the block for all its lanes (so lanes that skipped it by their own mask read the block's value once exec is
+  restored), a wave with no active lane keeps the value from before the block. Controls: the block's statement dropped, the wave
+  vote dropped.
 - case G reads two independently offset LDS dwords with the address in the first destination VGPR.
 - cases L-uint and L-unorm use the same formatted load with native descriptor stride and word 3 supplied by the
   harness. The descriptor selects unaligned UINT16 pairs or an UNORM8 field and permutes the outputs.
@@ -821,6 +825,57 @@ WORDS_JOIN_LOAD = bytes.fromhex(OFF_PROLOGUE_WORDS + '078006bf 010084bf 000080bf
                                 '703f8cbf 0705307e 18020e7e 040046d707060104 82080834 001070e004070480 000081bf')
 CASES['join-load'] = (SOURCE_JOIN_LOAD, WORDS_JOIN_LOAD, USER7 | TGID_X, (8, 1, 1), (2, 1, 1))
 
+# A scalar written inside a block s_cbranch_execz skips and read after the join (the definition is live there). The guest
+# runs the block for the whole wave when any lane is active, so every lane of such a wave reads the block's value, and a wave
+# with no active lane keeps the value from before the block (7). Eight lanes per group, four groups; s22 = group * STRIDE + KEY
+# inside the block. JOIN-S-after: exec is restored before the read, so lanes that skipped the block by their own mask read the
+# block's value too. JOIN-S-guarded: the read is under the entry mask (lanes 0-2). JOIN-S-empty: only group 1 has active lanes
+# at the block; the other groups' waves skip it and every lane of them reads 7.
+JOIN_HEAD = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+s_mov_b32 s22, 7
+s_mov_b32 s21, exec_lo
+"""
+JOIN_ENTRY_LANES = """\
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_mov_b32 exec_lo, vcc_lo
+"""
+JOIN_ENTRY_GROUP = """\
+s_cmp_eq_u32 s7, 1
+s_cselect_b32 s23, -1, 0
+s_mov_b32 exec_lo, s23
+"""
+JOIN_BLOCK = """\
+s_cbranch_execz 2
+s_mul_i32 s22, s7, s5
+s_add_u32 s22, s22, s4
+"""
+JOIN_AFTER_RESTORED = """\
+s_mov_b32 exec_lo, s21
+v_add_nc_u32 v6, s22, v0
+buffer_store_dword v6, v4, s[16:19], 0 offen
+s_endpgm
+"""
+JOIN_AFTER_GUARDED = """\
+v_add_nc_u32 v6, s22, v0
+buffer_store_dword v6, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+JOIN_RSRC2 = USER7 | TGID_X | tidig(1)
+CASES['JOIN-S-after'] = (JOIN_HEAD + JOIN_ENTRY_LANES + JOIN_BLOCK + JOIN_AFTER_RESTORED, bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f1400064a82060834870396be7e0395be8300887d6a03febe020088bf07051693160416801503febe16000c4a001070e004060480000081bf'), JOIN_RSRC2, (8, 1, 1), (4, 1, 1))
+CASES['JOIN-S-guarded'] = (JOIN_HEAD + JOIN_ENTRY_LANES + JOIN_BLOCK + JOIN_AFTER_GUARDED, bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f1400064a82060834870396be7e0395be8300887d6a03febe020088bf070516931604168016000c4a001070e0040604801503febe000081bf'), JOIN_RSRC2, (8, 1, 1), (4, 1, 1))
+CASES['JOIN-S-empty'] = (JOIN_HEAD + JOIN_ENTRY_GROUP + JOIN_BLOCK + JOIN_AFTER_RESTORED, bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f1400064a82060834870396be7e0395be078106bfc18017851703febe020088bf07051693160416801503febe16000c4a001070e004060480000081bf'), JOIN_RSRC2, (8, 1, 1), (4, 1, 1))
+
 
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
@@ -880,6 +935,14 @@ def expected(name):
     if name == 'join-load':
         for i in range(16):
             out[i] = input_word(i // 8)
+        return out
+    if name in ('JOIN-S-after', 'JOIN-S-guarded', 'JOIN-S-empty'):
+        for group in range(4):
+            block = (group * STRIDE + KEY) & MASK if (group == 1 or name != 'JOIN-S-empty') else 7   # the value the wave reads
+            for lane in range(8):
+                if name == 'JOIN-S-guarded' and lane >= 3:
+                    continue
+                out[group * 8 + lane] = (block + lane) & MASK
         return out
     if name == 'O-dword':
         for group in range(4):
@@ -2237,6 +2300,10 @@ MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
     'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
+    # The block's scalar statement dropped: the lanes read the old value after the join.
+    'join-s-drop': ('JOIN-S-after', 's22 = s7 * ud1;', 's22 = 0u;'),
+    # The wave vote dropped: a wave with no active lane runs the block and reads the block's value instead of 7.
+    'join-s-no-vote': ('JOIN-S-empty', 'pc = !x2w_any ? 2u : 1u;', 'pc = 1u;'),
     # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
     's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
     # s_sub_u32 borrow: the first source is the smaller one.
@@ -2343,6 +2410,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
         else:
             runs = [(name, None) for name in CASES]
             runs.append(('join-load', 'join-load-zero'))
+            runs += [('JOIN-S-after', 'join-s-drop'), ('JOIN-S-empty', 'join-s-no-vote')]
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
             runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
