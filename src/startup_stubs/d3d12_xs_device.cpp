@@ -2791,7 +2791,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+        log("x2w-draw upload ring reservation refused: no unused capacity (asked %zu bytes, ring %llu MiB in %zu chunks, %ld reservations, %ld recycled so far)",
+            bytes, static_cast<unsigned long long>(total_bytes >> 20), chunks.size(), static_cast<long>(upload_ring_reservations),
+            static_cast<long>(upload_ring_recycled));
     return reservation;
 }
 

@@ -1716,9 +1716,14 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     x2w_upload::Page owned;
     // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
     const bool own_buffer = !console && !tiled && !is_compact && !address_uploads_from_ring() && total >= own_upload_buffer_bytes;
-    if (dedicated || own_buffer) {
+    // A tiled block-compressed chain or surface is written to a zeroed buffer of its own as a console layout is: these are the
+    // large world textures, and sharing the ring with the draws' constants let a streaming burst fill it (draws then lost their
+    // buffers). X2W_TEST_ADDRESS_UPLOAD_RING=1 keeps the ring, for the existing fixtures.
+    const bool own_tiled = (tiled_chain || (tiled && !single)) && !console && !address_uploads_from_ring();
+    if (dedicated || own_buffer || own_tiled) {
         u64 bytes = 0;
-        for (UINT i = 0; i < (console ? mips : plan.count); ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        for (UINT i = 0; i < (console || tiled_chain ? mips : tiled ? 1 : plan.count); ++i)
+            bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
@@ -1728,7 +1733,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             return false;
         }
         // Console layouts detile into a zeroed buffer; a plain upload overwrites every byte it names.
-        if (dedicated) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+        if (dedicated || own_tiled) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1762,30 +1767,48 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
-                u64 offset = 0;
+                u64 offset = owned.cursor;
                 ID3D12Resource* chunk = nullptr;
-                auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-                if (!rows || !chunk) {
-                    state.done = false;
-                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+                if (owned.cpu) {
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                } else {
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    if (!rows || !chunk) {
+                        state.done = false;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                    }
+                    std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
-                std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else if (tiled && !single) {
-        u64 offset = 0;
+        u64 offset = owned.cursor;
         const auto bytes = plan.bytes(0);
         ID3D12Resource* chunk = nullptr;
-        auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-        if (!rows || !chunk) {
-            state.done = false;
-            return false;  // staging failed: not uploaded, so report it and retry at the next bind
+        unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+        if (owned.cpu) {
+            owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+        } else {
+            rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+            if (!rows || !chunk) {
+                state.done = false;
+                return false;  // staging failed: not uploaded, so report it and retry at the next bind
+            }
+            std::memset(rows, 0, static_cast<std::size_t>(bytes));
         }
-        std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
-        plan.upload(list, texture, chunk, 1, 1, 0, 0, offset);
+        plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, 1, 1, 0, 0, offset);
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
