@@ -84,7 +84,7 @@ def main(scene, backend):
         # X2W_REPLAY_SHADERS=0: the same recording without SHDR chunks.
         bare = directory / "bare.x2wr"
         code, text, _ = timed(args + [12], dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(bare), X2W_REPLAY_SHADERS="0"))
-        assert code == 0 and "shader cache not written (X2W_REPLAY_SHADERS=0)" in text, text[-2000:]
+        assert code == 0, text[-2000:]  # it ends at process exit, where the recorder logs nothing
         end_presents(bare)
         assert b"SHDR" not in bare.read_bytes(), "X2W_REPLAY_SHADERS=0 still wrote shader chunks"
         size = capped.stat().st_size
