@@ -374,6 +374,17 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.played;
         return true;
     }
+    // Older recordings can supply a generic ARGM for a descriptor array.
+    // Skip a copy with missing arrays instead of passing captured process addresses to the stand-in.
+    if (c.kind == device_kind && c.slot == 23) {
+        for (const unsigned i : {1u, 2u, 4u, 5u}) {
+            if (static_cast<UINT>(c.args[i < 3 ? 0 : 3]) && c.args[i] && a[i] == c.args[i] &&
+                !page_replay().reserved(a[i])) {
+                ++p.missing_blob;
+                return false;
+            }
+        }
+    }
     const auto* layout = p.use_slot_layouts ? x2w_replay_slots::find(c.kind, c.slot) : nullptr;
     const bool wait = layout && c.kind == device_kind && c.slot == 80;
     const bool barrier_noop = layout && c.kind == x2w_replay_slots::list && c.slot == 146;

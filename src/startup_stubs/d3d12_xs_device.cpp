@@ -99,6 +99,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -2313,6 +2314,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 //
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
+std::size_t desktop_stream_size(UINT type);
 #include "startup_stubs/d3d12_capture.inl"
 #include "startup_stubs/d3d12_record.inl"
 #include "startup_stubs/d3d12_present_pictures.inl"

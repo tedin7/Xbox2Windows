@@ -110,7 +110,7 @@ void page_scan(bool everything, u64 stamp)
             const u64 at = range.address + page_cursor_offset;
             const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset));
             page_cursor_offset += want;
-            const std::size_t readable = readable_window(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
+            const std::size_t readable = committed_readable_prefix(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
             SIZE_T got = 0;
             if (!readable || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), buffer.data(), readable, &got) ||
                 got != readable) {
