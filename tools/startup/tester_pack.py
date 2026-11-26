@@ -5,15 +5,20 @@
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
-  tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N]   write the zip, print its path and size
+  tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
+  tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR]   write the zip, print its path and size
 
 The zip holds every file the run wrote in its log folder (stdout, stderr, events, finished, threads, files, trap.log,
 translate, translate_err, window*.png, bink_luma.png ...), the debugger summary (`<logdir>.out`) and manifest.json.
-Not in it: sub-folders such as a shader cache, memory dumps and game files. Nothing is dropped: past the size limit
+Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
+`shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
+of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason. Never
+shader code or binaries. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
 """
 import argparse
 import re
+import struct
 import json
 import os
 import sys
@@ -83,8 +88,7 @@ def validate_manifest(manifest):
     return manifest
 
 
-READY_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:ms57\.)?txt$")
-REQUEST_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:a|rtv|c67|m57)$")
+REQUEST_RE = re.compile(r"^req_([0-9a-f]{16})\.(a|rtv|c67|m57)$")
 
 
 MEMORY_FRACTION = 0.75     # of physical RAM: the launcher's job memory cap (debug_launch --memory-gib)
@@ -110,19 +114,139 @@ def cache_tag(translator):
     return "-".join(numbers)
 
 
+def _non_empty(path):
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _complete_dxbc(path):
+    """A DXContainer whose header length matches the file (gfx2hlsl.py has_complete_mesh57_bytecode)."""
+    try:
+        with open(path, "rb") as shader:
+            header = shader.read(32)
+            if len(header) != 32 or header[:4] != b"DXBC":
+                return False
+            size, parts = struct.unpack_from("<II", header, 24)
+            return size == os.fstat(shader.fileno()).st_size and 0 < parts <= (size - 32) // 4
+    except OSError:
+        return False
+
+
+def _translated(cache_dir, key, kind):
+    """The translator's own test for a finished request (gfx2hlsl.py pending_keys): the result manifest
+    `<key>.txt` (`<key>.ms57.txt` for a mesh pipeline) is published and the bytecode it describes is on disk, non-empty:
+    `.vs.cso` + `.ps.cso` (pixel pipelines), `.cs.cso` (compute), `.ms57.cso` + `.ps57.cso`, both complete DXContainers (mesh; a pixel stage the
+    manifest says is `ps none` needs no `.ps57.cso`). The request file itself is `req_<key>.<kind>`."""
+    base = os.path.join(cache_dir, key)
+    if kind == "m57":
+        manifest = base + ".ms57.txt"
+        if not (os.path.isfile(manifest) and _complete_dxbc(base + ".ms57.cso")):
+            return False
+        if _complete_dxbc(base + ".ps57.cso"):
+            return True
+        with open(manifest, "rb") as handle:
+            return b"ps none" in handle.read().splitlines()
+    stages = (".cs.cso",) if kind == "c67" else (".vs.cso", ".ps.cso")
+    return os.path.isfile(base + ".txt") and all(_non_empty(base + stage) for stage in stages)
+
+
 def cache_stats(cache_dir):
-    """(translations ready, requests, failures) in a shader cache folder: a request is translated once its
-    ready marker req_<key>.txt (or .ms57.txt for a mesh pipeline) is published."""
+    """(translations ready, requests, failures) in a shader cache folder, counted per request file req_<key>.<kind>:
+    ready = the translator's finished-request test passes (manifest + bytecode, see _translated); failed = not ready and
+    `<key>.fail` exists (a refusal or compiler error; the next pass retries it). The rest is pending."""
     ready = requests = failed = 0
     if os.path.isdir(cache_dir):
         for name in os.listdir(cache_dir):
-            if READY_RE.match(name):
+            match = REQUEST_RE.match(name)
+            if not match:
+                continue
+            requests += 1
+            if _translated(cache_dir, match.group(1), match.group(2)):
                 ready += 1
-            elif REQUEST_RE.match(name):
-                requests += 1
-            elif name.endswith(".fail"):
+            elif os.path.isfile(os.path.join(cache_dir, match.group(1) + ".fail")):
                 failed += 1
     return ready, requests, failed
+
+
+RESULTS_NAME = "shader_results.txt"
+KEY_RE = re.compile(r"(?:^|[^0-9a-f])([0-9a-f]{16})(?:[^0-9a-f]|$)")
+# request file extension -> kind; result marker: ready file suffix per kind, `.fail` for a refusal
+REQUEST_KINDS = {".a": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
+READY_SUFFIXES = {"graphics": (".txt",), "compute": (".txt",), "mesh57": (".ms57.txt",), "mesh86": (".mesh86.txt",)}
+REASON_CHARS = 200         # per key; the translator's own message, first line only
+COMPILER_CODE_RE = re.compile(r"\b(?:error|warning)\s+[A-Z]\d{3,5}\b")
+TOP_REASONS = 80
+
+
+def clean_reason(text):
+    """One line of text from a `.fail` file, never shader code: the first line only, at most REASON_CHARS characters.
+    A compiler (dxc, fxc) message quotes the HLSL source, so only its stage and error codes are kept."""
+    line = text.strip().splitlines()[0].strip() if text.strip() else "(empty .fail)"
+    compiler = re.match(r"(dxc|fxc)( \w+)?:", line)
+    if compiler:
+        codes = sorted(set(COMPILER_CODE_RE.findall(text)))
+        return ("%s compile failed" % compiler.group(0).rstrip(":")) + (" (" + ", ".join(codes[:6]) + ")" if codes else "")
+    return re.sub(r"\s+", " ", line)[:REASON_CHARS]
+
+
+def normal_reason(reason):
+    """The reason without registers, numbers and addresses, so that the same wall counts as one."""
+    reason = re.sub(r"0x[0-9a-fA-F]+", "X", reason)
+    reason = re.sub(r"\b[sv]\d+\b", "R", reason)
+    return re.sub(r"\d+", "N", reason)[:110]
+
+
+def cache_results(cache_dir):
+    """[(key, kind, status, reason)] for every request key in a shader cache folder, sorted by kind and key. Status is
+    `ok` (the ready marker is published), `refused` (a `.fail` file: its first line is the reason) or `pending`."""
+    found, by_key = {}, {}
+    if not os.path.isdir(cache_dir):
+        return []
+    for name in sorted(os.listdir(cache_dir)):
+        match = KEY_RE.search(name)
+        if not match:
+            continue
+        by_key.setdefault(match.group(1), []).append(name)
+        ext = os.path.splitext(name)[1]
+        if ext in REQUEST_KINDS:
+            found[match.group(1)] = REQUEST_KINDS[ext]
+    rows = []
+    for key, kind in found.items():
+        status, reason = "pending", ""
+        for name in by_key[key]:
+            if name.endswith(".fail"):
+                with open(os.path.join(cache_dir, name), "r", encoding="utf-8", errors="replace") as handle:
+                    status, reason = "refused", clean_reason(handle.read(4096))
+                break
+            if name.endswith(READY_SUFFIXES[kind]) and not name.endswith(".fail"):
+                status = "ok"
+        rows.append((key, kind, status, reason))
+    return sorted(rows, key=lambda row: (row[1], row[0]))
+
+
+def format_results(rows):
+    """Text for the zip: totals, the refusals ranked by normalized reason, then one line per key."""
+    kinds = {}
+    for _, kind, _, _ in rows:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    count = lambda status: sum(1 for row in rows if row[2] == status)
+    lines = ["# shader cache results: the translator's own messages, first line of each .fail, no shader code",
+             "keys %d (%s): ok %d, refused %d, pending %d" % (
+                 len(rows), ", ".join("%s %d" % item for item in sorted(kinds.items())) or "none",
+                 count("ok"), count("refused"), count("pending")),
+             "", "## refusals by reason (registers and numbers normalized)"]
+    ranked = {}
+    for _, kind, status, reason in rows:
+        if status == "refused":
+            entry = ranked.setdefault(normal_reason(reason), {})
+            entry[kind] = entry.get(kind, 0) + 1
+    for reason, by_kind in sorted(ranked.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:TOP_REASONS]:
+        lines.append("%5d  %s   [%s]" % (sum(by_kind.values()), reason, ", ".join("%s %d" % i for i in sorted(by_kind.items()))))
+    lines += ["", "## keys: key kind status reason"]
+    lines += ["%s %s %s%s" % (key, kind, status, " " + reason if reason else "") for key, kind, status, reason in rows]
+    return "\n".join(lines) + "\n"
 
 
 def log_files(logdir):
@@ -172,7 +296,7 @@ def first_poll(logdir):
     return None
 
 
-def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES):
+def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
     manifest = validate_manifest(dict(manifest_in))
@@ -180,15 +304,23 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     manifest["first_poll_seconds"] = poll[0] if poll else None
     room = limit_bytes - MANIFEST_ROOM
     parts, members, used, listing = [], [[]], 0, {}
+    def add(member, data):
+        nonlocal used
+        packed = len(zlib.compress(data, 6)) + 100 + 2 * len(member)
+        if used + packed > room and members[-1]:
+            members.append([])
+            used = 0
+        members[-1].append((member, data))
+        listing[member] = {"bytes": len(data), "part": len(members)}
+        used += packed
+
     for name, path in log_files(logdir):
         for member, data in chunks(name, path, chunk_bytes):
-            packed = len(zlib.compress(data, 6)) + 100 + 2 * len(member)
-            if used + packed > room and members[-1]:
-                members.append([])
-                used = 0
-            members[-1].append((member, data))
-            listing[member] = {"bytes": len(data), "part": len(members)}
-            used += packed
+            add(member, data)
+    if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
+        rows = cache_results(cache_dir)
+        manifest["cache_keys"] = len(rows)
+        add(RESULTS_NAME, format_results(rows).encode("utf-8"))
     stem, ext = os.path.splitext(zip_path)
     count = len(members)
     for index, group in enumerate(members, 1):
@@ -222,6 +354,9 @@ def main(argv):
     q.add_argument("manifest")
     q.add_argument("zip")
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
+    q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
+    r = sub.add_parser("cache-results")
+    r.add_argument("cache")
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds))
@@ -235,6 +370,9 @@ def main(argv):
     if args.cmd == "cache-stats":
         print("%d %d %d" % cache_stats(args.cache))
         return 0
+    if args.cmd == "cache-results":
+        sys.stdout.write(format_results(cache_results(args.cache)))
+        return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)
         print("first pad poll at %g s after start (first input entry at %g s)" % poll if poll
@@ -242,7 +380,7 @@ def main(argv):
         return 0
     with open(args.manifest, encoding="utf-8-sig") as handle:
         manifest_in = json.load(handle)
-    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024)):
+    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache):
         print("%s %d" % (path, size))
     return 0
 

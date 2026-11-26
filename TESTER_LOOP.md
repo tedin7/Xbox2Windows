@@ -8,7 +8,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | Piece | Source | Head taken |
 |---|---|---|
 | `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `0355a7745` |
-| revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
+| revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815), with the fix `d39f65cfc` | `d39f65cfc` |
 | periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
 | opt-in lazy slot 133 textures (`X2W_D3D12_LAZY_TEXTURES=1`): external PR #2773, opt-in; its conflict with main is resolved on this branch only | PR #2773 (triggered02) | `92db6d4eb` |
 | C++ exception record decoded into a sanitized summary | PR #1939 | `49ca19e34` |
@@ -28,6 +28,14 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | watch translator serves the newest requests first | fork branch `x2w-watch-newest` | `e7b617bcb` |
 | residency slice 1 | fork branch `f4-residency-s1` | `df147080e` |
 | tester_run turns on `X2W_XMEM_STARTUP_BELOW_40` (`-NoStartupBelow40` off) | fork branch `c15-bvh40` | `2b9643b13` |
+| tester_run: finish translation after the run, PowerShell 5.1 native stderr fix | fork branch `c18-tester-run` | `8bab8da2d` |
+| 1D and 3D image_store | fork branch `c22-img-1d3d` | `d17d221a9` |
+| residency slice 1 (update) | fork branch `f4-residency-s1` | `5cc2a859c` |
+| per-reason SRV shape table | fork branch `c22-srv-shapes` | `3a826e171` |
+| tester pack: reasons in the report | fork branch `tester-pack-reasons` | `10a88f822` |
+| image_gather4_lz_o with a constant packed offset | fork branch `x2w-w5-gather-lz-o` | `0c5b82846` |
+| DPP in compute (w6) | fork branch `w6-dpp-cs` | `49bc35454` |
+| execz refusal names its cause (text only) | fork branch `c7-execz-cause` | `dd0d392e3` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
@@ -79,7 +87,6 @@ Windows build, wall time). It holds no game files, no shader cache and no memory
 
 | Branch | Head | Conflict |
 |---|---|---|
-| `c22-srv-shapes` | `14a63df5e` | `tests/startup_memory_srv_census_check.cpp`: expected census line differs from the slot 70 causes (`c23-slot70-texture-causes`) |
 | `c15-sysmem-fallback` | `f45c6849d` | `d3d12_xs_device.cpp`, `triage_run.py`, `tester_run.ps1` and their tests |
 | `c21-g3-bufunavail` | `b9a06c4b5` | `d3d12_memory_srv.inl` (`unplaced_memory_buffer` signature with #2782) |
 | `c7-s4-dropmips` | `8a95e07f9` | `d3d12_xs_device.cpp`: the lazy SRV code moved into `create_lazy_srv` (fix-2773); the drop-levels view handling has to move with it |

@@ -49,9 +49,21 @@ Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 exit 0
 """
 TRANSLATOR = """\
+import os, sys, time
+def fnv(blob): return 0
 key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
+# one pass (argv: --once <cache>): publish a ready marker for every request that has none; STUB_HANG never ends (the cap)
+if len(sys.argv) > 2 and sys.argv[1] == '--once':
+    if os.environ.get('STUB_HANG'):
+        time.sleep(600)
+    for name in sorted(os.listdir(sys.argv[2])):
+        if name.startswith('req_') and name.endswith('.a'):
+            base = os.path.join(sys.argv[2], name[4:-2])      # req_<key>.a -> <key>.txt + the two bytecode files
+            if not os.path.exists(base + '.txt'):
+                for suffix in ('.txt', '.vs.cso', '.ps.cso'):
+                    open(base + suffix, 'wb').write(b'ok')
 """
 DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
@@ -86,13 +98,25 @@ def make_tree(root):
     return tree, head, gen / "x2w_build_rev.cpp"
 
 
-def run_script(shell, tree, *args):
+def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr=False):
     env = dict(os.environ)
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    if extra_path:
+        env["PATH"] = str(extra_path) + os.pathsep + env["PATH"]
+    env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
-    command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tree / "tools" / "startup" / "tester_run.ps1"),
-               "-Exe", "title.exe", "-DataDir", "data", *args]
+    if "-FinishTranslateSeconds" not in args:
+        args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
+    script = str(tree / "tools" / "startup" / "tester_run.ps1")
+    if merge_stderr:
+        # A caller that merges the script's error stream into its output (`... 2>&1`, as a tester's wrapper or a log pipe
+        # does): Windows PowerShell 5.1 then turns every line a native command writes to stderr into an error record.
+        words = " ".join(word if word.startswith("-") and not word[1:].isdigit() else "'%s'" % word
+                         for word in ("-Exe", "title.exe", "-DataDir", "data", *args))
+        command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& '%s' %s 2>&1; exit $LASTEXITCODE" % (script, words)]
+    else:
+        command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Exe", "title.exe", "-DataDir", "data", *args]
     return subprocess.run(command, capture_output=True, text=True, errors="replace", env=env, timeout=300, cwd=str(tree))
 
 
@@ -101,15 +125,18 @@ def check_shell(shell):
         tree, head, rev_file = make_tree(root)
         cache = tree / "out" / "startup" / "shader_cache_28-28-7"
         cache.mkdir(parents=True)
-        for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_1123456789abcdef.a", "revision.txt"):
+        # A warm cache as the translator leaves it: one finished request (manifest <key>.txt + both bytecode files), one
+        # pending, one refused (<key>.fail), and the revision stamp.
+        warm = ["req_0123456789abcdef.a", "0123456789abcdef.txt", "0123456789abcdef.vs.cso", "0123456789abcdef.ps.cso",
+                "req_1123456789abcdef.a", "req_4123456789abcdef.a", "4123456789abcdef.fail", "revision.txt"]
+        for name in warm:
             (cache / name).write_bytes(b"x")
 
         rev_file.write_text(REV_CPP % "00000000", encoding="ascii")
         stale = run_script(shell, tree, "-NoBuild")
         assert stale.returncode != 0 and "00000000" in stale.stdout + stale.stderr and head in stale.stdout + stale.stderr, \
             (shell, "a build from another commit was not refused", stale.stdout, stale.stderr)
-        assert sorted(os.listdir(cache)) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
-                                                     "req_1123456789abcdef.a", "revision.txt"]), "the cache was touched"
+        assert sorted(os.listdir(cache)) == sorted(warm), "the cache was touched"
         assert not list((tree / "out" / "tester").glob("*.zip")) if (tree / "out" / "tester").exists() else True
 
         rev_file.write_text(REV_CPP % head, encoding="ascii")
@@ -135,10 +162,9 @@ def check_shell(shell):
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
-        assert sorted(args["CacheEntries"]) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
-                                                                  "req_1123456789abcdef.a", "revision.txt"]), \
+        assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
-        assert "1 translations were already present at start (2 requests, 0 failed)" in ok.stdout, ok.stdout
+        assert "1 translations were already present at start (3 requests, 1 failed)" in ok.stdout, ok.stdout
         assert manifest["commit"] == head and manifest["build_commit"] == head and manifest["dirty"] is False
         assert manifest["seconds"] == 200 and manifest["deep"] is False and manifest["input_script"] == args["InputScript"]
         assert manifest["env"].get("X2W_D3D12_BUDGET") == "1" and all(k.startswith("X2W_") for k in manifest["env"])
@@ -182,7 +208,8 @@ def check_shell(shell):
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
-        (cache / "req_2123456789abcdef.txt").write_bytes(b"x")
+        for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):
+            (cache / name).write_bytes(b"x")
         again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
 
@@ -206,7 +233,31 @@ def check_shell(shell):
         rev_file.write_text(REV_CPP % git(tree, "rev-parse", "--short=8", "HEAD"), encoding="ascii")
         fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert fresh.returncode == 0 and "0 translations were already present at start" in fresh.stdout, fresh.stdout
-        assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("req_*.txt"))) == 2
+        assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("????????????????.txt"))) == 2
+
+        # F1: after the zip is packed, one translator pass finishes the pending requests (cap: -FinishTranslateSeconds).
+        fresh_cache = cache.parent / "shader_cache_29-29-7"
+        (fresh_cache / "req_aaaaaaaaaaaaaaaa.a").write_bytes(b"x")
+        (fresh_cache / "req_bbbbbbbbbbbbbbbb.a").write_bytes(b"x")
+        for suffix in (".txt", ".vs.cso", ".ps.cso"):
+            (fresh_cache / ("bbbbbbbbbbbbbbbb" + suffix)).write_bytes(b"x")
+        finished = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "60")
+        assert finished.returncode == 0, (finished.stdout, finished.stderr)
+        assert "finishing the translation: 1 request(s) pending" in finished.stdout, finished.stdout
+        assert "pending before 1, after 0; ok 2, refused 0 in total (0 new)" in finished.stdout, finished.stdout
+        assert (fresh_cache / "aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
+        assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
+        # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
+        (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
+        capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
+                            extra_env={"STUB_HANG": "1"})
+        assert capped.returncode == 0, (capped.stdout, capped.stderr)
+        assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
+        assert not (fresh_cache / "cccccccccccccccc.txt").exists()
+        assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
+        assert list((tree / "out" / "tester").glob("report_*.zip"))
+        skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
@@ -268,8 +319,16 @@ def check_build(shell):
         git(tree, "commit", "-q", "-m", "cmake")
         head = git(tree, "rev-parse", "--short=8", "HEAD")
         assert not (build / "xmem.dll").exists()
-        result = run_script(shell, tree, "-CaptureEvery", "0")
+        # cmake writes a warning to stderr (as the real one does) while this script's stderr is captured: under Windows
+        # PowerShell 5.1 that is an error record, and with $ErrorActionPreference Stop it used to end the script. The
+        # build is judged by its exit code.
+        shim = Path(root) / "shim"
+        shim.mkdir()
+        (shim / "cmake.cmd").write_text('@echo CMake Warning: stub warning on stderr 1>&2\r\n@"%s" %%*\r\n' % shutil.which("cmake"),
+                                        encoding="ascii")
+        result = run_script(shell, tree, "-CaptureEvery", "0", extra_path=shim, merge_stderr=True)
         assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "stub warning on stderr" in result.stdout + result.stderr, ("the shim did not run", result.stdout[-1500:], result.stderr[-500:])
         assert "building startup_runtime" in result.stdout, result.stdout
         for dll in DLLS:
             assert (build / (dll + ".dll")).exists(), dll + ".dll was not built"

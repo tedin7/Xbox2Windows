@@ -1124,10 +1124,14 @@ struct TextureUpload {
     bool staged = false;       // the last upload attempt put the title memory into the desktop texture
     bool gpu_written = false;  // a list copy or resolve wrote the texture; its title memory is stale and must not be uploaded
     UINT uploads = 0;          // X2W_D3D12_RESIDENCY observation: copies of title memory into this texture over the run
+    u64 bytes = 0;             // size of the last upload (residency accounting)
+    bool resident = true, pinned = false, evictable = false;  // residency state (d3d12_residency.inl)
+    LONG evicted_at = -1000000;
     LONG last_use = -1;        // frame_number of the last upload_texture call that named it (a bind, a copy or a dispatch)
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 u64 address_upload_revision;
+#include "startup_stubs/d3d12_residency.inl"
 
 // A texture published in a newly supported console layout is not filled through the shared upload ring.
 // The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
@@ -1352,12 +1356,6 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
 LONG textures_reuploaded;  // uploads of a texture that had been uploaded before (X2W_D3D12_RESIDENCY observation)
 
-bool residency_observe()
-{
-    static const bool on = std::getenv("X2W_D3D12_RESIDENCY") != nullptr && std::getenv("X2W_D3D12_RESIDENCY")[0] == '1';
-    return on;
-}
-
 // One "x2w-residency" line: how many textures the run uploaded, how many were uploaded again, the highest repeat counts
 // and how many textures were used in the last 120 frames (counts only; nothing is evicted by this).
 void residency_report(LONG frame)
@@ -1430,6 +1428,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         return false;
     }
     TextureUpload& state = *cached;
+    if (residency_observe() && !residency_use(self, texture, resource->own().retire_when_idle, state, frame_number)) return false;
     state.last_use = frame_number;
     TextureWrite written;
     AcquireSRWLockShared(&written_lock);
@@ -1609,6 +1608,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     state.staged = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
+    state.bytes = total;
     if (state.uploads++) InterlockedIncrement(&textures_reuploaded);
     static LONG shown;
     if (first_calls(shown, 12))
@@ -2313,12 +2313,78 @@ static const char* const not_drawn_names[] = {
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
 LONG not_drawn_counts[not_drawn_sites];
+// The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
+// increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
+struct NotDrawnKey {
+    LONG total = 0;
+    LONG by_site[not_drawn_sites] = {};
+};
+SRWLOCK not_drawn_key_lock = SRWLOCK_INIT;
+std::unordered_map<u64, NotDrawnKey>& not_drawn_keys()
+{
+    static std::unordered_map<u64, NotDrawnKey> keys;
+    return keys;
+}
+thread_local u64 not_drawn_key = 0;  // set by draw_translated once the pipeline's translation is known
 static bool not_drawn(int site)
 {
     const LONG seen = InterlockedIncrement(&not_drawn_counts[site]);
     if (seen <= 3)
         log("x2w-draw not drawn: %s (call %ld at this site)", not_drawn_names[site], seen);
+    AcquireSRWLockExclusive(&not_drawn_key_lock);
+    NotDrawnKey& entry = not_drawn_keys()[not_drawn_key];
+    ++entry.total;
+    ++entry.by_site[site];
+    ReleaseSRWLockExclusive(&not_drawn_key_lock);
     return false;
+}
+// With the periodic totals (about every 60 s): the pipeline keys that were not drawn, most draws first, each with its
+// three most frequent refusal sites. The tester pack ranks pipelines by these lines.
+std::vector<std::string> not_drawn_key_lines()
+{
+    std::vector<std::string> lines;
+    std::vector<std::pair<u64, NotDrawnKey>> keys;
+    AcquireSRWLockShared(&not_drawn_key_lock);
+    for (const auto& item : not_drawn_keys()) keys.emplace_back(item.first, item.second);
+    ReleaseSRWLockShared(&not_drawn_key_lock);
+    if (keys.empty()) return lines;
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.second.total > b.second.total; });
+    LONG64 all = 0;
+    for (const auto& item : keys) all += item.second.total;
+    char head[128];
+    snprintf(head, sizeof(head), "x2w-render not drawn by pipeline key: %zu keys, %lld draws", keys.size(), static_cast<long long>(all));
+    lines.push_back(head);
+    for (std::size_t k = 0; k < keys.size() && k < 40; ++k) {
+        const NotDrawnKey& entry = keys[k].second;
+        int order[not_drawn_sites];
+        for (int i = 0; i < not_drawn_sites; ++i) order[i] = i;
+        std::sort(order, order + not_drawn_sites, [&](int a, int b) { return entry.by_site[a] > entry.by_site[b]; });
+        char causes[256];
+        int used = 0;
+        for (int i = 0; i < 3 && entry.by_site[order[i]] && used < static_cast<int>(sizeof(causes)) - 64; ++i)
+            used += snprintf(causes + used, sizeof(causes) - used, "%s%s %ld", i ? ", " : "", not_drawn_names[order[i]], entry.by_site[order[i]]);
+        causes[used > 0 ? used : 0] = 0;
+        char line[384];
+        snprintf(line, sizeof(line), "x2w-render not drawn key %016llx: %ld (%s)", keys[k].first, entry.total, causes);
+        lines.push_back(line);
+    }
+    return lines;
+}
+void log_not_drawn_keys()
+{
+    for (const std::string& line : not_drawn_key_lines()) log("%s", line.c_str());
+}
+// Fixture export (startup_indirect_draw_indexed): the lines log_not_drawn_keys prints, '\n'-separated, as census_report does.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity)
+{
+    std::string text;
+    for (const std::string& line : not_drawn_key_lines()) text += line + "\n";
+    if (out && capacity) {
+        const std::size_t n = text.size() < capacity - 1 ? text.size() : capacity - 1;
+        std::memcpy(out, text.data(), n);
+        out[n] = 0;
+    }
+    return text.size();
 }
 void log_not_drawn_causes()
 {
@@ -2332,6 +2398,7 @@ void log_not_drawn_causes()
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
+    not_drawn_key = 0;
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
@@ -2342,6 +2409,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
+    not_drawn_key = tr ? tr->key : bound && bound->translation ? bound->translation->key : 0;
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;

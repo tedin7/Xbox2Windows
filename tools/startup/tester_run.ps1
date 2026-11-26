@@ -23,6 +23,10 @@ commit passes the cap dies with error 1455. -MemoryGiB overrides it; the summary
 Lazy memory commit is ON by default (run.ps1 -LazyMemory): physical pages and the large startup blocks are committed on
 first touch, which cuts the section commit. -NoLazyMemory turns it off. The manifest records it.
 
+When the report is packed the script finishes the translation: one translator pass over the shader cache (no --watch), until
+nothing is pending or -FinishTranslateSeconds (default 900, 0 = skip) is over, then prints "pending before/after, ok, refused".
+The next run then starts with every request the title made already translated. The mail does not wait for this step.
+
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
 
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
@@ -52,19 +56,31 @@ param(
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
+    [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
-    [switch]$NoStartupBelow40                   # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
+    [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
+    [switch]$NoLowAddresses                     # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $repo $BuildDir }
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 
+# Windows PowerShell 5.1 turns a native command's stderr into error records when the script's own stderr is redirected
+# (a caller that captures it), and "Stop" then ends the script on a harmless warning (cmake, git, python). Native commands
+# run with "Continue" here and are judged by $LASTEXITCODE; a native command's stderr is shown, not captured.
+function Invoke-Native([scriptblock]$Command) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Command | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Host $_.ToString() } else { $_ } } }
+    finally { $ErrorActionPreference = $saved }
+}
+
 function Get-CheckoutRevision {
-    $head = (& git -C $repo rev-parse --short=8 HEAD).Trim()
+    $head = (Invoke-Native { & git -C $repo rev-parse --short=8 HEAD } | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $head -notmatch "^[0-9a-f]+$") { throw "tester_run: $repo is not a git checkout" }
-    $changes = & git -C $repo --no-optional-locks status --porcelain --untracked-files=no
+    $changes = Invoke-Native { & git -C $repo --no-optional-locks status --porcelain --untracked-files=no }
     return @{ Commit = $head; Dirty = [bool]$changes }
 }
 
@@ -99,15 +115,15 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
         if ($BuildDir -ne "out/build/release") { throw "tester_run: $buildRoot is not configured (run cmake -S `"$repo`" -B `"$buildRoot`" first)" }
         Write-Host "tester_run: configuring $buildRoot (cmake --preset release)"
         Push-Location $repo
-        try { & cmake --preset release } finally { Pop-Location }
+        try { Invoke-Native { & cmake --preset release } } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw "tester_run: the configure failed (cmake exit $LASTEXITCODE)" }
     }
     if ($FullBuild) {
         Write-Host "tester_run: build is from $have, checkout is ${wanted}: building everything (-FullBuild)"
-        & cmake --build $buildRoot
+        Invoke-Native { & cmake --build $buildRoot }
     } else {
         Write-Host "tester_run: build is from $have, checkout is ${wanted}: building startup_runtime (the run's targets)"
-        & cmake --build $buildRoot --target startup_runtime
+        Invoke-Native { & cmake --build $buildRoot --target startup_runtime }
     }
     if ($LASTEXITCODE -ne 0) { throw "tester_run: the build failed (cmake exit $LASTEXITCODE)" }
     $built = Get-BuildRevision
@@ -128,12 +144,12 @@ $cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCach
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
-$cacheTag = (& $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py")).Trim()
+$cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py") } | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
 New-Item -ItemType Directory -Force $cache | Out-Null
-$cacheAtStart = (& $python -B $pack cache-stats $cache) -split " "
-$script = (& $python -B $pack input-preset $InputMode $Seconds)
+$cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
@@ -142,13 +158,15 @@ $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
 $physicalBytes = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-if ($MemoryGiB -le 0) { $MemoryGiB = [int](& $python -B $pack memory-gib $physicalBytes) }
+if ($MemoryGiB -le 0) { $MemoryGiB = [int](Invoke-Native { & $python -B $pack memory-gib $physicalBytes }) }
 Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $MemoryGiB, ($physicalBytes / 1GB))
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $StartupBelow40 = -not $NoStartupBelow40
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" } else { Remove-Item Env:X2W_XMEM_STARTUP_BELOW_40 -ErrorAction SilentlyContinue }
+$LowAddresses = -not $NoLowAddresses
+if ($LowAddresses) { $env:X2W_LOW_ADDRESSES = "1" } else { Remove-Item Env:X2W_LOW_ADDRESSES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir
     MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
@@ -184,14 +202,14 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; startup_below_40 = [bool]$StartupBelow40; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
-$manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$stamp.json"
+$manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 
 $zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
-$parts = @(& $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB)
+$parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
 foreach ($line in $parts) {
@@ -199,6 +217,27 @@ foreach ($line in $parts) {
     Write-Host ("Send this file: {0} ({1:N1} MB)" -f $path, ([double]$bytes / 1MB))
 }
 Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
-Write-Host (& $python -B $pack first-poll $logDir)
+Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
 if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send all of them." }
+
+# F1: the report is packed, now finish what the run left. One translator pass over the cache (no --watch) until nothing is
+# pending or -FinishTranslateSeconds is over, so the next run starts with every request already translated.
+if ($FinishTranslateSeconds -gt 0) {
+    $before = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0])
+    $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
+    $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
+    Write-Host ("tester_run: finishing the translation: {0} request(s) pending, one pass, at most {1} s (the report above is already packed; do not close this window)" -f $pendingBefore, $FinishTranslateSeconds)
+    $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
+        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
+    $null = $translator.Handle    # keeps the exit code readable after the process ends
+    $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
+    if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
+    $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0])
+    $note = if ($capped) { ", stopped at the cap" } elseif ($translator.ExitCode -ne 0) { ", translator exit code $($translator.ExitCode) (see $finishErr)" } else { "" }
+    Write-Host ("tester_run: finish translation done in {0:N0} s: pending before {1}, after {2}; ok {3}, refused {4} in total ({5} new){6}" -f `
+        $finishClock.Elapsed.TotalSeconds, $pendingBefore, $pendingAfter, [int]$after[0], [int]$after[2], ([int]$after[2] - [int]$before[2]), $note)
+}
 exit $exitCode

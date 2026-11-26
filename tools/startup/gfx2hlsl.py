@@ -3127,11 +3127,38 @@ class Stage:
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
                     named = [unread[word] for word in words if unread[word] >= 0]
+                    first = min(named) if named else None
+                    word_of = next((w for w in words if unread[w] == first), None)
                     reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
-                        ': read by %s after the join' % self.ins[min(named)][2] if named else '')
+                        ': read by %s after the join' % self.ins[first][2] if named else '')
+                    if named:
+                        reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def execz_read_cause(self, j, word, b, t, effects, into):
+        """Why the read at instruction j of `word` after the join t of an execz block is not proven (execz_live_read),
+        as a short phrase for the refusal text: the condition that failed first, in the order the proof checks them."""
+        name, asm = self.ins[j][2:]
+        if not exec_absorbs(name, asm, word):
+            lanes = mask_lanes(name, asm)
+            if not lanes:
+                return 'cause: a data read or a copy, not a lane-mask operation'
+            if lanes[0] not in ('and', 'nand', 'orn2'):
+                return 'cause: lane-mask operation %s, not and/nand/orn2 with exec' % lanes[0]
+            if high_half_of_b32(lanes, word):
+                return 'cause: a 32-bit read of the high half'
+            return 'cause: the word is not paired with the exec word of the same lanes'
+        if j < t:
+            return 'cause: read before the join, reached again through a loop'
+        if not all(b <= k < t for k in into.get(t, ())):
+            return 'cause: another path enters the join'
+        if any(effects[k][2] & EXEC_KEYS for k in range(t, j)):
+            return 'cause: exec is written between the join and the read (restored or changed)'
+        if any(k in into for k in range(t + 1, j + 1)):
+            return 'cause: a branch target (loop or join) lies between the join and the read'
+        return 'cause: other'
 
     def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
@@ -5036,17 +5063,21 @@ class Stage:
                 src_neg_abs.append((neg, absolute, base_tok))
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
-        if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
-        if not getattr(self, 'wqm_exec', False):
-            raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
-                              'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
-        self.note_quad_flow(base)
-        self.needs_sm6 = True
+        compute = getattr(self, 'kind', None) == 'cs'
+        if compute:
+            self.compute_quad_gate(base)
+        else:
+            if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
+                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+            if not getattr(self, 'wqm_exec', False):
+                raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
+                                  'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+            self.note_quad_flow(base)
+            self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
             neg0, abs0, base0 = src_neg_abs[0]
-            swapped = '%s(%s)' % (intrinsic, self.u(base0))
+            swapped = self.quad_source(intrinsic, self.u(base0), compute)
             first = 'F(%s)' % swapped
             if abs0:
                 first = 'abs(%s)' % first
@@ -5054,10 +5085,37 @@ class Stage:
                 first = '(-%s)' % first
             args = [first] + [self.f(o) for o in ops[2:1 + arity]]
         else:
-            swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+            swapped = self.quad_source(intrinsic, self.u(ops[1]), compute)
             args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+        if compute:
+            self.emit('GroupMemoryBarrierWithGroupSync();')  # the next exchange may rewrite the array
+
+    def compute_quad_gate(self, base):
+        """A DPP quad swap in a compute program is exchanged through groupshared memory (no quad intrinsic: SM 6 leaves the
+        quad of a compute thread to the implementation). Lane i of an aligned group of four reads lane perm[i] (RDNA 2 ISA,
+        DPP16 quad_perm); a wave holds 32 or 64 consecutive threads in x-major order, so lane bits 1:0 are the bits 1:0
+        of the flat thread index whatever the wave size. Taken only when every thread reaches the exchange with exec equal
+        to the entry mask (straight-line code, no exec write: the barrier is then uniform and each source lane is active)
+        and the group is made of whole quads."""
+        x, y, z = self.pipe.group
+        if x * y * z % 4:
+            raise Unsupported('%s_dpp in a compute program requires a group of whole quads (a multiple of 4 threads)' % base)
+        if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
+            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
+
+    def quad_source(self, intrinsic, source, compute):
+        """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
+        a groupshared slot, wait for the group, and read the slot of the lane the swap names."""
+        if not compute:
+            return '%s(%s)' % (intrinsic, source)
+        x, y, _z = self.pipe.group
+        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        self.uses_quad_shared = True
+        self.emit('x2w_quad[%s] = %s;' % (flat, source))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3}[intrinsic])
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
@@ -7614,9 +7672,15 @@ class Stage:
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
-        array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
-        if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
+        # Compute also stores to 1D, 2D-array and 3D images: the address is x; x, y, layer; x, y, z, and the bound
+        # view is a RWTexture1D, RWTexture2DArray or RWTexture3D (a 3D view keeps the caller's W range, as an
+        # array view keeps its slices). Pixel stages store to 2D only.
+        shapes = {'SQ_RSRC_IMG_2D': (2, 'tex2d', 'x and y'), 'SQ_RSRC_IMG_2D_ARRAY': (3, 'tex2da', 'x, y and layer'),
+                  'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z')}
+        if dims[0] not in shapes or (dims[0] != 'SQ_RSRC_IMG_2D' and self.kind != 'cs') or \
+                (d16 and dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D')):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
+        address, image_kind, address_text = shapes[dims[0]]
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -7633,10 +7697,8 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        address = 3 if array else 2
         if len(cs) != address:
-            raise Unsupported('%s with %d address registers: %s expected'
-                              % (name, len(cs), 'x, y and layer' if array else 'x and y'))
+            raise Unsupported('%s with %d address registers: %s expected' % (name, len(cs), address_text))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -7650,8 +7712,8 @@ class Stage:
             value = 'float4(%s)' % ', '.join(rgba)
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, 'tex2da' if array else 'tex2d')
-        index = 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
+        image = self.pipe.uav(key, image_kind)
+        index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
@@ -7700,6 +7762,53 @@ class Stage:
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
+    def constant_vgpr_word(self, n, name):
+        """Value of VGPR v<n> when its only writer is one `v_mov_b32 v<n>, <literal>` of a straight-line program."""
+        if getattr(self, 'has_branches', True):
+            raise Unsupported('%s needs straight-line code to prove its offset register' % name)
+        value = None
+        for _, _, op, asm in getattr(self, 'ins', ()):
+            ops = parse(asm)[1]
+            base = re.sub(r'_e(32|64)$', '', op)
+            if base.startswith(('exp', 'buffer_store', 'ds_write', 'v_cmpx')) or not ops:
+                continue
+            if any(r and r[0] == 'v' and r[1] <= n <= r[2] for r in map(reg_range, destinations(op, ops))):
+                if value is not None or base != 'v_mov_b32' or len(ops) != 2:
+                    raise Unsupported('%s offset register v%d is not one literal move' % (name, n))
+                try:
+                    value = int(ops[1], 0)
+                except ValueError:
+                    raise Unsupported('%s offset register v%d is not an integer literal' % (name, n)) from None
+        if value is None:
+            raise Unsupported('%s offset register v%d is never written' % (name, n))
+        return value & 0xffffffff
+
+    def op_image_gather4_lz_o(self, ops, mods):
+        """image_gather4_lz_o: image_gather4_lz with a texel offset packed in the first address register.
+
+        RDNA 2 MIMG address order for the _o forms is offset, then the coordinates; the offset register holds
+        signed 6-bit X in bits 5:0 and Y in bits 13:8 (LLVM AMDGPU MIMG address layout). HLSL's Gather takes
+        the offset as a literal in -8..7, so the register must be one literal move and both fields in range.
+        """
+        name = 'image_gather4_lz_o'
+        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
+            name, ops, mods, 3, 'three contiguous address registers', mip_preclamp=True)
+        packed = self.constant_vgpr_word(addr[1], name)
+        if packed & ~0x3f3f:
+            raise Unsupported('%s offset %#x sets bits outside the X and Y fields' % (name, packed))
+        fields = []
+        for shift in (0, 8):
+            field = (packed >> shift) & 0x3f
+            field -= 64 if field & 0x20 else 0
+            if not -8 <= field <= 7:
+                raise Unsupported('%s offset %d is outside the HLSL gather range -8..7' % (name, field))
+            fields.append(field)
+        smp = self.pipe.sampler(tuple(words))
+        u, v = (self.f('v%d' % i) for i in (addr[1] + 1, addr[1] + 2))
+        self.emit('t = %s.Gather%s(%s, float2(%s, %s), int2(%d, %d));' % (tex, channel_name, smp, u, v, *fields))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
@@ -10552,7 +10661,7 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -10979,6 +11088,8 @@ class ComputePipeline(Pipeline):
         uses_sync = getattr(s, 'uses_wavesync', False)
         if uses_sync:
             shared += self.wavesync.declarations()
+        if getattr(s, 'uses_quad_shared', False):
+            shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + (['    ' + line for line in self.wavesync.prologue()] if uses_sync else [])
