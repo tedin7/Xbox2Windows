@@ -32,9 +32,12 @@ struct PageKeyHash {
 inline PageKey page_key(const unsigned char* page)
 {
     std::uint64_t a = 1469598103934665603ull, b = 0x84222325cbf29ce4ull;
-    for (std::size_t i = 0; i < page_bytes; ++i) {
-        a = (a ^ page[i]) * 1099511628211ull;
-        b = (b + page[i] + 1) * 0xff51afd7ed558ccdull;
+    for (std::size_t i = 0; i < page_bytes; i += 8) {
+        std::uint64_t word;
+        std::memcpy(&word, page + i, 8);
+        a = (a ^ word) * 1099511628211ull;
+        a ^= a >> 32;
+        b = (b + word + 1) * 0xff51afd7ed558ccdull;
         b ^= b >> 29;
     }
     return {a, b};
@@ -54,8 +57,8 @@ struct PageStats {
 };
 
 struct MapHeader {
-    std::uint64_t address, bytes;
-    std::uint32_t seq, runs;
+    std::uint64_t address, bytes, seq;  // seq: the recorder's call sequence number when the range was read
+    std::uint32_t runs, pad;
 };
 struct RunHeader {
     std::uint32_t first, pages, kind;  // kind 0: keys follow; 1: zero pages
@@ -68,7 +71,7 @@ public:
 
     // address and bytes must be multiples of the page size (title ranges come from VirtualAlloc). False: nothing written.
     // PAGE chunks for content never written before go to the sink first, then one MAP chunk with the changed runs.
-    bool capture(std::uint64_t address, const void* data, std::size_t bytes, std::uint32_t seq)
+    bool capture(std::uint64_t address, const void* data, std::size_t bytes, std::uint64_t seq)
     {
         if (!bytes || address % page_bytes || bytes % page_bytes) return false;
         const auto* base = static_cast<const unsigned char*>(data);
@@ -118,7 +121,8 @@ public:
             }
         }
         close_run();
-        MapHeader header{address, bytes, seq, run_count};
+        if (!run_count) return true;  // nothing changed since the last capture of these pages: no chunk
+        MapHeader header{address, bytes, seq, run_count, 0};
         sink_("MAP ", &header, sizeof(header), runs.data(), runs.size());
         return true;
     }

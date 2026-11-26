@@ -12,6 +12,8 @@
 // File: the capture chunk framing (tag, header bytes, data bytes). XREC (version, timer frequency), CALL, ARGM (argument
 // memory: seq, arg, address, bytes, blob hash), BLOB (hash, bytes; once per content), OUTP (seq, arg, the pointer an
 // output argument holds after the call), PRES (seq, present), XEND (calls, blobs, bytes, dropped).
+#include "startup_stubs/replay_pages.h"
+
 namespace replay_record {
 
 constexpr int wide_slots = 256;   // device and command-list slots wrapped
