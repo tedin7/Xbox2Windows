@@ -22,6 +22,11 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | `-Input menus2` (waits for a new picture after each confirm) | fork branch `c24-menus2`, gate PASS | `43a382c7b` |
 | fix for #2773 (lazy textures), gate PASS | fork branch `fix-2773` | `5ad90a328` |
 | slot 70 texture_unavailable causes (row 3), gate PASS | fork branch `c23-slot70-texture-causes` | `d814a2e9e` |
+| window capture of flip-model windows through PrintWindow (black BitBlt) | fork branch `c22-capture-flip` | `1dd66de57` |
+| refused draws counted as "not drawn" with reasons | fork branch `c22-notdrawn` | `a3d15d7bc` |
+| commit counters in the heartbeat | fork branch `x2w-commit-counters` | `3c7b2a56f` |
+| watch translator serves the newest requests first | fork branch `x2w-watch-newest` | `e7b617bcb` |
+| residency slice 1 | fork branch `f4-residency-s1` | `df147080e` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
@@ -68,3 +73,12 @@ send every part (mail limit). The zip holds every file the run wrote in its log 
 finished, threads, files, trap.log, translate, translate_err, the window captures, the debugger summary) and
 `manifest.json` (commit, build commit, dirty flag, seconds, input script, `X2W_*` variables, graphics card and driver,
 Windows build, wall time). It holds no game files, no shader cache and no memory dumps.
+
+## Waiting for a fix on their own branch (conflict with this branch)
+
+| Branch | Head | Conflict |
+|---|---|---|
+| `c22-srv-shapes` | `14a63df5e` | `tests/startup_memory_srv_census_check.cpp`: expected census line differs from the slot 70 causes (`c23-slot70-texture-causes`) |
+| `c15-sysmem-fallback` | `f45c6849d` | `d3d12_xs_device.cpp`, `triage_run.py`, `tester_run.ps1` and their tests |
+| `c21-g3-bufunavail` | `b9a06c4b5` | `d3d12_memory_srv.inl` (`unplaced_memory_buffer` signature with #2782) |
+| `c7-s4-dropmips` | `8a95e07f9` | `d3d12_xs_device.cpp`: the lazy SRV code moved into `create_lazy_srv` (fix-2773); the drop-levels view handling has to move with it |
