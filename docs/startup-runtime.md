@@ -1886,10 +1886,10 @@ Unset, no slot is wrapped and nothing changes.
 
 Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
 the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
-to its thread's own buffer: the call (sequence, thread, kind, slot, object, seven argument words, return value, time,
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
 present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
 are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
-shader's is), and the wrapper an argument's memory holds after the call (a creation's
+shader's is; argument words 8 to 11, mostly the caller's stack, get 256 bytes each and are not followed), and the wrapper an argument's memory holds after the call (a creation's
 result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
 written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
 closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
@@ -1902,7 +1902,8 @@ Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the n
 and anything past 512 MiB in total are left out and counted in the log).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
-passed first, the object second), its memory after the call is `ARGM` argument 7.
+passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven
+argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
 Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
@@ -1920,7 +1921,8 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 recording, 3 a page range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
-Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
+Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack
+word past the slot's own arguments may point at the same variable), argument memory is copied into the replayer's
 memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
 heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
 completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
