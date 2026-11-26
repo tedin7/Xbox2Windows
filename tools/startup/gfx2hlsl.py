@@ -4296,6 +4296,24 @@ class Stage:
         whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
         return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
 
+    def quad_exec_cause(self):
+        """Why a pixel DPP quad read meets an EXEC that is not the entry mask, for the refusal text (the refusal itself is
+        unchanged): the stage when it is not a pixel stage, or the last instruction before the read that can write EXEC
+        (writes_exec), so a tester report names the shape to lift. Empty when neither applies."""
+        kind = getattr(self, 'kind', None)
+        if kind != 'ps':
+            return ': %s stage' % (kind or 'unknown')
+        if getattr(self, 'exec_known', False):
+            return ''
+        here = getattr(self, 'pc', None)
+        writer = None
+        for off, _n, name, asm in getattr(self, 'ins', ()):
+            if here is not None and off >= here:
+                break
+            if writes_exec(name, parse(asm)[1]):
+                writer = (off, name)
+        return ': EXEC written at +0x%x by %s' % writer if writer else ': EXEC not known at entry'
+
     def note_quad_flow(self, base):
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
             self.quad_flow_reads.append((self.pc, base))
@@ -4834,7 +4852,8 @@ class Stage:
         # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
         if (not getattr(self, 'exec_known', False) or
                 (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
-            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                              % (base, self.quad_exec_cause()))
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -4923,7 +4942,7 @@ class Stage:
             self.compute_quad_gate(base)
         else:
             if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
             if not getattr(self, 'wqm_exec', False):
                 raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                                   'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
