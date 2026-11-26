@@ -266,6 +266,9 @@ check('inf * 0 is NaN in both lanes', M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0
       and M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] >> 16))
 # A literal source read through its low half in both lanes (what the title's clamp uses: 0x7bef is just under the binary16 maximum).
 PKLIT = [
+    ('v_pk_max_f16 v3, 0xc900, v0 op_sel_hi:[0,1]', [0xbc00 | 0x4000 << 16], 0x4000bc00),
+    ('v_pk_add_f16 v3, 1.0, v0 op_sel_hi:[0,1]', [ONE | TWO << 16], f2h(2.0) | f2h(3.0) << 16),
+    ('v_pk_mul_f16 v3, -2.0, v0 op_sel_hi:[0,1]', [ONE | THREE << 16], f2h(-2.0) | f2h(-6.0) << 16),
     ('v_pk_min_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x7c00 | 0x4000 << 16], 0x40007bef),
     ('v_pk_min_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x3c00 | 0xfc00 << 16], 0xfc003c00),
     ('v_pk_max_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x3c00 | 0xfc00 << 16], 0x7bef7bef),
@@ -275,7 +278,7 @@ for asm, regs, expected in PKLIT:
     got = run(asm, regs + [0] * (4 - len(regs)))[1]
     check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
 for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg_hi:[0,1]', 'v_pk_add_f16 v3, v0, v1 clamp',
-            'v_pk_mul_f16 v3, 2.0, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 0x7bef', 'v_pk_min_f16 v3, v0, 0x7bef op_sel:[0,1] op_sel_hi:[1,0]', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
+            'v_pk_mul_f16 v3, 2.0, v1', 'v_pk_mul_f16 v3, 2.0, v1 op_sel:[1,0] op_sel_hi:[0,1]', 'v_pk_add_f16 v3, 3, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 0x7bef', 'v_pk_min_f16 v3, v0, 0x7bef op_sel:[0,1] op_sel_hi:[1,0]', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
             'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
             'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
     try:
