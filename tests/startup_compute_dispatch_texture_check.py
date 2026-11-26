@@ -26,7 +26,7 @@ changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refus
 Mip chain (WARP): two dispatches reduce an 8x8 RGBA32_FLOAT texture to its 4x4 and 2x2 mips on one command list.
 The CPU reference checks every channel. The disabled and overlapping-view controls preserve both mips. The
 missing-UAV-transition and full-SRV mutants must produce a debug-layer error or a readback mismatch.
-Exit 77 when the adapter or the mip-chain debug layer is not available.
+Exit 77 when the adapter is not available. The debug layer is optional (extra validation when present).
 """
 import os
 from pathlib import Path
@@ -317,9 +317,8 @@ def mip_chain(directory, consumer, dxc, env):
     layout = '<%df' % len(expected)
     mode = 'texture-mip-chain'
     got, result = run(directory, consumer, env, mode, layout)
-    if not any('0x00000000 enabled' in line for line in lines(result, 'x2w-d3d12 debug layer: ')):
-        print('mip chain: skipped, D3D12 debug layer unavailable')
-        sys.exit(77)
+    # The debug layer only adds validation: without it (no Graphics Tools) the readback checks still run.
+    layer = any('0x00000000 enabled' in line for line in lines(result, 'x2w-d3d12 debug layer: '))
     assert got == untouched and not debug_errors(result), result.stderr[-3000:]
     assert len(lines(result, 'refused: no translation')) == 2, result.stderr[-3000:]
     key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
@@ -352,6 +351,10 @@ def mip_chain(directory, consumer, dxc, env):
                           mode, layout, expect_gpu_error=True)
         check_recorded(result)
         errors = debug_errors(result)
+        if mutant == 'missing-uav' and not layer and got == expected:
+            # A missing state transition changes no WARP output: only the debug layer sees it.
+            print('mip chain: missing-uav needs the debug layer to be seen; not checked here')
+            continue
         assert errors or got != expected, f'{mutant} survived the WARP and debug-layer checks'
         print(f'mip chain: {mutant} detected by ' + ('debug layer' if errors else 'readback mismatch'))
 
