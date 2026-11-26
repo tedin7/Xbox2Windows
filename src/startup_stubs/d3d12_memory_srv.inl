@@ -607,8 +607,11 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = address_texture_bytes(device, desc);
+    // A console layout is read only up to its last addressed element: a small texture in a big block need not have the
+    // block's padding mapped.
+    const auto read_bytes = console_layout_srv(desc) ? x2w_startup::gfx10::Layout(desc).used_bytes() : bytes;
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > max_published_texture_bytes || !texture_range_readable(address, bytes)) return nullptr;
+    if (bytes > max_published_texture_bytes || !texture_range_readable(address, read_bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {
