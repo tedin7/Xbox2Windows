@@ -2282,6 +2282,18 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
+- **Wave reductions.** A whole wave32 reduction chain in a straight-line pixel stage (`s_or_saveexec_b32 sS, -1`,
+  the identity fill `v_cndmask_b32_e64 vT, <identity>, vX, sS`, four `_dpp` steps `quad_perm:[1,0,3,2]`,
+  `quad_perm:[2,3,0,1]`, `row_half_mirror`, `row_mirror`, `v_permlanex16_b32 vP, vT, 0, 0`, the combine,
+  `s_mov_b32 exec_lo, sS` and `v_readlane_b32 sD, vT, 31`) of `v_or_b32`, `v_min_u32` or `v_max_u32` is recognised
+  as one `WaveActiveBitOr`, `WaveActiveMin` or `WaveActiveMax` over the active lanes of the desktop wave (a correct
+  program cannot depend on how pixels are packed into waves). The min chain may read its lane later, as the #2125
+  censuses show: after its restore, one `v_cndmask_b32_sdwa` (lowered as usual), the saveexec of a max chain, then the
+  readlane, carried by that max chain before its fill. The entry EXEC must still hold, without `s_wqm`, so helper
+  lanes are left out on both sides. Other shapes that start like a chain are refused with their reason
+  ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

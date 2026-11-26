@@ -4524,6 +4524,8 @@ class Stage:
         llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
         The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
         The check runs after the form's own refusals, so those keep their messages."""
+        if self.wave_reduction(base, ops):
+            return None
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
@@ -9526,6 +9528,239 @@ class Stage:
                 lines.append('    int ai = 0;')
         lines += ['    s%d = %s;' % kv for kv in sorted(getattr(self, 'materialized', {}).items())]
         return lines
+
+    # ---- whole-wave reductions (#2125 item D) --------------------------------------------------------------------------
+    # A wave32 reduction reads lanes outside the pixel quad, so its instructions cannot be lowered one at a time. The
+    # whole chain is recognised instead, in the order the #2125 censuses report for every wave32 chain (LLVM 15
+    # spelling; vT, vX, vP, sS, sD any registers, OP one operation, ID its identity):
+    #   s_or_saveexec_b32 sS, -1                            save EXEC, enable all 32 lanes
+    #   v_cndmask_b32_e64 vT, ID, vX, sS                    the identity fill: vX where sS has the lane, ID elsewhere
+    #   OP_dpp vT, vT, vT quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf   lane pairs
+    #   OP_dpp vT, vT, vT quad_perm:[2,3,0,1] ...           quads
+    #   OP_dpp vT, vT, vT row_half_mirror ...               lane i with lane 7 - i: eight lanes
+    #   OP_dpp vT, vT, vT row_mirror ...                    lane i with lane 15 - i: the row of sixteen
+    #   v_permlanex16_b32 vP, vT, 0, 0                      lane 0 of the other row
+    #   OP vT, vP, vT                                       every lane now holds the whole wave
+    #   s_mov_b32 exec_lo, sS
+    #   v_readlane_b32 sD, vT, 31
+    # (RDNA 2 ISA: DPP16 quad_perm, row_half_mirror and row_mirror, V_PERMLANEX16_B32, V_READLANE_B32.) With every
+    # lane enabled no DPP or permlane source is disabled, so bound_ctrl and fi have nothing to decide. sD is OP over
+    # the lanes active before the chain, the others adding the identity. The census also shows a min chain whose
+    # readlane comes later: after its restore, one v_cndmask_b32_sdwa, then the s_or_saveexec_b32 sS2, -1 of a max
+    # chain, and only then v_readlane_b32 sD, vT, 31; the max chain takes that readlane between its saveexec and its
+    # fill. Readlane ignores EXEC, so the min result is still the one in vT as long as nothing in between writes vT
+    # (checked); the v_cndmask_b32_sdwa keeps its own handler, under the restored EXEC. The console packs pixels into
+    # waves in its own way, so a correct program cannot depend on which pixels share a wave: the chain becomes one
+    # WaveActiveBitOr / WaveActiveMin / WaveActiveMax of vX over the active lanes of the desktop wave, which leaves
+    # helper lanes out. Accepted only in a straight-line pixel stage whose EXEC is the entry mask, not widened by
+    # s_wqm (helper lanes would then be counted on the console). Every other shape that starts like a chain is refused
+    # with its reason: wave64, another fill, a wrong identity, missing or reordered steps, other or mixed operations,
+    # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
+    # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
+    WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
+                   'v_max_u32': ('WaveActiveMax({0})', 0)}
+    WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
+
+    @staticmethod
+    def wave_reduce_cndmask_fill(stretch, ss):
+        """The identity fill of the census: exactly v_cndmask_b32_e64 vT, 0 | -1, vX, sS (the input where the saved
+        mask has the lane, the inline constant elsewhere). (vT, 'vX', identity), or None for any other stretch."""
+        if len(stretch) != 1:
+            return None
+        base, ops, mods, _text = stretch[0]
+        if base != 'v_cndmask_b32' or mods or len(ops) != 4 or ops[3] != 's%d' % ss or ops[1] not in ('0', '-1') or \
+                not re.fullmatch(r'v\d+', ops[0]) or not re.fullmatch(r'v\d+', ops[2]) or ops[0] == ops[2]:
+            return None
+        return int(ops[0][1:]), ops[2], int(ops[1]) & 0xffffffff
+
+    # The identity fill, between s_or_saveexec_b32 sS, -1 and the first quad_perm step: each entry is a function
+    # (stretch, sS) -> (vT, input operand, identity) for a form it proves, or None; stretch is a list of
+    # (base, operands, modifiers, text). The identity itself is checked against OP afterwards.
+    WAVE_REDUCE_FILLS = (wave_reduce_cndmask_fill,)
+    # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
+    WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
+
+    def wave_reduction(self, base, ops):
+        """True when this instruction belongs to a recognised wave reduction (its result is lowered at the restore of
+        EXEC, its readlane at the readlane). False for anything that does not start like one; Unsupported for a chain of
+        the wrong shape."""
+        plan, pc = getattr(self, 'reduce_plan', None), getattr(self, 'pc', None)
+        if plan and pc in plan:
+            action = plan[pc]
+            if action:
+                action()
+            return True
+        if pc is None or not isinstance(getattr(self, 'ins', None), list) or not (
+                base in ('s_or_saveexec_b32', 's_or_saveexec_b64') and len(ops) == 2 and ops[1] == '-1'):
+            return False
+        index = next((i for i, item in enumerate(self.ins) if item[0] == pc), None)
+        if index is None:
+            return False
+        steps = [parse(asm) for _off, _n, _name, asm in self.ins[index:index + 17]]
+        if not any(name == 'v_permlanex16_b32' or name.endswith('_dpp') and ('row_mirror' in mods or
+                                                                             'row_half_mirror' in mods)
+                   for name, _ops, mods in steps[1:]):
+            return False   # not a reduction: the instruction keeps its own handler
+        if base.endswith('_b64'):
+            raise Unsupported('wave reduction in the wave64 form (%s %s): only the wave32 chain is lowered'
+                              % (base, ', '.join(ops)))
+        ss = reg_range(ops[0])
+        if not ss or ss[0] != 's' or ss[1] != ss[2]:
+            raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
+        ss = ss[1]
+        first = next((k for k, (name, _o, m) in enumerate(steps)
+                      if name.endswith('_dpp') and set(m) & set(self.WAVE_REDUCE_STEPS)), len(steps))
+        items = self.ins[index:index + first + 10]
+
+        def at(k, what):
+            if k >= len(items):
+                raise Unsupported('wave reduction: the chain ends before %s' % what)
+            name, o, m = parse(items[k][3])
+            return re.sub(r'_e(32|64)$', '', name), o, m, items[k][3]
+
+        stretch = [at(k, 'the first quad_perm step') for k in range(1, first)]
+        pending = getattr(self, 'reduce_pending', {})
+        taken = None   # the later readlane of the min chain just before, which this chain carries before its fill
+        if stretch and stretch[0][0] == 'v_readlane_b32' and items[1][0] in pending:
+            taken = pending[items[1][0]]
+            stretch = stretch[1:]
+        fill = next((found for found in (form(stretch, ss) for form in self.WAVE_REDUCE_FILLS) if found), None)
+        if fill is None:
+            raise Unsupported('wave reduction: the identity fill after s_or_saveexec_b32 s%d, -1 (%s) is not a known '
+                              'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
+        vt, source, identity = fill
+        op = None
+        for k, want in enumerate(self.WAVE_REDUCE_STEPS):
+            b, o, m, text = at(first + k, want)
+            if not b.endswith('_dpp'):
+                raise Unsupported('wave reduction: missing step %s (found %s)' % (want, text))
+            controls = [x for x in m if not x.startswith(('row_mask:', 'bank_mask:', 'bound_ctrl:', 'fi:'))]
+            if controls != [want]:
+                order = ' (steps out of order or missing)' if controls and controls[0] in self.WAVE_REDUCE_STEPS else ''
+                raise Unsupported('wave reduction: %s in place of %s%s' % (' '.join(controls) or 'no DPP control', want,
+                                                                         order))
+            if 'row_mask:0xf' not in m or 'bank_mask:0xf' not in m:
+                raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
+            this = b[:-len('_dpp')]
+            if this not in self.WAVE_REDUCE:
+                raise Unsupported('wave reduction of %s: only v_or_b32, v_min_u32 and v_max_u32 are lowered' % this)
+            if op not in (None, this):
+                raise Unsupported('wave reduction mixes %s and %s' % (op, this))
+            op = this
+            if o != ['v%d' % vt] * 3:
+                raise Unsupported('wave reduction: %s does not combine v%d with itself' % (text, vt))
+        if identity != self.WAVE_REDUCE[op][1]:
+            raise Unsupported('wave reduction of %s: the inactive lanes get 0x%08x, the identity is 0x%08x'
+                              % (op, identity, self.WAVE_REDUCE[op][1]))
+        if taken is not None and op != 'v_max_u32':
+            raise Unsupported('wave reduction: a %s chain carries the later readlane of the v_min_u32 chain before it; '
+                              'only a v_max_u32 chain is lowered there' % op)
+        b, o, m, text = at(first + 4, 'v_permlanex16_b32')
+        if b != 'v_permlanex16_b32' or len(o) != 4 or o[1] != 'v%d' % vt or not re.fullmatch(r'v\d+', o[0]) or \
+                o[0] == o[1]:
+            raise Unsupported('wave reduction: %s in place of v_permlanex16_b32 vN, v%d, 0, 0' % (text, vt))
+        if m or o[2:] != ['0', '0']:
+            raise Unsupported('wave reduction: %s: only the lane selects 0, 0 without modifiers are lowered' % text)
+        vp = int(o[0][1:])
+        b, o, m, text = at(first + 5, 'the two rows are combined')
+        if b != op or m or len(o) != 3 or o[0] != 'v%d' % vt or sorted(o[1:]) != sorted(['v%d' % vt, 'v%d' % vp]):
+            mixed = b in self.WAVE_REDUCE and b != op
+            raise Unsupported('wave reduction %s' % ('mixes %s and %s' % (op, b) if mixed else
+                                                     ': %s in place of %s v%d, v%d, v%d' % (text, op, vt, vt, vp)))
+        b, o, m, text = at(first + 6, 'EXEC is restored')
+        if b != 's_mov_b32' or o != ['exec_lo', 's%d' % ss] or m:
+            raise Unsupported('wave reduction: %s in place of s_mov_b32 exec_lo, s%d (EXEC restored before the readlane)'
+                              % (text, ss))
+        read = first + 7   # the readlane: right after the restore, or later in the min chain
+        b, o, m, text = at(read, 'v_readlane_b32')
+        later = b == 'v_cndmask_b32_sdwa'
+        if later:
+            # The census's min form: restore, one v_cndmask_b32_sdwa (its own handler, under the restored EXEC), the
+            # s_or_saveexec_b32 sS2, -1 of the max chain that follows, then this chain's readlane. Readlane ignores
+            # EXEC; vT must still hold the result, and sS2 must survive the readlane for the max chain's fill and
+            # restore.
+            if op != 'v_min_u32':
+                raise Unsupported('wave reduction of %s: %s after the restore in place of v_readlane_b32 sN, v%d, 31 '
+                                  '(only the v_min_u32 chain reads its lane later)' % (op, text, vt))
+            if o and reg_range(o[0]) and reg_range(o[0])[0] == 'v' and \
+                    reg_range(o[0])[1] <= vt <= reg_range(o[0])[2]:
+                raise Unsupported('wave reduction: %s rewrites v%d before the readlane of the v_min_u32 chain'
+                                  % (text, vt))
+            b, o, m, text = at(first + 8, 'the s_or_saveexec_b32 of the v_max_u32 chain')
+            nxt = reg_range(o[0]) if b == 's_or_saveexec_b32' and len(o) == 2 and o[1] == '-1' and not m else None
+            if not nxt or nxt[0] != 's' or nxt[1] != nxt[2]:
+                raise Unsupported('wave reduction: %s in place of the s_or_saveexec_b32 sN, -1 of the v_max_u32 chain '
+                                  'before the readlane of the v_min_u32 chain' % text)
+            read = first + 9
+            b, o, m, text = at(read, 'the readlane of the v_min_u32 chain')
+        sd = reg_range(o[0]) if len(o) == 3 else None
+        if b != 'v_readlane_b32' or m or not sd or sd[0] != 's' or sd[1] != sd[2] or sd[1] == ss or \
+                o[1] != 'v%d' % vt:
+            raise Unsupported('wave reduction: %s in place of v_readlane_b32 sN, v%d, 31' % (text, vt))
+        if o[2] != '31':
+            raise Unsupported('wave reduction: %s reads lane %s: only lane 31 is lowered' % (text, o[2]))
+        if later and sd[1] == nxt[1]:
+            raise Unsupported('wave reduction: the readlane of the v_min_u32 chain overwrites s%d, the EXEC saved by '
+                              'the v_max_u32 chain' % sd[1])
+        end = items[read][0]
+        targets = {int(parse(asm)[1][0].split('_')[1], 16) for _off, _n, name, asm in self.ins
+                   if name.startswith('s_cbranch') or name == 's_branch'}
+        inside = sorted(t for t in targets if pc < t <= end)
+        if inside:
+            raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
+        if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
+            raise Unsupported('wave reduction outside a pixel stage')
+        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+            raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
+        if not getattr(self, 'exec_known', False):
+            raise Unsupported('wave reduction: EXEC is not the entry mask')
+        if getattr(self, 'wqm_exec', False):
+            raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
+        for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
+            _name, o, _m = parse(asm)
+            hits = [i for i, tok in enumerate(o) if any(
+                int(r.group(3) or r.group(1)) <= vp <= int(r.group(3) or r.group(2))
+                for r in re.finditer(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', tok))]
+            if not hits:
+                continue
+            short = re.sub(r'_e(32|64)$', '', name)
+            if hits == [0] and short.startswith('v_') and not self.WAVE_REDUCE_KEEPS.match(short):
+                break
+            raise Unsupported('wave reduction: v%d (the other row from v_permlanex16_b32) is read after the chain by %s'
+                              % (vp, asm))
+        # Nothing of the chain is emitted until the restore, so every register read there still holds its value from
+        # the fill (the only instruction lowered in between is the min chain's readlane carried here, an SGPR write
+        # that is not this chain's saved EXEC). The readlane then copies vT, which nothing has rewritten since.
+        plan = self.reduce_plan = getattr(self, 'reduce_plan', {})
+        if taken is not None:
+            taken[0] = True
+        for k in range(1, read + 1):
+            if k in (first + 7, first + 8) and later:
+                continue   # the v_cndmask_b32_sdwa keeps its handler; the max chain's saveexec starts that chain
+            plan.setdefault(items[k][0], None)
+        plan[items[first + 6][0]] = lambda: self.lower_wave_reduction(op, vt, vp, ss, source)
+        claim = [False]
+        if later:
+            self.reduce_pending = {**pending, items[read][0]: claim}
+        plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
+        return True
+
+    def lower_wave_reduction(self, op, vt, vp, ss, source):
+        value = self.WAVE_REDUCE[op][0].format(self.u(source))
+        self.needs_sm6 = True
+        self.set_s(ss, 'exec')
+        self.sym[ss] = ('execcopy',)
+        self.masks.add(ss)
+        self.set_v(vt, value)
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(vp)
+        self.set_scc('true')   # s_or_saveexec_b32 set SCC from the all-lanes EXEC
+
+    def lower_wave_readlane(self, sd, vt, claim):
+        if claim is not None and not claim[0]:
+            raise Unsupported('wave reduction: the later readlane of the v_min_u32 chain is not carried by a v_max_u32 '
+                              'chain')
+        self.set_s(sd, self.u('v%d' % vt), uniform=False)
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
