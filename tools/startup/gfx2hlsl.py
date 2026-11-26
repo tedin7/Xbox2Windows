@@ -4461,22 +4461,23 @@ class Stage:
         return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
 
     def quad_exec_cause(self):
-        """Why a pixel DPP quad read meets an EXEC that is not the entry mask, for the refusal text (the refusal itself is
-        unchanged): the stage when it is not a pixel stage, or the last instruction before the read that can write EXEC
-        (writes_exec), so a tester report names the shape to lift. Empty when neither applies."""
+        """Why a DPP quad read meets an EXEC that is not the entry mask or a program that is not straight-line, for the
+        refusal text (the refusal itself is unchanged): the stage when it is neither a pixel nor a compute stage, the last
+        instruction before the read that can write EXEC (writes_exec), or, for a compute program, its first branch, so a
+        tester report names the shape to lift. Empty when none applies."""
         kind = getattr(self, 'kind', None)
-        if kind != 'ps':
+        if kind not in ('ps', 'cs'):
             return ': %s stage' % (kind or 'unknown')
-        if getattr(self, 'exec_known', False):
-            return ''
         here = getattr(self, 'pc', None)
-        writer = None
-        for off, _n, name, asm in getattr(self, 'ins', ()):
-            if here is not None and off >= here:
-                break
-            if writes_exec(name, parse(asm)[1]):
-                writer = (off, name)
-        return ': EXEC written at +0x%x by %s' % writer if writer else ': EXEC not known at entry'
+        before = [(off, name, asm) for off, _n, name, asm in getattr(self, 'ins', ()) if here is None or off < here]
+        if not getattr(self, 'exec_known', False):
+            writer = next(((off, name) for off, name, asm in reversed(before) if writes_exec(name, parse(asm)[1])), None)
+            return ': EXEC written at +0x%x by %s' % writer if writer else ': EXEC not known at entry'
+        if kind == 'cs' and not self.quad_flow_straight():
+            branch = next(((off, name) for off, _n, name, _a in getattr(self, 'ins', ())
+                           if name == 's_branch' or name.startswith('s_cbranch')), None)
+            return ': branch at +0x%x (%s)' % branch if branch else ': not straight-line'
+        return ''
 
     def note_quad_flow(self, base):
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
@@ -5155,7 +5156,7 @@ class Stage:
         if row_ror8 and x * y * z % 16:
             raise Unsupported('%s_dpp row_ror:8 in a compute program requires a group of whole rows (a multiple of 16 threads)' % base)
         if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
+            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC%s' % (base, self.quad_exec_cause()))
 
     def quad_source(self, intrinsic, source, compute):
         """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
