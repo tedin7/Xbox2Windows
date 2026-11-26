@@ -34,7 +34,8 @@ def words_bytes(words):
 
 def record(directory, consumer, env, mode):
     recording = directory / (mode + '.x2wr')
-    got, result = dispatch(directory, consumer, dict(env, X2W_REPLAY_RECORD='all', X2W_REPLAY_RECORD_FILE=str(recording)), mode)
+    got, result = dispatch(directory, consumer, dict(env, X2W_REPLAY_RECORD='all', X2W_REPLAY_RECORD_FILE=str(recording),
+                                  X2W_REPLAY_PAGES_AT_SUBMIT='1', X2W_REPLAY_TITLE_RANGES='1'), mode)
     found = re.search(r'x2w-test dispatch output 0x([0-9a-f]+) (\d+)', result.stdout)
     assert found, 'the consumer did not name its output buffer\n' + result.stdout[-1500:]
     return recording, got, result, '%s:%s' % (found.group(1), found.group(2))
