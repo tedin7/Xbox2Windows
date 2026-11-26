@@ -105,6 +105,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -2773,7 +2774,7 @@ u64 upload_ring_max_bytes()
     return bytes;
 }
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
 {
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
@@ -2791,6 +2792,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
         InterlockedIncrement(&upload_ring_reservations);
         chunks[index].hold(list->own().upload_chunks, index);
+        if (frame_hold) chunks[index].hold(*frame_hold, index);
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
@@ -7717,9 +7719,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_FRAME_MARK;
     static LONG frames;
     static ULONGLONG started, last_report;
+    const bool reuse_large_bindings = bigbind_once_enabled();
+    if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;
+    if (reuse_large_bindings) {
+        finish_bigbind_frame(frame);
+        draw_lock_release_exclusive();
+    }
     draw_dump_flush();
     red_producers().flush();
     {

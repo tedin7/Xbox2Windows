@@ -1,5 +1,6 @@
-"""A constant buffer the title rewrites between two draws of one frame reaches the second draw with its new contents."""
+"""Check title-memory snapshots for writes between draws and across frame boundaries."""
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -21,8 +22,8 @@ def run(directory, consumer, backend, mode):
     log = folder / "trap.log"
     # The cross-frame reuse is off by default: the big-* cases switch it on, the controls below leave it off or break it.
     reuse = {"X2W_BIG_COPY_REUSE": "1"} if mode.startswith("big-") else {}
-    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), **reuse},
-                          binding="srv 0 buf table 0 0")
+    modes = {"X2W_TEST_FRAME_COPY": mode, "X2W_TRAP_LOG": str(log), "X2W_BIGBIND_ONCE": "0", **reuse}
+    pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf table 0 0")
     refreshed = [line for line in log.read_text(errors="replace").splitlines() if "frame copy of" in line] if log.exists() else []
     return pixels, refreshed
 
@@ -53,8 +54,8 @@ def check(directory, consumer, backend):
     ):
         folder = directory / name.replace(" ", "_").replace(",", "")
         folder.mkdir()
-        pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": "big-changed", **extra},
-                              binding="srv 0 buf table 0 0")
+        modes = {"X2W_TEST_FRAME_COPY": "big-changed", "X2W_BIGBIND_ONCE": "0", **extra}
+        pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf table 0 0")
         if pixels is None:
             return 77
         if pixels != expected:
@@ -63,6 +64,62 @@ def check(directory, consumer, backend):
     return 0
 
 
+def check_once(directory, consumer, backend):
+    shader = HLSL.replace("asfloat(constants.Load4(0))",
+                          "0.5 * (asfloat(constants.Load4(0)) + asfloat(constants.Load4(16777200)))")
+    log = directory / "trap.log"
+    pixels = draw_texture(directory, consumer, backend, shader, {
+        "X2W_TEST_FRAME_COPY": "once", "X2W_TRAP_LOG": str(log),
+        "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+    }, binding="srv 0 buf table 0 0")
+    if pixels is None:
+        return 77
+    expected = (RED * 4 + BLUE * 4) * 4
+    if pixels != expected:
+        raise AssertionError(f"once: actual {pixels.hex()} expected {expected.hex()}")
+    frames = re.findall(r"large bindings frame (\d+): (\d+) trims, (\d+) copies, (\d+) hits, (\d+) bytes",
+                        log.read_text(errors="replace"))
+    expected_frames = [(str(frame), "1", "1", "3", str(16 << 20)) for frame in (1, 2)]
+    if frames != expected_frames:
+        raise AssertionError(f"once: frame counters {frames!r}, expected {expected_frames!r}")
+    print(f"{backend} once: 32 pixels exact, 1 trim and 1 full 16 MiB copy per frame, 3 hits per frame")
+    # Two views of ONE address with different lengths in one frame: the cache key must include the length. The 64 KiB view reads the
+    # zero head and nothing past its end (pixels 0); the 16 MiB view also reads the red words at its end.
+    keys_shader = HLSL.replace("asfloat(constants.Load4(0))",
+                               "(asfloat(constants.Load4(0)) + asfloat(constants.Load4(16777200)))")
+    ZERO = bytes(4)
+    expected_keys = b"".join((ZERO * 2 if column % 2 == 0 else RED * 2) for column in range(4)) * 4
+    for name, extra, expected in (("keys", {}, expected_keys),
+                                  ("keys, address-only key (mutant)", {"X2W_TEST_BIGBIND_KEY_ADDRESS": "1"}, None)):
+        folder = directory / name.split(",")[0].replace(" ", "_")
+        if extra:
+            folder = directory / "keys_mutant"
+        folder.mkdir()
+        pixels = draw_texture(folder, consumer, backend, keys_shader, {
+            "X2W_TEST_FRAME_COPY": "once-keys", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", **extra,
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        if expected is not None and pixels != expected:
+            raise AssertionError(f"{name}: actual {pixels.hex()} expected {expected.hex()}")
+        if expected is None and pixels == expected_keys:
+            raise AssertionError(f"{name}: the mutant still drew the right picture, the control proves nothing")
+        print(f"{backend} {name}: " + ("32 pixels exact, small and large view of one address read their own bytes" if expected else "wrong picture, as the control expects"))
+    # Control: with the reset at Present broken, the second frame reuses the first frame's snapshot and must show the old colour
+    # (red in all eight columns), which proves the check above catches a cache that outlives its frame.
+    folder = directory / "no_reset"
+    folder.mkdir()
+    pixels = draw_texture(folder, consumer, backend, shader, {
+        "X2W_TEST_FRAME_COPY": "once", "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0", "X2W_TEST_BIGBIND_NO_RESET": "1",
+    }, binding="srv 0 buf table 0 0")
+    if pixels != RED * 8 * 4:
+        raise AssertionError(f"once, no reset at Present: actual {pixels.hex() if pixels else pixels} expected all red")
+    print(f"{backend} once, no reset at Present (mutant): second frame shows the old bytes, as the control expects")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
+        consumer, backend = sys.argv[1:3]
+        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        sys.exit(check_mode(Path(temporary), consumer, backend))
