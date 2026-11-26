@@ -33,7 +33,7 @@ bool failed_publication_keeps_view(void* guest, const D3D12_RESOURCE_DESC& desc,
     return std::memcmp(previous.data(), slot, previous.size()) == 0;
 }
 
-bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word address = 0, Word bytes = 0)
+bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word address = 0, Word bytes = 0, Word* gpu = nullptr)
 {
     struct Extended {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -43,7 +43,9 @@ bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word ad
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return false;
     cpu = invoke(heap, 9);
     invoke(list, 32, 1, ptr(&heap));
-    invoke(list, 36, 0, invoke(heap, 10));
+    const Word handle = invoke(heap, 10);
+    if (gpu) *gpu = handle;
+    invoke(list, 36, 0, handle);
     return true;
 }
 }
@@ -117,13 +119,15 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     UINT64 row_bytes = 0, bytes = 0;
     desktop->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &bytes);
     if (rows != 2 || row_bytes != 2 || bytes < footprint.Footprint.RowPitch + 2) return 40;
-    std::array<std::vector<unsigned char>, 2> planes;
-    void* placed[2]{};
-    for (unsigned i = 0; i < planes.size(); ++i) {
+    extern UINT stream_joined_table_choices();
+    const UINT choices = stream_joined_table_choices();
+    std::array<std::vector<unsigned char>, 4> planes;
+    void* placed[4]{};
+    for (UINT i = 0; i < (choices ? choices : 2u); ++i) {
         planes[i].resize(static_cast<std::size_t>(bytes));
         for (unsigned y = 0; y < rows; ++y)
             for (unsigned x = 0; x < row_bytes; ++x)
-                planes[i][y * footprint.Footprint.RowPitch + x] = static_cast<unsigned char>(16 + 128 * i + 32 * y + 7 * x);
+                planes[i][y * footprint.Footprint.RowPitch + x] = static_cast<unsigned char>(16 + (choices ? 64 : 128) * i + 32 * y + 7 * x);
         if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(planes[i].data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
                                                0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[i]))))) return 41;
     }
@@ -131,12 +135,14 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const Word stride = joined_table ? invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
     static std::vector<unsigned char> title_table;  // The bound heap retains this backing memory.
+    const UINT slots = choices ? 2 * choices : joined_table ? 2u : 1u;
     if (joined_table) {
         if (stride < 32) return 42;
-        title_table.resize(2 * stride);
+        title_table.resize(slots * stride);
     }
-    if (!bind_view_table(guest, list, cpu, joined_table ? 2 : 1, joined_table ? ptr(title_table.data()) : 0,
-                         joined_table ? title_table.size() : 0)) return 42;
+    Word gpu = 0;
+    if (!bind_view_table(guest, list, cpu, slots, joined_table ? ptr(title_table.data()) : 0,
+                         joined_table ? title_table.size() : 0, &gpu)) return 42;
     if (joined_table && cpu != ptr(title_table.data())) return 42;
     ViewAt v{};
     v.view.Format = DXGI_FORMAT_R8_UNORM;
@@ -148,6 +154,23 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
     };
+    if (choices) {
+        constexpr std::array<float, 4> table_words{0.125f, 0.25f, 0.375f, 0.5f};
+        for (UINT i = 0; i < choices; ++i) {
+            const Word offset = 2 * i * stride;
+            invoke(guest, 18, ptr(placed[i]), ptr(&v.view), cpu + offset);
+            std::memcpy(title_table.data() + offset + 32, &table_words[i], sizeof(float));
+            invoke(list, 36, i ? i + 1 : 0, gpu + offset);
+        }
+        for (UINT key = 0; key < choices; ++key) {
+            const D3D12_RECT strip{static_cast<LONG>(key * 8 / choices), 0,
+                                   static_cast<LONG>((key + 1) * 8 / choices), 4};
+            invoke(list, 40, 1, 1, ptr(&key), 0);
+            invoke(list, 22, 1, ptr(&strip));
+            invoke(list, 12, 3, 1);
+        }
+        return 0;
+    }
     if (joined_table) {
         for (UINT swap = 0; swap < 2; ++swap) {
             for (UINT i = 0; i < 2; ++i)

@@ -5121,6 +5121,12 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_joined_table_pointer_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")
             set_tests_properties(startup_joined_table_pointer_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            if(backend STREQUAL "warp")
+                add_test(NAME startup_joined_table_pointer_choice_${compiler}_warp COMMAND "${INTAKE_PYTHON}" -B
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_joined_table_pointer_check.py"
+                    "$<TARGET_FILE:startup_stream_consumer>" "warp" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}" choice)
+                set_tests_properties(startup_joined_table_pointer_choice_${compiler}_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endif()
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")

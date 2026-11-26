@@ -6,6 +6,7 @@ values (tables, vertex-buffer table, root buffers) turn into HLSL resources inst
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
 import bisect
+import copy
 from contextlib import suppress
 import functools
 import hashlib
@@ -670,6 +671,7 @@ def ptr_high_symbol(source, offset):
 
 # Sources whose pointer is a 64-bit register pair (the low word 'ptr', the high word 'ptrhi').
 PTR64_SOURCES = ('root', 'vbtab')
+JOINED_POINTER_LOAD = r"^s_load through s[0-9]+ holding \('joined at a branch target',\)"
 
 
 @functools.lru_cache(maxsize=None)
@@ -898,6 +900,8 @@ def names_one_value(sym):
     is taken only while exec holds the entry mask, so equal copies hold the same mask."""
     if sym is None:
         return False
+    if sym[0] in ('ptrsel', 'ptrselhi', 'choiceword'):
+        return True  # these symbols include the identity of the forward join
     if sym[0] == 'desc':
         # A compute descriptor can also carry an integer tag identifying the load or constant high word.
         return len(sym) == 4 or (len(sym) == 5 and isinstance(sym[4], int))
@@ -2428,8 +2432,9 @@ class Stage:
     address_carry_pairs = ()
     address_carry_reader = None
 
-    def __init__(self, pipe, kind, code, refusals=None, decoded=None):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None, *, pointer_choices=False):
         self.pipe, self.kind = pipe, kind
+        self.pointer_choices = pointer_choices
         self.refusals = refusals
         self.raw_code = strip_header(code)
         if refusals is None:
@@ -2589,6 +2594,13 @@ class Stage:
                 return '0x%08xu' % (s[1] & 0xffffffff)
             if s[0] == 'ud':
                 return 'ud%d' % s[1]
+            if s[0] == 'choiceword':
+                _, selection, locations, word = s
+                values = ['ud%d' % self.pipe.ud(('tableword', table, offset + 4 * word))
+                          for (_, table), offset in locations]
+                if len(self.pipe.uds) > 32:
+                    raise Unsupported('table pointer choice exceeds the graphics entry word limit')
+                return self.choice_expression(selection, values)
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
@@ -3727,6 +3739,40 @@ class Stage:
         sites = getattr(self, 'entry_exec_proof', None)
         return self.exec_known if sites is None else self.pc in sites
 
+    @staticmethod
+    def choice_expression(selection, values):
+        result = values[0]
+        for i, value in enumerate(values[1:], 1):
+            result = '(%s == %du ? %s : %s)' % (selection, i, value, result)
+        return result
+
+    def join_pointer_choices(self, target, regs, arriving, edges):
+        """Prove both words on each edge before replacing the old joined symbols."""
+        choices = {}
+        for low in sorted(r for r in regs if isinstance(r, int) and r % 2 == 0 and r < 105):
+            paths = [state.get(low) for state, _ in arriving]
+            if not paths or any(not p or p[0] != 'ptr' or p[1][0] not in ('table', 'root')
+                                or (len(p) > 2 and not isinstance(p[2], int)) for p in paths):
+                continue
+            candidates = tuple((p[1], p[2] if len(p) > 2 else 0) for p in paths)
+            distinct = tuple(dict.fromkeys(candidates))
+            if not 2 <= len(distinct) <= 4 or len({source[0] for source, _ in distinct}) != 1:
+                continue
+            high = [state.get(low + 1) for state, _ in arriving]
+            if distinct[0][0][0] == 'table':
+                # Graphics tables have a 32-bit ABI pointer. Prove a common high word for the operand pair.
+                if not high[0] or high[0][0] not in ('const', 'ud') or not names_one_value(high[0]) or (
+                        high[0][0] == 'const' and len(high[0]) != 2) or any(h != high[0] for h in high):
+                    continue
+            elif high != [ptr_high_symbol(source, offset) for source, offset in candidates]:
+                continue
+            selector = 'ptrsel_%x_s%d' % (target, low)
+            choices[low] = ('ptrsel', distinct, selector)
+            choices[low + 1] = ('ptrselhi', distinct, selector)
+            self.pointer_choice_edges[selector] = [(edge, distinct.index(candidate))
+                                                   for edge, candidate in zip(edges, candidates)]
+        return choices
+
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
@@ -3910,6 +3956,10 @@ class Stage:
             tentative_kept = set()
             materialize = {}
             incoming = {}
+            incoming_blocks = {}
+            pointer_choices = getattr(self, 'pointer_choices', False) and not any(t <= pc for pc, t in branches)
+            self.pointer_choice_edges = {}
+            self.used_pointer_choices = set()
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -3959,8 +4009,12 @@ class Stage:
                     }
                     kept[off] = {}
                     here = joined.get(off, set())
-                    arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
-                        incoming.get(off, [])
+                    state = dict(self.sym) if pointer_choices else {reg: self.sym.get(reg) for reg in here}
+                    arriving = ([(state, written & here)] if falls else []) + incoming.get(off, [])
+                    choices = {}
+                    if pointer_choices and len(arriving) > 1:
+                        edges = ([(self.blocks[-1][0], off)] if falls else []) + incoming_blocks.get(off, [])
+                        choices = self.join_pointer_choices(off, here, arriving, edges)
                     written = (written - here) | set().union(*(w for _, w in arriving))
                     for reg in here:
                         paths = [s[reg] for s, w in arriving if reg in w]
@@ -3985,6 +4039,7 @@ class Stage:
                         self.sym.pop(reg, None)
                         if reg != 'm0':
                             self.used_s.add(reg)
+                    self.sym.update(choices)
                     # A joined register the fall-through wrote as a plain run-time number: every other path into
                     # this target has exec bit 0, so the instruction at the target may AND it with exec (scalar()). A register that still holds a plain
                     # variable reads the same either way.
@@ -4035,7 +4090,10 @@ class Stage:
                     b_target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
                     there = joined.get(b_target, set())
                     if b_target > off:
-                        incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        state = dict(self.sym) if pointer_choices else {reg: self.sym.get(reg) for reg in there}
+                        incoming.setdefault(b_target, []).append((state, written & there))
+                        if pointer_choices:
+                            incoming_blocks.setdefault(b_target, []).append((start, b_target))
                         scc_in.setdefault(b_target, []).append(self.scc_def)
                     else:
                         for reg in there & written:
@@ -6464,6 +6522,34 @@ class Stage:
         for n in range(dst[1], dst[2] + 1):
             getattr(self, 'masks', set()).discard(n)
         p = self.sym.get(base[1])
+        if p and p[0] == 'ptrsel':
+            reason = "s_load through s%d holding ('joined at a branch target',)" % base[1]
+            high = self.sym.get(base[2])
+            if high != ('ptrselhi', *p[1:]) or into_vcc:
+                raise Unsupported(reason)
+            token = smem_offset(ops[2])
+            known = self.const_soffset(token)
+            if known is not None:
+                offset = known + (imm or 0)
+            elif re.fullmatch(r'0[xX][0-9a-fA-F]+|[0-9]+', token) and imm is None:
+                offset = int(token, 0)
+            else:
+                raise Unsupported(reason)
+            locations = tuple((source, start + offset) for source, start in p[1])
+            if not 0 <= offset <= 0xfffff or any(at < 0 or at > 0x7fffffff - 4 * count or at & 3 or source[1] >= 16
+                    for source, at in locations):
+                raise Unsupported(reason)
+            self.used_pointer_choices.add(p[2])
+            if locations[0][0][0] == 'root':
+                buffers = [self.pipe.resource((source, None), 'buf') for source, _ in locations]
+                for i in range(count):
+                    values = ['%s.Load(%d)' % (buf, at + 4 * i) for buf, (_, at) in zip(buffers, locations)]
+                    self.set_s(dst[1] + i, self.choice_expression(p[2], values))
+            else:
+                # Keep the locations until a consumer distinguishes numeric data from a texture descriptor.
+                for i in range(count):
+                    self.sym[dst[1] + i] = ('choiceword', p[2], locations, i)
+            return
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         waterfall = count == 8 and getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
@@ -7798,10 +7884,26 @@ class Stage:
                                  'mask and wave-uniform control flow')
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
-        desc_key = self.descriptor(ops[2])
-        tex = self.pipe.resource(desc_key, kinds[dim])
-        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
-            self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
+        span = reg_range(ops[2])
+        first = self.sym.get(span[1]) if span and span[0] == 's' else None
+        choice = first and first[0] == 'choiceword'
+        if choice:
+            _, selector, locations, word = first
+            if (span[2] - span[1] != 7 or word % 8 or 'd16' in mods
+                    or how not in ('load', 'load_mip', 'l', 'lz', 'sample', 'b', 'get_lod')
+                    or any(self.sym.get(span[1] + i) != (*first[:3], word + i) for i in range(8))):
+                raise Unsupported('image operand %s has an unverified table pointer choice' % ops[2])
+            keys = [(source, at + 4 * word) for source, at in locations]
+        else:
+            keys = [self.descriptor(ops[2])]
+        textures = [self.pipe.resource(key, kinds[dim]) for key in keys]
+        desc_key, tex = keys[0], textures[0]
+        if choice:
+            for key in keys:
+                self.pipe.resources[key]['pointer_choice'] = True
+        if hasattr(self.pipe, 'note_use'):  # unit-test stubs have none
+            for key in keys:
+                self.pipe.note_use(key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
@@ -7920,12 +8022,22 @@ class Stage:
                 # holds (entry EXEC, wave-uniform control flow, no divergent back edge over the call) the call is the
                 # implicit-LOD Sample; otherwise it stays level 0 (resolve_plain_samples).
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
-                if getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
+                if choice and self.uniform_cf:
+                    call = '%s.Sample(%s, %s)' % (tex, smp, uv)
+                elif getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
                     self.plain_samples[self.pc] = (call, '%s.Sample(%s, %s)' % (tex, smp, uv))
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
-        self.emit('t = %s;' % call)
+        if choice:
+            self.emit('switch (%s) {' % selector)
+            for i, texture in enumerate(textures):
+                expression = re.sub(r'\b' + tex + r'\b', texture, call)
+                label = 'case %d' % i if i else 'default'
+                self.emit('    %s: t = %s; break;' % (label, expression))
+            self.emit('}')
+        else:
+            self.emit('t = %s;' % call)
         if how in ('load', 'load_mip') and 'd16' in mods:
             res = self.pipe.resources[desc_key]
             res['d16_exact'] = True
@@ -10320,6 +10432,10 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
+        edge_writes = {}
+        for selector in sorted(getattr(self, 'used_pointer_choices', ())):
+            for edge, candidate in self.pointer_choice_edges[selector]:
+                edge_writes.setdefault(edge, []).append('%s = %du;' % (selector, candidate))
         for i, (off, lines, term) in enumerate(self.blocks):
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
@@ -10341,12 +10457,24 @@ class Stage:
                         '    if (pc == %d) {' % i,
                         '        uint mesh_vote = mesh_vote_%d;' % i]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
+            advancing = edge_writes.get((off, offsets[nxt]), ()) if nxt != 0xffff else ()
+            taken = edge_writes.get((off, term[-1]), ()) if term and term[0] in ('jump', 'branch') else ()
             if not term:
+                out.extend('        ' + line for line in advancing)
                 out.append('        pc = %d;' % nxt)
             elif term[0] == 'end':
                 out.append('        pc = 0xffffu;')
             elif term[0] == 'jump':
+                out.extend('        ' + line for line in taken)
                 out.append('        pc = %d;' % goto(term[1]))
+            elif taken or advancing:
+                out.append('        if (%s) {' % term[1])
+                out.extend('            ' + line for line in taken)
+                out.append('            pc = %d;' % goto(term[2]))
+                out.append('        } else {')
+                out.extend('            ' + line for line in advancing)
+                out.append('            pc = %d;' % nxt)
+                out.append('        }')
             else:
                 out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
             out.append('    }')
@@ -10365,6 +10493,8 @@ class Stage:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         if getattr(self, 'spill_slots', None):
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
+        for selector in sorted(getattr(self, 'used_pointer_choices', ())):
+            lines.append('    uint %s = 0u;' % selector)
         if getattr(self, 'uniform_load_temps', None):
             lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in sorted(self.uniform_load_temps)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
@@ -11097,6 +11227,39 @@ VERIFIED_UINT_RTVS = frozenset((3, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 
+def graphics_stage(pipe, kind, code, refusals=None, decoded=None):
+    """Retry a joined-pointer refusal with selector lowering, keeping the legacy fast path."""
+    def snapshot():
+        return {key: copy.deepcopy(value) if isinstance(value, (dict, list, set)) else value
+                for key, value in vars(pipe).items()}
+
+    before = snapshot()
+    first = len(refusals) if refusals is not None else 0
+    try:
+        legacy = Stage(pipe, kind, code, refusals=refusals, decoded=decoded)
+        errors = [] if refusals is None else refusals[first:]
+    except Unsupported as error:
+        legacy, errors = error, [(str(error), kind)]
+    if any(re.fullmatch(JOINED_POINTER_LOAD, reason) for reason, _ in errors):
+        after = vars(pipe).copy()
+        vars(pipe).clear()
+        vars(pipe).update(before)
+        try:
+            selected = Stage(pipe, kind, code, decoded=decoded, pointer_choices=True)
+            if len(pipe.resources) <= 32 and len(pipe.uds) <= 32:
+                if refusals is not None:
+                    del refusals[first:]
+                selected.refusals = refusals
+                return selected
+        except Unsupported:
+            pass
+        vars(pipe).clear()
+        vars(pipe).update(after)
+    if isinstance(legacy, Unsupported):
+        raise legacy
+    return legacy
+
+
 class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
@@ -11158,12 +11321,12 @@ class Pipeline:
                                  ps_attr_map, srv_formats)
         self.rect = self.ud(('rect',))
         if refusals is None:
-            self.vs = Stage(self, self.vertex_kind, vs_code)
-            self.ps = Stage(self, 'ps', ps_code) if ps_code is not None else None
+            self.vs = graphics_stage(self, self.vertex_kind, vs_code)
+            self.ps = graphics_stage(self, 'ps', ps_code) if ps_code is not None else None
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
-            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps')) if ps_code is not None else None
+            self.vs = graphics_stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.ps = graphics_stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps')) if ps_code is not None else None
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
             if 'pos' not in self.vs.exports:
@@ -11742,8 +11905,10 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def manifest(self):
-        # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
-        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
+        table_words = any(source[0] == 'tableword' for source in self.uds)
+        choice_views = any(r.get('pointer_choice') for r in self.resources.values())
+        version = 3 if table_words or choice_views else 2 if self.stored_images() else 1
+        lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
@@ -11753,6 +11918,8 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+            if r.get('pointer_choice'):
+                lines.append('srvchoice %d' % r['index'])
             if self.srv_use_line(r):
                 lines.append(self.srv_use_line(r))
             if r.get('d16_exact'):
@@ -11982,7 +12149,7 @@ class MeshPixelStage(Pipeline):
             clean_params.append(p)
         self.params = sorted(set(clean_params))
         self.mesh_plain_params = frozenset(self.params)
-        self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded)
+        self.ps = graphics_stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded)
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         for a, how in self.ps.attrs.items():
             if 'f16' not in how:
@@ -12936,6 +13103,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('joined-table-pointer', JOINED_POINTER_LOAD),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
