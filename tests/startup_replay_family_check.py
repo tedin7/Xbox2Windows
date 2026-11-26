@@ -90,7 +90,7 @@ def main(argv):
             summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
             return code, text, summary, pictures(out)
 
-        phase("replay")
+        phase("recorded %d calls, %d MiB; replay" % (calls, recording.stat().st_size >> 20))
         code, text, summary, replayed = replay(recording, directory / "replayed")
         log = directory / "replayed" / "stderr.txt"
         tail = log.read_text(errors="replace")[-2500:] if log.exists() else ""
