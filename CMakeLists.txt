@@ -2186,12 +2186,12 @@ target_include_directories(startup_memory_srv_census_check PRIVATE src)
 target_compile_features(startup_memory_srv_census_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_census COMMAND startup_memory_srv_census_check)
 # Bounded per-(key, reason) refusal census (src/startup_stubs/per_reason_refusal_census.h), without a device.
-# Both compile-time mutated targets build the real class with one reason per key and must fail.
+# Compile-time controls lose reasons or ignore call counts and must fail.
 add_executable(startup_per_reason_refusal_census_check tests/startup_per_reason_refusal_census_check.cpp)
 target_include_directories(startup_per_reason_refusal_census_check PRIVATE src)
 target_compile_features(startup_per_reason_refusal_census_check PRIVATE cxx_std_17)
 add_test(NAME startup_per_reason_refusal_census COMMAND startup_per_reason_refusal_census_check)
-foreach(mutation IN ITEMS keep_last keep_first)
+foreach(mutation IN ITEMS keep_last keep_first insertion_order)
     string(REPLACE "_" "-" mutation_flag ${mutation})
     string(TOUPPER "${mutation}" mutation_macro)
     add_executable(startup_per_reason_refusal_census_${mutation}_control tests/startup_per_reason_refusal_census_check.cpp)

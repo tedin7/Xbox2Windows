@@ -94,6 +94,7 @@ void check_limits_and_periodic_deltas()
     }
     check("ninth distinct entry is not detailed", !census.note(999, "r"));
 
+    check("capacity is 1024 pairs", PerReasonRefusalCensus::max_entries == 1024);
     while (census.entry_count() < PerReasonRefusalCensus::max_entries) {
         census.note(1000 + census.entry_count(), "fill");
     }
@@ -101,8 +102,16 @@ void check_limits_and_periodic_deltas()
     check("second call past max_entries counts as overflow", !census.note(5001, "overflow"));
     check("overflow count is two", census.overflow_calls() == 2);
 
+    const auto late_key = 1000 + census.entry_count() - 1;
+    for (int i = 0; i < 4; ++i) census.note(late_key, "fill");
     const auto full = collect_report(census, true);
-    check("report has summary plus max_entries lines", full.size() == 1 + PerReasonRefusalCensus::max_entries);
+    check("report has summary, top 64 pairs and omitted count", full.size() == 66);
+    if (full.size() == 66) {
+        check("late hot pair is first",
+              full[1] == "x2w-d3d12 per-reason refusal 1024: key=00000000000007e7 reason=fill calls=5");
+        check("ties retain insertion order", full[64].find("refusal 63:") != std::string::npos);
+        check("omitted count excludes overflow", full[65] == "x2w-d3d12 per-reason refusals omitted: pairs=960");
+    }
     check("unknown normalized and merged",
           contains_line(full, "x2w-d3d12 per-reason refusal 1: key=0000000000000001 reason=unknown calls=2"));
     check("newline replaced by space",
@@ -111,16 +120,14 @@ void check_limits_and_periodic_deltas()
     check("unchanged periodic report is skipped", collect_report(census, true).empty());
     census.note(1, nullptr);
     const auto delta = collect_report(census, true);
-    check("periodic delta prints summary and changed entry only",
-          delta.size() == 2 &&
-              delta[1] == "x2w-d3d12 per-reason refusal 1: key=0000000000000001 reason=unknown calls=3");
+    check("changed periodic report keeps the complete ranking",
+          delta.size() == 66 &&
+              delta[2] == "x2w-d3d12 per-reason refusal 1: key=0000000000000001 reason=unknown calls=3");
 
     census.note(2, "line1\nline2");
-    check("forced report prints all entries", collect_report(census, false).size() == 1 + PerReasonRefusalCensus::max_entries);
-    const auto after_forced = collect_report(census, true);
-    check("forced report does not hide next periodic delta",
-          after_forced.size() == 2 &&
-              after_forced[1] == "x2w-d3d12 per-reason refusal 2: key=0000000000000002 reason=line1 line2 calls=2");
+    const auto forced = collect_report(census, false);
+    check("forced report uses the same top 64", forced.size() == 66);
+    check("forced report does not suppress the next periodic report", collect_report(census, true) == forced);
 }
 
 }  // namespace

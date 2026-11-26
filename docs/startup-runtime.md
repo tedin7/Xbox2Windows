@@ -590,19 +590,20 @@ token null with zero words, and the R8 texels. The control publishes the support
 `(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same pipeline key
 with the last refusal:
 
-- Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
+- Up to 1024 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
   call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
   `total` and `overflow calls` without unbounded allocation.
-- `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
-  the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
-  prints the full table without hiding the next periodic delta.
+- Both report modes print the summary and up to 64 pairs ranked by cumulative calls. Ties follow
+  insertion order and each pair retains its original number. The omitted line counts the stored pairs
+  outside the ranking. The summary counts overflow calls separately. Periodic reports skip unchanged
+  tables, and a forced report leaves that change check intact.
 - [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) and
   [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
   `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
   `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
   `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
   each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
-  emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
+  emits the ranking in the five-second report, and appends the ranked `x2w-d3d12 indirect-draw refusals:` lines
   to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
   existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
   are not counted in this census (matching the per-call log gate), so `total` counts only refusals
@@ -614,16 +615,16 @@ with the last refusal:
   checks (`no_render_target`, `multiple_render_targets`, `depth_target_bound`,
   `missing_viewport_or_scissor`, `target_format_mismatch`, `graphics_multi_command`,
   `argument_outside_placed_buffer`, etc.), keeps logging the first occurrence of each of the first 8
-  distinct `(key, reason)` pairs even after the 16-call global refusal log limit is spent, emits deltas
-  in the five-second report, and appends the full `x2w-d3d12 indirect-other refusals:` lines to
+  distinct `(key, reason)` pairs even after the 16-call global refusal log limit is spent, emits the ranking
+  in the five-second report, and appends the ranked `x2w-d3d12 indirect-other refusals:` lines to
   `x2w_d3d12_census_report` whenever at least one `other` refusal occurred.
 
 Check without a device via
-`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
-the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and delta
+`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_(keep-last|keep-first|insertion-order)_control)?$' -V`:
+the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and ranked
 reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
 `X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
-mismatch output, and are marked `WILL_FAIL`.
+mismatch output. The `insertion-order` control ignores call counts. All three are marked `WILL_FAIL`.
 
 Check the runtime wiring on WARP and hardware via
 `ctest --preset dev --no-tests=error -R '^startup_indirect_(translated|other)_refusal_census_(warp|hardware|control_warp)$' -V`:
@@ -1282,7 +1283,13 @@ When `fxc` is available, a request that later translates loses its `.fail`. In m
 
 ### 3. Measure a run against the previous one
 
-With `-Render`, `d3d12_xs` prints a running total to `stderr.txt` every 300 frames:
+With `-Render`, `d3d12_xs` prints running totals to `stderr.txt` after 300 presents or 10 seconds since
+the last totals report, whichever comes first. The first interval starts at the first present. The
+wall-time deadline is checked on Present, so a report is emitted on the first present at or after it.
+This cadence covers the draw, indirect and upload-ring totals. Lock timing also reports with the
+existing five-second heartbeat. `ctest --preset dev --no-tests=error -R '^startup_present_gray$' -V`
+checks the timed report on a slow WARP present sequence, with synthetic picture readback and a
+frame-only log control.
 
 ```
 x2w-render totals: ... translated draws N (not drawn M), pipelines translated P / missing Q, ...

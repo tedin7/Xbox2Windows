@@ -5,6 +5,8 @@
 // max_entries; calls past the table continue to advance total_ and overflow_calls_.
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,7 +17,8 @@ namespace x2w_startup {
 
 class PerReasonRefusalCensus {
 public:
-    static constexpr unsigned max_entries = 128;
+    static constexpr unsigned max_entries = 1024;
+    static constexpr unsigned report_entries = 64;
     static constexpr unsigned detail_entries = 8;
     static constexpr std::size_t max_label_bytes = 32;
     static constexpr std::size_t max_reason_bytes = 64;
@@ -64,7 +67,6 @@ public:
         entry.key = key;
         std::memcpy(entry.reason, reason, sizeof(reason));
         entry.calls = 1;
-        entry.reported_calls = 0;
         const bool detail = entry_count_ < detail_entries;
         ++entry_count_;
         return detail;
@@ -75,7 +77,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const bool changed = total_ != reported_;
-        if (only_if_changed) reported_ = total_;  // a forced report leaves periodic deltas intact
+        if (only_if_changed) reported_ = total_;  // a forced report leaves the periodic change check intact
         if (only_if_changed && !changed) return false;
 
         char line[256];
@@ -85,14 +87,30 @@ public:
                       static_cast<unsigned long long>(overflow_calls_));
         emit(static_cast<const char*>(line));
 
-        for (unsigned i = 0; i < entry_count_; ++i) {
-            Entry& entry = entries_[i];
-            if (only_if_changed && entry.calls == entry.reported_calls) continue;
-            if (only_if_changed) entry.reported_calls = entry.calls;
+        // Rank by cumulative calls. Keep the original entry numbers and break ties by first sighting.
+        std::array<unsigned, max_entries> order{};
+        for (unsigned i = 0; i < entry_count_; ++i) order[i] = i;
+        const unsigned shown = (std::min)(entry_count_, report_entries);
+        std::partial_sort(order.begin(), order.begin() + shown, order.begin() + entry_count_,
+                          [&](unsigned a, unsigned b) {
+#ifdef X2W_CENSUS_INSERTION_ORDER
+                              return a < b;
+#else
+                              return entries_[a].calls == entries_[b].calls ? a < b : entries_[a].calls > entries_[b].calls;
+#endif
+                          });
+        for (unsigned rank = 0; rank < shown; ++rank) {
+            const unsigned i = order[rank];
+            const Entry& entry = entries_[i];
             std::snprintf(line, sizeof(line),
                           "x2w-d3d12 %s refusal %u: key=%016llx reason=%s calls=%llu",
                           label_, i + 1, static_cast<unsigned long long>(entry.key), entry.reason,
                           static_cast<unsigned long long>(entry.calls));
+            emit(static_cast<const char*>(line));
+        }
+        if (shown < entry_count_) {
+            std::snprintf(line, sizeof(line), "x2w-d3d12 %s refusals omitted: pairs=%u",
+                          label_, entry_count_ - shown);
             emit(static_cast<const char*>(line));
         }
         return true;
@@ -127,7 +145,6 @@ private:
         std::uint64_t key = 0;
         char reason[max_reason_bytes] = {};
         std::uint64_t calls = 0;
-        std::uint64_t reported_calls = 0;
     };
 
     static void copy_sanitized(char* out, std::size_t out_size, const char* src, const char* fallback)

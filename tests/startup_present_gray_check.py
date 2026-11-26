@@ -14,6 +14,7 @@ Each of those two runs must log the interval line exactly twice (frames 300 and 
 present-onset   two-tone for about 6 s, then flat gray for 6 s: exactly one `x2w-gray onset` line, flat from a time between
                    6.0 s and the run time, mean 128.00, spread 0.00, and at least four picture lines in 12 s of a constant
                    picture (the time rule; the count rules log three). present-flat logs one onset line, present-split none.
+The slow run also checks the totals, indirect and upload-ring lines at the first ten-second deadline.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -51,6 +52,8 @@ def present(consumer, directory, mode):
         print(result.stdout, end='')
         sys.exit(77)
     assert result.returncode == 0, f'{mode}: consumer exit {result.returncode}\n{result.stderr[-3000:]}'
+    if mode == 'present-onset':
+        print(result.stdout, end='')
     return result.stderr
 
 
@@ -77,12 +80,46 @@ def check(consumer, mode, mean, spread):
           f'{len(onsets)} onset lines')
 
 
+TOTALS_PREFIXES = ("x2w-render totals:", "x2w-render indirect:", "x2w-render upload ring:")
+LOCK_PREFIX = "x2w-render draw_lock since the last report"
+
+
+def check_slow_totals(log):
+    seen = set()
+    reports = []
+    last_ms = 0
+    for line in log.splitlines():
+        seen.update(prefix for prefix in (*TOTALS_PREFIXES, LOCK_PREFIX) if line.startswith(prefix))
+        end = re.fullmatch(r"fixture present (\d+) ended at (\d+) ms", line)
+        if end:
+            frame, elapsed_ms = map(int, end.groups())
+            if seen.intersection(TOTALS_PREFIXES):
+                reports.append((frame, last_ms, elapsed_ms, seen))
+            seen = set()
+            last_ms = elapsed_ms
+    assert len(reports) == 1, f"expected one slow totals report, found {reports}"
+    frame, previous_ms, elapsed_ms, lines = reports[0]
+    assert lines == {*TOTALS_PREFIXES, LOCK_PREFIX}, reports
+    # The deadline is sampled inside Present. Allow one 200 ms frame and scheduling/readback slack.
+    assert frame < 300 and previous_ms < 10000 and 9900 <= elapsed_ms <= 10750, reports
+
+
 def check_onset(consumer):
     """Two-tone for about 6 s, then flat gray: one onset line at about the second the picture turned flat, and a picture
     line at least every 5 s (the run shows a constant picture for 12 s, which the count/40th rules alone would not log
     more than three times)."""
     with tempfile.TemporaryDirectory() as temporary:
         log = present(consumer, Path(temporary), 'present-onset')
+    check_slow_totals(log)
+    # Reproduce the old frame-only policy: this run never reaches its first report.
+    frame_only = "\n".join(line for line in log.splitlines()
+                           if not line.startswith(TOTALS_PREFIXES))
+    try:
+        check_slow_totals(frame_only)
+    except AssertionError as exc:
+        assert str(exc) == "expected one slow totals report, found []", exc
+    else:
+        raise AssertionError("frame-only control passed")
     elapsed = present.elapsed
     onsets = [m for m in map(ONSET.search, log.splitlines()) if m]
     assert len(onsets) == 1, f'present-onset: {len(onsets)} onset lines\n{log[-3000:]}'
@@ -92,6 +129,8 @@ def check_onset(consumer):
     assert 6.0 <= at <= elapsed, f'present-onset: flat from {at} s, expected between 6.0 and the run time {elapsed:.1f} s: {m.group(0)}'
     pictures = [m for m in map(PRESENTED.search, log.splitlines()) if m]
     assert len(pictures) >= 4, f'present-onset: {len(pictures)} picture lines, a timed line was expected\n{log[-3000:]}'
+    expected = {(127.5, 127.5), (128.0, 0.0)}
+    assert all((float(p.group(2)), float(p.group(3))) in expected for p in pictures), [p.group(0) for p in pictures]
     print(f'present-onset: one onset line, flat from {at} s of a {elapsed:.1f} s run; {len(pictures)} picture lines')
 
 

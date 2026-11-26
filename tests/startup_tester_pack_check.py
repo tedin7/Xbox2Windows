@@ -544,15 +544,21 @@ def check_indirect_mesh_requests():
                 write(cache, name, files[name])
             write(cache, f"req_{key}.fail", b"unsupported synthetic mesh instruction\n")
         census = (
+            b"x2w-render totals: resets 2 (failed 0), closes 2, clears 3\n"
+            b"x2w-d3d12 indirect-graphics refusals: total 1029; distinct keys 1024, distinct pairs 1024 (overflow calls 0)\n"
+            b"x2w-d3d12 indirect-graphics refusal 1024: key=4000000000000001 reason=mesh no translation calls=5\n"
             b"x2w-d3d12 indirect-graphics refusal 1: key=3000000000000001 reason=mesh no translation calls=2\n"
-            b"x2w-d3d12 indirect-graphics refusal 2: key=4000000000000001 reason=mesh no translation calls=5\n"
-        )
+        ) + "".join(
+            f"x2w-d3d12 indirect-graphics refusal {i}: key={i:016x} reason=synthetic calls=1\n"
+            for i in range(2, 64)
+        ).encode() + b"x2w-d3d12 indirect-graphics refusals omitted: pairs=960\n"
         for used in (True, False):
             log = census + (b"x2w-render key use mesh 3000000000000001 first 1.0 s last 2.0 s uses 2\n"
                             b"x2w-render key use mesh 4000000000000001 first 1.0 s last 3.0 s uses 5\n" if used else b"")
             write(run, "stderr.txt", log)
             T.pack(str(run), MANIFEST, str(tmp / "mesh.zip"), cache_dir=str(cache))
             with zipfile.ZipFile(tmp / "mesh.zip") as archive:
+                assert archive.read("stderr.txt") == log
                 prefix = T.REQUESTS_DIR + "/"
                 packed = {n[len(prefix):]: archive.read(n) for n in archive.namelist() if n.startswith(prefix)}
                 assert packed == (files if used else {}), packed

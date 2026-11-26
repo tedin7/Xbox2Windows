@@ -781,9 +781,17 @@ static int present_gray(void* device, const std::string& mode)
     resources[0] = word(texture);
     plane[1] = 1;
     plane[2] = word(resources);
+    ULONGLONG first_present = 0;
+    unsigned frame = 0;
     const auto show = [&](UINT count, DWORD pause_ms) {
         for (UINT i = 0; i < count; ++i) {
             if (FAILED(static_cast<HRESULT>(invoke(queue, 32, 1, word(plane), word(present))))) return 81;
+            if (onset) {
+                const ULONGLONG now = GetTickCount64();
+                if (++frame == 1) first_present = now;
+                std::fprintf(stderr, "fixture present %u ended at %llu ms\n", frame, now - first_present);
+                std::fflush(stderr);
+            }
             if (pause_ms) Sleep(pause_ms);
         }
         return 0;

@@ -7757,7 +7757,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_ZONE("Present");
     X2W_FRAME_MARK;
     static LONG frames;
-    static ULONGLONG started, last_report;
+    static ULONGLONG started, last_report, last_totals;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
@@ -7814,7 +7814,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
-    if (frame == 1) started = last_report = now;
+    if (frame == 1) started = last_report = last_totals = now;
+    static LONG last_totals_frame = 0;
+    const bool totals_due = render_mode() && (frame - last_totals_frame >= 300 || now - last_totals >= 10000);
+    if (totals_due) {
+        last_totals = now;
+        last_totals_frame = frame;
+    }
     if (frame <= 2) {
         char a[3 * 0x50 + 1], b[3 * 0x40 + 1];
         hex_text(plane_parameters, 0x50, a, sizeof(a));
@@ -7852,7 +7858,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
-    if (render_mode() && frame % 300 == 0) {
+    if (totals_due || (render_mode() && frame % 300 == 0)) {
         draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
@@ -7861,7 +7867,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
-    if (render_mode() && frame % 300 == 0)
+    if (totals_due)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
@@ -7891,7 +7897,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         std::memcpy(last, now_values, sizeof(last));
         log("%s", text);
     }
-    if (render_mode() && frame % 300 == 0) {
+    if (totals_due) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
@@ -7908,6 +7914,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
+    }
+    if (render_mode() && frame % 300 == 0) {
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
@@ -7918,7 +7926,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             log_not_drawn_keys();
         }
     }
-    if (render_mode() && frame % 300 == 0) {
+    if (totals_due) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
                                                "placeholder-signature", "other"};
@@ -7945,7 +7953,18 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("%s", line);
     }
-    if (now - last_report >= 5000) {
+    const bool heartbeat_due = now - last_report >= 5000;
+    if (totals_due || heartbeat_due) {
+        {
+            char line[400];
+            if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[400];
+            if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+        }
+    }
+    if (heartbeat_due) {
         last_report = now;
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
@@ -7954,14 +7973,6 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);
-        }
-        {
-            char line[400];
-            if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
-        }
-        {
-            char line[400];
-            if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
         }
         {
             char line[500];

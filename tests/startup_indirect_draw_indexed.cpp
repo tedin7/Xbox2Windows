@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -1322,6 +1323,11 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         }
         parsed.push_back({index, key, reason, calls});
     }
+    if (parsed[0].index != 1 || parsed[1].index != 4 || parsed[2].index != 2 || parsed[3].index != 3) {
+        std::fprintf(stderr, "indirect-draw census is not ordered by calls, then insertion order\n");
+        return false;
+    }
+    std::rotate(parsed.begin() + 1, parsed.begin() + 2, parsed.end());
     const bool entries_ok =
         parsed[0].index == 1 && parsed[0].reason == "missing_guest_root" && parsed[0].calls == 2 &&
         parsed[1].index == 2 && parsed[1].key == parsed[0].key &&
