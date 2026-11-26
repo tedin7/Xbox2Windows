@@ -53,10 +53,11 @@ std::vector<char> read_blob(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup::TranslatedSamplers& samplers)
+ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup::TranslatedSamplers& samplers,
+                                        UINT srv_count)
 {
     ComPtr<ID3D12RootSignature> root;
-    check(x2w_startup::create_translated_root(device, entry_constants, 1, samplers, &root),
+    check(x2w_startup::create_translated_root(device, entry_constants, srv_count, samplers, &root),
           "Create translated image 3D root signature");
     return root;
 }
@@ -66,13 +67,17 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // view of a two-slice texture is a Texture2DArray over both. Multi-mip fixtures use a 4x4 base.
 // A nonzero view_levels selects an explicit 2D SRV starting at first_mip. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
+// Waterfall mode reads 16 floats from a 2x2 quad and binds two 2D texture views.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            float* color, const char* sampler_line, bool array, UINT levels, bool one_dimensional,
+                            bool two_dimensional, UINT first_mip, UINT view_levels, bool waterfall)
 {
+    const UINT draw_size = waterfall ? 2 : 1;
+    const UINT srv_count = waterfall ? 2 : 1;
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
-    if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
+    if ((waterfall && !view_levels) ||
+        (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip)))
         throw std::runtime_error("2D mip window exceeds the resource");
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
@@ -81,7 +86,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
         throw std::runtime_error("Expected one inline sampler in the image 3D draw");
     const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
-    const auto root = create_root(device, samplers);
+    const auto root = create_root(device, samplers, srv_count);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -141,8 +146,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = 1;
-    rd.Height = 1;
+    rd.Width = draw_size;
+    rd.Height = draw_size;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -155,7 +160,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     device->GetCopyableFootprints(&rd, 0, 1, 0, &target_footprint, nullptr, nullptr, &readback_size);
     const auto readback = make_buffer(device, readback_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srv_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image 3D view heap");
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -167,6 +172,16 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         view.Texture2D.MipLevels = view_levels;
     }
     device->CreateShaderResourceView(texture.Get(), view_levels ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    ComPtr<ID3D12Resource> second_texture;
+    if (waterfall) {
+        second_texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto second = views->GetCPUDescriptorHandleForHeapStart();
+        second.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // The second texture exposes alpha as red so each descriptor and mip
+        // produces a distinct result from the same synthetic upload.
+        view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 1, 2, 0);
+        device->CreateShaderResourceView(second_texture.Get(), &view, second);
+    }
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -180,8 +195,14 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         from.PlacedFootprint = footprints[i];
         list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        if (second_texture) {
+            to.pResource = second_texture.Get();
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        }
     }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (second_texture)
+        transition(list, second_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};
@@ -192,8 +213,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const std::uint32_t constants[entry_constants] = {0, z_bits, 0, 0};
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
+    const D3D12_VIEWPORT viewport{0, 0, float(draw_size), float(draw_size), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(draw_size), LONG(draw_size)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -206,9 +227,13 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     list->CopyTextureRegion(&out, 0, 0, 0, &in, nullptr);
     commands.submit_and_wait(device);
 
-    const D3D12_RANGE read{0, 4 * sizeof(float)};
+    const UINT row_bytes = draw_size * 4 * sizeof(float);
+    const SIZE_T offset = static_cast<SIZE_T>(target_footprint.Offset);
+    const UINT pitch = target_footprint.Footprint.RowPitch;
+    const D3D12_RANGE read{offset, offset + (draw_size - 1) * pitch + row_bytes};
     check(readback->Map(0, &read, &mapped), "Map image 3D readback");
-    std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
+    for (UINT y = 0; y < draw_size; ++y)
+        std::memcpy(color + y * draw_size * 4, static_cast<std::uint8_t*>(mapped) + offset + y * pitch, row_bytes);
     readback->Unmap(0, &none);
     std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
                 one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",

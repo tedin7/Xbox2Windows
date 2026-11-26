@@ -7,6 +7,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 """
 import bisect
 from contextlib import suppress
+from copy import copy, deepcopy
 import functools
 import os
 import re
@@ -2392,6 +2393,85 @@ def mrtz_covers_every_path(ins, at):
 # Inline float constants of a packed binary16 operation and their binary16 words.
 PK_INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00, '2.0': 0x4000, '-2.0': 0xc000, '4.0': 0x4400, '-4.0': 0xc400}
 
+def pixel_waterfalls(ins):
+    """Collapse complete, straight-line descriptor waterfalls before building the HLSL CFG.
+
+    The compare partitions the incoming lanes by key, and the close removes that partition
+    from the saved EXEC. Each lane executes exactly one sample with its own key.
+    """
+    if not any(name == 'v_readfirstlane_b32' for _, _, name, _ in ins):
+        return ins, {}
+    branches = {i for i, (_, _, name, _) in enumerate(ins)
+                if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc'))}
+    if not branches:
+        return ins, {}
+    parsed = [parse(asm) for _, _, _, asm in ins]
+    lowered, samples, removed = [], {}, set()
+    dead = set()
+    entry_exec = True
+    i = 0
+    while i < len(ins):
+        name, ops, mods = parsed[i]
+        if name.startswith('s_movrel'):
+            return ins, {}
+        if (entry_exec and name == 's_mov_b64' and not mods and len(ops) == 2
+                and ops[1] == 'exec' and i + 11 < len(ins)):
+            _, head, compare, select, shift, load, ready, sample, wait, close, branch, restore = parsed[i:i + 12]
+            _, key, key_mods = head
+            if (head[0] == 'v_readfirstlane_b32' and len(key) == 2 and not key_mods
+                    and re.fullmatch(r's(?:[0-9]|[1-9][0-9]|10[0-5])', key[0])
+                    and re.fullmatch(r'v[0-9]+', key[1])
+                    and re.fullmatch(r'v_cmp_eq_[iu]32(?:_e(?:32|64))?', compare[0])
+                    and len(compare[1]) == 3 and compare[1][0] in ('vcc', 'vcc_lo')
+                    and compare[1][1:] in (key, key[::-1]) and not compare[2]
+                    and select[0] == 's_and_saveexec_b64' and not select[2]
+                    and len(select[1]) == 2 and select[1][1] == 'vcc'
+                    and shift == ('s_lshl_b32', [key[0], key[0], '5'], [])
+                    and load[0] == 's_load_dwordx8' and len(load[1]) == 3 and load[1][2] == key[0] and not load[2]
+                    and ready[0] == 's_waitcnt' and ready[1:] == (['lgkmcnt(0)'], [])
+                    and sample[0] == 'image_sample' and len(sample[1]) == 4 and sample[1][2] == load[1][0]
+                    and wait[0] == 's_waitcnt' and wait[1:] == (['vmcnt(0)'], [])
+                    and ((close == ('s_xor_b64', ['exec', 'exec', select[1][0]], [])
+                          and branch[0] == 's_cbranch_execnz')
+                         or (close == ('s_andn2_wrexec_b64', [select[1][0]] * 2, [])
+                             and branch[0] == 's_cbranch_scc1'))
+                    and branch[1:] == (['label_%#x' % ins[i + 1][0]], [])
+                    and restore == ('s_mov_b64', ['exec', ops[0]], [])):
+                regions = [reg_range(reg) for reg in (ops[0], select[1][0], load[1][0], load[1][1], sample[1][3])]
+                if any(not r or r[0] != 's' or r[2] > 105 for r in regions):
+                    return ins, {}
+                if [r[2] - r[1] + 1 for r in regions] != [2, 2, 8, 2, 4]:
+                    return ins, {}
+                words = [{f's{n}' for n in range(r[1], r[2] + 1)} for r in regions]
+                if len(set.union(*words, {key[0]})) != 19 or dead & (words[3] | words[4]):
+                    return ins, {}
+                # The unmodified vector key is bounded by a mask immediately before the save.
+                if not i:
+                    return ins, {}
+                mask_op, mask_args, mask_mods = parsed[i - 1]
+                if (mask_op not in ('v_and_b32', 'v_and_b32_e32', 'v_and_b32_e64') or mask_mods
+                        or len(mask_args) != 3 or mask_args[0] != key[1]
+                        or mask_args[1] not in ('1', '3', '7', '15', '31')):
+                    return ins, {}
+                site = ins[i + 7]
+                samples[site[0]] = (key[1], int(mask_args[1]) + 1, regions[3][1])
+                lowered.append(site)
+                removed.add(i + 10)
+                dead.update(words[0] | words[1] | words[2] | {key[0], 'vcc', 'vcc_hi', 'scc'})
+                i += 12
+                continue
+        if writes_exec(name, ops) and (name, ops) not in (
+                ('s_wqm_b64', ['exec', 'exec']), ('s_wqm_b32', ['exec_lo', 'exec_lo'])):
+            entry_exec = False
+        reads, writes, _ = scalar_effects(name, ins[i][3])
+        if dead & reads or ('scc' in dead and reads_scc(name, ins[i][3])):
+            return ins, {}
+        dead -= writes
+        lowered.append(ins[i])
+        i += 1
+    return (lowered, samples) if branches == removed else (ins, {})
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -2423,7 +2503,7 @@ class Stage:
     address_carry_pairs = ()
     address_carry_reader = None
 
-    def __init__(self, pipe, kind, code, refusals=None, decoded=None):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None, *, lower_waterfalls=True):
         self.pipe, self.kind = pipe, kind
         self.refusals = refusals
         self.raw_code = strip_header(code)
@@ -2450,6 +2530,19 @@ class Stage:
             pipe = getattr(self, 'pipe', None)
             self.ins = wave32_vcc_hi(self.ins, wave32=getattr(pipe, 'wave_size', None) == 32 or wave32_exec_proof(self.ins))
         if kind == 'ps':
+            if lower_waterfalls:
+                lowered, samples = pixel_waterfalls(self.ins)
+                if samples:
+                    # Prefer the old translation whenever it succeeds. Probe with private
+                    # registries so a refused translation cannot leave any bindings behind.
+                    probe = copy(pipe)
+                    for attr, value in vars(pipe).items():
+                        if isinstance(value, (dict, list, set)):
+                            setattr(probe, attr, deepcopy(value))
+                    try:
+                        Stage(probe, kind, code, lower_waterfalls=False)
+                    except Unsupported:
+                        self.ins, self.pixel_waterfall_samples = lowered, samples
             self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
@@ -7692,9 +7785,24 @@ class Stage:
                                  'mask and wave-uniform control flow')
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
-        desc_key = self.descriptor(ops[2])
-        tex = self.pipe.resource(desc_key, kinds[dim])
-        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+        waterfall = getattr(self, 'pixel_waterfall_samples', {}).get(getattr(self, 'pc', None))
+        if waterfall:
+            index, count, base = waterfall
+            ptr = self.sym.get(base)
+            if (not self.exec_known or getattr(self, 'helper_restore', False)
+                    or getattr(self, 'lane_exec_breaks', None) or dim != 'SQ_RSRC_IMG_2D' or 'a16' in mods):
+                raise Unsupported('pixel waterfall sample requires 2D coordinates and entry EXEC')
+            if not ptr or len(ptr) != 2 or ptr[0] != 'ptr' or ptr[1][0] != 'table':
+                raise Unsupported('pixel waterfall requires a bounded SRV descriptor table')
+            param = ptr[1][1]
+            if (param >= 16 or self.sym.get(base + 1) != ('const', 0)
+                    or self.pipe.root['params'][param].get('srv_prefix', 0) < count):
+                raise Unsupported('pixel waterfall requires a bounded SRV descriptor table')
+            tex = self.pipe.waterfall_texture(param, count, self.u(index))
+        else:
+            desc_key = self.descriptor(ops[2])
+            tex = self.pipe.resource(desc_key, kinds[dim])
+        if not waterfall and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
@@ -7807,6 +7915,10 @@ class Stage:
                 # each side applies besides the sampler's (the view's mip range) is assumed to agree.
                 call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
                     tex, smp, uv, tex, smp, uv)
+            elif waterfall:
+                # The collapsed loop has no divergent flow. Take derivatives of the
+                # shared coordinate expression before selecting a resource per lane.
+                call = '%s.SampleGrad(%s, %s, ddx(%s), ddy(%s))' % (tex, smp, uv, uv, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             elif len(self.blocks) > 0:
@@ -10942,6 +11054,7 @@ def parse_root(blob):
     for o in read('<%dI' % n, blob, 32):
         if blob[o:o + 4] == b'RTS0':
             d = blob[o + 8:]
+            part_size, = read('<I', blob, o + 4)
             ver, nparam, poff, nsamp, soff, flags = read('<6I', d, 0)
             params = []
             for i in range(nparam):
@@ -10949,6 +11062,15 @@ def parse_root(blob):
                 p = dict(type=ptype, vis=vis)
                 if ptype == 1:
                     p['reg'], p['space'], p['count'] = read('<3I', d, off)
+                end = min(part_size, len(d))
+                if ptype == 0 and ver in (1, 2) and vis in (0, 5) and off + 8 <= end:
+                    nrange, roff = read('<2I', d, off)
+                    size = 20 if ver == 1 else 24
+                    if nrange and roff + size <= end:
+                        rtype, count = read('<2I', d, roff)
+                        start, = read('<I', d, roff + size - 4)
+                        if rtype == 0 and start in (0, 0xffffffff) and count != 0xffffffff:
+                            p['srv_prefix'] = count
                 params.append(p)
             return dict(flags=flags, params=params)
     raise Unsupported('no RTS0 part')
@@ -11108,6 +11230,22 @@ class Pipeline:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
         r['calls'] = r.get('calls', 0) + 1
         return 'r%d' % r['index']
+
+    def waterfall_texture(self, param, count, index):
+        # These slots use the existing static table manifest and draw binding path.
+        # Keep the array contiguous even if another instruction uses a scalar SRV
+        # from the same guest table.
+        source = ('table', param, 'waterfall', count)
+        if (source, 0) not in self.resources:
+            if len(self.resources) + count > 32:
+                raise Unsupported('pixel waterfall exceeds the translated SRV limit')
+            for lane in range(count):
+                key = (source, 32 * lane)
+                self.resource(key, 'tex2d')
+                self.note_use(key, 'sample')
+                self.resources[key]['array'] = count if lane == 0 else 0
+        first = self.resources[source, 0]['index']
+        return 'wf%d[NonUniformResourceIndex(%s)]' % (first, index)
 
     def note_use(self, key, use):
         """Says what the shader does with the read resource it just asked for through resource(): 'sample' (Sample,
@@ -11271,6 +11409,10 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
+            if 'array' in r:
+                if r['array']:
+                    out.append('Texture2D<float4> wf%d[%d] : register(t%d);' % (r['index'], r['array'], r['index']))
+                continue
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))

@@ -1380,6 +1380,19 @@ OperationResult run_startup_image_2d_view(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-waterfall <vs.cso> <ps.cso> <sampler manifest line> reads a 2x2 quad.
+OperationResult run_startup_image_waterfall(const OperationContext& ctx)
+{
+    float color[16]{};
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+                           0, 3, true);
+    std::uint32_t bits[16];
+    std::memcpy(bits, color, sizeof(bits));
+    for (unsigned i = 0; i < 16; i += 4)
+        std::printf("waterfall_rgba=%08x,%08x,%08x,%08x\n", bits[i], bits[i + 1], bits[i + 2], bits[i + 3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array> <vs.cso> <ps.cso> <expected.bin>:
 // draws an 8x2 full-screen pair to an R32G32B32A32_UINT target against a two-mip (8x2 + 4x1) 2D or two-slice
 // 2D-array R16_UNORM / R32G32B32A32_FLOAT source texture and compares all 64 little-endian words with expected.bin.
@@ -1721,6 +1734,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-waterfall", 6, 6, nullptr, kNoGate, run_startup_image_waterfall},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
