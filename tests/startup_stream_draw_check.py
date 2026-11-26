@@ -1,6 +1,5 @@
 """Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
 import os
-import re
 from pathlib import Path
 import subprocess
 import sys
@@ -88,20 +87,6 @@ def check(directory, consumer, backend):
         if output.read_bytes() != expected:
             raise AssertionError(f"{mode}: got {output.read_bytes().hex()} expected {expected.hex()}")
         print(f"{backend} {mode} green={green}: 32 pixels exact, drawn byte {value}")
-    # The present-source line names what wrote the presented surface: the translated draw's key, or "no translated draw" when the
-    # target only holds its clear colour (the line is printed at present 6).
-    ps.write_bytes(pixel(False))
-    drawn_key = f"{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}"
-    sources = {}
-    for mode in ("draw", "clear"):
-        result = subprocess.run(args + [backend, output], env=dict(env, X2W_TEST_PRESENT_SOURCE=mode), capture_output=True, text=True, timeout=30)
-        if result.returncode or "x2w-render present source" not in result.stderr:
-            raise RuntimeError(f"present source {mode} failed on {backend}: {result.returncode}\n{result.stderr}")
-        sources[mode] = [l for l in result.stderr.splitlines() if "x2w-render present source" in l]
-    named = re.search(r"present source at [\d.]+ s: last translated draw into the presented surface key ([0-9a-f]{16}) \(target 0, format \d+, (\d+) draws into it\)", sources["draw"][0])
-    assert named and named.group(1) == drawn_key and int(named.group(2)) >= 1, (drawn_key, sources["draw"])
-    assert "no translated draw wrote the presented surface" in sources["clear"][0] and "last translated draw" not in sources["clear"][0], sources["clear"]
-    print(f"{backend}: present source names the drawn key {drawn_key}; a clear-only target says no translated draw")
     return 0
 
 
