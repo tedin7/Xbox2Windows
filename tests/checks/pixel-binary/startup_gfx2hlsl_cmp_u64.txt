@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_cmp_u64_check.py binary llvm-mc-15 llvm-objcopy-15

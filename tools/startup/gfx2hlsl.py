@@ -485,7 +485,7 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('%s reserved bit 16 set at +0x%x' % (name, off))
         if word1 & LDS_UNUSED_W1_MASK[name]:
             raise Unsupported('%s unused operand field set at +0x%x' % (name, off))
-    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_[iu]16_e64', name):
+    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_([iu]16|u64)_e64', name):
         # The decoder prints NEG on an inline integer as a sign (inline 1 with NEG reads `-1`, the same text as
         # inline -1), and LLVM 15 rejects `-v1` and `|v1|` on these sources: refuse either bit (VOP3 w0[10:8] ABS,
         # w1[31:29] NEG) so a printed -N is always a genuine inline integer.
@@ -9658,6 +9658,17 @@ class Stage:
                 reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
             raise Unsupported('%s into %s' % (base, ops[0]))
 
+    def _u64_source(self, base, tok):
+        """(low, high) words of a source of an unsigned 64-bit compare: a VGPR pair, an even SGPR pair or an inline
+        integer (-16..64, sign-extended to 64 bits as the hardware reads it). Literals, floats, vcc/exec pairs,
+        lane-mask SGPRs (u() would give the per-lane 0/1 projection, not the architectural mask) and the neg/abs
+        spellings are refused."""
+        reg = reg_range(tok)
+        if tok in FLOATS or tok in ('vcc', 'exec') or (
+                reg and reg[0] == 's' and any(w in self.masks for w in range(reg[1], reg[2] + 1))):
+            raise Unsupported('%s source %s' % (base, tok))
+        return self.i64_words(tok)
+
     def _low16_source(self, base, tok, signed):
         """A source of a 16-bit integer compare: bits 15:0 of the operand, sign- or zero-extended (RDNA 2 VOPC
         S0.i16 / S0.u16). A float token is refused: on a 16-bit operand the inline constants 240-248 are binary16
@@ -9768,10 +9779,13 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16|u64)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
+        # The unsigned 64-bit compares: six relations on register pairs and inline integers (no SDWA form exists).
+        if typ == 'u64' and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
         # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
@@ -9807,6 +9821,8 @@ class Stage:
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         elif typ in ('i16', 'u16'):
             x, y = (self._low16_source(base, t, typ == 'i16') for t in (a, b))
+        elif typ == 'u64':
+            x, y = (self._u64_source(base, t) for t in (a, b))
         else:
             x, y = self.u(a), self.u(b)
         def word(tok):
@@ -9818,7 +9834,11 @@ class Stage:
         ordered = ''
         if '{2}' in table[cond]:
             ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
-        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
+        if typ == 'u64':
+            condition = U64_COMPARE[cond].format(al=x[0], ah=x[1], bl=y[0], bh=y[1])
+        else:
+            condition = table[cond].format(x, y, ordered)
+        expr = '((%s) ? 1u : 0u)' % condition
         if not self.exec_known:
             expr = '(exec & %s)' % expr
         if writes_exec or dst in ('exec', 'exec_lo'):
@@ -10410,6 +10430,17 @@ VEC_U.update({
 })
 
 VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
+
+# Unsigned 64-bit VOPC relations on (low, high) uint words: the high words decide, the low words only on a tie.
+# Bitwise & and | on the bool results: both sides are plain words, so nothing needs short-circuit evaluation.
+U64_COMPARE = {
+    'lt': '(({ah} < {bh}) | (({ah} == {bh}) & ({al} < {bl})))',
+    'le': '(({ah} < {bh}) | (({ah} == {bh}) & ({al} <= {bl})))',
+    'gt': '(({ah} > {bh}) | (({ah} == {bh}) & ({al} > {bl})))',
+    'ge': '(({ah} > {bh}) | (({ah} == {bh}) & ({al} >= {bl})))',
+    'eq': '(({ah} == {bh}) & ({al} == {bl}))',
+    'ne': '(({ah} != {bh}) | ({al} != {bl}))',
+}
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
 # no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
