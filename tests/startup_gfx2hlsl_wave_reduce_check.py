@@ -567,6 +567,19 @@ def controls():
     text, reason = translate(branch_program('v_max_u32', False)[1])
     check('a forward execz branch is a wave vote and the chain still lowers', text is not None and
           'WaveActiveAnyTrue((exec & 1u) != 0u)' in text and 'WaveActiveMax(' in text, str(reason))
+    # Branchy pixel programs, assembled from source (wave32): a min chain under an SCC branch that follows the EXEC write, inside a
+    # two-pass loop with a uniform counter, and under a branch on an SCC made from lane data (refused by name).
+    sccz = bytes.fromhex('81000a3690000c2c810c0c36ff000836ffff00009000062cff000e165d9b0000830e0e2c8102107ec10381be810818368018847d090001d58002a9016a3c82be110084bfc13d80be020001d5c10e0200fa04042602b104fffa040426024e04fffa040426024105fffa040426024005ff0a0078d7020101020a0504260003febe010060d7023f01007e027e880003167e8700183a01021a7e0d1b1a4cf2021c7e0f1800f80b0c0d0e000081bf')
+    loop = bytes.fromhex('81000a3690000c2c810c0c36ff000836ffff00009000062cff000e165d9b0000830e0e2c8102107ec10381be810818368018847d090001d58002a901800386be6a3c82be140088bfc13d80be020001d5c10e0200fa04042602b104fffa040426024e04fffa040426024105fffa040426024005ff0a0078d7020101020a0504260003febe010060d7023f01000681068006820abfecff85bf7e027e880003167e8700183a01021a7e0d1b1a4cf2021c7e0f1800f80b0c0d0e000081bf')
+    lane = bytes.fromhex('81000a3690000c2c810c0c36ff000836ffff00009000062cff000e165d9b0000830e0e2c8102107ec10381be810818368018847d090001d58002a9016a810887110085bfc13d80be020001d5c10e0200fa04042602b104fffa040426024e04fffa040426024105fffa040426024005ff0a0078d7020101020a0504260003febe010060d7023f01000003167e8700183a01021a7e0d1b1a4cf2021c7e0f1800f80b0c0d0e000081bf')
+    for label, words, need in (('an SCC branch after the EXEC write', sccz, ('scc = WaveActiveAnyTrue(', 'WaveActiveMin(')),
+                               ('a two-pass loop', loop, ('[loop]', 'scc = s6 < 0x00000002u', 'WaveActiveMin('))):
+        text, reason = translate(words)
+        check('%s around the chain is a wave vote and the chain lowers' % label,
+              text is not None and all(piece in text for piece in need), str(reason))
+    text, reason = translate(lane)
+    check('a branch on an SCC from lane data refuses the wave-wide read, by name',
+          text is None and reason is not None and 'neither wave-uniform nor an EXEC / VCC vote' in reason, str(reason))
     for label, (source, words), fragment, model in refusals():
         text, reason = translate(words)
         check('refuses %s, by name' % label, text is None and reason is not None and 'wave reduction' in reason

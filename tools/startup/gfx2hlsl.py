@@ -2877,6 +2877,13 @@ class Stage:
         sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
         self.scc_effect = 'emitted'
         self.scc_verified = True
+        if expr == 'exec != 0' and getattr(self, 'wave_exec', False):
+            # SCC of a write to EXEC is "some lane of the wave has EXEC set": one value for the host wave (see set_exec_scc).
+            self.needs_sm6 = True
+            if self.tracks_uniformity():
+                self.scc_uniform = True
+            self.emit('scc = WaveActiveAnyTrue(%s);' % LE.EXEC_BIT)
+            return
         if self.tracks_uniformity():
             self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
@@ -3626,8 +3633,12 @@ class Stage:
         # A pixel program with a wave-wide read (a whole-wave reduction) and only forward branches decides every EXEC / VCC
         # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
         # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
-        self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
-                          and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
+        # A loop is allowed only with a reduction in it: every back edge must then be uniform or a vote as well.
+        forward_only = all(t > pc for pc, t in branches)
+        self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches)
+                          and ((self.holds_wave_reduction() and not self.quad_exec)
+                               or (forward_only and not self.quad_exec and self.skipped_scalar_read_later(branches))
+                               or (forward_only and self.holds_wave_reduction())))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
@@ -5970,6 +5981,14 @@ class Stage:
         self.exec_known = False
         self.scc_effect = 'emitted'
         self.scc_verified = True
+        if getattr(self, 'wave_exec', False):
+            # The guest's SCC is one bit for the wave: "some lane has EXEC set". Every thread of the host wave is here
+            # together (rule C1), so the vote gives it the same value in all of them and a branch on it is uniform.
+            self.needs_sm6 = True
+            self.emit('exec = (%s) & 1; scc = WaveActiveAnyTrue(%s);' % (expr, LE.EXEC_BIT))
+            if hasattr(self, 'scc_uniform'):
+                self.scc_uniform = True
+            return
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
