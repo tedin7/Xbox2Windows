@@ -143,10 +143,16 @@ PK_OPS = {'v_pk_mul_f16': ('mul', 2), 'v_pk_add_f16': ('add', 2), 'v_pk_fma_f16'
           'v_pk_min_f16': ('min', 2), 'v_pk_max_f16': ('max', 2)}
 
 
+# Group 4 of min/max: source 1 is the literal 0x7bef, read through its low half in both lanes (the only form the translator
+# takes: op_sel[1] = 0 and op_sel_hi[1] = 0); source 0 takes every lane selector.
+LIT = 0x7bef
+LIT_PAIRS = [([0, 0], [1, 0]), ([1, 0], [0, 0]), ([0, 0], [0, 0]), ([1, 0], [1, 0])]
+
+
 def pk_parse(key):
     name, half, group = key.split(':')
     kind, arity = PK_OPS[name]
-    pairs = M.combos(arity)[int(group) * 4:int(group) * 4 + 4]
+    pairs = LIT_PAIRS if int(group) == 4 else M.combos(arity)[int(group) * 4:int(group) * 4 + 4]
     return name, kind, arity, half, pairs
 
 
@@ -167,6 +173,8 @@ def pk_lane_ok(kind, words, sel, hi, half):
 def pk_lanes(key):
     name, kind, arity, half, pairs = pk_parse(key)
     seeds = M.sample(sum(map(ord, key)), 400, arity)
+    if key.endswith(':4'):
+        seeds = [(w[0], LIT) + tuple(w[2:]) for w in seeds]
     lanes = []
     for i in range(8):
         sel, hi = pairs[i % 4]
@@ -176,7 +184,7 @@ def pk_lanes(key):
     return [tuple(w) + (0,) * (3 - arity) for w in lanes]
 
 
-PK_KEYS = ['%s:%s:%d' % (n, h, g) for n in PK_OPS for g in range(4) for h in ('lo', 'hi')]
+PK_KEYS = ['%s:%s:%d' % (n, h, g) for n in PK_OPS for g in range(5 if n in ('v_pk_min_f16', 'v_pk_max_f16') else 4) for h in ('lo', 'hi')]
 for _key in PK_KEYS:
     DRAW[_key] = pk_lanes(_key)
 
@@ -194,6 +202,8 @@ def pk_body_source(key):
     for lane, (sel, hi) in enumerate(pairs):
         dst = 12 + lane
         srcs = ', '.join('v%d' % (lane + 4 * i) for i in range(arity))
+        if key.endswith(':4'):
+            srcs = 'v%d, 0x%x' % (lane, LIT)
         lines.append('%s v%d, %s op_sel:[%s] op_sel_hi:[%s]\n' % (name, dst, srcs, ','.join(map(str, sel)), ','.join(map(str, hi))))
         lines.append('v_and_b32 v%d, 0xffff, v%d\n' % (dst, dst) if half == 'lo' else 'v_lshrrev_b32 v%d, 16, v%d\n' % (dst, dst))
     return ''.join(lines)
@@ -341,6 +351,14 @@ BODY_WORDS.update({
         '0c5812cc00090200ff181836ffff00000d5812cc010b0208ff1a1a36ffff00000e5812cc020d0210ff1c1c36ffff00000f5812cc030f0218ff1e1e36ffff0000'),
     'v_pk_max_f16:hi:3': bytes.fromhex(
         '0c5812cc000902009018182c0d5812cc010b0208901a1a2c0e5812cc020d0210901c1c2c0f5812cc030f0218901e1e2c'),
+    'v_pk_min_f16:lo:4': bytes.fromhex(
+        '0c4011cc00ff0108ef7b0000ff181836ffff00000d4811cc01ff0100ef7b0000ff1a1a36ffff00000e4011cc02ff0100ef7b0000ff1c1c36ffff00000f4811cc03ff0108ef7b0000ff1e1e36ffff0000'),
+    'v_pk_min_f16:hi:4': bytes.fromhex(
+        '0c4011cc00ff0108ef7b00009018182c0d4811cc01ff0100ef7b0000901a1a2c0e4011cc02ff0100ef7b0000901c1c2c0f4811cc03ff0108ef7b0000901e1e2c'),
+    'v_pk_max_f16:lo:4': bytes.fromhex(
+        '0c4012cc00ff0108ef7b0000ff181836ffff00000d4812cc01ff0100ef7b0000ff1a1a36ffff00000e4012cc02ff0100ef7b0000ff1c1c36ffff00000f4812cc03ff0108ef7b0000ff1e1e36ffff0000'),
+    'v_pk_max_f16:hi:4': bytes.fromhex(
+        '0c4012cc00ff0108ef7b00009018182c0d4812cc01ff0100ef7b0000901a1a2c0e4012cc02ff0100ef7b0000901c1c2c0f4812cc03ff0108ef7b0000901e1e2c'),
 })
 
 
