@@ -399,6 +399,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             if (FAILED(static_cast<HRESULT>(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&more_allocator)))) ||
                 FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(more_allocator), 0,
                                                    word(&__uuidof(ID3D12GraphicsCommandList)), word(&more_list))))) return 72;
+            if (FAILED(static_cast<HRESULT>(invoke(more_list, 139, word(more_allocator))))) return 74;
             invoke(more_list, 32, 1, word(&heap));
             invoke(more_list, 25, word(slot67_pipeline));
             invoke(more_list, 33, word(slot67_root));
