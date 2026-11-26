@@ -1008,6 +1008,11 @@ add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_
 add_executable(startup_root_constant_store tests/startup_root_constant_store.cpp)
 target_compile_features(startup_root_constant_store PRIVATE cxx_std_17)
 add_test(NAME startup_root_constant_store COMMAND startup_root_constant_store)
+
+# SetPredication argument checks (src/startup_stubs/predication_args.h, #870).
+add_executable(startup_predication_args tests/startup_predication_args.cpp)
+target_compile_features(startup_predication_args PRIVATE cxx_std_17)
+add_test(NAME startup_predication_args COMMAND startup_predication_args)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
@@ -1676,6 +1681,21 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+# SOSetTargets through list slot 49 (#870): opt-in (X2W_D3D12_SO_TARGETS=1), records bind, partial unbind and rejected ranges.
+add_executable(startup_stream_output_slot tests/startup_stream_output_slot.cpp)
+target_compile_features(startup_stream_output_slot PRIVATE cxx_std_17)
+target_link_libraries(startup_stream_output_slot PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS on off)
+        add_test(NAME startup_stream_output_slot_${backend}_${mode} COMMAND startup_stream_output_slot ${backend} ${mode})
+        set(so_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+        if(mode STREQUAL on)
+            list(APPEND so_env "X2W_D3D12_SO_TARGETS=1")
+        endif()
+        set_tests_properties(startup_stream_output_slot_${backend}_${mode} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${so_env}")
+    endforeach()
+endforeach()
+
 # CopyResource, ResolveSubresource and CopyBufferRegion on a recording list (slots 17, 19 and 15).
 add_executable(startup_list_copy tests/startup_list_copy.cpp)
 target_compile_features(startup_list_copy PRIVATE cxx_std_17)
@@ -1745,6 +1765,11 @@ endforeach()
 # The same header without a GPU (src/startup_stubs/slice_footprints.h): accepted NV12 descriptions,
 # re-read intervals and size cap, the footprint request and the bytes up to the end of the last row.
 # The mutated run is the negative control.
+add_executable(startup_stream_output_targets_check tests/startup_stream_output_targets_check.cpp)
+target_include_directories(startup_stream_output_targets_check PRIVATE src)
+target_compile_features(startup_stream_output_targets_check PRIVATE cxx_std_17)
+add_test(NAME startup_stream_output_targets COMMAND startup_stream_output_targets_check)
+
 add_executable(startup_slice_footprints_check tests/startup_slice_footprints_check.cpp)
 target_include_directories(startup_slice_footprints_check PRIVATE src)
 target_compile_features(startup_slice_footprints_check PRIVATE cxx_std_17)

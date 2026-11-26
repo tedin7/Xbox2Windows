@@ -198,10 +198,22 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         return rejected ? rejected : 7;
     }
     stream_root = root;
-    if (std::strcmp(cbv_mode, "switch_root") == 0) {
-        root_cbv.Descriptor.ShaderRegister = 1;
+    char rc_mode[16]{};
+    GetEnvironmentVariableA("X2W_TEST_ROOT_CONSTANT", rc_mode, sizeof(rc_mode));
+    if (std::strcmp(cbv_mode, "switch_root") == 0 || std::strcmp(rc_mode, "switch_root") == 0) {
+        D3D12_ROOT_SIGNATURE_DESC alt_desc = root_desc;
+        D3D12_ROOT_PARAMETER alt_param = root_cbv;
+        if (std::strcmp(cbv_mode, "switch_root") == 0) {
+            alt_param.Descriptor.ShaderRegister = 1;
+        } else {
+            alt_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            alt_param.Constants = {1, 0, 1};
+            alt_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+        alt_desc.NumParameters = 1;
+        alt_desc.pParameters = &alt_param;
         ComPtr<ID3DBlob> alternate;
-        if (FAILED(serialize_root(root_desc, alternate)) ||
+        if (FAILED(serialize_root(alt_desc, alternate)) ||
             FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, alternate->GetBufferPointer(),
                                                             alternate->GetBufferSize(), __uuidof(ID3D12RootSignature),
                                                             &stream_alternate_root))) return 7;

@@ -1461,6 +1461,16 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return true;
     }
+    // A copy recorded under the guest predicate could be skipped and leave the texture stale, and
+    // lifting the predicate for it would sample the predicate buffer a second time (desktop
+    // SetPredication samples when the GPU reaches the command), so a write in between could flip
+    // a later draw. Refuse the combination instead: nothing is recorded, the texture stays not
+    // done, and the next unpredicated draw uploads it.
+    if (list && self->own().predication_buffer) {
+        static LONG refused;
+        if (first_calls(refused, 6)) log("x2w-draw texture upload %p refused: a guest predicate is active on this list", static_cast<void*>(texture));
+        return false;
+    }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
     if (dedicated) {
@@ -2921,6 +2931,14 @@ void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count,
 {
     store_root_constants(pass_of(self).compute_constants, "compute", parameter, count, data, offset);
 }
+// List slot 38 (desktop 34 + 4), SetGraphicsRoot32BitConstant(parameter, value, offset): one word of a root
+// constant. The word is kept for the draw like the ones of slot 40; a parameter of 16 or more or an offset of 8 or
+// more has no storage and the call is dropped. Nothing is forwarded to the desktop list.
+void __stdcall list_root_constant(Wrapper* self, UINT parameter, std::uint32_t value, UINT offset)
+{
+    if (!self || parameter >= 16 || offset >= 8) return;
+    pass_of(self).constants[parameter][offset] = value;
+}
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)
 {
@@ -2935,6 +2953,31 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
     for (UINT i = 0; i < count && i < 8 - start; ++i) {
         pass.vb[start + i] = views[i];
         pass.placed_vb[start + i] = placed_buffer_range(self->own().list_device, views[i].BufferLocation, views[i].SizeInBytes);
+    }
+}
+// List slot 49 (desktop 45 + 4), SOSetTargets(start, count, views). The bindings are kept on the pass;
+// draws do not write stream output yet (opt-in: X2W_D3D12_SO_TARGETS=1), so the first calls with a bound buffer are logged.
+void __stdcall list_stream_output_targets(Wrapper* self, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+{
+    static LONG logged;
+    x2w_startup::StreamOutputView kept[x2w_startup::stream_output_slot_count] = {};
+    const bool fits = start < x2w_startup::stream_output_slot_count && count <= x2w_startup::stream_output_slot_count - start;
+    const bool have_views = views && fits && x2w_local::readable(views, std::size_t{count} * sizeof(*views));
+    if (have_views)
+        for (UINT i = 0; i < count; ++i)
+            kept[i] = {views[i].BufferLocation, views[i].SizeInBytes, views[i].BufferFilledSizeLocation};
+    // An unreadable array is refused like one that does not fit; a null array unbinds.
+    if (views && !have_views) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u, views unreadable or out of range", start, count);
+        return;
+    }
+    Pass& pass = pass_of(self);
+    const auto result = x2w_startup::set_stream_output_targets(pass.stream_output, start, count, views ? kept : nullptr);
+    if (result == x2w_startup::StreamOutputResult::refused) {
+        if (first_calls(logged, 4)) log("x2w-render SOSetTargets refused: start %u, count %u (4 slots)", start, count);
+    } else if (result == x2w_startup::StreamOutputResult::applied && first_calls(logged, 4)) {
+        log("x2w-render SOSetTargets: start %u, count %u, %u bound (draws do not write stream output yet)", start, count,
+            pass.stream_output.bound_count());
     }
 }
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).

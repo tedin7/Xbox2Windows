@@ -59,12 +59,14 @@
 #include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/stream_output_targets.h"
 #include "startup_stubs/present_signature_sampler.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
+#include "predication_args.h"
 #include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
@@ -170,6 +172,9 @@ struct alignas(16) WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
+    ID3D12Resource* predication_buffer;  // CommandList: the guest predicate in force, or null
+    std::uint64_t predication_offset;
+    UINT predication_operation;
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
@@ -1858,6 +1863,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             state.list_scratch = nullptr;
             state.list_ready = false;
             state.list_open = true;
+            state.predication_buffer = nullptr;  // a desktop Reset clears predication
         }
     }
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -2648,6 +2654,7 @@ struct Pass {
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
+    x2w_startup::StreamOutputTargets stream_output;  // set by slot 49; recorded, not yet written by draws
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool targets_single_sample = false;
@@ -2689,6 +2696,17 @@ Pass& pass_of(Wrapper* self)
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
 }
+// Fixtures: the stream-output binding a list holds in a slot (BufferLocation, SizeInBytes, BufferFilledSizeLocation).
+// Returns 1 if the slot is bound, 0 if empty, -1 for a bad list or slot.
+extern "C" __declspec(dllexport) int x2w_d3d12_stream_output_slot(void* list, unsigned slot, unsigned long long* out)
+{
+    Wrapper* l = as_wrapper(list);
+    if (!l || l->own().kind != list_kind || slot >= x2w_startup::stream_output_slot_count) return -1;
+    const auto& v = pass_of(l).stream_output.views[slot];
+    if (out) { out[0] = v.location; out[1] = v.size; out[2] = v.filled_size_location; }
+    return v.location != 0;
+}
+
 
 bool indirect_copy_ranges()
 {
@@ -3919,6 +3937,46 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     }
 }
 
+// List slot 59 (desktop 55 + 4), SetPredication(buffer, offset, operation). A null buffer turns predication off.
+// A buffer must be a default-heap desktop buffer; it is moved to the predication state before the call.
+void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset, UINT operation)
+{
+    const auto refuse = [](const char* reason) {
+        static LONG refusals;
+        if (first_calls(refusals, 16)) log("x2w-render SetPredication refused: %s", reason);
+    };
+    auto* list = recording(self);
+    if (!list) return refuse("list is closed");
+    Wrapper* buffer = as_wrapper(buffer_arg);
+    const bool has_buffer = buffer_arg != nullptr;
+    if (has_buffer && (!buffer || buffer->own().kind != resource_kind || !buffer->own().real))
+        return refuse("buffer has no desktop resource");
+    auto* resource = has_buffer ? static_cast<ID3D12Resource*>(buffer->own().real) : nullptr;
+    const auto desc = has_buffer ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+    // Width is the size in bytes only for a buffer, so the Dimension check must stay above check(), which takes it as the size.
+    if (has_buffer && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return refuse("predication needs a buffer");
+    switch (x2w_predication::check(has_buffer, offset, operation, desc.Width)) {
+    case x2w_predication::Verdict::clear:
+        self->own().predication_buffer = nullptr;
+        list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        return;
+    // set: the arguments are valid, but the heap and state checks below can still refuse; the list then keeps its previous predication.
+    case x2w_predication::Verdict::set: break;
+    case x2w_predication::Verdict::bad_operation: return refuse("operation is not 0 or 1");
+    case x2w_predication::Verdict::bad_offset: return refuse("offset is not a multiple of 8");
+    case x2w_predication::Verdict::outside_buffer: return refuse("value is outside the buffer");
+    }
+    // Only a DEFAULT heap buffer is tracked from COMMON; upload and readback heaps are fixed to
+    // GENERIC_READ / COPY_DEST and cannot enter the predication state.
+    D3D12_HEAP_PROPERTIES heap{};
+    if (FAILED(resource->GetHeapProperties(&heap, nullptr)) || heap.Type != D3D12_HEAP_TYPE_DEFAULT)
+        return refuse("buffer is not in a default heap");
+    require_state(self, resource, D3D12_RESOURCE_STATE_PREDICATION);
+    self->own().predication_buffer = resource;
+    self->own().predication_offset = offset;
+    self->own().predication_operation = operation;
+    list->SetPredication(resource, offset, static_cast<D3D12_PREDICATION_OP>(operation));
+}
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -7457,9 +7515,15 @@ void build_tables()
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
         list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
         list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
+
+        list_typed[38] = reinterpret_cast<ListTyped>(&list_root_constant);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        // Slot 49 is inferred from the desktop order (45 + 4), with no independent evidence yet: opt in.
+        if (x2w_local::env_on("X2W_D3D12_SO_TARGETS")) list_typed[49] = reinterpret_cast<ListTyped>(&list_stream_output_targets);
+
+        list_typed[59] = reinterpret_cast<ListTyped>(&list_set_predication);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
         // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
         // bindings are opt-in. Unset, the slots stay no-ops.

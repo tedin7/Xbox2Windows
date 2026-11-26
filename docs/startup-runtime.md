@@ -721,6 +721,18 @@ These slots have not been seen in a title log yet. Slot 16 is described in [Comm
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
 resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
 
+## Single root constants
+
+Command-list slot 38 (desktop `SetGraphicsRoot32BitConstant` plus four) takes `(parameter, value, offset)` and stores one
+word in the same per-list table as slot 40, which a translated shader reads through a `rootconst` manifest entry. A parameter
+of 16 or more or an offset of 8 or more has no storage and the call is dropped without a log line. Nothing is forwarded
+to the desktop list. Setting the graphics root signature to a different signature clears every stored constant, as it
+clears the root addresses; setting the same one again keeps them (this also applies to slot 40). The slot number is derived
+from the desktop order and the console shift, not yet seen in a title log. The
+`startup_mrt_{fxc,dxc}_{warp,hardware}` tests drive it with eleven cases: set, overwrite, an offset that is and is not the one
+the shader reads, preserving an offset written through slot 40 while writing another through slot 38, the last stored slot
+(15, 7), four out-of-range calls, the same root signature again, a switched one and no call.
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
@@ -1545,6 +1557,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
+| `X2W_D3D12_SO_TARGETS=1` | with `X2W_D3D12_PERMISSIVE=1`, records `SOSetTargets` (list slot 49, inferred from the desktop order 45 + 4, no independent evidence yet) on the recording list: bind, partial unbind and refused ranges. Draws do not write stream output yet (`ctest --preset dev --no-tests=error -R ^startup_stream_output_slot_warp_`) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
