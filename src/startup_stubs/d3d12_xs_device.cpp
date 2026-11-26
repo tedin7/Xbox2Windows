@@ -2235,7 +2235,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         AcquireSRWLockExclusive(&shown_lock);
         shown_pixels.resize(shown_width * shown_height);
     }
-    std::uint64_t sum = 0, alpha_sum = 0;
+    std::uint64_t sum = 0, alpha_sum = 0, luma_squares = 0;  // luma_squares: for the spread of the picture (flat fill or detail)
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -2244,6 +2244,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
             if (!raw) shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
             sum += r + g + b;
+            { const unsigned luma = (r + g + b) / 3; luma_squares += static_cast<std::uint64_t>(luma) * luma; }
             alpha_sum += texel[3];
         }
     }
@@ -2286,8 +2287,12 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         return;
     }
     const LONG count = InterlockedIncrement(&shown_frames);
-    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
-                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
+    // Spread of the luma over the picture: near 0 is a flat fill or fade, a lit scene is tens.
+    const double pixels_seen = 1.0 * shown_width * shown_height;
+    const double luma_mean = sum / (3.0 * pixels_seen);
+    const double luma_spread = std::sqrt((std::max)(0.0, luma_squares / pixels_seen - luma_mean * luma_mean));
+    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255, spread %.2f",
+                  desc.Width, desc.Height, desc.Format, count, luma_mean, luma_spread);
     // Also whenever the picture's mean level moved by more than 2 since the last line (a screen change shows in the log
     // with its time; at most 300 such lines), not only for the first 3 readbacks and every 40th.
     static double last_logged_mean = -1000;
@@ -7757,6 +7762,22 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        // What moved since the last report: at the first interval of a gray (or white) picture the counter that jumped names the branch
+        // (constants refused, null textures, draws not drawn, compute refused, texture uploads failing).
+        static long last[9];
+        const UploadRingStats ring_now = upload_ring_stats();
+        const long now_values[9] = {ring_now.refusals, null_total, null_causes[5], untranslated_draws, translated_draws,
+                                    compute_dispatches_translated, compute_dispatches_refused, textures_unreadable, list_copies_refused};
+        char text[360];
+        std::snprintf(text, sizeof(text),
+                      "x2w-gray interval (frame %ld): ring refusals +%ld, null bindings +%ld (ring_full +%ld), draws not drawn +%ld, translated draws +%ld, "
+                      "compute translated +%ld, compute refused +%ld, textures unreadable +%ld, list copies refused +%ld",
+                      frame, now_values[0] - last[0], now_values[1] - last[1], now_values[2] - last[2], now_values[3] - last[3],
+                      now_values[4] - last[4], now_values[5] - last[5], now_values[6] - last[6], now_values[7] - last[7], now_values[8] - last[8]);
+        std::memcpy(last, now_values, sizeof(last));
+        log("%s", text);
+    }
     if (render_mode() && frame % 300 == 0) {
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
