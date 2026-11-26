@@ -2078,7 +2078,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
   first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
-  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages and a changed EXEC are refused (branches and loops: see below), as are `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
   with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
@@ -2103,6 +2103,15 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
+- **DPP quad reads in branches and loops.** The quad swaps, broadcasts and pair broadcasts above also lower in a pixel
+  program with branches or loops when a whole-program check proves that the four threads of the quad reach the read
+  together: the `s_wqm exec, exec` runs before every branch and target, no other EXEC write can reach the read (an
+  exact-mask restore after the last read is fine), and every conditional branch that can reach it is wave-uniform
+  (SCC proven uniform; `s_cbranch_execz`/`execnz` under the whole-quad mask). A `vccz`/`vccnz` loop, SCC taken from a
+  lane mask, an EXEC write inside the loop and a late `s_wqm` are refused with the offset that breaks the proof. No
+  wave size is assumed. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_flow"`: the draws on
+  WARP and hardware run swap, broadcast and pair reads inside a five-pass scalar loop with an `if`, compare 16 x 16
+  pixels with a CPU reference, and require wrong-lane translations to fail.
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
