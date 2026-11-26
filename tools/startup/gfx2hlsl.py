@@ -7307,12 +7307,12 @@ class Stage:
         # address dword, so their address is x then level; Texture1D.SampleLevel takes the location as a
         # float, which is what the `one` branch below builds. Anything else stays refused by name.
         if one:
-            expected = {'sample': 1, 'lz': 1, 'l': 2}.get(how)
+            expected = {'sample': 1, 'lz': 1, 'l': 2, 'load': 1, 'load_mip': 2}.get(how)
             if expected is None or len(cs) != expected or not dmask:
                 raise Unsupported('unverified 1D image %s address or modifiers' % how)
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or (how != 'sample' and m in ('dlc', 'glc', 'slc'))):
-                    raise Unsupported('1D image %s modifier %s' % (how, m))
+                    raise Unsupported('unverified 1D image %s address or modifiers' % how)
         lod = bias = None
         grads = None
         if how == 'd':
@@ -7389,7 +7389,7 @@ class Stage:
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
-            axes = 3 if three else 2
+            axes = 1 if one else 3 if three else 2
             packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
             packed_d16 = how in ('load', 'load_mip') and 'd16' in mods
             allowed = ('unorm', 'glc', 'slc', 'dlc')
