@@ -4602,7 +4602,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast f-second-fill g-swapped-offsets g-overlap
                 j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept
                 n-dropped-broadcast p-dropped-andn2 p-dropped-or p-block-entered q-block-entered q-not-all-ones
-                s-min-strict s-borrow-flipped)
+                s-min-strict s-borrow-flipped lds-copy-same-lane lds-8x8-same-lane lds-16x16-same-lane
+                lds-4x4x2-same-lane)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})

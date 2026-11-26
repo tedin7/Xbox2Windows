@@ -494,6 +494,56 @@ WORDS_F = bytes.fromhex(
     '7fc08cbf00008abfff08103a80000000ff101036fc0000001000d8d8080000067fc08cbf8002107e'
     'a400d8d8080000077fc08cbf0786158f1500124a83121234001074e009060480000081bf')
 
+# Fill offset 16 with packed XYZ coordinates, then read from the selected peer.
+# The UAV address uses the original thread's flat index.
+LDS_LOCAL = {
+    'lds-copy': ((8, 1, 1), 1, 4, 1, 'v_mov_b32 v3, v0\nv_mov_b32 v0, 0\n'),
+    'lds-8x8': ((8, 8, 1), 2, 8, 1, 'v_lshl_add_u32 v3, v1, 3, v0\n'),
+    'lds-16x16': ((16, 16, 1), 2, 16, 3,
+                  'v_mul_lo_u32 v3, v1, 16\nv_add_nc_u32 v3, v0, v3\n'),
+    'lds-4x4x2': ((4, 4, 2), 3, 16, 1,
+                  'v_lshl_add_u32 v3, v2, 2, v1\nv_lshl_add_u32 v3, v3, 2, v0\n'),
+}
+
+LDS_LOCAL_WORDS = {
+    'lds-copy': (
+        '06038abe80038bbe05030cf4000000fa7fc08cbf0003067e8002007e03030a7e82060834100034d8040500007fc08cbf'
+        '00008abf9008103a9c1010361000d8d8080000067fc08cbf001070e004060480000081bf'),
+    'lds-8x8': (
+        '06038abe80038bbe05030cf4000000fa7fc08cbf030046d701070104050046d7010b010482060834100034d804050000'
+        '7fc08cbf00008abfa008103aff101036fc0000001000d8d8080000067fc08cbf001070e004060480000081bf'),
+    'lds-16x16': (
+        '06038abe80038bbe05030cf4000000fa7fc08cbf030069d5012101000007064a050046d7010b010482060834100034d8'
+        '040500007fc08cbf00008abfc008103aff101036fc0300001000d8d8080000067fc08cbf001070e004060480000081bf'),
+    'lds-4x4x2': (
+        '06038abe80038bbe05030cf4000000fa7fc08cbf030046d702050504030046d703050104050046d7020b0504050046d7'
+        '050b010482060834100034d8040500007fc08cbf00008abfc008103aff1010367c0000001000d8d8080000067fc08cbf'
+        '001070e004060480000081bf'),
+}
+
+
+def lds_local_source(local, peer, index_setup):
+    x, y, z = local
+    if z > 1:
+        data = 'v_lshl_add_u32 v5, v2, 5, v1\nv_lshl_add_u32 v5, v5, 5, v0\n'
+    elif y > 1:
+        data = 'v_lshl_add_u32 v5, v1, 5, v0\n'
+    else:
+        data = 'v_mov_b32 v5, v3\n'
+    return SOURCE_F.split('s_lshl_b32', 1)[0] + index_setup + data + f"""\
+v_lshlrev_b32 v4, 2, v3
+ds_write_b32 v4, v5 offset:16
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v8, {4 * peer:#x}, v4
+v_and_b32 v8, {4 * (x * y * z - 1):#x}, v8
+ds_read_b32 v6, v8 offset:16
+s_waitcnt lgkmcnt(0)
+buffer_store_dword v6, v4, s[16:19], 0 offen
+s_endpgm
+"""
+
+
 # Case F-two-fills keeps the first bank and writes each lane's byte address to a second bank.
 # Broadcast lane 37 from the second bank while the peer read still addresses the first.
 SOURCE_F2 = SOURCE_F.replace('ds_write_b32 v4, v5 offset:16',
@@ -685,6 +735,9 @@ CASES = {
     'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
     'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     'F-two-fills': (SOURCE_F2, WORDS_F2, USER7 | TGID_X | (2 << 15), (64, 1, 1), (2, 1, 1)),
+    **{name: (lds_local_source(local, peer, setup), bytes.fromhex(LDS_LOCAL_WORDS[name]),
+              USER7 | tidig(components) | units << 15, local, (1, 1, 1))
+       for name, (local, components, peer, units, setup) in LDS_LOCAL.items()},
     'J': (SOURCE_J, WORDS_J, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
@@ -974,6 +1027,13 @@ def expected(name):
                 base = lane & 31
                 index = 2 * (64 * group + lane)
                 out[index:index + 2] = [stored[base + first], stored[base + second]]
+        return out
+    if name in LDS_LOCAL:
+        x, y, z = local
+        _, _, peer, _, _ = LDS_LOCAL[name]
+        for lane in range(x * y * z):
+            neighbor = lane ^ peer
+            out[lane] = neighbor % x | (neighbor // x % y) << 5 | (neighbor // (x * y)) << 10
         return out
     if name in ('F', 'F-two-fills'):
         for group in range(2):
@@ -1409,8 +1469,8 @@ def check_lds():
     sync = 'GroupMemoryBarrierWithGroupSync();'
     assert hlsl.count(sync) == 1 and hlsl.index('] = v5;') < hlsl.index(sync) < hlsl.index('v6 = lds[')
     for old, new, reason in (
-        ('82000834', '8002007e82000834', 'unchanged entry local X'),  # write v0 before computing the address
-        ('82000834', '00cb087e82000834', 'unchanged entry local X'),  # v_swap also writes its second operand
+        ('82000834', '8002007e82000834', 'one bounded dword'),  # write v0 before computing the address
+        ('82000834', '00cb087e82000834', 'simple address setup'),  # v_swap also writes its second operand
         ('82000834', '82020834', 'one bounded dword'),              # use Y instead of X
         (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
         (store, store + store, 'disjoint'),                           # overlapping fill
@@ -1432,7 +1492,21 @@ def check_lds():
     base = USER7 | TGID_X
     for units in (0, 65):
         refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
-    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+    refused('one bounded dword', lambda: translate('F', group=(32, 2, 1)))
+    for name, (local, components, _, _, _) in LDS_LOCAL.items():
+        shader = translate(name).hlsl_cs()
+        assert '[numthreads(%d, %d, %d)]' % local in shader
+        for axis in range(components):
+            assert 'v%d = tid.%s;' % (axis, 'xyz'[axis]) in shader
+        mutate(shader, name + '-same-lane')
+    # A missing Y VGPR, wrong row stride, or overwritten alias cannot prove a bijective fill.
+    refused('one bounded dword', lambda: translate('lds-8x8', rsrc2=USER7 | 1 << 15))
+    refused('one bounded dword', lambda: translate('lds-8x8', code=patch(
+        CASES['lds-8x8'][1], '030046d701070104', '030046d701050104')))
+    refused('one bounded dword', lambda: translate('lds-copy', code=patch(
+        CASES['lds-copy'][1], '8002007e', '8002067e')))
+    # Each of the 256 threads needs its own dword after the 16-byte offset.
+    refused('one bounded dword', lambda: translate('lds-16x16', rsrc2=USER7 | tidig(2) | 2 << 15))
     # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
     at_end = patch(WORDS_F, store, '000134d804050000')
     at_end = patch(at_end, peer, '0001d8d808000006')
@@ -2301,6 +2375,8 @@ def check_binary(llvm_mc):
 MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
+    **{name + '-same-lane': (name, f'0x{4 * peer:08x}u ^ v4', 'v4')
+       for name, (_, _, peer, _, _) in LDS_LOCAL.items()},
     'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
     # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
     's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
@@ -2343,6 +2419,8 @@ CONTROLS = {
 
 # First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
+    **{name + '-same-lane': f'word=0 expected={expected(name)[0]:08x} actual=00000000'
+       for name in LDS_LOCAL},
     'join-load-zero': 'word=0 expected=8b02a7f1 actual=00000000',
     'f-second-fill': 'word=1 expected=00000094 actual=00000000',
     'd-mask': 'word=8 expected=00000008 actual=00000009',

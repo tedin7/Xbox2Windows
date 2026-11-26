@@ -1434,19 +1434,46 @@ def lds_byte_offsets(name, mods):
     return first, second
 
 
-# (is_write, byte_width, fill_shift, fill_unit_name)
+# (is_write, byte_width, fill_unit_name)
 LDS_EXCHANGE_OPS = {
-    'ds_write_b32': (True, 4, '2', 'dword'),
-    'ds_read_b32': (False, 4, None, 'dword'),
-    'ds_read2_b32': (False, 4, None, 'dword'),
-    'ds_write_b64': (True, 8, '3', 'qword'),
-    'ds_read_b64': (False, 8, None, 'qword'),
-    'ds_write_b128': (True, 16, '4', 'quad-dword'),
-    'ds_read_b128': (False, 16, None, 'quad-dword'),
+    'ds_write_b32': (True, 4, 'dword'),
+    'ds_read_b32': (False, 4, 'dword'),
+    'ds_read2_b32': (False, 4, 'dword'),
+    'ds_write_b64': (True, 8, 'qword'),
+    'ds_read_b64': (False, 8, 'qword'),
+    'ds_write_b128': (True, 16, 'quad-dword'),
+    'ds_read_b128': (False, 16, 'quad-dword'),
 }
 
 
-def check_lds_exchange(ins, group, words):
+def lds_index_terms(name, args, terms):
+    """Track coefficients of tid.x, tid.y and tid.z in uint VGPR arithmetic."""
+    def scale(src, literal, shift=False):
+        if src not in terms or not re.fullmatch(r'0x[0-9a-f]+|\d+', literal):
+            return None
+        factor = int(literal, 0)
+        if shift:
+            factor = 1 << (factor & 31)
+        return tuple((term * factor) & 0xffffffff for term in terms[src])
+
+    if name == 'v_mov_b32' and len(args) == 1:
+        return terms.get(args[0])
+    if name == 'v_lshlrev_b32' and len(args) == 2:
+        return scale(args[1], args[0], shift=True)
+    if name == 'v_mul_lo_u32' and len(args) == 2:
+        return scale(*args) or scale(*reversed(args))
+    if name == 'v_add_nc_u32' and len(args) == 2:
+        left, right = map(terms.get, args)
+    elif name == 'v_lshl_add_u32' and len(args) == 3:
+        left, right = scale(args[0], args[1], shift=True), terms.get(args[2])
+    else:
+        return None
+    if left is not None and right is not None:
+        return tuple((a + b) & 0xffffffff for a, b in zip(left, right))
+    return None
+
+
+def check_lds_exchange(ins, group, words, thread_components=1):
     """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
 
     RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
@@ -1456,12 +1483,18 @@ def check_lds_exchange(ins, group, words):
     LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
     """
     # One reason per failed condition, with the measured value, so a refusal count says which limit the title exceeds.
-    if group[0] < 1 or group[1:] != (1, 1):
-        raise Unsupported('LDS exchange needs a 1D group (the group is %dx%dx%d)' % tuple(group))
+    if min(group) < 1:
+        raise Unsupported('LDS exchange needs positive group dimensions (the group is %dx%dx%d)' % tuple(group))
     if words == 0:
         raise Unsupported('LDS exchange needs a nonzero LDS allocation (COMPUTE_PGM_RSRC2 allocates 0 bytes)')
     if not 0 < words <= 8192:
         raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
+    x, y, z = group
+    # Entry VGPRs map to SV_GroupThreadID. Unit axes contribute zero, and disabled
+    # components have no proven value. The byte address must be width * (xID + X * (yID + Y * zID)).
+    terms = {'v%d' % axis: tuple(int(axis == i and dim > 1) for i, dim in enumerate(group))
+             for axis in range(thread_components)}
+    strides = tuple(stride if dim > 1 else 0 for stride, dim in zip((1, x, x * y), group))
     fill_spans = []
     published = False
     read = False
@@ -1478,7 +1511,7 @@ def check_lds_exchange(ins, group, words):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
         elif base in LDS_EXCHANGE_OPS:
-            write, width, shift, unit_name = LDS_EXCHANGE_OPS[base]
+            write, width, unit_name = LDS_EXCHANGE_OPS[base]
             dwords = width // 4
             addr_op = ops[0] if (write and len(ops) == 2) else (ops[1] if len(ops) == 2 else '')
             val_op = ops[1] if (write and len(ops) == 2) else (ops[0] if len(ops) == 2 else '')
@@ -1495,12 +1528,11 @@ def check_lds_exchange(ins, group, words):
             producer, args, modifiers = prev
             if write:
                 offset, = offsets
-                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
                 # 8-byte / 16-byte alignment is not required for LDS dword-addressed writes.
-                end = offset + group[0] * width
+                end = offset + x * y * z * width
                 if (offset % 4 or end > words * 4 or published
                         or fill_spans and (base != 'ds_write_b32' or producer != 'ds_write_b32')):
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
+                    raise Unsupported('LDS exchange needs one bounded %s per local thread' % unit_name)
                 if fill_spans:
                     if len(fill_spans) != 1:
                         raise Unsupported('LDS exchange allows at most two consecutive bounded dword fills')
@@ -1510,8 +1542,8 @@ def check_lds_exchange(ins, group, words):
                     start0, end0 = fill_spans[0]
                     if offset < end0 and start0 < end:
                         raise Unsupported('LDS dword fills must be disjoint')
-                elif producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0'] or modifiers:
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
+                elif terms.get(addr_op) != tuple(width * stride for stride in strides):
+                    raise Unsupported('LDS exchange needs one bounded %s per local thread' % unit_name)
                 fill_spans.append((offset, end))
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
@@ -1536,10 +1568,14 @@ def check_lds_exchange(ins, group, words):
             raise Unsupported('LDS exchange does not cover ' + asm)
         elif not fill_spans and not base.startswith('s_'):
             # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
-            # can also change a source. After the fill, each read proves its own address without the entry X ID.
+            # can also change a source. After the fill, each read proves its own address.
             if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
-                    or not ops or not re.fullmatch(r'v[0-9]+', ops[0]) or ops[0] == 'v0'):
-                raise Unsupported('LDS fill needs the unchanged entry local X ID')
+                    or not ops or _lds_single(ops[0]) is None):
+                raise Unsupported('LDS fill needs simple address setup from the entry local IDs')
+            value = None if mods else lds_index_terms(base, ops[1:], terms)
+            terms.pop(ops[0], None)
+            if value is not None:
+                terms[ops[0]] = value
         prev = base, ops, mods
     if not read:
         raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
@@ -5100,7 +5136,7 @@ class Stage:
                 try:
                     if getattr(self, 'pipe', None) is None:
                         raise Unsupported('LDS exchange needs pipeline metadata')
-                    check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                    check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words, self.pipe.entry[2])
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)

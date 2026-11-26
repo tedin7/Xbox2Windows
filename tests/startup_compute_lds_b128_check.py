@@ -341,15 +341,15 @@ def check_controls():
     ]
     G.check_lds_exchange(b64_to_b128, (4, 1, 1), 128)  # [8, 40): read [24, 40) fits
     # Each limit has its own refusal naming the measured value (a census says which one the title exceeds).
-    refused('needs a 1D group (the group is 8x4x1)', lambda: G.check_lds_exchange(b64_to_b128, (8, 4, 1), 128))
-    refused('needs a 1D group (the group is 4x1x2)', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 2), 128))
+    refused('one bounded qword per local thread', lambda: G.check_lds_exchange(b64_to_b128, (8, 4, 1), 128))
+    refused('one bounded qword per local thread', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 2), 128))
     refused('needs a nonzero LDS allocation', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 1), 0))
     refused('at most 32 KiB (COMPUTE_PGM_RSRC2 allocates 33 KiB)', lambda: G.check_lds_exchange(b64_to_b128, (4, 1, 1), 8448))
     bad_b64_to_b128 = list(b64_to_b128)
     bad_b64_to_b128[5] = (24, 8, 'ds_read_b128', 'ds_read_b128 v[8:11], v8 offset:28')  # [28, 44) overflows 40
     refused('initialized span', lambda: G.check_lds_exchange(bad_b64_to_b128, (4, 1, 1), 128))
 
-    # Unaligned offsets, wrong shift, missing barrier/waitcnt, double fill/barrier, unprovable address, gds, EXEC/branch/non-1D.
+    # Unaligned offsets, wrong shift, missing barrier/waitcnt, double fill/barrier, unprovable address, gds, EXEC and branch.
     wait = '7fc08cbf'
     barrier = '00008abf'
     nop = '000080bf'
@@ -371,7 +371,7 @@ def check_controls():
             lambda: translate_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', nop)))                               # non-producer s_nop before read
     refused('entry EXEC', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '8003febe' + store_q)))
     refused('straight-line', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
-    refused('1D group', lambda: translate_case('Q', group=(16, 2, 1)))
+    refused('one bounded quad-dword per local thread', lambda: translate_case('Q', group=(16, 2, 1)))
     refused('completed read', lambda: G.check_lds_exchange(b64_to_b128[:4] + [b64_to_b128[-1]], (4, 1, 1), 128))
     refused('does not cover', lambda: G.check_lds_exchange([
         (0, 4, 'v_lshlrev_b32', 'v_lshlrev_b32 v4, 4, v0'),
