@@ -899,6 +899,31 @@ print the same results and write the same failures as one, an unexpected transla
 `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
 with a child process.
 
+### One command for a run and its report
+
+`tools/startup/tester_run.ps1` checks that the build in `-BuildDir` is from the checkout's commit (building only the
+`startup_runtime` target if not), runs the title with `run.ps1 -Render -Translate -FakeUser -GpuMirror` against one shader
+cache folder per translator revision (`out\startup\shader_cache_<revision>`, kept across runs), and packs every log of the
+run with a `manifest.json` into `out\tester\report_<commit>_<time>.zip`, split into numbered parts of at most `-LimitMB`
+(default 20) so each part fits a mail. The manifest records the commit, the input script, the `X2W_*` variables, the
+adapter and driver, the job memory cap and the cache counts at the start; the shader cache, memory dumps and game files
+are never in the zip.
+
+- The job memory cap (`run.ps1 -MemoryGiB`) is 75% of physical RAM, at least 14 GiB, unless `-MemoryGiB` says otherwise.
+- `-Input menus` presses D-pad down, down, A every 6 s from 5 s after the first pad poll, up to 500 s; `-Input menus2` waits
+  after every A until the presented picture has changed and settled (see "Waiting for the presented picture"); any other
+  value is a raw `X2W_INPUT_SCRIPT`.
+- Lazy memory commit is on (`run.ps1 -LazyMemory`, `-NoLazyMemory` turns it off) and the 0x283 startup blocks are placed
+  below 2^40 (`-NoStartupBelow40` turns it off).
+- After the zip is packed, one translator pass runs over the cache (`-FinishTranslateSeconds`, default 900, 0 skips) so the
+  next run starts with every request already translated; the script prints the pending count before and after.
+- A request counts as translated when its manifest `<key>.txt` and its bytecode are on disk, the translator's own test;
+  the start line says how many translations, requests and refusals the cache held.
+
+`startup_tester_pack` checks the zip, the split, the input presets and the cache count against the translator's own
+pending test; `startup_tester_run_ps1` runs the script in a scratch tree with a stub launcher (stale build refused, cache
+reuse and per-revision folders, run arguments, switches, the finish pass and its cap, a build tool that writes to stderr).
+
 ### Compute pipeline requests
 
 Device slot 67 creates a pipeline from a console compute program. The stand-in reads 12 64-bit words of the
