@@ -291,7 +291,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 # Order: the oldest published request first; under --watch the ones published after the watcher started go first.
-def recorded_order(d, since=None, rescan=False, on_call=None):
+def recorded_order(d, since=None, rescan=False, on_call=None, driver=None):
     calls = []
     real = gfx2hlsl.translate_request
 
@@ -304,7 +304,10 @@ def recorded_order(d, since=None, rescan=False, on_call=None):
     gfx2hlsl.translate_request = fake
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            gfx2hlsl.translate_pending(str(d), jobs=1, rescan=rescan, since=since)
+            if driver:
+                driver()
+            else:
+                gfx2hlsl.translate_pending(str(d), jobs=1, rescan=rescan, since=since)
     finally:
         gfx2hlsl.translate_request = real
     return calls
@@ -341,6 +344,23 @@ with tempfile.TemporaryDirectory() as tmp:
     calls = recorded_order(d, since=now, rescan=False,
                            on_call=lambda n: n == 2 and touch(d / ('req_%016x.rtv' % late)))
     expect('one-shot scan: the late request is not picked up', late in calls, False)
+    # A --watch pass (watch_pass, as the watcher runs it) does rescan: the late request is next again.
+    for key in backlog + [late]:
+        (d / ('req_%016x.rtv' % key)).unlink(missing_ok=True)
+    for n, key in enumerate(backlog):
+        touch(d / ('req_%016x.rtv' % key), mtime=now - 100 + n)
+    saved_jobs = os.environ.get('X2W_TRANSLATE_JOBS')
+    os.environ['X2W_TRANSLATE_JOBS'] = '1'  # in this process, so the fake translator runs
+    try:
+        calls = recorded_order(d, on_call=lambda n: n == 2 and touch(d / ('req_%016x.rtv' % late)),
+                               driver=lambda: gfx2hlsl.watch_pass(str(d), False, now))
+    finally:
+        if saved_jobs is None:
+            os.environ.pop('X2W_TRANSLATE_JOBS', None)
+        else:
+            os.environ['X2W_TRANSLATE_JOBS'] = saved_jobs
+    expect('--watch pass: the late request is next after the request in progress',
+           calls.index(late) if late in calls else None, 2)
 
 # The same with parallel workers (forked, so they run this check's slow fake): the late request finishes before
 # the backlog does.
