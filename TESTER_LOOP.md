@@ -8,7 +8,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | Piece | Source | Head taken |
 |---|---|---|
 | `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `0355a7745` |
-| revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
+| revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815), with the fix `d39f65cfc` | `d39f65cfc` |
 | periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
 | opt-in lazy slot 133 textures (`X2W_D3D12_LAZY_TEXTURES=1`): external PR #2773, opt-in; its conflict with main is resolved on this branch only | PR #2773 (triggered02) | `92db6d4eb` |
 | C++ exception record decoded into a sanitized summary | PR #1939 | `49ca19e34` |
