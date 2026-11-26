@@ -102,6 +102,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -6100,6 +6101,7 @@ void retire_drop_heap_views(Wrapper* heap)
             if (id - 1 < view_records().size() && view_materialized()[id - 1])
                 view_refs_release(view_records()[id - 1].slot, view_records()[id - 1].resource,
                                   view_records()[id - 1].counter);
+            view_slot_unref(id);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);
@@ -6628,6 +6630,31 @@ extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long ti
         out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
         out->retire_when_idle = r->own().retire_when_idle;
     }
+}
+
+// Fixture probe (startup_view_reuse): what the view token in title descriptor memory at a handle resolves to. 1: a view
+// record that still holds the view it was written for; 0: a stale token (its id was reused since: the draw refuses it);
+// -1: no token there. Also the reuse counters.
+struct ViewReuseProbe {
+    int token;
+    unsigned id, generation;
+    unsigned long long records, ids, reused, free_list;
+};
+extern "C" __declspec(dllexport) void x2w_d3d12_view_reuse_probe(unsigned long long title_handle, ViewReuseProbe* out)
+{
+    *out = {};
+    std::uint32_t words[4]{};
+    const bool readable = title_handle && x2w_local::readable(reinterpret_cast<const void*>(title_handle), sizeof(words));
+    if (readable) std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
+    note_lock_acquire(false);
+    out->token = !readable || words[0] != view_token_magic ? -1 : view_token_known(words) ? 1 : 0;
+    out->id = words[1];
+    out->generation = words[3];
+    out->records = view_records().size();
+    out->ids = view_ids().size();
+    out->reused = static_cast<unsigned long long>(views_reused);
+    out->free_list = view_free_list().size();
+    ReleaseSRWLockShared(&note_lock);
 }
 
 // Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
@@ -7788,10 +7815,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
+        note_lock_acquire(false);
+        const u64 records = view_records().size(), free_ids = view_free_list().size();
+        ReleaseSRWLockShared(&note_lock);
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
-            "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
+            "(region-information proofs %lld, region queries %lld); view records %llu (reused %lld, free list %llu)",
+            views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
-            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
+            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries), records,
+            static_cast<long long>(views_reused), free_ids);
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);

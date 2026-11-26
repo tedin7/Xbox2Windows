@@ -310,7 +310,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             bool known = false, created = false;
             if (words[0] == view_token_magic) {
                 note_lock_acquire(false);
-                known = words[1] < view_records().size();
+                known = view_token_known(words);
                 if (known) {
                     record = view_records()[words[1]];
                     created = view_materialized()[words[1]] != 0;

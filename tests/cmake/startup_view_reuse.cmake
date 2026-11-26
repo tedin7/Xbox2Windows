@@ -1,0 +1,26 @@
+# View records are reused: two million distinct views written into the same 4096 slots keep the table at about one
+# record per slot, and a title copy of a reused view's token resolves to no view. The age window is 0 here (the
+# default 10 s / 262144 views would only slow the fixture). `control` turns reuse off, so the fixture must print FAIL.
+add_executable(startup_view_reuse tests/startup_view_reuse.cpp)
+target_compile_features(startup_view_reuse PRIVATE cxx_std_17)
+target_link_libraries(startup_view_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS on control)
+        set(reuse_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        list(APPEND reuse_env "X2W_D3D12_VIEW_REUSE_SECONDS=0" "X2W_D3D12_VIEW_REUSE_NOTES=0")
+        if(mode STREQUAL "on")
+            set(reuse_test startup_view_reuse_${backend})
+            add_test(NAME ${reuse_test} COMMAND startup_view_reuse ${backend})
+        else()
+            set(reuse_test startup_view_reuse_control_${backend})
+            add_test(NAME ${reuse_test} COMMAND startup_view_reuse ${backend} control)
+            list(APPEND reuse_env "X2W_D3D12_VIEW_REUSE=0")
+        endif()
+        list(APPEND reuse_env "X2W_TRAP_LOG=${CMAKE_CURRENT_BINARY_DIR}/${reuse_test}.log")
+        set_tests_properties(${reuse_test} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 ENVIRONMENT "${reuse_env}")
+        if(mode STREQUAL "control")
+            set_tests_properties(${reuse_test} PROPERTIES
+                PASS_REGULAR_EXPRESSION "FAIL: the view records grew with views rewritten into the same slots")
+        endif()
+    endforeach()
+endforeach()

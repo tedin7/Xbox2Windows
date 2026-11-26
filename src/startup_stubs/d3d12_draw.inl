@@ -1429,7 +1429,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
     }
     note_lock_acquire(false);
     const auto& records = view_records();
-    const bool valid = words[2] == 22 && words[1] < records.size() && records[words[1]].slot == 22 &&
+    const bool valid = words[2] == 22 && view_token_known(words) && records[words[1]].slot == 22 &&
                        records[words[1]].desc_bytes == sizeof(sampler);
     if (valid) std::memcpy(&sampler, records[words[1]].desc, sizeof(sampler));
     ReleaseSRWLockShared(&note_lock);
@@ -2015,7 +2015,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         ViewRecord record{};
         bool known = false;
         note_lock_acquire(false);
-        known = words[1] < view_records().size();
+        known = view_token_known(words);
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
@@ -2297,7 +2297,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         note_lock_acquire(false);
-        if (words[1] < view_records().size()) record = view_records()[words[1]];
+        if (view_token_known(words)) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (record.slot == 17 && record.desc_bytes >= 12) {
             UINT size = 0;
@@ -2440,7 +2440,7 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         note_lock_acquire(false);
-        const bool known = words[1] < view_records().size();
+        const bool known = view_token_known(words);
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
@@ -2512,7 +2512,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
         ViewRecord record{};
         note_lock_acquire(false);
-        const bool known = words[1] < view_records().size();
+        const bool known = view_token_known(words);
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (!known) return refuse(i, "unknown view token", words[1]);
@@ -2555,7 +2555,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
             if (srv_words[0] != view_token_magic) continue;
             note_lock_acquire(false);
-            const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
+            const u64 srv_resource = view_token_known(srv_words) ? view_records()[srv_words[1]].resource : 0;
             ReleaseSRWLockShared(&note_lock);
             if (srv_resource && srv_resource == record.resource) return refuse(i, "the texture is also an SRV of this draw", s);
         }
@@ -2878,7 +2878,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bool known = false;
             if (words[0] == view_token_magic) {
                 note_lock_acquire(false);
-                known = words[1] < view_records().size();
+                known = view_token_known(words);
                 if (known) record = view_records()[words[1]];
                 ReleaseSRWLockShared(&note_lock);
             }
@@ -3024,7 +3024,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // shader-resource view names a range of its resource's title memory.
             ViewRecord record{};
             note_lock_acquire(false);
-            buffer_token_known = words[1] < view_records().size();
+            buffer_token_known = view_token_known(words);
             if (buffer_token_known) record = view_records()[words[1]];
             ReleaseSRWLockShared(&note_lock);
             if (record.slot == 17 && record.desc_bytes >= 12) {

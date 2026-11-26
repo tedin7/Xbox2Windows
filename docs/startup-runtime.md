@@ -1539,6 +1539,8 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
+| `X2W_D3D12_VIEW_REUSE=0` | keeps every view record for good, as before view reuse ([details](#d3d12-view-reuse)). Default on |
+| `X2W_D3D12_VIEW_REUSE_SECONDS=N`, `X2W_D3D12_VIEW_REUSE_NOTES=N` | the age window of view reuse: a freed record waits at least N seconds (default 10) and N new views (default 262144) before a new view takes it |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
@@ -1875,11 +1877,42 @@ allow unordered access are never in the retire class.
 ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
 ```
 
+## D3D12 view reuse
+
+A title that keeps creating new views (a new constant buffer address, a new
+resource) into the same descriptor slots added one record per distinct view, for
+good: millions of records over a long run, each about 170 bytes with its id map
+entry.
+
+Each record counts the tracked descriptor slots (the shadow entries of the
+desktop heaps) that name it: a new view written into a slot, a descriptor copy
+between tracked slots, a copy over a slot and a heap whose views are dropped all
+move the count. When the last tracked slot stops naming a record, it goes on a
+free list. A new distinct view takes the oldest free record once it has been
+free for at least 10 seconds and 262144 new views (the age window), so the table
+stays at about the views the slots hold plus the window.
+
+The token the stand-in writes into title descriptor memory carries the record's
+generation in word 3 (0 for records never reused, as tokens before reuse). Reuse
+moves the generation on, and every reader of a token checks it, so a copy of an
+old token the title made with its own memory copy, still bound after the window,
+resolves to no view: the draw or dispatch refuses the descriptor, it never binds
+the new view in its place. Records whose views a descriptor copy put into an
+untracked destination, and records no tracked slot ever named, are never reused.
+
+The five-second `x2w-d3d12 views noted` line ends with `view records N (reused
+R, free list F)`. `X2W_D3D12_VIEW_REUSE=0` turns reuse off.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_view_reuse' --output-on-failure
+```
+
 ## D3D12 view census
 
 The stand-in keeps one record per distinct view: slot, resource, counter,
 description bytes and whether the desktop view was created. Records are not
-removed. `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
+removed while a tracked slot or an untracked copy may name them (see [view reuse](#d3d12-view-reuse)).
+`X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
 record, id or descriptor binding.
 
 The heartbeat adds a line:

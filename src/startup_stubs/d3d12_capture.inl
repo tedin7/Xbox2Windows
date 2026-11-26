@@ -27,8 +27,11 @@ struct ViewRecord {
     std::uint32_t id, slot;          // slot: 17 CBV, 18 SRV, 19 UAV, 20 RTV, 21 DSV, 22 sampler
     u64 resource, counter;           // title-side wrapper pointers (or 0)
     u64 dest_title, dest_desktop;
-    std::uint32_t desc_bytes, pad;
+    std::uint32_t desc_bytes;
+    std::uint32_t generation;        // bumped when the id is reused for another view; word 3 of the view's token
     unsigned char desc[64];
+    std::uint32_t slot_refs;         // tracked descriptor slots (shadow entries) that name this id
+    std::uint32_t free_ticket;       // ticket of the id's newest free-list entry (0: never freed)
 };
 struct HeapInfo {
     u64 wrapper;
@@ -106,6 +109,104 @@ std::vector<ViewRecord>& view_records() { static std::vector<ViewRecord> v; retu
 std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t> v; return v; }  // 1 if desktop view was created
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
+
+// View reuse (docs/startup-runtime.md#d3d12-view-reuse). An id that a tracked descriptor slot held and that no tracked
+// slot names any more goes on a free list; once it has been free for the age window, a new view takes its record with
+// the next generation. The token in title memory carries the generation, so a copy of the old token the title kept
+// resolves to no view (a refusal), never to the new one. Records no tracked slot ever held are kept as before.
+struct FreedView {
+    std::uint32_t id, ticket;
+    LONG64 noted;           // views_noted when it was freed
+    ULONGLONG ms;           // GetTickCount64 when it was freed
+};
+std::deque<FreedView>& view_free_list() { static std::deque<FreedView> q; return q; }
+std::uint32_t view_free_tickets;
+LONG64 views_reused;
+constexpr std::uint32_t no_reusable_view = 0xffffffffu;
+
+u64 view_reuse_number(const char* name, u64 fallback)
+{
+    const DWORD saved = GetLastError();
+    char value[24]{};
+    const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+    SetLastError(saved);
+    if (!n || n >= sizeof(value)) return fallback;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end && end != value && !*end ? parsed : fallback;
+}
+// X2W_D3D12_VIEW_REUSE=0 keeps every record for good (the behaviour before reuse).
+bool view_reuse_enabled()
+{
+    static const bool on = view_reuse_number("X2W_D3D12_VIEW_REUSE", 1) != 0;
+    return on;
+}
+// The age window: a freed id waits at least this long, and for at least this many new views, before reuse.
+u64 view_reuse_ms()
+{
+    static const u64 ms = view_reuse_number("X2W_D3D12_VIEW_REUSE_SECONDS", 10) * 1000;
+    return ms;
+}
+u64 view_reuse_notes()
+{
+    static const u64 notes = view_reuse_number("X2W_D3D12_VIEW_REUSE_NOTES", 262144);
+    return notes;
+}
+
+constexpr std::uint32_t view_pinned = 0xffffffffu;  // slot_refs of a record kept for good
+// A tracked slot now names the id (id + 1 as the shadow holds it; 0 is nothing). note_lock held exclusively.
+void view_slot_ref(std::uint32_t id_plus_one)
+{
+    if (!id_plus_one || id_plus_one - 1 >= view_records().size()) return;
+    std::uint32_t& refs = view_records()[id_plus_one - 1].slot_refs;
+    if (refs < view_pinned - 1) ++refs;
+}
+// The id's token went where nothing follows it (a destination no shadow slot tracks): its record is never reused.
+void view_slot_pin(std::uint32_t id_plus_one)
+{
+    if (id_plus_one && id_plus_one - 1 < view_records().size()) view_records()[id_plus_one - 1].slot_refs = view_pinned;
+}
+// A tracked slot no longer names the id: the last one puts it on the free list. A free list that cannot grow leaves
+// the id unreused, as before. note_lock held exclusively.
+void view_slot_unref(std::uint32_t id_plus_one)
+{
+    if (!id_plus_one || id_plus_one - 1 >= view_records().size()) return;
+    ViewRecord& record = view_records()[id_plus_one - 1];
+    if (!record.slot_refs || record.slot_refs == view_pinned || --record.slot_refs || !view_reuse_enabled()) return;
+    if (!++view_free_tickets) ++view_free_tickets;  // 0 means never freed
+    try {
+        view_free_list().push_back(FreedView{id_plus_one - 1, view_free_tickets, views_noted, GetTickCount64()});
+        record.free_ticket = view_free_tickets;
+    } catch (const std::bad_alloc&) {
+    }
+}
+// The oldest freed id that has been free for the age window and that no tracked slot named again since, taken off the
+// free list; or no_reusable_view. Entries of ids named again, or freed again later, are dropped. note_lock held
+// exclusively.
+std::uint32_t take_reusable_view()
+{
+    auto& list = view_free_list();
+    while (!list.empty()) {
+        const FreedView freed = list.front();
+        const ViewRecord& record = view_records()[freed.id];
+        if (record.slot_refs || record.free_ticket != freed.ticket) {
+            list.pop_front();
+            continue;
+        }
+        if (static_cast<u64>(views_noted - freed.noted) < view_reuse_notes() || GetTickCount64() - freed.ms < view_reuse_ms())
+            return no_reusable_view;
+        list.pop_front();
+        return freed.id;
+    }
+    return no_reusable_view;
+}
+// The record a view token in title memory names still holds the view it was written for: the id is known and the
+// generation (word 3) matches. Tokens written before reuse carry 0, the first generation. note_lock held.
+template<class Words>
+bool view_token_known(const Words& words)
+{
+    return words[1] < view_records().size() && view_records()[words[1]].generation == words[3];
+}
 
 // X2W_D3D12_VIEW_CENSUS=1 (diagnostic only, docs/startup-runtime.md): new distinct view records by slot, and one line
 // before an insertion that is expected to grow view_records or the view_ids buckets. All fields: note_lock held.
@@ -225,7 +326,7 @@ bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
     std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
     if (words[0] != view_token_magic) return false;
     note_lock_acquire(false);
-    live = words[1] < view_records().size() && view_materialized()[words[1]];
+    live = view_token_known(words) && view_materialized()[words[1]];
     ReleaseSRWLockShared(&note_lock);
     return live;
 }
@@ -433,6 +534,41 @@ void reserve_one_view_entry(std::vector<T>& v, ViewAllocation site)
     v.reserve(v.capacity() + v.capacity() / 2 + 1);
 }
 
+// The key views share an id by: slot, resource, counter, every description byte and whether the view was created.
+u64 view_content_hash(const ViewRecord& record, std::uint8_t created)
+{
+    u64 hash = 1469598103934665603ull;
+    const auto mix = [&hash](const void* data, std::size_t bytes) {
+        for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
+    };
+    mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
+    return hash;
+}
+
+// Puts a new view into the freed record `id` (take_reusable_view; note_lock held): the old content no longer maps to the
+// id, the generation moves on (tokens of the old view stop resolving), and the new content maps to the id. No vector
+// grows. Returns the container that could not allocate, or null; then the record stays out of use with the new
+// generation, so the old tokens stay refused.
+const char* reuse_view(std::uint32_t id, ViewRecord& record, std::uint8_t created, u64 hash)
+{
+    ViewRecord& old = view_records()[id];
+    const auto stale = view_ids().find(view_content_hash(old, view_materialized()[id]));
+    if (stale != view_ids().end() && stale->second == id) view_ids().erase(stale);
+    record.id = id;
+    record.generation = old.generation + 1 ? old.generation + 1 : 1;
+    old.generation = record.generation;
+    try {
+        view_allocation_gate(view_ids_site);
+        view_ids().try_emplace(hash, id);
+    } catch (const std::bad_alloc&) {
+        return "view_ids";
+    }
+    old = record;  // no tracked slot names it yet, and it is on no free list
+    view_materialized()[id] = created;
+    ++views_reused;
+    return nullptr;
+}
+
 // Adds a new record to the three view containers, or to none of them (note_lock held). Everything that can allocate
 // comes first: the two reservations change no size, and a failed try_emplace leaves the map unchanged. The two
 // push_back calls then have room and cannot fail. Returns the name of the container that could not allocate, or null.
@@ -466,6 +602,7 @@ void drop_unrecorded_view(const ViewRecord& record, bool materialized, const cha
         if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
             view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
                               view_records()[prev - 1].counter);
+        view_slot_unref(prev);
     }
     if (materialized) view_refs_leave_class(record.slot, record.resource, record.counter, RetireLeft::view);
     ReleaseSRWLockExclusive(&note_lock);
@@ -496,22 +633,21 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     }
     const std::uint8_t created = materialized ? 1 : 0;
     // Views with the same content and materialization state share one id, so per-frame re-creation does not grow the list.
-    u64 hash = 1469598103934665603ull;
-    const auto mix = [&hash](const void* data, std::size_t bytes) {
-        for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
-    };
-    mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
+    const u64 hash = view_content_hash(record, created);
     note_lock_acquire(true);
     ++views_noted;
     const auto found = view_ids().find(hash);
     if (found != view_ids().end()) {
         record.id = found->second;
+        record.generation = view_records()[record.id].generation;
     } else {
+        const std::uint32_t reuse = view_reuse_enabled() ? take_reusable_view() : no_reusable_view;
+        const bool grows = reuse == no_reusable_view;
         record.id = static_cast<std::uint32_t>(view_records().size());
         const bool census = view_census_enabled();
         std::size_t capacity_before = 0, buckets_before = 0;
         bool records_full = false, ids_full = false;
-        if (census) {
+        if (census && grows) {
             capacity_before = view_records().capacity();
             buckets_before = view_ids().bucket_count();
             records_full = view_records().size() == capacity_before;
@@ -530,15 +666,17 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
                 log("%s (new slot %u)", line, record.slot);
             }
         }
-        if (const char* container = store_view(record, created, hash)) {
+        if (const char* container = grows ? store_view(record, created, hash) : reuse_view(reuse, record, created, hash)) {
             drop_unrecorded_view(record, materialized, container);
             return;
         }
         ++views_distinct;
         if (census) {
             if (record.slot >= 17 && record.slot <= 22) ++view_census.distinct[record.slot - 17];
-            view_census.missed += !records_full && view_records().capacity() != capacity_before;
-            view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
+            if (grows) {
+                view_census.missed += !records_full && view_records().capacity() != capacity_before;
+                view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
+            }
         }
     }
     if (slot == 18 && resource && materialized) {
@@ -551,20 +689,25 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         // The same view written to the same slot again keeps its id and changes no reference count. A different view
         // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
         if (prev != record.id + 1) {
+            view_slot_ref(record.id + 1);
             if (materialized) view_refs_add(static_cast<std::uint32_t>(slot), resource, counter);
             if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
                 view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
                                   view_records()[prev - 1].counter);
+            view_slot_unref(prev);
         }
-    } else if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource) {
-        // A descriptor no shadow slot tracks cannot hold the view: the use takes the resource out of the class.
-        view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
+    } else {
+        // A descriptor no shadow slot tracks: nothing follows its token, so the record is kept for good. The use takes
+        // the resource out of the class.
+        view_slot_pin(record.id + 1);
+        if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource)
+            view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
         x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {
-        std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), 0,
+        std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), record.generation,
                                   static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32), 0, 0};
         std::memcpy(reinterpret_cast<void*>(dest_title), token, token_bytes);
     }
@@ -582,6 +725,7 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
             // replaced. Slots 18-21 count one ref (slot 19 one for the resource and one for its counter).
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t src_id = from[i];
+                view_slot_ref(src_id);
                 if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
                     view_refs_add(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
                                   view_records()[src_id - 1].counter);
@@ -591,6 +735,7 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
                 if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
                     view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
                                       view_records()[old_id - 1].counter);
+                view_slot_unref(old_id);
             }
             std::memmove(to, from, u64{count} * 4);
         } else {
@@ -599,13 +744,16 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
                 if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
                     view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
                                       view_records()[old_id - 1].counter);
+                view_slot_unref(old_id);
             }
             std::memset(to, 0, u64{count} * 4);
         }
     } else if (from && count <= src_room) {
-        // The destination is not tracked: the copy puts the views where no shadow slot can hold them.
+        // The destination is not tracked: the copy puts the views where no shadow slot can hold them. Their tokens are
+        // copied in title memory, where nothing follows them, so their records are kept for good, as before reuse.
         for (UINT i = 0; i < count; ++i) {
             const std::uint32_t src_id = from[i];
+            view_slot_pin(src_id);
             if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
                 view_refs_leave_class(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
                                       view_records()[src_id - 1].counter, RetireLeft::view_copy);
@@ -781,7 +929,8 @@ void view(std::uint32_t id_plus_one, bool with_data)
     if (known) record = view_records()[id_plus_one - 1];
     ReleaseSRWLockShared(&note_lock);
     if (!known) return;
-    if (views.insert(record.id).second) chunk("VIEW", &record, sizeof(record), nullptr, 0);
+    // Once per record content: a reused id (a new generation) is written again.
+    if (views.insert(u64{record.generation} << 32 | record.id).second) chunk("VIEW", &record, sizeof(record), nullptr, 0);
     if (Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource))) {
         object(resource);
         if (with_data && record.slot == 18) resource_data(resource);
@@ -820,10 +969,13 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
         const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
         const u64 title_start = heap.title_cpu + index * stride;
         for (std::uint32_t i = 0; i < entries; ++i) {
-            std::uint32_t token[2]{};
+            std::uint32_t token[4]{};
             SIZE_T got = 0;
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title_start + u64{i} * stride), token, sizeof(token), &got);
-            ids[entries + i] = token[0] == view_token_magic ? token[1] + 1 : 0;
+            note_lock_acquire(false);
+            const bool known = token[0] == view_token_magic && view_token_known(token);  // a stale token names no view
+            ReleaseSRWLockShared(&note_lock);
+            ids[entries + i] = known ? token[1] + 1 : 0;
         }
         memory(title_start, u64{entries} * stride, 0, 0x4c4254);
     }
