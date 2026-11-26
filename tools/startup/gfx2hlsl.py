@@ -4940,9 +4940,8 @@ class Stage:
         if base in VEC_H:
             return self.half_alu(base, ops, mods)
         if base == 'v_ldexp_f32':
-            # RDNA 2 ISA VOP3 v_ldexp_f32: D = S0.f * 2^S1.i, S1 a signed 32-bit exponent of any size. x2w_ldexp scales
-            # in at most two steps with the intermediate rounding kept out of the denormal range (the musl scalbnf
-            # scheme), so a large exponent over a denormal source and the reverse both round once, like the product.
+            # RDNA 2 ISA VOP3 v_ldexp_f32: D = S0.f * 2^S1.i, S1 a signed 32-bit exponent of any size. x2w_ldexp
+            # (prelude) works on the binary32 fields, so every exponent, denormal and signed zero rounds like the product.
             if len(ops) != 3:
                 raise Unsupported('%s with %d operands, expected 3' % (base, len(ops)))
             if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
@@ -4955,7 +4954,7 @@ class Stage:
             pipe = getattr(self, 'pipe', None)
             if pipe is not None:
                 pipe.uses_ldexp = True
-            return self.set_vf(dst[1], 'x2w_ldexp(%s, asint(%s))' % (self.f(ops[1]), self.u(ops[2])), mods)
+            return self.set_vf(dst[1], 'asfloat(x2w_ldexp(asuint(%s), asint(%s)))' % (self.f(ops[1]), self.u(ops[2])), mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -11051,22 +11050,31 @@ class Pipeline:
                 '}',
             ))
         if getattr(self, 'uses_ldexp', False):
+            # Integer arithmetic on the binary32 fields (sign, biased exponent, 24-bit significand): x * 2^n with one
+            # rounding to nearest even. The result exponent is e + n; at 255 or more it overflows to infinity, below 1
+            # the significand is shifted right by 1 - E bits and rounded (a carry into bit 23 is the smallest normal),
+            # and a shift past 25 bits is zero. A denormal source is normalised first. No float multiply is involved,
+            # so denormal results and the sign of a zero survive compilers that flush or fold them.
             out.extend((
-                'float x2w_ldexp(float x, int n) {',
-                '    // precise: the steps must not be reassociated (2^-102 * 2^-102 folds to zero).',
-                '    precise float y = x;',
-                '    if (n > 127) {',
-                '        y *= asfloat(0x7f000000u); n -= 127;',
-                '        if (n > 127) { y *= asfloat(0x7f000000u); n -= 127; if (n > 127) n = 127; }',
-                '    } else if (n < -126) {',
-                '        y *= asfloat(0x0c800000u); n += 102;',
-                '        if (n < -126) { y *= asfloat(0x0c800000u); n += 102; if (n < -126) n = -126; }',
+                'uint x2w_ldexp(uint b, int n) {',
+                '    uint sign = b & 0x80000000u, m = b & 0x7fffffu;',
+                '    int e = int((b >> 23) & 0xffu);',
+                '    if (e == 255) return m != 0u ? (b | 0x00400000u) : b;',
+                '    if (e == 0) {',
+                '        if (m == 0u) return b;',
+                '        int s = 23 - int(firstbithigh(m));',
+                '        m <<= uint(s); e = 1 - s;',
+                '    } else {',
+                '        m |= 0x00800000u;',
                 '    }',
-                '    precise float z = y * asfloat(uint(0x7f + n) << 23);',
-                '    uint bits = asuint(z);',
-                '    // A zero result keeps the sign of the source, as the product does; decided on the bits because',
-                '    // some compilers fold a float zero without its sign.',
-                '    return asfloat((bits & 0x7fffffffu) == 0u ? (asuint(x) & 0x80000000u) : bits);',
+                '    int E = e + clamp(n, -1000, 1000);',
+                '    if (E >= 255) return sign | 0x7f800000u;',
+                '    if (E >= 1) return sign | (uint(E) << 23) | (m & 0x7fffffu);',
+                '    int sh = 1 - E;',
+                '    if (sh > 25) return sign;',
+                '    uint keep = m >> uint(sh), rem = m & ((1u << uint(sh)) - 1u), half = 1u << uint(sh - 1);',
+                '    if (rem > half || (rem == half && (keep & 1u) != 0u)) keep += 1u;',
+                '    return sign | keep;',
                 '}',
             ))
         if 'v_sad_u8' in self.uses_sad:
