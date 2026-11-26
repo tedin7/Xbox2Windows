@@ -82,17 +82,24 @@ def check(directory, consumer, backend):
     hlsl = ("Texture2D<float> t : register(t0);\n"
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
             "  return float4(t.Load(int3(uint2(p.xy) % 2, 0)), 0, 0, 1);\n}\n")
-    trap_log = directory / "trap.log"
-    actual = draw_texture(directory, consumer, backend, hlsl, {"X2W_TEST_ADDRESS_SRV": "1", "X2W_TRAP_LOG": str(trap_log)})
-    if actual is None:
-        return 77
-    plane_at_x = (0, 1, 0, 0, 1, 1, 1, 0)
-    expected = bytes(c for y in range(4) for x, plane in enumerate(plane_at_x)
-                     for c in (16 + plane * 128 + (y % 2) * 32 + (x % 2) * 7, 0, 0, 255))
-    if actual != expected:
-        raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
-    check_refusal_lines(trap_log.read_text(errors="replace"))
-    print(f"{backend}: ordinary view, alternating addresses, zero/interior/mismatched updates; all 32 RGBA pixels exact")
+    for replace in (False, True):
+        run_directory = directory / ("null" if replace else "preserve")
+        run_directory.mkdir()
+        trap_log = run_directory / "trap.log"
+        actual = draw_texture(run_directory, consumer, backend, hlsl, {
+            "X2W_TEST_ADDRESS_SRV": "1", "X2W_TRAP_LOG": str(trap_log),
+            "X2W_SLOT70_REFUSED_NULL": str(int(replace)),
+        })
+        if actual is None:
+            return 77
+        plane_at_x = (0, 1, 0, 0, 1, 1, 1, 0)
+        expected = bytes(c for y in range(4) for x, plane in enumerate(plane_at_x)
+                         for c in (0 if replace and x in (3, 5, 6)
+                                   else 16 + plane * 128 + (y % 2) * 32 + (x % 2) * 7, 0, 0, 255))
+        if actual != expected:
+            raise AssertionError(f"X2W_SLOT70_REFUSED_NULL={int(replace)} actual {actual.hex()} expected {expected.hex()}")
+        check_refusal_lines(trap_log.read_text(errors="replace"))
+        print(f"{backend}: X2W_SLOT70_REFUSED_NULL={int(replace)}, all 32 RGBA pixels exact")
     return 0
 
 

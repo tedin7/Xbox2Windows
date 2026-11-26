@@ -756,13 +756,44 @@ void log_layout0_texture(const char* reason, const D3D12_RESOURCE_DESC* resource
 
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
-void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
+void refuse_memory_srv(Wrapper* self, LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                        const MemoryShaderResourceView* input, u64 destination)
 {
     const bool within_limit = first_calls(refused, 8);
     const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
     log_layout0_texture(reason, resource, input);
+
+    static const bool replace = x2w_local::env_on("X2W_SLOT70_REFUSED_NULL");
+    if (!replace || !destination || !memory_srv_destination(destination)) return;
+    const u64 desktop = desktop_cpu_handle(destination);
+    if (!desktop) return;
+
+    // Preserve the requested view type when there is enough information to construct a valid desktop null.
+    const bool readable = x2w_local::readable(input, sizeof(*input));
+    auto null_view = null_srv_desc(readable ? input->view.ViewDimension : D3D12_SRV_DIMENSION_TEXTURE2D);
+    if (readable && input->view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        null_view = {};
+        null_view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        null_view.Format = DXGI_FORMAT_R32_UINT;
+        if (x2w_startup::buffer_srv_element_bytes(input->view)) {
+            null_view.Format = input->view.Format;
+            null_view.Buffer.StructureByteStride = input->view.Buffer.StructureByteStride;
+            null_view.Buffer.Flags = input->view.Buffer.Flags;
+        }
+        null_view.Buffer.NumElements = 1;
+    } else if (readable && x2w_startup::is_as_srv(input->view)) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};
+        if (SUCCEEDED(device_of(self)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options, sizeof(options))) &&
+            options.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
+            null_view = {};
+            null_view.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+            null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+    }
+    device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)});
+    note_view(18, 0, 0, &null_view, sizeof(null_view), destination, desktop, false);
 }
 
 // Counts a successful write (memory_srv_writes) and logs the first write to each of the first few
@@ -800,7 +831,7 @@ x2w_startup::PlacedAsBuffer placed_as_buffer(const Wrapper* device, u64 address)
 }
 
 // Slot 70 with an acceleration-structure view: published through slot 18 with no resource and the
-// desktop address; a refusal leaves the destination descriptor as it was.
+// desktop address. Unavailable structures use the shared slot 70 refusal path.
 void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
@@ -808,7 +839,7 @@ void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const Me
     D3D12_SHADER_RESOURCE_VIEW_DESC resolved{};
     const auto refusal = x2w_startup::resolve_as_srv_desc(location, placed_as_buffer(self, location), input->view, resolved);
     if (refusal != x2w_startup::AsSrvRefusal::none) {
-        refuse_memory_srv(refused, "unavailable acceleration structure at the supplied address",
+        refuse_memory_srv(self, refused, "unavailable acceleration structure at the supplied address",
                           x2w_startup::as_srv_refusal_name(refusal), resource, input, destination);
         return;
     }
@@ -863,19 +894,19 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     static LONG refused;
     check_resource_address_index();
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
-        refuse_memory_srv(refused, "unsupported memory SRV arguments", reason, resource, input, destination);
+        refuse_memory_srv(self, refused, "unsupported memory SRV arguments", reason, resource, input, destination);
         return;
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
     if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
         if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
-            refuse_memory_srv(refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
+            refuse_memory_srv(self, refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
                               destination);
         } else if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource)) {
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             note_memory_srv_write(resource, input, destination);
         } else {
-            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout",
+            refuse_memory_srv(self, refused, "unavailable texture at the supplied base and layout",
                               texture_unavailable_reason(self, input->address, *resource, true), resource, input, destination);
         }
         return;
@@ -890,7 +921,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
         const auto refusal_stamp = buffer_refusal_stamp(input->address);
         if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64(), buffer_refusal_page_still_uncommitted)) {
-            refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
+            refuse_memory_srv(self, refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
         }
@@ -907,7 +938,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
             if (buffer) refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
             buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), refusal_proof);
-            refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
+            refuse_memory_srv(self, refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
         }
@@ -954,7 +985,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) outcome = held ? held : unavailable;
     log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
-        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : unavailable,
+        refuse_memory_srv(self, refused, "unavailable texture at the supplied base and layout", held ? held : unavailable,
                           resource, input, destination);
         return;
     }

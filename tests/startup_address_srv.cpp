@@ -112,13 +112,13 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     draw(0); // Ordinary resource-object SRV is the independent control.
     publish(desc, ptr(planes[1].data())); draw(1);
     publish(desc, ptr(planes[0].data())); draw(2);
-    publish(desc, 0); draw(3); // Rejection preserves the previous descriptor.
+    publish(desc, 0); draw(3); // Refuse a zero address in the slot last written by slot 70.
     publish(desc, ptr(planes[1].data())); draw(4);
     auto wrong_desc = desc;
     wrong_desc.Width = 1;
     publish(wrong_desc, ptr(planes[0].data())); draw(5);
     publish(desc, ptr(planes[0].data()) + 1); // Interior address, not the registered base.
-    // Refusals that name their cause in the log; draw 6 shows each left the descriptor alone.
+    // Exercise an unavailable buffer and a misaligned destination before reading the slot again.
     D3D12_RESOURCE_DESC buffer_desc{};
     buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer_desc.Width = 256;

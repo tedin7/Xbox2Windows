@@ -16137,22 +16137,27 @@ In the permissive Windows device wrapper, slot 70 takes a resource description, 
 texture SRV with an address at offset 0x28, and a destination view-heap CPU handle.
 The tested case uses a single-layer, single-mip R8_UNORM texture previously placed
 with slot 133. The address must uniquely identify a live texture with the same resource
-description. An invalid address or mismatched description leaves the old descriptor in place.
+description. By default a refusal preserves the old descriptor. With
+`X2W_SLOT70_REFUSED_NULL=1`, a refusal replaces a valid destination slot with a
+refused-view token and a desktop null SRV.
 
-`startup_address_srv_hardware` and `startup_address_srv_warp` compare 32 RGBA pixels
-each. Two 2×2 source-built textures have different values in both rows. The test switches
+`startup_address_srv_hardware` and `startup_address_srv_warp` use two 2×2
+source-built textures with different values in both rows. The test switches
 between their addresses, compares an ordinary resource-object SRV, and tries zero,
-interior, and mismatched addresses after a successful publication.
+interior, and mismatched addresses after a successful publication. Each backend
+compares 32 pixels per switch setting. With replacement enabled, the three
+columns drawn after refusals read zero. The default control reads the texels
+from the previous view.
 
 ```powershell
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
-ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
+ctest --preset release --no-tests=error -R '^startup_address_srv_(warp|hardware)$' -V
 ```
 
 ### Name the cause of a refused slot 70 call
 
-A slot 70 call that the runtime refuses leaves the destination descriptor as it was and logs one
-line, for the first eight refusals of a process (stderr and `X2W_TRAP_LOG`). The line names the first
+For the first eight slot 70 refusals of a process, the runtime logs one line per call
+to stderr and `X2W_TRAP_LOG`. The line names the first
 check that refused it, in the order the checks run: `null_destination`, `unreadable_resource`,
 `unreadable_view`, `null_address`, `unsupported_description`, `destination_outside_view_heaps`, or
 `texture_unavailable` (the description passed but no single live texture or published view matches the
