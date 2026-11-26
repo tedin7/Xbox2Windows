@@ -262,6 +262,47 @@ def check_memory_gib():
     assert T.memory_gib(int(31.9 * gib)) == 23, "whole GiB, rounded down"
 
 
+def check_end_cause():
+    """The end cause is recorded on every path, with the last present milestone."""
+    beats = b"x2w-d3d12 heartbeat: 100 frames presented in 30.0 s (3.3 fps overall)\nx2w-d3d12 heartbeat: 450 frames presented in 120.0 s (3.7 fps overall)\n"
+
+    def run(finished=None, files=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            write(folder, "stderr.txt", beats)
+            if finished is not None:
+                write(folder, "finished.txt", finished.encode())
+            for name, data in files:
+                write(folder, name, data)
+            return T.end_cause(str(folder))
+
+    milestone = "last present #450 at 120 s"
+    cases = [
+        ("timeout after 600.02 s\n", (), "timeout after 600.02 s (the run was not stopped early)"),
+        ("stopped by request after 90.5 s (stop file)\n", (), "stopped by request at 90.5 s (stop file, no watchdog stop)"),
+        ("stopped by request after 90.5 s (commit headroom: system commit has 100 MiB free, under the headroom of 256 MiB)\n", (),
+         "stopped by request at 90.5 s (commit headroom: system commit has 100 MiB free, under the headroom of 256 MiB, no watchdog stop)"),
+        ("process exited with 0xffffffff after 256.1 s\n", (), "title killed externally (exit code 0xffffffff, no stop file) at 256.1 s"),
+        ("process exited with 0x00000000 after 12.0 s\n", (), "title exited by itself (code 0x0) at 12.0 s"),
+        ("process exited with 0xc0000005 after 40.0 s\n", (), "title crashed (exit code 0xc0000005) at 40.0 s"),
+        ("stopped at access violation (0xc0000005) at d3d12_xs+0x10 after 33.3 s\n", (), "debugger stop: access violation (0xc0000005) at 33.3 s"),
+        ("timeout after 300.0 s\n", (("stall_stop.json", b'{"at_seconds": 300, "reason": "deadlock: no frame"}'),),
+         "watchdog at 300 s: deadlock: no frame"),
+        (None, (("hard_end.json", b'{"at_seconds": 70, "note": "title 5 gone"}'),), "debugger did not finish: title 5 gone"),
+        (None, (), "unknown: the debugger wrote no summary (killed, or still running)"),
+    ]
+    for finished, files, want in cases:
+        got = run(finished, files)
+        assert got == want + "; " + milestone, (finished, got)
+    # No heartbeat at all: the milestone says so.
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), "finished.txt", b"timeout after 5.0 s\n")
+        assert T.end_cause(tmp).endswith("; no present reported"), T.end_cause(tmp)
+    # A hard end after a finished summary is appended, not replacing it.
+    got = run("timeout after 5.0 s\n", (("hard_end.json", b'{"note": "debugger ended"}'),))
+    assert "timeout after 5.0 s" in got and "hard end: debugger ended" in got, got
+
+
 def check_first_poll():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -502,6 +543,7 @@ if __name__ == "__main__":
     check_privacy_screen()
     check_manifest()
     check_first_poll()
+    check_end_cause()
     check_cache_stats()
     check_cache_tag()
     check_memory_gib()

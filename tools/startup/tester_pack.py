@@ -443,6 +443,79 @@ def first_poll(logdir):
     return None
 
 
+RE_ENDED_TIMEOUT = re.compile(r"^timeout after ([0-9.]+) s", re.M)
+RE_ENDED_REQUEST = re.compile(r"^stopped by request after ([0-9.]+) s \(([^)]*)\)", re.M)
+RE_ENDED_EXIT = re.compile(r"^process exited with (0x[0-9a-fA-F]+) after ([0-9.]+) s", re.M)
+RE_ENDED_STOP = re.compile(r"^stopped at (.+?) \((0x[0-9a-fA-F]+)\) at .* after ([0-9.]+) s", re.M)
+RE_HEARTBEAT_FRAMES = re.compile(r"x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s")
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def last_milestone(logdir):
+    """The last frame count the title reported ("last present #N at S s") from its heartbeat lines, or "no present reported"."""
+    best = None
+    for name in ("stderr.txt", "stdout.txt"):
+        path = os.path.join(logdir, name)
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 262144))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for found in RE_HEARTBEAT_FRAMES.finditer(text):
+            candidate = (float(found.group(2)), int(found.group(1)))
+            best = candidate if best is None or candidate[0] > best[0] else best
+    return "last present #%d at %.0f s" % (best[1], best[0]) if best else "no present reported"
+
+
+def end_cause(logdir):
+    """Why the run ended, always one line, from the debugger's summary and the files the watchdog leaves:
+    watchdog (stall/deadlock/memory, or a hard end), timeout, stopped by request (stop file or commit headroom), title
+    exited (code 0), killed externally (a non-zero exit code and no stop file), crashed (exception code), debugger stop."""
+    stall = _read_json(os.path.join(logdir, "stall_stop.json"))
+    hard = _read_json(os.path.join(logdir, "hard_end.json"))
+    text = ""
+    for path in (os.path.join(logdir, "finished.txt"), logdir.rstrip("\\/") + ".out"):
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+            break
+    if stall:
+        cause = "watchdog at %s s: %s" % (stall.get("at_seconds"), stall.get("reason"))
+    elif hard and not text:
+        cause = "debugger did not finish: " + str(hard.get("note"))
+    elif RE_ENDED_TIMEOUT.search(text):
+        cause = "timeout after %s s (the run was not stopped early)" % RE_ENDED_TIMEOUT.search(text).group(1)
+    elif RE_ENDED_REQUEST.search(text):
+        found = RE_ENDED_REQUEST.search(text)
+        cause = "stopped by request at %s s (%s, no watchdog stop)" % (found.group(1), found.group(2))
+    elif RE_ENDED_EXIT.search(text):
+        found = RE_ENDED_EXIT.search(text)
+        code, at = int(found.group(1), 16), found.group(2)
+        if code == 0:
+            cause = "title exited by itself (code 0x0) at %s s" % at
+        elif code >= 0xC0000000 and code != 0xFFFFFFFF:
+            cause = "title crashed (exit code %s) at %s s" % (found.group(1), at)
+        else:
+            cause = "title killed externally (exit code %s, no stop file) at %s s" % (found.group(1), at)
+    elif RE_ENDED_STOP.search(text):
+        found = RE_ENDED_STOP.search(text)
+        cause = "debugger stop: %s (%s) at %s s" % (found.group(1), found.group(2), found.group(3))
+    else:
+        cause = "unknown: the debugger wrote no summary (killed, or still running)"
+    if hard and text:
+        cause += "; hard end: " + str(hard.get("note"))
+    return cause + "; " + last_milestone(logdir)
+
+
 def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
@@ -507,6 +580,8 @@ def main(argv):
     s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
+    e = sub.add_parser("end-cause")
+    e.add_argument("logdir")
     q = sub.add_parser("pack")
     q.add_argument("logdir")
     q.add_argument("manifest")
@@ -538,6 +613,9 @@ def main(argv):
         if args.json:
             with open(args.json, "w", encoding="utf-8") as handle:
                 json.dump(result, handle)
+        return 0
+    if args.cmd == "end-cause":
+        print(end_cause(args.logdir))
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)
