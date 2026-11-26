@@ -94,10 +94,11 @@ def run(asm, regs):
     env.update(
         mul16=lambda a, b: a * b,
         f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
+        minmax_zero32=lambda a, b, mx: (max if mx else min)(a, b),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
-    py = expr.replace('0u', '0').replace('&&', 'and')
+    py = expr.replace('0u', '0').replace('&&', 'and').replace('false', 'False').replace('true', 'True')
     py = re.sub(r'(0x[0-9a-f]+)u', r'\1', py)
     py = re.sub(r'\b(\d+)u\b', r'\1', py)
     py = re.sub(r'^isnan\((.*?)\) \? 0 : (.*)$', r'(0 if isnan(\1) else \2)', py)
@@ -263,8 +264,21 @@ for asm, regs, expected in PK:
     check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
 check('inf * 0 is NaN in both lanes', M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] & 0xffff)
       and M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] >> 16))
+# A literal source read through its low half in both lanes (what the title's clamp uses: 0x7bef is just under the binary16 maximum).
+PKLIT = [
+    ('v_pk_max_f16 v3, 0xc900, v0 op_sel_hi:[0,1]', [0xbc00 | 0x4000 << 16], 0x4000bc00),
+    ('v_pk_add_f16 v3, 1.0, v0 op_sel_hi:[0,1]', [ONE | TWO << 16], f2h(2.0) | f2h(3.0) << 16),
+    ('v_pk_mul_f16 v3, -2.0, v0 op_sel_hi:[0,1]', [ONE | THREE << 16], f2h(-2.0) | f2h(-6.0) << 16),
+    ('v_pk_min_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x7c00 | 0x4000 << 16], 0x40007bef),
+    ('v_pk_min_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x3c00 | 0xfc00 << 16], 0xfc003c00),
+    ('v_pk_max_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x3c00 | 0xfc00 << 16], 0x7bef7bef),
+    ('v_pk_max_f16 v3, v0, 0x7bef op_sel_hi:[1,0]', [0x7c00 | 0x4000 << 16], 0x7bef7c00),
+]
+for asm, regs, expected in PKLIT:
+    got = run(asm, regs + [0] * (4 - len(regs)))[1]
+    check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
 for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg_hi:[0,1]', 'v_pk_add_f16 v3, v0, v1 clamp',
-            'v_pk_mul_f16 v3, 2.0, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_add_f16 v3, s0, v1',
+            'v_pk_mul_f16 v3, 2.0, v1', 'v_pk_mul_f16 v3, 2.0, v1 op_sel:[1,0] op_sel_hi:[0,1]', 'v_pk_add_f16 v3, 3, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 0x7bef', 'v_pk_min_f16 v3, v0, 0x7bef op_sel:[0,1] op_sel_hi:[1,0]', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
             'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
             'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
     try:

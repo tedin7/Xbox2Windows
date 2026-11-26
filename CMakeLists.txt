@@ -1167,6 +1167,28 @@ add_test(NAME startup_console_mode_control
 add_test(NAME startup_console_mode_provider_control
          COMMAND startup_console_mode --control provider --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
 set_tests_properties(startup_console_mode_control startup_console_mode_provider_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# X2W_SKIP_MOVIES (movie_skip.inl): a stand-in bink2scarlett.dll with an eight-frame movie and an EXE that imports the title's eight
+# Bink functions by name from it and plays it. With the switch the movie ends at once, without it nothing changes; --no-hook (the
+# hook not installed) must FAIL on every case that needs the hook.
+if (WIN32)
+    add_library(startup_movie_skip_fake_bink SHARED tests/startup_movie_skip_fake_bink.cpp)
+    set_target_properties(startup_movie_skip_fake_bink PROPERTIES OUTPUT_NAME bink2scarlett PREFIX "")
+    target_compile_features(startup_movie_skip_fake_bink PRIVATE cxx_std_17)
+    add_executable(startup_movie_skip tests/startup_movie_skip.cpp)
+    target_include_directories(startup_movie_skip PRIVATE src)
+    target_compile_features(startup_movie_skip PRIVATE cxx_std_17)
+    target_link_libraries(startup_movie_skip PRIVATE startup_movie_skip_fake_bink)
+    foreach(case plain:0 goto_end:1 loop:1 mid:1 frames1:frames1 open_null:open_null log:log)
+        string(REPLACE ":" ";" parts "${case}")
+        list(GET parts 0 case_name)
+        list(GET parts 1 case_switch)
+        add_test(NAME startup_movie_skip_${case_name} COMMAND startup_movie_skip ${case_name})
+        set_tests_properties(startup_movie_skip_${case_name} PROPERTIES ENVIRONMENT "X2W_SKIP_MOVIES=${case_switch}"
+            PASS_REGULAR_EXPRESSION "startup_movie_skip: PASS")
+    endforeach()
+    add_test(NAME startup_movie_skip_no_hook_control COMMAND startup_movie_skip goto_end --no-hook)
+    set_tests_properties(startup_movie_skip_no_hook_control PROPERTIES ENVIRONMENT "X2W_SKIP_MOVIES=1" PASS_REGULAR_EXPRESSION "FAIL: ")
+endif()
 # EXE + late-loaded package helper through the real Windows loader: proxied xgameruntime QueryApiImpl,
 # unrelated same-named export stays original. Notification only enqueues; rewrite runs after link.
 if (WIN32)
@@ -1347,6 +1369,17 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
+
+# Replay (docs/startup-runtime.md#d3d12-replay-record): the player, next to the stand-in it loads, and the scene the
+# replay test records (tests/cmake/startup_replay.cmake).
+add_executable(x2w_replay src/replay/x2w_replay.cpp)
+target_compile_features(x2w_replay PRIVATE cxx_std_17)
+# Delay-loaded: the recording's settings (XENV) are in the environment before the stand-in reads any.
+target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp)
+target_link_options(x2w_replay PRIVATE /DELAYLOAD:d3d12_xs.dll)
+add_executable(startup_replay_quad tests/startup_replay_quad.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_replay_quad PRIVATE cxx_std_17)
+target_link_libraries(startup_replay_quad PRIVATE d3d12_xs_shim d3d12 dxgi)
 
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
@@ -2288,6 +2321,26 @@ target_compile_features(startup_committed_range_check PRIVATE cxx_std_17)
 add_test(NAME startup_committed_range COMMAND startup_committed_range_check)
 add_test(NAME startup_committed_range_touch_control COMMAND startup_committed_range_check --mutate touch)
 set_tests_properties(startup_committed_range_touch_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_committed_extent_check tests/startup_committed_extent_check.cpp)
+target_include_directories(startup_committed_extent_check PRIVATE src)
+target_compile_features(startup_committed_extent_check PRIVATE cxx_std_17)
+add_test(NAME startup_committed_extent COMMAND startup_committed_extent_check)
+add_test(NAME startup_committed_extent_prefix_control COMMAND startup_committed_extent_check --mutate prefix)
+set_tests_properties(startup_committed_extent_prefix_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_copy_cache_check tests/startup_copy_cache_check.cpp)
+target_include_directories(startup_copy_cache_check PRIVATE src)
+target_compile_features(startup_copy_cache_check PRIVATE cxx_std_17)
+add_test(NAME startup_copy_cache COMMAND startup_copy_cache_check)
+add_test(NAME startup_copy_cache_per_frame_control COMMAND startup_copy_cache_check --mutate per-frame)
+set_tests_properties(startup_copy_cache_per_frame_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_zero_tail_check tests/startup_zero_tail_check.cpp)
+target_include_directories(startup_zero_tail_check PRIVATE src)
+target_compile_features(startup_zero_tail_check PRIVATE cxx_std_17)
+add_test(NAME startup_zero_tail COMMAND startup_zero_tail_check)
+add_test(NAME startup_zero_tail_keep_all_control COMMAND startup_zero_tail_check --mutate keep-all)
+add_test(NAME startup_zero_tail_no_budget_control COMMAND startup_zero_tail_check --mutate no-budget)
+add_test(NAME startup_zero_tail_cache_control COMMAND startup_zero_tail_check --mutate cache)
+set_tests_properties(startup_zero_tail_keep_all_control startup_zero_tail_cache_control startup_zero_tail_no_budget_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
@@ -3667,6 +3720,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_s_quadmask_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl lowers s_bitreplicate_b64_b32 (SOP1, Run R 3c50f16a): CPU evaluation with mutants, then a D3D12 UAV
+    # readback on WARP/hardware of both destination dwords and an SCC that must stay set.
+    add_test(NAME startup_gfx2hlsl_s_bitreplicate COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitreplicate_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_s_bitreplicate_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitreplicate_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_s_bitreplicate_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lowers v_cube{id,sc,tc,ma}_f32: device-free translation controls.
     add_test(NAME startup_gfx2hlsl_cube_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py")
@@ -4641,6 +4704,22 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    # gfx2hlsl v_permlane16_b32 in a straight-line compute program, exchanged through groupshared memory (Run O audit).
+    add_test(NAME startup_compute_permlane16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_permlane16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_permlane16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wrong-row swapped-selects)
+            add_test(NAME startup_compute_permlane16_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_permlane16_cs_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_permlane16_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # gfx2hlsl bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops (Refs #1541).
     add_test(NAME startup_compute_lds_b128_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b128_check.py")
@@ -4804,6 +4883,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_float_transcendental_${adapter} PROPERTIES TIMEOUT 300
             SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl v_ldexp_f32 (D = S0 * 2^S1, signed exponent of any size): translation controls, then a draw against a
+    # binary64-scaled reference (overflow, denormal results, a denormal source) and one mutated lowering.
+    add_test(NAME startup_gfx2hlsl_ldexp_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_ldexp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_ldexp_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_gfx2hlsl_scalar_shift64_bfe_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py")
     add_test(NAME startup_gfx2hlsl_scalar_m0_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4864,6 +4953,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stall_watchdog_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stall_watchdog_check.py")
     set_tests_properties(startup_stall_watchdog_check PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_tester_janitor_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_janitor_check.py")
+    set_tests_properties(startup_tester_janitor_check PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -5113,7 +5205,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_frame_copy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
-        set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -5139,6 +5231,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
             "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_xg_bc_chain_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # The same draw with a 1 MiB upload ring: a level of the chain is larger than a quarter of it, so the ring refuses every
+        # level and the texture would stay empty; the chain fills a buffer of its own instead.
+        add_test(NAME startup_xg_bc_chain_small_ring_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "X2W_TEST_UPLOAD_RING_MAX_KIB=1024"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
+            "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_xg_bc_chain_small_ring_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_xg_bc_array_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_array_check.py"
             "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

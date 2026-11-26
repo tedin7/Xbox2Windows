@@ -42,6 +42,14 @@ public:
         return true;
     }
 
+    // The key was read some other way: drop it from the wanted and ready sets.
+    void forget(std::uint64_t key)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wanted_.erase(key);
+        ready_.erase(key);
+    }
+
     // True when some key is waiting for its manifest (the background thread has work to do).
     bool has_wanted() const
     {
@@ -110,8 +118,23 @@ public:
         return io_.read(key, out);
     }
 
-    // Retries and lookups that lost the claim: in-memory only.
-    bool load_retry(std::uint64_t key, std::string& out) { return prefetch_.fetch(key, out); }
+    // Retries and lookups that lost the claim: the background thread's copy first; if it has none yet, a retry may read the file
+    // itself, but only while a small budget lasts (retry_reads_per_second, spent across all keys), so a manifest published a
+    // moment ago is seen by the next retry (not up to a background period later) while hundreds of absent keys cannot turn into
+    // hundreds of opens per second under draw_lock. `now_ms` is a monotonic clock in milliseconds.
+    bool load_retry(std::uint64_t key, std::string& out, std::uint64_t now_ms = 0)
+    {
+        if (prefetch_.fetch(key, out)) return true;
+        if (!take_retry_token(now_ms)) return false;
+        {
+            std::lock_guard<std::mutex> lock(opened_mutex_);
+            ++retry_opens_;
+        }
+        if (!io_.read(key, out)) return false;
+        prefetch_.forget(key);
+        return true;
+    }
+    static constexpr int retry_reads_per_second = 20;
 
     ManifestPrefetch& prefetch() { return prefetch_; }
     long long first_opens() const { return first_opens_; }
@@ -119,9 +142,22 @@ public:
     long long background_reads() const { return prefetch_.background_reads(); }
 
 private:
+    bool take_retry_token(std::uint64_t now_ms)
+    {
+        std::lock_guard<std::mutex> lock(opened_mutex_);
+        if (now_ms >= window_start_ms_ + 1000) {
+            window_start_ms_ = now_ms;
+            tokens_ = retry_reads_per_second;
+        }
+        if (tokens_ <= 0) return false;
+        --tokens_;
+        return true;
+    }
     ManifestPrefetch::Io io_;
     ManifestPrefetch prefetch_;
     std::mutex opened_mutex_;
+    std::uint64_t window_start_ms_ = 0;
+    int tokens_ = 0;
     std::unordered_set<std::uint64_t> claimed_, read_;
     long long first_opens_ = 0, retry_opens_ = 0;
 };

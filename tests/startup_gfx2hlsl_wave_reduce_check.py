@@ -113,11 +113,13 @@ EXEC_LO, INLINE_M1 = 126, 0xc1
 V_PERMLANEX16_B32, V_READLANE_B32, V_CNDMASK_B32_E64, V_LSHLREV_B32_E64 = 0x378, 0x360, 0x101, 0x11a
 V_CNDMASK_B32, V_CMP_GT_U32 = 0x01, 0xc4
 VOP2_OPS = {'v_or_b32': 0x1c, 'v_min_u32': 0x13, 'v_max_u32': 0x14, 'v_max_i32': 0x12, 'v_add_nc_u32': 0x25,
+            'v_and_b32': 0x1b, 'v_xor_b32': 0x1d, 'v_min_i32': 0x11,
             'v_max_f32': 0x10}
-CTRL = {'quad_perm:[1,0,3,2]': 0xb1, 'quad_perm:[2,3,0,1]': 0x4e, 'row_half_mirror': 0x141, 'row_mirror': 0x140,
+CTRL = {'quad_perm:[1,0,3,2]': 0xb1, 'quad_perm:[3,2,1,0]': 0x1b, 'quad_perm:[2,3,0,1]': 0x4e, 'row_half_mirror': 0x141, 'row_mirror': 0x140,
         'row_shr:1': 0x111}
-IDENTITY = {'v_or_b32': 0, 'v_min_u32': 0xffffffff, 'v_max_u32': 0, 'v_max_i32': 0x80000000, 'v_add_nc_u32': 0}
-OPS = ('v_or_b32', 'v_min_u32', 'v_max_u32')
+IDENTITY = {'v_or_b32': 0, 'v_min_u32': 0xffffffff, 'v_max_u32': 0, 'v_max_i32': 0x80000000, 'v_add_nc_u32': 0,
+            'v_and_b32': 0xffffffff, 'v_xor_b32': 0, 'v_min_i32': 0x7fffffff}
+OPS = ('v_or_b32', 'v_min_u32', 'v_max_u32', 'v_and_b32', 'v_xor_b32', 'v_add_nc_u32')
 STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
 
 
@@ -285,6 +287,12 @@ def apply(op, a, b):
         return max(a, b)
     if op == 'v_max_i32':
         return max(a, b, key=lambda v: v - (1 << 32) if v & 0x80000000 else v)
+    if op == 'v_min_i32':
+        return min(a, b, key=lambda v: v - (1 << 32) if v & 0x80000000 else v)
+    if op == 'v_and_b32':
+        return a & b
+    if op == 'v_xor_b32':
+        return a ^ b
     if op == 'v_add_nc_u32':
         return (a + b) & MASK
     raise AssertionError(op)
@@ -401,7 +409,9 @@ def model_says_reduction(source, expect, trials=300, seed=2125):
 
 
 # ---- controls ---------------------------------------------------------------------------------------------------------
-INTRINSIC = {'v_or_b32': 'WaveActiveBitOr(v1)', 'v_min_u32': 'WaveActiveMin(v1)', 'v_max_u32': 'WaveActiveMax(v1)'}
+INTRINSIC = {'v_or_b32': 'WaveActiveBitOr(v1)', 'v_min_u32': 'WaveActiveMin(v1)', 'v_max_u32': 'WaveActiveMax(v1)',
+             'v_and_b32': 'WaveActiveBitAnd(v1)', 'v_xor_b32': 'WaveActiveBitXor(v1)', 'v_add_nc_u32': 'WaveActiveSum(v1)',
+             'v_min_i32': 'asuint(WaveActiveMin(asint(v1)))', 'v_max_i32': 'asuint(WaveActiveMax(asint(v1)))'}
 PAIR_EXPECT = [(1, 'v_min_u32'), (5, 'v_max_u32')]
 
 
@@ -426,15 +436,14 @@ def refusals():
            'identity', [(1, 'v_or_b32')])
     yield ('wrong identity (0 for the interleaved v_min_u32)', pair(min_kw=dict(identity=0)), 'identity',
            [(1, 'v_min_u32')])
-    yield ('row_mirror step removed', full(steps=STEPS[:3]), 'missing step row_mirror', False)
-    yield ('row_half_mirror step removed', full(steps=STEPS[:2] + STEPS[3:]), 'in place of row_half_mirror', False)
-    yield ('first quad step removed', full(steps=STEPS[1:]), 'in place of quad_perm:[1,0,3,2]', False)
-    yield ('mirror steps reordered (conservative)', full(steps=STEPS[:2] + STEPS[3:1:-1]), 'out of order', True)
-    yield ('quad steps reordered (conservative)', full(steps=STEPS[1::-1] + STEPS[2:]), 'out of order', True)
+    yield ('row_mirror step removed', full(steps=STEPS[:3]), 'missing step 4 of 4', False)
+    yield ('row_half_mirror step removed', full(steps=STEPS[:2] + STEPS[3:]), 'missing step 4 of 4', False)
+    yield ('first quad step removed', full(steps=STEPS[1:]), 'missing step 4 of 4', False)
+    yield ('a quad step repeated in place of the half mirror', full(steps=(STEPS[0], STEPS[1], STEPS[1], STEPS[3])),
+           'do not bring every lane', False)
+    yield ('the half mirror twice', full(steps=(STEPS[0], STEPS[1], STEPS[2], STEPS[2])), 'do not bring every lane', False)
     yield ('row_shr:1 in place of row_mirror', full(steps=STEPS[:3] + ('row_shr:1',)), 'row_shr:1 in place of', False)
     yield ('mixed operations (one v_min_u32 step)', full(step_ops={2: 'v_min_u32'}), 'mixes', False)
-    yield ('v_add_nc_u32 (not in the census)', program(START_MUL, chain('v_add_nc_u32'), RESULT, END),
-           'only v_or_b32', None)
     yield ('v_max_i32 (not in the census)', program(START_MUL, chain('v_max_i32', identity=0), RESULT, END),
            'only v_or_b32', None)
     yield ('a float step (v_max_f32)', full(step_ops={0: 'v_max_f32'}), 'only v_or_b32', None)
@@ -448,7 +457,6 @@ def refusals():
     yield ('branch target inside the chain', branch_program(op, True), 'branch target', None)
     yield ('branch target on the later readlane of the v_min_u32 chain', branch_into_later_readlane(),
            'branch target', None)
-    yield ('a program with branches', branch_program(op, False), 'program with branches', None)
     yield ('after s_wqm exec_lo, exec_lo', program(WQM, START_MUL, chain(op), RESULT, END), 'helper lanes', None)
     yield ('the permlane VGPR read after the chain', program(START_MUL, chain(op), RESULT, END_READS_VP),
            'read after the chain', None)
@@ -542,7 +550,11 @@ def controls():
     for label, variant in (('bound_ctrl on every step', chain('v_max_u32', bound_ctrl=True)),
                            ('steps without fi', chain('v_max_u32', fi=False)),
                            ('the combine with the sources the other way round', chain('v_max_u32', combine='e32')),
-                           ('the combine in VOP3', chain('v_max_u32', combine='e64'))):
+                           ('the combine in VOP3', chain('v_max_u32', combine='e64')),
+                           ('the mirror steps in the other order', chain('v_max_u32', steps=STEPS[:2] + STEPS[3:1:-1])),
+                           ('the quad steps in the other order', chain('v_max_u32', steps=STEPS[1::-1] + STEPS[2:])),
+                           ('the half mirror first', chain('v_max_u32', steps=(STEPS[2], STEPS[0], STEPS[1], STEPS[3]))),
+                           ('a reversing quad step after the swap', chain('v_max_u32', steps=('quad_perm:[1,0,3,2]', 'quad_perm:[3,2,1,0]', STEPS[2], STEPS[3])))):
         source, words = program(START_MUL, variant, RESULT, END)
         text, reason = translate(words)
         check('accepts %s' % label, text is not None and 'v2 = WaveActiveMax(v1);' in text, str(reason))
@@ -550,6 +562,11 @@ def controls():
     _source, words = program(START_MUL, chain('v_max_u32'), RESULT, KILL_VP, END_READS_VP)
     text, reason = translate(words)
     check('accepts the permlane VGPR rewritten before it is read', text is not None and 'v3 = 0' in text, str(reason))
+    # A program with an execz branch ahead of the chain: the branch is decided over the host wave (every thread reaches the
+    # chain together), the chain keeps its lowering.
+    text, reason = translate(branch_program('v_max_u32', False)[1])
+    check('a forward execz branch is a wave vote and the chain still lowers', text is not None and
+          'WaveActiveAnyTrue((exec & 1u) != 0u)' in text and 'WaveActiveMax(' in text, str(reason))
     for label, (source, words), fragment, model in refusals():
         text, reason = translate(words)
         check('refuses %s, by name' % label, text is None and reason is not None and 'wave reduction' in reason
@@ -604,11 +621,22 @@ def drop_sdwa(text):
     return '\n'.join(kept) if len(kept) == len(lines) - 1 else text
 
 
-OTHER = {'v_or_b32': 'v_max_u32', 'v_min_u32': 'v_max_u32', 'v_max_u32': 'v_min_u32'}
+OTHER = {'v_or_b32': 'v_max_u32', 'v_min_u32': 'v_max_u32', 'v_max_u32': 'v_min_u32', 'v_and_b32': 'v_or_b32',
+         'v_xor_b32': 'v_or_b32', 'v_add_nc_u32': 'v_xor_b32', 'v_min_i32': 'v_max_i32', 'v_max_i32': 'v_min_i32'}
+SIGNED = {'v_min_i32': 'v_min_u32', 'v_max_i32': 'v_max_u32'}
+
+
+def sign_swapped(text, op):
+    """The other signedness of a min or max; text unchanged for an operation that has none."""
+    if op in SIGNED:
+        return text.replace(INTRINSIC[op], INTRINSIC[SIGNED[op]])
+    if op in ('v_min_u32', 'v_max_u32'):
+        return text.replace(INTRINSIC[op], INTRINSIC[op].replace('(v1)', '(int(v1))').replace('Wave', 'uint(Wave', 1) + ')')
+    return text
+
 MUTATIONS = {
     'another operation': lambda text, op: text.replace(INTRINSIC[op], INTRINSIC[OTHER[op]]),
-    'signed for unsigned': lambda text, op: text.replace(INTRINSIC[op], INTRINSIC[op].replace(
-        '(v1)', '(int(v1))').replace('Wave', 'uint(Wave', 1) + ')') if op != 'v_or_b32' else text,
+    'signed for unsigned': lambda text, op: sign_swapped(text, op),
     "the lane's own value": lambda text, op: text.replace(INTRINSIC[op], 'v1'),
     "the first lane's value": lambda text, op: text.replace(INTRINSIC[op], 'WaveReadLaneFirst(v1)'),
 }
@@ -633,6 +661,11 @@ def pair_sdwa(x, y):
 DRAWS = [(op, fixture(op)[1]) + single(op) for op in OPS] + [
     ('min then max, interleaved', PAIR[1], 'v_min_u32',
      (('reduce', 'v_min_u32'), ('lane', pair_sdwa), ('reduce', 'v_max_u32')))]
+
+# The recognition simulates the steps, so another order of the same four steps is drawn too (label -> operation).
+REORDERED = {'v_max_u32, half mirror first': ('v_max_u32', (STEPS[2], STEPS[0], STEPS[1], STEPS[3])),
+             'v_add_nc_u32, quad steps swapped then reversed': ('v_add_nc_u32', ('quad_perm:[1,0,3,2]', 'quad_perm:[3,2,1,0]', STEPS[2], STEPS[3]))}
+DRAWS += [(label, program(start(op), chain(op, steps=steps), RESULT, END)[1]) + single(op) for label, (op, steps) in REORDERED.items()]
 
 
 def verify(input_op, channels, words):
@@ -698,15 +731,16 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if text is None:
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
-            if label in OPS:
-                hows = [(how, (lambda t, f=f: f(t, label))) for how, f in MUTATIONS.items()]
+            if label in OPS or label in REORDERED:
+                label_op = REORDERED[label][0] if label in REORDERED else label
+                hows = [(how, (lambda t, f=f: f(t, label_op))) for how, f in MUTATIONS.items()]
             else:
                 hows = list(PAIR_MUTATIONS.items())
             for how, mutate in [(None, None)] + hows:
                 source = observed(text if how is None else mutate(text))
                 if how is not None and source == observed(text):
-                    if label == 'v_or_b32' and how == 'signed for unsigned':
-                        continue   # v_or_b32 has no signedness
+                    if label not in ('v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32') and how == 'signed for unsigned':
+                        continue   # only min and max have a signedness
                     check('%s %s %s: the planted error applies' % (adapter, label, how), False)
                     continue
                 tag = re.sub(r'\W+', '_', label + ('' if how is None else '_' + how))

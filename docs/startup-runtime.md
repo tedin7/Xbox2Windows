@@ -1553,6 +1553,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
+| `X2W_SKIP_MOVIES=<mode>` | with `X2W_RUNTIME_PROXY=1`, opt-in: the title's imports of its movie player (`bink2scarlett.dll`: open, close, next frame, goto, do frame, wait, should skip, pause) are forwarded to the real functions with a change per mode. `1` or `goto_end`: after a playback's first frame the real goto jumps to the last frame, so the title sees the movie end at once; `frames1`: the header's frame count is set to 1 after the open; `open_null`: the open returns null; `log`: nothing changes, the first calls and the movie header are logged. Unset or `0`: nothing is rewritten. Delay-load imports and pointers fetched with `GetProcAddress` are not rewritten. Tested with a stand-in DLL and player (`startup_movie_skip_*`). |
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
@@ -1873,6 +1874,62 @@ allow unordered access are never in the retire class.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
+```
+
+## D3D12 replay record
+
+`X2W_REPLAY_RECORD=all`, `<start s>,<seconds>` or `f<first present>,<presents>` records every call the title
+makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `<X2W_REPLAY_DIR>\replay.x2wr` when that folder is
+set, else `replay.x2wr`; it stops with its end chunk once the file reaches `X2W_REPLAY_MAX_MIB`, default 2048), so a replayer can feed the
+same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
+Unset, no slot is wrapped and nothing changes.
+
+Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
+the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, seven argument words, return value, time,
+present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
+are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
+shader's is), and the wrapper an argument's memory holds after the call (a creation's
+result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
+written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
+closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
+
+File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
+`CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
+`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
+Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the name, data: the bytes; files over 16 MiB
+and anything past 512 MiB in total are left out and counted in the log).
+Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
+parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
+passed first, the object second), its memory after the call is `ARGM` argument 7.
+Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
+
+`X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
+present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
+GPU round trip per present. A recorded run and its replay write the same names.
+
+### Replayer
+
+`x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a
+device through the stand-in (loaded late, after it has set every recorded `XENV` setting this process does not set
+itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache), writes the recording's
+`SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
+(the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
+`replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
+recording, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+accepted and ignored in this version.
+
+Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
+memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
+heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
+completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
+map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
+with a buffer of the replayer's. Not replayed yet: memory written through mapped pointers or into placed-resource
+memory, float arguments passed by value, one thread per recorded thread.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
 ```
 
 ## D3D12 view census
