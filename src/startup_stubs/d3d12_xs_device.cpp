@@ -2827,6 +2827,50 @@ void note_copy_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u6
         if (first_calls(reports, 16)) log("x2w-render recorded GPU buffer copy range: offset 0x%llx, %llu bytes", offset, bytes);
     }
 }
+// Placed buffers that do not alias title memory (copied placement) and that a recorded copy has written. The title's memory
+// never receives those bytes, so a draw that reads the buffer's range from title memory reads what the title wrote before the
+// copy, or nothing. The ranges outlive the recording: the copy and the draw that reads it are often in different lists.
+// A range is dropped with its wrapper's title address changing; a recording that is discarded still leaves its range here,
+// which only makes a later draw read the buffer's own copy.
+struct PlacedGpuWrite { u64 address, offset, bytes; };
+SRWLOCK placed_gpu_writes_lock = SRWLOCK_INIT;
+LONG placed_gpu_write_buffers = 0;
+std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>>& placed_gpu_writes()
+{
+    static std::unordered_map<Wrapper*, std::vector<PlacedGpuWrite>> m;
+    return m;
+}
+void note_placed_gpu_write(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    if (!buffer || !buffer->own().title_memory || !bytes) return;
+    const auto* info = resource_info(buffer);
+    if (!info || info->placement != Placement::copied_buffer) return;
+    const u64 address = reinterpret_cast<u64>(buffer->own().title_memory);
+    AcquireSRWLockExclusive(&placed_gpu_writes_lock);
+    try {
+        auto& writes = placed_gpu_writes()[buffer];
+        if (!writes.empty() && writes.front().address != address) writes.clear();  // a new buffer at a reused wrapper
+        if (writes.size() < 64) writes.push_back({address, offset, bytes});
+        placed_gpu_write_buffers = static_cast<LONG>(placed_gpu_writes().size());
+    } catch (const std::bad_alloc&) {
+    }
+    ReleaseSRWLockExclusive(&placed_gpu_writes_lock);
+}
+// True when a recorded copy wrote any byte of [offset, offset + bytes) of the buffer.
+bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
+{
+    if (!InterlockedCompareExchange(&placed_gpu_write_buffers, 0, 0)) return false;
+    bool written = false;
+    AcquireSRWLockShared(&placed_gpu_writes_lock);
+    const auto found = placed_gpu_writes().find(buffer);
+    if (found != placed_gpu_writes().end() && buffer->own().title_memory &&
+        found->second.front().address == reinterpret_cast<u64>(buffer->own().title_memory)) {
+        for (const auto& write : found->second)
+            if (offset < write.offset + write.bytes && write.offset < offset + bytes) written = true;
+    }
+    ReleaseSRWLockShared(&placed_gpu_writes_lock);
+    return written;
+}
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
