@@ -75,6 +75,8 @@ param(
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [switch]$FreshSave,                       # wipe the saved game folder first (out/startup/saves, or -SaveRoot): the title starts as a new profile and shows its legal/privacy screens again
+    [string]$SaveRoot = "out/startup/saves",      # X2W_STORAGE_PATH for the title: its saves and persistent local storage, kept across runs so a screen accepted once is skipped next time
     [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
     [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
@@ -244,6 +246,13 @@ $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
 if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
+$saveDir = if ([System.IO.Path]::IsPathRooted($SaveRoot)) { $SaveRoot } else { Join-Path $repo $SaveRoot }
+if ($FreshSave -and (Split-Path -Leaf $saveDir) -notmatch "save") { throw "tester_run: -FreshSave only wipes a folder whose name contains save (got $saveDir)" }
+if ($FreshSave -and (Test-Path -LiteralPath $saveDir)) { Remove-Item -LiteralPath $saveDir -Recurse -Force }
+New-Item -ItemType Directory -Force $saveDir | Out-Null
+$env:X2W_STORAGE_PATH = $saveDir.TrimEnd('\', '/') + '\'
+$saveBefore = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)
+Write-Host ("tester_run: saves in {0} ({1} files kept from earlier runs{2})" -f $saveDir, $saveBefore.Count, $(if ($FreshSave) { ', -FreshSave wiped it' } else { '' }))
 $HddMode = -not $NoHddMode
 if ($HddMode) { $env:X2W_STORAGE_HDD = "1" } else { Remove-Item Env:X2W_STORAGE_HDD -ErrorAction SilentlyContinue }
 $GpuTime = -not $NoGpuTime
@@ -324,7 +333,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue).Count
     pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
