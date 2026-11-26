@@ -156,6 +156,7 @@ struct Translation {
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
     LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
+    LONG cbuf_seen = 0, cbuf_logged = 0;                           // X2W_RED_PRODUCER_* constant-buffer float log
 };
 
 // Per title pipeline: its translation and the blend state found in its state block (if any).
@@ -1291,6 +1292,38 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
+// Diagnostic only (Run N magenta): with X2W_RED_PRODUCER_AUTO or X2W_RED_PRODUCER_FRAMES set, a small buffer SRV of a translated draw is also
+// logged as floats (one line per 16 bytes, float values and raw bits so NaN/pointer-like data is visible): the first 8 draws of each key and then
+// every 300th. Reads the same title memory the existing hex head shows; changes nothing that is bound or drawn.
+bool red_cbuf_floats_enabled()
+{
+    static const bool on = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", value, sizeof(value)) != 0 ||
+               GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", value, sizeof(value)) != 0;
+    }();
+    return on;
+}
+void log_cbuf_floats(Translation* tr, UINT srv_index, u64 address, std::size_t bytes)
+{
+    const LONG seen = ++tr->cbuf_seen;
+    if (tr->cbuf_logged >= 8 && seen % 300 != 0) return;
+    ++tr->cbuf_logged;
+    const auto* words = reinterpret_cast<const unsigned*>(address);
+    for (std::size_t row = 0; row * 16 < bytes; ++row) {
+        float f[4]{};
+        unsigned w[4]{};
+        for (std::size_t k = 0; k < 4; ++k) {
+            if ((row * 4 + k) * 4 + 4 > bytes) break;
+            w[k] = words[row * 4 + k];
+            std::memcpy(&f[k], &w[k], sizeof(float));
+        }
+        log("x2w-red cbuf key=%016llx srv=%u draw#%ld address=0x%llx bytes=%zu row=%zu: %.9g %.9g %.9g %.9g bits %08x %08x %08x %08x",
+            tr->key, srv_index, seen, address, bytes, row, static_cast<double>(f[0]), static_cast<double>(f[1]), static_cast<double>(f[2]),
+            static_cast<double>(f[3]), w[0], w[1], w[2], w[3]);
+    }
+}
+
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
 {
     u64 h = 0xcbf29ce484222325ull;
@@ -2629,6 +2662,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
         }
+        if (have && bytes <= 256 && red_cbuf_floats_enabled()) log_cbuf_floats(tr, i, address, bytes);
     }
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
