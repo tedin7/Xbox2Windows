@@ -58,12 +58,25 @@ HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& 
 {
     if (!desc.Flags) return D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
     std::vector<D3D12_ROOT_PARAMETER1> parameters(desc.NumParameters);
+    std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges(desc.NumParameters);  // referenced by the parameters until serialized
     for (UINT i = 0; i < desc.NumParameters; ++i) {
         const D3D12_ROOT_PARAMETER& p = desc.pParameters[i];
-        if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_CBV && p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) return E_INVALIDARG;
         parameters[i].ParameterType = p.ParameterType;
-        parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
         parameters[i].ShaderVisibility = p.ShaderVisibility;
+        if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+            parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+        } else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+            parameters[i].Constants = p.Constants;
+        } else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+            for (UINT r = 0; r < p.DescriptorTable.NumDescriptorRanges; ++r) {
+                const D3D12_DESCRIPTOR_RANGE& old = p.DescriptorTable.pDescriptorRanges[r];
+                ranges[i].push_back({old.RangeType, old.NumDescriptors, old.BaseShaderRegister, old.RegisterSpace,
+                                     D3D12_DESCRIPTOR_RANGE_FLAG_NONE, old.OffsetInDescriptorsFromTableStart});
+            }
+            parameters[i].DescriptorTable = {static_cast<UINT>(ranges[i].size()), ranges[i].data()};
+        } else {
+            return E_INVALIDARG;
+        }
     }
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{D3D_ROOT_SIGNATURE_VERSION_1_1};
     versioned.Desc_1_1 = {desc.NumParameters, parameters.data(), 0, nullptr, desc.Flags};
@@ -149,6 +162,10 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             root_desc.NumParameters = 2;
         }
     }
+    // X2W_TEST_HEAP_SRV (with X2W_TEST_JOINED_TABLE, tests/startup_pixel_heap_srv_check.py): the shader indexes the view heap
+    // itself, so the root signature carries CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400).
+    if (joined_table && GetEnvironmentVariableW(L"X2W_TEST_HEAP_SRV", nullptr, 0))
+        root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
     D3D12_ROOT_PARAMETER root_cbv{};
@@ -166,7 +183,8 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     // A runtime or device that rejects the requested root signature flags is a capability skip.
     const int rejected = root_desc.Flags ? 77 : 0;
     ComPtr<ID3DBlob> blob;
-    if (FAILED(serialize_root(root_desc, blob))) return rejected ? rejected : 6;
+    // A serializer failure is a fixture failure, never a capability skip: only the device's CreateRootSignature may skip.
+    if (FAILED(serialize_root(root_desc, blob))) return 6;
     stream_root_bytes.assign(static_cast<const char*>(blob->GetBufferPointer()),
                              static_cast<const char*>(blob->GetBufferPointer()) + blob->GetBufferSize());
     std::ofstream(root_path, std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());

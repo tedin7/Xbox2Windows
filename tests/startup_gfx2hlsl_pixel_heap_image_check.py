@@ -49,6 +49,18 @@ def main():
     assert st.heap_index[8] == ('rc', 0, H.INDEX_WORD, 1, 0x10, 0xfffffff0), st.heap_index
     st.mark_heap_index('s_mul_i32', 9, ['s7', '4'], [None, None])
     assert 9 not in st.heap_index, 'a multiply of a masked word must not be named'
+    # The SOPK forms read the same marks on every pixel shader: s_addk_i32 keeps the mask, s_mulk_i32 does not name it,
+    # and neither may fail on a masked mark (a five-value mark once raised ValueError in a program with no heap load).
+    st.sym.pop(7, None)  # the real flow leaves the s_and result untracked
+    st.heap_index_was = {7: st.heap_index.pop(7)}
+    st.op_s_addk_i32(['s7', '0x10'], [])
+    assert st.heap_index[7] == ('rc', 0, H.INDEX_WORD, 1, 0x10, 0xfffffff0), st.heap_index
+    st = stage()
+    st.mark_heap_index('s_and_b32', 7, ['s5', '-16'], [rootconst_sym(st), None])
+    st.sym.pop(7, None)
+    st.heap_index_was = {7: st.heap_index.pop(7)}  # a write ends the mark; the handler reads the one it replaced
+    st.op_s_mulk_i32(['s7', '0x4'], [])
+    assert 7 not in st.heap_index, st.heap_index
     st = stage('cs')
     st.mark_heap_index('s_and_b32', 7, ['s5', '-16'], [rootconst_sym(st), None])
     assert 7 not in st.heap_index, 'compute does not read a mask: not named'

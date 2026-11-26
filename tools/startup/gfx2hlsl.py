@@ -5694,9 +5694,14 @@ class Stage:
             self.set_s(d, result, align4=acc_align4)
         offset = self.heap_word_offset(ops[0], sym) if hasattr(self, 'heap_index') else None
         if offset:
-            p, w, scale, plus = offset
-            self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff) if add else (
-                'rc', p, w, scale * imm & 0xffffffff, plus * imm & 0xffffffff)
+            p, w, scale, plus, *mask = offset
+            if mask:
+                # (word & mask) plus a constant keeps its mask; a multiply of a masked word is not named.
+                if add:
+                    self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff, mask[0])
+            else:
+                self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff) if add else (
+                    'rc', p, w, scale * imm & 0xffffffff, plus * imm & 0xffffffff)
         self.masks.discard(d)
         return None
 
@@ -10665,9 +10670,12 @@ class Pipeline:
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             source, off = key
-            where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0), 'vbtab': 'vb %d' % ((off or 0) // 16),
-                     'root': 'root %d' % (source[1] if len(source) > 1 else 0)}.get(source[0])
-            if where is None and source[0] == 'resheap' and off in (None, 0):
+            where = None
+            if source[0] in ('table', 'vbtab', 'root'):
+                where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0),
+                         'vbtab': 'vb %d' % ((off or 0) // 16),
+                         'root': 'root %d' % (source[1] if len(source) > 1 else 0)}[source[0]]
+            elif source[0] == 'resheap' and off in (None, 0):
                 where = heap_where(source)
             if where is None:
                 raise Unsupported('resource through %s' % (source,))

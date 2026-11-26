@@ -72,12 +72,18 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     Word cpu = 0;
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const Word stride = joined_table ? invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
+    // X2W_TEST_HEAP_SRV=word: the heap index is a word of a buffer whose hardware descriptor sits at table byte 64
+    // (tests/startup_pixel_heap_srv_check.py, case word), so the heap holds four native slots.
+    wchar_t heap_mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_HEAP_SRV", heap_mode, 8);
+    const bool heap_word = joined_table && std::wcscmp(heap_mode, L"word") == 0;
+    const UINT heap_slots = heap_word ? 4 : 2;
     static std::vector<unsigned char> title_table;  // The bound heap retains this backing memory.
     if (joined_table) {
         if (stride < 32) return 42;
-        title_table.resize(2 * stride);
+        title_table.resize(heap_slots * stride);
     }
-    if (!bind_view_table(guest, list, cpu, joined_table ? 2 : 1, joined_table ? ptr(title_table.data()) : 0,
+    if (!bind_view_table(guest, list, cpu, joined_table ? heap_slots : 1, joined_table ? ptr(title_table.data()) : 0,
                          joined_table ? title_table.size() : 0)) return 42;
     if (joined_table && cpu != ptr(title_table.data())) return 42;
     ViewAt v{};
@@ -97,8 +103,28 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
             // The shader uses packed 32-byte records. Publish both views at native
             // slot boundaries, then pack the second token in the guest-owned table.
             std::memmove(title_table.data() + 32, title_table.data() + stride, 32);
+            // Heap case: only the two packed records exist. The second native slot (byte `stride`) held the token just
+            // moved; left in place it would be record 2 or 3, a valid record for a key that must be refused.
+            if (GetEnvironmentVariableW(L"X2W_TEST_HEAP_SRV", nullptr, 0))
+                std::memset(title_table.data() + 64, 0, title_table.size() - 64);
+            if (heap_word) {
+                // The index buffer, in this recording's upload memory (list slot 148): word k is the record key k names.
+                // Records 0 and 1 are the views; 5 and 7 are past the heap. Its hardware buffer descriptor (address, a raw
+                // 16-byte range) is table byte 64, which the shader reads with s_load_dwordx4.
+                auto* const index = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, 256, 256)));
+                if (!index) return 43;
+                const UINT records[4] = {1, 0, 5, 7};
+                std::memcpy(index, records, sizeof(records));
+                const Word address = ptr(index);
+                const UINT descriptor[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+                std::memcpy(title_table.data() + 64, descriptor, sizeof(descriptor));
+            }
+            // The heap-record case (X2W_TEST_HEAP_SRV) uses the same four strips: keys 2 and 3 name records the two-entry
+            // heap does not hold, and each such draw must be refused.
             for (UINT key = 0; key < 4; ++key) {
-                invoke(list, 40, 1, 1, ptr(&key), 0);
+                // Word case, key 3: the byte offset root constant * 4 wraps at 32 bits to 4, as the shader's own s_mul_i32 does.
+                const UINT value = heap_word && key == 3 ? 0x40000001u : key;
+                invoke(list, 40, 1, 1, ptr(&value), 0);
                 draw(static_cast<LONG>(swap * 4 + key));
             }
         }
