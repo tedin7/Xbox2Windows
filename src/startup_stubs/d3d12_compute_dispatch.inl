@@ -11,6 +11,16 @@
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
 
+struct TranslatedIndirectConstants {
+    x2w_startup::ComPtr<ID3D12CommandSignature> signature;
+    std::array<UINT, 32> source_offsets{};
+    UINT covered = 0, word_count = 0, stride = 0;
+    bool repack = false;
+    const char* failure = nullptr;
+
+    bool covers_entry(UINT entry) const { return (covered & (1u << entry)) != 0; }
+};
+
 struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
@@ -35,6 +45,7 @@ struct ComputeTranslation {
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    std::unordered_map<const Wrapper*, TranslatedIndirectConstants> indirect_constants;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     KeyUse use;                            // when a Dispatch first and last had this key bound
@@ -48,6 +59,7 @@ struct ComputeTranslation {
         // The per-process cache is destroyed during DLL detach. A driver may already have shut
         // down when the process is terminating. Explicit unload still releases both references.
         if (x2w_startup::d3d12_process_terminating) {
+            for (auto& pair : indirect_constants) pair.second.signature.Detach();
             pipeline.Detach();
             root.Detach();
         }
@@ -238,6 +250,75 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     return nullptr;
 }
 
+// GPU records are packed and D3D12 requires increasing constant destinations. A different order,
+// a shared source, or an unused word needs a GPU copy into the layout of the translated signature.
+TranslatedIndirectConstants make_translated_indirect_constants(ID3D12Device* device, const ComputeTranslation& tr,
+                                                                const IndirectConstantLayout& layout)
+{
+    TranslatedIndirectConstants result;
+    const auto record_offset = [&](int parameter, int word) -> UINT {
+        for (const auto& arg : layout.arguments)
+            if (arg.parameter == static_cast<UINT>(parameter) && static_cast<UINT>(word) >= arg.first_word &&
+                static_cast<UINT>(word) - arg.first_word < arg.word_count)
+                return arg.byte_offset + (static_cast<UINT>(word) - arg.first_word) * sizeof(UINT);
+        return UINT_MAX;
+    };
+    const auto selects_resource = [&](const ComputeTranslation::Slot& slot) {
+        return slot.heap && (slot.word_param < 0 || slot.times) && record_offset(slot.a, slot.b) != UINT_MAX;
+    };
+    if (std::any_of(tr.srvs.begin(), tr.srvs.end(), selects_resource) ||
+        std::any_of(tr.uavs.begin(), tr.uavs.end(), selects_resource)) {
+        result.failure = "an indirect root constant selects a resource";
+        return result;
+    }
+
+    std::array<D3D12_INDIRECT_ARGUMENT_DESC, 33> arguments{};
+    UINT argument_count = 0;
+    for (UINT i = 0; i < tr.uds.size(); ++i) {
+        const auto& entry = tr.uds[i];
+        if (entry.source != ComputeTranslation::root_constant) continue;
+        const UINT offset = record_offset(entry.a, entry.b);
+        if (offset == UINT_MAX) continue;
+        result.covered |= 1u << i;
+        result.repack |= offset != result.word_count * sizeof(UINT);
+        result.source_offsets[result.word_count++] = offset;
+        if (argument_count) {
+            auto& previous = arguments[argument_count - 1].Constant;
+            if (previous.DestOffsetIn32BitValues + previous.Num32BitValuesToSet == i) {
+                ++previous.Num32BitValuesToSet;
+                continue;
+            }
+        }
+        auto& argument = arguments[argument_count++];
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        argument.Constant = {0, i, 1};
+    }
+    result.repack |= layout.dispatch_offset != result.word_count * sizeof(UINT);
+    result.stride = (std::max)(layout.stride,
+        static_cast<UINT>(result.word_count * sizeof(UINT) + sizeof(D3D12_DISPATCH_ARGUMENTS)));
+    arguments[argument_count++].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    const D3D12_COMMAND_SIGNATURE_DESC desc{result.stride, argument_count, arguments.data(), layout.node_mask};
+    if (FAILED(device->CreateCommandSignature(&desc, result.word_count ? tr.root.Get() : nullptr,
+                                               IID_PPV_ARGS(&result.signature))))
+        result.failure = "translated indirect constant signature creation failed";
+    return result;
+}
+
+ID3D12Resource* translated_indirect_constant_scratch(Wrapper* self, Pass& pass, UINT bytes)
+{
+    if (pass.indirect_constant_scratch && pass.indirect_constant_scratch->GetDesc().Width >= bytes)
+        return pass.indirect_constant_scratch;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    x2w_startup::ComPtr<ID3D12Resource> scratch;
+    if (FAILED(device_of(self->own().list_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&scratch))) ||
+        !retain_with_recording(self, scratch)) return nullptr;
+    return pass.indirect_constant_scratch = scratch.Get();
+}
+
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
 x2w_phase::Totals dispatch_phase_totals;
 
@@ -306,9 +387,23 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
         }
     }
+    const TranslatedIndirectConstants* indirect = nullptr;
+    const auto* layout = dispatch.rooted_signature ? dispatch.rooted_signature->own().indirect_constants : nullptr;
+    if (!reason && layout) {
+        try {
+            auto [it, inserted] = tr->indirect_constants.try_emplace(dispatch.rooted_signature);
+            if (inserted)
+                it->second = make_translated_indirect_constants(device_of(self->own().list_device), *tr, *layout);
+            indirect = &it->second;
+            reason = indirect->failure;
+        } catch (const std::bad_alloc&) {
+            reason = "translated indirect constant signature allocation failed";
+        }
+    }
     // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
-        if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
+        if (tr->uds[i].source == ComputeTranslation::root_constant && !(indirect && indirect->covers_entry(static_cast<UINT>(i))) &&
+            !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     phases.to(1);
@@ -510,10 +605,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
+        if (ud.source == ComputeTranslation::root_constant) {
+            if (!indirect || !indirect->covers_entry(static_cast<UINT>(i)))
+                values[i] = pass.compute_constants.word(ud.a, ud.b);
+            continue;
+        }
         const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
-        case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;
+        case ComputeTranslation::root_constant: break;
         case ComputeTranslation::input_stride: values[i] = view.stride; break;
         case ComputeTranslation::input_word3:
             std::memcpy(word, view.words, sizeof(word));
@@ -536,6 +636,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    ID3D12Resource* scratch = nullptr;
+    if (!reason && indirect && indirect->repack) {
+        scratch = translated_indirect_constant_scratch(self, pass, indirect->stride);
+        if (!scratch) reason = "translated indirect constants have no scratch buffer";
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -600,8 +705,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
-        require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
+        if (scratch) {
+            require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            require_state(self, scratch, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (UINT i = 0; i < indirect->word_count; ++i)
+                list->CopyBufferRegion(scratch, i * sizeof(UINT), dispatch.argument,
+                                       dispatch.offset + indirect->source_offsets[i], sizeof(UINT));
+            list->CopyBufferRegion(scratch, indirect->word_count * sizeof(UINT), dispatch.argument,
+                                   dispatch.offset + layout->dispatch_offset, sizeof(D3D12_DISPATCH_ARGUMENTS));
+            require_state(self, scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ExecuteIndirect(indirect->signature.Get(), 1, scratch, 0, nullptr, 0);
+        } else {
+            require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ExecuteIndirect(indirect ? indirect->signature.Get() : dispatch.signature,
+                                  1, dispatch.argument, dispatch.offset, nullptr, 0);
+        }
     } else {
         list->Dispatch(x, y, z);
     }

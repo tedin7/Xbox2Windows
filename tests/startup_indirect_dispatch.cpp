@@ -1,3 +1,4 @@
+#include "startup_indirect_signature.h"
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -409,12 +410,8 @@ int main(int argc, char** argv) try
     const auto other_guest_root = make_root(1, guest.Get());
     D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
     const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
-    D3D12_INDIRECT_ARGUMENT_DESC constant_arguments[2]{};
-    constant_arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
-    constant_arguments[0].Constant = {1, 0, 2};
-    constant_arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
-    const D3D12_COMMAND_SIGNATURE_DESC constant_signature_desc{
-        2 * sizeof(UINT) + sizeof(D3D12_DISPATCH_ARGUMENTS), 2, constant_arguments, 0};
+    const ConstantDispatchSignature constants_then_dispatch(1, 0, 2);
+    const auto constant_signature_desc = constants_then_dispatch.desc();
     ComPtr<ID3D12CommandSignature> signature;
     ComPtr<ID3D12CommandSignature> padded;
     ComPtr<ID3D12CommandSignature> placeholder;

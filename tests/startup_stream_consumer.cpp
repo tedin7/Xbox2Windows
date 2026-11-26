@@ -235,7 +235,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
-    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
+    const bool rooted = mode.rfind("dispatch-indirect-rooted-", 0) == 0;
+    const bool partial = mode == "dispatch-indirect-rooted-partial" || mode == "dispatch-indirect-rooted-missing-b";
+    const bool rooted_refusal = mode == "dispatch-indirect-rooted-refused" || mode == "dispatch-indirect-rooted-missing-b";
+    const UINT groups = rooted ? 4u : mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
@@ -316,7 +319,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
                         sizeof(descriptors[0]));
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
-    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
+    const UINT constants[3] = {rooted ? 0x1111u : 0x01234567u, rooted ? 0x2222u : 0x9e3779b9u, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));
@@ -325,7 +328,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    if (indirect) {
+        const UINT constant_count = !rooted ? 0 : partial ? 1 : mode == "dispatch-indirect-rooted-unused" ? 3 : 2;
+        record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups,
+                       slot67_root, constant_count, placed[1]);
+    }
     bind(list);
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
@@ -376,9 +383,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
     }
-    if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
+    if (mode != "dispatch-missing-word" && !partial) invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
-    invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    if (mode != "dispatch-indirect-rooted-missing-b") invoke(list, 39, 0, 1, word(&constants[1]), 1);
     if (mode == "dispatch-root-changed") invoke(list, 33, word(slot67_other_root));
     if (mode == "dispatch-root-changed" || mode == "dispatch-same-root") invoke(list, 33, word(slot67_root));
     if (mode == "dispatch-reset") {
@@ -403,8 +410,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
-                                 mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
+    if (indirect) {
+        record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+                       mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
+        if (mode == "dispatch-indirect-rooted-unused") record.execute(list, 1, false, false);
+        if (rooted) record.capture_output(!rooted_refusal);
+    }
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode == "dispatch-nolock-burst") {
@@ -523,6 +534,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
+    if (rooted) record.read_output(buffers[1]);
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
     return 0;
 }

@@ -102,6 +102,7 @@ def check_mutation():
     differing = [i for i in range(C.WORDS) if two[i] != five[i]]
     assert differing == [2, 3, 4], f'2/5 group references differ at {differing}'
     assert compare_words(two, five) == [2, 3, 4]
+    check_rooted_mutation(rooted_expected(0x5678, 0x1234), rooted_expected(0x1234, 0x5678))
     print(f'mutation oracle: {C.WORDS} words, sentinel 0x{C.SENTINEL:08x}; consumer and sentinel flips detected; '
           '2/5 references differ at [2, 3, 4]')
 
@@ -154,14 +155,101 @@ def main(consumer, dxc, adapter):
         print('debug layer:', 'enabled' if layer and '0x00000000' in layer[0] else 'unavailable')
 
 
+# Independent desktop translation fixture. The title request carries only s_endpgm.
+# The shader's entry order is B then A, while the title record carries A then B.
+ROOTED_SHADER = """cbuffer Entry : register(b0) { uint b; uint a; };
+RWByteAddressBuffer output : register(u0);
+[numthreads(2, 1, 1)]
+void main(uint3 thread : SV_DispatchThreadID)
+{
+    output.Store3(thread.x * 12, uint3(a, b, thread.x));
+}
+"""
+
+
+def rooted_expected(a, b):
+    records = [word for thread in range(4 * 2) for word in (a, b, thread)]
+    return records + [C.SENTINEL] * (C.WORDS - len(records))
+
+
+def check_rooted_mutation(actual, expected):
+    wrong = compare_words(actual, expected)
+    assert wrong == [3 * i + j for i in range(8) for j in (0, 1)], wrong
+    assert actual == rooted_expected(0x5678, 0x1234), actual[:24]
+    print(f'CPU reference rejected the title-order mutant at {len(wrong)} words')
+
+
+def rooted_refusal(run, reason):
+    refusals = lines(run, 'ExecuteIndirect refused')
+    assert len(refusals) == 1 and reason in refusals[0], run.stderr[-3000:]
+
+
+def run_rooted(consumer, dxc):
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        cache, env = setup(directory, 'warp')
+        (directory / 'compute_root').write_bytes(C.root_blob(constants=3, table_range=True))
+        (directory / 'program').write_bytes(bytes.fromhex('000081bf'))
+        (directory / 'data').write_bytes(bytes(16))
+        (directory / 'state').write_bytes(state_a((2, 1, 1), C.USER7 | C.TGID_X))
+        untouched = [C.SENTINEL] * C.WORDS
+
+        def check_case(mode, expected, reason=None, enabled=True, mutant=False):
+            case_env = dict(env)
+            case_env.pop('X2W_TRANSLATED_INDIRECT_CONSTANTS', None)
+            if enabled:
+                case_env['X2W_TRANSLATED_INDIRECT_CONSTANTS'] = '1'
+            actual, run = dispatch(directory, consumer, case_env, 'dispatch-indirect-rooted-' + mode)
+            if reason:
+                rooted_refusal(run, reason)
+            else:
+                assert not lines(run, 'ExecuteIndirect refused'), run.stderr[-3000:]
+            for line in lines(run, 'x2w-d3d12-debug '):
+                assert ' sev=0 ' not in line and ' sev=1 ' not in line, line
+            if mutant:
+                check_rooted_mutation(actual, expected)
+            else:
+                wrong = compare_words(actual, expected)
+                assert not wrong, f'{mode}: first mismatches {wrong[:10]}, readback {actual[:24]}\n{run.stderr[-3000:]}'
+                print(f'{mode}: all {len(expected)} readback words match')
+
+        check_case('refused', untouched, 'no translation')
+        request, = cache.glob('req_*.c67')
+        key = request.stem.removeprefix('req_')
+        shader = directory / 'indirect_constants.hlsl'
+        shader.write_text(ROOTED_SHADER)
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', shader], check=True)
+
+        manifest = cache / f'{key}.txt'
+        entry = 'group 2 1 1\nud 2\nudsrc 0 rootconst 0 1\nudsrc 1 rootconst 0 0\n'
+        output = 'uav 0 table 1 16\n'
+        manifest.write_text(entry + output)
+        check_case('both', rooted_expected(0x1234, 0x5678))
+        check_case('partial', rooted_expected(0x1234, 0x2222))
+        manifest.write_text(entry.replace('udsrc 0 rootconst 0 1', 'udsrc 0 rootconst 0 2') + output)
+        check_case('unused', rooted_expected(0x1234, 0x5678))
+        manifest.write_text(entry + output)
+        check_case('refused', untouched, 'one rootless command and no count buffer', enabled=False)
+        check_case('missing-b', untouched, 'an entry value was not set since the compute root')
+        for selector in ('rootconst 0 0', 'word table 1 0 at 16 rootconst 0 0 times 4'):
+            manifest.write_text(entry + 'srv 0 buf heap ' + selector + '\n' + output)
+            check_case('refused', untouched, 'an indirect root constant selects a resource')
+
+        # Keep shader bytecode and records fixed. This models a signature mapping by title order.
+        manifest.write_text('group 2 1 1\nud 2\nudsrc 0 rootconst 0 0\nudsrc 1 rootconst 0 1\n' + output)
+        check_case('both', rooted_expected(0x1234, 0x5678), mutant=True)
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] == 'mutation':
         sys.exit(run_mutation())
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         assert assemble(sys.argv[2], SOURCE) == PROGRAM
         print('slot 67 indirect consumer matches LLVM gfx1013 assembly')
+    elif len(sys.argv) == 4 and sys.argv[3] == 'rooted-warp':
+        run_rooted(*sys.argv[1:3])
     elif len(sys.argv) == 4 and sys.argv[3] in ('hardware', 'warp'):
         main(*sys.argv[1:])
     else:
-        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware> | '
+        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware|rooted-warp> | '
                  'binary <llvm-mc> | mutation')

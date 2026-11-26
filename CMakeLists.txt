@@ -5023,6 +5023,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        if(adapter STREQUAL "warp")
+            add_test(NAME startup_slot67_indirect_constants_warp COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot67_indirect_dispatch_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" rooted-warp)
+            set_tests_properties(startup_slot67_indirect_constants_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_slot67_indirect_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot67_indirect_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})

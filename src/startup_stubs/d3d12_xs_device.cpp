@@ -153,6 +153,18 @@ const char* const kind_names[kind_count] = {
 struct Wrapper;
 struct RootParameter;
 enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
+struct IndirectConstantLayout {
+    struct Argument { UINT parameter, first_word, word_count, byte_offset; };
+    std::vector<Argument> arguments;
+    UINT stride = 0, dispatch_offset = 0, node_mask = 0;
+};
+
+bool translated_indirect_constants_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_CONSTANTS");
+    return enabled;
+}
+
 struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
     DXGI_FORMAT target_format{};
@@ -221,6 +233,7 @@ struct alignas(16) WrapperOwn {
     Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
     IndirectCommand indirect_command;
     ID3D12RootSignature* signature_root; // CommandSignature: desktop root of a Dispatch with root constants, or null
+    IndirectConstantLayout* indirect_constants;
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
@@ -1137,6 +1150,10 @@ ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
     if (!refs) {
+        if (self->own().indirect_constants) {
+            delete self->own().indirect_constants;
+            self->own().indirect_constants = nullptr;
+        }
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
         if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
@@ -1330,12 +1347,33 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             constants_only = desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
             bytes += desc->pArgumentDescs[i].Constant.Num32BitValuesToSet * sizeof(UINT);
         }
-        if (constants_only && desc->ByteStride == bytes && signature && signature->own().kind == command_signature_kind) {
+        const bool remap = translated_indirect_constants_enabled();
+        if (constants_only && (desc->ByteStride == bytes || (remap && desc->ByteStride > bytes)) &&
+            signature && signature->own().kind == command_signature_kind) {
             auto& state = signature->own();
             state.indirect_command = IndirectCommand::dispatch;
             state.signature_root = reinterpret_cast<ID3D12RootSignature*>(unwrap(root));
             state.indirect_bytes = bytes;
             state.signature_device = self;
+            if (remap) {
+                try {
+                    auto layout = std::make_unique<IndirectConstantLayout>();
+                    layout->stride = desc->ByteStride;
+                    layout->dispatch_offset = bytes - sizeof(D3D12_DISPATCH_ARGUMENTS);
+                    layout->node_mask = desc->NodeMask;
+                    layout->arguments.reserve(desc->NumArgumentDescs - 1);
+                    UINT offset = 0;
+                    for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
+                        const auto& c = desc->pArgumentDescs[i].Constant;
+                        layout->arguments.push_back({c.RootParameterIndex, c.DestOffsetIn32BitValues,
+                                                     c.Num32BitValuesToSet, offset});
+                        offset += c.Num32BitValuesToSet * sizeof(UINT);
+                    }
+                    state.indirect_constants = layout.release();
+                } catch (const std::bad_alloc&) {
+                    // The desktop signature can still be used by the desktop compute path.
+                }
+            }
         }
     }
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
@@ -2955,6 +2993,7 @@ struct Pass {
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
     x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
+    ID3D12Resource* indirect_constant_scratch = nullptr; // retained by the recording allocator
     Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
@@ -3446,6 +3485,7 @@ struct TranslatedDispatch {
     ID3D12CommandSignature* signature = nullptr;
     ID3D12Resource* argument = nullptr;
     u64 offset = 0;
+    const Wrapper* rooted_signature = nullptr;
 };
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch);
 u64 known_pipeline_key(Wrapper* pipeline);
@@ -3571,6 +3611,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
+    if (!translated_compute && sig->own().indirect_constants &&
+        sig->own().indirect_constants->stride != sig->own().indirect_bytes)
+        return refuse("requires a supported signature from this device", indirect_other,
+                      indirect_other_refusal_code::signature_device_mismatch);
     const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
@@ -3668,8 +3712,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
         }
     } else if (translated_compute) {
-        if (count != 1 || count_buffer || sig->own().signature_root)
+        if (count != 1 || count_buffer || (sig->own().signature_root && !translated_indirect_constants_enabled()))
             return refuse("translated Dispatch requires one rootless command and no count buffer", indirect_compute_pipeline);
+        if (sig->own().signature_root) {
+            if (!sig->own().indirect_constants)
+                return refuse("translated Dispatch has no indirect constant layout", indirect_compute_pipeline);
+            if (!pass.compute_root_wrapper || pass.compute_root_wrapper->own().real != sig->own().signature_root)
+                return refuse("signature root constants require the bound compute root", indirect_other,
+                              indirect_other_refusal_code::compute_root_mismatch);
+            bytes = sig->own().indirect_constants->stride;
+        }
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
@@ -3697,8 +3749,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("argument buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::argument_not_common_state);
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
     if (translated_compute) {
-        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset};
+        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset,
+                                          sig->own().signature_root ? sig : nullptr};
         if (const char* failure = record_translated_dispatch(self, dispatch)) return refuse(failure, indirect_compute_pipeline);
+        if (dispatch.rooted_signature) retire_hold(self, buffer);
         InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
         return;
     }

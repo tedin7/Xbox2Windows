@@ -12,6 +12,7 @@
 //
 // Exit codes: 0 pass, 77 no such adapter or no debug layer (or one that does not report the control),
 // other values name the failing step.
+#include "startup_indirect_signature.h"
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
@@ -161,6 +162,21 @@ int main(int argc, char** argv)
         else std::printf("FAIL console type: %d debug layer message(s) %d\n", seen, unexpected_parameter_type);
         return 13;
     }
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants = {0, 0, 2};
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter};
+    ComPtr<ID3DBlob> root_blob;
+    ComPtr<ID3D12RootSignature> root;
+    auto* guest = static_cast<ID3D12Device*>(device);
+    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, nullptr)) ||
+        FAILED(guest->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&root))))
+        return 14;
+    const ConstantDispatchSignature constants_then_dispatch(0, 0, 2);
+    const auto rooted_desc = constants_then_dispatch.desc();
+    ComPtr<ID3D12CommandSignature> rooted;
+    if (FAILED(guest->CreateCommandSignature(&rooted_desc, root.Get(), IID_PPV_ARGS(&rooted)))) return 15;
+
     DeleteFileW(log_path.c_str());
     std::printf("startup_command_signature: PASS\n");
     return 0;
