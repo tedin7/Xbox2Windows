@@ -7,7 +7,7 @@ debugger and no GPU are involved. Needs git and a PowerShell (powershell or pwsh
 notice and passes, because Linux hosts cannot run the script.
 
   - a build from another commit is refused with -NoBuild, and accepted when its revision matches HEAD
-  - one shader cache folder per commit: kept across runs at a commit, a new empty one for the next commit,
+  - one shader cache folder per shader revision (gfx2hlsl.py): kept across runs and commits, a new empty one on a bump,
     and the summary says how many translations were present at start
   - run.ps1 gets -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000, the menus input script, the capture
     interval and X2W_D3D12_BUDGET=1; -Deep adds -TraceCalls and -TraceApi
@@ -47,6 +47,11 @@ Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input scri
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 exit 0
 """
+TRANSLATOR = """\
+key = fnv(b'x2w-startup-shader-%d')
+ckey = fnv(b'x2w-startup-shader-%dcs')
+mkey = fnv(b'x2w-startup-mesh-57-7')
+"""
 REV_CPP = 'const char x2w_build_rev[] = "%s";\n'
 
 
@@ -62,9 +67,10 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "tools" / "startup" / "run.ps1").write_text(STUB_RUN, encoding="utf-8")
+    (tree / "tools" / "startup" / "gfx2hlsl.py").write_text((TRANSLATOR % (28, 28)), encoding="utf-8")
     git(tree, "init", "-q")
     git(tree, "config", "user.email", "check@example.invalid")
     git(tree, "config", "user.name", "check")
@@ -89,7 +95,7 @@ def run_script(shell, tree, *args):
 def check_shell(shell):
     with tempfile.TemporaryDirectory() as root:
         tree, head, rev_file = make_tree(root)
-        cache = tree / "out" / "startup" / ("shader_cache_" + head)
+        cache = tree / "out" / "startup" / "shader_cache_28-28-7"
         cache.mkdir(parents=True)
         for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_1123456789abcdef.a", "revision.txt"):
             (cache / name).write_bytes(b"x")
@@ -120,7 +126,7 @@ def check_shell(shell):
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
-        assert args["CacheFolder"] == "shader_cache_" + head, args["CacheFolder"]
+        assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
                                                                   "req_1123456789abcdef.a", "revision.txt"]), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
@@ -130,7 +136,7 @@ def check_shell(shell):
         assert manifest["env"].get("X2W_D3D12_BUDGET") == "1" and all(k.startswith("X2W_") for k in manifest["env"])
         assert manifest["first_poll_seconds"] == 151.9
         assert manifest["parts"] == 1 and "gpu" in manifest and "windows_build" in manifest
-        assert manifest["shader_cache"] == "shader_cache_" + head and manifest["translations_at_start"] == 1
+        assert manifest["shader_cache"] == "shader_cache_28-28-7" and manifest["translations_at_start"] == 1
         assert not any(p.name.startswith("shader_cache.old") for p in cache.parent.iterdir()), "the cache was moved aside"
         assert not any(n.endswith(".bin") or n.startswith("req_") for n in names), "shader cache content travelled"
 
@@ -154,14 +160,22 @@ def check_shell(shell):
         dirty = run_script(shell, tree, "-NoBuild")
         assert dirty.returncode != 0 and head + "-dirty" in dirty.stdout + dirty.stderr, (dirty.stdout, dirty.stderr)
 
-        # A new commit gets its own, empty shader cache folder; the old one stays.
+        # A new commit that leaves the shader revision alone keeps the warm cache.
         git(tree, "commit", "-q", "-am", "second")
         head2 = git(tree, "rev-parse", "--short=8", "HEAD")
         rev_file.write_text(REV_CPP % head2, encoding="ascii")
+        kept = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert kept.returncode == 0 and "2 translations were already present at start" in kept.stdout, kept.stdout
+
+        # A bumped revision gets its own, empty shader cache folder; the old one stays.
+        translator = tree / "tools" / "startup" / "gfx2hlsl.py"
+        translator.write_text(TRANSLATOR % (29, 29), encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "third")
+        rev_file.write_text(REV_CPP % git(tree, "rev-parse", "--short=8", "HEAD"), encoding="ascii")
         fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert fresh.returncode == 0 and "0 translations were already present at start" in fresh.stdout, fresh.stdout
-        assert (cache.parent / ("shader_cache_" + head2)).is_dir() and len(list(cache.glob("req_*.txt"))) == 2
-    print("tester_run.ps1 under %s: stale build refused, per-commit shader cache, run arguments, -Deep, zip and manifest pass"
+        assert (cache.parent / "shader_cache_29-29-7").is_dir() and len(list(cache.glob("req_*.txt"))) == 2
+    print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
 

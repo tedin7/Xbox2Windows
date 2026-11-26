@@ -5,8 +5,8 @@ One command for a tester: check the build, run the title offline with a per-comm
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
    into generated\x2w_build_rev.cpp). If not, it builds (cmake --build) or, with -NoBuild, stops with a message.
-2. Uses one shader cache folder per commit (out\startup\shader_cache_<commit>): kept across runs at the same commit,
-   new when the commit changes. The --watch translator needs minutes to catch up, so an emptied cache would leave
+2. Uses one shader cache folder per shader revision (out\startup\shader_cache_<rev>, from the x2w-startup-shader-N
+   strings of gfx2hlsl.py): kept across runs and across branch updates that do not bump the revision. The --watch translator needs minutes to catch up, so an emptied cache would leave
    pipelines untranslated and the screen black. The summary says how many translations were present at start.
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
@@ -33,7 +33,7 @@ param(
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
-    [string]$ShaderCacheRoot = "out/startup",     # one folder per commit inside: shader_cache_<commit>
+    [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$LimitMB = 20,
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep                               # also -TraceCalls and -TraceApi: slower, more detailed
@@ -75,17 +75,20 @@ if ($built -ne $wanted) {
     }
 }
 
-# One shader cache folder per commit, kept across runs at the same commit and fresh when the commit changes: the
-# --watch translator needs minutes to catch up, so an emptied cache leaves pipelines untranslated (a black screen).
+# One shader cache folder per shader revision (the x2w-startup-shader-N strings of gfx2hlsl.py), kept across runs and across
+# branch updates that leave the revision alone: the --watch translator needs minutes to catch up, so an emptied cache
+# leaves pipelines untranslated (a black screen). A revision bump starts a new folder.
 $runScript = Join-Path $PSScriptRoot "run.ps1"
 $runParams = (Get-Command $runScript).Parameters
 $cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCacheRoot } else { Join-Path $repo $ShaderCacheRoot }
-$cache = Join-Path $cacheRoot "shader_cache_$wanted"
-New-Item -ItemType Directory -Force $cache | Out-Null
 
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
+$cacheTag = (& $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py")).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
+$cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
+New-Item -ItemType Directory -Force $cache | Out-Null
 $cacheAtStart = (& $python -B $pack cache-stats $cache) -split " "
 $script = (& $python -B $pack input-preset $InputMode $Seconds)
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }

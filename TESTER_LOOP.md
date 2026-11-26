@@ -26,9 +26,10 @@ What it does:
 
 1. Checks that the build in `out/build/release` was made from this checkout's current commit and builds when it was
    not (`-NoBuild` stops with a message instead).
-2. Uses one shader cache folder per commit, `out/startup/shader_cache_<commit>`: kept across runs at the same commit,
-   a new empty one when the commit changes. The `--watch` translator needs minutes to catch up, so emptying the
-   cache on every run would leave pipelines untranslated and the screen black.
+2. Uses one shader cache folder per shader revision, `out/startup/shader_cache_<rev>` (for example `shader_cache_28-28-3`,
+   from the `x2w-startup-shader-N` strings of `gfx2hlsl.py`): kept across runs and across branch updates that leave
+   the revision alone, a new empty one when a revision is bumped. The `--watch` translator needs minutes to catch up,
+   so emptying the cache on every run would leave pipelines untranslated and the screen black.
 3. Runs `run.ps1 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000` with `X2W_D3D12_BUDGET=1`.
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
    already in the shader cache at start, and when the title first polled the pad.

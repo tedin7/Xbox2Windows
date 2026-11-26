@@ -145,6 +145,15 @@ def check_cache_stats():
         assert T.cache_stats(str(tmp)) == (2, 4, 1), T.cache_stats(str(tmp))
 
 
+def check_cache_tag():
+    with tempfile.TemporaryDirectory() as tmp:
+        translator = Path(tmp) / "gfx2hlsl.py"
+        translator.write_text("a = b'x2w-startup-shader-28'\nb = b'x2w-startup-shader-28cs'\nc = b'x2w-startup-mesh-57-3'\n")
+        assert T.cache_tag(str(translator)) == "28-28-3"
+        translator.write_text("a = b'x2w-startup-shader-29'\nb = b'x2w-startup-shader-29cs'\n")
+        assert T.cache_tag(str(translator)) == "29-29-x", "a missing literal must not crash"
+
+
 def check_first_poll():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -173,5 +182,6 @@ if __name__ == "__main__":
     check_manifest()
     check_first_poll()
     check_cache_stats()
+    check_cache_tag()
     check_zip()
     print("startup_tester_pack_check: preset, manifest and zip checks pass")

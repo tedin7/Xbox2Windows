@@ -2,6 +2,7 @@
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
   tester_pack.py input-preset <menus|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
   tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N]   write the zip, print its path and size
@@ -65,6 +66,20 @@ def validate_manifest(manifest):
 
 READY_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:ms57\.)?txt$")
 REQUEST_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:a|rtv|c67|m57)$")
+
+
+def cache_tag(translator):
+    """Name suffix of the shader cache folder: the translation revisions of gfx2hlsl.py (graphics, compute, mesh 57),
+    e.g. `28-28-1` for x2w-startup-shader-28, x2w-startup-shader-28cs and x2w-startup-mesh-57-1. A branch update that
+    leaves these alone keeps its warm cache; a bump of any of them starts a new folder."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import shader_cache_revision as R
+    found = R.translator_revisions(translator)
+    numbers = []
+    for kind in R.KINDS:
+        match = re.search(r"([0-9]+)(?:cs)?$", found.get(kind, ""))
+        numbers.append(match.group(1) if match else "x")
+    return "-".join(numbers)
 
 
 def cache_stats(cache_dir):
@@ -166,6 +181,8 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
+    n = sub.add_parser("cache-tag")
+    n.add_argument("translator")
     c = sub.add_parser("cache-stats")
     c.add_argument("cache")
     f = sub.add_parser("first-poll")
@@ -178,6 +195,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds))
+        return 0
+    if args.cmd == "cache-tag":
+        print(cache_tag(args.translator))
         return 0
     if args.cmd == "cache-stats":
         print("%d %d %d" % cache_stats(args.cache))
