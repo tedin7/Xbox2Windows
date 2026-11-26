@@ -450,7 +450,10 @@ def check_shell(shell):
         assert huge.returncode != 0 and "needs twice the cap free" in (huge.stdout + huge.stderr), (huge.stdout[-500:], huge.stderr[-500:])
         both = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-Matrix", "gray")
         assert both.returncode != 0 and "own run" in (both.stdout + both.stderr), (both.stdout[-500:], both.stderr[-500:])
-        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64", "-Upload")
+        auto = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "auto", "-NoUpload")
+        assert auto.returncode == 0 and "recording 140,20 into" in auto.stdout and "(cap 500 MiB" in auto.stdout, (auto.stdout[-1500:], auto.stderr[-500:])
+        assert "uploaded" not in auto.stdout and "UPLOAD_THESE_FILES" not in auto.stdout, "-NoUpload keeps the recording local"
+        rec = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Record", "140,60", "-RecordMaxMiB", "64")
         assert rec.returncode == 0, (rec.stdout[-2000:], rec.stderr[-1000:])
         assert "recording: 2 files" in rec.stdout and "(cap 64 MiB)" in rec.stdout, rec.stdout[-1500:]
         newest_rec = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]

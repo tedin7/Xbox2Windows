@@ -744,6 +744,8 @@ def check_record_spec():
     """-Record values for the replay recorder and the size report of a recording folder."""
     assert T.parse_record_spec("140,60") == {"spec": "140,60", "by": "time", "start": 140, "length": 60}
     assert T.parse_record_spec(" F4000,24 ")["spec"] == "f4000,24" and T.parse_record_spec("f4000,24")["by"] == "frame"
+    assert T.parse_record_spec("auto")["spec"] == T.RECORD_DEFAULT_SPEC == "140,20" and T.parse_record_spec("Default")["by"] == "time"
+    assert T.RECORD_DEFAULT_MAX_MIB == 500 < T.RECORD_EXPLICIT_MAX_MIB
     for bad in ("", "soon", "140", "140,0", "140,121", "f10,2001", "-5,10", "140;60", "140,60,1"):
         try:
             T.parse_record_spec(bad)

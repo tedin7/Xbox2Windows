@@ -64,9 +64,10 @@ param(
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
     [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
-    [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
-    [int]$RecordMaxMiB = 2048,                  # hard cap of the recording (X2W_REPLAY_MAX_MIB); the run refuses to start with less than twice this free on the disk
-    [switch]$Upload,                            # after a -Record run: cut the recording into 100 MB chunks and copy it into the synced Drive folder x2w-registrazioni, or print the list to upload by hand in the browser
+    [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = the default cliff window (140 s for 20 s, 500 MiB cap), "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
+    [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 500 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
+    [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
+    [switch]$Upload,                            # (implied by -Record) after a -Record run: cut the recording into 100 MB chunks and copy it into the synced Drive folder x2w-registrazioni, or print the list to upload by hand in the browser
     [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
@@ -342,6 +343,8 @@ if ($Record) {
     if ($Matrix) { throw "tester_run: -Record is its own run, not with -Matrix" }
     $recordSpec = (Invoke-Native { & $python -B $pack record-spec $Record } | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw "tester_run: -Record refused (see above)" }
+    $defaults = (Invoke-Native { & $python -B $pack record-defaults } | Out-String).Trim() -split " "
+    if ($RecordMaxMiB -le 0) { $RecordMaxMiB = if ($Record.Trim().ToLower() -in @("auto", "default")) { [int]$defaults[1] } else { [int]$defaults[2] } }
     $recordDir = Join-Path $outRoot ("record_" + $stamp)
     New-Item -ItemType Directory -Force $recordDir | Out-Null
     $freeMiB = [math]::Floor((Get-PSDrive -Name ((Split-Path -Qualifier $recordDir).TrimEnd(":"))).Free / 1MB)
@@ -510,7 +513,7 @@ foreach ($line in $parts) {
 }
 Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
 Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
-if ($recordDir -and $recordReport -and $recordReport.files -gt 0 -and $Upload) {
+if ($recordDir -and $recordReport -and $recordReport.files -gt 0 -and -not $NoUpload) {
     $transfer = Join-Path $PSScriptRoot "record_transfer.py"
     $staging = $recordDir + "_upload"
     $null = Invoke-Native { & $python -B $transfer pack $recordDir $staging --id $stamp }

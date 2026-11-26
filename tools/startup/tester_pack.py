@@ -867,6 +867,9 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     return parts
 
 
+RECORD_DEFAULT_SPEC = "140,20"       # `-Record auto`: the first 20 s of the cliff (Run S: it starts at 150-190 s, the loading art is gone by 140 s)
+RECORD_DEFAULT_MAX_MIB = 500         # ... capped at 500 MiB so the upload stays small (c25 may change both numbers here, one place)
+RECORD_EXPLICIT_MAX_MIB = 2048       # an explicit -Record spec keeps the old cap unless -RecordMaxMiB says otherwise
 RECORD_RE = re.compile(r"^(f)?(\d+),(\d+)$")
 RECORD_MAX_SECONDS = 120
 RECORD_MAX_FRAMES = 2000
@@ -876,6 +879,8 @@ def parse_record_spec(spec):
     """`-Record` value for the replay recorder (X2W_REPLAY_RECORD): `<start s>,<seconds>` (e.g. 140,60) or `f<first frame>,<frames>`.
     Returns {"spec": normalized text, "by": "time"|"frame", "start", "length"}. Raises ValueError for anything else, a window longer
     than 120 s / 2000 frames (the file would not fit a disk or a Drive folder) or an empty window."""
+    if spec.strip().lower() in ("auto", "default"):
+        spec = RECORD_DEFAULT_SPEC
     match = RECORD_RE.match(spec.strip().lower())
     if not match:
         raise ValueError("-Record wants <start s>,<seconds> (e.g. 140,60) or f<first frame>,<frames> (e.g. f4000,24), got %r" % spec)
@@ -982,6 +987,7 @@ def main(argv):
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
     rs = sub.add_parser("record-spec")
     rs.add_argument("spec")
+    sub.add_parser("record-defaults")
     rr = sub.add_parser("record-report")
     rr.add_argument("folder")
     cb = sub.add_parser("combine")
@@ -998,6 +1004,9 @@ def main(argv):
         except ValueError as error:
             print(error, file=sys.stderr)
             return 2
+        return 0
+    if args.cmd == "record-defaults":
+        print("%s %d %d" % (RECORD_DEFAULT_SPEC, RECORD_DEFAULT_MAX_MIB, RECORD_EXPLICIT_MAX_MIB))
         return 0
     if args.cmd == "record-report":
         print(json.dumps(folder_report(args.folder)))
