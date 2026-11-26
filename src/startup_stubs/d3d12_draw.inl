@@ -181,6 +181,7 @@ struct Translation {
 struct BoundPipeline {
     Translation* translation = nullptr;
     const std::vector<RootParameter>* guest_root = nullptr;
+    const Wrapper* guest_root_wrapper = nullptr;
     bool has_blend = false;
     D3D12_BLEND_DESC blend{};
     bool has_depth_stencil = false;
@@ -1105,6 +1106,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         std::memcpy(words, info->desc.data(), sizeof(words));
         Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
         bound->guest_root = root ? root_info(root) : nullptr;
+        bound->guest_root_wrapper = bound->guest_root ? root : nullptr;
         std::vector<unsigned char> root_blob;
         if (root) {
             note_lock_acquire(false);
@@ -2854,6 +2856,23 @@ void log_not_drawn_causes()
             render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
+// Root parameter metadata is keyed by wrapper identity. Identical serialized
+// guest signatures have the same layout even when created as separate objects.
+bool indirect_guest_root_matches(const BoundPipeline& bound, const Pass& pass)
+{
+    if (!bound.guest_root || !pass.root) return false;
+    if (bound.guest_root == pass.root) return true;
+    if (!x2w_local::env_on("X2W_INDIRECT_ROOT_FIX")) return false;
+
+    note_lock_acquire(false);
+    const auto& blobs = root_blobs();
+    const auto expected = blobs.find(bound.guest_root_wrapper);
+    const auto actual = blobs.find(pass.guest_root_wrapper);
+    const bool match = expected != blobs.end() && actual != blobs.end() && expected->second == actual->second;
+    ReleaseSRWLockShared(&note_lock);
+    return match;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -2885,7 +2904,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         return not_drawn(1);
     }
     if (indirect) {
-        if (!bound->guest_root || bound->guest_root != pass.root) {
+        if (!indirect_guest_root_matches(*bound, pass)) {
             indirect->set_refusal("translated draw requires the guest pipeline's root signature",
                                   indirect_refusal_code::missing_guest_root);
             draw_lock_release_exclusive();
