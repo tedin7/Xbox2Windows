@@ -14,7 +14,10 @@
 // read; a view qualifier or a 'channels' field, as in the compute line, is refused.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
+    bool load = false;  // manifest 'uavload N': the program also reads the texel back (partial-dmask store)
 };
+static_assert(x2w_startup::kSupport2UavTypedLoad == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, "typed load bit");
+static_assert(x2w_startup::kSupport2UavTypedStore == D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, "typed store bit");
 constexpr unsigned pixel_uav_limit = 8;
 
 // Returns nullptr and fills out, or the reason the line is refused.
@@ -88,7 +91,8 @@ bool srgb_uav_format(DXGI_FORMAT format)
 // own view (nullptr when it passed none) with console format values already mapped. Returns nullptr and fills
 // out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out,
+                           bool needs_load)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
     if (resource.DepthOrArraySize != 1) return "resource is a texture array";
@@ -105,9 +109,9 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     if (srgb_uav_format(format)) return "sRGB format";
     if (!float_uav_format(format)) return "format is not a float colour format";
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
-        !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
-        return "format has no typed UAV store on this device";
+    const unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                                  ? 0u : static_cast<unsigned>(support.Support2);
+    if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, needs_load)) return unsupported;
     out = {};
     out.Format = format;
     out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -344,6 +348,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 log("x2w-draw invalid d16srv manifest line for %016llx: %s", tr.key, line.c_str());
                 return;
             }
+        } else if (line.compare(0, 8, "uavload ") == 0) {
+            // The pixel program reads the stored image back (partial-dmask store); the view then needs typed load.
+            unsigned index = 0;
+            const std::string digits = line.substr(8);
+            const bool well_formed = !digits.empty() && digits.size() <= 9 &&
+                                     digits.find_first_not_of("0123456789") == std::string::npos;
+            if (well_formed) index = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
+            if (!well_formed || index >= tr.uavs.size() || tr.uavs[index].load) {
+                log("x2w-draw pipeline %016llx uavload line refused: %s; translation not used", tr.key, line.c_str());
+                return;
+            }
+            tr.uavs[index].load = true;
         } else if (line.compare(0, 4, "uav ") == 0) {
             // A pixel-stage image_store: the view is made at draw time from the title's unordered-access view at
             // that table entry (resolve_pixel_uavs).
@@ -2234,7 +2250,8 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view,
+                                            uav.load);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))

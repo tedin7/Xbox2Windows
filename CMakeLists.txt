@@ -2481,6 +2481,13 @@ target_compile_features(startup_d16_image_format_check PRIVATE cxx_std_17)
 add_test(NAME startup_d16_image_format COMMAND startup_d16_image_format_check)
 add_test(NAME startup_d16_image_format_accept_uint_control COMMAND startup_d16_image_format_check --mutate accept-uint)
 set_tests_properties(startup_d16_image_format_accept_uint_control PROPERTIES WILL_FAIL TRUE)
+# Typed UAV support a pixel image store needs; a partial-dmask store also needs typed load ('uavload N').
+add_executable(startup_pixel_uav_support_check tests/startup_pixel_uav_support_check.cpp)
+target_include_directories(startup_pixel_uav_support_check PRIVATE src)
+target_compile_features(startup_pixel_uav_support_check PRIVATE cxx_std_17)
+add_test(NAME startup_pixel_uav_support COMMAND startup_pixel_uav_support_check)
+add_test(NAME startup_pixel_uav_support_no_load_check_control COMMAND startup_pixel_uav_support_check --mutate no-load-check)
+set_tests_properties(startup_pixel_uav_support_no_load_check_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
