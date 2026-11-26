@@ -1536,6 +1536,9 @@ bool gpu_time_on()
 }
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
+// OMSetRenderTargets refused for a depth stencil view with one read-only plane (depth read-only, stencil writable or the
+// reverse): nothing is bound, so every later draw of that pass is 'state_not_ready'. Counted by flags (index: DSV flags 0..3).
+LONG render_target_mixed_dsv[4];
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
@@ -4111,6 +4114,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             // A format without a stencil plane has no second plane to disagree with.
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
+                InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
                 return;
             }
