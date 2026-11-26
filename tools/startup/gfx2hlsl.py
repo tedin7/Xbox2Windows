@@ -8,6 +8,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 import bisect
 from contextlib import suppress
 import functools
+import math
 import os
 import re
 import struct
@@ -1089,6 +1090,36 @@ def vcc_hi_scalar_mask_read(ins):
         vcc_hi_whole_word_writer(name, parse(asm)[1]) for _o, _n, name, asm in ins))
 
 
+def wave32_vcc_pair_moves(ins):
+    """Rename a scalar pair destination only when its low word is dead before the next VCC definition."""
+    moves = set()
+    full_exec = True
+    pending = False
+    for off, _, name, asm in ins:
+        ops = parse(asm)[1]
+        if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call')):
+            if pending or name.startswith(('s_setpc', 's_swappc', 's_call')):
+                return None
+            full_exec = False
+        if re.search(r'\bvcc\b', asm):
+            if (name != 's_mov_b64' or len(ops) != 2 or ops[0] != 'vcc'
+                    or pc_pair(ops[1]) is None):
+                return None
+            moves.add(off)
+            pending = True
+            continue
+        if pending:
+            reads, _, _ = scalar_effects(name, asm)
+            if 'vcc' in reads or 'src_vccz' in ops:
+                return None
+            if (name == 's_mov_b32' and ops[:1] == ['vcc_lo']) or (
+                    full_exec and name.startswith('v_cmp_') and ops[:1] == ['vcc_lo']):
+                pending = False
+        if writes_exec(name, ops):
+            full_exec = False
+    return moves
+
+
 def wave32_vcc_hi(ins, wave32=False):
     """`ins` with every vcc_hi operand renamed to an unused SGPR when vcc_hi is provably an ordinary scalar register,
     else `ins`.
@@ -1102,12 +1133,16 @@ def wave32_vcc_hi(ins, wave32=False):
     - a VALU compare or carry writes vcc_hi or an odd SGPR, or a VOP3 mask source reads one (a misaligned pair in
       wave64, so the program is wave32), or no VALU instruction and no vcc branch uses vcc_lo as a lane mask.
     Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused.
-    wave32=True is the caller's proof that the program is wave32 (RDNA 2 ISA, wave32: VCC is vcc_lo alone, so no VALU
-    instruction ever writes or reads vcc_hi as part of a mask): the two wave64 conditions above are then not needed."""
+    wave32=True is the caller's proof that implicit VCC uses touch only vcc_lo. An explicit pair move can then
+    be renamed when the low word is dead. Explicit vcc_hi mask operands still need their lane-bit representation."""
     if not any(re.search(r'\bvcc_hi\b', asm) for *_, asm in ins):
         return ins
-    if any(re.search(r'\bvcc\b', asm) or name.startswith('s_movrel') for _o, _n, name, asm in ins):
+    if any(name.startswith('s_movrel') for _, _, name, _ in ins):
         return ins
+    pair_moves = set()
+    if any(re.search(r'\bvcc\b', asm) for *_, asm in ins):
+        if not wave32 or (pair_moves := wave32_vcc_pair_moves(ins)) is None:
+            return ins
     masks = []  # lane-mask destinations of VALU compares and carry-outs (VOP3b SDST)
     for _o, _n, name, asm in ins:
         ops = parse(asm)[1]
@@ -1127,7 +1162,8 @@ def wave32_vcc_hi(ins, wave32=False):
                        or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
     if not wave32 and 'vcc_hi' not in masks and not odd and vcc_mask_use:
         return ins
-    if vcc_hi_scalar_mask_read(ins):
+    # A whole-word pair move may feed an explicit VOP3 mask operand. That needs bit extraction, not renaming.
+    if vcc_hi_scalar_mask_read(ins) or (pair_moves and 'vcc_hi' in masks):
         return ins
     named = set()
     for *_, asm in ins:
@@ -1135,6 +1171,13 @@ def wave32_vcc_hi(ins, wave32=False):
             if lo and int(lo) <= 107 <= int(hi):
                 return ins   # a wide operand such as s[104:107] covers SGPR 107, which is vcc_hi: no free alias
             named.update(range(int(lo), int(hi) + 1) if lo else (int(single),))
+    if pair_moves:
+        low = next((n for n in range(104, 63, -2) if not {n, n + 1} & named), None)
+        if low is None:
+            return ins
+        return [(off, n, name, (asm.replace('vcc,', 's[%d:%d],' % (low, low + 1), 1) if off in pair_moves
+                                else re.sub(r'\bvcc_hi\b', 's%d' % (low + 1), asm)))
+                for off, n, name, asm in ins]
     free = next((n for n in range(105, 63, -1) if n not in named), None)
     if free is None:
         return ins
@@ -3055,6 +3098,38 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def single_wave_early_out(self, jumps, index):
+        """Group-wide vote for a converged wave32 zero-and-jump diamond."""
+        pipe = getattr(self, 'pipe', None)
+        if (len(jumps) != 2 or pipe is None or getattr(pipe, 'wave_size', None) == 64
+                or not wave32_exec_proof(self.ins)):
+            return None
+        lanes = math.prod(pipe.group)
+        # Reserve room for the vote and a possible DPP exchange in the 32 KiB shared-memory budget.
+        if not 0 < lanes <= 32 or getattr(pipe, 'lds_words', 0) + 2 * lanes > 8192:
+            return None
+        (branch, skip), (jump, join) = jumps
+        skip, join = index.get(skip), index.get(join)
+        if (skip != jump + 1 or join is None or not 0 < branch == jump - 2 < skip < join
+                or join + 1 >= len(self.ins)):
+            return None
+        if any(name.startswith(('s_setpc', 's_swappc', 's_call', 's_endpgm', 's_trap', 's_rfe'))
+               for _, _, name, _ in self.ins[:join]):
+            return None
+        save, vote, zero, leave = [parse(row[3]) for row in self.ins[branch - 1:jump + 1]]
+        restore, mask = [parse(row[3]) for row in self.ins[join:join + 2]]
+        if any(op[2] for op in (save, vote, zero, leave, restore, mask)):
+            return None
+        if (save[0] != 's_and_saveexec_b32' or len(save[1]) != 2 or save[1][1] != 'vcc_lo'
+                or vote[0] != 's_cbranch_execz' or leave[0] != 's_branch'
+                or zero[0] != 's_mov_b32' or len(zero[1]) != 2 or zero[1][1] != '0'
+                or not re.fullmatch(r's\d+', zero[1][0]) or zero[1][0] == save[1][0]
+                or restore[:2] not in (('s_or_b32', ['exec_lo', 'exec_lo', save[1][0]]),
+                                      ('s_mov_b32', ['exec_lo', save[1][0]]))
+                or mask[:2] != ('s_and_b32', ['exec_lo', 'exec_lo', zero[1][0]])):
+            return None
+        return self.ins[branch][0]
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3118,11 +3193,12 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        self.group_execz_vote = self.single_wave_early_out(jumps, index)
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
-            if name != 's_cbranch_execz':
+            if name != 's_cbranch_execz' or off == self.group_execz_vote:
                 continue
             t = index.get(int(parse(asm)[1][0].split('_')[1], 16))
             if t is None or t <= b:
@@ -4003,7 +4079,8 @@ class Stage:
                                     raise Unsupported(execz_effects)
                                 self.u(dst)  # declare the variable; refuses a symbol with no run-time value
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
-                                        or off in wave_limits or off in wave_loads or off in mesh_votes)
+                                        or off in wave_limits or off in wave_loads or off in mesh_votes
+                                        or off == getattr(self, 'group_execz_vote', None))
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -4984,7 +5061,16 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
-            if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
+            if getattr(self, 'group_execz_vote', None) is not None and self.pc == self.group_execz_vote:
+                # One guest wave spans the group. All threads reach this one vote, even with a clear EXEC bit.
+                x, y, z = self.pipe.group
+                self.emit('x2w_exec_vote[tid.x + %du * (tid.y + %du * tid.z)] = exec & 1u;' % (x, y))
+                self.emit('GroupMemoryBarrierWithGroupSync();')
+                self.emit('uint x2w_any_exec = 0u;')
+                self.emit('[unroll] for (uint lane = 0u; lane < %du; ++lane) x2w_any_exec |= x2w_exec_vote[lane];'
+                          % (x * y * z))
+                cond = 'x2w_any_exec == 0u'
+            elif getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
                 # The guest skips the block when no lane of the wave has the bit; here every thread of the host wave
                 # takes the same decision (convergence rule C2).
                 self.needs_sm6 = True
@@ -10215,7 +10301,8 @@ class Stage:
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
                            'pc == %d ? %s : 0u, false);' % (i, i, i, value))
-            if off == getattr(self, 'mesh_allocation_block', None):
+            if off == getattr(self, 'mesh_allocation_block', None) or (
+                    i == 0 and getattr(self, 'group_execz_vote', None) is not None):
                 out.append('    {')
             else:
                 attribute = '[branch] ' if off in wave_load_blocks else ''
@@ -11805,6 +11892,8 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        if getattr(s, 'group_execz_vote', None) is not None:
+            shared.append('groupshared uint x2w_exec_vote[%d];' % math.prod(self.group))
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,

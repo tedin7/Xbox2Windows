@@ -5,6 +5,8 @@ startup_gfx2hlsl_vcc_hi_check.py, which covers the pixel stage).
   (no arguments)                         translation controls and refusals, pure Python
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                          translate, compile with DXC cs_6_0, dispatch and compare all 320 words
+  fixture <early-out|vcc-pair> <dxc> <offscreen_check> <warp|hardware>
+                                         dispatch synthetic fixtures and check predicted mutant readbacks
   control <vcc-hi-lost> <dxc> <offscreen_check> <warp|hardware>
                                          mutated translation must mismatch on readback at the word the reference predicts
 
@@ -18,11 +20,11 @@ Program (32 threads, 4 x 4 x 2): vcc_hi = 3.0; lanes below 8 enter an execz bloc
 selects 1000 for those lanes (v_cndmask_b32); after the join every lane adds vcc_hi to float(lane). The reference is written
 from that description with integers and float32, not from the translated text.
 """
-import re
 import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -42,8 +44,11 @@ VCC_HI = 107
 VCC_LO = 106
 EXEC_LO = 126
 S_AND_SAVEEXEC_B32 = 0x3c   # SOP1
+S_AND_B32 = 0x0e
+S_BRANCH = 0x02
 S_OR_B32 = 0x10             # SOP2
 S_CBRANCH_EXECZ = 0x08      # SOPP
+V_CMP_GT_I32 = 0x84         # VOPC
 V_CMP_GT_U32 = 0xc4         # VOPC
 V_CNDMASK_B32 = 0x01        # VOP2
 V_ADD_F32 = 0x03            # VOP2
@@ -81,6 +86,45 @@ PROGRAM = b''.join([
 ])
 
 
+# The c67 words are synthetic. VCC's low word is overwritten with full EXEC before it can be read.
+HI_INIT = sop1(S_MOV_B32, VCC_HI, LITERAL, THREE)
+PAIR_INIT = b''.join([
+    sop1(S_MOV_B32, 94, 128 + 13),
+    sop1(S_MOV_B32, 95, LITERAL, THREE),
+    sop1(0x04, VCC_LO, 94),                              # s_mov_b64 vcc, s[94:95]
+])
+PAIR_PROGRAM = PROGRAM.replace(HI_INIT, PAIR_INIT, 1).replace(
+    vopc(V_CMP_GT_U32, 128 + 4, 11), vopc(V_CMP_GT_I32, 128 + 4, 11), 1)
+
+
+def early_out_program(limit):
+    return b''.join([
+        HEAD,
+        vop1(V_MOV_B32, 8, 256 + 5),                       # v8 = flat * 7 + 1
+        vop1(V_MOV_B32, 9, 128),                           # v9 = 0
+        vop1(V_MOV_B32, 10, LITERAL, SELECTED),             # v10 = 1000
+        sop1(S_MOV_B32, 20, 193),                          # still-running mask = -1
+        vopc(V_CMP_GT_U32, 128 + limit, 11),                # vcc_lo = flat < limit
+        sop1(S_AND_SAVEEXEC_B32, 6, VCC_LO),
+        sopp(S_CBRANCH_EXECZ, 2),
+        sop1(S_MOV_B32, 20, 128),                          # stop every lane when the wave enters
+        sopp(S_BRANCH, 1),
+        sopp(0x00),                                       # empty-mask path
+        sop2(S_OR_B32, EXEC_LO, EXEC_LO, 6),
+        sop2(S_AND_B32, EXEC_LO, EXEC_LO, 20),
+        BASE.S_WAITCNT_LGKM0,
+        BASE.PROGRAM_TAIL_STORE,
+    ])
+
+
+def early_out_words(limit, per_lane=False):
+    words = [SENTINEL] * WORDS
+    for lane in range(32):
+        if limit == 0 or (per_lane and lane >= limit):
+            words[4 * lane:4 * lane + 4] = [lane * 7 + 1, 0, SELECTED, lane]
+    return words
+
+
 def float_bits(value):
     return struct.unpack('<I', struct.pack('<f', value))[0]
 
@@ -110,7 +154,23 @@ def check_controls():
     pair = sop1(0x04, VCC_LO, 128)         # s_mov_b64 vcc, 0
     assert G.decode(pair)[0][3] == 's_mov_b64 vcc, 0', G.decode(pair)
     refused('vcc_hi', lambda: translate(code=PROGRAM[:len(HEAD)] + pair + PROGRAM[len(HEAD):]).hlsl_cs())
-    print('compute vcc_hi as a scalar: translation controls and refusals pass')
+    pair_asm = [a for _, _, _, a in G.decode(PAIR_PROGRAM)]
+    assert 's_mov_b64 vcc, s[94:95]' in pair_asm
+    assert 'v_cmp_gt_i32_e32 vcc_lo, 4, v11' in pair_asm
+    translate(PAIR_PROGRAM).hlsl_cs()
+    refused('definition of vcc_hi, live where the block joins',
+            lambda: translate(PAIR_PROGRAM, wave_size=64).hlsl_cs())
+    low_read = vop1(V_MOV_B32, 8, VCC_LO)
+    low_live = PAIR_PROGRAM.replace(PAIR_INIT, PAIR_INIT + low_read, 1)
+    refused('data operand vcc_lo is a lane mask', lambda: translate(low_live).hlsl_cs())
+    translate(early_out_program(8)).hlsl_cs()
+    refused('definition of s20, live where the block joins',
+            lambda: translate(early_out_program(8), group=(8, 4, 2)).hlsl_cs())
+    shader = G.Stage.__new__(G.Stage)
+    shader.ins = G.decode(early_out_program(8))
+    shader.pipe = SimpleNamespace(group=(8, 4, 2), wave_size=32)
+    assert any('branch out of the block' in reason for reason in shader.execz_refusals().values())
+    print('compute EXEC early-out and vcc_hi: translation controls and refusals pass')
 
 
 CONTROLS = {
@@ -126,24 +186,45 @@ def first_difference(expected, model):
     raise AssertionError('the mutant model equals the reference')
 
 
-def check_dispatch(dxc, runner, adapter, control=None):
+def check_dispatch(dxc, runner, adapter, control=None, fixture='vcc-hi'):
+    if fixture == 'early-out':
+        for limit in (0, 8):
+            status = run_readback(dxc, runner, adapter, translate(early_out_program(limit)).hlsl_cs(),
+                                  early_out_words(limit))
+            if status:
+                return status
+        hlsl = translate(early_out_program(8)).hlsl_cs()
+        assert hlsl.count('x2w_any_exec == 0u') == 1
+        return run_readback(dxc, runner, adapter,
+                            hlsl.replace('x2w_any_exec == 0u', '(exec & 1u) == 0u'),
+                            early_out_words(8), early_out_words(8, per_lane=True), 'per-lane-execz')
+    hlsl = translate(PAIR_PROGRAM if fixture == 'vcc-pair' else PROGRAM).hlsl_cs()
+    mutant_words = None
+    if control:
+        mutate, model = CONTROLS[control]
+        if fixture == 'vcc-pair':
+            # The original scalar assignment and the pair's high-half copy both materialize the constant.
+            before, literal, after = hlsl.rpartition('0x40400000u')
+            assert literal
+            mutated = before + '0x00000000u' + after
+        else:
+            mutated = mutate(hlsl)
+        assert mutated != hlsl, (control, hlsl)
+        hlsl = mutated
+        mutant_words = expected_words(**model)
+    return run_readback(dxc, runner, adapter, hlsl, expected_words(), mutant_words, control)
+
+
+def run_readback(dxc, runner, adapter, hlsl, expected, mutant_words=None, control=None):
     runner = str(Path(runner).resolve())
     out = ROOT / 'out'
     out.mkdir(exist_ok=True)
-    hlsl = translate().hlsl_cs()
-    if control:
-        if control not in CONTROLS:
-            raise SystemExit('unknown control %r' % control)
-        mutate, model = CONTROLS[control]
-        mutated = mutate(hlsl)
-        assert mutated != hlsl, (control, hlsl)
-        hlsl = mutated
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         d = Path(tmp)
         src, cso, case = d / 'vcchi.hlsl', d / 'vcchi.cso', d / 'vcchi.case'
         src.write_text(hlsl, encoding='ascii')
         subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-        case.write_bytes(struct.pack('<I', 1 | (1 << 8) | (1 << 16)) + struct.pack('<%dI' % WORDS, *expected_words())
+        case.write_bytes(struct.pack('<I', 1 | (1 << 8) | (1 << 16)) + struct.pack('<%dI' % WORDS, *expected)
                          + struct.pack('<16I', *([0] * 16)))
         run = subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
         print(run.stdout, end='')
@@ -152,7 +233,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
         diagnostics = [line for line in run.stderr.splitlines()
                        if not (adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '))]
         if control:
-            want = first_difference(expected_words(), expected_words(**CONTROLS[control][1]))
+            want = first_difference(expected, mutant_words)
             if run.returncode != 1 or diagnostics[:1] != [want]:
                 raise AssertionError('control %s: unexpected result (exit %d), wanted %s: %s' % (
                     control, run.returncode, want, run.stderr))
@@ -169,6 +250,14 @@ if __name__ == '__main__':
         check_controls()
     elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
         sys.exit(check_dispatch(*sys.argv[2:]))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'fixture':
+        fixture = sys.argv[2]
+        if fixture == 'vcc-pair':
+            status = check_dispatch(*sys.argv[3:], fixture=fixture)
+            sys.exit(status or check_dispatch(*sys.argv[3:], fixture=fixture, control='vcc-hi-lost'))
+        if fixture == 'early-out':
+            sys.exit(check_dispatch(*sys.argv[3:], fixture=fixture))
+        sys.exit(__doc__)
     elif len(sys.argv) == 6 and sys.argv[1] == 'control':
         sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2]))
     else:
