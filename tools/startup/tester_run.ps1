@@ -336,7 +336,7 @@ try {
     [System.IO.File]::WriteAllText($janitorFile, ($job | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     $janitorArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'tester_janitor.py')`"", "`"$logDir`"", "--parent", "$PID", "--pack-json", "`"$janitorFile`"", "--cache", "`"$cache`"")
     Start-Process -FilePath $python -WindowStyle Hidden -ArgumentList $janitorArgs `
-        -RedirectStandardError (Join-Path $logDir "janitor_err.txt") -RedirectStandardOutput (Join-Path $logDir "janitor_out.txt") | Out-Null
+        -RedirectStandardError "$janitorFile.err" -RedirectStandardOutput "$janitorFile.out" | Out-Null
 } catch { Write-Warning "tester_run: the janitor is off (Ctrl-C or a closed window will not pack the report): $($_.Exception.Message)" }
 # Stall watchdog (stall_watchdog.py): ends the run through the `stop` file when it is clearly stuck; the reason is printed as
 # "tester_run: STALL STOP at N s: ..." and recorded as stop_reason in the manifest.

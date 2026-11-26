@@ -259,6 +259,8 @@ def check_shell(shell):
         packed = sorted(set((tree / "out" / "tester").glob("report_*.zip")) - before)
         if not packed:
             notes = {str(f.relative_to(tree)): f.read_text(errors="replace")[-1500:] for f in (tree / "out" / "tester").glob("run_*/janitor*.txt")}
+            for f in Path(tempfile.gettempdir()).glob("tester_janitor_*.json.*"):   # the janitor's own stdout/stderr
+                notes[f.name] = f.read_text(errors="replace")[-1500:]
             raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
         with zipfile.ZipFile(packed[0]) as z:
             cut = json.loads(z.read("manifest.json").decode("utf-8-sig"))
