@@ -7815,6 +7815,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[400];
             if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+            static ULONGLONG holders_reported;
+            if (now >= holders_reported + 30000) {
+                holders_reported = now;
+                char holders[1024];
+                if (draw_lock_holders_line(holders, sizeof(holders))) log("%s", holders);
+            }
         }
         {
             char line[500];
