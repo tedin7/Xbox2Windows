@@ -394,6 +394,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
+    // Where the stand-in's GPU work left the result, for a replay check (--dump of x2w_replay).
+    std::printf("x2w-test dispatch output 0x%llx %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(buffers[1])),
+                static_cast<unsigned>(words * sizeof(UINT)));
+    std::fflush(stdout);
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
     return 0;
 }
