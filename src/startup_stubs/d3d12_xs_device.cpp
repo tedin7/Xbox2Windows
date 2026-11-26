@@ -3270,8 +3270,20 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("command count is zero or above the supported maximum", indirect_other, indirect_other_refusal_code::invalid_command_count);
     if (!count_buffer && count_offset)
         return refuse("count offset without a count buffer", indirect_other, indirect_other_refusal_code::count_offset_without_buffer);
-    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
+    if (!sig || sig->own().kind != command_signature_kind || !sig->own().real) {
+        // A console-only signature has no desktop equivalent: show what the title put in its argument buffer so the
+        // layout can be read from the log (first calls only; bytes of the argument range, at most 48 per call).
+        static LONG traced;
+        if (sig && sig->own().kind == command_signature_kind && first_calls(traced, 8)) {
+            const Wrapper* arg = as_wrapper(argument);
+            const auto* memory = arg && arg->own().kind == resource_kind ? static_cast<const unsigned char*>(arg->own().title_memory) : nullptr;
+            char bytes[3 * 48 + 1] = "unreadable";
+            if (memory && readable_window(reinterpret_cast<u64>(memory) + offset, 48) >= 48) hex_text(memory + offset, 48, bytes, sizeof(bytes));
+            log("x2w-render ExecuteIndirect placeholder signature: count=%u offset=%llu count_buffer=%p argument title memory=%p bytes [%s]",
+                count, static_cast<unsigned long long>(offset), count_buffer, static_cast<const void*>(memory), bytes);
+        }
         return refuse("missing or placeholder signature", indirect_placeholder);
+    }
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device", indirect_other, indirect_other_refusal_code::signature_device_mismatch);

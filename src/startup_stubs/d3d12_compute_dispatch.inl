@@ -387,9 +387,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
-        if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
-            !(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-            reason = "an output is not an aliased placed buffer range with unordered access";
+        // One reason per condition, so a census says which one an output failed on.
+        if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
+        else if (!bytes || bytes % 4 || bytes > (16u << 20)) reason = "an output range is empty, over 16 MiB or not whole dwords";
+        else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
+        else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
+        else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
+        else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            reason = "an output buffer was created without unordered access";
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
