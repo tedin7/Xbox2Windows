@@ -12,24 +12,38 @@ namespace x2w_local {
 // length of [data, data + bytes) without its trailing zero bytes, rounded up to `granule` (a power of two) and never below
 // `granule` or above `bytes`. The scan walks backwards from the end and stops at the first non-zero word, so a buffer that is
 // used to its end costs one word.
-inline std::size_t used_length(const void* data, std::size_t bytes, std::size_t granule = 256) noexcept
+inline constexpr std::size_t unlimited_scan = ~std::size_t{0};
+
+// scan_budget bounds the work: at most that many bytes are looked at. When the zeros use up the budget before the data is
+// found, the range is returned whole (never worse than copying it all), so the cost per call is bounded.
+inline std::size_t used_length(const void* data, std::size_t bytes, std::size_t granule = 256, std::size_t scan_budget = unlimited_scan) noexcept
 {
     if (bytes <= granule) return bytes;
     const auto* base = static_cast<const unsigned char*>(data);
-    std::size_t end = bytes;
-    while (end % 8 && end > 0) {
-        if (base[end - 1]) return (end + granule - 1) & ~(granule - 1) < bytes ? (end + granule - 1) & ~(granule - 1) : bytes;
+    const auto rounded_up = [&](std::size_t end) {
+        if (end < granule) end = granule;
+        const std::size_t rounded = (end + granule - 1) & ~(granule - 1);
+        return rounded < bytes ? rounded : bytes;
+    };
+    std::size_t end = bytes, scanned = 0;
+    while (end % 32 && end > 0) {
+        if (base[end - 1]) return rounded_up(end);
         --end;
+        ++scanned;
     }
-    while (end >= 8) {
-        std::uint64_t word;
-        std::memcpy(&word, base + end - 8, 8);
-        if (word) break;
-        end -= 8;
+    while (end >= 32) {
+        if (scanned >= scan_budget) return bytes;
+        std::uint64_t w[4];
+        std::memcpy(w, base + end - 32, 32);
+        if (w[0] | w[1] | w[2] | w[3]) {
+            while (end > 0 && !base[end - 1]) --end;
+            return rounded_up(end);
+        }
+        end -= 32;
+        scanned += 32;
     }
-    if (end < granule) end = granule;
-    const std::size_t rounded = (end + granule - 1) & ~(granule - 1);
-    return rounded < bytes ? rounded : bytes;
+    while (end > 0 && !base[end - 1]) --end;
+    return rounded_up(end);
 }
 
 // The backwards scan is a pass over the whole range when the tail is zero (about 3 ms for 16 MiB, more than the copy it saves).

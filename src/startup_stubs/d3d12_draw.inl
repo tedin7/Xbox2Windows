@@ -314,6 +314,7 @@ std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { 
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
+constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
 LONG64 zero_tail_bytes_saved;  // bytes of buffer bindings not copied because they were zero to the end (zero_tail.h)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
@@ -3126,7 +3127,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
         if (readable_range && !formatted.entry && full_bytes >= (64u << 10)) {
-            bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes);
+            bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
             if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
         }
         bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
