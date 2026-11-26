@@ -115,7 +115,7 @@ V_CNDMASK_B32, V_CMP_GT_U32 = 0x01, 0xc4
 VOP2_OPS = {'v_or_b32': 0x1c, 'v_min_u32': 0x13, 'v_max_u32': 0x14, 'v_max_i32': 0x12, 'v_add_nc_u32': 0x25,
             'v_and_b32': 0x1b, 'v_xor_b32': 0x1d, 'v_min_i32': 0x11,
             'v_max_f32': 0x10}
-CTRL = {'quad_perm:[1,0,3,2]': 0xb1, 'quad_perm:[2,3,0,1]': 0x4e, 'row_half_mirror': 0x141, 'row_mirror': 0x140,
+CTRL = {'quad_perm:[1,0,3,2]': 0xb1, 'quad_perm:[3,2,1,0]': 0x1b, 'quad_perm:[2,3,0,1]': 0x4e, 'row_half_mirror': 0x141, 'row_mirror': 0x140,
         'row_shr:1': 0x111}
 IDENTITY = {'v_or_b32': 0, 'v_min_u32': 0xffffffff, 'v_max_u32': 0, 'v_max_i32': 0x80000000, 'v_add_nc_u32': 0,
             'v_and_b32': 0xffffffff, 'v_xor_b32': 0, 'v_min_i32': 0x7fffffff}
@@ -436,11 +436,12 @@ def refusals():
            'identity', [(1, 'v_or_b32')])
     yield ('wrong identity (0 for the interleaved v_min_u32)', pair(min_kw=dict(identity=0)), 'identity',
            [(1, 'v_min_u32')])
-    yield ('row_mirror step removed', full(steps=STEPS[:3]), 'missing step row_mirror', False)
-    yield ('row_half_mirror step removed', full(steps=STEPS[:2] + STEPS[3:]), 'in place of row_half_mirror', False)
-    yield ('first quad step removed', full(steps=STEPS[1:]), 'in place of quad_perm:[1,0,3,2]', False)
-    yield ('mirror steps reordered (conservative)', full(steps=STEPS[:2] + STEPS[3:1:-1]), 'out of order', True)
-    yield ('quad steps reordered (conservative)', full(steps=STEPS[1::-1] + STEPS[2:]), 'out of order', True)
+    yield ('row_mirror step removed', full(steps=STEPS[:3]), 'missing step 4 of 4', False)
+    yield ('row_half_mirror step removed', full(steps=STEPS[:2] + STEPS[3:]), 'missing step 4 of 4', False)
+    yield ('first quad step removed', full(steps=STEPS[1:]), 'missing step 4 of 4', False)
+    yield ('a quad step repeated in place of the half mirror', full(steps=(STEPS[0], STEPS[1], STEPS[1], STEPS[3])),
+           'do not bring every lane', False)
+    yield ('the half mirror twice', full(steps=(STEPS[0], STEPS[1], STEPS[2], STEPS[2])), 'do not bring every lane', False)
     yield ('row_shr:1 in place of row_mirror', full(steps=STEPS[:3] + ('row_shr:1',)), 'row_shr:1 in place of', False)
     yield ('mixed operations (one v_min_u32 step)', full(step_ops={2: 'v_min_u32'}), 'mixes', False)
     yield ('v_max_i32 (not in the census)', program(START_MUL, chain('v_max_i32', identity=0), RESULT, END),
@@ -549,7 +550,11 @@ def controls():
     for label, variant in (('bound_ctrl on every step', chain('v_max_u32', bound_ctrl=True)),
                            ('steps without fi', chain('v_max_u32', fi=False)),
                            ('the combine with the sources the other way round', chain('v_max_u32', combine='e32')),
-                           ('the combine in VOP3', chain('v_max_u32', combine='e64'))):
+                           ('the combine in VOP3', chain('v_max_u32', combine='e64')),
+                           ('the mirror steps in the other order', chain('v_max_u32', steps=STEPS[:2] + STEPS[3:1:-1])),
+                           ('the quad steps in the other order', chain('v_max_u32', steps=STEPS[1::-1] + STEPS[2:])),
+                           ('the half mirror first', chain('v_max_u32', steps=(STEPS[2], STEPS[0], STEPS[1], STEPS[3]))),
+                           ('a reversing quad step after the swap', chain('v_max_u32', steps=('quad_perm:[1,0,3,2]', 'quad_perm:[3,2,1,0]', STEPS[2], STEPS[3])))):
         source, words = program(START_MUL, variant, RESULT, END)
         text, reason = translate(words)
         check('accepts %s' % label, text is not None and 'v2 = WaveActiveMax(v1);' in text, str(reason))
@@ -657,6 +662,11 @@ DRAWS = [(op, fixture(op)[1]) + single(op) for op in OPS] + [
     ('min then max, interleaved', PAIR[1], 'v_min_u32',
      (('reduce', 'v_min_u32'), ('lane', pair_sdwa), ('reduce', 'v_max_u32')))]
 
+# The recognition simulates the steps, so another order of the same four steps is drawn too (label -> operation).
+REORDERED = {'v_max_u32, half mirror first': ('v_max_u32', (STEPS[2], STEPS[0], STEPS[1], STEPS[3])),
+             'v_add_nc_u32, quad steps swapped then reversed': ('v_add_nc_u32', ('quad_perm:[1,0,3,2]', 'quad_perm:[3,2,1,0]', STEPS[2], STEPS[3]))}
+DRAWS += [(label, program(start(op), chain(op, steps=steps), RESULT, END)[1]) + single(op) for label, (op, steps) in REORDERED.items()]
+
 
 def verify(input_op, channels, words):
     """Group the readback by desktop wave and compare with the CPU reference. Returns (errors, facts)."""
@@ -721,8 +731,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if text is None:
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
-            if label in OPS:
-                hows = [(how, (lambda t, f=f: f(t, label))) for how, f in MUTATIONS.items()]
+            if label in OPS or label in REORDERED:
+                label_op = REORDERED[label][0] if label in REORDERED else label
+                hows = [(how, (lambda t, f=f: f(t, label_op))) for how, f in MUTATIONS.items()]
             else:
                 hows = list(PAIR_MUTATIONS.items())
             for how, mutate in [(None, None)] + hows:

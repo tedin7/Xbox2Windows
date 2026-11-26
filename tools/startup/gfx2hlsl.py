@@ -10027,6 +10027,28 @@ class Stage:
                    'v_max_u32': ('WaveActiveMax({0})', 0), 'v_and_b32': ('WaveActiveBitAnd({0})', 0xffffffff),
                    'v_xor_b32': ('WaveActiveBitXor({0})', 0), 'v_add_nc_u32': ('WaveActiveSum({0})', 0)}
     WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
+    WAVE_REDUCE_CONTROL = re.compile(r'quad_perm:\[[0-3],[0-3],[0-3],[0-3]\]|row_half_mirror|row_mirror')
+
+    @staticmethod
+    def wave_steps_reduce(controls, op):
+        """Whether four DPP16 steps (each a quad_perm, row_half_mirror or row_mirror, every lane valid) followed by
+        v_permlanex16_b32 with lane selects 0, 0 and the combine leave lane 31 with every lane's input exactly once
+        (ISA, DPP16 and V_PERMLANEX16_B32). Each lane holds, per source lane, how often that input went into its value:
+        a step adds the permuted lane's counts to the lane's own. An idempotent operation (or, and, min, max) only needs
+        every count at least once; xor and sum need exactly once."""
+        def source(control, lane):
+            if control == 'row_half_mirror':
+                return (lane & ~7) | (7 - (lane & 7))
+            if control == 'row_mirror':
+                return (lane & ~15) | (15 - (lane & 15))
+            sel = [int(x) for x in control[len('quad_perm:['):-1].split(',')]
+            return (lane & ~3) | sel[lane & 3]
+        held = [[int(i == lane) for i in range(32)] for lane in range(32)]
+        for control in controls:
+            held = [[a + b for a, b in zip(held[source(control, lane)], held[lane])] for lane in range(32)]
+        held = [[a + b for a, b in zip(held[(lane & ~15 ^ 16)], held[lane])] for lane in range(32)]
+        counts = held[31]
+        return all(c == 1 for c in counts) if op in ('v_xor_b32', 'v_add_nc_u32') else all(c >= 1 for c in counts)
 
     @staticmethod
     def wave_reduce_cndmask_fill(stretch, ss):
@@ -10115,7 +10137,7 @@ class Stage:
             raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
         ss = ss[1]
         first = next((k for k, (name, _o, m) in enumerate(steps)
-                      if name.endswith('_dpp') and set(m) & set(self.WAVE_REDUCE_STEPS)), len(steps))
+                      if name.endswith('_dpp') and any(self.WAVE_REDUCE_CONTROL.fullmatch(x) for x in m)), len(steps))
         items = self.ins[index:index + first + 10]
 
         def at(k, what):
@@ -10136,15 +10158,16 @@ class Stage:
                               'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
         vt, source, identity = fill
         op = None
-        for k, want in enumerate(self.WAVE_REDUCE_STEPS):
-            b, o, m, text = at(first + k, want)
+        seen = []
+        for k in range(len(self.WAVE_REDUCE_STEPS)):
+            b, o, m, text = at(first + k, 'the DPP step %d of 4' % (k + 1))
             if not b.endswith('_dpp'):
-                raise Unsupported('wave reduction: missing step %s (found %s)' % (want, text))
+                raise Unsupported('wave reduction: missing step %d of 4 (found %s)' % (k + 1, text))
             controls = [x for x in m if not x.startswith(('row_mask:', 'bank_mask:', 'bound_ctrl:', 'fi:'))]
-            if controls != [want]:
-                order = ' (steps out of order or missing)' if controls and controls[0] in self.WAVE_REDUCE_STEPS else ''
-                raise Unsupported('wave reduction: %s in place of %s%s' % (' '.join(controls) or 'no DPP control', want,
-                                                                         order))
+            if len(controls) != 1 or not self.WAVE_REDUCE_CONTROL.fullmatch(controls[0]):
+                raise Unsupported('wave reduction: %s in place of a quad_perm, row_half_mirror or row_mirror step'
+                                  % (' '.join(controls) or 'no DPP control'))
+            seen.append(controls[0])
             if 'row_mask:0xf' not in m or 'bank_mask:0xf' not in m:
                 raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
             this = b[:-len('_dpp')]
@@ -10155,6 +10178,9 @@ class Stage:
             op = this
             if o != ['v%d' % vt] * 3:
                 raise Unsupported('wave reduction: %s does not combine v%d with itself' % (text, vt))
+        if not self.wave_steps_reduce(seen, op):
+            raise Unsupported('wave reduction: the steps %s do not bring every lane\'s input into lane 31%s' % (
+                ', '.join(seen), ' exactly once' if op in ('v_xor_b32', 'v_add_nc_u32') else ''))
         if identity != self.WAVE_REDUCE[op][1]:
             raise Unsupported('wave reduction of %s: the inactive lanes get 0x%08x, the identity is 0x%08x'
                               % (op, identity, self.WAVE_REDUCE[op][1]))
