@@ -9409,13 +9409,18 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|f16|u32|i32|i16|u16)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
         # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
+        # The binary16 compares read the low half of each source (or a binary16 inline constant): the half converts to
+        # binary32 exactly (every finite half, denormals included, is a normal binary32; inf and NaN stay inf and NaN), so the
+        # relation of the converted values is the relation of the halves. Their SDWA forms are not lowered here.
+        if typ == 'f16' and (sdwa or cond == 'ne'):  # 'ne' is the integer name; the binary16 one is neq
             raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
@@ -9433,6 +9438,11 @@ class Stage:
         # Conditions outside the table or dedicated lowering stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
+        if typ == 'f16':
+            # DXC folds x == x, x <= x and x >= x to true and x != x to false when both sources are the same register, which
+            # is wrong for a NaN half; the ordered forms read the NaN test on the bits (inline constants are never NaN).
+            table.update({'eq': '({2} && {0} == {1})', 'le': '({2} && {0} <= {1})', 'ge': '({2} && {0} >= {1})',
+                          'neq': '!({2} && {0} == {1})'})
         if sdwa:
             self.check_compare_sdwa_destination(base, writes_exec, ops)
         if len(ops) == 3:
@@ -9444,6 +9454,11 @@ class Stage:
             x, y = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
         elif typ == 'f32':
             x, y = self.f(a), self.f(b)
+        elif typ == 'f16':
+            # A lane mask is one lane bit here, not the 16-bit word the hardware would read as a half.
+            self.reject_lane_mask_data(base, a)
+            self.reject_lane_mask_data(base, b)
+            x, y = self.half_operand(a, 'h'), self.half_operand(b, 'h')
         elif typ == 'i32':
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         elif typ in ('i16', 'u16'):
@@ -9458,7 +9473,13 @@ class Stage:
             return self.u(tok)
         ordered = ''
         if '{2}' in table[cond]:
-            ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
+            if typ == 'f16':
+                # A half is a NaN when its exponent is all ones and its mantissa is not zero: |bits| > 0x7c00. An inline
+                # constant is never a NaN. The words before neg/abs are tested, as for binary32.
+                tests = ['(%s & 0x7fffu) <= 0x7c00u' % word(t) for t in (a, b) if self.split_neg(t)[1].strip('|') not in FLOATS]
+                ordered = ' && '.join(tests) or 'true'
+            else:
+                ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
         expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
         if not self.exec_known:
             expr = '(exec & %s)' % expr
