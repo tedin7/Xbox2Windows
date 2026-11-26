@@ -10,7 +10,10 @@ on every 300th present `x2w-gray interval (frame F): ...` with the change of nin
   present-split  the left half cleared to white (255) over black (0): mean level 127.50, spread 127.50 (a picture full of detail).
                    The same mean, so only the spread tells the two pictures apart.
 
-Both runs must log the interval line exactly twice (frames 300 and 600) with all eight named counters, none negative.
+Each of those two runs must log the interval line exactly twice (frames 300 and 600) with all eight named counters, none negative.
+present-onset   two-tone for about 6 s, then flat gray for 6 s: exactly one `x2w-gray onset` line, flat from a time between
+                   6.0 s and the run time, mean 128.00, spread 0.00, and at least four picture lines in 12 s of a constant
+                   picture (the time rule; the count rules log three). present-flat logs one onset line, present-split none.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -19,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 import startup_stream_check as S
 
@@ -28,6 +32,10 @@ INTERVAL = re.compile(r'x2w-gray interval \(frame (\d+)\): ring refusals \+(-?\d
                       r'textures unreadable \+(-?\d+), list copies refused \+(-?\d+)')
 
 
+ONSET = re.compile(r'x2w-gray onset (\d+) \(frame (\d+)\): flat picture from ([0-9.]+) s \(mean ([0-9.]+), spread ([0-9.]+)\); '
+                   r'first upload ring refusal at (NONE yet, )?([0-9.]+) s; first draw not drawn at (NONE yet, )?([0-9.]+) s')
+
+
 def present(consumer, directory, mode):
     cache = directory / 'cache'
     cache.mkdir(exist_ok=True)
@@ -35,8 +43,10 @@ def present(consumer, directory, mode):
         (directory / name).write_bytes(data)
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_RENDER='1', X2W_D3D12_LIST_NOOP='1',
                X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache))
+    started = time.monotonic()
     result = subprocess.run([consumer, directory / 'vertex', directory / 'pixel', directory / 'root', mode], env=env,
                             capture_output=True, text=True)
+    present.elapsed = time.monotonic() - started
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
@@ -57,12 +67,38 @@ def check(consumer, mode, mean, spread):
     frames = [int(m.group(1)) for m in intervals]
     assert frames == [300, 600], f'{mode}: interval lines at frames {frames}, expected [300, 600]\n{log[-3000:]}'
     assert all(int(v) >= 0 for m in intervals for v in m.groups()[1:]), [m.group(0) for m in intervals]
-    print(f'{mode}: {len(pictures)} presented lines at mean {mean:.2f} spread {spread:.2f}, interval lines at {frames}')
+    onsets = [m for m in map(ONSET.search, log.splitlines()) if m]
+    if spread < 4 and mean > 100:  # a flat picture from the first readback: one onset line, at the start of the run
+        assert len(onsets) == 1 and (onsets[0].group(4), onsets[0].group(5)) == ('%.2f' % mean, '%.2f' % spread), \
+            f'{mode}: expected one onset line with mean {mean:.2f} spread {spread:.2f}, got {[m.group(0) for m in onsets]}'
+    else:  # a picture with detail is never an onset (negative control)
+        assert not onsets, f'{mode}: onset line for a picture with detail: {onsets[0].group(0)}'
+    print(f'{mode}: {len(pictures)} presented lines at mean {mean:.2f} spread {spread:.2f}, interval lines at {frames}, '
+          f'{len(onsets)} onset lines')
+
+
+def check_onset(consumer):
+    """Two-tone for about 6 s, then flat gray: one onset line at about the second the picture turned flat, and a picture
+    line at least every 5 s (the run shows a constant picture for 12 s, which the count/40th rules alone would not log
+    more than three times)."""
+    with tempfile.TemporaryDirectory() as temporary:
+        log = present(consumer, Path(temporary), 'present-onset')
+    elapsed = present.elapsed
+    onsets = [m for m in map(ONSET.search, log.splitlines()) if m]
+    assert len(onsets) == 1, f'present-onset: {len(onsets)} onset lines\n{log[-3000:]}'
+    m = onsets[0]
+    at = float(m.group(3))
+    assert (m.group(4), m.group(5)) == ('128.00', '0.00'), m.group(0)
+    assert 6.0 <= at <= elapsed, f'present-onset: flat from {at} s, expected between 6.0 and the run time {elapsed:.1f} s: {m.group(0)}'
+    pictures = [m for m in map(PRESENTED.search, log.splitlines()) if m]
+    assert len(pictures) >= 4, f'present-onset: {len(pictures)} picture lines, a timed line was expected\n{log[-3000:]}'
+    print(f'present-onset: one onset line, flat from {at} s of a {elapsed:.1f} s run; {len(pictures)} picture lines')
 
 
 def main(consumer):
     check(consumer, 'present-flat', 128.0, 0.0)
     check(consumer, 'present-split', 127.5, 127.5)
+    check_onset(consumer)
     print('PASS')
 
 

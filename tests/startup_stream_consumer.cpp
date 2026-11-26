@@ -597,7 +597,7 @@ static bool create_slot67(void* device, const char* code_path, const char* data_
     return true;
 }
 
-// present-flat / present-split: a 64x64 RGBA8 render target cleared (ClearRenderTargetView, list slot 52) to one gray (128), or to
+// present-flat / present-split / present-onset (two-tone for 6 s, then flat for 6 s): a 64x64 RGBA8 render target cleared (ClearRenderTargetView, list slot 52) to one gray (128), or to
 // black with its left half cleared to white, then presented 600 times through queue slot 32 with X2W_D3D12_RENDER=1. The stand-in
 // reads the picture back and logs "x2w-render presented ... mean level M/255, spread S" and, every 300th present, an
 // "x2w-gray interval" line of counters.
@@ -605,7 +605,7 @@ static int present_gray(void* device, const std::string& mode)
 {
     constexpr UINT size = 64, presents = 600;
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
-    const bool split = mode == "present-split";
+    const bool split = mode == "present-split", onset = mode == "present-onset";
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
         D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
@@ -626,19 +626,25 @@ static int present_gray(void* device, const std::string& mode)
     if (!handle) return 73;
     const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     invoke(device, 20, word(texture), word(&view), handle);
-    const float background[4] = {split ? 0.0f : 128.0f / 255.0f, split ? 0.0f : 128.0f / 255.0f, split ? 0.0f : 128.0f / 255.0f, 1.0f};
+    const float gray[4] = {128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 1.0f};
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     const D3D12_RECT left_half{0, 0, static_cast<LONG>(size / 2), static_cast<LONG>(size)};
-    if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator), 0)))) return 74;
-    invoke(list, 52, handle, word(background));
-    if (split) invoke(list, 52, handle, word(white), 1, word(&left_half));
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
-        Sleep(1);
-    }
+    UINT64 fence_value = 0;
+    // One recording that clears the target (flat gray, or black with its left half white), run to its fence.
+    const auto fill = [&](bool two_tone) {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator), 0)))) return 74;
+        invoke(list, 52, handle, word(two_tone ? black : gray));
+        if (two_tone) invoke(list, 52, handle, word(white), 1, word(&left_half));
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), ++fence_value)))) return 76;
+        for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < fence_value;) {
+            if (GetTickCount64() >= deadline) return 78;
+            Sleep(1);
+        }
+        return 0;
+    };
     // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
     static std::uint64_t resources[1];
     static std::uint64_t plane[9];
@@ -646,9 +652,22 @@ static int present_gray(void* device, const std::string& mode)
     resources[0] = word(texture);
     plane[1] = 1;
     plane[2] = word(resources);
-    for (UINT i = 0; i < presents; ++i)
-        if (FAILED(static_cast<HRESULT>(invoke(queue, 32, 1, word(plane), word(present))))) return 81;
-    return 0;
+    const auto show = [&](UINT count, DWORD pause_ms) {
+        for (UINT i = 0; i < count; ++i) {
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 32, 1, word(plane), word(present))))) return 81;
+            if (pause_ms) Sleep(pause_ms);
+        }
+        return 0;
+    };
+    if (onset) {
+        // Two-tone for 6 s, then a flat gray for 6 s: the picture turns flat once, about 6 s into the run.
+        if (const int rc = fill(true)) return rc;
+        if (const int rc = show(30, 200)) return rc;
+        if (const int rc = fill(false)) return rc;
+        return show(30, 200);
+    }
+    if (const int rc = fill(split)) return rc;
+    return show(presents, 0);
 }
 
 int main(int argc, char** argv)
