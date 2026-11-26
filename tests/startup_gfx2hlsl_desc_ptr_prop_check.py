@@ -1,6 +1,6 @@
 """Check descriptor pointer propagation through s_add_u32 / s_addc_u32 in tools/startup/gfx2hlsl.py (#1723).
 
-usage: startup_gfx2hlsl_desc_ptr_prop_check.py
+usage: startup_gfx2hlsl_desc_ptr_prop_check.py [draw <dxc> <offscreen_check> <adapter>]
 
 A shader advances a descriptor table or root pointer with `s_add_u32 sD, sP, <literal>` and
 `s_addc_u32 sD+1, sP+1, 0`, into the same or another register pair, then loads descriptors through
@@ -8,7 +8,10 @@ the result. The load must read at the advanced byte offset. A non-literal addend
 never silently treated as the unchanged pointer.
 """
 import os
+import struct
 import sys
+import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
@@ -222,4 +225,68 @@ check('complete out-of-place pair leaves the original high source untouched',
 if failures:
     print('FAILED: %s' % ', '.join(failures))
     sys.exit(1)
+def descriptor_number_pipeline(word=2):
+    from startup_gfx2hlsl_sload_s104_check import TABLE_ROOT, vs_words
+    from startup_gfx2hlsl_scalar_null_check import POST_WORDS, smem, sop1, sop2, vop1
+
+    # Mask NUM_RECORDS to six bits and scale it by five. Keep the result
+    # across an overwrite of the source word before converting it to float.
+    body = smem(2, 72, 8, imm=0x20) + struct.pack('<I', 0xbf8c0000)
+    body += sop2(0x0e, 46, 72 + word, 191)
+    body += sop2(0x26, 47, 46, 133)
+    body += sop1(3, 72 + word, 128)
+    body += vop1(6, 12, 47)
+    body += b''.join(vop1(1, reg, 128) for reg in range(13, 16))
+    return G.Pipeline(vs_words([(0, 0, 0)] * 4), body + POST_WORDS, TABLE_ROOT)
+
+
+def check_descriptor_number():
+    pipe = descriptor_number_pipeline()
+    assert pipe.manifest().startswith('x2w-manifest 3\n')
+    assert ('descword', 0, 0x28) in pipe.uds
+    assert not pipe.resources
+    # A heap record has no graphics entry-word representation.
+    s = stage({72: ('desc', ('resheap', 0, 0), 0, 2)})
+    s.kind = 'ps'
+    s.scalar('s_and_b32', ['s46', 's72', '63'])
+    try:
+        s.S(46)
+    except G.Unsupported as error:
+        assert 'cannot materialize descriptor word 2' in str(error), error
+    else:
+        raise AssertionError('an unavailable descriptor word translated')
+
+
+def draw_descriptor_number(dxc, renderer, adapter):
+    from startup_flat_param_check import compile_hlsl
+    from startup_gfx2hlsl_bit_alu_check import words_text
+    import gpu_case_runner
+
+    correct, wrong = (descriptor_number_pipeline(word) for word in (2, 1))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', correct.hlsl_vs(), 'vs_descriptor_number', 'vs_6_0', directory)
+        for label, pipe in (('record_count', correct), ('wrong_word', wrong)):
+            ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), label, 'ps_6_0', directory)
+            for descriptor in ((0, 0x30112, 91, 0), (0, 0x40023, 109, 0)):
+                values = [descriptor[(source[2] - 0x20) // 4] if source[0] == 'descword' else 0
+                          for source in pipe.uds]
+                values += [0] * (4 - len(values))
+                expected = words_text([G.fbits(float((descriptor[2] & 63) * 5)), 0, 0, 0])
+                result = gpu_case_runner.run(renderer, adapter,
+                                             ['--startup-flat-param', vs, ps, expected, words_text(values)])
+                if result.returncode == 77:
+                    raise SystemExit(77)
+                if pipe is correct:
+                    assert result.returncode == 0, (result.stdout, result.stderr)
+                else:
+                    actual = words_text([G.fbits(float((descriptor[1] & 63) * 5)), 0, 0, 0])
+                    assert result.returncode == 1 and 'actual=' + actual in result.stderr, result.stderr
+
+
+check_descriptor_number()
+if len(sys.argv) > 1:
+    if len(sys.argv) != 5 or sys.argv[1] != 'draw':
+        raise SystemExit(__doc__)
+    draw_descriptor_number(*sys.argv[2:])
 print('startup_gfx2hlsl_desc_ptr_prop: ok')

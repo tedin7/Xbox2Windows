@@ -3,9 +3,11 @@
 usage: startup_gfx2hlsl_desc_vcc_check.py [draw <dxc> <offscreen_check> <warp|hardware> [fxc]]
 """
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from startup_gfx2hlsl_sload_s104_check import (
     G, TABLE_ROOT, compile_hlsl, draw, translate, vs_words, words_text,
@@ -51,6 +53,75 @@ def pixel_words(alias):
     return struct.pack('<%dI' % len(words), *words) + POST_WORDS
 
 
+def odd_image(*, swapped=False, constant_high=False):
+    from startup_image_sample_a16_check import DIM_2D, IMG_SAMPLE_LZ, encode_mimg
+
+    # Preserve the six low words from the load into s[100:107]. Copy the last
+    # two from a separate load through an odd pair and back into VCC.
+    words = [*smem(3, 100, 8, 0x20), *smem(3, 56, 8, 0x20), 0xbf8c0000]
+    pair = (63, 62) if swapped else (62, 63)
+    high = 128 if constant_high else pair[1]
+    words += [0xbe9d0300 | pair[0], 0xbe9e0300 | high, mov64(106, 29)]
+    words += [0xbea40380, 0xbea50380, 0xbea60380, 0xbea70380]  # s36:s39 sampler, all zero
+    words += [0x7e000200 | 18 << 17 | 255, 0x3f400000, 0x7e000200 | 19 << 17 | 255, 0x3e800000]
+    img = encode_mimg(IMG_SAMPLE_LZ, dim=DIM_2D, vaddr=18, vdata=12, srsrc=100, ssamp=36)
+    return struct.pack('<%dI' % len(words), *words) + img + struct.pack('<I', 0xbf8c3f70) + POST_WORDS
+
+
+def sample_pipeline(**options):
+    return G.Pipeline(vs_words([(0, 0, 0)] * 4), odd_image(**options), TABLE_ROOT)
+
+
+def check_odd_sample():
+    code = odd_image()
+    assert any(asm == 's_mov_b64 vcc, s29' for _, _, _, asm in G.decode(code))
+    pipe = sample_pipeline()
+    assert list(pipe.resources) == [(('table', 0), 0x20)]
+    mixed = sample_pipeline(constant_high=True)
+    assert mixed.ps.sym[107] == ('const', 0)
+    assert mixed.resources == pipe.resources
+    try:
+        sample_pipeline(swapped=True)
+    except G.Unsupported as error:
+        assert 'needs matching descriptor words in vcc' in str(error), error
+    else:
+        raise AssertionError('swapped VCC descriptor words translated')
+
+
+def draw_odd_sample(directory, dxc, renderer, adapter):
+    from startup_image_sample_c_border_check import f32_hex, manifest_sampler
+
+    pipe = sample_pipeline()
+    vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), 'vs_odd_image', 'vs_6_0', directory)
+    # Point sampling the 2x2 texture at (0.75, 0.25) selects texel (1, 0).
+    expected = f32_hex((1 + 1) / 8, 1, 0, 0)
+    for label, sample in (('odd_image', pipe), ('mixed_image', sample_pipeline(constant_high=True))):
+        ps = compile_hlsl(dxc, 'dxc', sample.hlsl_ps(), 'ps_' + label, 'ps_6_0', directory)
+        command = [renderer, adapter, '--startup-image-2d', vs, ps, '0', expected, manifest_sampler(sample)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 77:
+            raise SystemExit(77)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+
+    # The swapped descriptor is invalid. Verify that treating it as an unbound
+    # (zero) resource in the readback harness cannot satisfy the same reference.
+    descriptor = G.Stage.descriptor
+
+    def invalid_as_null(stage, operand, **kwargs):
+        try:
+            return descriptor(stage, operand, **kwargs)
+        except G.Unsupported as error:
+            if 'needs matching descriptor words in vcc' not in str(error):
+                raise
+            return None
+
+    with patch.object(G.Stage, 'descriptor', invalid_as_null):
+        mutant = sample_pipeline(swapped=True).hlsl_ps()
+    command[4] = compile_hlsl(dxc, 'dxc', mutant, 'ps_swapped_image_words', 'ps_6_0', directory)
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 1 and 'actual=00000000,00000000,00000000,00000000' in result.stderr, result.stderr
+
+
 def main():
     stage = translate(LOAD, LOW, COPY, CLOBBER, FETCH, END)
     # Manual mutant: dropping the symbol copy must fail the positive alias or this symbol check.
@@ -92,11 +163,19 @@ def main():
         's_mov_b64 exec, s[42:43]',
         's_mov_b32 vcc_lo, s42',
         's_and_b64 vcc, s[42:43], -1',
-        's_mov_b64 vcc, s[41:42]',
     ):
         refuse('mask from descriptor data', LOAD, operation)
-    refuse('even pair of descriptor words', LOAD, 's_mov_b32 s43, 0', COPY)
-    refuse('even pair of descriptor words', LOAD, 's_mov_b32 s42, 0', COPY)
+    stage = translate(LOAD, 's_mov_b32 s43, 0', COPY, END)
+    assert stage.sym[107] == ('const', 0)
+    stage = translate(LOAD, 's_mov_b32 s42, 0', COPY, END)
+    assert stage.sym[106] == ('const', 0)
+    refuse('needs a pair of tracked descriptor words or constants', LOAD, 's_mov_b64 vcc, s[43:44]')
+    zeros = ('s_mov_b64 s[104:105], 0', 's_mov_b64 s[38:39], 0', 's_mov_b64 vcc, s[38:39]')
+    stage = translate(*zeros, FETCH, END)
+    assert stage.sym[106] == stage.sym[107] == ('const', 0)
+    assert any('vcc = ' in line for _, lines, _ in stage.blocks for line in lines)
+    refuse('without a matching load on every path', *zeros[:2], 's_cbranch_scc0 label_0010', zeros[2], FETCH)
+    check_odd_sample()
 
     # Manual mutant: skipping the consistency check must accept these malformed descriptors.
     message = 'needs four consecutive words of the same descriptor'
@@ -116,6 +195,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     payload = [0x3f100000, 0x3f200000, 0x3f300000, 0x3f400000]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        draw_odd_sample(directory, dxc, renderer, adapter)
         for alias in (False, True):
             pipe = G.Pipeline(vs_code, pixel_words(alias), TABLE_ROOT)
             source = pipe.hlsl_ps()
