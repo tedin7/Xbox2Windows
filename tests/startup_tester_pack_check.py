@@ -65,6 +65,8 @@ def check_preset():
     for n, item in enumerate(items2[1:]):
         assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
+    for none in ("none", "off", "OFF", ""):
+        assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"
     for bad in ("4@1," * 300, "x" * 5000):
         try:

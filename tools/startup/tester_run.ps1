@@ -36,7 +36,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
+-Input none (the default, also off): no automatic presses at all, the title only sees the tester's own input. -Input menus: D-pad down, D-pad down, A, one press every second (each held 0.8 s) starting 5 s after the first pad poll, for the first 256 presses (about 260 s; input script
 time counts from that poll, which the title reaches late).
 -PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
 the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
@@ -55,7 +55,7 @@ param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 600,
-    [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
+    [Alias("Input")] [string]$InputMode = "none",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
     [int]$CaptureMenuEvery = 5,                 # during the menu phase (until the first loading-like picture) a picture this often; 0 = only -CaptureEvery
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
@@ -236,6 +236,8 @@ Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
+# No script (-Input none): run.ps1 sets X2W_INPUT_SCRIPT only for a non-empty script, so clear one left in this shell's environment.
+if (-not $script) { Remove-Item Env:X2W_INPUT_SCRIPT -ErrorAction SilentlyContinue }
 # One intent label per timed press ("privacy pass 2: toggle box 1", ...), kept in the manifest next to input_script; analyze_run joins
 # them with the "x2w-input script press item N" lines (item N = label N). Empty for scripts that are not the menus preset.
 $inputLabels = @()

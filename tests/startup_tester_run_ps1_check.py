@@ -153,7 +153,7 @@ def check_shell(shell):
         assert not list((tree / "out" / "tester").glob("*.zip")) if (tree / "out" / "tester").exists() else True
 
         rev_file.write_text(REV_CPP % head, encoding="ascii")
-        ok = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "10")
+        ok = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "10", "-Input", "menus")
         assert ok.returncode == 0, (shell, ok.stdout, ok.stderr)
         zips = sorted((tree / "out" / "tester").glob("report_%s_*.zip" % head))
         assert len(zips) == 1, zips
@@ -251,6 +251,8 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_snap) as z:
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
+        # No -Input given: the default is no automatic presses (an empty script, no labels), so the tester's own clicks are not fought
+        assert snap_manifest["input_script"] in ("", None) and not snap_manifest["input_labels"], snap_manifest["input_script"]
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
