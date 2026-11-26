@@ -103,13 +103,14 @@ ULONGLONG WINAPI movie_hook_open(ULONGLONG a, ULONGLONG b, ULONGLONG c, ULONGLON
 
 ULONGLONG WINAPI movie_hook_next_frame(ULONGLONG a, ULONGLONG b, ULONGLONG c, ULONGLONG d)
 {
+    // The frame number before the call: 1 means the playback is leaving its first frame.
+    MovieHeader before{};
+    const bool have = movie_header(a, &before);
     const ULONGLONG result = movie_forward(movie_next_frame, a, b, c, d);
-    MovieHeader header{};
-    if (movie_mode() == MovieMode::goto_end && movie_header(a, &header) && header.frame <= 1 && header.frames > 1 &&
-        header.frames < (1u << 24)) {
+    if (movie_mode() == MovieMode::goto_end && have && before.frame <= 1 && before.frames > 1 && before.frames < (1u << 24)) {
         // The playback just started: go to the last frame with the real BinkGoto (frame, flags 0).
-        movie_forward(movie_goto, a, header.frames, 0, 0);
-        if (movie_log_this(movie_goto)) x2w_local::logf("x2w-movie playback ended at once: handle 0x%llx, %u frames", a, header.frames);
+        movie_forward(movie_goto, a, before.frames, 0, 0);
+        if (movie_log_this(movie_goto)) x2w_local::logf("x2w-movie playback ended at once: handle 0x%llx, %u frames", a, before.frames);
     } else if (movie_mode() == MovieMode::log && movie_log_this(movie_next_frame)) {
         movie_log_call(movie_next_frame, a, b, result);
     }

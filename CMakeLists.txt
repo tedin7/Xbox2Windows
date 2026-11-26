@@ -1167,6 +1167,28 @@ add_test(NAME startup_console_mode_control
 add_test(NAME startup_console_mode_provider_control
          COMMAND startup_console_mode --control provider --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
 set_tests_properties(startup_console_mode_control startup_console_mode_provider_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# X2W_SKIP_MOVIES (movie_skip.inl): a stand-in bink2scarlett.dll with an eight-frame movie and an EXE that imports the title's eight
+# Bink functions by name from it and plays it. With the switch the movie ends at once, without it nothing changes; --no-hook (the
+# hook not installed) must FAIL on every case that needs the hook.
+if (WIN32)
+    add_library(startup_movie_skip_fake_bink SHARED tests/startup_movie_skip_fake_bink.cpp)
+    set_target_properties(startup_movie_skip_fake_bink PROPERTIES OUTPUT_NAME bink2scarlett PREFIX "")
+    target_compile_features(startup_movie_skip_fake_bink PRIVATE cxx_std_17)
+    add_executable(startup_movie_skip tests/startup_movie_skip.cpp)
+    target_include_directories(startup_movie_skip PRIVATE src)
+    target_compile_features(startup_movie_skip PRIVATE cxx_std_17)
+    target_link_libraries(startup_movie_skip PRIVATE startup_movie_skip_fake_bink)
+    foreach(case plain:0 goto_end:1 loop:1 mid:1 frames1:frames1 open_null:open_null log:log)
+        string(REPLACE ":" ";" parts "${case}")
+        list(GET parts 0 case_name)
+        list(GET parts 1 case_switch)
+        add_test(NAME startup_movie_skip_${case_name} COMMAND startup_movie_skip ${case_name})
+        set_tests_properties(startup_movie_skip_${case_name} PROPERTIES ENVIRONMENT "X2W_SKIP_MOVIES=${case_switch}"
+            PASS_REGULAR_EXPRESSION "startup_movie_skip: PASS")
+    endforeach()
+    add_test(NAME startup_movie_skip_no_hook_control COMMAND startup_movie_skip goto_end --no-hook)
+    set_tests_properties(startup_movie_skip_no_hook_control PROPERTIES ENVIRONMENT "X2W_SKIP_MOVIES=1" PASS_REGULAR_EXPRESSION "FAIL: ")
+endif()
 # EXE + late-loaded package helper through the real Windows loader: proxied xgameruntime QueryApiImpl,
 # unrelated same-named export stays original. Notification only enqueues; rewrite runs after link.
 if (WIN32)
