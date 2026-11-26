@@ -34,7 +34,7 @@ $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; Sysmem = $env:X2W_D3D12_SYSMEM_FALLBACK; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -162,6 +162,7 @@ def check_shell(shell):
         assert "job memory cap %d GiB" % args["MemoryGiB"] in ok.stdout, ok.stdout
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
+        assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
@@ -215,6 +216,17 @@ def check_shell(shell):
             big_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert big_args["MemoryGiB"] == 33 and big_manifest["memory_gib"] == 33
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
+        assert plain_args["Sysmem"] == "1" and plain_manifest["sysmem_fallback"] is True  # -NoLazyTextures leaves it on
+
+        # -NoSysmemFallback leaves its variable unset and the manifest says so.
+        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback")
+        assert nosys.returncode == 0, (nosys.stdout, nosys.stderr)
+        newest_nosys = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_nosys) as z:
+            nosys_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            nosys_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert not nosys_args["Sysmem"] and nosys_manifest["sysmem_fallback"] is False
+        assert "X2W_D3D12_SYSMEM_FALLBACK" not in nosys_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
         for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):

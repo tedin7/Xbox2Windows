@@ -36,6 +36,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
+#include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
@@ -411,6 +412,17 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
 }
 
 bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
+
+// One line for each of the first 32 textures created in system memory after the default heap ran out of video memory.
+// The running totals are in the x2w-budget line.
+void log_sysmem_fallback(const void* address, const D3D12_RESOURCE_DESC& desc, const char* path)
+{
+    static LONG logged;
+    if (!first_calls(logged, 32)) return;
+    log("x2w-d3d12 sysmem fallback %s: address=%p dim=%d %llux%ux%u mips=%u fmt=%d samples=%u -> created in system memory (L0)",
+        path, address, desc.Dimension, static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
+        desc.MipLevels, desc.Format, desc.SampleDesc.Count);
+}
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
@@ -5307,12 +5319,17 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         const auto* clear_value = packed_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
                                                     desktop_format(desc->Format), texture.Format, clear_copy);
         ID3D12Resource* created = nullptr;
-        HRESULT texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
+        // On E_OUTOFMEMORY of the default heap, X2W_D3D12_SYSMEM_FALLBACK=1 creates the texture once more in system memory.
+        bool in_system_memory = false;
+        HRESULT texture_hr = x2w_sysmem::create_with_fallback(device_of(self), props, [&](const D3D12_HEAP_PROPERTIES& heap) {
+            HRESULT result = device_of(self)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                                       D3D12_RESOURCE_STATE_COMMON, clear_value,
                                                                       IID_PPV_ARGS(&created));
-        if (FAILED(texture_hr) && clear_value)
-            texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
+            if (FAILED(result) && clear_value)
+                result = device_of(self)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+            return result;
+        }, in_system_memory);
         static LONG textures, failures;
         if (first_calls(textures, 6) || (FAILED(texture_hr) && first_calls(failures, 8))) {
             char bytes[3 * 0x38 + 1];
@@ -5330,7 +5347,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             created->Release();
             return E_OUTOFMEMORY;
         }
-        w->own().budget = x2w_budget::committed(device_of(self), created, props.Type);
+        w->own().budget = x2w_budget::committed(device_of(self), created, props.Type, in_system_memory);
+        if (in_system_memory) log_sysmem_fallback(address, texture, "eager");
         w->own().title_memory = address;
         note_resource(w, desc, 0);
         retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
@@ -5545,8 +5563,11 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         if (!device) return nullptr;
 
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-        const HRESULT hr = device->CreateCommittedResource(
-            &props, D3D12_HEAP_FLAG_NONE, &record.desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+        bool in_system_memory = false;
+        const HRESULT hr = x2w_sysmem::create_with_fallback(device, props, [&](const D3D12_HEAP_PROPERTIES& heap) {
+            return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &record.desc, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, IID_PPV_ARGS(&created));
+        }, in_system_memory);
         static LONG materialized, failures;
         if (first_calls(materialized, 8) || (FAILED(hr) && first_calls(failures, 8))) {
             log("x2w-d3d12 lazy texture materialize wrapper=%p address=%p dim=%d %llux%ux%u mips=%u fmt=%d -> 0x%08lx",
@@ -5572,7 +5593,8 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         }
 
         x2w_startup::mark_packed_stand_in(created, record.desktop_format);
-        x2w_budget::Ticket* const ticket = x2w_budget::committed(device, created, props.Type);
+        x2w_budget::Ticket* const ticket = x2w_budget::committed(device, created, props.Type, in_system_memory);
+        if (in_system_memory) log_sysmem_fallback(w->own().title_memory, record.desc, "lazy");
         w->own().budget = ticket;
         if (ticket && InterlockedCompareExchange(&w->own().refs, 0, 0) <= 0) {
             ticket->end_use();
@@ -7078,7 +7100,8 @@ void report_budget(ID3D12CommandQueue* queue)
             std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
         FreeLibrary(xmem);
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s sysmem-fallback=%llu bytes=%llu", local, nonlocal, text, counts.unmeasured,
+        commit, pool, job, counts.sysmem_fallbacks, counts.sysmem_fallback_bytes);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
