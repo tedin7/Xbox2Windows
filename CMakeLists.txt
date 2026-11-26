@@ -4479,6 +4479,18 @@ if(EXISTS "${INTAKE_PYTHON}")
             set_tests_properties(startup_compute_tg_size_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
+        # More than 32 threads per group (two wave32 waves): the wave ID bits of TG_SIZE are the flat thread index / 32.
+        add_test(NAME startup_compute_tg_size_waves_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" waves-dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_tg_size_waves_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS wave-id-zero wave-width-16)
+            add_test(NAME startup_compute_tg_size_waves_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" waves-control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_tg_size_waves_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
     endforeach()
     # gfx2hlsl DPP16 quad swaps in a straight-line compute program, exchanged through groupshared memory.
     add_test(NAME startup_compute_dpp_quad_swap_controls COMMAND "${INTAKE_PYTHON}" -B
