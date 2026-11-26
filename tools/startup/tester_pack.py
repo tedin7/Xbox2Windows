@@ -30,7 +30,7 @@ BUTTON_A = "4"
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
 SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
-                 "windows_build", "wall_seconds", "deep", "shader_cache", "translations_at_start")
+                 "windows_build", "wall_seconds", "deep", "lazy_textures", "shader_cache", "translations_at_start")
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces

@@ -10,6 +10,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `0355a7745` |
 | revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
 | periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
+| opt-in lazy slot 133 textures (`X2W_D3D12_LAZY_TEXTURES=1`): external PR #2773, opt-in; its conflict with main is resolved on this branch only | PR #2773 (triggered02) | `92db6d4eb` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
@@ -37,6 +38,9 @@ What it does:
 `-Input menus` presses D-pad down, D-pad down, A, one press every 6 s, starting 5 s after the first pad poll and up to 500 s. The input
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
+
+`-LazyTextures` (default on for now) sets `X2W_D3D12_LAZY_TEXTURES=1` so read-only slot 133 textures are created on first use
+and video memory does not run out; `-LazyTextures $false` turns it off and the manifest records the choice.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
 

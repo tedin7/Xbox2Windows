@@ -33,7 +33,7 @@ $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -124,6 +124,7 @@ def check_shell(shell):
                                 "args.json", "debugger_summary.out", "manifest.json"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
+        assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
@@ -148,6 +149,16 @@ def check_shell(shell):
             deep_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert deep_args["TraceCalls"] and deep_args["TraceApi"] and deep_args["InputScript"] == "4@60,1@70", deep_args
         assert deep_manifest["deep"] is True and deep_args["CaptureEvery"] == 0, deep_manifest
+
+        # -LazyTextures $false leaves the variable unset and the manifest says so.
+        plain = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-LazyTextures", "$false")
+        assert plain.returncode == 0, (plain.stdout, plain.stderr)
+        newest_plain = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_plain) as z:
+            plain_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            plain_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert not plain_args["Lazy"] and plain_manifest["lazy_textures"] is False
+        assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
         (cache / "req_2123456789abcdef.txt").write_bytes(b"x")

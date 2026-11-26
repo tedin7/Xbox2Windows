@@ -18,6 +18,9 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
 
+-LazyTextures (default $true, for now) sets X2W_D3D12_LAZY_TEXTURES=1: read-only slot 133 textures are created on first
+use, which keeps video memory from running out. Pass -LazyTextures $false to turn it off. The manifest records it.
+
 -Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
 time counts from that poll, which the title reaches late). Any other value is a raw
 X2W_INPUT_SCRIPT (docs/startup-runtime.md, "Input script").
@@ -36,7 +39,8 @@ param(
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$LimitMB = 20,
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
-    [switch]$Deep                               # also -TraceCalls and -TraceApi: slower, more detailed
+    [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
+    [bool]$LazyTextures = $true                 # X2W_D3D12_LAZY_TEXTURES=1 (PR #2773): defer read-only slot 133 textures; -LazyTextures $false turns it off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -99,6 +103,7 @@ $logDir = Join-Path $outRoot "run_$stamp"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
 $env:X2W_D3D12_BUDGET = "1"
+if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir
     ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
@@ -133,7 +138,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; shader_cache = (Split-Path -Leaf $cache)
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$stamp.json"

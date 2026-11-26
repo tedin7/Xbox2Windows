@@ -17,7 +17,7 @@ import tester_pack as T  # noqa: E402
 
 MANIFEST = {"commit": "abcdef12", "build_commit": "abcdef12", "dirty": False, "seconds": 300,
             "input_script": "4@70", "env": {"X2W_D3D12_BUDGET": "1"}, "gpu": "GPU", "gpu_driver": "1.0",
-            "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "shader_cache": "shader_cache_abcdef12",
+            "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "lazy_textures": True, "shader_cache": "shader_cache_abcdef12",
             "translations_at_start": 0}
 
 
