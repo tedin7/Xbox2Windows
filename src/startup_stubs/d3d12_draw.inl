@@ -896,6 +896,7 @@ struct Slot57Mesh {
     UINT targets{};
     bool pipeline_attempted{};
     bool bindings_valid{};
+    unsigned load_failures{};  // manifest worker only
 };
 
 void* volatile pending_slot57_meshes;
@@ -1008,6 +1009,8 @@ std::unordered_set<u64> published_slot57_keys()
     return keys;
 }
 
+constexpr unsigned slot57_load_attempts = 8;
+
 void prefetch_slot57_meshes()
 {
     static Slot57Mesh* waiting;
@@ -1022,9 +1025,14 @@ void prefetch_slot57_meshes()
     const auto published = published_slot57_keys();
     for (auto** slot = &waiting; *slot;) {
         auto* mesh = *slot;
-        if (published.count(mesh->key) && load_slot57_result(*mesh)) {
+        const bool is_published = published.count(mesh->key) != 0;
+        if (is_published && load_slot57_result(*mesh)) {
             *slot = mesh->next;
             InterlockedExchangePointer(&mesh->ready, mesh);
+        } else if (is_published && ++mesh->load_failures >= slot57_load_attempts) {
+            // The writer publishes the manifest last, so a result that still cannot be read is malformed: stop
+            // listing the cache and re-reading its files every pass for it. Its calls stay counted as incomplete.
+            *slot = mesh->next;
         } else {
             slot = &mesh->next;
         }
