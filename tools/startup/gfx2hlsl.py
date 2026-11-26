@@ -5310,6 +5310,14 @@ class Stage:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
+            # Every path below writes the destination's symbol directly, not through set_s, or refuses. The
+            # written word is descriptor data, so a lane-mask mark the SGPR held from an earlier write ends here as
+            # set_s ends it. lower() has already classified the sources, so a mask read by this instruction is
+            # still refused.
+            if dst and dst[0] == 's':
+                for reg in range(dst[1], dst[2] + 1):
+                    getattr(self, 'masks', set()).discard(reg)
+                    getattr(self, 'mask_high', set()).discard(reg)
             if self.pointer_add(base, dname, srcs, syms):
                 return None
             if dname == 'm0':

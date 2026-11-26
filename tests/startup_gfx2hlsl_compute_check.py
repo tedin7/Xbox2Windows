@@ -723,6 +723,7 @@ SPLICE = {
     's_bfe_u32 s21, s29, 0xe0010': '1dff959310000e00',
     's_max_u32 s21, s21, 1': '15819584',
     's_max_u32 s21, s21, 2': '15829584',
+    'v_cmp_gt_u32_e64 s21, 3, v0': '1500c4d483000200',
     's_bfe_u32 s21, s17, 0xe0011': '11ff959311000e00',
     's_mul_i32 s18, s18, s21': '12151293',
     's_mul_i32 s18, s18, 4': '12841293',
@@ -768,6 +769,15 @@ OOB_RAW = 's_or_b32 s19, s19, 0x30000000'
 RAW_CONVERSION = (STRIDE_EXTRACT, STRIDE_CLEAR, SCALE_RECORDS, OOB_CLEAR, OOB_RAW)
 CASES['I-raw'] = (SOURCE_A.replace('buffer_store_dword', '\n'.join((*RAW_CONVERSION, 'buffer_store_dword'))),
                   splice(*RAW_CONVERSION), *CASES['A'][2:])
+
+# Case I-raw-mask: s21 first holds a lane mask (a compare in a 24-lane group), then the clamped stride of the same
+# conversion. The descriptor-data write ends the mark, so the clamp is not a lane-mask read and the store lands as
+# in case A. The translator before that change refused it: s_max_u32 reads lane mask s21 as numeric data.
+MASK_S21 = 'v_cmp_gt_u32_e64 s21, 3, v0'
+CLAMPED_CONVERSION = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
+CASES['I-raw-mask'] = (SOURCE_A.replace('buffer_store_dword',
+                                        '\n'.join((MASK_S21, *CLAMPED_CONVERSION, 'buffer_store_dword'))),
+                       splice(MASK_S21, *CLAMPED_CONVERSION), *CASES['A'][2:])
 
 # Replace the nonzero stride constant in s5 with the first active lane of a
 # fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
@@ -873,7 +883,7 @@ def formatted_input():
 
 
 def expected(name):
-    if name in ('I', 'I-raw'):
+    if name in ('I', 'I-raw', 'I-raw-mask'):
         return expected('A')
     out = [SENTINEL] * WORDS
     if name == 'join-load':
@@ -1711,6 +1721,13 @@ def check_controls():
     # Captured programs clamp the extracted stride to at least 1 before scaling NUM_RECORDS.
     clamped = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
     assert translate('A', code=splice(*clamped)).hlsl_cs() == raw.hlsl_cs()
+    # After a lane mask in s21 the clamped conversion still matches case I-raw apart from the compare itself; the
+    # dispatch of case I-raw-mask stores through it. Control: a clamp that reads the mask itself stays refused.
+    masked = translate('I-raw-mask').hlsl_cs().splitlines()
+    assert [line for line in masked if line not in raw.hlsl_cs().splitlines()] == [
+        '    s21 = ((0x00000003u > v0) ? 1u : 0u);'], masked
+    refused('s_max_u32 reads lane mask s21 as numeric data', lambda: translate(
+        'A', code=splice(MASK_S21, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])).hlsl_cs())
     refused('buffer store through a modified descriptor', lambda: translate(
         'A', code=splice(STRIDE_EXTRACT, 's_max_u32 s21, s21, 2', *RAW_CONVERSION[1:])).hlsl_cs())
     reload = ('s_load_dwordx8 s[24:31], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)')
