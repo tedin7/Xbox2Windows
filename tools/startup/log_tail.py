@@ -40,7 +40,11 @@ def tail_text(path, tail_chars=TAIL_CHARS, prefixes=HEARTBEATS, window=WINDOW_BY
     if not text:
         return ""
     tail = text[-tail_chars:]
-    # A line the tail holds whole starts right after a newline of the tail (or at the start of the window).
-    whole = tail if len(text) <= tail_chars else tail[tail.find("\n") + 1:] if "\n" in tail else ""
-    kept = [line for prefix, line in sorted(last_lines(text, prefixes).items()) if line + "\n" not in whole]
+    # The lines the tail holds whole: complete lines, not the first one when the tail starts inside it. The runtime ends
+    # its lines with CRLF.
+    lines = tail.splitlines(keepends=True)
+    if len(text) > tail_chars and lines and not text[:-tail_chars].endswith("\n"):
+        lines = lines[1:]
+    whole = {line.rstrip("\r\n") for line in lines if line.endswith("\n")}
+    kept = [line for prefix, line in sorted(last_lines(text, prefixes).items()) if line not in whole]
     return "".join("(newest complete line, kept from before the tail) %s\n" % line for line in kept) + tail

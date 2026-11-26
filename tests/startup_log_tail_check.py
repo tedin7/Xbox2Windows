@@ -29,15 +29,22 @@ OLD = ("x2w-dstorage heartbeat 590 s: requests 195000 (inflated=10 failed=0); pa
 NEW = ("x2w-dstorage heartbeat 600 s: requests 195373 (inflated=12 failed=0); page tokens 0 at enqueue=0, still 0 at "
        "run=0, replaced after enqueue=0; commit peak=13795 MiB current=13281 MiB, live physical-page sections=4")
 PROGRESS = "x2w-dstorage progress 600 s: pending 0 oldest 0 ms, enqueued 195373 completed 195373, total read 1 KiB"
+
+
+def write(log, text):
+    """The runtime ends its log lines with CRLF."""
+    log.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
 DRAWS = "".join("x2w-draw %016x refused: unknown view token %d\n" % (i, i) for i in range(80))  # about 4000 characters
 
 with tempfile.TemporaryDirectory() as tmp:
     log = Path(tmp) / "stderr.txt"
     assert len(DRAWS) >= 4000, len(DRAWS)
-    log.write_text("start\n" + OLD + "\n" + PROGRESS + "\n" + NEW + "\n" + DRAWS + "x2w-draw half a li", encoding="utf-8")
+    write(log, "start\n" + OLD + "\n" + PROGRESS + "\n" + NEW + "\n" + DRAWS + "x2w-draw half a li")
     text = L.tail_text(str(log))
     tail = text[-L.TAIL_CHARS:]
-    expect("the tail is the last characters of the log", tail, log.read_text(encoding="utf-8")[-L.TAIL_CHARS:])
+    expect("the tail is the last characters of the log", tail, log.read_bytes().decode("utf-8")[-L.TAIL_CHARS:])
     head = text[:-L.TAIL_CHARS].splitlines()
     expect("the newest heartbeat and progress lines, whole, before the tail",
            [line.split(") ", 1)[1] for line in head], [NEW, PROGRESS])
@@ -46,17 +53,17 @@ with tempfile.TemporaryDirectory() as tmp:
     expect("the older heartbeat is not printed", OLD in text, False)
 
     # The heartbeat is the last line: the tail holds it whole, nothing is printed twice.
-    log.write_text(DRAWS + NEW + "\n", encoding="utf-8")
+    write(log, DRAWS + NEW + "\n")
     text = L.tail_text(str(log))
     expect("a heartbeat the tail holds whole is printed once", text.count(NEW), 1)
     # A line still being written (no newline at the end) is not a heartbeat yet: the older complete one is kept.
-    log.write_text(OLD + "\n" + DRAWS + NEW[:90], encoding="utf-8")
+    write(log, OLD + "\n" + DRAWS + NEW[:90])
     expect("a half-written heartbeat is skipped", L.tail_text(str(log)).splitlines()[0].endswith(OLD), True)
     # The bounded read: a heartbeat before the window is not looked for.
-    log.write_text(NEW + "\n" + "x" * 5000 + "\n", encoding="utf-8")
+    write(log, NEW + "\n" + "x" * 5000 + "\n")
     expect("the window bounds the read", NEW in L.tail_text(str(log), window=4096), False)
     expect("inside the window it is kept", NEW in L.tail_text(str(log), window=8192), True)
-    log.write_text("", encoding="utf-8")
+    write(log, "")
     expect("an empty log gives no text", L.tail_text(str(log)), "")
     expect("a missing log gives no text", L.tail_text(str(Path(tmp) / "missing.txt")), "")
 
