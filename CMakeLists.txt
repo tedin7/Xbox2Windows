@@ -5250,7 +5250,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_sources_check.py")
     add_test(NAME startup_tester_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_run_ps1_check.py")
-    set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 300)
+    set_tests_properties(startup_tester_run_ps1 PROPERTIES TIMEOUT 600)
     # The Linux launcher's check exits 77 on Windows; the Ubuntu job runs it.
     add_test(NAME startup_run_sh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_sh_check.py")

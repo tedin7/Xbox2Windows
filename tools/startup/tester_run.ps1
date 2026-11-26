@@ -62,6 +62,7 @@ param(
     [string]$OutDir = "out/tester",
     [string]$ShaderCacheRoot = "out/startup",     # one folder per shader revision inside: shader_cache_<rev>
     [int]$ThreadSnapshotEvery = 120,           # a thread snapshot (threads_<sec>.txt: every thread's rip and stack modules) every N s from N s to 480 s, so a black phase shows what the title waits on; 0 = off
+    [string]$Matrix = "",                       # gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=0, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
     [int]$LimitMB = 9,
     [switch]$FullBuild,                         # build every target (cmake --build with no --target) instead of only the run's
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
@@ -130,6 +131,58 @@ function Get-MissingDlls {
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
+
+# -Matrix gray: the same script, three times as child processes (each one a full run with its own report), then ONE combined report.
+# A/B/C differ only by one environment switch each, so the logs of the gray phase can be compared side by side.
+if ($Matrix) {
+    if ($Matrix -ne "gray") { throw "tester_run: -Matrix knows only 'gray' (got '$Matrix')" }
+    $legSeconds = if ($PSBoundParameters.ContainsKey("Seconds")) { $Seconds } else { 240 }
+    $legs = @(
+        @{ Label = "a"; Name = "default";                          Env = [ordered]@{} },
+        @{ Label = "b"; Name = "X2W_TEST_ADDRESS_UPLOAD_RING=1";   Env = [ordered]@{ X2W_TEST_ADDRESS_UPLOAD_RING = "1" } },
+        @{ Label = "c"; Name = "X2W_BIG_COPY_REUSE=0";             Env = [ordered]@{ X2W_BIG_COPY_REUSE = "0" } })
+    $skipOwn = @("Matrix", "Seconds", "OutDir", "FinishTranslateSeconds")
+    $childArgs = @()
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($skipOwn -contains $key) { continue }
+        $value = $PSBoundParameters[$key]
+        if ($value -is [switch]) { if ($value.IsPresent) { $childArgs += "-$key" } }
+        elseif ($value -is [array]) { $childArgs += "-$key"; $childArgs += ($value -join ",") }
+        else { $childArgs += "-$key"; $childArgs += [string]$value }
+    }
+    $matrixOut = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
+    $matrixStamp = Get-Date -Format "yyyyMMdd-HHmm"
+    $matrixRoot = Join-Path $matrixOut "matrix_$matrixStamp"
+    $shell = (Get-Process -Id $PID).Path
+    $legRuns = @(); $worst = 0
+    foreach ($leg in $legs) {
+        $legOut = Join-Path $matrixRoot ("run_" + $leg.Label)
+        $finish = if ($leg.Label -eq "c") { $FinishTranslateSeconds } else { 0 }   # the translator pass once, after the last leg
+        Write-Host ("tester_run: matrix {0} leg {1} ({2}): {3} s, report in {4}" -f $Matrix, $leg.Label, $leg.Name, $legSeconds, $legOut)
+        foreach ($name in $leg.Env.Keys) { Set-Item -Path ("Env:" + $name) -Value $leg.Env[$name] }
+        try {
+            & $shell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @childArgs -Seconds $legSeconds -OutDir $legOut -FinishTranslateSeconds $finish
+            $code = $LASTEXITCODE
+        } finally {
+            foreach ($name in $leg.Env.Keys) { Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue }
+        }
+        if ($code -gt $worst) { $worst = $code }
+        $legParts = @(Get-ChildItem -LiteralPath $legOut -Filter "report_*.zip" -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+        if ($legParts.Count -eq 0) { Write-Warning ("tester_run: matrix leg {0} wrote no report (exit code {1}); the combined report has no run_{0}" -f $leg.Label, $code) }
+        else { $legRuns += ("{0}={1}" -f $leg.Label, ($legParts -join ",")) }
+    }
+    if ($legRuns.Count -eq 0) { throw "tester_run: no matrix leg wrote a report" }
+    $combined = Join-Path $matrixOut ("report_matrix_{0}_{1}.zip" -f $Matrix, $matrixStamp)
+    $runArgs = @(); foreach ($spec in $legRuns) { $runArgs += "--run"; $runArgs += $spec }
+    $lines = @(Invoke-Native { & $python -B $pack combine $combined --matrix $Matrix --limit-mb $LimitMB @runArgs })
+    if ($LASTEXITCODE -ne 0) { throw "tester_run: combining the matrix reports failed (the single reports stay in $matrixRoot)" }
+    foreach ($line in $lines) {
+        $path, $bytes = $line -split " (?=\d+$)"
+        Write-Host ("Send this file: {0} ({1:N1} MB)" -f $path, ([double]$bytes / 1MB))
+    }
+    if ($lines.Count -gt 1) { Write-Host "The report has $($lines.Count) parts: send all of them, exactly as they are." }
+    exit $worst
+}
 
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }

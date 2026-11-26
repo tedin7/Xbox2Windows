@@ -377,6 +377,23 @@ def check_shell(shell):
         assert list((tree / "out" / "tester").glob("report_*.zip"))
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
+        # -Matrix gray: three runs back to back (child processes), one combined report, each leg with its own env switch
+        matrix = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-Matrix", "gray", "-Seconds", "200")
+        assert matrix.returncode == 0, (matrix.stdout[-2000:], matrix.stderr[-1000:])
+        combined = sorted((tree / "out" / "tester").glob("report_matrix_gray_*.zip"), key=os.path.getmtime)
+        assert combined and "Send this file" in matrix.stdout, matrix.stdout[-1500:]
+        for leg in ("a", "b", "c"):
+            assert ("matrix gray leg %s" % leg) in matrix.stdout, leg
+        with zipfile.ZipFile(combined[-1]) as z:
+            names = z.namelist()
+            top = json.loads(z.read("matrix_manifest.json").decode("utf-8-sig"))
+        assert sorted(top["runs"]) == ["a", "b", "c"], top["runs"].keys()
+        assert all(top["runs"][l]["seconds"] == 200 for l in "abc"), top["runs"]
+        assert "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["a"]["env"] and "X2W_BIG_COPY_REUSE" not in top["runs"]["a"]["env"], top["runs"]["a"]["env"]
+        assert top["runs"]["b"]["env"].get("X2W_TEST_ADDRESS_UPLOAD_RING") == "1" and "X2W_BIG_COPY_REUSE" not in top["runs"]["b"]["env"]
+        assert top["runs"]["c"]["env"].get("X2W_BIG_COPY_REUSE") == "0" and "X2W_TEST_ADDRESS_UPLOAD_RING" not in top["runs"]["c"]["env"]
+        assert {"run_a/manifest.json", "run_b/manifest.json", "run_c/manifest.json", "run_a/stderr.txt"} <= set(names), names[:20]
+        assert not os.environ.get("X2W_BIG_COPY_REUSE"), "the matrix must not leave its switches in this environment"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 

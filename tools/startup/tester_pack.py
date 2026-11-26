@@ -867,6 +867,54 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     return parts
 
 
+def combine(zip_path, runs, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, matrix="matrix"):
+    """One report from several runs of a matrix (tester_run -Matrix gray). `runs` is [(label, [part zip paths in order])]; every
+    member of run <label> goes in as run_<label>/<name>, its manifest.json too. Part 1 also holds matrix_manifest.json (per run:
+    env, seconds, end cause, exit code, parts, files) and the parts are mail-ready like pack()'s (limit, part_NN_of_MM.txt).
+    Small files of all runs come first, the big ones after, so a part 1 that arrives alone answers for every run."""
+    room = limit_bytes - MANIFEST_ROOM
+    summary, items = {}, []
+    for label, paths in runs:
+        folder = "run_%s/" % label
+        manifest = {}
+        for path in paths:
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    if re.match(r"^part_\d\d_of_\d\d\.txt$", name):
+                        continue
+                    data = z.read(name)
+                    if name == "manifest.json":
+                        manifest = json.loads(data.decode("utf-8-sig"))
+                    items.append((folder + name, data))
+        summary[label] = {key: manifest.get(key) for key in ("seconds", "env", "end_cause", "stop_reason", "exit_code", "parts", "input_script", "commit")}
+        summary[label]["source_parts"] = len(paths)
+    items.sort(key=lambda item: (len(item[1]) > SMALL_FILE_BYTES, item[0]))
+    members, used, listing = [[]], 0, {}
+    for member, data in items:
+        packed = len(zlib.compress(data, 6)) + 100 + 2 * len(member)
+        if used + packed > room and members[-1]:
+            members.append([])
+            used = 0
+        members[-1].append((member, data))
+        listing[member] = {"bytes": len(data), "part": len(members)}
+        used += packed
+    stem, ext = os.path.splitext(zip_path)
+    count = len(members)
+    parts = []
+    for index, group in enumerate(members, 1):
+        path = zip_path if count == 1 else "%s_part%02dof%02d%s" % (stem, index, count, ext)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            for member, data in group:
+                z.writestr(member, data)
+            if count > 1:
+                z.writestr("part_%02d_of_%02d.txt" % (index, count), part_note(index, count, members))
+            if index == 1:
+                z.writestr("matrix_manifest.json", json.dumps({"matrix": matrix, "runs": summary, "files": listing, "parts": count},
+                                                              indent=2, sort_keys=True))
+        parts.append((path, os.path.getsize(path)))
+    return parts
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -900,9 +948,19 @@ def main(argv):
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
     q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
+    cb = sub.add_parser("combine")
+    cb.add_argument("zip")
+    cb.add_argument("--matrix", default="matrix")
+    cb.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
+    cb.add_argument("--run", action="append", required=True, help="label=part1.zip,part2.zip (repeat per run)")
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
+    if args.cmd == "combine":
+        runs = [(spec.split("=", 1)[0], spec.split("=", 1)[1].split(",")) for spec in args.run]
+        for path, size in combine(args.zip, runs, int(args.limit_mb * 1024 * 1024), args.matrix):
+            print("%s %d" % (path, size))
+        return 0
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds, args.privacy_boxes))
         return 0
