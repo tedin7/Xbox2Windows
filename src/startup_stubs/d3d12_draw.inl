@@ -1421,6 +1421,16 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return true;
     }
+    // A copy recorded under the guest predicate could be skipped and leave the texture stale, and
+    // lifting the predicate for it would sample the predicate buffer a second time (desktop
+    // SetPredication samples when the GPU reaches the command), so a write in between could flip
+    // a later draw. Refuse the combination instead: nothing is recorded, the texture stays not
+    // done, and the next unpredicated draw uploads it.
+    if (list && self->own().predication_buffer) {
+        static LONG refused;
+        if (first_calls(refused, 6)) log("x2w-draw texture upload %p refused: a guest predicate is active on this list", static_cast<void*>(texture));
+        return false;
+    }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
     if (dedicated) {

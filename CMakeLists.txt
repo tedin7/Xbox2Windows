@@ -997,6 +997,11 @@ add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_
 add_executable(startup_root_constant_store tests/startup_root_constant_store.cpp)
 target_compile_features(startup_root_constant_store PRIVATE cxx_std_17)
 add_test(NAME startup_root_constant_store COMMAND startup_root_constant_store)
+
+# SetPredication argument checks (src/startup_stubs/predication_args.h, #870).
+add_executable(startup_predication_args tests/startup_predication_args.cpp)
+target_compile_features(startup_predication_args PRIVATE cxx_std_17)
+add_test(NAME startup_predication_args COMMAND startup_predication_args)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
