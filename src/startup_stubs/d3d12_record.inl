@@ -113,8 +113,11 @@ bool in_window()
 }
 void update_window()
 {
+    const bool was_prefix = prefix_open;
     window_open = in_window();
     if (window_open) prefix_open = false;
+    if (window_open && was_prefix)
+        log("x2w-replay record: window opens after a prefix of %lld calls, %llu bytes written", calls_written, bytes_written);
 }
 
 // The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
@@ -350,9 +353,12 @@ void stop(bool at_exit)
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
-    if (!at_exit)
-        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
-            end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
+    if (at_exit) return;
+    if (prefix_open)
+        log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
+            "%.1f s, %ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, seconds_now(), presents, max_bytes >> 20);
+    log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs, end.bytes,
+        presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.

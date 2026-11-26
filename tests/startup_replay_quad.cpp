@@ -122,8 +122,14 @@ int main(int argc, char** argv)
     unsigned pause_frame = ~0u, pause_ms = 0;
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PAUSE", pause, sizeof(pause)) && std::sscanf(pause, "%u,%u", &pause_frame, &pause_ms) != 2)
         return 2;
+    // X2W_TEST_REPLAY_VIEWS=<n>: n more render target views written per frame (device calls: a recorder's prefix log).
+    char views_text[16]{};
+    const unsigned views = GetEnvironmentVariableA("X2W_TEST_REPLAY_VIEWS", views_text, sizeof(views_text))
+                               ? static_cast<unsigned>(std::strtoul(views_text, nullptr, 10)) : 0;
+    const D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     for (UINT frame = 0; frame < frames; ++frame) {
         if (frame == pause_frame) Sleep(pause_ms);
+        for (unsigned v = 0; v < views; ++v) invoke(device, 20, arg(scene.target), arg(&view), scene.rtv);
         if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
     }
     std::printf("replay quad: %u presents drawn\n", frames);

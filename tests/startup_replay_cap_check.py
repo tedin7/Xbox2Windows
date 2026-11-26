@@ -6,7 +6,9 @@ startup_replay_quad draws 300 presents with X2W_REPLAY_RECORD=all and a 1 MiB ca
   - the file is well formed and ends with its XEND, holding fewer presents than were drawn;
   - the file stays near the cap (cap + one thread buffer + the shader cache files);
   - the log says the cap was reached;
-  - "slow" opens its window at the first present after a pause, and that file ends with its XEND too.
+  - "slow" opens its window at the first present after a pause, and that file ends with its XEND too;
+  - a prefix log that fills the cap before the window opens says so in the log;
+  - X2W_REPLAY_SHADERS=0 writes no SHDR chunk.
 Also printed, not checked (timing on a shared machine): the same 300 presents plain, with the window closed
 (X2W_REPLAY_RECORD=f100000,1: every slot wrapped, nothing recorded) and recorded without a cap.
 
@@ -97,6 +99,14 @@ def main(scene, backend):
         opened = [line for line in text.splitlines() if "x2w-replay record: window opens at" in line]
         assert len(opened) == 1 and "present 16 (first slowdown" in opened[0], opened or text[-3000:]
         end_presents(slow)
+
+        # A window that never opens (f100000,1) and a prefix log that fills the cap first: the log says so.
+        prefix = directory / "prefix.x2wr"
+        code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="f100000,1", X2W_REPLAY_RECORD_FILE=str(prefix),
+                                                      X2W_REPLAY_MAX_MIB=str(CAP_MIB), X2W_TEST_REPLAY_VIEWS="64"))
+        assert code == 0, text[-3000:]
+        assert "the cap stopped the recording BEFORE the window opened: prefix only" in text, text[-3000:]
+        end_presents(prefix)
 
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),
