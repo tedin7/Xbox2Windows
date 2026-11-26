@@ -618,7 +618,8 @@ u64 publish_compute_request(const void* desc)
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
     u64 key = fnv_bytes(shader_cache::compute_revision, sizeof(shader_cache::compute_revision) - 1);
-    static const bool engine = x2w_local::env_on("X2W_ENGINE");
+    // X2W_ENGINE=compute selects the engine for compute requests only (gfx2hlsl.py engine_compute_only); =1 selects it for every kind.
+    static const bool engine = x2w_local::env_on("X2W_ENGINE") || x2w_local::env_is("X2W_ENGINE", "compute");
     if (engine) key = fnv_bytes("-engine1", 8, key);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);

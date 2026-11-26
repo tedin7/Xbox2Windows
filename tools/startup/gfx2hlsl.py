@@ -11869,7 +11869,20 @@ def log_unvalidated_lod(key, pipe):
               % (key, ', '.join(sorted(forms))), file=sys.stderr, flush=True)
 
 
+def engine_compute_only():
+    """X2W_ENGINE=compute: the opt-in engine translates compute requests only; graphics and mesh stay on this translator.
+    src/startup_stubs/d3d12_draw.inl then hashes the engine suffix into the compute key alone."""
+    return os.environ.get('X2W_ENGINE') == 'compute'
+
+
 def translate_compute(out_dir, key):
+    if engine_compute_only():
+        import gfx2hlsl_engine
+        return gfx2hlsl_engine.translate_compute(out_dir, key)
+    return translate_compute_default(out_dir, key)
+
+
+def translate_compute_default(out_dir, key):
     """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
