@@ -55,9 +55,14 @@ void check_ring_reuse()
     b.value = UINT64_MAX;
     check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "device removal is not completion");
     b.value = 2;
+    const std::uint64_t submitted_slice_generation = chunk.generation;  // what a slice cached before the recycle carries
     const auto next = reuse_upload_chunk(chunk, 0, bytes, queues);
     check(next.mapped == storage.get() && next.offset == 0 && next.generation == 1,
           "320 MiB cumulative reservations reuse completed storage");
+    // frame_copy (d3d12_draw.inl) finds a cached slice again only while the chunk still has the slice's generation: a slice
+    // made before the recycle (generation 0) names storage that now belongs to a new reservation (generation 1).
+    check(next.generation == chunk.generation && submitted_slice_generation != chunk.generation,
+          "a slice cached before a recycle no longer matches its chunk");
 
     queues[0].submitted(submitted, false);
     queues[0].submitted(submitted, true);
