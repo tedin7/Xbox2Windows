@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "startup"))
-from window_capture import PNG_SIGNATURE, Series, frame_hash, frame_name, png_bytes  # noqa: E402
+from window_capture import PNG_SIGNATURE, Series, frame_hash, frame_name, pick_window, png_bytes  # noqa: E402
 
 
 def decode_png(data):
@@ -83,6 +83,16 @@ class Naming(unittest.TestCase):
         self.assertNotEqual(frame_hash(2, 2, pixels), frame_hash(2, 2, bytes(15) + b"\x01"))
 
 
+class PickWindow(unittest.TestCase):
+    def test_the_output_window_wins_over_the_titles_own_window(self):
+        windows = [(11, "Game"), (22, "Xbox2Windows abc1234 - output"), (33, "")]
+        self.assertEqual(pick_window(windows), 22)
+        self.assertEqual(pick_window(list(reversed(windows))), 22)
+
+    def test_without_an_output_window_the_first_visible_one_is_used(self):
+        self.assertEqual(pick_window([(11, "Game"), (33, "")]), 11)
+
+
 class Frames(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -92,12 +102,12 @@ class Frames(unittest.TestCase):
     def files(self):
         return sorted(os.listdir(self.dir.name))
 
-    def test_identical_frames_are_skipped_and_changes_are_saved(self):
+    def test_identical_frames_are_saved_too_and_counted_as_repeats(self):
         series = Series(self.dir.name)
         results = [series.offer(t, 4, 4, p) for t, p in ((5, self.a), (10, self.a), (15, self.a), (20, self.b), (25, self.b), (30, self.a))]
-        self.assertEqual(results, ["saved", "unchanged", "unchanged", "saved", "unchanged", "saved"])
-        self.assertEqual(self.files(), ["window_005s.png", "window_020s.png", "window_030s.png"])
-        self.assertEqual((series.saved, series.unchanged, series.first_change), (3, 3, 20))
+        self.assertEqual(results, ["saved"] * 6)
+        self.assertEqual(self.files(), ["window_%03ds.png" % t for t in (5, 10, 15, 20, 25, 30)])
+        self.assertEqual((series.saved, series.repeated, series.first_change), (6, 3, 20))
         with open(os.path.join(self.dir.name, "window_020s.png"), "rb") as handle:
             self.assertEqual(decode_png(handle.read())[2], reference_rows(4, 4, self.b))
 
@@ -122,13 +132,13 @@ class Frames(unittest.TestCase):
 
     def test_summary_line(self):
         series = Series(self.dir.name)
-        self.assertEqual(series.summary(), "window captures: 0 saved, 0 unchanged skipped, no change seen")
+        self.assertEqual(series.summary(), "window captures: 0 saved (0 identical to the one before), no change seen")
         series.offer(5, 4, 4, self.a)
         series.offer(10, 4, 4, self.a)
-        self.assertEqual(series.summary(), "window captures: 1 saved, 1 unchanged skipped, no change seen")
+        self.assertEqual(series.summary(), "window captures: 2 saved (1 identical to the one before), no change seen")
         series.offer(74, 4, 4, self.b)
         series.miss()
-        self.assertEqual(series.summary(), "window captures: 2 saved, 1 unchanged skipped, first change at 74 s, 1 ticks without a window")
+        self.assertEqual(series.summary(), "window captures: 3 saved (1 identical to the one before), first change at 74 s, 1 ticks without a window")
 
     def test_a_failing_write_leaves_the_series_unchanged(self):
         def refuse(path, data):
@@ -136,7 +146,7 @@ class Frames(unittest.TestCase):
         series = Series(self.dir.name, write=refuse)
         with self.assertRaises(OSError):
             series.offer(1, 4, 4, self.a)
-        self.assertEqual((series.saved, series.unchanged), (0, 0))
+        self.assertEqual((series.saved, series.repeated), (0, 0))
         series._write = Series._write_file
         self.assertEqual(series.offer(2, 4, 4, self.a), "saved")
 

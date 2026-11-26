@@ -36,6 +36,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
+#include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
@@ -61,6 +62,7 @@
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/stream_output_targets.h"
+#include "startup_stubs/texture_drop_mips.h"
 #include "startup_stubs/present_signature_sampler.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
@@ -89,6 +91,7 @@
 #include <array>
 #include <cctype>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -177,10 +180,12 @@ struct alignas(16) WrapperOwn {
     std::uint64_t predication_offset;
     UINT predication_operation;
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
+    UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
     bool lazy_view_created;    // Resource: at least one materialized view was created referencing this wrapper.
+    std::uint8_t drop_levels;  // Lazy texture: top mip levels left out of the desktop texture (texture_drop_mips.h), 0 = all kept.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
     bool retire_hold_missed;  // Resource: retire_hold could not record a use (no desktop object or no room), so the
@@ -416,6 +421,17 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
 }
 
 bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
+
+// One line for each of the first 32 textures created in system memory after the default heap ran out of video memory.
+// The running totals are in the x2w-budget line.
+void log_sysmem_fallback(const void* address, const D3D12_RESOURCE_DESC& desc, const char* path)
+{
+    static LONG logged;
+    if (!first_calls(logged, 32)) return;
+    log("x2w-d3d12 sysmem fallback %s: address=%p dim=%d %llux%ux%u mips=%u fmt=%d samples=%u -> created in system memory (L0)",
+        path, address, desc.Dimension, static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
+        desc.MipLevels, desc.Format, desc.SampleDesc.Count);
+}
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
@@ -1051,6 +1067,7 @@ void retire_drop_heap_views(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
+void release_upload_recording(Wrapper* list);
 void retire_discard_holds(Wrapper* list);
 void residency_discard_list(Wrapper* list);
 void residency_title_touched(ID3D12Resource* desktop);
@@ -1066,6 +1083,17 @@ bool lazy_textures_enabled()
 {
     static const bool on = x2w_local::env_on("X2W_D3D12_LAZY_TEXTURES");
     return on;
+}
+// X2W_D3D12_TEXTURE_DROP_MIPS=<levels> (1 to 4, default off), X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES (default 4 MiB).
+const x2w_startup::drop_mips::Config& drop_mips_config()
+{
+    static const x2w_startup::drop_mips::Config config = [] {
+        char levels[16]{}, bytes[24]{};
+        GetEnvironmentVariableA("X2W_D3D12_TEXTURE_DROP_MIPS", levels, sizeof(levels));
+        GetEnvironmentVariableA("X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES", bytes, sizeof(bytes));
+        return x2w_startup::drop_mips::parse_config(levels, bytes);
+    }();
+    return config;
 }
 struct LazyTextureRecord {
     Wrapper* device{};
@@ -1110,6 +1138,7 @@ ULONG __stdcall release(Wrapper* self)
                 linear_buffers().retire(static_cast<ID3D12Resource*>(self->own().real));
         }
         if (self->own().kind == list_kind && self->own().real) {
+            release_upload_recording(self);
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
@@ -1525,8 +1554,17 @@ struct TitleAllocator {
 SRWLOCK allocator_lock = SRWLOCK_INIT;
 std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
-std::unordered_map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, UINT64>> queue_submits;
+std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
+std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+
 LONG allocator_swaps, allocator_creates;
+
+void release_upload_recording(Wrapper* list)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    ReleaseSRWLockExclusive(&allocator_lock);
+}
 
 // allocator_lock held.
 TitleAllocator& title_allocator(Wrapper* allocator)
@@ -1721,7 +1759,9 @@ bool submit_fence_fails()
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
 void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
-    auto& [fence, value] = queue_submits[queue];
+    auto& submit = queue_submits[queue];
+    auto& fence = submit.fence;
+    auto& value = submit.value;
     if (!fence && !submit_fence_fails()) {
         ID3D12Device* device = nullptr;
         if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
@@ -1729,8 +1769,12 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             device->Release();
         }
     }
-    if (fence && SUCCEEDED(queue->Signal(fence, value + 1))) {
-        ++value;
+    UploadChunkMask chunks = 0;
+    for (auto* list : lists) chunks |= list->own().upload_chunks;
+    const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
+    if (signaled) ++value;
+    submit.submitted(chunks, signaled);
+    if (signaled) {
         for (Wrapper* list : lists) {
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
@@ -1863,6 +1907,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
+            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
             state.list_uploads = nullptr;
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -1905,6 +1950,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
+        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2104,7 +2150,22 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    // Also whenever the picture's mean level moved by more than 2 since the last line (a screen change shows in the log
+    // with its time; at most 300 such lines), not only for the first 3 readbacks and every 40th.
+    static double last_logged_mean = -1000;
+    static LONG change_lines;
+    const double mean_level = sum / (3.0 * shown_width * shown_height);
+    const bool periodic = (count > 0 && count <= 3) || count % 40 == 0;
+    const bool moved = std::fabs(mean_level - last_logged_mean) > 2 && change_lines < 300;
+    if (periodic || moved) {
+        if (moved && !periodic) {
+            ++change_lines;
+            log("x2w-render presented %s (mean level changed by %.2f since the last line)", shown_note, mean_level - last_logged_mean);
+        } else {
+            log("x2w-render presented %s", shown_note);
+        }
+        last_logged_mean = mean_level;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2486,35 +2547,59 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 }
 
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
-// 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
-// refuses new reservations rather than reusing storage without completion.
+// 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
+// no recording can submit its bytes and every queue that used it has finished.
 
-UploadReservation reserve_upload_ring(std::size_t bytes)
+volatile LONG64 upload_ring_reserved_bytes;
+volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled;
+
+struct UploadRingStats {
+    unsigned long long reserved_bytes = 0, capacity = 0;
+    long reservations = 0, refusals = 0, recycled = 0;
+    std::size_t chunks = 0;
+};
+UploadRingStats upload_ring_stats()
 {
-    constexpr u64 initial_chunk_bytes = u64{16} << 20;
-    constexpr u64 max_total_bytes = u64{256} << 20;
-    constexpr u64 max_alloc_bytes = max_total_bytes / 4;
+    UploadRingStats stats;
+    stats.reserved_bytes = static_cast<unsigned long long>(upload_ring_reserved_bytes);
+    stats.reservations = upload_ring_reservations;
+    stats.refusals = upload_ring_refusals;
+    stats.recycled = upload_ring_recycled;
+    AcquireSRWLockShared(&allocator_lock);
+    stats.chunks = upload_chunks.size();
+    for (const auto& chunk : upload_chunks) stats.capacity += chunk.capacity;
+    ReleaseSRWLockShared(&allocator_lock);
+    return stats;
+}
+
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
+{
+    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
-    static SRWLOCK lock = SRWLOCK_INIT;
-    static std::vector<UploadRingChunk> chunks;
-    static std::size_t active = 0;
+    auto& chunks = upload_chunks;
+    static unsigned active = 0;
     static u64 total_bytes = 0;
 
-    AcquireSRWLockExclusive(&lock);
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto finish = [&](unsigned index) {
+        active = index;
+        InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
+        InterlockedIncrement(&upload_ring_reservations);
+        chunks[index].hold(list->own().upload_chunks, index);
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return reservation;
+    };
     if (!chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) {
-            ReleaseSRWLockExclusive(&lock);
-            return reservation;
-        }
+        if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
+    const u64 remaining = total_bytes < max_upload_ring_bytes ? max_upload_ring_bytes - total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() ? initial_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
@@ -2537,10 +2622,8 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
-                        active = chunks.size() - 1;
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
-                        ReleaseSRWLockExclusive(&lock);
-                        return reservation;
+                        return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
                         if (budget) budget->end_use();
@@ -2554,46 +2637,51 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
         }
     }
     // Allocation failed or the cap was reached. Older unused tails are still safe.
-    for (std::size_t index = 0; index < chunks.size(); ++index) {
+    for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reserve_upload_chunk(chunks[index], rounded);
+        if (reservation.mapped) return finish(index);
+    }
+
+    for (unsigned index = 0; index < chunks.size(); ++index) {
+        reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
         if (reservation.mapped) {
-            active = index;
-            ReleaseSRWLockExclusive(&lock);
-            return reservation;
+            InterlockedIncrement(&upload_ring_recycled);
+            return finish(index);
         }
     }
 
-    ReleaseSRWLockExclusive(&lock);
+    ReleaseSRWLockExclusive(&allocator_lock);
+    InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity");
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
 {
-    auto* dest = reserve_upload_ring(bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(Wrapper* list, u64 title_address, std::size_t bytes)
 {
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
-    return ring_copy(title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
+    return ring_copy(list, title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -4002,7 +4090,7 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         return;
     }
     const std::size_t bytes = readable_window(address, 0x10000);
-    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
+    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(self, address, bytes) : 0;
     static LONG logged;
     if (first_calls(logged, 4)) {
         char head[3 * 32 + 1];
@@ -4427,6 +4515,7 @@ void* __stdcall resource_get_desc(void* a, void* b)
     if (!self || !result) return result;
     if (self->own().real) {
         *static_cast<D3D12_RESOURCE_DESC*>(result) = static_cast<ID3D12Resource*>(self->own().real)->GetDesc();
+        if (self->own().drop_levels) lazy_texture_desc(self, *static_cast<D3D12_RESOURCE_DESC*>(result));  // the title's size
     } else if (!lazy_texture_desc(self, *static_cast<D3D12_RESOURCE_DESC*>(result))) {
         return result;
     }
@@ -4909,7 +4998,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 // Writes the desktop SRV for a lazy texture's view record into one descriptor slot, as the title's view described it.
 // The caller holds note_lock shared and has checked that the slot still names the record.
 void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_RESOURCE_DESC& created_desc,
-                     x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+                     x2w_view_dimension::DefaultViews view_mode, const ViewRecord& vr, D3D12_CPU_DESCRIPTOR_HANDLE dest,
+                     unsigned dropped_levels = 0)
 {
     if (vr.desc_bytes < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
         device->CreateShaderResourceView(created, nullptr, dest);
@@ -4925,6 +5015,17 @@ void create_lazy_srv(ID3D12Device* device, ID3D12Resource* created, const D3D12_
         return;
     }
     srv_desc.Format = desktop_format(srv_desc.Format);
+    if (dropped_levels) {
+        // A view that starts below the top level or clamps the LOD names levels that are gone: leave it unbound.
+        // The others lose the same count of levels the texture lost.
+        const bool array = srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        if ((srv_desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D && !array) ||
+            srv_desc.Texture2D.MostDetailedMip != 0 || (!array && srv_desc.Texture2D.ResourceMinLODClamp != 0.0f)) {
+            x2w_startup::drop_mips::counters.keep(x2w_startup::drop_mips::Reason::view_clamp);
+            return;
+        }
+        srv_desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(srv_desc.Texture2D.MipLevels, dropped_levels);
+    }
     if (x2w_startup::packed_target_format(srv_desc.Format)) {
         const auto verdict = x2w_startup::packed_view(
             srv_desc.Format, created_desc.Format, x2w_startup::packed_stand_in_of(created));
@@ -4984,7 +5085,8 @@ void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT
             view_materialized()[candidate.id - 1] && view_records()[candidate.id - 1].slot == 18 &&
             view_records()[candidate.id - 1].resource == reinterpret_cast<u64>(candidate.texture)) {
             const D3D12_CPU_DESCRIPTOR_HANDLE dest{static_cast<SIZE_T>(dest_desktop + u64{candidate.index} * increment)};
-            create_lazy_srv(device_of(self), real, real_desc, view_mode, view_records()[candidate.id - 1], dest);
+            create_lazy_srv(device_of(self), real, real_desc, view_mode, view_records()[candidate.id - 1], dest,
+                           candidate.texture->own().drop_levels);
         }
         ReleaseSRWLockShared(&note_lock);
         real->Release();
@@ -5365,12 +5467,17 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         const auto* clear_value = packed_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
                                                     desktop_format(desc->Format), texture.Format, clear_copy);
         ID3D12Resource* created = nullptr;
-        HRESULT texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
+        // On E_OUTOFMEMORY of the default heap, X2W_D3D12_SYSMEM_FALLBACK=1 creates the texture once more in system memory.
+        bool in_system_memory = false;
+        HRESULT texture_hr = x2w_sysmem::create_with_fallback(device_of(self), props, [&](const D3D12_HEAP_PROPERTIES& heap) {
+            HRESULT result = device_of(self)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                                       D3D12_RESOURCE_STATE_COMMON, clear_value,
                                                                       IID_PPV_ARGS(&created));
-        if (FAILED(texture_hr) && clear_value)
-            texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
+            if (FAILED(result) && clear_value)
+                result = device_of(self)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+            return result;
+        }, in_system_memory);
         static LONG textures, failures;
         if (first_calls(textures, 6) || (FAILED(texture_hr) && first_calls(failures, 8))) {
             char bytes[3 * 0x38 + 1];
@@ -5388,7 +5495,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             created->Release();
             return E_OUTOFMEMORY;
         }
-        w->own().budget = x2w_budget::committed(device_of(self), created, props.Type);
+        w->own().budget = x2w_budget::committed(device_of(self), created, props.Type, in_system_memory);
+        if (in_system_memory) log_sysmem_fallback(address, texture, "eager");
         w->own().title_memory = address;
         note_resource(w, desc, 0);
         retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
@@ -5603,8 +5711,26 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         if (!device) return nullptr;
 
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-        const HRESULT hr = device->CreateCommittedResource(
-            &props, D3D12_HEAP_FLAG_NONE, &record.desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+        // Opt-in: a texture a translated draw binds for plain sampling may lose its top mip levels. Every other first
+        // use (copy, compute view, map) has no hint and keeps all levels; the reason is counted by name.
+        D3D12_RESOURCE_DESC create_desc = record.desc;
+        unsigned dropped = 0;
+        {
+            namespace dm = x2w_startup::drop_mips;
+            const dm::Hint hint = dm::current_hint;
+            const dm::Decision decision = dm::decide(record.desc, drop_mips_config(), hint.use, hint.view);
+            if (decision.levels) {
+                dropped = decision.levels;
+                create_desc = dm::reduced_desc(record.desc, dropped);
+            } else if (drop_mips_config().levels) {
+                dm::counters.keep(hint.draw ? decision.reason : dm::Reason::copy_or_other);
+            }
+        }
+        bool in_system_memory = false;
+        const HRESULT hr = x2w_sysmem::create_with_fallback(device, props, [&](const D3D12_HEAP_PROPERTIES& heap) {
+            return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &create_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, IID_PPV_ARGS(&created));
+        }, in_system_memory);
         static LONG materialized, failures;
         if (first_calls(materialized, 8) || (FAILED(hr) && first_calls(failures, 8))) {
             log("x2w-d3d12 lazy texture materialize wrapper=%p address=%p dim=%d %llux%ux%u mips=%u fmt=%d -> 0x%08lx",
@@ -5614,6 +5740,19 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                 static_cast<unsigned long>(hr));
         }
         if (FAILED(hr) || !created) return nullptr;
+        if (dropped) {
+            namespace dm = x2w_startup::drop_mips;
+            w->own().drop_levels = static_cast<std::uint8_t>(dropped);
+            dm::counters.dropped.fetch_add(1, std::memory_order_relaxed);
+            dm::counters.saved_bytes.fetch_add(dm::saved_estimate(dm::chain_estimate(record.desc), dropped),
+                                               std::memory_order_relaxed);
+            static LONG shown;
+            if (first_calls(shown, 6))
+                log("x2w-d3d12 texture drop-mips wrapper=%p %llux%u mips=%u -> %llux%u mips=%u (top %u level(s) left out)",
+                    static_cast<void*>(w), static_cast<unsigned long long>(record.desc.Width), record.desc.Height,
+                    record.desc.MipLevels, static_cast<unsigned long long>(create_desc.Width), create_desc.Height,
+                    create_desc.MipLevels, dropped);
+        }
 
         publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
@@ -5630,7 +5769,8 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         }
 
         x2w_startup::mark_packed_stand_in(created, record.desktop_format);
-        x2w_budget::Ticket* const ticket = x2w_budget::committed(device, created, props.Type);
+        x2w_budget::Ticket* const ticket = x2w_budget::committed(device, created, props.Type, in_system_memory);
+        if (in_system_memory) log_sysmem_fallback(w->own().title_memory, record.desc, "lazy");
         w->own().budget = ticket;
         if (ticket && InterlockedCompareExchange(&w->own().refs, 0, 0) <= 0) {
             ticket->end_use();
@@ -5690,7 +5830,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
             if (vr.slot != 18 || vr.resource != target_wrapper) continue;
             const D3D12_CPU_DESCRIPTOR_HANDLE dest{
                 static_cast<SIZE_T>(target_heap->desktop_cpu + u64{item.slot_index} * target_heap->increment)};
-            create_lazy_srv(device, created, created_desc, view_mode, vr, dest);
+            create_lazy_srv(device, created, created_desc, view_mode, vr, dest, w->own().drop_levels);
         }
         ReleaseSRWLockShared(&note_lock);
     }
@@ -7072,6 +7212,29 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
                                 : "x2w-present picture signature: setup failed, no samples");
 }
 
+// One line with the heartbeat while X2W_D3D12_TEXTURE_DROP_MIPS is set: how many textures lost levels, the estimated
+// bytes saved, and every reason a texture kept all of them (counted once per first use).
+void report_drop_mips()
+{
+    namespace dm = x2w_startup::drop_mips;
+    if (!drop_mips_config().levels) return;
+    char reasons[320]{};
+    std::size_t used = 0;
+    for (unsigned r = 1; r < static_cast<unsigned>(dm::Reason::count); ++r) {
+        const auto n = dm::counters.kept[r].load(std::memory_order_relaxed);
+        if (!n || used + 40 >= sizeof(reasons)) continue;
+        used += static_cast<std::size_t>(std::snprintf(reasons + used, sizeof(reasons) - used, " %s=%llu",
+                                                       dm::reason_name(static_cast<dm::Reason>(r)),
+                                                       static_cast<unsigned long long>(n)));
+    }
+    log("x2w-drop-mips levels=%u min_bytes=%llu dropped=%llu saved_mib=%llu conflicts=%llu upload_unsupported=%llu no_drop:%s",
+        drop_mips_config().levels, static_cast<unsigned long long>(drop_mips_config().min_bytes),
+        static_cast<unsigned long long>(dm::counters.dropped.load()),
+        static_cast<unsigned long long>(dm::counters.saved_bytes.load() >> 20),
+        static_cast<unsigned long long>(dm::counters.conflicts.load()),
+        static_cast<unsigned long long>(dm::counters.upload_unsupported.load()), used ? reasons : " none");
+}
+
 void report_budget(ID3D12CommandQueue* queue)
 {
     using Microsoft::WRL::ComPtr;
@@ -7136,7 +7299,8 @@ void report_budget(ID3D12CommandQueue* queue)
             std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
         FreeLibrary(xmem);
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s sysmem-fallback=%llu bytes=%llu", local, nonlocal, text, counts.unmeasured,
+        commit, pool, job, counts.sysmem_fallbacks, counts.sysmem_fallback_bytes);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7316,12 +7480,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
@@ -7329,8 +7493,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
     if (render_mode() && frame % 300 == 0) {
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
-            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        UploadRingStats ring = upload_ring_stats();
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
+            ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
+            compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
@@ -7407,6 +7575,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
         if (x2w_budget::enabled()) report_budget(static_cast<ID3D12CommandQueue*>(self->own().real));
+        report_drop_mips();
         if (retire_reasons_enabled()) {
             char line[1536];
             if (retire_reasons_line(line, sizeof(line))) log("%s", line);

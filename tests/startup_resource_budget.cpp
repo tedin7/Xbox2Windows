@@ -219,6 +219,7 @@ int check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool co
     Snapshot actual{};
     if (!snap(actual) || !matches(active, actual, "allocated")) return 5;
     for (unsigned i = 0; i < category_count; ++i) {
+        if (i == sysmem) continue;  // only an out-of-memory fallback fills it: startup_sysmem_fallback covers it
         const auto bytes = active.live[i].bytes - baseline.live[i].bytes;
         const auto objects = active.live[i].objects - baseline.live[i].objects;
         if (!bytes || !objects) return 5;

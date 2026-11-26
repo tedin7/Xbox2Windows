@@ -32,22 +32,22 @@ def write(folder, name, data):
 def check_preset():
     script = T.input_preset("menus", 300)
     items = script.split(",")
-    assert items[:4] == ["80@5", "80@11", "4@17", "80@23"], items[:4]
-    times = [int(i.split("@")[1]) for i in items]
-    assert times == list(range(5, 300, 6)), times
+    assert items[:4] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2"], items[:4]
+    times = [int(i.split("@")[1].split("+")[0]) for i in items]
+    assert times == list(range(5, 300, 2)), times
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
     assert T.input_preset("menus", 5) == "", "no entry before the start second"
-    assert T.input_preset("menus", 420).count(",") + 1 == 70
+    assert T.input_preset("menus", 420).count(",") + 1 == len(range(5, 300, 2))
     long_menus = T.input_preset("menus", 600).split(",")
-    assert [int(i.split("@")[1]) for i in long_menus] == list(range(5, 500, 6)), "the menus preset stops at 500 s"
+    assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 300, 2)), "the menus preset stops at 300 s"
     assert len(long_menus) <= T.MAX_ENTRIES
     long_run = T.input_preset("menus", 100000).split(",")
-    assert len(long_run) == len(range(5, 500, 6)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
-    assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5"
+    assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"
     assert menus2 == T.input_preset("menus2", 30), "menus2 does not depend on the run length"
-    assert items2[1:5] == ["80@+1", "80@+1", "4@+1", "wait=2/90/go"], "down, down, A, then wait for the new picture"
+    assert items2[1:5] == ["80@+2+1.2", "80@+2+1.2", "4@+2+1.2", "wait=2/90/go"], "down, down, A, then wait for the new picture"
     for n, item in enumerate(items2[1:]):
         assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
@@ -298,7 +298,93 @@ def check_cache_results():
             assert manifest["cache_keys"] == 12 and manifest["files"][T.RESULTS_NAME]["bytes"] == len(text.encode())
 
 
+def make_old_cache(folder):
+    """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
+    graphics = ("a", "b", "root")
+    for n in range(3):
+        key = "00000000000000a%d" % n
+        for ext in graphics:
+            write(folder, "req_%s.%s" % (key, ext), ("graphics %d %s" % (n, ext)).encode())
+        write(folder, "req_%s.txt" % key, b"old ready marker")
+        write(folder, "req_%s.vs.cso" % key, b"old binary")
+        write(folder, "%s.fail" % key, b"old refusal")
+    for ext in ("desc", "sa", "sb", "data", "root", "c67"):
+        write(folder, "req_00000000000000c0.%s" % ext, ("compute " + ext).encode())
+    write(folder, "req_00000000000000c0.txt", b"old ready marker")
+    for ext in ("ps57", "root", "m57"):
+        write(folder, "req_00000000000000e0.%s" % ext, ("mesh " + ext).encode())
+    write(folder, "req_00000000000000e0.ms57.txt", b"old ready marker")
+
+
+def check_seed_cache():
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        old, new = root / "shader_cache_27-27-1", root / "shader_cache_28-28-1"
+        old.mkdir()
+        new.mkdir()
+        make_old_cache(old)
+        old_names = sorted(os.listdir(old))
+
+        # Nothing to seed from, or the new cache is already warm: skipped, nothing written, never an error.
+        assert T.seed_cache(str(root / "none"), str(root / "none" / "shader_cache_1"))["skipped"] == "no older shader_cache_* folder"
+        lonely = root / "lonely"
+        (lonely / "shader_cache_1").mkdir(parents=True)
+        assert T.seed_cache(str(lonely), str(lonely / "shader_cache_1"))["skipped"] == "no older shader_cache_* folder"
+
+        # The jobs the pre-translation may use reach the re-keying tool: a stub records its environment.
+        stub = root / "rekey_stub.py"
+        stub.write_text("import os, sys\nopen(os.path.join(sys.argv[2], 'jobs.txt'), 'w').write(os.environ['X2W_TRANSLATE_JOBS'])\n")
+        T.seed_cache(str(root), str(new), jobs=3, rekey=str(stub))
+        assert (new / "jobs.txt").read_text() == "3"
+        os.remove(new / "jobs.txt")
+
+        result = T.seed_cache(str(root), str(new), jobs=2)
+        assert result["skipped"] is None and result["sources"] == 1 and result["seeded"] == 5 and not result["failed"], result
+        assert T.seed_line(result) == "pre-translate: 5 requests from 1 older cache(s) in %g s" % result["seconds"]
+        assert sorted(os.listdir(old)) == old_names, "the old cache is only read"
+        names = os.listdir(new)
+        # Requests only, under new names, and no result of the old revision.
+        assert not [n for n in names if n.endswith((".txt", ".fail", ".cso", ".hlsl", ".tmp"))], names
+        assert not [n for n in names if n.startswith(("req_00000000000000a", "req_00000000000000c0", "req_00000000000000e0"))], names
+        assert T.request_count(str(new)) == 5, names
+        assert sorted(n.rsplit(".", 1)[1] for n in names if n.startswith("req_") and n.endswith((".a", ".c67", ".m57"))) == [
+            "a", "a", "a", "c67", "m57"], names
+
+        # The requests are now new-revision requests: this checkout's translator answers every one of them (a refusal
+        # is an answer), from its own process pool, and nothing else is written.
+        env = dict(os.environ, X2W_TRANSLATE_JOBS="2")
+        done = subprocess.run([sys.executable, "-B", str(Path(T.__file__).with_name("gfx2hlsl.py")), "--pending", str(new)],
+                              capture_output=True, text=True, env=env, timeout=300)
+        assert done.returncode == 0, done.stderr[-500:]
+        keys = {n[4:20] for n in os.listdir(new) if n.startswith("req_")}
+        answered = {k for k in keys if any((new / name).exists() for name in ("req_%s.txt" % k, "%s.fail" % k, "req_%s.fail" % k))}
+        assert len(keys) == 5 and answered == keys, (sorted(keys), sorted(answered), done.stdout[-400:])
+
+        # A seeded cache is not seeded again; a broken old request leaves the new cache untouched and is reported.
+        assert T.seed_cache(str(root), str(new))["skipped"] == "the new cache already holds requests"
+        broken_root = root / "broken"
+        (broken_root / "shader_cache_1").mkdir(parents=True)
+        (broken_root / "shader_cache_2").mkdir()
+        write(broken_root / "shader_cache_1", "req_00000000000000b0.a", b"only the marker")
+        broken = T.seed_cache(str(broken_root), str(broken_root / "shader_cache_2"))
+        assert broken["skipped"] == "every older cache was refused" and broken["seeded"] == 0 and len(broken["failed"]) == 1, broken
+        assert T.request_count(str(broken_root / "shader_cache_2")) == 0
+        assert T.seed_line(broken).startswith("pre-translate: skipped (every older cache was refused); shader_cache_1: error:"), T.seed_line(broken)
+
+        # The command line prints the line and writes the manifest part.
+        cli_root = root / "cli"
+        (cli_root / "shader_cache_old").mkdir(parents=True)
+        make_old_cache(cli_root / "shader_cache_old")
+        (cli_root / "shader_cache_new").mkdir()
+        out = subprocess.run([sys.executable, "-B", T.__file__, "seed-cache", str(cli_root), str(cli_root / "shader_cache_new"),
+                              "--jobs", "2", "--json", str(root / "seed.json")], capture_output=True, text=True)
+        assert out.returncode == 0 and out.stdout.startswith("pre-translate: 5 requests from 1 older cache(s) in "), out
+        assert json.loads((root / "seed.json").read_text())["seeded"] == 5
+
+
 if __name__ == "__main__":
+    check_seed_cache()
     check_cache_results()
     check_preset()
     check_manifest()

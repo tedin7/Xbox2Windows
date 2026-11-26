@@ -838,12 +838,12 @@ movie-player module name is not hooked by default, that each of its 7 export cal
 **Window pictures.** At the end of a run that is still going, `debug_launch.py` saves the client area of the
 title's window as `window.png`. `--capture-every <seconds>` (`run.ps1 -CaptureEvery`, `run.sh --capture-every`)
 also saves it every N seconds (N is at least 1; 0, the default, is off) as `window_<sss>s.png`, with the seconds
-since the process started, so a run that passes several screens leaves one picture per screen. A frame whose
-pixels equal the previous frame is not saved, at most 120 files are written (later changes are counted, not
-saved), and the summary prints one line such as `window captures: 12 saved, 7 unchanged skipped, first change
-at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
+since the process started, so a run that passes several screens leaves one picture per screen. Every
+tick is saved, also a frame whose pixels equal the previous one (a dark loading screen is still a picture); at
+most 120 files are written (later frames are counted, not saved), and the summary prints one line such as
+`window captures: 12 saved (7 identical to the one before), first change at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
 conversion to PNG uses whole-buffer slices instead of a per-byte loop. The end-of-run `window.png` is
-unchanged. `tests/startup_window_capture_check.py` checks the file names, the skip, the cap, the summary line
+unchanged. `tests/startup_window_capture_check.py` checks the file names, the repeats, the cap, the summary line
 and the pixels of the PNG against a per-pixel reference. `tests/startup_debug_window_check.py` runs the
 source-built `tests/startup_window_probe.cpp` (a window that is red, then blue after 3.5 s) with
 `--capture-every 1`: one red and one blue frame are saved, the others are skipped, the reported first change
@@ -900,10 +900,11 @@ next run. Each pass serves the requests in the order the title published them, t
 watcher started first, then the older backlog; during a pass the watcher looks for new requests about every
 second between results, so a request the title publishes while a long backlog is being translated starts next
 instead of after the backlog. The cache persists: a later run reads every published `<key>.txt` and translates only new
-requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
-requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
-ready marker is not retried during the run (the runtime writes each request once and never rewrites
-it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
+requests. The watcher's first pass and the one-shot `--pending` scan retry a failure only when it is older than the
+translator's own files (`gfx2hlsl.py` and the modules it loads from its folder), so a translator update reaches
+requests that failed with an earlier build, while a refusal this build already wrote is not translated again on every
+run; `X2W_RETRY_FAILED=1` retries every failure. After the first pass, a request whose `<key>.fail` is newer than
+its ready marker is not retried during the run (the runtime writes each request once and never rewrites it). An unexpected translator error is written
 to `<key>.fail` as `translator error: ...`, ending with the function, file name and line that raised
 it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of
 stopping the scan. An operand refusal
@@ -1632,7 +1633,8 @@ the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/start
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
-buffers, upload buffers, readback buffers, and explicit heaps. Resource sizes
+buffers, upload buffers, readback buffers, explicit heaps, and `sysmem` (textures
+created in system memory by the fallback below). Resource sizes
 come from the desktop allocation info for the created description. A slot 133
 texture or buffer with committed backing counts in its committed category.
 Each opened or created heap uses its desktop heap size once, even when several
@@ -1648,6 +1650,23 @@ stay live until their desktop references are released. The diagnostic leaves
 those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
+
+### System-memory fallback for textures
+
+`X2W_D3D12_SYSMEM_FALLBACK=1` (opt in): when the desktop `CreateCommittedResource` of a slot 133 texture in a default
+heap fails with `E_OUTOFMEMORY` (the eager path and the lazy first-use path alike), the shim retries once with a custom heap
+in the system pool (`MEMORY_POOL_L0`). The CPU page property depends on the adapter (`D3D12_FEATURE_ARCHITECTURE1`): a
+shared-memory adapter tries `NOT_AVAILABLE`, then `WRITE_COMBINE`, then `WRITE_BACK`; a discrete adapter tries
+`WRITE_COMBINE`, then `WRITE_BACK`, because `NOT_AVAILABLE` belongs to the video-memory pool there. If every retry fails the
+caller gets the original `E_OUTOFMEMORY`, as without the switch. Any other failure, and any other heap type, is not retried.
+
+Such a texture is counted in the `sysmem` category (its ticket is released with the resource, like every category), and
+the first 32 fallbacks log one `x2w-d3d12 sysmem fallback` line each. The `x2w-budget` line ends with
+`sysmem-fallback=N bytes=M`, the total made so far (released or not). `tools/startup/tester_run.ps1` turns the switch on;
+`-NoSysmemFallback` turns it off. Source: Microsoft D3D12 documentation for `D3D12_HEAP_PROPERTIES`, `D3D12_MEMORY_POOL` and
+`D3D12_CPU_PAGE_PROPERTY`. The rules are in `src/startup_stubs/sysmem_policy.h` (`sysmem_policy` test) and the retry in
+`src/startup_stubs/sysmem_create.h` (`startup_sysmem_fallback_{warp,hardware}`: a forced out-of-memory, upload, a sampled
+read-back against a CPU reference, and the controls).
 
 `X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
 2D textures that have one sample, no render-target, depth-stencil or

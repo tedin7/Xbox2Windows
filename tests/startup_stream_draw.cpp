@@ -255,6 +255,34 @@ bool bind_small4k(ID3D12Device* desktop, void* guest, const StartupBc7Input& inp
     return bind_table(desktop, guest, texture, binding);
 }
 
+// A 256x256 R8G8B8A8 texture with 9 mips; mip k is one solid colour (drop_mip_color), laid out in rows as the
+// title's memory holds a plain texture (the footprints of the desktop description).
+bool bind_dropmips(ID3D12Device* desktop, void* guest, Bc7Binding& binding)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 9,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[9]{};
+    UINT rows[9]{};
+    UINT64 row_bytes[9]{}, size = 0;
+    desktop->GetCopyableFootprints(&desc, 0, 9, 0, footprints, rows, row_bytes, &size);
+    if (!size || size == UINT64_MAX) return false;
+    binding.backing.assign(static_cast<std::size_t>((size + 0xFFFF) & ~UINT64{0xFFFF}), 0);
+    for (UINT mip = 0; mip < 9; ++mip)
+        for (UINT y = 0; y < rows[mip]; ++y)
+            for (UINT x = 0; x < footprints[mip].Footprint.Width; ++x) {
+                unsigned char* texel = binding.backing.data() + footprints[mip].Offset +
+                                       std::uint64_t{y} * footprints[mip].Footprint.RowPitch + std::uint64_t{x} * 4;
+                texel[0] = static_cast<unsigned char>(0x10 + 0x20 * mip);
+                texel[1] = static_cast<unsigned char>(0x40 + mip);
+                texel[2] = 0x80;
+                texel[3] = 0xff;
+            }
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
+
 // A shader-visible heap whose first entry is a view of every mip of texture; binding.table is its GPU handle.
 bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding)
 {
@@ -298,6 +326,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
     } else if (bc7 && bc7->small4k) {
         if (!bind_small4k(desktop.Get(), guest, *bc7, binding)) return 35;
+    } else if (bc7 && bc7->dropmips) {
+        if (!bind_dropmips(desktop.Get(), guest, binding)) return 36;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
@@ -469,7 +499,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         Sleep(250);
         if (invoke(fence, 8) != 0) return 46;  // a submit completed although the queue was held
         if (FAILED(static_cast<HRESULT>(invoke(gate, 10, 1)))) return 47;
-        // One more recording without a draw: its submit is where the stand-in visits the completed ones.
+        // The last submit visits the completed uploads. In the ring-reuse case it also draws a new payload.
         const auto reached = [&](UINT64 value) {
             const auto deadline = GetTickCount64() + 60000;
             while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
@@ -477,6 +507,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         };
         if (!reached(payloads)) return 25;
         if (!next_recording()) return 35;
+        if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)) {
+            if (const int result = draw_gated_console_payload(guest, list, payloads, false)) return result;
+        }
         invoke(list, 9);
         invoke(queue, 10, 1, arg(&list));
         if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;

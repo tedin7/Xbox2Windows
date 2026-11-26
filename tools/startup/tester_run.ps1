@@ -4,7 +4,10 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
-   into generated\x2w_build_rev.cpp). If not, or a DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
+   into generated\x2w_build_rev.cpp). A build from another commit is used as it is when the runtime sources (src, cmake,
+   CMakeLists.txt, CMakePresets.json) are the same there and here, so a commit that changes only tools, tests or docs needs
+   no rebuild; the summary says why (runtime_sources.py) and the manifest records it as build_check. Otherwise, or when a
+   DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
    revision stamp; -FullBuild builds everything) or, with -NoBuild, stops with a message.
 2. Uses one shader cache folder per shader revision (out\startup\shader_cache_<rev>, from the x2w-startup-shader-N
    strings of gfx2hlsl.py): kept across runs and across branch updates that do not bump the revision. The --watch translator needs minutes to catch up, so an emptied cache would leave
@@ -32,7 +35,7 @@ The next run then starts with every request the title made already translated. T
 Lazy slot 133 textures are ON for now: X2W_D3D12_LAZY_TEXTURES=1 creates read-only slot 133 textures on first use, which
 keeps video memory from running out. -NoLazyTextures turns it off. The manifest records it.
 
--Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
+-Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
 time counts from that poll, which the title reaches late).
 -Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
 still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
@@ -60,7 +63,11 @@ param(
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
-    [switch]$NoLowAddresses                     # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
+    [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
+    [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
+    [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
+    [int]$CommitWarnMiB = 2048                  # a warning line in the log when the system commit has less than this free; 0 = off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -101,11 +108,23 @@ function Get-MissingDlls {
     return @($runDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $buildRoot "$_.dll")) })
 }
 
+$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
+$pack = Join-Path $PSScriptRoot "tester_pack.py"
+
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }
 $built = Get-BuildRevision
 $missing = Get-MissingDlls
-if ($built -ne $wanted -or $missing.Count -gt 0) {
+# A build from another commit is used as it is when the runtime sources (src, cmake, CMakeLists.txt, CMakePresets.json)
+# are the same there and here: a commit that changes only tools, tests or docs needs no rebuild (runtime_sources.py).
+$buildCheck = if ($built -eq $wanted) { "same commit" } else { $null }
+if ($built -and $built -ne $wanted -and $missing.Count -eq 0) {
+    $why = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "runtime_sources.py") $repo $built } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) { $buildCheck = $why; Write-Host "tester_run: using the build: $why" }
+    elseif ($why) { Write-Host "tester_run: $why" }
+}
+if (-not $buildCheck -or $missing.Count -gt 0) {
     $have = if ($built) { $built } else { "no build" }
     if ($built -eq $wanted) { $have = "$built without " + ($missing -join ", ") + ".dll" }
     if ($NoBuild) {
@@ -132,6 +151,7 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
     if ($built -ne $wanted) {
         throw "tester_run: after the build the revision is $built, expected $wanted"
     }
+    $buildCheck = "built here"
 }
 
 # One shader cache folder per shader revision (the x2w-startup-shader-N strings of gfx2hlsl.py), kept across runs and across
@@ -140,15 +160,34 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
 $runScript = Join-Path $PSScriptRoot "run.ps1"
 $runParams = (Get-Command $runScript).Parameters
 $cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCacheRoot } else { Join-Path $repo $ShaderCacheRoot }
-
-$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
-$pack = Join-Path $PSScriptRoot "tester_pack.py"
 $cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py") } | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
 New-Item -ItemType Directory -Force $cache | Out-Null
 $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+# Pre-translation: after a revision bump the new cache folder is empty and the title would be black until the --watch
+# translator caught up. The requests of the older shader_cache_* folders are copied under the new keys first (the translator
+# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through in
+# its process pool (all cores but one) while the title boots; what the title asks for meanwhile goes first. Never blocks the run.
+$translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+if (-not $env:X2W_TRANSLATE_JOBS) { $env:X2W_TRANSLATE_JOBS = "$translateJobs" }
+$seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
+$preTranslate = $null
+# The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
+# gets its own priority back afterwards.
+$self = [System.Diagnostics.Process]::GetCurrentProcess()
+$ownPriority = $self.PriorityClass
+try {
+    try { $self.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { Write-Warning "could not lower the priority: $($_.Exception.Message)" }
+    $seedLine = (Invoke-Native { & $python -B $pack seed-cache $cacheRoot $cache --jobs $translateJobs --json $seedFile } | Out-String).Trim()
+    if (Test-Path -LiteralPath $seedFile) { $preTranslate = Get-Content -Raw -LiteralPath $seedFile | ConvertFrom-Json }
+} catch {
+    $seedLine = "pre-translate: skipped ($($_.Exception.Message))"
+} finally {
+    try { $self.PriorityClass = $ownPriority } catch { }
+}
+Write-Host "tester_run: $seedLine"
+Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
@@ -163,10 +202,14 @@ Write-Host ("tester_run: job memory cap {0} GiB ({1:N1} GiB physical RAM)" -f $M
 $env:X2W_D3D12_BUDGET = "1"
 $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
+$SysmemFallback = -not $NoSysmemFallback
+if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
 $StartupBelow40 = -not $NoStartupBelow40
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" } else { Remove-Item Env:X2W_XMEM_STARTUP_BELOW_40 -ErrorAction SilentlyContinue }
 $LowAddresses = -not $NoLowAddresses
 if ($LowAddresses) { $env:X2W_LOW_ADDRESSES = "1" } else { Remove-Item Env:X2W_LOW_ADDRESSES -ErrorAction SilentlyContinue }
+$TitleInputSnapshot = -not $NoTitleInputSnapshot
+if ($TitleInputSnapshot) { $env:X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT = "1"; $env:X2W_TRANSLATED_INDIRECT_COPY_RANGES = "1" } else { Remove-Item Env:X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT, Env:X2W_TRANSLATED_INDIRECT_COPY_RANGES -ErrorAction SilentlyContinue }
 $runArgs = @{
     Exe = $Exe; DataDir = $DataDir; LogDir = $logDir; Seconds = $Seconds; BuildDir = $BuildDir
     MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
@@ -174,6 +217,9 @@ $runArgs = @{
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
 if (-not $NoLazyMemory) { $runArgs.LazyMemory = $true }
+$runArgs.NoNullIdentity = $true   # X2W_DRAW_NULL_IDENTITY=1 replaced the real address of an empty buffer slot in the log (Run I); the tester run keeps it
+if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB }
+if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
@@ -197,12 +243,13 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
 $manifest = [ordered]@{
-    commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds
+    commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    pretranslate = $preTranslate
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
@@ -224,10 +271,12 @@ if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send
 # pending or -FinishTranslateSeconds is over, so the next run starts with every request already translated.
 if ($FinishTranslateSeconds -gt 0) {
     $before = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0])
+    # Pending = no result at all. A refusal is a result (c25: a refusal of this translator build is final): counting it as pending
+    # printed "2616 pending" for requests that were all refused.
+    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0] - [int]$before[2])
     $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
     $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
-    Write-Host ("tester_run: finishing the translation: {0} request(s) pending, one pass, at most {1} s (the report above is already packed; do not close this window)" -f $pendingBefore, $FinishTranslateSeconds)
+    Write-Host ("tester_run: finishing the translation: {0} request(s) pending ({1} refused earlier, retried only if the translator changed), one pass, at most {2} s (the report above is already packed; do not close this window)" -f $pendingBefore, [int]$before[2], $FinishTranslateSeconds)
     $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
         -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
@@ -235,7 +284,7 @@ if ($FinishTranslateSeconds -gt 0) {
     $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
     if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
     $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0])
+    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0] - [int]$after[2])
     $note = if ($capped) { ", stopped at the cap" } elseif ($translator.ExitCode -ne 0) { ", translator exit code $($translator.ExitCode) (see $finishErr)" } else { "" }
     Write-Host ("tester_run: finish translation done in {0:N0} s: pending before {1}, after {2}; ok {3}, refused {4} in total ({5} new){6}" -f `
         $finishClock.Elapsed.TotalSeconds, $pendingBefore, $pendingAfter, [int]$after[0], [int]$after[2], ([int]$after[2] - [int]$before[2]), $note)

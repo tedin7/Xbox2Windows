@@ -34,7 +34,7 @@ $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
     GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
+    Budget = $env:X2W_D3D12_BUDGET; Lazy = $env:X2W_D3D12_LAZY_TEXTURES; Sysmem = $env:X2W_D3D12_SYSMEM_FALLBACK; MemoryGiB = $MemoryGiB; LazyMemory = [bool]$LazyMemory; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -81,8 +81,10 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
+    (tree / "src").mkdir()
+    (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
     (tree / "tools" / "startup" / "run.ps1").write_text(STUB_RUN, encoding="utf-8")
     (tree / "tools" / "startup" / "gfx2hlsl.py").write_text((TRANSLATOR % (28, 28)), encoding="utf-8")
     git(tree, "init", "-q")
@@ -152,14 +154,18 @@ def check_shell(shell):
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
-                                "args.json", "debugger_summary.out", "manifest.json"]), names
+                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
+        assert manifest["build_check"] == "same commit", manifest
+        assert manifest["title_input_snapshot"] is True and manifest["env"].get("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT") == "1" \
+            and manifest["env"].get("X2W_TRANSLATED_INDIRECT_COPY_RANGES") == "1", manifest["env"]
         assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
         assert "job memory cap %d GiB" % args["MemoryGiB"] in ok.stdout, ok.stdout
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
+        assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
@@ -198,6 +204,13 @@ def check_shell(shell):
             mem_args = json.loads(z.read("args.json").decode("utf-8-sig"))
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
+        nosnap = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoTitleInputSnapshot")
+        assert nosnap.returncode == 0, (nosnap.stdout, nosnap.stderr)
+        newest_snap = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_snap) as z:
+            snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert snap_manifest["title_input_snapshot"] is False
+        assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
         newest_big = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
@@ -206,6 +219,17 @@ def check_shell(shell):
             big_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert big_args["MemoryGiB"] == 33 and big_manifest["memory_gib"] == 33
         assert "X2W_D3D12_LAZY_TEXTURES" not in plain_manifest["env"]
+        assert plain_args["Sysmem"] == "1" and plain_manifest["sysmem_fallback"] is True  # -NoLazyTextures leaves it on
+
+        # -NoSysmemFallback leaves its variable unset and the manifest says so.
+        nosys = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoSysmemFallback")
+        assert nosys.returncode == 0, (nosys.stdout, nosys.stderr)
+        newest_nosys = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_nosys) as z:
+            nosys_args = json.loads(z.read("args.json").decode("utf-8-sig"))
+            nosys_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert not nosys_args["Sysmem"] and nosys_manifest["sysmem_fallback"] is False
+        assert "X2W_D3D12_SYSMEM_FALLBACK" not in nosys_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
         for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):
@@ -213,18 +237,30 @@ def check_shell(shell):
         again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
 
-        # A tracked change makes the checkout dirty: the build revision must carry -dirty to match.
-        pack = tree / "tools" / "startup" / "tester_pack.py"
-        pack.write_text(pack.read_text() + "\n# local edit\n")
+        # A tracked change in the runtime sources makes the checkout dirty: the build revision must carry -dirty to match.
+        device = tree / "src" / "device.cpp"
+        device.write_text(device.read_text() + "// local edit\n")
         dirty = run_script(shell, tree, "-NoBuild")
         assert dirty.returncode != 0 and head + "-dirty" in dirty.stdout + dirty.stderr, (dirty.stdout, dirty.stderr)
+        assert "local changes in the runtime sources (src/device.cpp)" in dirty.stdout, dirty.stdout
+        git(tree, "checkout", "-q", "--", "src")
+        # A local edit of the tools only: the build of HEAD is used as it is, and the summary and manifest say why.
+        pack = tree / "tools" / "startup" / "tester_pack.py"
+        pack.write_text(pack.read_text() + "\n# local edit\n")
+        tools_only = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert tools_only.returncode == 0 and "using the build: the build %s has the same runtime sources" % head in tools_only.stdout, \
+            (tools_only.stdout, tools_only.stderr)
 
-        # A new commit that leaves the shader revision alone keeps the warm cache.
+        # A new commit that leaves the shader revision alone keeps the warm cache. It changes only tools, so the build of
+        # the first commit is used without a rebuild (the tester pulled a tools fix).
         git(tree, "commit", "-q", "-am", "second")
         head2 = git(tree, "rev-parse", "--short=8", "HEAD")
-        rev_file.write_text(REV_CPP % head2, encoding="ascii")
         kept = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert kept.returncode == 0 and "2 translations were already present at start" in kept.stdout, kept.stdout
+        assert "the build %s has the same runtime sources as %s" % (head, head2) in kept.stdout, kept.stdout
+        manifest = json.loads(zipfile.ZipFile(sorted((tree / "out" / "tester").glob("report_%s_*.zip" % head2))[-1]).read("manifest.json").decode("utf-8-sig"))
+        assert manifest["build_commit"] == head and manifest["build_check"].startswith("the build %s" % head), manifest
+        rev_file.write_text(REV_CPP % head2, encoding="ascii")
 
         # A bumped revision gets its own, empty shader cache folder; the old one stays.
         translator = tree / "tools" / "startup" / "gfx2hlsl.py"

@@ -36,6 +36,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | image_gather4_lz_o with a constant packed offset | fork branch `x2w-w5-gather-lz-o` | `0c5b82846` |
 | DPP in compute (w6) | fork branch `w6-dpp-cs` | `49bc35454` |
 | execz refusal names its cause (text only) | fork branch `c7-execz-cause` | `dd0d392e3` |
+| opt-in drop of the top mip of big sampled textures (`X2W_D3D12_TEXTURE_DROP_MIPS=<levels>`), with the manifest hint `srvuse` | this branch (branch `c7-s4-dropmips`) | its own tests: `startup_texture_drop_mips`, `startup_srvuse_manifest`, `startup_texture_drop_mips_draw_*` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
@@ -51,7 +52,9 @@ From a PowerShell in the checkout, with the title's executable folder prepared a
 What it does:
 
 1. Checks that the build in `out/build/release` was made from this checkout's current commit and builds when it was
-   not (`-NoBuild` stops with a message instead).
+   not (`-NoBuild` stops with a message instead). A build from another commit is used as it is when the runtime sources
+   (`src`, `cmake`, `CMakeLists.txt`, `CMakePresets.json`) are the same, so pulling a tools-only fix needs no rebuild; the
+   summary prints why and the manifest records it as `build_check`.
 2. Uses one shader cache folder per shader revision, `out/startup/shader_cache_<rev>` (for example `shader_cache_28-28-3`,
    from the `x2w-startup-shader-N` strings of `gfx2hlsl.py`): kept across runs and across branch updates that leave
    the revision alone, a new empty one when a revision is bumped. The `--watch` translator needs minutes to catch up,
@@ -60,7 +63,7 @@ What it does:
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
    already in the shader cache at start, and when the title first polled the pad.
 
-`-Input menus` presses D-pad down, D-pad down, A, one press every 6 s, starting 5 s after the first pad poll and up to 500 s. The input
+`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 `-Input menus2` presses the same buttons, but after every A it waits until the presented picture has changed and stayed still for 2 s (at most 90 s) before the next press, so nothing is pressed blind while a screen loads. It needs render mode, which the script always uses.
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
@@ -71,9 +74,27 @@ ends a long run with error 1455. The summary prints it and the manifest records 
 Lazy slot 133 textures are on for now: the script sets `X2W_D3D12_LAZY_TEXTURES=1` so read-only slot 133 textures are created
 on first use and video memory does not run out. `-NoLazyTextures` turns it off; the manifest records the choice.
 
+The system-memory fallback is on too (`X2W_D3D12_SYSMEM_FALLBACK=1`): when a slot 133 texture runs out of video memory it is created
+once more in system memory instead of returning an error, and the `x2w-budget` line ends with `sysmem-fallback=N bytes=M`.
+`-NoSysmemFallback` turns it off; the manifest records the choice.
+
 Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
+
+## Drop the top mip (opt-in, off by default)
+
+`X2W_D3D12_TEXTURE_DROP_MIPS=1` (1 to 4 levels) and `X2W_D3D12_TEXTURE_DROP_MIPS_MIN_BYTES` (default 4 MiB; needs `X2W_D3D12_LAZY_TEXTURES=1`):
+a read-only slot 133 texture above the threshold is created without its top mip level(s) the first time a translated draw binds it for
+plain sampling. The picture gets softer; nothing is read at a wrong place. A texture keeps every level when the shader loads texels,
+asks for the size or the level of detail, when a copy, a compute view or a map comes first, when a view starts below the top level, or
+when the translated pipeline carries no hint. The heartbeat line `x2w-drop-mips` counts the dropped textures, the estimated MiB saved and
+every reason a texture kept its levels.
+
+The hint is a manifest line `srvuse N sample|texel|lod` that `tools/startup/gfx2hlsl.py` writes next to `srv N ...` (metadata only,
+the emitted HLSL is the same). No line means unknown, and unknown never drops. **Before this can go upstream**, R0Y00's C++ frontend
+would need to write the same hint for its pipelines, and the translator change would go through the translator review; on this
+branch it is a fork-only addition.
 
 ## What to send
 

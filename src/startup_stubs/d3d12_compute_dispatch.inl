@@ -37,6 +37,7 @@ struct ComputeTranslation {
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     const char* first_refusal = nullptr;   // reason of the first refused call
+    bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
     ~ComputeTranslation()
@@ -67,6 +68,7 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
 const char* load_compute_translation(ComputeTranslation& tr)
@@ -356,7 +358,17 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
+            if (view.source == 2) {
+                InterlockedIncrement(&compute_inputs_snapshot);
+                InterlockedExchangeAdd(&compute_inputs_snapshot_kib, static_cast<LONG>((view.bytes + 1023) / 1024));
+            }
+            if (view.source && !tr->input_path_logged) {
+                tr->input_path_logged = true;
+                log("x2w-draw compute %016llx input %zu (%s %d %d) comes from %s (%llu bytes)", key, i, slot.heap ? "heap" : "table", slot.a, slot.b,
+                    view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for a null descriptor" : "a snapshot of title memory", view.bytes);
+            }
             if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,

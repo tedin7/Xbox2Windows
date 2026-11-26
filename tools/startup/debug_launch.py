@@ -1,6 +1,6 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--suspend-others 0]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -28,7 +28,8 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
-from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
+from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
+from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 
@@ -140,6 +141,17 @@ def main():
         capture_every = -1
     if not (capture_every == 0 or 1 <= capture_every < float("inf")):
         print("expected --capture-every of 0 (off) or a finite number of seconds that is at least 1")
+        return 2
+    try:
+        headroom_mib = int(opts.get("--commit-headroom-mib", 0))  # end the run when the system commit has less free; 0 = off
+    except ValueError:
+        headroom_mib = -1
+    try:
+        warn_mib = int(opts.get("--commit-warn-mib", 0))  # log a warning when the system commit has less free; 0 = off
+    except ValueError:
+        warn_mib = -1
+    if headroom_mib < 0 or warn_mib < 0:
+        print("expected --commit-headroom-mib and --commit-warn-mib of 0 (off) or a whole number of MiB")
         return 2
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
@@ -720,13 +732,15 @@ def main():
             owner = wt.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
             if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
+                text = ctypes.create_unicode_buffer(128)
+                user32.GetWindowTextW(wt.HWND(hwnd), text, 128)
+                found.append((hwnd, text.value))
             return True
 
         user32.EnumWindows(proto(visit), 0)
         if not found:
             return "no visible window"
-        hwnd = found[0]
+        hwnd = pick_window(found)
         rect = wt.RECT()
         user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
         width, height = min(rect.right, 1920), min(rect.bottom, 1080)
@@ -788,13 +802,34 @@ def main():
     if capture_thread:
         capture_thread.start()
     stop_requested = False
+    stop_reason = "stop file"
     stop_next = 0.0
+
+    def free_commit_mib():
+        """What the system commit can still give, in MiB (GlobalMemoryStatusEx: available page file), or None."""
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", wt.DWORD), ("load", wt.DWORD), ("phys", ctypes.c_uint64), ("phys_free", ctypes.c_uint64),
+                        ("page", ctypes.c_uint64), ("page_free", ctypes.c_uint64), ("virt", ctypes.c_uint64),
+                        ("virt_free", ctypes.c_uint64), ("ext", ctypes.c_uint64)]
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        return status.page_free >> 20 if k32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+
+    headroom = HeadroomGuard(headroom_mib, free_commit_mib, warn_mib)
     while not timeout or time.time() - start < timeout:
         if time.time() >= stop_next:
             stop_next = time.time() + 0.5
             if os.path.exists(stop_file):
                 stop_requested = True
                 log(f"{time.time() - start:7.3f} stop file found: ending the run")
+                break
+            low = headroom.check(time.time())
+            warning = headroom.take_warning()
+            if warning:
+                log(f"{time.time() - start:7.3f} commit headroom warning: {warning}")
+            if low:
+                stop_requested, stop_reason = True, "commit headroom: " + low
+                log(f"{time.time() - start:7.3f} {stop_reason}: ending the run")
                 break
         if dump_at and time.time() - start >= dump_at[0]:
             dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
@@ -1035,7 +1070,7 @@ def main():
     elif exit_code is not None:
         print(f"process exited with {exit_code:#010x} after {elapsed:.2f} s")
     else:
-        print(f"stopped by request after {elapsed:.2f} s (stop file)" if stop_requested
+        print(f"stopped by request after {elapsed:.2f} s ({stop_reason})" if stop_requested
               else f"timeout after {elapsed:.2f} s")
         dumped = dump_threads(os.path.join(logdir, "threads.txt"))
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
@@ -1080,6 +1115,8 @@ def main():
     else:
         print("  call tracing: off (runtime and movie-player call hooks; --trace-calls 1)")
 
+    if headroom_mib or warn_mib:
+        print("  " + headroom.summary())
     if capture_thread:
         capture_done.set()
         capture_thread.join(30)

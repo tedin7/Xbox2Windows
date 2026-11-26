@@ -7384,6 +7384,8 @@ class Stage:
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
+        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+            self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
@@ -10532,7 +10534,26 @@ class Pipeline:
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
+        r['calls'] = r.get('calls', 0) + 1
         return 'r%d' % r['index']
+
+    def note_use(self, key, use):
+        """Says what the shader does with the read resource it just asked for through resource(): 'sample' (Sample,
+        SampleBias, SampleLevel, SampleGrad), 'texel' (Load) or 'lod' (CalculateLevelOfDetail). Only feeds the manifest
+        line `srvuse` (srv_use_line); the emitted HLSL does not depend on it."""
+        r = self.resources[key]
+        r.setdefault('uses', set()).add(use)
+        r['classified'] = r.get('classified', 0) + 1
+
+    @staticmethod
+    def srv_use_line(r):
+        """`srvuse N sample|texel|lod` for a read texture whose every use was classified, else None: a runtime that
+        wants to change the texture (opt-in, dropping its top mip) reads no line as unknown and leaves it alone."""
+        uses = r.get('uses')
+        if r['kind'] == 'buf' or not uses or r.get('classified', 0) != r.get('calls', 0):
+            return None
+        word = 'texel' if 'texel' in uses else 'lod' if 'lod' in uses else 'sample'
+        return 'srvuse %d %s' % (r['index'], word)
 
     def stored_images(self):
         return self.uavs or {}
@@ -11019,6 +11040,8 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+            if self.srv_use_line(r):
+                lines.append(self.srv_use_line(r))
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
@@ -11998,26 +12021,40 @@ def main():
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
-        # The first pass retries earlier failures once (the runtime never rewrites a request, so a
-        # translator fix would otherwise not reach them); later passes skip failures already written.
+        # The first pass retries the failures an older translator build wrote (the runtime never rewrites a
+        # request, so a translator fix would otherwise not reach them); a failure this build already wrote is final
+        # (translator_stamp). Later passes skip every failure already written.
         skip_failed = False
         started = time.time()  # requests published after this are the running title's: they go first
         while True:
-            if watch_pass(out_dir, skip_failed, started):
+            if watch_pass(out_dir, skip_failed, started, translator_stamp()):
                 skip_failed = True
             time.sleep(interval)
-    translate_pending(out_dir)
+    translate_pending(out_dir, since_translator=translator_stamp())
 
 
 
 
-def watch_pass(out_dir, skip_failed, since=None):
+def translator_stamp():
+    """The newest modification time of the translator's own files (this module and the modules it loaded from its
+    folder): a .fail older than this was written by another build and is tried again. None with X2W_RETRY_FAILED=1,
+    which retries every failure."""
+    if os.environ.get('X2W_RETRY_FAILED') == '1':
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = {os.path.abspath(__file__)} | {
+        os.path.abspath(module.__file__) for module in list(sys.modules.values())
+        if getattr(module, '__file__', None) and os.path.dirname(os.path.abspath(module.__file__)) == here}
+    return max(os.path.getmtime(name) for name in files if os.path.isfile(name))
+
+
+def watch_pass(out_dir, skip_failed, since=None, since_translator=None):
     """One --watch pass: translate_pending with rescans, so a request the title publishes during a long pass starts
     within about RESCAN_SECONDS. A worker killed from outside (out of memory) breaks the pool; the pass is
     reported and its requests are retried on the next pass instead of ending the watcher."""
     from concurrent.futures.process import BrokenProcessPool
     try:
-        translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since)
+        translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since, since_translator=since_translator)
         return True
     except BrokenProcessPool as error:
         print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
@@ -12094,7 +12131,7 @@ def request_order(stamps, since=None):
     return sorted(stamps, key=lambda key: (since is None or stamps[key] < since, stamps[key], key))
 
 
-def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None):
+def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None):
     """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
     the ready markers last.
 
@@ -12105,7 +12142,7 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     waiting for the next pass; a request already handled in this pass is queued again only when its marker is
     rewritten. Results are printed as they finish.
     """
-    stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed)))
+    stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
     if not queue:
         return
@@ -12152,7 +12189,10 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
             pool.shutdown()
 
 
-def pending_keys(out_dir, skip_failed):
+def pending_keys(out_dir, skip_failed, since_translator=None):
+    """Keys whose request has no finished result. A key with a .fail is skipped when the .fail is newer than its
+    request and stream description and, unless skip_failed, also newer than since_translator (translator_stamp:
+    the translator files themselves). Without either, every failure is tried again."""
     keys = []
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
@@ -12191,8 +12231,9 @@ def pending_keys(out_dir, skip_failed):
         # still published without its recorded description is checked even with an older .fail, which a success on
         # the manifest-only path leaves in place.
         recheck = lost and os.path.isfile(manifest)
-        if skip_failed and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= max(
-                os.path.getmtime(os.path.join(out_dir, name)), described or 0):
+        inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
+        cutoff = inputs if skip_failed else None if since_translator is None else max(inputs, since_translator)
+        if cutoff is not None and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= cutoff:
             continue
         keys.append(key)
     return keys

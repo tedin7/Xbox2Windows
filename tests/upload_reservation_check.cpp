@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -16,6 +18,51 @@ void check(bool ok, const char* what)
 }
 
 constexpr std::uint64_t kAlign = 512;
+
+struct TestFence {
+    std::uint64_t value = 0;
+    std::uint64_t GetCompletedValue() const { return value; }
+};
+
+void check_ring_reuse()
+{
+    // Four 64 MiB reservations fill the 256 MiB budget. The queues run independently.
+    constexpr auto bytes = max_upload_ring_bytes / 4;
+    std::unique_ptr<unsigned char[]> storage(new unsigned char[max_upload_ring_bytes]);
+    std::array<UploadRingChunk, 4> chunks{};
+    UploadChunkMask recording = 0;
+    for (unsigned i = 0; i < chunks.size(); ++i) {
+        chunks[i] = {nullptr, storage.get() + i * bytes, bytes};
+        const auto slice = reserve_upload_chunk(chunks[i], bytes);
+        check(slice.mapped != nullptr, "fill ring");
+        chunks[i].hold(recording, i);
+        chunks[i].hold(recording, i);
+        check(chunks[i].recordings == 1, "one hold per recording and chunk");
+    }
+
+    TestFence a, b;
+    std::map<unsigned, UploadQueue<TestFence>> queues{{0, {&a, 1}}, {1, {&b, 1}}};
+    for (auto& queue : queues) queue.second.submitted(recording, true);
+    a.value = b.value = 1;
+    auto& chunk = chunks[0];
+    check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "closed list can be resubmitted");
+
+    ++queues[1].value;
+    queues[1].submitted(recording, true);
+    const auto submitted = recording;
+    discard_upload_chunks(recording, chunks.data());  // reset after the second submit on queue b
+    check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "latest submit on every queue must complete");
+    b.value = UINT64_MAX;
+    check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "device removal is not completion");
+    b.value = 2;
+    const auto next = reuse_upload_chunk(chunk, 0, bytes, queues);
+    check(next.mapped == storage.get() && next.offset == 0 && next.generation == 1,
+          "320 MiB cumulative reservations reuse completed storage");
+
+    queues[0].submitted(submitted, false);
+    queues[0].submitted(submitted, true);
+    check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "untracked submit prevents reuse");
+}
 
 }  // namespace
 
@@ -63,6 +110,7 @@ int main()
           storage_a[2 * kAlign - 1] == 0x5a && storage_a[2 * kAlign] == 0x7d,
           "existing reservations survive exhaustion");
 
+    check_ring_reuse();
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

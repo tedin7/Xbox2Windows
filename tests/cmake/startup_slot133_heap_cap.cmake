@@ -24,3 +24,23 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(${case} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_DEBUG=0")
 endforeach()
+
+# Video-sized CPU-written textures (1 MiB and up) are filled from their own upload buffer, not the shared ring (the audit's
+# black-screen cause: the intro video's plane uploads filled the ring). Forty 1920x1080 RGBA8 textures, read back exact.
+foreach(backend IN ITEMS warp hardware)
+    set(case startup_slot133_video_upload_${backend})
+    add_test(NAME ${case} COMMAND startup_slot133_heap_cap_check ${backend} video)
+    set_tests_properties(${case} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_DEBUG=0")
+endforeach()
+
+# A staging failure while uploading a multi-level texture reports "not uploaded" (no copy from the half-staged texture) and the
+# retry uploads every level; lazy textures off and on.
+foreach(backend IN ITEMS warp hardware)
+    foreach(lazy IN ITEMS 0 1)
+        set(case startup_slot133_stage_fail_${backend}_lazy${lazy})
+        add_test(NAME ${case} COMMAND startup_slot133_heap_cap_check ${backend} stagefail)
+        set_tests_properties(${case} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_DEBUG=0;X2W_D3D12_LAZY_TEXTURES=${lazy}")
+    endforeach()
+endforeach()

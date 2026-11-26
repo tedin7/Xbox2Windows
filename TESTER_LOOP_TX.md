@@ -41,6 +41,7 @@ Gate = the independent check recorded before the PR was closed.
 | `tx-stage-25` | `50eace9c4` | #2067, #2048. #1726 dropped: its `startup_mrt_check` change needs a `startup_stream_draw` part that was not carried, and `startup_mrt` failed on Windows (reverted here too) |
 | `tx-stage-24` | `0435d6c8b` | nothing new: #1801 is the older copy of #1939 (kept as on `tester-loop`); #1170's concurrency block is already in main's `windows.yml` |
 | `tx-stage-shader` | `186904f55` | #1946, #2005, #2029 (translator PRs closed before 2026-11-26 that merged cleanly; the others need a hand merge) |
+| `tx-stage-hand` | `6ceaafb85` | hand merges, batch 1: #1724 (1D `image_load`/`load_mip` on the existing 1D path; `startup_gfx2hlsl_image_1d_check` updated) and #1952 (code already here, its check added). Not merged: #1812 (`class_f16` already here, its test expects other helper text), #1973 (its test refuses formatted buffer loads that this branch lowers). #1796 skipped: duplicate of #2012. Win2025 gate PASS on `5ad36b656` (image_1d, mul_hi_u32, fract, dev and release); the `v_mul_hi_u32`/`v_mul_hi_i32` WARP and hardware readbacks (`startup_gfx2hlsl_mul_hi_*`) pass 7/7 on `3dbbbe68a` and 6 of 7 fail with the carry term dropped |
 | `w7-mesh-rfl-marker` | `90b0b747b` | the opt-in engine (`tools/startup/gfx2hlsl_engine.py`, `X2W_ENGINE=1`, default off; see `docs/startup-engine.md`) and its single-block mesh marker fix. The engine's copies of the WaveSync and slot 57 buffer-read checks are `tests/startup_engine_wavesync_check.py` and `tests/startup_engine_mesh57_buffer_read_check.py` (CTest `startup_engine_*`); the default checks keep their names. Engine keys use revision 29 like the runtime here |
 
 ## Other fixes on this branch
@@ -60,7 +61,10 @@ Gate = the independent check recorded before the PR was closed.
   `startup_gfx2hlsl_f16_alu_draw_warp` and `startup_gfx2hlsl_cvt_pk_int16_hardware` (`PermissionError` replacing an
   entry of the shared DXC cache that another test held open), `startup_resource_retire_title_{warp,hardware}_debug0`
   (the warp one passed when run again alone). Release was not reached in that run.
-- Windows Server 2025, D3D12 WARP, on `4c1feffa7` (translator PRs, stage branches, the `revision.txt` test fixes; a
-  second host), CTest regex `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute`: dev 470/470 and release
-  470/470. The `pixel_heap_srv`, `gather_lz` and DXC cache failures above did not appear there; the first host's
-  build is suspect for them.
+- Known issue: `startup_pixel_heap_srv{,_word}_{fxc,dxc}_{warp,hardware}` (8 draws of #2763) pass when run alone
+  (CTest regex `^startup_pixel_heap_srv`, `148786973`, dev and release 9/9) but fail inside the large
+  `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute` run: there the request the consumer publishes reaches the
+  translator with a root signature without the heap-indexing flag (0x400), so it is refused (`s_load through s10`).
+  The cause under parallel load is not found yet.
+- A later Windows run reported 470/470 for `^startup_gfx2hlsl|^startup_pixel_heap|^startup_compute`, but it built
+  another head, not this branch, so it does not count; a run of that regex on `4d8b44580` is pending.

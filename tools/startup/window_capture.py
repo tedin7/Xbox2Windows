@@ -43,15 +43,26 @@ def frame_hash(width, height, bgra):
     return hashlib.blake2b(bgra, digest_size=16, key=struct.pack("<II", width, height)).digest()
 
 
+def pick_window(windows):
+    """windows: (handle, title text) of the visible windows of the process, in enumeration order. The window to photograph
+    is the stand-in's output window (its title ends in "- output": the presented picture is shown there), else the first
+    one. The title's own window is another, often wrong-sized window (Run H: a 1920x1080 picture of it)."""
+    for handle, text in windows:
+        if text.endswith("- output"):
+            return handle
+    return windows[0][0]
+
+
 class Series:
-    """The periodic frames of one run. Frames are offered in time order; one is saved when its pixels differ from
-    the previous frame (an unchanged screen costs no file and no PNG conversion), until the file cap is reached."""
+    """The periodic frames of one run. Frames are offered in time order and every one is saved, until the file cap is
+    reached: a frame identical to the previous one is saved too (a dark loading screen that looks "unchanged" is still a
+    picture the reader wants, 26/11 Run I) and only counted in `repeated`."""
 
     def __init__(self, logdir, cap=FILE_CAP, level=1, write=None):
         self.logdir, self.cap, self.level = logdir, cap, level
         self._write = write or self._write_file
         self._last = None
-        self.saved = self.unchanged = self.missed = self.dropped = 0
+        self.saved = self.repeated = self.missed = self.dropped = 0
         self.first_change = None  # seconds of the first saved frame after the baseline
         self.names = []
 
@@ -69,17 +80,17 @@ class Series:
         self.missed += 1
 
     def offer(self, seconds, width, height, bgra):
-        """Returns "saved", "unchanged" or "capped"."""
+        """Returns "saved" or "capped"."""
         digest = frame_hash(width, height, bgra)
-        if digest == self._last:
-            self.unchanged += 1
-            return "unchanged"
+        repeat = digest == self._last
         if self.full:
             self.dropped += 1
             return "capped"
         name = frame_name(seconds)
         self._write(os.path.join(self.logdir, name), png_bytes(width, height, bgra, self.level))
-        if self.saved and self.first_change is None:
+        if repeat:
+            self.repeated += 1
+        elif self.saved and self.first_change is None:
             self.first_change = int(seconds)
         self._last = digest
         self.saved += 1
@@ -87,7 +98,7 @@ class Series:
         return "saved"
 
     def summary(self):
-        text = "window captures: %d saved, %d unchanged skipped, " % (self.saved, self.unchanged)
+        text = "window captures: %d saved (%d identical to the one before), " % (self.saved, self.repeated)
         text += "first change at %d s" % self.first_change if self.first_change is not None else "no change seen"
         if self.dropped:
             text += ", file cap %d reached (%d changed frames dropped)" % (self.cap, self.dropped)

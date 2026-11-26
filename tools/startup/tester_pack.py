@@ -5,6 +5,7 @@
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
+  tester_pack.py seed-cache <cache root> <new cache> [--jobs N]  copy the old caches' requests under the new keys (pre-translation backlog)
   tester_pack.py cache-results <cache dir>                      print the result text of every request key (ok / refused + reason / pending)
   tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N] [--cache DIR]   write the zip, print its path and size
 
@@ -28,11 +29,13 @@ import zlib
 MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
-MENUS_STEP_S = 6
-MENUS_END_S = 500          # the preset stops here however long the run is
+MENUS_STEP_S = 2           # one step (DOWN, DOWN, A pattern) every 2 s after the first press (Run K: 6 s was too slow)
+MENUS_END_S = 300          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
 BUTTON_A = "4"
-MENUS2_GAP_S = "1"         # between the presses of one cycle; the first press follows the previous wait by the same gap
+MENUS_HOLD_S = "1.2"       # a press is held this long (0.8 s released before the next): at 2 to 3 fps the title polls the pad every 0.4 s, and the 0.3 s default fell between two polls (Run I saw DOWN,A instead of DOWN,DOWN,A)
+MENUS2_HOLD_S = "1.2"
+MENUS2_GAP_S = "2"         # between the presses of one cycle; the first press follows the previous wait by the same gap
 MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
 MENUS2_TIMEOUT_S = 90      # a screen that never changes (or loads slower) lets the script go on after this
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
@@ -50,17 +53,18 @@ def menus2_script():
     so nothing is pressed blind while a screen loads. Each press is timed from the previous item (`@+`). A wait that
     times out logs it and the script goes on. Needs render mode, which tester_run.ps1 always uses. The cycle count fills
     the entry limit; the run's own length ends the script."""
-    items = ["%s@%d" % (DPAD_DOWN, MENUS_START_S)]
-    cycle = ["%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S), "%s@+%s" % (BUTTON_A, MENUS2_GAP_S), "wait=%d/%d/go" % (MENUS2_SETTLE_S, MENUS2_TIMEOUT_S)]
+    items = ["%s@%d+%s" % (DPAD_DOWN, MENUS_START_S, MENUS2_HOLD_S)]
+    press = lambda mask: "%s@+%s+%s" % (mask, MENUS2_GAP_S, MENUS2_HOLD_S)
+    cycle = [press(DPAD_DOWN), press(BUTTON_A), "wait=%d/%d/go" % (MENUS2_SETTLE_S, MENUS2_TIMEOUT_S)]
     while len(items) + 1 + len(cycle) <= MAX_ENTRIES:
-        items.append("%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S))   # first down of the cycle
+        items.append(press(DPAD_DOWN))   # first down of the cycle
         items.extend(cycle)
     return ",".join(items)
 
 
 def input_preset(spec, seconds):
-    """`menus` is D-pad down, D-pad down, A, one press every 6 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time, but not past 500 s, at most 256 entries. Anything else is a raw script."""
+    """`menus` is D-pad down, D-pad down, A, one press every 2 s from 5 s after the first pad poll; entries run to
+    `seconds` of script time, but not past 300 s, at most 256 entries. Anything else is a raw script."""
     if spec == "menus2":
         return menus2_script()
     if spec != "menus":
@@ -72,7 +76,7 @@ def input_preset(spec, seconds):
     items = []
     press, at = 0, MENUS_START_S
     while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
-        items.append("%s@%d" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at))
+        items.append("%s@%d+%s" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at, MENUS_HOLD_S))
         press += 1
         at += MENUS_STEP_S
     return ",".join(items)
@@ -168,6 +172,78 @@ def cache_stats(cache_dir):
             elif os.path.isfile(os.path.join(cache_dir, match.group(1) + ".fail")):
                 failed += 1
     return ready, requests, failed
+
+
+def request_count(cache_dir):
+    """Request keys (ready markers .a / .rtv / .c67 / .m57) in a shader cache folder."""
+    if not os.path.isdir(cache_dir):
+        return 0
+    return sum(1 for name in os.listdir(cache_dir) if REQUEST_RE.match(name))
+
+
+def older_caches(cache_root, new_cache):
+    """The other shader_cache_* folders of the tester's cache root, most recently changed first."""
+    new = os.path.normcase(os.path.abspath(new_cache))
+    found = []
+    if os.path.isdir(cache_root):
+        for name in os.listdir(cache_root):
+            path = os.path.join(cache_root, name)
+            if name.startswith("shader_cache_") and os.path.isdir(path) and os.path.normcase(os.path.abspath(path)) != new:
+                found.append((os.path.getmtime(path), path))
+    return [path for _, path in sorted(found, reverse=True)]
+
+
+def seed_cache(cache_root, new_cache, jobs=0, rekey=None):
+    """Pre-translation of an old cache after a shader revision bump. When the new cache folder holds no request yet, the
+    request files of every older shader_cache_* folder are copied into it under the keys of the current revision
+    (shader_cache_rekey.py: re-hashed with this gfx2hlsl.py, ready marker last, requests only, no result file of the old
+    revision). The --watch translator the run starts then finds them as a backlog and translates them in its process pool
+    while the title boots; requests the title publishes meanwhile go first. Never raises and never blocks a run: any
+    problem is returned as `skipped`/`failed` text.
+
+    Returns {"seeded": new requests, "sources": older caches used, "seconds": time spent, "skipped": reason or None,
+    "failed": [(older cache, first line of the error)]}."""
+    import subprocess
+    import time
+    started = time.monotonic()
+    result = {"seeded": 0, "sources": 0, "seconds": 0.0, "skipped": None, "failed": []}
+    here = os.path.dirname(os.path.abspath(__file__))
+    rekey = rekey or os.path.join(here, "shader_cache_rekey.py")
+    try:
+        olds = older_caches(cache_root, new_cache)
+        if request_count(new_cache):
+            result["skipped"] = "the new cache already holds requests"
+        elif not olds:
+            result["skipped"] = "no older shader_cache_* folder"
+        elif not os.path.isfile(rekey):
+            result["skipped"] = "shader_cache_rekey.py is missing"
+        else:
+            env = dict(os.environ)
+            if jobs > 0:
+                env["X2W_TRANSLATE_JOBS"] = str(jobs)
+            os.makedirs(new_cache, exist_ok=True)
+            for old in olds:
+                done = subprocess.run([sys.executable, "-B", rekey, old, new_cache], capture_output=True, text=True, env=env)
+                if done.returncode == 0:
+                    result["sources"] += 1
+                else:
+                    text = (done.stderr or done.stdout or "").strip().splitlines()
+                    result["failed"].append((os.path.basename(old), text[0][:160] if text else "exit %d" % done.returncode))
+            result["seeded"] = request_count(new_cache)
+            if not result["sources"]:
+                result["skipped"] = "every older cache was refused"
+    except Exception as error:  # noqa: BLE001 - seeding must never stop a tester run
+        result["skipped"] = "%s: %s" % (type(error).__name__, str(error)[:120])
+    result["seconds"] = round(time.monotonic() - started, 1)
+    return result
+
+
+def seed_line(result):
+    if result["skipped"]:
+        return "pre-translate: skipped (%s)" % result["skipped"] + "".join("; %s: %s" % item for item in result["failed"])
+    return "pre-translate: %d requests from %d older cache(s) in %g s%s" % (
+        result["seeded"], result["sources"], result["seconds"],
+        "".join("; skipped %s: %s" % item for item in result["failed"]))
 
 
 RESULTS_NAME = "shader_results.txt"
@@ -347,6 +423,11 @@ def main(argv):
     n.add_argument("translator")
     c = sub.add_parser("cache-stats")
     c.add_argument("cache")
+    s = sub.add_parser("seed-cache")
+    s.add_argument("cache_root")
+    s.add_argument("new_cache")
+    s.add_argument("--jobs", type=int, default=0)
+    s.add_argument("--json", default=None, help="write the result as JSON (for the manifest)")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
     q = sub.add_parser("pack")
@@ -372,6 +453,13 @@ def main(argv):
         return 0
     if args.cmd == "cache-results":
         sys.stdout.write(format_results(cache_results(args.cache)))
+        return 0
+    if args.cmd == "seed-cache":
+        result = seed_cache(args.cache_root, args.new_cache, args.jobs)
+        print(seed_line(result))
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as handle:
+                json.dump(result, handle)
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)

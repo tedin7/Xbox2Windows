@@ -155,6 +155,13 @@ inline bool unplaced_buffer_extent(std::uint64_t address, std::uint64_t span_byt
     return page_span <= max_span && page_span >= span_bytes;
 }
 
+// A structured or typed view needs (address - base) to be a whole number of elements. For a base at the 64 KiB page start
+// that fails for most sub-allocated addresses; those views take a copy that starts at the address.
+inline bool unplaced_view_needs_exact_start(std::uint64_t address, std::uint64_t page_start, std::uint64_t elem_bytes)
+{
+    return elem_bytes > 1 && address >= page_start && (address - page_start) % elem_bytes != 0;
+}
+
 // Checks whether an existing cached page range completely covers the requested [address, address + span_bytes).
 inline bool unplaced_buffer_covers(std::uint64_t cached_start, std::uint64_t cached_span,
                                    std::uint64_t address, std::uint64_t span_bytes)
