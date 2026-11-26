@@ -83,6 +83,14 @@ DEMOTE_EXIT_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1,
                          '.exit:\nexp null off, off, off, off done vm\ns_endpgm\n')
 DEMOTE_EXIT_PIXEL = ('c8020002 c8060102 c80a0202 c80e0302 be8c047e 7c0800f0 8a8c6a0c 85fe807e bf840004 befe040c'
                      ' f800180f 03020100 bf810000 f8001890 00000000 bf810000').split()
+# A depth export (exp mrtz v1 done vm, v1 = 0.5) behind the same kill: lanes whose flat attribute 0 red is not above 0.5 leave
+# EXEC, s_cbranch_execz jumps to the early-exit null export (which discards), the others export depth 0.5.
+MRTZ_KILL_EXIT_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_cmpx_lt_f32_e32 0.5, v0\ns_cbranch_execz .exit\n'
+                            'v_mov_b32_e32 v1, 0.5\nexp mrtz v1, off, off, off done vm\ns_endpgm\n'
+                            '.exit:\nexp null off, off, off, off done vm\ns_endpgm\n')
+MRTZ_KILL_EXIT_PIXEL = 'c8020002 7c2200f0 bf880004 7e0202f0 f8001881 00000001 bf810000 f8001890 00000000 bf810000'.split()
+# The same depth export with no kill (straight-line, accepted before): every covered pixel gets depth 0.5.
+MRTZ_PLAIN_PIXEL = '7e0202f0 f8001881 00000001 bf810000'.split()
 DEPTH_PIXEL_MUTANTS = (
     ('a colour write next to the drawn null export', DEPTH_PIXEL[:NULL_EXPORT] + ['f800000f', '00000000'] + DEPTH_PIXEL[NULL_EXPORT:],
      'slot 57 pixel stage mixes the null export with another export'),
@@ -1033,6 +1041,12 @@ def draw_depth(dxc, renderer, adapter):
         expect('the pixel stage without discard translates and compiles', bare_result, 'ok')
         if result != 'ok' or bare_result != 'ok':
             return 0
+        mrtz, mrtz_result = request(tmp, MESH, MRTZ_KILL_EXIT_PIXEL)
+        expect('the depth-export pair behind a kill translates and compiles', mrtz_result, 'ok')
+        plain_z, plain_z_result = request(tmp, MESH, MRTZ_PLAIN_PIXEL)
+        expect('the depth-export pair without a kill translates and compiles', plain_z_result, 'ok')
+        if mrtz_result != 'ok' or plain_z_result != 'ok':
+            return 0
         names = sorted(p.name[16:] for p in Path(tmp).iterdir() if p.name.startswith('%016x' % key))
         expect('depth-only compiled files', names, ['.ms57.cso', '.ms57.hlsl', '.ms57.txt', '.ps57.cso', '.ps57.hlsl'])
         manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
@@ -1042,11 +1056,18 @@ def draw_depth(dxc, renderer, adapter):
         struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '1'], len(points))
         head = b''.join(bytes(constants) + upload for upload in uploads) + b'\xcd' * 160
         path = Path(tmp) / 'depth.bin'
-        stems = {'depth-only pair': key, 'pixel stage without discard': bare}
+        stems = {'depth-only pair': key, 'pixel stage without discard': bare, 'depth export behind a kill': mrtz,
+                 'depth export without a kill': plain_z}
+        half = struct.pack('<f', 0.5)
+        # The depth export writes the constant 0.5 where the pair draws and keeps the sentinel where the kill discards.
+        exported = b''.join(half if depth[i:i + 4] != cleared[i:i + 4] else cleared[i:i + 4] for i in range(0, len(depth), 4))
         # (label, pair, reference depth, depth mismatches). The colour target must stay cleared in every case.
         cases = (('baseline', 'depth-only pair', depth, 0),
                  ('a reference without the depth writes', 'depth-only pair', cleared, written),
-                 ('the discard dropped', 'pixel stage without discard', depth, killed))
+                 ('the discard dropped', 'pixel stage without discard', depth, killed),
+                 ('depth export behind a kill', 'depth export behind a kill', exported, 0),
+                 ('depth export behind a kill, reference without the depth writes', 'depth export behind a kill', cleared, written),
+                 ('depth export without the kill', 'depth export without a kill', exported, covered - written))
         for label, pair, ref_depth, depth_errors in cases:
             name = str(Path(tmp) / ('%016x' % stems[pair]))
             path.write_bytes(head + colour + ref_depth)

@@ -2238,6 +2238,55 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
+def mrtz_covers_every_path(ins, at):
+    """True when every path from the first instruction to an s_endpgm either runs the depth export at offset `at` or ends in a
+    `exp null ... vm` export (the early exit of a kill: it discards a lane that left EXEC), and the export cannot run twice.
+
+    Instruction-level control flow of a decoded pixel program (RDNA 2 ISA, SOPP branches). A taken s_cbranch_execz is the
+    way out when no lane is live, which the null export's vm flag turns into a discard; every other conditional branch is
+    followed both ways. An indirect jump or a branch that leaves the program makes the answer False."""
+    index = {off: i for i, (off, _s, _n, _a) in enumerate(ins)}
+    absorbing = {off for off, _s, name, asm in ins
+                 if off == at or (name == 'exp' and re.match(r'exp null\b.*\bvm\b', asm) is not None)}
+    successors = []
+    for i, (_off, _size, name, asm) in enumerate(ins):
+        if name == 's_endpgm':
+            successors.append([])
+        elif name in ('s_setpc_b64', 's_swappc_b64', 's_trap'):
+            return False
+        elif name == 's_branch' or name.startswith('s_cbranch'):
+            target = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+            if target is None:
+                return False
+            successors.append([target] if name == 's_branch' else [i + 1, target])
+        else:
+            successors.append([i + 1] if i + 1 < len(ins) else [])
+    if at not in index:
+        return False
+    stack, seen = [0], set()
+    while stack:
+        i = stack.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        if ins[i][0] in absorbing:
+            continue
+        if ins[i][2] == 's_endpgm':
+            return False  # a path ends without the depth export and without the discarding exit
+        stack += successors[i]
+    # The export must not be inside a loop: it would run once per pass.
+    stack, seen = list(successors[index[at]]), set()
+    while stack:
+        i = stack.pop()
+        if i == index[at]:
+            return False
+        if i not in seen:
+            seen.add(i)
+            stack += successors[i]
+    return True
+
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -9360,9 +9409,12 @@ class Stage:
         if target == 'null':
             return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
-            if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
-                    or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
-                    or vals[1:] != ['off', 'off', 'off']):
+            plain = (self.kind == 'ps' and 'depth' not in self.exports and 'compr' not in flags and len(vals) == 4
+                     and re.fullmatch(r'v\d+', vals[0]) is not None and vals[1:] == ['off', 'off', 'off'])
+            straight = not (self.has_branches or self.blocks) and self.exec_known
+            # Not straight-line: the export is still one assignment of o.depth when every lane that is not discarded runs
+            # it exactly once (mrtz_covers_every_path) and a lane that left EXEC is discarded by the export's own vm flag.
+            if not plain or not (straight or ('vm' in flags and mrtz_covers_every_path(self.ins, self.pc))):
                 raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
             self.exports['depth'] = True
             self.emit('o.depth = %s;' % self.f(vals[0]))
