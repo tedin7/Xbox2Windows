@@ -7239,7 +7239,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
             auto& pipeline = static_cast<Wrapper*>(*out)->own();
             pipeline.compute_request_key = key;
             pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
-            if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
+            if (nolock_compute_refuse() || nolock_indirect_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);

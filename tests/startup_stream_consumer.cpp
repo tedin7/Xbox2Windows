@@ -395,7 +395,17 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+    if (mode == "dispatch-indirect-burst") {
+        const auto before = compute_refusal_stats();
+        for (UINT i = 0; i < 10000; ++i) {
+            if (i == 5000) Sleep(300);  // Let the legacy path register a manifest retry.
+            record.execute(list, 1, false, false);
+        }
+        const auto after = compute_refusal_stats();
+        std::printf("indirect refusal window: draw_lock holds +%lld, untranslated +%ld, repeated reads +%lld\n",
+                    after.holds - before.holds, after.untranslated - before.untranslated,
+                    after.repeated_reads - before.repeated_reads);
+    } else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
@@ -825,13 +835,17 @@ int main(int argc, char** argv)
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
-        if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
-            if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;
-            const auto before = nolock_retry ? compute_refusal_stats().background_reads : 0;
+        const bool indirect_retry = std::strcmp(argv[8], "dispatch-indirect-retry") == 0;
+        if (nolock_retry || indirect_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
+            const char* first = indirect_retry ? "dispatch-indirect-burst" :
+                                nolock_retry ? "dispatch-nolock-burst" : "dispatch";
+            if (int rc = dispatch_slot67(adapter.Get(), device, first)) return rc;
+            const bool wait_for_publication = nolock_retry || indirect_retry;
+            const auto before = wait_for_publication ? compute_refusal_stats().background_reads : 0;
             std::puts("first slot 67 Dispatch fenced");
             std::fflush(stdout);
             if (std::getchar() != '\n') return 2;
-            if (nolock_retry) {
+            if (wait_for_publication) {
                 const ULONGLONG deadline = GetTickCount64() + 10000;
                 while (compute_refusal_stats().background_reads == before) {
                     if (GetTickCount64() >= deadline) return 84;

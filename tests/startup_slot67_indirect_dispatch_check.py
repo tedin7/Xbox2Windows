@@ -5,10 +5,13 @@ prefilled sentinel readback matches zero written words, that one flipped consume
 both caught, and that the 2-group and 5-group references differ only at indices 2, 3 and 4.
 """
 import os
+import re
+import struct
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 import startup_gfx2hlsl_compute_check as C
 from startup_compute_dispatch_check import dispatch, lines
@@ -154,14 +157,73 @@ def main(consumer, dxc, adapter):
         print('debug layer:', 'enabled' if layer and '0x00000000' in layer[0] else 'unavailable')
 
 
+def check_late_publication(consumer, dxc, enabled):
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        cache, env = setup(directory, 'warp')
+        output = directory / 'out.bin'
+        env.update(X2W_NOLOCK_REFUSE='0', X2W_NOLOCK_INDIRECT=str(int(enabled)), X2W_TEST_DISPATCH_OUT=str(output))
+        args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
+                directory / 'program', directory / 'data', directory / 'state', 'dispatch-indirect-retry']
+        stdout, stderr = directory / 'stdout', directory / 'stderr'
+
+        def check_output(written):
+            actual = [word for (word,) in struct.iter_unpack('<I', output.read_bytes())]
+            wrong = compare_words(actual, expected_words(written))
+            assert not wrong, f'expected {written} written words, first mismatch: {wrong[0]}'
+
+        with stdout.open('wb') as out, stderr.open('wb') as err, subprocess.Popen(
+                args, stdin=subprocess.PIPE, stdout=out, stderr=err, env=env) as process:
+            try:
+                deadline = time.monotonic() + 20
+                while 'first slot 67 Dispatch fenced' not in stdout.read_text():
+                    if process.poll() == 77:
+                        raise SystemExit(77)
+                    if process.poll() is not None or time.monotonic() > deadline:
+                        raise AssertionError(f'indirect burst did not fence\n{stderr.read_text()[-2500:]}')
+                    time.sleep(0.025)
+                check_output(0)
+                output.unlink()
+                window = re.search(r'indirect refusal window: draw_lock holds \+(\d+), untranslated \+(\d+), '
+                                   r'repeated reads \+(\d+)', stdout.read_text())
+                assert window, stdout.read_text()
+                holds, refusals, reads = map(int, window.groups())
+                assert refusals == 10000, window[0]
+                if enabled:
+                    assert (holds, reads) == (0, 0), window[0]
+                else:
+                    assert holds >= 10000, f'switch-off control must fail the zero-hold assertion: {window[0]}'
+                request, = cache.glob('req_*.c67')
+                key = request.stem.removeprefix('req_')
+                assert not (cache / f'{key}.txt').exists()
+                translated = subprocess.run([sys.executable, '-B', C.G.__file__, '--pending', cache], check=True,
+                                            capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc))
+                assert f'{key}: ok' in translated.stdout, translated.stdout
+                process.communicate(input=b'\n', timeout=20)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        log = stderr.read_text()
+        assert process.returncode == 0, log[-2500:]
+        assert 'ExecuteIndirect refused: no translation' in log, log[-2500:]
+        assert not [line for line in log.splitlines()
+                    if 'x2w-d3d12-debug ' in line and (' sev=0 ' in line or ' sev=1 ' in line)], log[-2500:]
+        check_output(5)
+        print(f'X2W_NOLOCK_INDIRECT={int(enabled)}: {window[0]}; both readbacks match')
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] == 'mutation':
         sys.exit(run_mutation())
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         assert assemble(sys.argv[2], SOURCE) == PROGRAM
         print('slot 67 indirect consumer matches LLVM gfx1013 assembly')
+    elif len(sys.argv) == 4 and sys.argv[3] == 'nolock-warp':
+        for enabled in (True, False):
+            check_late_publication(*sys.argv[1:3], enabled)
     elif len(sys.argv) == 4 and sys.argv[3] in ('hardware', 'warp'):
         main(*sys.argv[1:])
     else:
-        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware> | '
+        sys.exit('usage: startup_slot67_indirect_dispatch_check.py <consumer> <dxc> <warp|hardware|nolock-warp> | '
                  'binary <llvm-mc> | mutation')

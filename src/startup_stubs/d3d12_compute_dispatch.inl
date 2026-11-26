@@ -84,6 +84,12 @@ bool nolock_compute_refuse()
     return enabled;
 }
 
+bool nolock_indirect_refuse()
+{
+    static const bool enabled = x2w_local::env_on("X2W_NOLOCK_INDIRECT");
+    return enabled;
+}
+
 ComputeManifest& compute_manifest_for(u64 key)
 {
     static auto* const entries = new std::unordered_map<u64, ComputeManifest>;
@@ -263,7 +269,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     const bool valid_groups = x <= x2w_startup::max_dispatch_groups && y <= x2w_startup::max_dispatch_groups &&
                               z <= x2w_startup::max_dispatch_groups;
     const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
-    if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
+    const bool manifest_missing = manifest && valid_type && valid_groups && valid_root &&
+                                  compute_manifest_missing(*manifest, key);
+    if (manifest_missing && (nolock_compute_refuse() || (dispatch.signature && nolock_indirect_refuse()))) {
         InterlockedIncrement(&compute_dispatches_untranslated);
         return "no translation";
     }
@@ -295,7 +303,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
-        if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
+        // Direct and indirect calls share the publication and the PSO cache. A direct
+        // refusal can reach here with no manifest, so leave the PSO eligible for loading.
+        if (!manifest_missing &&
+            (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at))) {
             tr->unmodelled = load_compute_translation(*tr, manifest);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
