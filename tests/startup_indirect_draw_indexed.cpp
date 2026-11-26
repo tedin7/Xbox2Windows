@@ -32,6 +32,9 @@
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
+extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(LONG64*, LONG64*, LONG64*, LONG*);
+extern "C" __declspec(dllimport) void x2w_d3d12_mesh_refusal_stats(LONG64*, LONG64*);
+extern "C" __declspec(dllimport) void x2w_d3d12_title_copy_stats(LONG*, LONG*);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
 
@@ -692,6 +695,12 @@ struct ReplayCopy {
     bool uncertified_overwrite = false;
 };
 
+struct DirectDraw {
+    ID3D12Resource* source = nullptr;
+    UINT64 bytes = 0;
+    bool* pixel_mismatch = nullptr;
+};
+
 constexpr UINT command_stride(DrawKind kind)
 {
     switch (kind) {
@@ -756,7 +765,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false,
+         const DirectDraw* direct_draw = nullptr)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -895,6 +905,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         list->CopyBufferRegion(arg_readback.Get(), 0, arguments->native.Get(), 0, sizeof(initial));
         // The wrapper owns the subsequent COMMON -> INDIRECT_ARGUMENT transition.
         transition(list, arguments->native.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (direct_draw && direct_draw->source) {
+        using Copy = void (WINAPI*)(IUnknown*, IUnknown*, UINT64, IUnknown*, UINT64, UINT64);
+        slot<Copy>(wrapped, 15)(wrapped, translated->sampled.Get(), 0, direct_draw->source, 0, direct_draw->bytes);
     }
     if (replay) {
         transition(list, replay->native, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1075,8 +1089,13 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
-    slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
-                               external_arguments ? leased->argument_offset : offset, nullptr, 0);
+    if (direct_draw) {
+        using Draw = void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT);
+        slot<Draw>(wrapped, 12)(wrapped, 3, 1, 0, 0);
+    } else {
+        slot<Execute>(wrapped, 61)(wrapped, signature, 1, external_arguments ? leased->argument : arguments->wrapped.Get(),
+                                   external_arguments ? leased->argument_offset : offset, nullptr, 0);
+    }
     if (restore_compute) {
         // Leave the previously forwarded root + SRV alone. Only install the
         // consumer PSO and the output UAV that this fixture owns.
@@ -1221,6 +1240,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 }
                 if (actual != background) ++painted;
                 if (actual == wanted) continue;
+                if (direct_draw && direct_draw->pixel_mismatch && actual == red && wanted == green)
+                    *direct_draw->pixel_mismatch = true;
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
                 pixels_match = false;
             }
@@ -1741,6 +1762,128 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
 #include "startup_indirect_mesh_lease.inl"
 }  // namespace
 
+// Opaque, source-owned stage data. The runtime is expected to publish it without
+// interpreting it as a desktop shader or recording a mesh dispatch.
+int mesh_refusal_bench(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer)
+{
+    constexpr unsigned pipeline_count = 8, thread_count = 4, rounds = 10000;
+    struct Stats {
+        LONG64 exclusive = 0, shared = 0, hashes = 0;
+    };
+    const auto stats = [] {
+        Stats result;
+        LONG64 reads{}, background{};
+        LONG untranslated{};
+        x2w_d3d12_compute_refusal_stats(&result.exclusive, &reads, &background, &untranslated);
+        x2w_d3d12_mesh_refusal_stats(&result.shared, &result.hashes);
+        return result;
+    };
+    wchar_t cache[MAX_PATH];
+    const DWORD cache_length = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache, MAX_PATH);
+    check(cache_length && cache_length < MAX_PATH ? S_OK : E_FAIL, "set an empty mesh bench cache");
+    const auto root = create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+    std::array<std::array<unsigned char, 6>, pipeline_count> stages{};
+    std::array<ComPtr<IUnknown>, pipeline_count> pipelines;
+    using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+    for (unsigned i = 0; i < pipeline_count; ++i) {
+        stages[i] = {'b', 'e', 'n', 'c', 'h', static_cast<unsigned char>(i)};
+        std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
+        fields[0] = reinterpret_cast<UINT64>(root.Get());
+        fields[13] = reinterpret_cast<UINT64>(stages[i].data());
+        fields[14] = stages[i].size();
+        check(slot<Create>(guest, 57)(guest, fields.data(), __uuidof(ID3D12PipelineState),
+            reinterpret_cast<void**>(pipelines[i].GetAddressOf())), "create mesh bench placeholder");
+    }
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    const D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    check(guest->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "create mesh bench signature");
+
+    std::array<ComPtr<ID3D12CommandAllocator>, thread_count> allocators;
+    std::array<ComPtr<IUnknown>, thread_count> lists;
+    using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+    using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+    for (unsigned i = 0; i < thread_count; ++i) {
+        check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i])),
+            "create mesh bench allocator");
+        lists[i] = begin_guest_list(guest, allocators[i].Get());
+        slot<Bind>(lists[i].Get(), 34)(lists[i].Get(), root.Get());
+    }
+    // The pipeline refusal precedes argument validation. Supply a valid owned buffer
+    // so the fixture cannot mistake a missing argument for the intended refusal.
+    PlacedBuffer commands(device, guest, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS),
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_DISPATCH_MESH_ARGUMENTS groups{1, 1, 1};
+    std::memcpy(commands.address, &groups, sizeof(groups));
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::array<std::thread, thread_count> threads;
+    const auto before = stats();
+    for (unsigned i = 0; i < thread_count; ++i) {
+        threads[i] = std::thread([&, i] {
+            auto* list = lists[i].Get();
+            ready.fetch_add(1);
+            while (!start.load()) SwitchToThread();
+            for (unsigned call = 0; call < rounds; ++call) {
+                slot<Bind>(list, 25)(list, pipelines[call % pipeline_count].Get());
+                slot<Execute>(list, 61)(list, signature.Get(), 1, commands.wrapped.Get(), 0, nullptr, 0);
+            }
+        });
+    }
+    while (ready.load() != thread_count) SwitchToThread();
+    start.store(true);
+    for (auto& thread : threads) thread.join();
+    const auto after = stats();
+    for (auto& list : lists)
+        check(slot<HRESULT (WINAPI*)(IUnknown*)>(list.Get(), 9)(list.Get()), "close mesh bench list");
+
+    std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    std::printf("mesh refusal bench: exclusive=%lld shared=%lld hashes=%lld\n",
+        after.exclusive - before.exclusive, after.shared - before.shared, after.hashes - before.hashes);
+    std::puts(report.c_str());
+
+    // Exercise the same refusal with a real target and argument readback.
+    if (!run(device, guest, writer, nullptr, root.Get(), pipelines[0].Get(), signature.Get(),
+             DrawKind::mesh, false, Refusal::none, "refused mesh leaves target unchanged")) return 1;
+
+    // Give known_pipeline_key a nonzero translation key, then trigger an early
+    // graphics refusal that needs that key independently of mesh requests.
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    ComPtr<ID3DBlob> blob;
+    const auto draw_root = create_root(guest, {1, &table, 0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT}, &blob);
+    const auto graphics = translated_pipeline(guest, draw_root.Get(), blob.Get(), false);
+    const auto producer = writer_pipeline(device, writer, "write_one_triangle");
+    const TranslatedDrawFixture binding(guest, red);
+    const DirectDraw direct_draw{};
+    if (!run(device, guest, writer, producer.Get(), draw_root.Get(), graphics.Get(), nullptr,
+             DrawKind::vertices, false, Refusal::none, "seed known pipeline key",
+             &binding, false, nullptr, false, false, 0, false, false, nullptr, nullptr, false, &direct_draw))
+        return 1;
+
+    ComPtr<ID3D12CommandAllocator> known_allocator;
+    check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&known_allocator)),
+        "create known key allocator");
+    auto known_list = begin_guest_list(guest, known_allocator.Get());
+    slot<Bind>(known_list.Get(), 25)(known_list.Get(), graphics.Get());
+    const auto before_known = stats();
+    for (unsigned i = 0; i < 32; ++i)
+        slot<Execute>(known_list.Get(), 61)(known_list.Get(), signature.Get(), 2, commands.wrapped.Get(), 0, nullptr, 0);
+    const auto after_known = stats();
+    check(slot<HRESULT (WINAPI*)(IUnknown*)>(known_list.Get(), 9)(known_list.Get()), "close known key list");
+    report.resize(x2w_d3d12_census_report(nullptr, 0) + 1);
+    x2w_d3d12_census_report(report.data(), report.size());
+    if (report.find("reason=graphics_multi_command calls=32") == std::string::npos ||
+        report.find("key=0000000000000000 reason=graphics_multi_command") != std::string::npos) return 1;
+    std::printf("known pipeline bench: shared=%lld\n", after_known.shared - before_known.shared);
+    return 0;
+}
+
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
@@ -1762,6 +1905,7 @@ int main(int argc, char** argv) try
             SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", nullptr) ? S_OK : E_FAIL, "enable loose XMem root SRV");
     else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
+    const bool mesh_bench = argc == 3 && std::strcmp(argv[2], "mesh-refusal-bench") == 0;
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
@@ -1783,7 +1927,7 @@ int main(int argc, char** argv) try
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
-    else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
+    else if (mesh_bench || lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
     else if (argc != 2 && !count_control && !translated_indexed && !lease_writer) return 2;
@@ -1867,6 +2011,7 @@ int main(int argc, char** argv) try
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
+    if (mesh_bench) return mesh_refusal_bench(device.Get(), guest.Get(), writer.Get());
     wchar_t mesh86_dir[MAX_PATH]{};
     if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
         const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
@@ -2374,6 +2519,51 @@ int main(int argc, char** argv) try
                     short_view ? "large buffer tail outside view" : "large buffer tail inside view", &large);
                 if (!ok) break;
             }
+        }
+        if (ok && copy_on) {
+            // Slot 133 placements at nonaligned guest addresses use separate desktop storage.
+            // DrawInstanced snapshots the title-side SRV after the copy records.
+            const TranslatedDrawFixture source(guest.Get(), green, device.Get(), false, true);
+            auto* const source_bytes = static_cast<unsigned char*>(source.backing.get()) + 16;
+            std::array<std::uint32_t, 16> incoming{}, old{};
+            incoming.fill(0x517be26au);
+            old.fill(0x2b1d6805u);
+            incoming[8] = green;
+            old[8] = red;
+            std::memcpy(source_bytes, incoming.data(), sizeof(incoming));
+            const auto verify = [&](bool readonly, bool omit_copy, const char* label) {
+                const TranslatedDrawFixture destination(guest.Get(), red, device.Get(), false, true);
+                auto* const bytes = static_cast<unsigned char*>(destination.backing.get()) + 16;
+                std::memcpy(bytes, old.data(), sizeof(old));
+                DWORD previous = 0;
+                if (readonly)
+                    check(VirtualProtect(destination.backing.get(), 4096, PAGE_READONLY, &previous) ? S_OK : E_FAIL,
+                        "protect title-copy destination page");
+                bool pixel_mismatch = false;
+                const DirectDraw copy{omit_copy ? nullptr : source.sampled.Get(), sizeof(incoming), &pixel_mismatch};
+                LONG copies_before{}, faults_before{}, copies_after{}, faults_after{};
+                x2w_d3d12_title_copy_stats(&copies_before, &faults_before);
+                const bool matches = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(),
+                    buffer_pso.Get(), signature.Get(), DrawKind::vertices, !readonly, Refusal::none, label,
+                    &destination, false, nullptr, false, false, 0, false, false, nullptr, nullptr, false, &copy);
+                x2w_d3d12_title_copy_stats(&copies_after, &faults_after);
+                const LONG expected_copies = !readonly && !omit_copy ? 1 : 0;
+                const LONG expected_faults = readonly ? 1 : 0;
+                if (copies_after - copies_before != expected_copies || faults_after - faults_before != expected_faults) {
+                    std::fprintf(stderr, "%s: copies +%ld, guarded faults +%ld\n", label,
+                        copies_after - copies_before, faults_after - faults_before);
+                    return false;
+                }
+                const auto& expected = readonly || omit_copy ? old : incoming;
+                if (std::memcmp(bytes, expected.data(), sizeof(expected)) != 0) {
+                    std::fprintf(stderr, "%s: title bytes differ from CPU reference\n", label);
+                    return false;
+                }
+                return omit_copy ? !matches && pixel_mismatch : matches;
+            };
+            ok = verify(false, false, "guarded title copy reaches shader") &&
+                 verify(true, false, "read-only title copy retains old bytes") &&
+                 verify(false, true, "guarded title copy omitted control");
         }
         if (ok && (copy_on || copy_off)) {
             const TranslatedDrawFixture copied(guest.Get(), green, device.Get(), false, true, true);

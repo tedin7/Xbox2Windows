@@ -813,9 +813,18 @@ u64 publish_compute_request(const void* desc)
     return key;
 }
 
+bool mesh_refusal_fixture()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TEST_MESH_REFUSAL_STATS");
+    return enabled;
+}
+
+LONG64 mesh_request_hashes;
+LONG64 refusal_shared_acquisitions;
+
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+u64 publish_slot57_mesh_request(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
     if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
@@ -846,6 +855,7 @@ u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bou
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
+    if (mesh_refusal_fixture()) InterlockedIncrement64(&mesh_request_hashes);
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
                                                                                  sizeof(shader_cache::mesh57_revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
@@ -864,6 +874,29 @@ u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bou
         return key;
     }
     return 0;
+}
+
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+{
+    if (!nolock_refuse() || !pipeline || !bound_root)
+        return publish_slot57_mesh_request(pipeline, bound_root);
+    auto& own = pipeline->own();
+    const auto cached = [&]() -> u64 {
+        const u64 key = InterlockedCompareExchange64(&own.mesh_request_key, 0, 0);
+        return key && own.mesh_request_root == bound_root ? key : 0;
+    };
+    if (const u64 key = cached()) return key;
+    x2w_startup::ExclusiveNoteLock guard(own.mesh_request_lock);
+    if (const u64 key = cached()) return key;
+    // Only the root named by the pipeline description can produce a key.
+    if (InterlockedCompareExchange64(&own.mesh_request_key, 0, 0)) return 0;
+    const u64 key = publish_slot57_mesh_request(pipeline, bound_root);
+    if (key) {
+        // Publish the root before the key so the lock-free reader sees the same pair.
+        own.mesh_request_root = bound_root;
+        InterlockedExchange64(&own.mesh_request_key, static_cast<LONG64>(key));
+    }
+    return key;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -1150,6 +1183,12 @@ u64 known_pipeline_key(Wrapper* pipeline)
     if (pipeline->own().mesh86_key) return pipeline->own().mesh86_key;
     if (pipeline->own().compute_trace_key) return pipeline->own().compute_trace_key;
     if (pipeline->own().real) return 0;
+    const bool cache_key = nolock_refuse();
+    auto& cached_key = pipeline->own().refusal_pipeline_key;
+    if (cache_key) {
+        if (const u64 key = InterlockedCompareExchange64(&cached_key, 0, 0)) return key;
+    }
+    if (mesh_refusal_fixture()) InterlockedIncrement64(&refusal_shared_acquisitions);
     AcquireSRWLockShared(&draw_lock);
     const auto& by_pipeline = translation_by_pipeline();
     const auto known = by_pipeline.find(pipeline);
@@ -1160,6 +1199,7 @@ u64 known_pipeline_key(Wrapper* pipeline)
         const PipelineInfo* info = pipeline_info(pipeline);
         if (info && info->path == 86 && info->stream_translation) key = info->stream_translation->key;
     }
+    if (cache_key && key) InterlockedExchange64(&cached_key, static_cast<LONG64>(key));
     return key;
 }
 
@@ -3658,11 +3698,11 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
         if (draw.shader_key) {
-            const char* kind = indices.resource ? "indexed" : "draw";
+            const auto kind = indices.resource ? GraphicsRefusalKind::indexed : GraphicsRefusalKind::draw;
             if (draw.refusal_code == indirect_refusal_code::translation_not_ready)
-                note_indirect_graphics_refusal(draw.shader_key, kind, "no translation");
+                note_indirect_graphics_refusal(draw.shader_key, kind, GraphicsRefusalReason::no_translation);
             else if (draw.refusal_code == indirect_refusal_code::missing_guest_root)
-                note_indirect_graphics_refusal(draw.shader_key, kind, "root mismatch");
+                note_indirect_graphics_refusal(draw.shader_key, kind, GraphicsRefusalReason::root_mismatch);
             const bool first_pair = indirect_draw_refusal_census.note(draw.shader_key, draw.refusal_code);
             if (first_pair || first_calls(refused, 32))
                 log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);

@@ -1,14 +1,17 @@
 """Speed bench: the cost per call of a translated Dispatch and its neighbours through the stand-in (list slots 35, 39, 14).
 
-usage: startup_list_cost_bench_check.py <startup_stream_consumer> <dxc> <warp|hardware>
+usage: startup_list_cost_bench_check.py <startup_stream_consumer> <dxc> <warp|hardware> [startup_indirect_draw_indexed]
 
 Runs the compute fixture of startup_compute_dispatch_check.py in mode dispatch-bench: X2W_TEST_BENCH_CALLS (default 2000 here) rounds of
 {SetComputeRootDescriptorTable, SetComputeRoot32BitConstants, Dispatch}, each call timed by the fixture. The output words must still match
 the case's expectation (the dispatches really ran), and the run prints `x2w-bench` and the stand-in-shaped slots line that
 tools/startup/slot_compare.py reads. The numbers are the scoreboard of the translate-once work: compare runs, not WARP against the tester.
+With the indirect fixture executable, also checks mesh refusal counters, request publication and GPU readback
+with the switch enabled and with the legacy path as a cost control.
 With X2W_BENCH_OUT=<file> the slots line is also written there. Exit 77 when the adapter is not available.
 """
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +24,46 @@ from startup_stream_check import gfx2hlsl as G
 CALLS = '2000'  # two recording threads by default: two lists record the same new pipeline at once (a refusal cached while the first read was in flight would show here)
 
 
-def main(consumer, dxc, adapter):
+def mesh_result(output, requests):
+    stats = re.search(r'^mesh refusal bench: exclusive=(-?\d+) shared=(-?\d+) hashes=(\d+)$', output, re.M)
+    assert stats, output[-3000:]
+    assert 'indirect-graphics refusals: total 40000; distinct keys 8, distinct pairs 8 (overflow calls 0)' in output
+    pairs = dict(re.findall(r'indirect-graphics refusal \d+: key=([0-9a-f]{16}) reason=mesh no translation calls=(\d+)', output))
+    uses = dict(re.findall(r'key use mesh ([0-9a-f]{16}) first [^\n]+ uses (\d+)', output))
+    files = {path.stem.removeprefix('req_'): path.read_bytes() for path in requests.glob('req_*.m57')}
+    assert set(files.values()) == {b'bench' + bytes([index]) for index in range(8)}, files
+    assert len(files) == 8
+    for key in files:
+        assert (requests / f'req_{key}.root').stat().st_size > 0
+        assert (requests / f'req_{key}.ps57').stat().st_size == 0
+    assert pairs == uses == dict.fromkeys(files, '5000'), (pairs, uses, files)
+    lookup = re.search(r'^known pipeline bench: shared=(\d+)$', output, re.M)
+    assert lookup, output[-3000:]
+    return (*map(int, stats.groups()), int(lookup[1]))
+
+
+def check_mesh_bench(executable, adapter, directory):
+    def run(switch):
+        requests = directory / f'mesh-{switch}'
+        requests.mkdir()
+        env = dict(os.environ, X2W_NOLOCK_REFUSE=switch, X2W_TEST_MESH_REFUSAL_STATS='1',
+                   X2W_SHADER_CACHE=str(requests))
+        result = subprocess.run([executable, adapter, 'mesh-refusal-bench'], env=env, text=True, capture_output=True)
+        if result.returncode == 77:
+            print(result.stdout)
+            sys.exit(77)
+        assert result.returncode == 0, (result.stdout[-3500:], result.stderr[-3500:])
+        return mesh_result(result.stdout, requests)
+
+    optimized = run('1')
+    legacy = run('0')  # Negative control for the same cost assertions.
+    expected = (0, 0, 8, 1)
+    assert optimized == expected, f'mesh + resolved-key counters {optimized}, expected {expected}'
+    assert legacy == (40000, 40000, 40000, 32), f'legacy cost control did not expose all repeated work: {legacy}'
+    print(f'mesh refusal bench: 40000 calls, 8 requests; counters optimized {optimized}, legacy {legacy}')
+
+
+def main(consumer, dxc, adapter, mesh_fixture=None):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare_case(directory, adapter)
@@ -64,10 +106,12 @@ def main(consumer, dxc, adapter):
         target = os.environ.get('X2W_BENCH_OUT')
         if target:
             Path(target).write_text(slots[0] + '\n')
+        if mesh_fixture:
+            check_mesh_bench(mesh_fixture, adapter, directory)
         print(f'startup_list_cost_bench: PASS on {adapter} (all {C.WORDS} words match; numbers above)')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
+    if len(sys.argv) not in (4, 5) or sys.argv[3] not in ('warp', 'hardware'):
         sys.exit(__doc__)
     main(*sys.argv[1:])

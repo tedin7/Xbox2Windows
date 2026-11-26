@@ -217,6 +217,28 @@ bool copy_source_authoritative(Wrapper* self, const CopyEndpoint& from, u64 offs
     return placed.alias || list_copied_gpu_range(self, from.resource, offset, bytes);
 }
 
+LONG guarded_title_copy_faults;
+
+extern "C" __declspec(dllexport) void x2w_d3d12_title_copy_stats(LONG* copies, LONG* faults)
+{
+    *copies = InterlockedCompareExchange(&list_title_memory_copies, 0, 0);
+    *faults = InterlockedCompareExchange(&guarded_title_copy_faults, 0, 0);
+}
+
+bool guarded_title_memmove(void* to, const void* from, std::size_t bytes) noexcept
+{
+    __try {
+        std::memmove(to, from, bytes);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ?
+                EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        x2w_local::forget_mapped_spans();
+        InterlockedIncrement(&guarded_title_copy_faults);
+        return false;
+    }
+    return true;
+}
+
 // A buffer copy whose source is a placed buffer that does not alias title memory is refused (its desktop copy holds nothing the
 // title wrote). When the title wrote the source with the CPU (no recorded copy wrote it) and the destination is title-backed too,
 // the copy is made in title memory now, which is also when a draw in the same recording snapshots the destination. A source or
@@ -233,6 +255,20 @@ bool copy_in_title_memory(const CopyEndpoint& to, u64 to_offset, const CopyEndpo
     const u64 to_width = to.resource->GetDesc().Width, from_width = from.resource->GetDesc().Width;
     if (to_offset > to_width || bytes > to_width - to_offset || from_offset > from_width || bytes > from_width - from_offset)
         return false;
+    static const bool guarded = x2w_local::env_on("X2W_TITLE_COPY_GUARDED");
+    if (guarded) {
+        auto* const destination = to_memory + to_offset;
+        // A fault on a later page could leave the first page partially updated.
+        // Keep the legacy whole-range check for page-spanning destinations.
+        constexpr std::uintptr_t page_size = 4096;
+        const auto page_offset = reinterpret_cast<std::uintptr_t>(destination) & (page_size - 1);
+        if (bytes <= page_size - page_offset) {
+            const auto* const source = from_memory + from_offset;
+            const auto size = static_cast<std::size_t>(bytes);
+            return x2w_local::readable(source, size) && x2w_local::readable(destination, size) &&
+                guarded_title_memmove(destination, source, size);
+        }
+    }
     if (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
         !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes)))
         return false;

@@ -20,7 +20,10 @@ public:
     static constexpr std::size_t max_label_bytes = 32;
     static constexpr std::size_t max_reason_bytes = 64;
 
-    explicit PerReasonRefusalCensus(const char* label = "per-reason")
+    using FormatCode = void (*)(unsigned, char*, std::size_t);
+
+    explicit PerReasonRefusalCensus(const char* label = "per-reason", FormatCode format_code = nullptr)
+        : format_code_(format_code)
     {
         copy_sanitized(label_, sizeof(label_), label, "per-reason");
     }
@@ -32,24 +35,36 @@ public:
         char reason[max_reason_bytes] = {};
         copy_sanitized(reason, sizeof(reason), reason_name, "unknown");
 
+        return note_entry(key, reason, 0);
+    }
+
+    bool note_code(std::uint64_t key, unsigned code)
+    {
+        return note_entry(key, nullptr, code);
+    }
+
+private:
+    bool note_entry(std::uint64_t key, const char* reason, unsigned code)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         ++total_;
         // Linear scan over max_entries under mutex_ is sized for refusal paths, not a per-draw hot path.
         for (unsigned i = 0; i < entry_count_; ++i) {
 #if defined(X2W_CENSUS_KEEP_LAST) || defined(X2W_CENSUS_KEEP_FIRST)
             if (entries_[i].key == key) {
-                if (std::strcmp(entries_[i].reason, reason) == 0) {
+                if (entries_[i].code == code && (code || std::strcmp(entries_[i].reason, reason) == 0)) {
                     ++entries_[i].calls;
 #ifdef X2W_CENSUS_KEEP_LAST
                 } else {
-                    std::memcpy(entries_[i].reason, reason, sizeof(reason));
+                    if (!code) std::memcpy(entries_[i].reason, reason, sizeof(entries_[i].reason));
+                    entries_[i].code = code;
                     entries_[i].calls = 1;
 #endif
                 }
                 return false;
             }
 #else
-            if (entries_[i].key == key && std::strcmp(entries_[i].reason, reason) == 0) {
+            if (entries_[i].key == key && entries_[i].code == code && (code || std::strcmp(entries_[i].reason, reason) == 0)) {
                 ++entries_[i].calls;
                 return false;
             }
@@ -62,7 +77,8 @@ public:
         if (!has_key_locked(key)) ++distinct_keys_;
         Entry& entry = entries_[entry_count_];
         entry.key = key;
-        std::memcpy(entry.reason, reason, sizeof(reason));
+        entry.code = code;
+        if (!code) std::memcpy(entry.reason, reason, sizeof(entry.reason));
         entry.calls = 1;
         entry.reported_calls = 0;
         const bool detail = entry_count_ < detail_entries;
@@ -70,6 +86,7 @@ public:
         return detail;
     }
 
+public:
     template <class Emit>
     bool report(Emit emit, bool only_if_changed)
     {
@@ -89,9 +106,11 @@ public:
             Entry& entry = entries_[i];
             if (only_if_changed && entry.calls == entry.reported_calls) continue;
             if (only_if_changed) entry.reported_calls = entry.calls;
+            char reason[max_reason_bytes];
+            if (entry.code) format_code_(entry.code, reason, sizeof(reason));
             std::snprintf(line, sizeof(line),
                           "x2w-d3d12 %s refusal %u: key=%016llx reason=%s calls=%llu",
-                          label_, i + 1, static_cast<unsigned long long>(entry.key), entry.reason,
+                          label_, i + 1, static_cast<unsigned long long>(entry.key), entry.code ? reason : entry.reason,
                           static_cast<unsigned long long>(entry.calls));
             emit(static_cast<const char*>(line));
         }
@@ -125,6 +144,7 @@ public:
 private:
     struct Entry {
         std::uint64_t key = 0;
+        unsigned code = 0;
         char reason[max_reason_bytes] = {};
         std::uint64_t calls = 0;
         std::uint64_t reported_calls = 0;
@@ -149,6 +169,7 @@ private:
         return false;
     }
 
+    FormatCode format_code_;
     mutable std::mutex mutex_;
     char label_[max_label_bytes] = {};
     Entry entries_[max_entries] = {};

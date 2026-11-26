@@ -130,7 +130,8 @@ x2w_startup::MemorySrvCensus memory_srv_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
-x2w_startup::PerReasonRefusalCensus indirect_graphics_refusal_census{"indirect-graphics"};
+void format_graphics_refusal(unsigned code, char* text, std::size_t size);
+x2w_startup::PerReasonRefusalCensus indirect_graphics_refusal_census{"indirect-graphics", format_graphics_refusal};
 x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};
 
 enum Kind : int {
@@ -224,6 +225,10 @@ struct alignas(16) WrapperOwn {
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
+    volatile LONG64 refusal_pipeline_key;
+    SRWLOCK mesh_request_lock;
+    const std::vector<RootParameter>* mesh_request_root;
+    volatile LONG64 mesh_request_key;
     UINT list_node_mask;
     D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
@@ -3499,10 +3504,37 @@ bool split_indirect_dispatch_enabled()
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
 }
 
-void note_indirect_graphics_refusal(u64 key, const char* kind, const char* reason)
+enum class GraphicsRefusalKind : unsigned { draw, indexed, mesh };
+enum class GraphicsRefusalReason : unsigned { no_translation, root_mismatch, switch_off };
+bool nolock_refuse();
+
+const char* graphics_refusal_kind(unsigned kind)
 {
+    constexpr const char* names[] = {"draw", "indexed", "mesh"};
+    return names[kind];
+}
+
+const char* graphics_refusal_reason(unsigned reason)
+{
+    constexpr const char* names[] = {"no translation", "root mismatch", "switch off"};
+    return names[reason];
+}
+
+void format_graphics_refusal(unsigned code, char* text, std::size_t size)
+{
+    --code;
+    std::snprintf(text, size, "%s %s", graphics_refusal_kind(code / 3), graphics_refusal_reason(code % 3));
+}
+
+void note_indirect_graphics_refusal(u64 key, GraphicsRefusalKind kind, GraphicsRefusalReason reason)
+{
+    const unsigned kind_id = static_cast<unsigned>(kind), reason_id = static_cast<unsigned>(reason);
+    if (nolock_refuse()) {
+        indirect_graphics_refusal_census.note_code(key, 1 + 3 * kind_id + reason_id);
+        return;
+    }
     char detail[64];
-    std::snprintf(detail, sizeof(detail), "%s %s", kind, reason);
+    std::snprintf(detail, sizeof(detail), "%s %s", graphics_refusal_kind(kind_id), graphics_refusal_reason(reason_id));
     indirect_graphics_refusal_census.note(key, detail);
 }
 
@@ -3574,7 +3606,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
     const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
     const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
-    const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
+    const auto graphics_kind = mesh ? GraphicsRefusalKind::mesh :
+        indexed ? GraphicsRefusalKind::indexed : GraphicsRefusalKind::draw;
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
@@ -3602,14 +3635,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                         pass.pipeline->own().mesh86_key);
             }
             if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-                u64 key = known_pipeline_key(pass.pipeline);
-                if (mesh && console_pipeline) {
+                const bool console_mesh = mesh && console_pipeline;
+                u64 key = nolock_refuse() && console_mesh ? 0 : known_pipeline_key(pass.pipeline);
+                if (console_mesh) {
                     const u64 stream_key = pass.pipeline->own().mesh86_key;
                     key = stream_key ? stream_key : pass.requested_mesh_key;
                     if (key) note_indirect_mesh_use(key);
                 }
-                const char* reason = graphics_draw_candidate ? "switch off" :
-                    (!pass.pipeline || console_pipeline) ? "no translation" : "root mismatch";
+                const auto reason = graphics_draw_candidate ? GraphicsRefusalReason::switch_off :
+                    (!pass.pipeline || console_pipeline) ? GraphicsRefusalReason::no_translation :
+                    GraphicsRefusalReason::root_mismatch;
                 note_indirect_graphics_refusal(key, graphics_kind, reason);
             }
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
@@ -3626,7 +3661,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags) {
                 const u64 key = known_pipeline_key(pass.pipeline);
                 if (key) note_indirect_mesh_use(key);
-                note_indirect_graphics_refusal(key, graphics_kind, "root mismatch");
+                note_indirect_graphics_refusal(key, graphics_kind, GraphicsRefusalReason::root_mismatch);
                 return refuse("cached mesh requires a recorded root without heap indexing", indirect_graphics_pipeline);
             }
             for (std::size_t i = 0; i < pass.root->size(); ++i) {
@@ -7268,7 +7303,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
             auto& pipeline = static_cast<Wrapper*>(*out)->own();
             pipeline.compute_request_key = key;
             pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
-            if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
+            if (nolock_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);

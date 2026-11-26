@@ -79,7 +79,7 @@ struct ComputeManifest {
     std::once_flag probe;
 };
 
-bool nolock_compute_refuse()
+bool nolock_refuse()
 {
     static const bool enabled = x2w_local::env_on("X2W_NOLOCK_REFUSE");
     return enabled;
@@ -683,11 +683,12 @@ void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use)
     emit(line);
 }
 
+SRWLOCK indirect_mesh_use_lock = SRWLOCK_INIT;
+
 void note_indirect_mesh_use(u64 key)
 {
     KeyUse first_use;
-    {
-        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+    const auto record = [&] {
         auto& use = indirect_mesh_key_uses()[key];
         // Publish the first use even if the title never reaches the periodic report.
         use.note(process_ms());
@@ -695,6 +696,17 @@ void note_indirect_mesh_use(u64 key)
             use.reported_uses = use.uses;
             first_use = use;
         }
+    };
+    auto& lock = nolock_refuse() ? indirect_mesh_use_lock : draw_lock;
+    if (&lock == &draw_lock && mesh_refusal_fixture()) {
+        struct TrackedDrawLock {
+            TrackedDrawLock() { draw_lock_acquire_exclusive(); }
+            ~TrackedDrawLock() { draw_lock_release_exclusive(); }
+        } guard;
+        record();
+    } else {
+        x2w_startup::ExclusiveNoteLock guard(lock);
+        record();
     }
     if (first_use.uses)
         emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, first_use);
@@ -706,19 +718,27 @@ void report_key_use_census(Emit emit, bool only_if_changed)
 {
     struct Row { const char* kind; u64 key; KeyUse use; };
     std::vector<Row> rows;
+    const bool separate_mesh = nolock_refuse();
+    const auto collect = [&](const char* kind, u64 key, KeyUse& use) {
+        if (!use.uses || (only_if_changed && use.uses == use.reported_uses)) return;
+        rows.push_back({kind, key, use});
+        if (only_if_changed) use.reported_uses = use.uses;
+    };
+    const auto collect_mesh = [&] {
+        for (auto& item : indirect_mesh_key_uses())
+            collect("mesh", item.first, item.second);
+    };
     {
         x2w_startup::ExclusiveNoteLock guard(draw_lock);
-        const auto collect = [&](const char* kind, u64 key, KeyUse& use) {
-            if (!use.uses || (only_if_changed && use.uses == use.reported_uses)) return;
-            rows.push_back({kind, key, use});
-            if (only_if_changed) use.reported_uses = use.uses;
-        };
         for (auto& item : compute_translations())
             collect("compute", item.second.key, item.second.use);
         for (auto& item : translation_by_key())
             if (item.second) collect("graphics", item.second->key, item.second->use);
-        for (auto& item : indirect_mesh_key_uses())
-            collect("mesh", item.first, item.second);
+        if (!separate_mesh) collect_mesh();
+    }
+    if (separate_mesh) {
+        x2w_startup::ExclusiveNoteLock guard(indirect_mesh_use_lock);
+        collect_mesh();
     }
     for (const Row& row : rows)
         emit_key_use(emit, row.kind, row.key, row.use);
@@ -744,4 +764,10 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_refusal_stats(
     *repeated_reads = manifest_source().retry_opens();
     *background_reads = manifest_source().background_reads();
     *untranslated = InterlockedCompareExchange(&compute_dispatches_untranslated, 0, 0);
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_mesh_refusal_stats(LONG64* shared, LONG64* hashes)
+{
+    *shared = InterlockedCompareExchange64(&refusal_shared_acquisitions, 0, 0);
+    *hashes = InterlockedCompareExchange64(&mesh_request_hashes, 0, 0);
 }

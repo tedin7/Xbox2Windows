@@ -1732,7 +1732,8 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_translated_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-refusal-census)
     add_test(NAME startup_indirect_translated_targets_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-targets)
     add_test(NAME startup_indirect_other_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} indirect-other-refusal-census)
-    add_test(NAME startup_indirect_copy_provenance_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance)
+    add_test(NAME startup_indirect_copy_provenance_${backend} COMMAND "${CMAKE_COMMAND}" -E env X2W_TITLE_COPY_GUARDED=1
+        "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend} copy-provenance)
     add_test(NAME startup_indirect_copy_provenance_off_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance-off)
     add_test(NAME startup_indirect_translated_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-indexed)
     add_test(NAME startup_indirect_translated_indexed_upload_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-indexed-upload)
@@ -5054,7 +5055,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${DXC_EXECUTABLE}" ${adapter})
         add_test(NAME startup_list_cost_bench_nolock_refuse_${adapter} COMMAND "${CMAKE_COMMAND}" -E env X2W_NOLOCK_REFUSE=1
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py"
-            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" ${adapter})
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" ${adapter} "$<TARGET_FILE:startup_indirect_draw_indexed>")
         set_tests_properties(startup_list_cost_bench_${adapter} startup_list_cost_bench_nolock_refuse_${adapter}
             PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     endforeach()
