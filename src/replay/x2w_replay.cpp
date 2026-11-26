@@ -8,7 +8,8 @@
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
 //
-// Version 1 plays on one thread. Per call:
+// One thread per recorded thread (--threads recorded, the default; --threads 1 plays everything on one), the recorded order
+// kept where threads meet (play_threads below). Per call:
 //   - the object and every argument naming a recorded wrapper get the replay's wrapper (wrappers are learned from the
 //     output arguments: OUTP);
 //   - argument memory is copied out of the recording into memory the replay owns, pointers between those copies are
@@ -20,20 +21,25 @@
 //   - a struct-returning slot called as (return buffer, object) is played the same way, with a buffer of its own.
 //   - title memory recorded as pages (PAGE/MAP) is reserved at its own addresses first and written before each call
 //     (replay_pages_apply.h); argument memory inside it is passed as is.
-// Not yet: float arguments passed by value, one thread per recorded thread.
+// Not yet: float arguments passed by value.
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -56,6 +62,8 @@ constexpr int top_slots = 8;
 struct Options {
     std::wstring recording, out;
     bool hardware = false;
+    bool one_thread = false;  // --threads 1: every call on this thread, in sequence order
+    bool ordered = true;      // --sync off: threads run free (a diagnostic: it shows what the order is worth)
     double max_seconds = 0;
 };
 
@@ -75,6 +83,9 @@ struct Player {
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     void* device = nullptr;
+    std::mutex state;  // everything above: one call at a time reads and learns it; the stand-in is called outside it
+    DWORD fence_wait_ms = 10000;
+    u64 threads = 1, order_timeouts = 0, sync_order_inversions = 0;
 
     u64 translate(u64 value) const
     {
@@ -252,6 +263,7 @@ bool play(Player& p, const Recording& r, const Step& step)
 {
     const CallRecord& c = step.call;
     Played call{&step};
+    std::unique_lock<std::mutex> lock(p.state);
     if (const auto object = p.objects.find(c.object); object != p.objects.end()) {
         call.self = object->second;
     } else if (const auto second = p.objects.find(c.args[0]); second != p.objects.end()) {
@@ -276,12 +288,17 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
+    const DWORD wait_ms = p.fence_wait_ms;
+    lock.unlock();
     call.ret = call_slot(call.self, rcx, c.slot, a);
+    bool timed_out = false;
     if (c.kind == fence_kind && c.slot == fence_completed && call.ret < c.ret) {
-        for (const ULONGLONG deadline = GetTickCount64() + 10000; call.ret < c.ret && GetTickCount64() < deadline; Sleep(1))
+        for (const ULONGLONG deadline = GetTickCount64() + wait_ms; call.ret < c.ret && GetTickCount64() < deadline; Sleep(1))
             call.ret = call_slot(call.self, rcx, c.slot, a);
-        if (call.ret < c.ret) ++p.fence_timeouts;
+        timed_out = call.ret < c.ret;
     }
+    lock.lock();
+    if (timed_out) ++p.fence_timeouts;
     if (c.kind == queue_kind && c.slot == queue_present) ++p.presents;
     learn_after(p, r, call);
     ++p.played;
@@ -316,7 +333,9 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
-        else if (name == L"--mode" || name == L"--threads" || name == L"--from-present") say("x2w-replay: %ls %ls is not in version 1 (ignored)", name.c_str(), value.c_str());
+        else if (name == L"--threads") o.one_thread = value == L"1";
+        else if (name == L"--sync" && (value == L"on" || value == L"off")) o.ordered = value == L"on";
+        else if (name == L"--mode" || name == L"--from-present") say("x2w-replay: %ls %ls is not in version 1 (ignored)", name.c_str(), value.c_str());
         else return false;
     }
     return true;
@@ -329,9 +348,9 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.3f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"stopped_at_max_seconds\": %s, ",
+                        "\"stopped_at_max_seconds\": %s, \"threads\": %llu, \"sync_order_inversions\": %llu, \"order_timeouts\": %llu, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, wall, fps,
-                     p.arena_bytes, stopped ? "true" : "false");
+                     p.arena_bytes, stopped ? "true" : "false", p.threads, p.sync_order_inversions, p.order_timeouts);
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
@@ -344,8 +363,9 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         std::fclose(f);
     }
     std::printf("x2w-replay score presents %llu calls %llu of %zu unknown_object %llu missing_blob %llu fence_timeouts %llu "
-                "wall_s %.3f fps %.2f%s\n",
-                p.presents, p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.fence_timeouts, wall, fps,
+                "wall_s %.3f fps %.2f threads %llu order_inversions %llu%s\n",
+                p.presents, p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.fence_timeouts, wall, fps, p.threads,
+                p.sync_order_inversions,
                 stopped ? " stopped_at_max_seconds" : "");
     std::fflush(stdout);
 }
@@ -408,6 +428,116 @@ void seed_shader_cache(const Recording& r)
     say("x2w-replay: shader cache %ls: %d files from the recording, %d already there, %d refused", dir, written, present, refused);
 }
 
+// Threads. One OS thread plays each recorded thread's calls in its own order. The recorded order across threads is kept
+// for the calls other threads can see or build on, the "ordered" steps: queue and fence calls, every call that makes an
+// object or an address the replay must learn (outputs, device calls, a heap's start, Map, a GPU address), and the first
+// call after each MAP chunk (the page image it needs). Ordered steps run one by one in sequence order. Any other step
+// waits until every ordered step with a lower sequence number has run, then runs free beside the other threads.
+bool is_ordered(const Step& s)
+{
+    const CallRecord& c = s.call;
+    return c.kind == queue_kind || c.kind == fence_kind || c.kind == device_kind || !s.outputs.empty() ||
+           (c.kind == descriptor_heap_kind && (c.slot == heap_cpu_start || c.slot == heap_gpu_start)) ||
+           (c.kind == resource_kind && (c.slot == resource_map || c.slot == resource_gpu_address));
+}
+
+struct Gate {
+    std::mutex m;
+    std::condition_variable cv;
+    std::size_t done = 0;  // ordered steps played
+    bool stop = false;
+    std::vector<u64> order;  // sequence numbers of the ordered steps, as they finished
+};
+
+struct Plan {
+    std::vector<char> ordered;
+    std::vector<std::size_t> need;  // ordered steps with a lower sequence number
+    std::map<std::uint32_t, std::vector<std::size_t>> threads;  // recorded thread -> its steps, in order
+};
+
+Plan make_plan(const Recording& r)
+{
+    Plan plan;
+    plan.ordered.assign(r.steps.size(), 0);
+    plan.need.assign(r.steps.size(), 0);
+    std::size_t next_map = 0, count = 0;
+    for (std::size_t i = 0; i < r.steps.size(); ++i) {
+        bool ordered = is_ordered(r.steps[i]);
+        while (next_map < r.maps.size() && r.maps[next_map].seq < r.steps[i].call.seq) {
+            ++next_map;
+            ordered = true;
+        }
+        plan.ordered[i] = ordered;
+        plan.need[i] = count;
+        count += ordered;
+        plan.threads[r.steps[i].call.thread].push_back(i);
+    }
+    return plan;
+}
+
+// The ordered steps that finished after a step with a higher sequence number did: 0 when the recorded order was kept.
+u64 count_inversions(const std::vector<u64>& order)
+{
+    u64 late = 0, highest = 0;
+    for (const u64 seq : order) {
+        if (seq < highest) ++late;
+        highest = std::max(highest, seq);
+    }
+    return late;
+}
+
+// Plays the recording on one thread per recorded thread. Returns true when it stopped at the time limit.
+bool play_threads(Player& p, const Recording& r, const Options& o, const std::chrono::steady_clock::time_point& started)
+{
+    const Plan plan = make_plan(r);
+    p.threads = plan.threads.size();
+    Gate gate;
+    std::atomic<bool> stopped{false};
+    const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
+    // Without the order the threads start from the last recorded thread, each 150 ms after the one before it.
+    std::vector<std::uint32_t> start_order;
+    for (const auto& entry : plan.threads) start_order.push_back(entry.first);
+    if (!o.ordered) {
+        p.fence_wait_ms = 50;
+        std::reverse(start_order.begin(), start_order.end());
+    }
+    std::vector<std::thread> workers;
+    for (std::size_t n = 0; n < start_order.size(); ++n) {
+        const std::vector<std::size_t>& mine = plan.threads.at(start_order[n]);
+        workers.emplace_back([&, n] {
+            if (!o.ordered) Sleep(static_cast<DWORD>(150 * n));
+            for (const std::size_t i : mine) {
+                if (o.max_seconds > 0 && elapsed() >= o.max_seconds) stopped = true;
+                {
+                    std::unique_lock<std::mutex> lock(gate.m);
+                    if (stopped) gate.stop = true;
+                    if (o.ordered) {
+                        const auto ready = [&] { return gate.stop || (plan.ordered[i] ? gate.done == plan.need[i] : gate.done >= plan.need[i]); };
+                        if (!gate.cv.wait_for(lock, std::chrono::seconds(30), ready)) {
+                            ++p.order_timeouts;  // a step it waited for never ran: go on, the count says so
+                            gate.done = std::max(gate.done, plan.need[i]);
+                        }
+                    }
+                    if (gate.stop) {
+                        gate.cv.notify_all();
+                        return;
+                    }
+                }
+                play(p, r, r.steps[i]);
+                if (plan.ordered[i]) {
+                    std::lock_guard<std::mutex> lock(gate.m);
+                    ++gate.done;
+                    gate.order.push_back(r.steps[i].call.seq);
+                    gate.cv.notify_all();
+                }
+            }
+        });
+    }
+    for (std::thread& t : workers) t.join();
+    p.sync_order_inversions = count_inversions(gate.order);
+    return stopped;
+}
+
 int run(const Options& o)
 {
     CreateDirectoryW(o.out.c_str(), nullptr);
@@ -456,12 +586,16 @@ int run(const Options& o)
     const auto started = std::chrono::steady_clock::now();
     const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); };
     bool stopped = false;
-    for (const Step& s : r.steps) {
-        if (o.max_seconds > 0 && elapsed() >= o.max_seconds) {
-            stopped = true;
-            break;
+    if (o.one_thread) {
+        for (const Step& s : r.steps) {
+            if (o.max_seconds > 0 && elapsed() >= o.max_seconds) {
+                stopped = true;
+                break;
+            }
+            play(p, r, s);
         }
-        play(p, r, s);
+    } else {
+        stopped = play_threads(p, r, o, started);
     }
     if (!stopped) apply_pages_before(r, ~0ull);  // the pages recorded after the last call
     const double wall = elapsed();
