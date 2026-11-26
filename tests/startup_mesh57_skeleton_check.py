@@ -214,12 +214,12 @@ WAVE_LOAD_PREFIX = 'bea803ff 3e808081 8f298806 beaa0386 7e0e0280 befe04c1 7da800
 WAVE_LOAD_BODY = 'f4200a08 520001e0 7e0e02f2 bf8cc07f'
 
 
-def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e280228 7e2a0307'):
+def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e280228 7e2a0307', join='befe04c1'):
     """Insert the scalar load before the count exchange and export its value as vertex red."""
     body = body.split()
     before = MESH.index('be8d0308')
     wait = MESH.index('bf8c3f70')
-    return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + ['befe04c1']
+    return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + join.split()
             + MESH[before:wait + 1] + exports.split() + MESH[wait + 1:])
 
 
@@ -366,10 +366,14 @@ INNER_VCC_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf8600
 
 # The second bound alone would let wave 1 load from beyond the SRV. Keep the
 # earlier EXEC narrowing to threads 0..2 when applying this bound.
+# The green write at the join must still honor that mask.
 NO_RESET_ASM = WAVE_LOAD_ASM.replace('s_mov_b32 s42, 6', 's_mov_b32 s42, 0x46').replace(
-    's_mov_b64 exec, -1\nv_cmpx', 'v_cmp_gt_u32_e32 vcc, 3, v0\ns_and_saveexec_b64 s[44:45], vcc\nv_cmpx')
+    's_mov_b64 exec, -1\nv_cmpx', 'v_cmp_gt_u32_e32 vcc, 3, v0\ns_and_saveexec_b64 s[44:45], vcc\nv_cmpx').replace(
+    's_cbranch_execz 4', 's_cbranch_execz 3').replace(
+    'v_mov_b32 v7, 1.0\ns_waitcnt lgkmcnt(0)\ns_mov_b64 exec, -1',
+    's_waitcnt lgkmcnt(0)\nv_mov_b32 v7, 1.0')
 NO_RESET_MESH = wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0386', 'beaa03ff 00000046').replace(
-    'befe04c1', '7d880083 beac246a'))
+    'befe04c1', '7d880083 beac246a'), WAVE_LOAD_BODY.replace('7e0e02f2 ', ''), join='7e0e02f2')
 
 # Select lane 1, which holds red 1.0. Lane 0 and the inactive provoking threads
 # hold 0 in v7, and the scalar load gives s40 a different value.
@@ -897,7 +901,7 @@ def rasterise(points, colours, indices, verts, prims):
 
 
 def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None, word=1.0, rule=None,
-                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6):
+                   inner_mutant=None, green=None, nest_mutant=None, wave_mutants=True, bound=6, control=None):
     """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
     wave: it must match the per-lane image and differ from the correct one."""
     key, result = request(directory, mesh)
@@ -931,13 +935,14 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
     expect('only the mixed wave reads; the empty wave address is past the SRV',
            (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: rule(word), 64: 64}))
 
-    def reference(swap):
+    def reference(swap=False, change=None):
         rendered = list(colours)
         for tri in triangles:
             for tid in tri:
                 first, slot = tid & ~63, tid & 15
                 red = wave_red[first ^ (64 if swap else 0)]
-                rendered[slot] = (red, green(tid), *colours[slot][2:])
+                rg = (red, green(tid))
+                rendered[slot] = (*(change(tid, *rg) if change else rg), *colours[slot][2:])
         return rasterise(points, rendered, triangles, 128, len(triangles))
 
     correct, swapped = reference(False), reference(True)
@@ -1000,6 +1005,21 @@ def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wav
             wrong_image = rasterise(points, rendered, triangles, 128, len(triangles))
             dropped = sum(a != b for a, b in zip(correct, wrong_image))
             cases += [('dropped inner branch %s against the correct image' % label, inner_cso, correct, 1 if dropped else 0, dropped)]
+        if control:
+            drop, keep, change = control
+            if source.count(drop) != 1:
+                raise AssertionError(f'{label}: expected exactly one mutant site for {drop!r}')
+            wrong_image = reference(change=change)
+            mismatches = sum(a != b for a, b in zip(correct, wrong_image))
+            if not mismatches:
+                raise AssertionError(f'{label}: mutant reference must change covered pixels')
+            mutant_hlsl = Path(directory) / 'wave-control.hlsl'
+            mutant_hlsl.write_text(source.replace(drop, keep))
+            mutant_cso = mutant_hlsl.with_suffix('.cso')
+            subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant_cso, mutant_hlsl],
+                           check=True, capture_output=True)
+            cases += [(label + ' mutant against the correct image', mutant_cso, correct, 1, mismatches),
+                      (label + ' mutant against its own image', mutant_cso, wrong_image, 0, 0)]
     for what, shader, image, status, mismatches in cases:
         path.write_bytes(bytes(constants) + bytes(data) + b'\xcd' * 80 + b''.join(map(bytes, image)))
         run = subprocess.run([renderer, adapter, '--mesh-indexed', shader,
@@ -1017,14 +1037,21 @@ def draw_wave_collectives(dxc, renderer, adapter):
     os.environ.pop('X2W_FXC', None)
     cases = (
         (INNER_VCC_MESH, 'inner VCC branch falls through', {}),
-        (INNER_VCC_MESH, 'inner VCC branch taken', {'word': 0.0, 'rule': lambda _: 64}),
-        (NO_RESET_MESH, 'no full EXEC reset', {'bound': 3}),
+        (INNER_VCC_MESH, 'inner VCC branch taken',
+         {'word': 0.0, 'rule': lambda _: 64,
+          'control': ('pc = (mesh_vote == 0u) ? 3 : 2;', 'pc = 2;',
+                      lambda tid, red, green: (0 if tid < 64 else red, green))}),
+        (NO_RESET_MESH, 'no full EXEC reset',
+         {'bound': 3, 'control': ('if (exec & 1) v7 = 0x3f800000u;', 'v7 = 0x3f800000u;',
+                                 lambda tid, red, green: (red, 255))}),
         (FIRST_LANE_MESH, 'readfirstlane broadcast',
-         {'word': 0.25, 'rule': lambda _: 255, 'green': lambda tid: 255 if 0 < tid < 6 else 0}),
+         {'word': 0.25, 'rule': lambda _: 255, 'green': lambda tid: 255 if 0 < tid < 6 else 0,
+          'control': ('s40 = mesh_first;', 's40 = v7;',
+                      lambda tid, red, green: (green if tid < 64 else red, green))}),
     )
     with tempfile.TemporaryDirectory() as tmp:
         for mesh, label, options in cases:
-            status = draw_wave_load(tmp, renderer, adapter, mesh, label, **options)
+            status = draw_wave_load(tmp, renderer, adapter, mesh, label, dxc, wave_mutants=False, **options)
             if status:
                 return status
     return 0
