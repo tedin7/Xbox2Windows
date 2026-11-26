@@ -414,12 +414,23 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
                     slot.heap ? "heap" : "table", slot.a, slot.b, entry);
             views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            views[i].wrapper = view.token_owner;
             views[i].stride = view.stride;
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        if (words[0] == view_token_magic && view_token_uav_enabled()) {
+            const auto view = uav_token_buffer(self, words, 16u << 20, true, reason);
+            for (std::size_t input = 0; input < inputs && !reason; ++input)
+                if (views[input].resource == view.resource) reason = "an output buffer is also an input";
+            views[i] = {view.resource, view.offset, view.bytes, true};
+            views[i].wrapper = view.token_owner;
+            views[i].words[0] = view_token_magic;
+            views[i].words[1] = view.stride << 16;
+            views[i].words[2] = static_cast<UINT>(view.bytes / (view.stride ? view.stride : 4));
+            continue;
+        }
+        // A hardware buffer descriptor must name a placed buffer that aliases title memory.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
@@ -468,7 +479,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             }
             values[i] = word[3];
             break;
-        case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
+        case ComputeTranslation::output_word3:
+            if (view.wrapper && !view.texture && view.words[0] == view_token_magic)
+                reason = "a UAV buffer view token has no hardware word 3";
+            values[i] = view.words[3];
+            break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
         }
@@ -518,6 +533,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (i < inputs) {
             if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (view.wrapper) retire_hold(self, view.wrapper);
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
@@ -533,6 +549,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.FirstElement = view.offset / 4;
         desc.Buffer.NumElements = static_cast<UINT>(view.bytes / 4);
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        if (view.wrapper) retire_hold(self, view.wrapper);
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
     if (!pass.heap_set) {
@@ -550,7 +567,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } else {
         list->Dispatch(x, y, z);
     }
-    for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+    // Order later UAV accesses even if the resource stays in UAV state. SRV consumers transition it with require_state.
+    for (std::size_t i = inputs; i < count; ++i) {
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;

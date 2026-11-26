@@ -1,0 +1,62 @@
+"""Exercise a GPU-only buffer written through a UAV token on WARP."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+from startup_compute_dispatch_check import C, G, dispatch, lines, prepare_case
+
+
+def main(consumer, dxc):
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        cache, env = prepare_case(directory, 'warp')
+        env.pop('X2W_VIEW_TOKEN_UAV', None)
+        srv_mode = 'dispatch-view-token-srv'
+        uav_mode = 'dispatch-view-token-uav'
+
+        _, request = dispatch(directory, consumer, env, 'dispatch')
+        key = int(lines(request, 'x2w-draw compute request')[0].split()[3], 16)
+        translation = subprocess.run(
+            [sys.executable, '-B', G.__file__, '--pending', cache],
+            check=True, capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc),
+        )
+        assert f'{key:016x}: ok' in translation.stdout, translation.stdout
+
+        def transformed(value, i):
+            return ((value * 33) & C.MASK) ^ ((C.KEY + i * C.STRIDE) & C.MASK)
+
+        written = 3 * 2 * 2 * 2 * 3 * 4
+        untouched = [C.SENTINEL] * C.WORDS
+        tail = untouched[written:]
+        expected = [transformed(transformed(C.input_word(i), i), i) for i in range(written)] + tail
+        zero_input = [transformed(0, i) for i in range(written)] + tail
+        assert expected != zero_input
+
+        for enabled, mode, reference, dispatches in (
+            (False, srv_mode, zero_input, 1),
+            (False, uav_mode, untouched, 0),
+            (True, srv_mode, expected, 2),
+            (True, uav_mode, expected, 2),
+        ):
+            run_env = dict(env, X2W_VIEW_TOKEN_UAV='1') if enabled else env
+            got, result = dispatch(directory, consumer, run_env, mode)
+            context = f'{mode}, switch={int(enabled)}\n{result.stderr[-3000:]}'
+            mismatch = next((i for i, (a, b) in enumerate(zip(got, reference)) if a != b), None)
+            assert mismatch is None, f'first differing word {mismatch}\n{context}'
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == dispatches, context
+            refusals = lines(result, 'Dispatch(3, 2, 2) refused:')
+            assert len(refusals) == 2 - dispatches, context
+            if not enabled:
+                assert refusals[0].endswith('an output is a view token, not a buffer descriptor'), context
+                if mode == uav_mode:
+                    assert refusals[1].endswith('an input view token is not a buffer view of a desktop resource'), context
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors
+        print(f'WARP: {C.WORDS} words match for SRV and slot-19 reads, including switch-off controls')
+
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])

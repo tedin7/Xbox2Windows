@@ -2370,7 +2370,75 @@ struct IndirectBufferView {
     UINT stride = 0;
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
+    Wrapper* token_owner = nullptr;
 };
+
+bool view_token_uav_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_VIEW_TOKEN_UAV");
+    return enabled;
+}
+
+// Resolve the view against its own desktop allocation, including when it has no title address.
+IndirectBufferView uav_token_buffer(Wrapper* self, const std::uint32_t* words, u64 limit, bool output,
+                                    const char*& reason)
+{
+    ViewRecord record{};
+    bool materialized = false;
+    note_lock_acquire(false);
+    if (words[1] < view_records().size()) {
+        record = view_records()[words[1]];
+        materialized = view_materialized()[words[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    const auto refuse = [&reason](const char* message) {
+        reason = message;
+        return IndirectBufferView{};
+    };
+    if (!materialized || record.slot != 19 || record.counter ||
+        record.desc_bytes < sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))
+        return refuse("a buffer view token does not name a materialized UAV without a counter");
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    std::memcpy(&view, record.desc, sizeof(view));
+    if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || view.Buffer.CounterOffsetInBytes)
+        return refuse("a UAV view token is not a counterless buffer view");
+    Wrapper* const owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
+        !InterlockedCompareExchange(&owner->own().refs, 0, 0))
+        return refuse("a UAV view token has no live desktop resource");
+    auto* const resource = static_cast<ID3D12Resource*>(owner->own().real);
+    const auto* info = resource_info(owner);
+    D3D12_HEAP_PROPERTIES props{};
+    x2w_startup::ComPtr<ID3D12Device> device;
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON ||
+        FAILED(resource->GetHeapProperties(&props, nullptr)) || props.Type != D3D12_HEAP_TYPE_DEFAULT ||
+        FAILED(resource->GetDevice(IID_PPV_ARGS(device.GetAddressOf()))) || device.Get() != device_of(self->own().list_device))
+        return refuse("a UAV view token needs a default heap buffer created in COMMON on this device");
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        (!output && (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+        return refuse("a UAV view token's resource does not support the requested buffer access");
+    const bool raw = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW &&
+        !view.Buffer.StructureByteStride && view.Format == DXGI_FORMAT_R32_TYPELESS;
+    UINT element = 0;
+    if (raw) {
+        element = 4;
+    } else if (view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE) {
+        if (view.Format == DXGI_FORMAT_UNKNOWN)
+            element = view.Buffer.StructureByteStride;
+        else if (!view.Buffer.StructureByteStride)
+            element = x2w_startup::typed_buffer_format_bytes(desktop_format(view.Format));
+    }
+    if (!element || view.Buffer.FirstElement > UINT64_MAX / element)
+        return refuse("a UAV view token has an invalid element layout");
+    const u64 offset = view.Buffer.FirstElement * element;
+    const u64 bytes = u64{view.Buffer.NumElements} * element;
+    if (!bytes || bytes > limit || bytes % 4 || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
+        offset > desc.Width || bytes > desc.Width - offset)
+        return refuse("a UAV view token has an invalid raw buffer range");
+    return {resource, offset, bytes, raw ? 0u : element, false, 0, owner};
+}
 
 // X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
 // (a committed default buffer that holds zeros) is read from title memory, snapshotted into the upload ring.
@@ -2398,6 +2466,11 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     bool own_memory = false;
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
+        if (words[2] == 19 && view_token_uav_enabled()) {
+            const char* reason = nullptr;
+            const auto view = uav_token_buffer(self, words, limit, false, reason);
+            return reason ? refuse(reason) : view;
+        }
         ViewRecord record{};
         note_lock_acquire(false);
         if (words[1] < view_records().size()) record = view_records()[words[1]];
@@ -3121,6 +3194,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (!view.upload)
                 require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (view.token_owner) retire_hold(self, view.token_owner);
             strides[i] = view.stride;
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
