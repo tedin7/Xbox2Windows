@@ -10614,7 +10614,6 @@ class Pipeline:
     uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
-    uses_ldexp = False
     uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -11051,7 +11050,7 @@ class Pipeline:
                 '    }',
                 '}',
             ))
-        if self.uses_ldexp:
+        if getattr(self, 'uses_ldexp', False):
             out.extend((
                 'float x2w_ldexp(float x, int n) {',
                 '    float y = x;',
