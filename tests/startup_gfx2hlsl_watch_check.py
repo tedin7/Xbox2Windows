@@ -472,6 +472,22 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('the --watch first pass keeps it final', fail.stat().st_mtime, built + 50)
     expect('the reason is unchanged', fail.read_text(), reason)
 
+# translate.txt timestamps (TitleClock): seconds since the title.pid the run wrote, else since the watcher started.
+with tempfile.TemporaryDirectory() as tmp:
+    pid = Path(tmp) / 'title.pid'
+    now = [1000.0]
+    clock = gfx2hlsl.TitleClock(str(pid), 990.0, now=lambda: now[0])
+    expect('no title.pid yet: the watcher clock', clock(), ' [t=10.0 s, translator clock]')
+    touch(pid, b'1', mtime=990.0 - gfx2hlsl.TITLE_START_SLACK - 1)
+    expect("an earlier run's title.pid is ignored", clock(), ' [t=10.0 s, translator clock]')
+    touch(pid, b'1', mtime=995.0)
+    now[0] = 1240.5
+    expect('seconds since the title started', clock(), ' [t=245.5 s]')
+    touch(pid, b'1', mtime=1200.0)
+    expect('the title start is read once', clock(), ' [t=245.5 s]')
+    expect('no title.pid path: the watcher clock', gfx2hlsl.TitleClock(None, 5.0, now=lambda: 7.5)(),
+           ' [t=2.5 s, translator clock]')
+
 # Beside a running title the --watch pool translates only the requests the title is waiting for: 30 refusals an older
 # translator build wrote stay untouched in the run and are retried by the finish pass (--pending) after it. The pool
 # keeps to at most WATCH_JOBS workers (X2W_TRANSLATE_JOBS overrides) and logs its size and commit.
@@ -485,6 +501,8 @@ with tempfile.TemporaryDirectory() as tmp:
     for key in new_keys:
         touch(d / ('req_%016x.rtv' % key), b'not an rtv request')
     env = {k: v for k, v in os.environ.items() if k != 'X2W_TRANSLATE_JOBS'}
+    env['X2W_TITLE_START_FILE'] = str(d / 'title.pid')
+    touch(d / 'title.pid', b'1234')  # the title starts with the watcher
     watcher = subprocess.Popen([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--watch', str(d),
                                 '0.2'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     deadline = time.monotonic() + 60
@@ -498,6 +516,8 @@ with tempfile.TemporaryDirectory() as tmp:
            [(d / ('%016x.fail' % k)).stat().st_mtime == built - 100 for k in old_keys], [True] * 30)
     expect('in-run: the translator printed only the new keys', sorted(re.findall(r'^([0-9a-f]{16}):', out, re.M)),
            ['%016x' % k for k in new_keys])
+    expect('in-run: each result line ends with seconds since the title started',
+           [bool(re.search(r' \[t=\d+\.\d s\]$', line)) for line in out.splitlines() if line.strip()], [True] * 3)
     expect('in-run: the pool is at most %d workers' % gfx2hlsl.WATCH_JOBS,
            'pool of at most %d workers' % min(gfx2hlsl.WATCH_JOBS, os.cpu_count() or 1) in err, True)
     expect('in-run: the pool logs its size and commit', 'gfx2hlsl watch pool: ' in err and ' MiB (peak ' in err, True)
