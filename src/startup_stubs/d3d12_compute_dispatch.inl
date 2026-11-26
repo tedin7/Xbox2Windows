@@ -70,6 +70,12 @@ bool float_output_format(DXGI_FORMAT format)
     }
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
+bool indirect_dispatch_full_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_INDIRECT_DISPATCH_FULL");
+    return enabled;
+}
+LONG compute_indirect_dispatches_translated;
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
@@ -190,6 +196,10 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
+        else if (indirect_dispatch_full_enabled() &&
+                 std::sscanf(line.c_str(), "srv %u tex2d heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.srvs.size())
+            tr.srvs.push_back({a, b, true, true});
         else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
             tr.srvs.push_back({a, b, true});
             tr.srvs.back().cube = true;
@@ -312,10 +322,12 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     phases.to(1);
+    const bool full_indirect = dispatch.signature && indirect_dispatch_full_enabled();
+    auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture)) {
+        if (dispatch.signature && !full_indirect && (slot.heap || slot.texture)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
@@ -448,7 +460,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true,
+                full_indirect ? dispatch.argument : nullptr);
             if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
                 tr->unfilled_heap_slot_logged = true;
                 log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
@@ -487,6 +500,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         else if (!bytes) reason = "an output range has zero bytes";
         else if (bytes % 4) reason = "an output range is not a whole number of dwords";
         else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
+        else if (full_indirect && placed.owner && placed.owner->own().real == dispatch.argument)
+            reason = "the argument buffer is an output of the dispatch";
         else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
@@ -502,9 +517,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
     timer.resolved();
-    if (dispatch.argument)
-        for (std::size_t i = 0; i < count && !reason; ++i)
-            if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
+    if (dispatch.argument) {
+        for (std::size_t i = 0; i < count && !reason; ++i) {
+            if (views[i].resource != dispatch.argument) continue;
+            if (!full_indirect) reason = "the indirect argument buffer is also a bound shader resource";
+            else if (i >= inputs) reason = "the argument buffer is an output of the dispatch";
+            else argument_state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        }
+    }
     phases.to(2);
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
     std::uint32_t values[32] = {};
@@ -572,7 +592,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             continue;
         }
         if (i < inputs) {
-            if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (view.transition && !(full_indirect && view.resource == dispatch.argument))
+                require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
@@ -600,7 +621,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
-        require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        require_state(self, dispatch.argument, argument_state);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
     } else {
         list->Dispatch(x, y, z);
@@ -624,6 +645,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
     InterlockedIncrement(&compute_dispatches_translated);
+    if (full_indirect) InterlockedIncrement(&compute_indirect_dispatches_translated);
     static LONG logged;
     if (!dispatch.signature && first_calls(logged, 8))
         log("x2w-draw compute %016llx Dispatch(%u, %u, %u) translated: entry [%x %x %x %x], %zu inputs, %zu outputs", key, x, y, z,

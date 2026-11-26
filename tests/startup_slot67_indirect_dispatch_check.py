@@ -48,6 +48,7 @@ def compare_words(actual, expected):
 
 def setup(directory, adapter):
     cache, env = prepare(directory)
+    env.pop('X2W_INDIRECT_DISPATCH_FULL', None)
     env.update(X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'), X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -98,6 +99,8 @@ def check_mutation():
             assert compare_words(mutated, reference) == [index], f'{groups}: {label} mutation was not isolated'
         assert compare_words(reference[:-1], reference), f'{groups}: a short readback passed'
         assert compare_words(reference + [C.SENTINEL], reference), f'{groups}: a long readback passed'
+    assert compare_words(texture_reference(2, 1), texture_reference(5, 3)) == list(range(4, 30))
+    assert compare_words(texture_reference(5, 3, 135), texture_reference(5, 3)) == list(range(30))
     two, five = expected_words(2), expected_words(5)
     differing = [i for i in range(C.WORDS) if two[i] != five[i]]
     assert differing == [2, 3, 4], f'2/5 group references differ at {differing}'
@@ -114,6 +117,74 @@ def run_mutation():
         return 1
     print('slot67 indirect mutation oracle: PASS (device-free)')
     return 0
+
+
+def texture_reference(groups_x, groups_y, counts=0):
+    expected = [C.SENTINEL] * C.WORDS
+    for y in range(groups_y):
+        for x in range(2 * groups_x):
+            expected[10 * y + x] = 17 + 11 * x + 97 * y + counts
+    return expected
+
+
+def check_texture(directory, cache, consumer, dxc, env):
+    # Publish a synthetic desktop translation to isolate manifest binding and submission.
+    # The guest stub only identifies the pipeline. No ISA lowering is under test here.
+    (directory / 'program').write_bytes(bytes.fromhex('000081bf'))
+    (directory / 'state').write_bytes(state_a((2, 1, 1), C.USER7 | C.TGID_X))
+    mode = 'dispatch-indirect-full'
+    untouched = texture_reference(0, 0)
+    actual, result = dispatch(directory, consumer, env, mode)
+    assert actual == untouched and lines(result, 'no translation'), result.stderr[-2500:]
+    assert lines(result, 'x2w-d3d12 debug layer: 0x00000000'), result.stderr[-2500:]
+    key, = {p.stem.removeprefix('req_') for p in cache.glob('req_*.c67')} - {
+        p.stem for p in cache.glob('*.txt')}
+    manifest = cache / f'{key}.txt'
+    source = directory / 'texture.hlsl'
+
+    def publish(read_counts):
+        source.write_text(
+            'Texture2D<float> image : register(t0);\n'
+            'ByteAddressBuffer args : register(t1);\n'
+            'RWByteAddressBuffer output : register(u0);\n'
+            '[numthreads(2, 1, 1)]\n'
+            'void main(uint3 id : SV_DispatchThreadID) {\n'
+            '    uint value = (uint)image.Load(int3(id.xy, 0));\n'
+            + ('    uint3 a = args.Load3(16);\n    value += a.x + 10 * a.y + 100 * a.z;\n' if read_counts else '')
+            + '    output.Store(4 * (id.x + 10 * id.y), value);\n'
+            '}\n')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', source], check=True)
+        manifest.write_text('x2w-manifest 2\nstage cs\ngroup 2 1 1\nud 0\nsrv 0 tex2d heap rootconst 0 0\n'
+                            + ('srv 1 buf table 1 0\n' if read_counts else '') + 'uav 0 table 1 16\n')
+
+    def run(suffix, enabled, refusal=None):
+        actual, result = dispatch(directory, consumer, dict(env, X2W_INDIRECT_DISPATCH_FULL=str(int(enabled))),
+                                  mode + suffix)
+        refused = lines(result, 'ExecuteIndirect refused')
+        if refusal:
+            assert len(refused) == 1 and refusal in refused[0], result.stderr[-2500:]
+        else:
+            assert not refused, result.stderr[-2500:]
+            assert any('1 dispatches, 1 translated' in line for line in lines(result, 'compute census key')), result.stderr[-2500:]
+        for line in lines(result, 'x2w-d3d12-debug '):
+            assert ' sev=0 ' not in line and ' sev=1 ' not in line, line
+        return actual
+
+    publish(False)
+    heap_manifest = manifest.read_text()
+    # The legacy manifest addresses the very same texture token as a fixed-table entry.
+    manifest.write_text(heap_manifest.replace('srv 0 tex2d heap rootconst 0 0', 'srv 0 tex2d table 1 64'))
+    assert run('', False, 'translated indirect Dispatch requires fixed-table raw buffers') == untouched
+    manifest.write_text(heap_manifest)
+    expected = texture_reference(5, 3)
+    assert run('', True) == expected
+    assert run('-output', True, 'the argument buffer is an output of the dispatch') == untouched
+    mutant = run('-offset-zero', True)
+    assert mutant == texture_reference(2, 1)
+    assert compare_words(mutant, expected) == list(range(4, 30)), 'offset-zero mutant escaped the readback oracle'
+    publish(True)
+    assert run('-input', True) == texture_reference(5, 3, 135)
+    print('heap texture indirect: 30 thread records, untouched tail, shared SRV arguments, two refusals and offset-zero mutant')
 
 
 def main(consumer, dxc, adapter):
@@ -150,6 +221,8 @@ def main(consumer, dxc, adapter):
             refusals = lines(run, 'ExecuteIndirect refused')
             assert len(refusals) == 1 and 'requires fixed-table raw buffers' in refusals[0], run.stderr[-2500:]
             print(refusals[0])
+        if adapter == 'warp':
+            check_texture(directory, cache, consumer, dxc, env)
         layer = lines(run, 'x2w-d3d12 debug layer: ')
         print('debug layer:', 'enabled' if layer and '0x00000000' in layer[0] else 'unavailable')
 

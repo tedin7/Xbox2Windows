@@ -2471,7 +2471,7 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool compute_input = false)
+                                         bool compute_input = false, ID3D12Resource* indirect_argument = nullptr)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2576,7 +2576,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias) {
+        // ExecuteIndirect and an SRV of its argument buffer must see the same GPU contents.
+        if (!placed.alias && !(indirect_argument && native == indirect_argument)) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
             } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {

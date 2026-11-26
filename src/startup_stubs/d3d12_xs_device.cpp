@@ -7905,9 +7905,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
+        char indirect_total[64]{};
+        if (indirect_dispatch_full_enabled())
+            std::snprintf(indirect_total, sizeof(indirect_total), "; translated indirect %ld", compute_indirect_dispatches_translated);
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)%s",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
-            compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
+            compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib, indirect_total);
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
