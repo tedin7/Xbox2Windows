@@ -42,6 +42,8 @@ CASES = [
     ("hn_0f1e_16", "66 0F 1E [rax], 16-bit operand size", bytes.fromhex("660f1e00"), True),
     ("hn_0f19_64", "48 0F 19 [rax], 64-bit operand size", bytes.fromhex("480f1900"), True),
     ("hn_0f1e_64", "48 0F 1E [rax], 64-bit operand size", bytes.fromhex("480f1e00"), True),
+    ("hn_endbr64", "F3 0F 1E FA (endbr64)", bytes.fromhex("f30f1efa"), False),
+    ("hn_endbr32", "F3 0F 1E FB (endbr32)", bytes.fromhex("f30f1efb"), False),
 ]
 
 TEST_MAIN = r"""

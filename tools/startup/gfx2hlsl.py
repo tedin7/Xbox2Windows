@@ -1924,6 +1924,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
+    nested_saves, nested_restores = {}, {}  # nested if of a wave block: save index -> restore index, and back
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
     def live_at_join(reg, join):
@@ -1978,7 +1979,28 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
-                    scalar = [i for i in range(source + 1, target) if i not in inner and not (no_effect(i) or lane_only(i))]
+                    # A nested if of the block: s_and_saveexec_b64 sK:sK+1, vcc / s_cbranch_execz over a body / the restore
+                    # s_or_b64 exec, exec, sK:sK+1. Every thread holds its own EXEC bit and the saved mask is one bit per
+                    # thread, so narrowing and restoring is per lane in the one-lane model; the per-lane skip of the
+                    # branch is the generic execz rule, checked on its own edge below. The save, the branch and the
+                    # restore are not scalar instructions the wave block would run once per wave.
+                    nested = set()
+                    for i in range(source + 2, target):
+                        if ins[i][2] != 's_cbranch_execz' or i not in edges or not i < edges[i] < target:
+                            continue
+                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[i - 1][3])
+                        done = ins[edges[i]][3]
+                        if (not save or int(save[2]) != int(save[1]) + 1 or done != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
+                                or not ins[i - 2][2].startswith('v_cmp_')
+                                or any(writes_exec(ins[k][2], parse(ins[k][3])[1]) or re.search(r'\bs\[?%s\b|\bs%s\b' % (save[1], save[2]), ins[k][3])
+                                       for k in range(i + 1, edges[i]))
+                                or any(live_at_join(reg, edges[i] + 1) for reg in ('s' + save[1], 's' + save[2]))):
+                            continue
+                        nested |= {i - 1, i, edges[i]}
+                        nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
+                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    scalar = [i for i in range(source + 1, target)
+                              if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
                     # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
                     # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
@@ -2000,6 +2022,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     # land between the compare and the execz branch, and the block itself is straight-line code.
                     entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
+                    def branch_kinds():
+                        """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
+                        kinds = set()
+                        for k in range(source + 1, target):
+                            if k in edges and k not in inner:
+                                where = ('backward' if edges[k] <= k else 'past the block' if edges[k] > target
+                                         else 'forward in the block')
+                                kinds.add('%s %s' % (ins[k][2], where))
+                        return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
                         ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
@@ -2007,7 +2038,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch',
+                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
@@ -2117,7 +2148,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         base_name = re.sub(r'_e(32|64)$', '', name)
         complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
                       and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
-        if name != 's_and_saveexec_b64' and not complement and scalar_registers(asm) & saved_masks:
+        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores
+                and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
             if scc_stale and reads_scc(name, asm):
@@ -2187,6 +2219,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             mask = None
             stale |= pending
             pending.clear()
+        elif index in nested_saves and mask == 'wave_load':
+            mask, scc_stale = ('nest', index), True
+        elif index in nested_restores and mask == ('nest', nested_restores[index]):
+            mask = 'wave_load'
         elif (name == 's_and_saveexec_b64' and mask is None and index > 0 and index not in targets
               and re.fullmatch(r's_and_saveexec_b64 s\[\d+:\d+\], vcc', asm)
               and ins[index - 1][2].startswith('v_cmp_')
@@ -12446,6 +12482,11 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    if sys.argv[1] == '--retry-lifted':
+        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
+        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
+        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
@@ -12513,6 +12554,98 @@ def raise_site(error):
         if not os.path.normcase(os.path.abspath(frame.filename)).startswith(tuple(roots)):
             return frame
     return frames[-1] if frames else None
+
+
+# Refusal families recent translators lift or narrow, by the reason an older build wrote (the first line of its .fail).
+# In the run the --watch pool leaves old refusals alone and the pass after the run retries them, so a lift would reach
+# only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
+# first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
+LIFTED_REASONS = (
+    ('mrtz', r'MRTZ requires one uncompressed depth export'),
+    ('rw-buffer', r'used for a load and a store'),
+    ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
+    ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
+    ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
+    ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
+    ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
+)
+PRE_RUN_RETRY_SECONDS = 180.0
+
+
+def lifted_family(reason, families=LIFTED_REASONS):
+    """The LIFTED_REASONS family whose pattern the refusal text contains, or None."""
+    return next((name for name, pattern in families if re.search(pattern, reason)), None)
+
+
+def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
+    """Keys of the requests an older build refused (a .fail older than since_translator, still pending) for a reason
+    of a lifted family, oldest request first."""
+    return [key for key, lifted in old_failures(out_dir, since_translator, families) if lifted]
+
+
+def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
+    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
+    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
+    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+    rows = []
+    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
+        fail = os.path.join(out_dir, '%016x.fail' % key)
+        try:
+            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
+                continue
+            with open(fail, encoding='utf-8', errors='replace') as handle:
+                reason = handle.readline()
+        except OSError:
+            continue
+        lifted = lifted_family(reason, families) is not None
+        compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
+        rows.append((not lifted, compute, order, key, lifted))
+    return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
+
+
+class RetryReport:
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0):
+        self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
+        self.lifted = lifted
+
+    def line(self):
+        """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
+        the pass after the run."""
+        left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
+        return 'pre-run retry: %d keys (%d in lifted families), ok %d, still refused %d%s, %.0f s' % (
+            self.keys, self.lifted, self.ok, self.refused, left, self.seconds)
+
+
+def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic):
+    """Translate again, on every core, the old refusals (old_failures: lifted families first) before the title starts.
+    No new request is started after `seconds`; what is left keeps its .fail for the pass after the run."""
+    start = clock()
+    rows = old_failures(out_dir, translator_stamp(), families)
+    keys = [key for key, _lifted in rows]
+    results = {}
+    if keys:
+        jobs = max(1, min(jobs or translation_jobs(), len(keys)))
+        if jobs == 1:
+            for key in keys:
+                if clock() - start >= seconds:
+                    break
+                results[key] = translate_one(out_dir, key)
+        else:
+            from concurrent.futures import FIRST_COMPLETED, wait
+            queue, running = list(keys), {}
+            with new_pool(jobs) as pool:
+                while queue or running:
+                    while queue and len(running) < jobs and clock() - start < seconds:
+                        key = queue.pop(0)
+                        running[pool.submit(translate_one, out_dir, key)] = key
+                    if not running:
+                        break
+                    done, _ = wait(running, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        results[running.pop(future)] = future.result()
+    ok = sum(1 for result in results.values() if result == 'ok')
+    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
+                       sum(1 for _key, lifted in rows if lifted))
 
 
 def translate_one(out_dir, key):

@@ -17,6 +17,8 @@
 #include "xmem_page_batch.h"
 #include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/committed_range.h"
+#include "startup_stubs/zero_tail.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -50,6 +52,8 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/gpu_time_probe.h"
+#include "startup_stubs/dispatch_phases.h"
+#include "startup_stubs/dsv_planes.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -77,6 +81,7 @@
 #include "descriptor_heap_type.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
+#include "key_use.h"
 #include "root_constant_store.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -365,9 +370,12 @@ Wrapper* the_device;
 
 // Time spent inside the stand-in per entry-point family, reported with the heartbeat.
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
-       time_pipeline, time_heap, time_copy, time_count };
+       time_pipeline, time_heap, time_copy,
+       // Parts of the pipeline-creation entry points (inside the "pipeline" total, which they overlap): waiting for note_lock,
+       // probing the title's descriptor memory, publishing a request, dumping.
+       time_pipe_lock, time_pipe_probe, time_pipe_publish, time_pipe_dump, time_count };
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
-                                            "pipeline", "heap", "copy"};
+                                            "pipeline", "heap", "copy", "pipe-lock", "pipe-probe", "pipe-publish", "pipe-dump"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
@@ -1532,6 +1540,9 @@ bool gpu_time_on()
 }
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
+// OMSetRenderTargets refused for a depth stencil view with one read-only plane (depth read-only, stencil writable or the
+// reverse): nothing is bound, so every later draw of that pass is 'state_not_ready'. Counted by flags (index: DSV flags 0..3).
+LONG render_target_mixed_dsv[4];
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
@@ -1567,13 +1578,83 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+// Pages of finished list arenas, handed to the next arenas (allocator_lock).
+x2w_upload::FreePages free_upload_pages;
 
 LONG allocator_swaps, allocator_creates;
+LONG64 arenas_recycled_early;  // arenas recycled before their allocator's Reset (reclaim_finished_arenas)
+
+// X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse (fixtures only): the list upload pages are not reused before their
+// allocator's Reset, as before the reuse; startup_upload_page_reuse must then fail.
+// X2W_UPLOAD_PAGE_REUSE=1: list upload pages go to a free pool for the next recordings (at the allocator's Reset, or
+// once a retired recording's submits passed), and a destroyed list stops pinning its allocator. Off by default since
+// Run P (a movie drew white with it on; the suspect is a GPU read of the memory by a list of another allocator, which
+// that allocator's submits do not cover): the pages are then released at the allocator's Reset, as before.
+bool upload_page_reuse()
+{
+    static const bool on = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_UPLOAD_PAGE_REUSE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
+bool upload_reuse_mutant()
+{
+    static const bool on = [] {
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_UPLOAD_PAGES_MUTANT", value, sizeof(value));
+        return n && n < sizeof(value) && std::strcmp(value, "never-reuse") == 0;
+    }();
+    return on;
+}
+
+// allocator_lock held. The list's current recording can never be submitted again (the list was Reset or destroyed):
+// its upload arena may be recycled once the GPU passes the recording's submits.
+void retire_list_arena(Wrapper* list)
+{
+    auto& state = list->own();
+    if (state.list_uploads) state.list_uploads->retired = true;
+    state.list_uploads = nullptr;
+}
+
+// allocator_lock held. Every arena of an idle allocator (no list holds a recording on it and the GPU passed its
+// submits) goes back to the free pages.
+void recycle_arenas(DesktopAllocator& allocator)
+{
+    if (upload_page_reuse())
+        for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
+    allocator.uploads.clear();
+}
+
+// allocator_lock held. A list recorded again and again on one allocator that the title rarely resets would otherwise
+// keep one arena (at least one 64 KB page) per recording until that Reset: the arenas whose recording is retired and
+// finished on the GPU are recycled now.
+void reclaim_finished_arenas(DesktopAllocator& allocator)
+{
+    if (!upload_page_reuse() || upload_reuse_mutant()) return;
+    auto& arenas = allocator.uploads;
+    for (auto it = arenas.begin(); it != arenas.end();) {
+        if (!(*it)->finished()) {
+            ++it;
+            continue;
+        }
+        (*it)->recycle(free_upload_pages);
+        it = arenas.erase(it);
+        ++arenas_recycled_early;
+    }
+}
 
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    retire_list_arena(list);
+    // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
+    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
+        if (found->second) --found->second->lists;
+        list_recordings.erase(found);
+    }
     ReleaseSRWLockExclusive(&allocator_lock);
 }
 
@@ -1609,11 +1690,13 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
     if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
         try {
             if (!state.list_uploads) {
+                reclaim_finished_arenas(*found->second);
                 auto arena = std::make_unique<x2w_upload::Arena>();
                 found->second->uploads.push_back(std::move(arena));
                 state.list_uploads = found->second->uploads.back().get();
             }
-            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment);
+            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment,
+                                                          !upload_page_reuse() || upload_reuse_mutant() ? nullptr : &free_upload_pages);
         } catch (const std::bad_alloc&) {
             // Refuse the allocation without invalidating any range already recorded.
         }
@@ -1740,7 +1823,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
     if (next) {
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
-            next->uploads.clear();
+            recycle_arenas(*next);
             next->indexed_validation.clear();
             next->scratches.clear();
             next->submits.clear();
@@ -1787,6 +1870,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     submit.submitted(chunks, signaled);
     if (signaled) {
         for (Wrapper* list : lists) {
+            if (auto* arena = list->own().list_uploads) arena->submitted(fence, value);
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
             auto& submits = found->second->submits;
@@ -1795,8 +1879,10 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             else same->second = value;
         }
     } else {
-        for (Wrapper* list : lists)
+        for (Wrapper* list : lists) {
+            if (auto* arena = list->own().list_uploads) arena->untracked = true;
             if (const auto found = list_recordings.find(list); found != list_recordings.end()) found->second->untracked = true;
+        }
         static LONG failures;
         if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
     }
@@ -1844,6 +1930,47 @@ extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_internal_queue(voi
     return *queue != nullptr;
 }
 
+// The list upload arenas and the allocators behind them, for the x2w-upload-pages heartbeat line and fixtures.
+struct UploadPageStats {
+    unsigned long long title_allocators, desktop_allocators, creates, swaps, arenas, recycled_early;
+    unsigned long long live_pages, live_bytes, free_pages, created, reused;
+};
+UploadPageStats upload_page_stats()
+{
+    UploadPageStats stats{};
+    AcquireSRWLockShared(&allocator_lock);
+    stats.title_allocators = title_allocators.size();
+    for (const auto& entry : title_allocators) {
+        stats.desktop_allocators += entry.second.pool.size();
+        for (const DesktopAllocator* allocator : entry.second.pool) stats.arenas += allocator->uploads.size();
+    }
+    stats.recycled_early = static_cast<unsigned long long>(arenas_recycled_early);
+    ReleaseSRWLockShared(&allocator_lock);
+    stats.creates = static_cast<unsigned long long>(InterlockedCompareExchange(&allocator_creates, 0, 0));
+    stats.swaps = static_cast<unsigned long long>(InterlockedCompareExchange(&allocator_swaps, 0, 0));
+    const auto& pages = x2w_upload::page_counters;
+    stats.live_pages = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.live), 0, 0));
+    stats.live_bytes = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.live_bytes), 0, 0));
+    stats.free_pages = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.free), 0, 0));
+    stats.created = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.created), 0, 0));
+    stats.reused = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.reused), 0, 0));
+    return stats;
+}
+
+// Fixtures: list upload pages alive (in an arena or the free pool), in the free pool, ever created, and handed out
+// again from the pool; and the arenas recycled before their allocator's Reset.
+extern "C" __declspec(dllexport) void x2w_d3d12_upload_page_stats(unsigned long long* live, unsigned long long* free,
+                                                                   unsigned long long* created, unsigned long long* reused,
+                                                                   unsigned long long* recycled_early)
+{
+    const UploadPageStats stats = upload_page_stats();
+    if (live) *live = stats.live_pages;
+    if (free) *free = stats.free_pages;
+    if (created) *created = stats.created;
+    if (reused) *reused = stats.reused;
+    if (recycled_early) *recycled_early = stats.recycled_early;
+}
+
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
 extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
 {
@@ -1873,7 +2000,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             target = nullptr;
             for (DesktopAllocator* spare : title.pool) {
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
-                    spare->uploads.clear();
+                    recycle_arenas(*spare);
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
                     spare->submits.clear();
@@ -1919,7 +2046,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             discard_upload_chunks(state.upload_chunks, upload_chunks.data());
-            state.list_uploads = nullptr;
+            retire_list_arena(self);
             state.list_scratch = nullptr;
             state.list_ready = false;
             state.list_open = true;
@@ -2293,7 +2420,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_root_translation_blob(voi
     Wrapper* w = as_wrapper(root);
     if (!w || w->own().kind != root_signature_kind) return 0;
     if (heap_flags) *heap_flags = root_heap_flags(w);
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto found = root_blobs().find(w);
     const std::size_t bytes = found == root_blobs().end() ? 0 : found->second.size();
     if (bytes && out) std::memcpy(out, found->second.data(), bytes < capacity ? bytes : capacity);
@@ -2738,6 +2865,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
+    std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
@@ -2878,6 +3006,18 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
+        if (it->resource != resource) continue;
+        // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
+        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
+            x2w_dsv::move_plane(list, *it, 0, state);
+            return;
+        }
+        // Anything else wants one state for the whole resource: bring both planes back to COMMON first.
+        x2w_dsv::release(list, *it);
+        pass.mixed.erase(it);
+        break;
+    }
     for (auto& known : pass.states) {
         if (known.first != resource) continue;
         if (known.second != state) {
@@ -2892,6 +3032,9 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 // State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
 D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 {
+    for (const auto& planes : pass_of(self).mixed)
+        if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
+            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     for (const auto& known : pass_of(self).states)
         if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -2908,6 +3051,7 @@ void release_targets(Wrapper* self)
     Pass& pass = pass_of(self);
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
     pass = Pass{};
 }
 
@@ -2918,7 +3062,10 @@ void retire_drop_recording(Wrapper* list)
 {
     residency_discard_list(list);
     if (!release_retired_enabled()) return;
-    if (list->own().pass) pass_of(list).states.clear();
+    if (list->own().pass) {
+        pass_of(list).states.clear();
+        pass_of(list).mixed.clear();
+    }
     retire_discard_holds(list);
 }
 
@@ -3667,7 +3814,7 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 {
     DXGI_FORMAT format = target->GetDesc().Format;
     if (const std::uint32_t id = shadow_id(desktop_handle)) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
         if (id - 1 < view_records().size() && view_records()[id - 1].desc_bytes >= 4)
             std::memcpy(&view_format, view_records()[id - 1].desc, 4);
@@ -3691,7 +3838,7 @@ ResolvedView resolve_view(u64 handle, int slot)
     bool known = false;
     bool materialized = false;
     if (const std::uint32_t id = shadow_id(handle)) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         known = id - 1 < view_records().size();
         if (known) {
             record = view_records()[id - 1];
@@ -3826,7 +3973,7 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
 ID3D12DescriptorHeap* owning_view_heap(u64 gpu)
 {
     u64 owner = 0;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
         const u64 offset = gpu - heap.desktop_gpu;
@@ -3982,6 +4129,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bool mixed_planes = false;  // a view with one read-only plane: dsv_state is the depth plane's, the stencil plane gets the other
+    D3D12_RESOURCE_STATES stencil_plane_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
         if (!resolved) {
@@ -4005,8 +4154,11 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             // A format without a stencil plane has no second plane to disagree with.
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
-                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
-                return;
+                // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
+                mixed_planes = true;
+                InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
+                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets: depth stencil view with one read-only plane (flags 0x%x) bound with per-plane states", view.dsv_flags);
+                stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
@@ -4023,7 +4175,24 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         pass.target_formats[i] = formats[i];
         if (i == 0) pass.target0 = targets[i];
     }
-    if (dsv_target) require_state(self, dsv_target, dsv_state);
+    if (dsv_target && mixed_planes) {
+        // A whole-resource state it was in is dropped to COMMON first; then each plane moves to its own state.
+        for (auto it = pass.states.begin(); it != pass.states.end(); ++it)
+            if (it->first == dsv_target) {
+                transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), dsv_target, it->second, D3D12_RESOURCE_STATE_COMMON);
+                pass.states.erase(it);
+                break;
+            }
+        auto found = std::find_if(pass.mixed.begin(), pass.mixed.end(), [&](const x2w_dsv::Planes& p) { return p.resource == dsv_target; });
+        if (found == pass.mixed.end()) {
+            pass.mixed.push_back(x2w_dsv::planes_of(dsv_target));
+            found = pass.mixed.end() - 1;
+        }
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
+    } else if (dsv_target) {
+        require_state(self, dsv_target, dsv_state);
+    }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
     pass.bound_depth = dsv_target;
@@ -4264,7 +4433,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         // recorded either before this submission's user value or after it, as the desktop queue gets them.
         auto order = linear_queue_order(queue, false);
         // Pin the closed recording and its allocator through submission bookkeeping.
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         AcquireSRWLockExclusive(&allocator_lock);
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
@@ -4315,7 +4484,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         }
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
         order.release();
         check_device("CommandQueue execute", 35);
         return;
@@ -4773,7 +4942,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     if constexpr (N >= 19 && N <= 21) {
         bool tracked = false;
         if (args[D]) {
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             tracked = shadow_slot(args[D]) != nullptr;
             ReleaseSRWLockShared(&note_lock);
         }
@@ -5064,7 +5233,7 @@ void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT
     };
     std::vector<Candidate> candidates;
     try {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         std::uint32_t room = 0;
         const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
         if (ids && count <= room) {
@@ -5093,7 +5262,7 @@ void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT
         if (!real) continue;
         const D3D12_RESOURCE_DESC real_desc = real->GetDesc();
         const auto view_mode = view_defaults_mode();
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         std::uint32_t room = 0;
         const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
         // The slot must still name the record, and the record still the texture (the title may have overwritten it).
@@ -5801,7 +5970,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     std::vector<PendingSrvRefresh> refreshes;
     const u64 target_wrapper = reinterpret_cast<u64>(w);
     try {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (const HeapInfo& h : heap_infos()) {
             if (!h.shadow || h.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
             for (std::uint32_t i = 0; i < h.count; ++i) {
@@ -5825,7 +5994,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         const auto view_mode = view_defaults_mode();
         // Hold note_lock shared across revalidation and CreateShaderResourceView so concurrent note_view /
         // note_copy / retire_drop_heap_views (all exclusive) cannot overwrite a slot or retire a heap mid-write.
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (const auto& item : refreshes) {
             const HeapInfo* target_heap = nullptr;
             for (const HeapInfo& h : heap_infos()) {
@@ -5920,7 +6089,7 @@ void retire_release_view_ref(const void* object)
 void retire_drop_heap_views(Wrapper* heap)
 {
     if (!release_retired_enabled() || !heap) return;
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     for (HeapInfo& h : heap_infos()) {
         if (h.wrapper != reinterpret_cast<u64>(heap) || !h.shadow) continue;
         for (std::uint32_t i = 0; i < h.count; ++i) {
@@ -5939,7 +6108,7 @@ void retire_drop_heap_views(Wrapper* heap)
 bool retire_address_has_live_user(u64 address, const Wrapper* skip)
 {
     bool other_live = false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         if (wrapper == skip || reinterpret_cast<u64>(wrapper->own().title_memory) != address) return false;
         if (InterlockedCompareExchange(const_cast<LONG*>(&wrapper->own().refs), 0, 0) > 0 ||
@@ -6195,9 +6364,9 @@ void drain_retired_resources()
             lazy_textures().erase(drop.wrapper);
         }
         if (drop.resource) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             texture_uploads().erase(drop.resource);
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             drop.resource->Release();
             const LONG64 total = InterlockedIncrement64(&retire_freed);
             if (total <= 8 || total % 1000 == 0) log("x2w-d3d12 retire: %lld desktop references dropped", total);
@@ -6271,7 +6440,7 @@ void retire_reasons_collect(RetireReasonReport& report)
 {
     // 1: which resources a tracked slot-18 descriptor names, and whether one of those lies in a shader-visible heap.
     std::unordered_map<const Wrapper*, bool> viewed;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     try {
         for (const HeapInfo& h : heap_infos()) {
             if (!h.shadow) continue;
@@ -6420,7 +6589,7 @@ std::size_t view_census_line(char* out, std::size_t capacity)
     if (!out || !capacity) return 0;
     out[0] = 0;
     if (!view_census_enabled()) return 0;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const std::size_t used = view_census_format(out, capacity, "distinct by slot");
     ReleaseSRWLockShared(&note_lock);
     return used;
@@ -6448,7 +6617,7 @@ extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long ti
 {
     *out = {};
     out->shadow = shadow_id(desktop_cpu_handle(title_handle));
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     out->records = view_records().size();
     out->materialized = view_materialized().size();
     out->ids = view_ids().size();
@@ -6484,9 +6653,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
         out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
         if (auto* real = static_cast<ID3D12Resource*>(r->own().real)) {
-            AcquireSRWLockExclusive(&draw_lock);
+            draw_lock_acquire_exclusive();
             out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
-            ReleaseSRWLockExclusive(&draw_lock);
+            draw_lock_release_exclusive();
             AcquireSRWLockShared(&target_lock);
             for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
             ReleaseSRWLockShared(&target_lock);
@@ -6691,7 +6860,7 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resou
     if (!w || w->own().kind != resource_kind) return FALSE;
     const u64 base = reinterpret_cast<u64>(w->own().title_memory);
     if (!base) return FALSE;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const bool indexed = resource_address_index().contains(base, static_cast<const Wrapper*>(w));
     ReleaseSRWLockShared(&note_lock);
     return indexed ? TRUE : FALSE;
@@ -6701,9 +6870,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resou
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_texture_upload_probe(void* desktop_resource)
 {
     if (!desktop_resource) return FALSE;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     const bool cached = texture_uploads().count(static_cast<ID3D12Resource*>(desktop_resource)) != 0;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     return cached ? TRUE : FALSE;
 }
 
@@ -6968,7 +7137,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
-    dump_pipeline("pipeline", N, desc, 0x300);
+    {
+        Timed dump_timed(time_pipe_dump);
+        dump_pipeline("pipeline", N, desc, 0x300);
+    }
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     if constexpr (N == 57) {
         if (x2w_local::env_on("X2W_REFUSE_FIXED_MESH") && is_fixed_mesh57_descriptor(desc)) {
@@ -6988,6 +7160,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (!*out) return E_OUTOFMEMORY;
     if constexpr (N == 67) {
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
+        Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
             static_cast<Wrapper*>(*out)->own().compute_request_key = key;
             static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
@@ -7213,12 +7386,12 @@ void draw_overlay(LONG frame, double seconds)
 void log_gpu_time(LONG frame, ULONGLONG now_ms)
 {
     static ULONGLONG last_ms;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     auto& probe = gpu_time_probe();
     probe.harvest(static_cast<std::uint64_t>(frame));
     const auto r = probe.stats.take(last_ms ? static_cast<double>(now_ms - last_ms) : 0);
     const unsigned skipped = probe.skipped, failed = probe.failed;
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
     last_ms = now_ms;
     log("x2w-gpu-time frame %ld: %llu frames, avg %.2f ms, max %.2f ms, busy %.0f ms of %.0f ms, GPU idle %.0f%% (stamps skipped %u, failed %u)", frame,
         static_cast<unsigned long long>(r.frames), r.avg_ms, r.max_ms, r.busy_ms, r.wall_ms, r.idle_share * 100.0, skipped, failed);
@@ -7361,6 +7534,18 @@ void report_budget(ID3D12CommandQueue* queue)
     }
     log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s sysmem-fallback=%llu bytes=%llu", local, nonlocal, text, counts.unmeasured,
         commit, pool, job, counts.sysmem_fallbacks, counts.sysmem_fallback_bytes);
+    // Who holds the upload memory: the list arenas (their pages and the free pool), the allocators behind the title's
+    // allocators, and the linear-buffer staging pool (Run N: +3,000 upload objects of about 90 KB after loading).
+    const UploadPageStats uploads = upload_page_stats();
+    X2wLinearBufferTotals linear{};
+    const bool linear_on = x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off;
+    if (linear_on) linear_buffers().totals(&linear);
+    char staging[48] = "staging=off";
+    if (linear_on) std::snprintf(staging, sizeof(staging), "staging=%llu", static_cast<unsigned long long>(linear.staging_created));
+    log("x2w-upload-pages list pages=%llu (%llu MiB) free=%llu created=%llu reused=%llu arenas=%llu recycled_early=%llu "
+        "allocators=%llu desktop=%llu creates=%llu swaps=%llu %s", uploads.live_pages, uploads.live_bytes >> 20,
+        uploads.free_pages, uploads.created, uploads.reused, uploads.arenas, uploads.recycled_early, uploads.title_allocators,
+        uploads.desktop_allocators, uploads.creates, uploads.swaps, staging);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7532,10 +7717,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
-        AcquireSRWLockExclusive(&draw_lock);
+        draw_lock_acquire_exclusive();
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
-        ReleaseSRWLockExclusive(&draw_lock);
+        draw_lock_release_exclusive();
     }
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
@@ -7558,12 +7743,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
-        log("x2w-render manifest lookups: file opens under draw_lock, first lookups %lld, retries %lld (must be 0); manifests read by the background thread %lld",
-            manifest_source().first_opens_under_lock(), manifest_source().retry_opens_under_lock(), manifest_source().background_reads());
+        log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+        log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
+            manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
+        log_key_use_census();
+        log_dispatch_phases();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
         if (now - last_key_report >= 60000) {
@@ -7609,6 +7797,18 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (view_census_line(line, sizeof(line))) log("%s", line);
         }
         {
+            char line[400];
+            if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[400];
+            if (draw_lock_stats_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[500];
+            if (dispatch_phase_line(line, sizeof(line))) log("%s", line);
+        }
+        {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
             char text[512];
@@ -7620,6 +7820,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                                           static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
             }
             log("x2w-d3d12 time inside the stand-in since the last report (ms/calls):%s", text);
+            log("x2w-d3d12 list copies: buffer %ld, resource %ld, resolves %ld, refused %ld, buffer copies made in title memory %ld",
+                InterlockedCompareExchange(&list_buffer_copies, 0, 0), InterlockedCompareExchange(&list_resource_copies, 0, 0),
+                InterlockedCompareExchange(&list_resolves, 0, 0), InterlockedCompareExchange(&list_copies_refused, 0, 0),
+                InterlockedCompareExchange(&list_title_memory_copies, 0, 0));
             used = 0;
             text[0] = 0;
             for (int i = 0; i < 256; ++i) {

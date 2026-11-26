@@ -109,6 +109,12 @@ def main(probe):
         assert busy.returncode == 0 and (busy_dir / "finished.txt").exists(), (busy.returncode, busy.stdout, busy.stderr)
         assert took < 20 and (busy_dir / "window.png").exists(), (took, busy.stdout)
         assert "window capture: 160x120 -> window.png" in busy.stdout and "skipped" not in busy.stdout, busy.stdout
+        # events.txt follows the modules and threads: an unloaded DLL is logged and dropped, thread creation and exit carry
+        # the live thread count.
+        _, churn_dir = run(probe, work, "churn", "--timeout", "3", extra_env={"STARTUP_WINDOW_PROBE_CHURN": "1"})
+        events = (churn_dir / "events.txt").read_text(encoding="utf-8", errors="replace")
+        assert re.search(r"load .*msimg32\.dll at 0x", events, re.I) and re.search(r"unload .*msimg32\.dll at 0x", events, re.I), events[:2000]
+        assert re.search(r"thread \d+ created \(\d+ live\)", events) and re.search(r"thread \d+ exited \(\d+ live\)", events), events[:2000]
     print("startup_debug_window: PASS (red then blue saved once each, unchanged frames skipped, change time reported, "
           "window.png unchanged, off by default, bad interval refused; commit headroom ends a run, one MiB does not)")
     return 0

@@ -117,7 +117,7 @@ void residency_tick(LONG frame)
     if (!residency_observe()) return;
     static x2w_residency::Pressure pressure;
     const x2w_residency::Config config;
-    AcquireSRWLockExclusive(&draw_lock);
+    draw_lock_acquire_exclusive();
     std::vector<x2w_residency::Texture> known;
     unsigned long long used = 0, budget = 0;
     const char* limit = std::getenv("X2W_D3D12_RESIDENCY_LIMIT_MB");
@@ -170,5 +170,5 @@ void residency_tick(LONG frame)
             InterlockedAdd64(&residency_evicted_bytes, static_cast<LONG64>(found->second.bytes));
         }
     }
-    ReleaseSRWLockExclusive(&draw_lock);
+    draw_lock_release_exclusive();
 }

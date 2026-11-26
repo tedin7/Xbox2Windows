@@ -212,9 +212,11 @@ def check_pending_manifest_upgrade(failures):
                 return subprocess.CompletedProcess(command, 1, '', 'synthetic compiler failure')
             return subprocess.CompletedProcess(command, 0, '', '')
 
-        def pending(configured):
+        def pending(configured, retry=False):
             request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None)
+            retry_env = {'X2W_RETRY_FAILED': '1'} if retry else {}
             with fxc_environment(work, configured, os.path.join(work, 'none')), \
+                 mock.patch.dict(os.environ, retry_env), \
                  mock.patch.object(sys, 'argv', ['gfx2hlsl.py', '--pending', work]), \
                  mock.patch.object(gfx2hlsl, 'load_request', return_value=request), \
                  mock.patch.object(subprocess, 'run', side_effect=compile_shader), \
@@ -236,8 +238,12 @@ def check_pending_manifest_upgrade(failures):
         if not failure.is_file():
             failures.append('a failed compilation did not write a failure report')
 
+        # A refusal the same translator build wrote is final: --pending leaves it alone unless X2W_RETRY_FAILED=1.
+        runs.clear()
+        if pending(str(fxc)) or runs or not failure.is_file():
+            failures.append('pending retried a refusal the same translator build wrote')
         fail_pixel = False
-        if pending(str(fxc)) != '%s: ok\n' % key or not all(path.is_file() for path in (vs, ps)):
+        if pending(str(fxc), retry=True) != '%s: ok\n' % key or not all(path.is_file() for path in (vs, ps)):
             failures.append('pending did not retry and publish both shader stages')
             return
         if (vs.read_bytes(), ps.read_bytes()) != (b'vs_5_1', b'ps_5_1'):
@@ -267,7 +273,7 @@ def check_pending_manifest_upgrade(failures):
                     failures.append('pending did not attempt to publish the changed manifest')
             if manifest.exists():
                 failures.append('failed publication left an old manifest beside the new bytecode')
-            if pending(str(fxc)) != '%s: ok\n' % key or manifest.read_text() != 'updated bindings\n':
+            if pending(str(fxc), retry=True) != '%s: ok\n' % key or manifest.read_text() != 'updated bindings\n':
                 failures.append('pending did not retry an interrupted manifest publication')
 
 

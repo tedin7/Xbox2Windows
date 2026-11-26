@@ -50,9 +50,12 @@ Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
 if ($env:STUB_STALL) {
     # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
     Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
-    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 60 }
+    $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 120 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    # what ended the wait: the stop file (the watchdog worked) or the stub's own deadline (it did not)
+    $ended = if (Test-Path -LiteralPath (Join-Path $LogDir "stop")) { "stop file" } else { "deadline" }
+    Set-Content -LiteralPath (Join-Path $LogDir "wait_ended.txt") -Value $ended
     Set-Content -LiteralPath (Join-Path $LogDir "finished.txt") -Value "stub finished.txt"
 }
 exit 0
@@ -117,6 +120,8 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
     env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
+    if "-ScanRoots" not in args:
+        args = (*args, "-ScanRoots", str(tree / "scan_none"))  # no search of the real AppData during the checks
     if "-FinishTranslateSeconds" not in args:
         args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
     script = str(tree / "tools" / "startup" / "tester_run.ps1")
@@ -151,7 +156,7 @@ def check_shell(shell):
         assert not list((tree / "out" / "tester").glob("*.zip")) if (tree / "out" / "tester").exists() else True
 
         rev_file.write_text(REV_CPP % head, encoding="ascii")
-        ok = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "10")
+        ok = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "10", "-Input", "menus")
         assert ok.returncode == 0, (shell, ok.stdout, ok.stderr)
         zips = sorted((tree / "out" / "tester").glob("report_%s_*.zip" % head))
         assert len(zips) == 1, zips
@@ -180,9 +185,13 @@ def check_shell(shell):
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
         assert manifest["gpu_time"] is True and manifest["env"].get("X2W_GPU_TIME") == "1", manifest  # GPU time per frame on
         assert manifest["hdd_mode"] is True and manifest["env"].get("X2W_STORAGE_HDD") == "1", manifest  # HDD mode on by default
-        # The default menus script: clock-free privacy passes (up x3, one box, down to Conferma, A), see tester_pack.privacy_cycles.
-        assert args["InputScript"].startswith("40@5+1.2,40@7+1.2,40@9+1.2,80@11+1.2,80@13+1.2,4@15+1.2"), args["InputScript"]
+        saves = tree / "out" / "startup" / "saves"  # the title's save folder: one per tree, kept across runs
+        assert saves.is_dir() and manifest["save_root"].replace("/", "\\").rstrip("\\").endswith("out\\startup\\saves") and manifest["fresh_save"] is False, manifest
+        assert manifest["env"].get("X2W_STORAGE_PATH", "").endswith("saves\\") and manifest["saves_at_start"] == 0 and manifest["saves_at_end"] == 0 and manifest["saves_files"] == [], manifest
         assert manifest["cache_repaired"] == -1, manifest  # no repair tool in the scratch tree: skipped with a warning, the run goes on
+        # The default menus script: clock-free privacy passes, a press every second held 0.8 s (tester_pack.privacy_cycles)
+        assert args["InputScript"].startswith("40@5+0.8,40@6+0.8,4@7+0.8,80@8+0.8,4@9+0.8,80@10+0.8,4@11+0.8"), args["InputScript"]
+        assert manifest["input_labels"][2] == "privacy pass 1: tick box 1" and len(manifest["input_labels"]) == len(args["InputScript"].split(",")), manifest["input_labels"][:3]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
             "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
@@ -221,18 +230,21 @@ def check_shell(shell):
             mem_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not mem_args["LazyMemory"] and mem_manifest["lazy_memory"] is False
         assert mem_manifest["stop_reason"] == "" and mem_manifest["stall_seconds"] == 90, mem_manifest
+        assert mem_manifest["end_cause"].startswith("unknown: the debugger wrote no summary"), mem_manifest["end_cause"]  # the stub writes no summary
         # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
         # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
-        started = time.monotonic()
         stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
                              "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
         assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
-        assert time.monotonic() - started < 50, "the run did not end through the stop file"
         assert "tester_run: STALL STOP at " in stalled.stdout and "frozen:" in stalled.stdout, stalled.stdout
         newest_stall = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_stall) as z:
             stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             assert "stall_stop.json" in z.namelist(), z.namelist()
+            # Not a wall-clock limit (a loaded VM with a release build running beside took 130 s for the whole test): the stub says
+            # whether the stop file or its own deadline ended its wait.
+            assert z.read("wait_ended.txt").decode("utf-8-sig").strip() == "stop file", "the run did not end through the stop file"
+        assert stall_manifest["end_cause"].startswith("watchdog at ") and "frozen:" in stall_manifest["end_cause"], stall_manifest
         assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
                          "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
@@ -243,6 +255,9 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_snap) as z:
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
+        # No -Input given: the default is accept, only A (never Start)
+        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
+        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept)", "press A #2 (accept)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
@@ -271,6 +286,38 @@ def check_shell(shell):
             (cache / name).write_bytes(b"x")
         again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
+
+        # A save written by one run is still there for the next; -FreshSave wipes it and the manifest says so.
+        (saves / "x2w-gamesave").mkdir(exist_ok=True)
+        (saves / "x2w-gamesave" / "profile.bin").write_bytes(b"accepted")
+        kept = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert kept.returncode == 0 and (saves / "x2w-gamesave" / "profile.bin").read_bytes() == b"accepted", kept.stdout
+        assert "1 files kept from earlier runs" in kept.stdout, kept.stdout
+        fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FreshSave")
+        assert fresh.returncode == 0 and not (saves / "x2w-gamesave" / "profile.bin").exists(), fresh.stdout
+        newest_fresh = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_fresh) as z:
+            fresh_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert fresh_manifest["fresh_save"] is True and fresh_manifest["saves_at_end"] == 0 and fresh_manifest["saves_at_start"] == 0, fresh_manifest
+
+        # Files written during the run under a search folder are listed in the manifest (where the title keeps its choices);
+        # a file older than the run start is not.
+        scan = tree / "scan_here"
+        (scan / "Vendor" / "Game").mkdir(parents=True, exist_ok=True)
+        written = scan / "Vendor" / "Game" / "privacy.dat"
+        written.write_bytes(b"1")
+        later = time.time() + 3600  # modified after the run starts
+        os.utime(written, (later, later))
+        stale = scan / "Vendor" / "Game" / "old.dat"
+        stale.write_bytes(b"1")
+        os.utime(stale, (1000000000, 1000000000))
+        scanned = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-ScanRoots", str(scan))
+        assert scanned.returncode == 0, (scanned.stdout, scanned.stderr)
+        newest_scan = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_scan) as z:
+            scan_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        listed = scan_manifest["files_written"]
+        assert len(listed) == 1 and listed[0].endswith("privacy.dat (1 bytes)"), scan_manifest["files_written"]
 
         # A tracked change in the runtime sources makes the checkout dirty: the build revision must carry -dirty to match.
         device = tree / "src" / "device.cpp"

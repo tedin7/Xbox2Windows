@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace {
 COLORREF g_color = RGB(200, 30, 30);
@@ -31,8 +32,29 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 }  // namespace
 
+DWORD WINAPI short_thread(void*) { return 0; }
+
 int main()
 {
+    // STARTUP_WINDOW_PROBE_MESSAGE=1: one 400+ character Unicode debug message with CRLF inside and a unique last word.
+    // STARTUP_WINDOW_PROBE_BREAK=1: after one second a __debugbreak() in the main image (a title soft assert).
+    char mode[8];
+    if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_MESSAGE", mode, sizeof(mode)) && mode[0] == '1') {
+        std::wstring message = L"probe-msg-start \u00e8\u4e2d\r\nsecond line\r\n";
+        while (message.size() < 400) message += L"0123456789 \u00fc ";
+        message += L"\r\nprobe-msg-suffix-7f3a";
+        OutputDebugStringW(message.c_str());
+    }
+    // STARTUP_WINDOW_PROBE_CHURN=1: load and free a DLL, start a thread that ends at once (the debugger logs the unload, and
+    // the thread's creation and exit with the live thread count).
+    char churn[8];
+    if (GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_CHURN", churn, sizeof(churn)) && churn[0] == '1') {
+        if (HMODULE module = LoadLibraryW(L"msimg32.dll")) FreeLibrary(module);
+        if (HANDLE thread = CreateThread(nullptr, 0, short_thread, nullptr, 0, nullptr)) {
+            WaitForSingleObject(thread, 5000);
+            CloseHandle(thread);
+        }
+    }
     WNDCLASSW wc{};
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpfnWndProc = window_proc;
@@ -66,6 +88,13 @@ int main()
         // STARTUP_WINDOW_PROBE_DEBUG_MS=<ms>: from then on the window thread raises a debug event (OutputDebugString) every pass;
         // it is frozen until the debugger continues it, which the debugger must keep doing while it ends the run.
         if (debug_ms && GetTickCount64() - begin >= debug_ms) OutputDebugStringA("window-probe debug event\n");
+        static bool broke = false;
+        if (!broke && GetTickCount64() - begin >= 1000 && GetEnvironmentVariableA("STARTUP_WINDOW_PROBE_BREAK", mode, sizeof(mode)) && mode[0] == '1') {
+            broke = true;
+            __debugbreak();
+            std::printf("window-probe continued after the breakpoint\n");
+            std::fflush(stdout);
+        }
         if (hang_ms && GetTickCount64() - begin >= hang_ms) {
             std::printf("window-probe hung\n");
             std::fflush(stdout);

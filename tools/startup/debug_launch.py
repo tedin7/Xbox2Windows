@@ -1,6 +1,6 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--capture-every S] [--capture-menu-every S] [--commit-headroom-mib N] [--commit-warn-mib N] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -31,7 +31,7 @@ import host_cpu  # noqa: E402
 
 CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
-from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
+from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
@@ -144,6 +144,13 @@ def main():
         capture_every = -1
     if not (capture_every == 0 or 1 <= capture_every < float("inf")):
         print("expected --capture-every of 0 (off) or a finite number of seconds that is at least 1")
+        return 2
+    try:
+        capture_menu_every = float(opts.get("--capture-menu-every", 0))  # faster pictures in the menu phase; 0 = off
+    except ValueError:
+        capture_menu_every = -1
+    if not (capture_menu_every == 0 or 1 <= capture_menu_every < float("inf")):
+        print("expected --capture-menu-every of 0 (off) or a finite number of seconds that is at least 1")
         return 2
     try:
         headroom_mib = int(opts.get("--commit-headroom-mib", 0))  # end the run when the system commit has less free; 0 = off
@@ -833,14 +840,20 @@ def main():
     series = Series(logdir) if capture_every else None
     capture_done = threading.Event()
 
+    pace = MenuPace(capture_every, capture_menu_every)
+
     def capture_loop():
-        while not capture_done.wait(capture_every):
+        while not capture_done.wait(pace.interval()):
             try:
                 frame = grab_window()
                 if isinstance(frame, str):
                     series.miss()
                 else:
-                    series.offer(time.time() - start, frame[0], frame[1], frame[2])
+                    seconds = time.time() - start
+                    series.offer(seconds, frame[0], frame[1], frame[2])
+                    if pace.note(seconds, frame_mean(frame[0], frame[1], frame[2])):
+                        print(f"  window captures: the menu phase ended at {seconds:.0f} s (loading-like picture), "
+                              f"pictures every {capture_every:g} s from here", flush=True)
             except Exception:  # diagnostics only: the run goes on, the tick is counted
                 series.miss()
 
@@ -956,15 +969,19 @@ def main():
                             arm(base + (address - local))
             if h_file:
                 k32.CloseHandle(wt.HANDLE(h_file))
+        elif code == UNLOAD_DLL:
+            base = struct.unpack_from("<Q", event, 16)[0]
+            log(f"{time.time() - start:7.3f} unload {modules.pop(base, '?')} at {base:#x}")  # the mapping is gone: where() must not name it
         elif code == CREATE_THREAD:
-            log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} created ({len(live_threads)} live)")
             h_thread = struct.unpack_from("<Q", event, 16)[0]
             if h_thread:
                 os_handles[tid] = h_thread
             window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            log(f"{time.time() - start:7.3f} thread {tid} exited ({len(live_threads)} live)")
             window.finish(tid)
             os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
@@ -976,12 +993,14 @@ def main():
             addr, unicode, length = struct.unpack_from("<QHH", event, 16)
             raw = read(addr, length * (2 if unicode else 1))
             text = raw.decode("utf-16-le" if unicode else "latin-1", errors="replace").rstrip("\0\r\n")
-            log(f"{time.time() - start:7.3f} debug-output {text[:300]}")
+            # One record per message, whole: line breaks are escaped (a CRLF used to split the record in two) and nothing is cut.
+            log(f"{time.time() - start:7.3f} debug-output {text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
         elif code == EXCEPTION:
             ex_code, ex_flags, _, ex_addr, nparams = struct.unpack_from("<IIQQI", event, 16)
             params = struct.unpack_from("<" + "Q" * min(nparams, 15), event, 16 + 32) if nparams else ()
             first = struct.unpack_from("<I", event, 16 + 152)[0]
             label = NAMES.get(ex_code, "")
+            disposition = ""   # how the exception was answered, written with the exception's own log line
             if ex_code == 0x80000003 and ex_addr in breakpoints:
                 handle_breakpoint(tid, ex_addr)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -1024,9 +1043,11 @@ def main():
                         log(f"{time.time() - start:7.3f} host-cpu {name} at {where(ex_addr)} rewritten")
                     k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                     continue
-            log(f"{time.time() - start:7.3f} exception {ex_code:#010x} {label} at {where(ex_addr)} "
-                f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]}")
+            def log_exception(how):
+                log(f"{time.time() - start:7.3f} exception {ex_code:#010x} {label} at {where(ex_addr)} "
+                    f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]} thread {tid}: {how}")
             if ex_code == 0x80000003 and not loader_break_seen:
+                disposition = "continued (the loader's initial breakpoint; hooks armed)"
                 loader_break_seen = True  # the loader's initial breakpoint
                 for addr in hooks:
                     arm(addr)
@@ -1043,19 +1064,30 @@ def main():
                   and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
+                patched = False
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
+                    patched = True
+                disposition = ("continued (soft assert, %d of %s skipped%s)" % (
+                    sum(asserts_seen.values()), "all" if skip_asserts == -1 else skip_asserts,
+                    ", int3 patched to a nop" if patched else ""))
                 status = DBG_CONTINUE  # rip is already past the int3
             elif not ending and ((not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                                 main_base <= ex_addr < main_base + 0x10000000)):
                 stop = (ex_code, ex_addr, tid, first, params)
+                log_exception("stopped (not continued: the debugger ends the run here)")
                 log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
                 ending = True  # this event stays unserved, so the stopped thread keeps its context
                 continue
             elif ex_code in (0x406D1388, 0x40010006):
+                disposition = "continued (thread name or debug print)"
                 status = DBG_CONTINUE
             else:
+                disposition = "not handled (passed on to the title)"
                 status = DBG_EXCEPTION_NOT_HANDLED
+            if not disposition:
+                disposition = "continued" if status == DBG_CONTINUE else "not handled (passed on to the title)"
+            log_exception(disposition)
         k32.ContinueDebugEvent(pid, tid, status)
 
     window.abandon()
@@ -1189,7 +1221,8 @@ def main():
     if capture_thread:
         capture_done.set()
         capture_thread.join(SHUTDOWN_STEP_SECONDS)
-        print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
+        menu_note = f", {capture_menu_every:g} s in the menu phase" if capture_menu_every else ""
+        print("  " + series.summary() + f" (every {capture_every:g} s{menu_note}, window_<sss>s.png, at most {FILE_CAP} files)")
     if final_thread is not None and exit_code is None:
         if final_result:
             print(final_result[0])

@@ -53,6 +53,44 @@ def pick_window(windows):
     return windows[0][0]
 
 
+LOADING_DROP = 0.6   # a loading-like picture is darker than this fraction of the brightest picture seen so far
+LOADING_MIN_PEAK = 20.0  # ... and that brightest picture must be a real screen (mean level of at least 20 of 255)
+
+
+def frame_mean(width, height, bgra):
+    """Mean level 0..255 of the colour channels of a BGRA frame, from every 61st pixel (cheap, enough for a trend)."""
+    step = 61 * 4
+    total = count = 0
+    for offset in range(0, len(bgra) - 3, step):
+        total += bgra[offset] + bgra[offset + 1] + bgra[offset + 2]
+        count += 3
+    return total / count if count else 0.0
+
+
+class MenuPace:
+    """How often to take a picture: every `menu_every` seconds (the menu phase, when the screens change fast) until the first
+    loading-like picture (a frame much darker than the brightest one so far, which was itself a real screen), then every `every`.
+    menu_every = 0 keeps `every` throughout."""
+
+    def __init__(self, every, menu_every=0):
+        self.every, self.menu_every = every, menu_every
+        self.peak = 0.0
+        self.loading_at = None
+
+    def interval(self):
+        return self.every if self.loading_at is not None or not self.menu_every else self.menu_every
+
+    def note(self, seconds, mean):
+        """Feed every taken frame; returns True once, at the frame that ends the menu phase."""
+        if self.loading_at is not None:
+            return False
+        if self.peak >= LOADING_MIN_PEAK and mean < LOADING_DROP * self.peak:
+            self.loading_at = seconds
+            return True
+        self.peak = max(self.peak, mean)
+        return False
+
+
 class Series:
     """The periodic frames of one run. Frames are offered in time order and every one is saved, until the file cap is
     reached: a frame identical to the previous one is saved too (a dark loading screen that looks "unchanged" is still a
