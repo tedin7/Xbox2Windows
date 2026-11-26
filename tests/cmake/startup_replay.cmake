@@ -16,3 +16,23 @@ if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:x2w_replay>")
     set_tests_properties(startup_replay_pages_play PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
+
+# Replay of the texture / sampler / image family (row c17 of briefs/replay_all_hands.md): each scene is an in-repo stand-in check
+# that takes a backend. It is recorded (X2W_REPLAY_RECORD=all), replayed by x2w_replay, and every call must play on a known
+# object, with equal pictures where the scene presents (tests/startup_replay_family_check.py).
+if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
+    set(replay_family_scenes startup_view_dimension_device startup_list_copy_texture_warp startup_texture_residency_warp
+        startup_view_census startup_resource_retire_views startup_clear_uav startup_list_dispatch_native
+        startup_small_texture_4k_device_check startup_slot133_lazy_textures_check startup_null_views_check
+        startup_present_view_check)
+    foreach(scene IN LISTS replay_family_scenes)
+        if(TARGET ${scene})
+            foreach(backend IN ITEMS warp hardware)
+                add_test(NAME startup_replay_family_${scene}_${backend} COMMAND "${INTAKE_PYTHON}" -B
+                    "${CMAKE_SOURCE_DIR}/tests/startup_replay_family_check.py" "$<TARGET_FILE:x2w_replay>" ${backend} --
+                    "$<TARGET_FILE:${scene}>" ${backend})
+                set_tests_properties(startup_replay_family_${scene}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            endforeach()
+        endif()
+    endforeach()
+endif()
