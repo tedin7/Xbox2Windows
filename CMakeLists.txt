@@ -3344,8 +3344,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_word_check.py")
+    add_test(NAME startup_gfx2hlsl_heap_row COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_row_check.py")
+    # The opt-in translation engine (tools/startup/gfx2hlsl_engine.py, X2W_ENGINE=1, default off; fork tester-loop-tx only).
+    foreach(engine_check IN ITEMS hook compute readfirstlane)
+        add_test(NAME startup_engine_${engine_check} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_engine_${engine_check}_check.py")
+        set_tests_properties(startup_engine_${engine_check} PROPERTIES TIMEOUT 300)
+    endforeach()
     add_test(NAME startup_compute_readfirstlane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py")
+    add_test(NAME startup_compute_execz_wave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_execz_wave_check.py")
     add_test(NAME startup_compute_gather_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_gather_l_check.py")
     add_test(NAME startup_compute_buffer_atomics COMMAND "${INTAKE_PYTHON}" -B
@@ -3637,6 +3647,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Slot 57 mesh requests (#2413): the one accepted group-memory shape translates; each mutation is refused.
     add_test(NAME startup_mesh57_skeleton COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py")
+    # Slot 57 mesh buffer reads (R11): soffset, structured idxen with the descriptor stride, out-of-range reads; wrong variants must differ.
+    add_test(NAME startup_mesh57_buffer_read COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh57_buffer_read_check.py")
     # Slot 57 mesh with a depth-only pixel stage (#2413 T5): the null export keeps its discard, no colour target.
     add_test(NAME startup_mesh57_depth_only COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh57_depth_only_check.py")
@@ -4353,6 +4366,46 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad64_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_mad64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    # gfx2hlsl WaveSync wave-wide gathers (first active lane, any lane, one lane) read back on a plain device: guest waves of 32 and
+    # 64, groups of 32 to 1024 threads, a short last wave, an empty-mask wave; three wrong-value controls must be rejected.
+    add_test(NAME startup_gfx2hlsl_wavesync_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_wavesync_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_wavesync_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_wavesync_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_wavesync_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_gfx2hlsl_wavesync_wrong_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_wavesync_check.py" controls "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_wavesync_wrong_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "control no-any 1024 threads, guest wave 32: rejected")
+    endforeach()
+    # Tick mode on loops: divergent, nested, break, continue, wave-wide skip, barriers inside loops, a lane mask read as a number;
+    # guest waves of 32 and 64, a short last wave, groups up to 1024 threads, compared with a CPU reference. A reference with
+    # one word changed must be rejected for every shape and wave.
+    add_test(NAME startup_compute_tick_loops_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_tick_loops_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_tick_loops_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tick_loops_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_tick_loops_${adapter} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_tick_loops_wrong_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tick_loops_check.py" controls "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_tick_loops_wrong_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "controls rejected")
+    endforeach()
+    # Slot 57 mesh programs that decide for the whole guest wave (EXEC skips, first-lane reads): the request path's translation is
+    # drawn and compared with the guest rule; each wrong model must differ in exactly the pixels its CPU picture differs in.
+    add_test(NAME startup_mesh57_wavewide_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_wavewide_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_mesh57_wavewide_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_wavewide_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_mesh57_wavewide_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl bounded 64-bit LDS exchanges (ds_write_b64, ds_read_b64) across s_barrier (Refs #2274, #1541).
     add_test(NAME startup_compute_lds_b64_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -9980,6 +10033,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_mesh57_buffer_read_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_buffer_read_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_mesh57_buffer_read_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_loop_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_loop_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -11098,6 +11155,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_readfirstlane_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_execz_wave_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_execz_wave_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_execz_wave_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_compute_gather_l_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_gather_l_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

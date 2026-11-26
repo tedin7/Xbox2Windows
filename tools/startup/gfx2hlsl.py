@@ -11272,6 +11272,10 @@ def refusals_main(argv):
 
 
 def main():
+    if os.environ.get('X2W_ENGINE') == '1':
+        # The opt-in engine (fork tester-loop-tx): the whole driver runs from its own module, keys carry ENGINE_KEY_SUFFIX.
+        import gfx2hlsl_engine
+        return gfx2hlsl_engine.main()
     if any(arg == '--refusals' or arg.startswith('--refusals=') for arg in sys.argv[1:]):
         return refusals_main(sys.argv[1:])
     out_dir = sys.argv[2]
