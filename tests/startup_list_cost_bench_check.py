@@ -18,7 +18,7 @@ import startup_gfx2hlsl_compute_check as C
 from startup_compute_dispatch_check import dispatch, lines, prepare_case
 from startup_stream_check import gfx2hlsl as G
 
-CALLS = '2000'
+CALLS = '2000'  # two recording threads by default: two lists record the same new pipeline at once (a refusal cached while the first read was in flight would show here)
 
 
 def main(consumer, dxc, adapter):
@@ -32,7 +32,7 @@ def main(consumer, dxc, adapter):
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
         assert f'{key:016x}: ok' in out, out
-        env['X2W_TEST_BENCH_THREADS'] = os.environ.get('X2W_TEST_BENCH_THREADS', '1')
+        env['X2W_TEST_BENCH_THREADS'] = os.environ.get('X2W_TEST_BENCH_THREADS', '2')
         got, result = dispatch(directory, consumer, env, 'dispatch-bench')
         expected = C.expected('A')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
