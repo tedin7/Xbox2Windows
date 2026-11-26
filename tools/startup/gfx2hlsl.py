@@ -832,7 +832,7 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
-def scalar_effects(name, asm):
+def scalar_effects(name, asm, wave=None):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
     _, ops, _ = parse(asm)
@@ -863,8 +863,9 @@ def scalar_effects(name, asm):
         may |= EXEC_KEYS
     if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
         writes.add('scc')
-    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
-    if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too
+    # (a known wave32 program writes only vcc_lo).
+    if wave != 32 and 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
         may.add('vcc_hi')
     return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
@@ -2259,6 +2260,124 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
+class WaveSync:
+    """Wave-wide decisions of a guest wave, computed from groupshared words, independent of the host wave size.
+
+    A translated compute thread is one guest lane; a guest wave is WAVE (32 or 64) consecutive threads of the group in
+    linear thread order (x fastest). Anything that depends on the other lanes of the wave (does any lane have the bit
+    set, which lane is the first with its exec bit set, the value of one lane) is a gather site: every thread publishes
+    its bit and value, the group meets at GroupMemoryBarrierWithGroupSync(), and every thread reads the wave's word. No
+    host wave intrinsic is used, so the result is the guest wave's for any host wave size.
+
+    The barrier has to be reached by every thread of the group in the same order, so a site is only legal where control
+    flow is uniform across the whole group: the caller passes uniform=False for anything else and gets a refusal.
+
+    Hazards, by construction (site number n counts the sites a thread has run; all threads run the same sequence):
+    - values live in two buffers by n parity: a thread writes buffer n % 2 after the barrier of site n - 1, and every
+      reader of site n - 2 left that buffer before it reached that barrier;
+    - the per-wave words (any, first lane) live in three buffers by n % 3: the lane 0 of each wave clears the buffer of
+      site n + 1 while site n runs. It was last used by site n - 2, whose readers are past the barrier of site n - 1,
+      and its first user is after the barrier of site n.
+    The prologue clears all three before the first site and ends in a barrier.
+    """
+    FIRST_NONE = '0xffffffffu'
+
+    def __init__(self, group, wave_size):
+        if wave_size not in (32, 64):
+            raise Unsupported('guest wave size %s' % (wave_size,))
+        threads = group[0] * group[1] * group[2]
+        if not 1 <= threads <= 1024:
+            raise Unsupported('thread group of %d threads' % threads)
+        self.group, self.wave, self.threads = tuple(group), wave_size, threads
+        self.waves = (threads + wave_size - 1) // wave_size
+        self.sites = 0
+
+    def declarations(self):
+        return ['groupshared uint x2w_any[3][%d];' % self.waves, 'groupshared uint x2w_first[3][%d];' % self.waves,
+                'groupshared uint x2w_val[2][%d];' % self.threads]
+
+    def prologue(self):
+        """Declares the thread's place in its guest wave and clears the words; ends with the barrier of the prologue."""
+        g = self.group
+        return ['uint x2w_n = 0;',
+                'uint x2w_lin = tid.x + tid.y * %du + tid.z * %du;' % (g[0], g[0] * g[1]),
+                'uint x2w_lane = x2w_lin %% %du, x2w_wave = x2w_lin / %du;' % (self.wave, self.wave),
+                'if (x2w_lane == 0u) { for (uint b = 0u; b < 3u; ++b) { x2w_any[b][x2w_wave] = 0u; '
+                'x2w_first[b][x2w_wave] = %s; } }' % self.FIRST_NONE,
+                'GroupMemoryBarrierWithGroupSync();']
+
+    def site(self, uniform, active=None, bit=None, value=None):
+        """The lines of one gather site and its number. active: lane-active expression (the first such lane is wanted);
+        bit: expression whose OR over the wave is wanted; value: published per-lane value. Results are read with
+        x2w_any_<k>, x2w_first_<k> (the lane index, x2w_none when no lane is active) and x2w_value_<k> (see lane_value)."""
+        if not uniform:
+            raise Unsupported('wave gather in control flow that is not uniform across the thread group')
+        k = self.sites
+        self.sites += 1
+        lines = ['{ uint b = x2w_n % 3u, nb = (x2w_n + 1u) % 3u, v = x2w_n & 1u;']
+        if active is not None:
+            lines.append('  if (%s) InterlockedMin(x2w_first[b][x2w_wave], x2w_lane);' % active)
+        if bit is not None:
+            lines.append('  if (%s) InterlockedOr(x2w_any[b][x2w_wave], 1u);' % bit)
+        lines.append('  x2w_val[v][x2w_lin] = %s;' % (value if value is not None else '0u'))
+        lines.append('  if (x2w_lane == 0u) { x2w_any[nb][x2w_wave] = 0u; x2w_first[nb][x2w_wave] = %s; }' % self.FIRST_NONE)
+        lines.append('  GroupMemoryBarrierWithGroupSync();')
+        lines.append('  x2w_any_%d = x2w_any[b][x2w_wave]; x2w_first_%d = x2w_first[b][x2w_wave];' % (k, k))
+        lines.append('  x2w_snap_%d = v; }' % k)
+        lines.append('x2w_n++;')
+        return k, lines
+
+    def gather_any(self, bit, uniform=True):
+        """(variable, lines): 1u when the bit is set in any lane of the wave, else 0u."""
+        k, lines = self.site(uniform, bit=bit)
+        return 'x2w_any_%d' % k, self.vars(k) + lines
+
+    def gather_first(self, active, value, uniform=True):
+        """(lane variable, value variable, lines): the lane index of the lowest lane whose `active` expression is true
+        (x2w_none, 0xffffffff, when there is none) and `value` as that lane published it (0u when there is none)."""
+        k, lines = self.site(uniform, active=active, value=value)
+        lines.append('uint x2w_value_%d = x2w_first_%d == %s ? 0u : x2w_val[x2w_snap_%d][x2w_wave * %du + x2w_first_%d];'
+                     % (k, k, self.FIRST_NONE, k, self.wave, k))
+        return 'x2w_first_%d' % k, 'x2w_value_%d' % k, self.vars(k) + lines
+
+    def gather_lane(self, value, lane, uniform=True):
+        """(variable, lines): `value` of lane `lane` (a wave-uniform expression below the wave size) of this wave. A lane
+        past the end of a short last wave reads 0u."""
+        k, lines = self.site(uniform, value=value)
+        lines.append('uint x2w_value_%d = (%s) < %du && x2w_wave * %du + (%s) < %du ? x2w_val[x2w_snap_%d][x2w_wave * %du + (%s)] : 0u;'
+                     % (k, lane, self.wave, self.wave, lane, self.threads, k, self.wave, lane))
+        return 'x2w_value_%d' % k, self.vars(k) + lines
+
+    @staticmethod
+    def vars(k):
+        return ['uint x2w_any_%d = 0u, x2w_first_%d = 0u, x2w_snap_%d = 0u;' % (k, k, k)]
+
+
+def guest_wave_size(code):
+    """32 or 64 when the instructions of a compute program show the wave size they were compiled for, else None.
+
+    A wave32 program touches the execution mask only through exec_lo and 32-bit mask operations; a wave64 program
+    uses the 64-bit mask (exec, exec_hi, _b64 forms of the exec-writing instructions, a compare with a register pair
+    destination). A program that never touches the mask, or mixes both, proves nothing."""
+    try:
+        ins = decode(code, [])
+    except Exception:  # noqa: BLE001 - the stage reports the real error
+        return None
+    sizes = set()
+    for _, _, name, asm in ins:
+        operands = parse(asm)[1]
+        if 'exec' in name and not name.startswith('s_cbranch'):  # a branch on exec names no wave size
+            sizes.add(64 if name.endswith('_b64') else 32 if name.endswith('_b32') else 0)
+        if re.match(r'v_cmpx?_', name) and operands and re.fullmatch(r's\[\d+:\d+\]', operands[0]):
+            sizes.add(64)
+        for tok in operands:
+            if tok == 'exec_lo':
+                sizes.add(32)
+            elif tok in ('exec', 'exec_hi'):
+                sizes.add(64)
+    return sizes.pop() or None if len(sizes) == 1 else None
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -2922,7 +3041,7 @@ class Stage:
         v_subb / v_add_co_ci style ops, and s_and_saveexec / s_and_b32 with exec."""
         offsets = [ins[0] for ins in self.ins]
         index = {off: i for i, off in enumerate(offsets)}
-        effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
+        effects = [scalar_effects(name, asm, getattr(getattr(self, 'pipe', None), 'wave', None)) for _, _, name, asm in self.ins]
         succ = []
         jumps = []  # (instruction, target) of every branch, the proven calculated s_setpc_b64 ones included
         for i, (off, n, name, asm) in enumerate(self.ins):
@@ -3557,6 +3676,7 @@ class Stage:
             self.helper_restore = False
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
+            self.first_lane_reads = False  # a v_readfirstlane_b32 lowered through the group (op_v_readfirstlane_b32)
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
@@ -3872,6 +3992,13 @@ class Stage:
             break
         else:
             reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, self.kind))
+        if getattr(self, 'first_lane_reads', False) and not self.uniform_cf:
+            # Every thread of the group has to reach the barriers of a first-lane read.
+            reason = ('v_readfirstlane_b32 requires a proven uniform source '
+                      '(the first-lane read needs control flow that is the same for every lane)')
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
@@ -8317,8 +8444,10 @@ class Stage:
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
+                not src or src[0] != 'v' or src[1] != src[2]):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        if not self.proven_uniform_v(src[1]):
+            return self.first_lane_read(ops, dst, src)
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
             # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
@@ -8326,6 +8455,26 @@ class Stage:
             self.set_s(dst[1], self.uniform_expr[src[1]])
         else:
             self.set_s(dst[1], self.u(ops[1]))
+
+    def first_lane_read(self, ops, dst, src):
+        """v_readfirstlane_b32 of a VGPR that is not proven wave-uniform, in a compute stage.
+
+        The hardware reads the VGPR of the lowest lane of the guest wave whose EXEC bit is set (lane 0 when EXEC is
+        zero). The model keeps `exec & 1` per thread, so the lowest enabled lane is a gather site of the shared wave
+        engine (WaveSync.gather_first: groupshared words and a group barrier, independent of the host wave size).
+        Every thread of the group must reach the barrier, so the program is refused when any branch is not proved the
+        same for every lane (first_lane_reads, checked after the pass), and when the guest wave size is unknown."""
+        ws = getattr(getattr(self, 'pipe', None), 'wavesync', None)
+        if getattr(self, 'kind', None) != 'cs' or ws is None or not getattr(self, 'uniform_cf', False):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        self.first_lane_reads = self.uses_wavesync = True
+        _, value, lines = ws.gather_first('(exec & 1) != 0u', self.u(ops[1]))
+        for line in lines:
+            self.emit(line)
+        # No enabled lane: the hardware reads lane 0 of the wave.
+        first = value.replace('x2w_value_', 'x2w_first_')
+        snap = value.replace('x2w_value_', 'x2w_snap_')
+        self.set_s(dst[1], '(%s == %s ? x2w_val[%s][x2w_wave * %du] : %s)' % (first, ws.FIRST_NONE, snap, ws.wave, value))
 
     # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k
@@ -10742,7 +10891,7 @@ class ComputePipeline(Pipeline):
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -10755,6 +10904,10 @@ class ComputePipeline(Pipeline):
             raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
+        # The guest wave size (32 or 64): given by the caller (the dispatch's wave mode), else shown by the
+        # program's mask operations. Unknown: no wave-wide gather (WaveSync) is emitted.
+        self.wave = wave if wave is not None else guest_wave_size(cs_code)
+        self.wavesync = WaveSync(self.group, self.wave) if self.wave else None
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -10795,9 +10948,13 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        uses_sync = getattr(s, 'uses_wavesync', False)
+        if uses_sync:
+            shared += self.wavesync.declarations()
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + (['    ' + line for line in self.wavesync.prologue()] if uses_sync else [])
+                         + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.

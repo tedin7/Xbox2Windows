@@ -1008,9 +1008,10 @@ def expected(name):
     return out
 
 
-def translate(name, rsrc2=None, code=None, group=None):
+def translate(name, rsrc2=None, code=None, group=None, wave=None):
     source, words, default_rsrc2, local, _ = CASES[name]
-    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local)
+    return G.ComputePipeline(code or words, root_blob(), default_rsrc2 if rsrc2 is None else rsrc2, group or local,
+                             wave=wave)
 
 
 def refused(fragment, build):
@@ -1978,7 +1979,15 @@ def check_controls():
     # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
     refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
             'joins: read by s_and_b32 after the join',
-            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo'), wave=64).hlsl_cs())
+    # Wave32: a branch on exec names no wave size, and the compare writes vcc_lo only, so a block that holds the compare
+    # is not refused as a definition of vcc_hi.
+    wave32 = splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_lo, exec_lo')
+    assert G.guest_wave_size(wave32) == 32
+    try:
+        translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs()
+    except G.Unsupported as reason:
+        assert 'definition of vcc_hi' not in str(reason), str(reason)
     assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
     for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
@@ -2179,7 +2188,14 @@ def check_controls():
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
     # A readfirstlane of a buffer load at a uniform address translates; at a per-lane address it is refused.
     assert 's20 = v1;' in translate('N').hlsl_cs()
-    refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
+    # A per-lane address: the read takes the lowest enabled lane of the guest wave when the wave size is known
+    # (WaveSync gather), and is refused when it is not.
+    for group in ((16, 1, 1), (64, 1, 1)):
+        varying = translate('N', code=WORDS_N_VARYING, group=group, wave=32).hlsl_cs()
+        assert 'InterlockedMin(x2w_first[' in varying and 'x2w_val[x2w_snap_' in varying, varying
+        assert varying.count('GroupMemoryBarrierWithGroupSync();') == 2, varying  # the prologue and the one site
+    refused('v_readfirstlane_b32 requires a proven uniform source',
+            lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
     print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 

@@ -127,12 +127,8 @@ PATCHES = (
      'v_readfirstlane_b32 requires a proven uniform source'),
     ('loop counter updated from lane mask',
      [(pack_hex(*sop2('s_add_u32', 's22', 's22', 1)), pack_hex(*sop1('s_mov_b32', 's22', 'vcc_lo')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
+     'reads lane mask s22 as numeric data'),
     # RF1 negative controls: the integer chain stays refused when a source differs between lanes.
-    ('integer chain from the thread id',
-     [(pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
-    # the lane-mask read as a number is refused first (#2702); the chain is not reached
     ('integer chain with a lane-mask scalar',
      [(pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 's27', 'v10')), pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 'vcc_lo', 'v10')))],
      'v_add_nc_u32 reads lane mask vcc_lo as numeric data'),
@@ -140,7 +136,7 @@ PATCHES = (
 
 
 def translate(code=None):
-    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL)
+    return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL, wave=32)
 
 
 def expected():
@@ -211,6 +207,11 @@ def controls(llvm_mc=None):
             code = patch(code, old_hex, new_hex)
         refused(reason, lambda code=code: translate(code))
 
+    # A thread-id source is not wave-uniform: the read takes the lowest enabled lane of the guest wave (WaveSync).
+    code = patch(PROGRAM_WORDS, pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))
+    text = translate(code).hlsl_cs()
+    assert 'x2w_value_' in text and 'InterlockedMin(x2w_first[' in text and 'v10 = v0;' in text, text
+    refused('requires a proven uniform source', lambda: G.ComputePipeline(code, root_blob(), RSRC2, LOCAL).hlsl_cs())
     if llvm_mc:
         check_binary(llvm_mc)
     waterfall.controls(llvm_mc)

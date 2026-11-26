@@ -4936,6 +4936,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_sload_const_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_const_offset_check.py")
     # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code and entry blocks (#1723).
+    # WaveSync: wave-wide gathers through groupshared memory for a guest wave of any host wave size.
+    add_test(NAME startup_gfx2hlsl_wavesync COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_wavesync_check.py")
     add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
     # v_readfirstlane_b32 past the entry block of a branched program: recomputed definition, joins and EXEC refused.
