@@ -202,7 +202,7 @@ if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see 
 $inputLabels = @()
 try {
     $labelJson = (Invoke-Native { & $python -B $pack input-labels $InputMode $Seconds --privacy-boxes $PrivacyBoxes } | Out-String).Trim()
-    if ($LASTEXITCODE -eq 0 -and $labelJson) { $inputLabels = @($labelJson | ConvertFrom-Json) }
+    if ($LASTEXITCODE -eq 0 -and $labelJson) { $inputLabels = @((ConvertFrom-Json $labelJson) | ForEach-Object { $_ }) }
 } catch { Write-Warning "tester_run: no input labels ($($_.Exception.Message))" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
