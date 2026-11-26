@@ -3,7 +3,8 @@
 // logf formatting/truncation/X2W_TRAP_LOG append,
 // one X2W_TRAP_LOG open per module under 8 concurrent writers (in a child process), recovery
 // after a first open into a missing directory or of a locked file fails (in child processes),
-// probe_readable page truncation and PAGE_GUARD re-arming, and readable/writable boundary checks.
+// probe_readable page truncation and PAGE_GUARD re-arming, readable/writable boundary checks, and that an
+// unmapped range is refused by the probe and the guarded copies with zero first-chance exceptions.
 #include "startup_stubs/local_log.h"
 
 #include <atomic>
@@ -585,6 +586,57 @@ void test_probe_and_access(bool guard_drop_mutate)
     }
 }
 
+// Exceptions seen by a vectored handler: the check counts first-chance faults, which a debugger stops on.
+volatile LONG first_chance_faults = 0;
+LONG CALLBACK count_first_chance(PEXCEPTION_POINTERS info)
+{
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == 0x80000001u)
+        InterlockedIncrement(&first_chance_faults);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Free address space is refused with zero first-chance exceptions by the probe, readable() and both copy flavours,
+// each counted in faults_avoided; a mapped source still copies and counts nothing.
+void test_unmapped_no_faults()
+{
+    constexpr std::size_t kPage = 0x1000;
+    void* const block = VirtualAlloc(nullptr, 2 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    check(block != nullptr, "VirtualAlloc 2 pages for the unmapped-range check");
+    if (!block) return;
+    std::memset(block, 0x5A, 2 * kPage);
+    char copy[64] = {};
+    x2w_local::forget_mapped_spans();
+    const LONG avoided_before = x2w_local::faults_avoided;
+    check(x2w_local::guarded_memcpy(copy, block, sizeof(copy), false) && copy[0] == 0x5A,
+          "a mapped source is copied");
+    check(x2w_local::faults_avoided == avoided_before, "a mapped source avoids no fault");
+    const auto base = reinterpret_cast<std::uintptr_t>(block);
+    check(VirtualFree(block, 0, MEM_RELEASE) != 0, "release the block: its range is now free");
+    x2w_local::forget_mapped_spans();
+    void* const handler = AddVectoredExceptionHandler(1, count_first_chance);
+    check(handler != nullptr, "vectored handler installed");
+    InterlockedExchange(&first_chance_faults, 0);
+    check(x2w_local::probe_readable(base, 16) == 0, "probe_readable on free address space returns 0");
+    check(!x2w_local::readable(reinterpret_cast<const void*>(base), 16), "readable on free address space is false");
+    check(!x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), false),
+          "guarded_memcpy (access violations only) refuses free address space");
+    check(!x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), true),
+          "guarded_memcpy (any exception) refuses free address space");
+    check(first_chance_faults == 0, "free address space: zero first-chance exceptions");
+    check(x2w_local::faults_avoided - avoided_before == 4, "four refusals counted in faults_avoided");
+    // Control: the handler does see a real fault, so the zero above means something.
+    InterlockedExchange(&first_chance_faults, 0);
+    x2w_local::forget_mapped_spans();
+    __try {
+        volatile unsigned char sink = *reinterpret_cast<const volatile unsigned char*>(base);
+        (void)sink;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    check(first_chance_faults == 1, "control: touching the free range directly is one first-chance fault");
+    RemoveVectoredExceptionHandler(handler);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -644,6 +696,7 @@ int main(int argc, char** argv)
                 static_cast<unsigned long>(locked));
     test_logf();
     test_probe_and_access(guard_drop_mutate);
+    test_unmapped_no_faults();
 
     if (cache_failure_mutate) {
         std::printf("startup_local_log cache-failure control: parent failures %d\n", failures);

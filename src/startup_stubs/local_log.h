@@ -5,6 +5,8 @@
 #include "startup_stubs/trap.h"
 
 #include <cstdarg>
+#include <cstdint>
+#include <cstring>
 #include <cstdio>
 
 namespace x2w_local {
@@ -50,6 +52,54 @@ inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
     return false;
 }
 
+// First-chance exceptions stop the whole process while a debugger is attached, so a probe or a copy that is
+// refused before it touches an unmapped address is worth a query. faults_avoided counts those refusals; the
+// totals line of the render heartbeat prints it.
+inline volatile LONG faults_avoided = 0;
+
+// Number of leading bytes of [start, start + bytes) that are not in free address space (MEM_FREE), found with
+// VirtualQuery. Only MEM_FREE is refused: a reserved or committed page may be a lazily committed xmem page that
+// the fault handler commits on first touch, a guard page or no-access page keeps its handling in the callers,
+// so those still go to the touch/__try path. One query walks a whole region, which on the title's
+// multi-gigabyte blocks costs about a millisecond, so the spans found are cached per thread; a span freed
+// after it was cached is caught by the touch/__try path as before (it only costs the fault it always cost).
+struct MappedSpan {
+    std::uintptr_t begin, end;
+};
+struct MappedCache {
+    MappedSpan spans[16];
+    int next;
+};
+inline thread_local MappedCache mapped_cache;
+// Forgets the spans this thread has found (a span can be freed later; a failed touch or copy calls this).
+inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
+
+inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexcept
+{
+    if (bytes == 0 || start + bytes < start) return bytes;
+    const std::uintptr_t end = start + bytes;
+    std::uintptr_t at = start;
+    while (at < end) {
+        bool hit = false;
+        for (const MappedSpan& span : mapped_cache.spans) {
+            if (span.begin <= at && at < span.end) {
+                at = span.end < end ? span.end : end;
+                hit = true;
+                break;
+            }
+        }
+        if (hit) continue;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) return bytes;  // unknown: let the touch decide
+        if (info.State == MEM_FREE) return static_cast<std::size_t>(at - start);
+        const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        mapped_cache.spans[mapped_cache.next] = {begin, begin + info.RegionSize};
+        mapped_cache.next = (mapped_cache.next + 1) % 16;
+        at = begin + info.RegionSize < end ? begin + info.RegionSize : end;
+    }
+    return bytes;
+}
+
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
 // millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so
@@ -61,7 +111,11 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     std::size_t done = 0;
     DWORD code = 0;
     std::uintptr_t at = start;
-    const std::uintptr_t end = start + bytes;
+    // Free address space is refused without touching it; the touch below only sees mapped pages.
+    const std::size_t mapped = mapped_prefix(start, bytes);
+    if (mapped < bytes) InterlockedIncrement(&faults_avoided);
+    if (mapped == 0) return 0;
+    const std::uintptr_t end = start + mapped;
     __try {
         volatile unsigned char sink = 0;
         while (at < end) {
@@ -79,7 +133,28 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
                 VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
         }
     }
+    if (done < mapped) forget_mapped_spans();  // the span was cached, then freed or protected
     return done;
+}
+
+// memcpy from title memory that may have been freed or unmapped since it was probed. A source that is in free
+// address space is refused up front with no exception (counted in faults_avoided); everything else is copied under
+// __try as the last guard. any_exception false: only an access violation or an in-page error is caught.
+inline bool guarded_memcpy(void* to, const void* from, std::size_t bytes, bool any_exception) noexcept
+{
+    if (bytes && mapped_prefix(reinterpret_cast<std::uintptr_t>(from), bytes) < bytes) {
+        InterlockedIncrement(&faults_avoided);
+        return false;
+    }
+    __try {
+        std::memcpy(to, from, bytes);
+    } __except (any_exception || GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                        GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        forget_mapped_spans();
+        return false;
+    }
+    return true;
 }
 
 // With X2W_XMEM_LAZY_COMMIT, physical pages are committed on first touch (xmem_mapped_pages.cpp). A check of the
