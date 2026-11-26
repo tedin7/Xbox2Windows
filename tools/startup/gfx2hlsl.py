@@ -19,6 +19,8 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
@@ -3621,6 +3623,11 @@ class Stage:
         self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
             name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
         self.uses_quad_vote = False
+        # A pixel program with a wave-wide read (a whole-wave reduction) and only forward branches decides every EXEC / VCC
+        # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
+        # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
+        self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
+                          and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
@@ -3682,6 +3689,8 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
+            self.wave_unsound = None
+            self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
@@ -3914,6 +3923,11 @@ class Stage:
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
+                        elif self.wave_exec and cond in ('execz', 'execnz', 'vccz', 'vccnz'):
+                            # Decided over the host wave (WaveActiveAnyTrue): every thread takes it together.
+                            self.wave_voted_branches.add(off)
+                            self.uniform_branches.add(off)
+                            cond_uniform = True
                         elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
                                 and self.uniform_cf and not self.lane_exec_breaks
                                 and self.skipped_block_vector_only(off, int(parse(asm)[1][0].split('_')[1], 16))):
@@ -3923,6 +3937,12 @@ class Stage:
                             # still follows the guest's.
                             self.voted_branches.add(off)
                             cond_uniform = True
+                        if self.wave_exec and not cond_uniform and self.wave_unsound is None:
+                            # A branch that is neither wave-uniform nor a vote parts the host wave, so no wave intrinsic
+                            # can be trusted to see every lane. Refused at the end of the pass, so that an earlier
+                            # refusal of the program keeps its own reason.
+                            self.wave_unsound = Unsupported('wave-wide read in a program with a branch (%s) that is '
+                                                            'neither wave-uniform nor an EXEC / VCC vote' % name)
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -3988,6 +4008,10 @@ class Stage:
                 if refusals is not None:
                     del refusals[first_refusal:]
                 continue
+            if raised_unsupported is None and self.wave_unsound is not None:
+                if refusals is None:
+                    raise self.wave_unsound
+                refusals.append((str(self.wave_unsound), self.kind))
             if raised_unsupported is not None:
                 raise raised_unsupported
             break
@@ -4864,7 +4888,14 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
-            if base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
+            if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
+                # The guest skips the block when no lane of the wave has the bit; here every thread of the host wave
+                # takes the same decision (convergence rule C2).
+                self.needs_sm6 = True
+                word = 'exec' if base[10:].startswith('exec') else 'vcc'
+                bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
+                cond = ('!' if base[10:].endswith('z') else '') + 'WaveActiveAnyTrue(%s)' % bit
+            elif base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
                 # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
                 # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
                 self.uses_quad_vote = True
@@ -10015,6 +10046,45 @@ class Stage:
     # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
     WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
 
+    def skipped_scalar_read_later(self, branches):
+        """Rule C5 of the active-lane model: a scalar register written inside a block that an EXEC / VCC branch can skip
+        and read after the join. The guest runs the block for the whole wave when any lane is active, so every lane sees the
+        new value (also a lane that is inactive in the block and reads it after EXEC is restored); a thread that skips
+        the block on its own keeps the old one. Only a wave-wide decision of the branch keeps them equal."""
+        ins = getattr(self, 'ins', None)
+        if not isinstance(ins, list):
+            return False
+        wave_branch = {off: name for off, _n, name, _a in ins
+                       if name.startswith('s_cbranch_') and name[10:] in ('execz', 'execnz', 'vccz', 'vccnz')}
+        for pc, target in branches:
+            if pc not in wave_branch:
+                continue
+            written = set()
+            for off, _n, name, asm in ins:
+                if pc < off < target:
+                    reads, writes, _may = scalar_effects(name, asm)
+                    if reads & {'exec', 'vcc'} or name.startswith('v_cmp'):
+                        continue   # mask arithmetic: one bit per thread already, no wave-wide value
+                    written |= {w for w in writes if re.fullmatch(r's\d+', w)}
+            if written and any(off >= target and written & scalar_effects(name, asm)[0] for off, _n, name, asm in ins):
+                return True
+        return False
+
+    def holds_wave_reduction(self):
+        """Whether the program starts a whole-wave reduction chain: s_or_saveexec_b32 sS, -1 and, within the chain's
+        length, a row_mirror / row_half_mirror DPP step or a v_permlanex16_b32 (the test wave_reduction itself uses)."""
+        ins = getattr(self, 'ins', None)
+        if not isinstance(ins, list):
+            return False
+        for index, (_off, _n, name, asm) in enumerate(ins):
+            _name, ops, _mods = parse(asm)
+            if name in ('s_or_saveexec_b32', 's_or_saveexec_b64') and len(ops) == 2 and ops[1] == '-1':
+                for nxt, nops, nmods in (parse(item[3]) for item in ins[index + 1:index + 17]):
+                    if nxt == 'v_permlanex16_b32' or nxt.endswith('_dpp') and ('row_mirror' in nmods or
+                                                                               'row_half_mirror' in nmods):
+                        return True
+        return False
+
     def wave_reduction(self, base, ops):
         """True when this instruction belongs to a recognised wave reduction (its result is lowered at the restore of
         EXEC, its readlane at the readlane). False for anything that does not start like one; Unsupported for a chain of
@@ -10145,10 +10215,13 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
-            raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
-        if not getattr(self, 'exec_known', False):
-            raise Unsupported('wave reduction: EXEC is not the entry mask')
+        if not getattr(self, 'wave_exec', False):
+            # Straight-line only: every lane of the host wave runs the chain with the entry EXEC.
+            if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+                raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are '
+                                  'lowered')
+            if not getattr(self, 'exec_known', False):
+                raise Unsupported('wave reduction: EXEC is not the entry mask')
         if getattr(self, 'wqm_exec', False):
             raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
         for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
@@ -10181,12 +10254,22 @@ class Stage:
         return True
 
     def lower_wave_reduction(self, op, vt, vp, ss, source):
-        value = self.WAVE_REDUCE[op][0].format(self.u(source))
+        operand = self.u(source)
+        if not self.exec_known:
+            # Past an EXEC write the lanes outside the old EXEC take the identity (the v_cndmask of the chain).
+            operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
+        value = self.WAVE_REDUCE[op][0].format(operand)
         self.needs_sm6 = True
         self.set_s(ss, 'exec')
         self.sym[ss] = ('execcopy',)
         self.masks.add(ss)
-        self.set_v(vt, value)
+        # The guest runs the chain with every lane enabled, so vT is written in every lane and every thread of the host
+        # wave takes part in the intrinsic: no `if (exec & 1)` around it (an inactive lane's readlane source must be set).
+        was_known, self.exec_known = self.exec_known, True
+        try:
+            self.set_v(vt, value)
+        finally:
+            self.exec_known = was_known
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(vp)
         self.set_scc('true')   # s_or_saveexec_b32 set SCC from the all-lanes EXEC
