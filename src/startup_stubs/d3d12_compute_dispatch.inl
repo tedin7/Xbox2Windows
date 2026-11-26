@@ -675,6 +675,7 @@ struct MeshKeyUse {
 
 constexpr std::size_t mesh_use_capacity = 4096;
 MeshKeyUse mesh_uses[mesh_use_capacity];
+static_assert((mesh_use_capacity & (mesh_use_capacity - 1)) == 0, "the probe masks the hash");
 static_assert(std::atomic<u64>::is_always_lock_free);
 
 // Keep counts exact even if a process exhausts the table. Overflow nodes are
