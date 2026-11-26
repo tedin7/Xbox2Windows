@@ -28,6 +28,13 @@ The draw fixture LOOP is the shape of a uniform loop over a scalar counter with 
 So the neighbour word read on pass k is w(neighbour) + k * 0x101 and the reference below sums or XORs it with plain
 integers. The EXEC restore after the loop does not reach any read and is allowed. Mutations of the translated text
 (each of the three reads taking the wrong lane) must fail the same draw.
+
+The SUBREV fixtures branch on the zero root constant supplied by the renderer.
+The untaken arm narrows EXEC and exits. The taken arm reads a whole quad and
+subtracts the selected neighbour from its own value. Comparing all four output
+words catches both a wrong neighbour and a reversed subtraction. Each own-lane
+mutant must fail GPU readback. A narrowed incoming edge and a VCC branch are
+translation refusal controls.
 """
 import re
 import struct
@@ -143,6 +150,52 @@ REFUSALS = {
 }
 
 
+# One arm narrows EXEC and exits. Only the whole-quad arm reaches the subtraction.
+# The shared encoding differs only in the DPP16 control byte.
+SUBREV_SOURCE = """s_wqm_b64 exec, exec
+v_cvt_f32_u32_e32 v1, v0
+s_cmp_eq_u32 s9, 0
+s_cbranch_scc1 4
+v_cmp_gt_u32_e32 vcc_lo, 8, v0
+s_and_saveexec_b64 s[4:5], vcc
+v_mov_b32_e32 v1, 0
+s_endpgm
+v_subrev_f32_dpp v2, v1, v1 quad_perm:[{perm}] row_mask:0xf bank_mask:0xf bound_ctrl:1
+exp mrt0 v2, v1, v1, v1 done vm
+s_endpgm
+"""
+SUBREV = {
+    'pair': ('0,0,2,2', 0xa0, lambda x, y: (x & ~1, y)),
+    'broadcast': ('2,2,2,2', 0xaa, lambda x, y: (x & ~1, y | 1)),
+    'swap_x': ('1,0,3,2', 0xb1, lambda x, y: (x ^ 1, y)),
+    'swap_y': ('2,3,0,1', 0x4e, lambda x, y: (x, y ^ 1)),
+}
+
+
+def subrev_words(control, alternate_exit='000081bf'):
+    return bytes.fromhex('7e0afebe000d027e098006bf040085bf8800887d6a2484be8002027e'
+                         f'{alternate_exit}fa02040a01{control:02x}08ff0f1800f802010101000081bf')
+
+
+def translate_words(code):
+    try:
+        return G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
+    except G.Unsupported as reason:
+        return None, str(reason)
+
+
+def subrev_reference(neighbour):
+    def packed(x, y):
+        return x | (y << 16)
+
+    values = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            local = packed(x, y)
+            values.extend((local - packed(*neighbour(x, y)), local, local, local))
+    return struct.unpack('<%dI' % len(values), struct.pack('<%df' % len(values), *values))
+
+
 def check(label, ok, detail=''):
     print('%s: %s' % (label, 'ok' if ok else 'MISMATCH  ' + detail[:2000]))
     if not ok:
@@ -154,10 +207,7 @@ def words(name):
 
 
 def translate(name):
-    try:
-        return G.Pipeline(VS_WORDS, words(name), root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
-    except G.Unsupported as reason:
-        return None, str(reason)
+    return translate_words(words(name))
 
 
 # ---- CPU reference ----------------------------------------------------------------------------------------------------
@@ -201,6 +251,35 @@ def pair_own(text):
 
 MUTATIONS = {'swap reads its own lane': swap_own, 'broadcast reads lane 1': broadcast_lane1,
              'pair keeps every lane': pair_own}
+
+
+SUBREV_MUTANTS = {
+    'pair': pair_own,
+    'broadcast': lambda text: replace_once(text, 'QuadReadLaneAt(v1, 2u)', 'v1'),
+    'swap_x': swap_own,
+    'swap_y': lambda text: replace_once(text, 'QuadReadAcrossY(v1)', 'v1'),
+}
+
+
+def subrev_controls():
+    own = subrev_reference(lambda x, y: (x, y))
+    for name, (_, control, neighbour) in SUBREV.items():
+        code = subrev_words(control)
+        text, reason = translate_words(code)
+        check('SUBREV %s translates after an EXEC-writing exit arm' % name, text is not None, str(reason))
+        if text is not None:
+            check('SUBREV %s branch reads the root constant' % name, 'scc = ud1 == ' in text)
+            check('SUBREV %s own-lane mutant changes HLSL' % name, SUBREV_MUTANTS[name](text) != text)
+        check('SUBREV %s CPU reference rejects the own lane' % name, subrev_reference(neighbour) != own)
+        # Replace the exit with a branch to the read. EXEC on that edge is narrowed.
+        text, reason = translate_words(subrev_words(control, alternate_exit='000082bf'))
+        check('SUBREV %s refuses a join with narrowed EXEC' % name, text is None and 'v_subrev_f32_dpp' in reason,
+              str(reason))
+        # Replace the SCC compare and branch with a lane comparison and a VCC branch.
+        divergent = code[:8] + bytes.fromhex('8800887d040087bf') + code[16:]
+        text, reason = translate_words(divergent)
+        check('SUBREV %s refuses divergent control flow' % name,
+              text is None and 'not proven wave-uniform' in reason, str(reason))
 
 
 # ---- controls ---------------------------------------------------------------------------------------------------------
@@ -279,7 +358,35 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                   run.returncode != 0 and bool(lines) and lines[0].startswith('pixel mismatch'), run.stdout + run.stderr)
 
 
+
+def check_subrev_draw(dxc, renderer, adapter, fxc=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_subrev', 'vs_6_0', directory)
+        for name, (_, control, neighbour) in SUBREV.items():
+            text, reason = translate_words(subrev_words(control))
+            if text is None:
+                check('SUBREV %s translates for the draw' % name, False, str(reason))
+                continue
+            reference = words_file(directory, name, subrev_reference(neighbour))
+            ps = compile_hlsl(dxc, 'dxc', text, 'ps_' + name, 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, ps, reference)
+            print('  ' + ' '.join(ln for ln in run.stdout.splitlines()
+                                  if ln.startswith(('backend=', 'adapter=', 'driver=', 'debug_errors='))))
+            check('SUBREV %s %s: all %d pixels match' % (name, adapter, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                  run.stdout + run.stderr)
+            mutant = compile_hlsl(dxc, 'dxc', SUBREV_MUTANTS[name](text), 'mutant_' + name, 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, mutant, reference)
+            check('SUBREV %s %s own-lane mutant fails readback' % (name, adapter),
+                  run.returncode != 0 and any(line.startswith('pixel mismatch') for line in run.stderr.splitlines()),
+                  run.stdout + run.stderr)
+
+
 def check_binary(llvm_mc):
+    for name, (perm, control, _) in SUBREV.items():
+        check('llvm-mc assembles the SUBREV %s fixture to the same words' % name,
+              assemble(llvm_mc, SUBREV_SOURCE.format(perm=perm)) == subrev_words(control))
     for name, (source, hexwords) in FIXTURES.items():
         check('llvm-mc assembles the %s fixture to the same words' % name,
               assemble(llvm_mc, source) == bytes.fromhex(hexwords))
@@ -288,13 +395,16 @@ def check_binary(llvm_mc):
 def main():
     if len(sys.argv) == 1:
         controls()
+        subrev_controls()
     else:
         mode, *args = sys.argv[1:]
         if mode == 'binary':
             check_binary(*args)
         elif mode == 'draw':
             controls()
+            subrev_controls()
             check_draw(*args)
+            check_subrev_draw(*args)
         else:
             raise SystemExit(__doc__)
     if failures:
