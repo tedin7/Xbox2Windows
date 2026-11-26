@@ -11,7 +11,8 @@
 namespace x2w_startup {
 
 struct PlannedRead {
-    std::uintptr_t file = 0;       // the file's identity (its handle value)
+    std::uintptr_t file = 0;       // the file's identity: a number unique to the open (a handle value can be reused)
+    std::uintptr_t handle = 0;     // the handle to read it through (not part of the identity)
     std::uint64_t offset = 0;
     std::uint32_t size = 0;
     std::size_t index = 0;         // the caller's number for this read (its place in the look-ahead window)

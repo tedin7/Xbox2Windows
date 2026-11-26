@@ -58,11 +58,84 @@ bool expect(bool condition, const char* what)
 
 }  // namespace
 
+// A closed file's bytes are never served again, even when the next open gets the same handle value (the cache is keyed by a
+// per-open number, and forget() drops the slots and queued reads and waits for a read in progress before the handle closes).
+int check_forget()
+{
+    wchar_t temp_dir[MAX_PATH] = {}, path_a[MAX_PATH] = {}, path_b[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp_dir);
+    std::swprintf(path_a, MAX_PATH, L"%lsx2w_hdd_forget_a_%lu.bin", temp_dir, GetCurrentProcessId());
+    std::swprintf(path_b, MAX_PATH, L"%lsx2w_hdd_forget_b_%lu.bin", temp_dir, GetCurrentProcessId());
+    std::vector<unsigned char> a(64 << 10), b(64 << 10);
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<unsigned char>((i * 7 + 1) ^ 0x11);
+        b[i] = static_cast<unsigned char>((i * 13 + 5) ^ 0xee);
+    }
+    const auto write_file = [](const wchar_t* path, const std::vector<unsigned char>& bytes) {
+        HANDLE out = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD written = 0;
+        const bool ok = out != INVALID_HANDLE_VALUE && WriteFile(out, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                        written == bytes.size();
+        if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+        return ok;
+    };
+    if (!write_file(path_a, a) || !write_file(path_b, b)) {
+        std::fprintf(stderr, "cannot write the test files\n");
+        return 1;
+    }
+    const auto open_read = [](const wchar_t* path) {
+        return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    };
+    const auto planned = [](std::uintptr_t generation, HANDLE handle, std::uint64_t offset) {
+        x2w_startup::PlannedRead r;
+        r.file = generation;
+        r.handle = reinterpret_cast<std::uintptr_t>(handle);
+        r.offset = offset;
+        r.size = 4096;
+        return r;
+    };
+    const auto wait_prefetched = [](x2w_startup::ReadCache& cache, LONG64 bytes) {
+        for (int i = 0; i < 500 && cache.counters().prefetched_bytes < bytes; ++i) Sleep(10);
+        return cache.counters().prefetched_bytes >= bytes;
+    };
+    bool ok = true;
+    x2w_startup::ReadCache cache(nullptr, 64 << 10, 4 << 20, 64 << 20, 20000);
+    HANDLE handle_a = open_read(path_a);
+    ok = expect(handle_a != INVALID_HANDLE_VALUE, "open file A") && ok;
+    cache.submit({planned(1, handle_a, 0), planned(1, handle_a, 8192)});
+    ok = expect(wait_prefetched(cache, 12288), "file A's two reads were prefetched") && ok;
+    cache.forget(1);  // the file is about to close
+    CloseHandle(handle_a);
+    std::vector<unsigned char> got;
+    ok = expect(!cache.take(1, 0, 4096, got, 0) && !cache.take(1, 8192, 4096, got, 0),
+                "a closed file's prefetched bytes are still served") && ok;
+    // A new open: possibly the very same handle value. Its bytes, not A's.
+    HANDLE handle_b = open_read(path_b);
+    std::printf("handle value reused by the next open: %s\n", handle_b == handle_a ? "yes" : "no");
+    cache.submit({planned(2, handle_b, 0), planned(2, handle_b, 8192)});
+    ok = expect(wait_prefetched(cache, 24576), "file B's two reads were prefetched") && ok;
+    bool b_exact = cache.take(2, 0, 4096, got, 3000) && std::memcmp(got.data(), b.data(), 4096) == 0;
+    b_exact = cache.take(2, 8192, 4096, got, 3000) && std::memcmp(got.data(), b.data() + 8192, 4096) == 0 && b_exact;
+    ok = expect(b_exact, "the reads after the reopen return file B's bytes") && ok;
+    // The closed generation takes no new reads either.
+    const LONG64 before = cache.counters().prefetched_bytes;
+    cache.submit({planned(1, handle_b, 0)});
+    Sleep(100);
+    ok = expect(cache.counters().prefetched_bytes == before && !cache.take(1, 0, 4096, got, 0), "a closed file's generation takes no new reads") && ok;
+    CloseHandle(handle_b);
+    DeleteFileW(path_a);
+    DeleteFileW(path_b);
+    if (!ok) return 1;
+    std::puts("hdd forget: a closed file's bytes are never served; the reopen reads its own bytes");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "forget") == 0) return check_forget();
     const bool on = argc == 2 && std::strcmp(argv[1], "on") == 0;
     if (!on && !(argc == 2 && std::strcmp(argv[1], "off") == 0)) {
-        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off\n");
+        std::fprintf(stderr, "usage: startup_dstorage_hdd_queue on|off|forget\n");
         return 2;
     }
     SetEnvironmentVariableA("X2W_STORAGE_HDD", on ? "1" : nullptr);  // read once, at the first use

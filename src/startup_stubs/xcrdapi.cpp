@@ -58,6 +58,7 @@ struct Object {
     unsigned kind;
     LONG refs;
     HANDLE handle;      // File
+    unsigned long long generation = 0;  // File: a number unique to this open (handle values are reused); the HDD cache's key
     unsigned capacity;  // StatusArray, Queue
     LONG* results;      // StatusArray: one HRESULT per index, E_PENDING until a status is enqueued
     LONG pending;       // Queue: worst HRESULT of the requests since the last status
@@ -333,6 +334,10 @@ unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long
 
 void destroy_object(Object* self) noexcept;
 
+// HDD mode: drop the cache's slots and queued reads of this open, and wait for a read in progress on it, before its handle is
+// closed (defined with the HDD cache below).
+void hdd_forget_file(unsigned long long generation) noexcept;
+
 // Final Release of a queue: stop the worker, wait for it to leave, then drop the entries that never
 // ran. Returns true when the worker owns the destruction (Release ran on the worker itself).
 // Defined after the entry helpers below.
@@ -377,7 +382,10 @@ void destroy_object(Object* self) noexcept
         delete object;
     } else if (self->kind == file) {
         auto* object = static_cast<FileObject*>(self);
-        if (object->handle != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(object->handle, INVALID_HANDLE_VALUE));
+        if (object->handle != INVALID_HANDLE_VALUE) {
+            hdd_forget_file(object->generation);
+            CloseHandle(std::exchange(object->handle, INVALID_HANDLE_VALUE));
+        }
         delete object;
     } else if (self->kind == status) {
         delete[] self->results;
@@ -427,6 +435,8 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
     auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
+    static LONG64 opens;
+    object->generation = static_cast<unsigned long long>(InterlockedIncrement64(&opens));
     wcsncpy_s(object->filename, path, _TRUNCATE);
     *out = object;
     return S_OK;
@@ -481,7 +491,10 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
 void __stdcall file_close(Object* self)
 {
     log("x2w-dstorage File::Close handle=%p", self->handle);
-    if (self->handle != INVALID_HANDLE_VALUE) CloseHandle(self->handle);
+    if (self->handle != INVALID_HANDLE_VALUE) {
+        hdd_forget_file(self->generation);
+        CloseHandle(self->handle);
+    }
     self->handle = INVALID_HANDLE_VALUE;
 }
 
@@ -604,6 +617,10 @@ x2w_startup::ReadCache& hdd_cache()
     static x2w_startup::ReadCache* const cache = new x2w_startup::ReadCache(&note_disk_read, 64 << 10, 4 << 20, 64 << 20, 20000);
     return *cache;
 }
+void hdd_forget_file(unsigned long long generation) noexcept
+{
+    if (hdd_mode()) hdd_cache().forget(static_cast<std::uintptr_t>(generation));
+}
 // Called with the queue mutex held, right after the worker took an entry: plan the file reads of the entries still waiting.
 void hdd_look_ahead(QueueWork& work)
 {
@@ -623,7 +640,8 @@ void hdd_look_ahead(QueueWork& work)
         const u64 options = *reinterpret_cast<const u64*>(e.bytes);
         if (options & memory_source_option) continue;
         x2w_startup::PlannedRead r;
-        r.file = reinterpret_cast<std::uintptr_t>(e.source->handle);
+        r.file = static_cast<std::uintptr_t>(e.source->generation);
+        r.handle = reinterpret_cast<std::uintptr_t>(e.source->handle);
         r.offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         r.size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
         r.index = i;
@@ -938,7 +956,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         bool file_read = false;
         if (file_object && file_object->kind == file) {
             // HDD mode: the prefetch may already hold these bytes (counted as read by the prefetch thread's own read).
-            if (hdd_mode()) file_read = hdd_cache().take(reinterpret_cast<std::uintptr_t>(file_object->handle), offset, source_size, packed, 3000);
+            if (hdd_mode() && file_object->handle != INVALID_HANDLE_VALUE)
+                file_read = hdd_cache().take(static_cast<std::uintptr_t>(file_object->generation), offset, source_size, packed, 3000);
             if (!file_read) {
                 LARGE_INTEGER began, ended;
                 QueryPerformanceCounter(&began);

@@ -12,6 +12,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "startup_stubs/dstorage_file_read.h"
@@ -44,7 +45,7 @@ public:
             evict_stale_locked();
             for (const PlannedRead& r : reads) {
                 const Key key{r.file, r.offset, r.size};
-                if (r.size == 0 || slots_.count(key) || held_ + r.size > max_bytes_) continue;
+                if (r.size == 0 || tombstones_.count(r.file) || slots_.count(key) || held_ + r.size > max_bytes_) continue;
                 slots_[key] = Slot{{}, false, false, GetTickCount()};
                 held_ += r.size;
                 fresh.push_back(r);
@@ -62,12 +63,32 @@ public:
         wake_.notify_all();
     }
 
+    // The file is going away (its handle is about to be closed): drop its slots and queued reads, refuse new ones, and wait
+    // for a prefetch read in progress on it, so that the handle is never read after it is closed. A generation is never reused.
+    void forget(std::uintptr_t file)
+    {
+        std::unique_lock lock(mutex_);
+        tombstones_.insert(file);
+        for (auto it = slots_.begin(); it != slots_.end();) {
+            if (it->first.file == file) {
+                held_ -= it->first.size;
+                it = slots_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = pending_.begin(); it != pending_.end();) it = it->file == file ? pending_.erase(it) : it + 1;
+        ready_.notify_all();  // a take() waiting for one of the erased slots must look again
+        idle_.wait(lock, [&] { return reading_file_ != file; });
+    }
+
     // The bytes of a planned read: moved into `out` when the prefetch has them (waiting up to wait_ms for a read in progress).
     // False when the read was not planned or its prefetch failed; the caller reads the file itself.
     bool take(std::uintptr_t file, std::uint64_t offset, std::uint32_t size, std::vector<unsigned char>& out, DWORD wait_ms)
     {
+        const Key key{file, offset, size};
         std::unique_lock lock(mutex_);
-        const auto found = slots_.find(Key{file, offset, size});
+        auto found = slots_.find(key);
         if (found == slots_.end()) {
             ++counters_.misses;
             return false;
@@ -75,7 +96,16 @@ public:
         bool waited = false;
         if (!found->second.ready) {
             waited = true;
-            ready_.wait_for(lock, std::chrono::milliseconds(wait_ms), [&] { return found->second.ready; });
+            // forget() can erase the slot while this waits: look it up again after every wake.
+            ready_.wait_for(lock, std::chrono::milliseconds(wait_ms), [&] {
+                const auto again = slots_.find(key);
+                return again == slots_.end() || again->second.ready;
+            });
+            found = slots_.find(key);
+            if (found == slots_.end()) {
+                ++counters_.misses;
+                return false;
+            }
         }
         if (!found->second.ready) {
             ++counters_.misses;  // the prefetch is still busy: read it directly, and the late bytes are dropped on arrival
@@ -147,13 +177,15 @@ private:
                 wake_.wait(lock, [&] { return !pending_.empty(); });
                 group = std::move(pending_.front());
                 pending_.pop_front();
+                reading_file_ = group.file;  // set under the lock that took the group: forget() sees it, and waits
             }
             std::vector<unsigned char> buffer;
             LARGE_INTEGER began, ended;
             QueryPerformanceCounter(&began);
-            const bool ok = read_storage_file(reinterpret_cast<HANDLE>(group.file), group.offset, static_cast<DWORD>(group.span), buffer);
+            const HANDLE handle = reinterpret_cast<HANDLE>(group.members.front().handle);
+            const bool ok = read_storage_file(handle, group.offset, static_cast<DWORD>(group.span), buffer);
             QueryPerformanceCounter(&ended);
-            if (hook_) hook_(reinterpret_cast<HANDLE>(group.file), group.offset, group.span, ended.QuadPart - began.QuadPart, ok);
+            if (hook_) hook_(handle, group.offset, group.span, ended.QuadPart - began.QuadPart, ok);
             {
                 const std::lock_guard guard(mutex_);
                 if (!ok) ++counters_.failed;
@@ -174,8 +206,10 @@ private:
                     it->second.ready = true;
                     it->second.tick = GetTickCount();
                 }
+                reading_file_ = 0;
             }
             ready_.notify_all();
+            idle_.notify_all();
         }
     }
 
@@ -183,7 +217,9 @@ private:
     std::uint64_t gap_, max_span_, max_bytes_;
     DWORD stale_ms_;
     mutable std::mutex mutex_;
-    std::condition_variable wake_, ready_;
+    std::condition_variable wake_, ready_, idle_;
+    std::set<std::uintptr_t> tombstones_;  // generations whose file was closed
+    std::uintptr_t reading_file_ = 0;      // the generation the prefetch thread is reading now (0: none; generations start at 1)
     std::deque<ReadGroup> pending_;
     std::map<Key, Slot> slots_;
     std::uint64_t held_ = 0;

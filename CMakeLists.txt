@@ -854,7 +854,8 @@ target_include_directories(startup_dstorage_hdd_queue PRIVATE src)
 target_link_libraries(startup_dstorage_hdd_queue PRIVATE psapi)
 add_test(NAME startup_dstorage_hdd_queue_on COMMAND startup_dstorage_hdd_queue on)
 add_test(NAME startup_dstorage_hdd_queue_off COMMAND startup_dstorage_hdd_queue off)
-set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off PROPERTIES TIMEOUT 60)
+add_test(NAME startup_dstorage_hdd_forget COMMAND startup_dstorage_hdd_queue forget)
+set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off startup_dstorage_hdd_forget PROPERTIES TIMEOUT 60)
 # Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
 # page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
 # compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
