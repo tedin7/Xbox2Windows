@@ -100,6 +100,12 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
+        # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty
+        # control above has a nonzero base and stays refused).
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-null')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert len(lines(result, 'comes from zeros for a null descriptor (16 bytes)')) == 1, result.stderr[-3000:]
+        assert got != expected and got != untouched, 'a null input must read zeros, not the expected words'
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
