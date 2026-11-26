@@ -425,7 +425,10 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
                                 const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
-    const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
+    u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
+    // X2W_ENGINE=1 selects the opt-in translation engine (tools/startup/gfx2hlsl_engine.py hashes ENGINE_KEY_SUFFIX the same way).
+    static const bool engine = x2w_local::env_on("X2W_ENGINE");  // read once, not per draw
+    if (engine) seed = fnv_bytes("-engine1", 8, seed);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
@@ -546,6 +549,8 @@ u64 publish_compute_request(const void* desc)
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
     u64 key = fnv_bytes(shader_cache::compute_revision, sizeof(shader_cache::compute_revision) - 1);
+    static const bool engine = x2w_local::env_on("X2W_ENGINE");
+    if (engine) key = fnv_bytes("-engine1", 8, key);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
     // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
