@@ -213,7 +213,7 @@ $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
 # most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
 # Never blocks the run.
 try {
-    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 } | Out-String).Trim()
+    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 90 } | Out-String).Trim()
     if ($retryLine) { Write-Host "tester_run: $retryLine" }
 } catch {
     Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"

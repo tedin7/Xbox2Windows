@@ -3654,6 +3654,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_retry_lifted COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_retry_lifted_check.py")
     set_tests_properties(startup_gfx2hlsl_retry_lifted PROPERTIES TIMEOUT 300)
+    add_test(NAME startup_gfx2hlsl_retry_cap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_retry_cap_check.py")
+    set_tests_properties(startup_gfx2hlsl_retry_cap PROPERTIES TIMEOUT 120)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
     # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.

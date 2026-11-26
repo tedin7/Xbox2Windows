@@ -12329,7 +12329,8 @@ LIFTED_REASONS = (
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
 )
-PRE_RUN_RETRY_SECONDS = 180.0
+PRE_RUN_RETRY_SECONDS = 90.0
+PRE_RUN_RETRY_GRACE_SECONDS = 20.0  # after the cap a request already running may finish this long; then its worker is ended
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
@@ -12400,7 +12401,18 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                         running[pool.submit(translate_one, out_dir, key)] = key
                     if not running:
                         break
-                    done, _ = wait(running, return_when=FIRST_COMPLETED)
+                    # Past the cap nothing new starts; the requests still running get PRE_RUN_RETRY_GRACE_SECONDS, then their
+                    # workers are ended (the game must not wait for one huge shader). An ended request keeps its .fail.
+                    now = clock()
+                    hard_end = start + seconds + PRE_RUN_RETRY_GRACE_SECONDS
+                    done, _ = wait(running, timeout=max(0.0, (start + seconds if now < start + seconds else hard_end) - now),
+                                   return_when=FIRST_COMPLETED)
+                    if not done:
+                        if clock() >= hard_end:
+                            for process in list(getattr(pool, '_processes', {}).values()):
+                                process.kill()
+                            break
+                        continue
                     for future in done:
                         results[running.pop(future)] = future.result()
     ok = sum(1 for result in results.values() if result == 'ok')
