@@ -2529,7 +2529,7 @@ class Stage:
         if tg_size is not None:
             if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
                     and not wave32_exec_proof(self.ins):
-                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+                raise Unsupported(tg_size_refusal(self.pipe.group, self.pipe.wave_size, False))
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -11549,6 +11549,20 @@ TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threa
                          '(more needs whole wave32 waves and a program proved wave32)')
 
 
+def tg_size_refusal(group, wave_size, proof):
+    """The refusal text, naming the group and which condition failed: a group that is not whole wave32 waves, a stated wave
+    size other than 32, or a program with no wave32 exec proof (proof is wave32_exec_proof's answer, None when not asked)."""
+    threads = group[0] * group[1] * group[2]
+    why = []
+    if threads % 32:
+        why.append('%d threads is not whole waves' % threads)
+    if wave_size not in (None, 32):
+        why.append('wave size %s stated' % wave_size)
+    if wave_size is None and proof is False:
+        why.append('no wave32 exec proof')
+    return '%s [group %dx%dx%d%s]' % (TG_SIZE_WAVES_REFUSAL, group[0], group[1], group[2], (': ' + ', '.join(why)) if why else '')
+
+
 def wave32_exec_proof(ins):
     """True when the program names a wave32 exec write (a 32-bit scalar op into exec_lo, or s_*saveexec_b32) and no wave64
     exec form (the 64-bit exec pair or a 64-bit scalar op on it). The opcodes differ between the sizes (RDNA 2 ISA, SOP1
@@ -11594,7 +11608,7 @@ class ComputePipeline(Pipeline):
         self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
         if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
                 wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
-            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+            raise Unsupported(tg_size_refusal(self.group, wave_size, None))
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)

@@ -289,10 +289,10 @@ def check_controls():
     for bad_group in ((8, 4, 2), (33, 1, 1), (64, 1, 1)):
         refused('TG_SIZE_EN requires at most 32 threads per group',
                 lambda g=bad_group: translate(code=S_ENDPGM, group=g))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(33, 1, 1), wave_size=32))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(8, 4, 2), wave_size=64))
+    refused('[group 33x1x1: 33 threads is not whole waves]', lambda: translate(code=S_ENDPGM, group=(33, 1, 1), wave_size=32))
+    refused('[group 8x4x2: wave size 64 stated]', lambda: translate(code=S_ENDPGM, group=(8, 4, 2), wave_size=64))
     wave_and = sop2(S_AND_B32, 20, 8, LIT, 0xfc0) + S_ENDPGM
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=wave_and, group=(8, 4, 2)))  # no wave size known
+    refused('[group 8x4x2: no wave32 exec proof]', lambda: translate(code=wave_and, group=(8, 4, 2)))  # no wave size known
     waves_hlsl = translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32).hlsl_cs()
     assert '    s20 = (((tid.x + 8u * (tid.y + 4u * tid.z)) >> 5u) << 6u);\n    scc = s20 != 0u;' in waves_hlsl, waves_hlsl
     waves_pipe = translate(code=wave_and, group=(8, 4, 2), wave_size=32)
