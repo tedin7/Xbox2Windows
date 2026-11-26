@@ -612,12 +612,27 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     return resource;
 }
 
+// A texture that lost mip levels (texture_drop_mips.h) goes only to a bind that said it samples it; every other reader
+// (a compute view, a bind of a texel-addressed shader) gets no texture and the refusal is counted.
+ID3D12Resource* texture_for_reader(Wrapper* resource, ID3D12Resource* texture)
+{
+    namespace dm = x2w_startup::drop_mips;
+    if (!texture || !resource->own().drop_levels || dm::may_receive_dropped(dm::current_hint)) return texture;
+    dm::counters.conflicts.fetch_add(1, std::memory_order_relaxed);
+    static LONG shown;
+    if (first_calls(shown, 6))
+        log("x2w-d3d12 texture %p lost %u mip level(s) and is asked for by a reader that does not only sample it: refused",
+            static_cast<void*>(resource), static_cast<unsigned>(resource->own().drop_levels));
+    return nullptr;
+}
+
 ID3D12Resource* sampled_address_texture(Wrapper* resource)
 {
     if (!resource || resource->own().kind != resource_kind) return nullptr;
     if (resource->own().lazy_slot133_texture && !resource->own().real)
-        return materialize_lazy_texture(resource);
-    if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
+        return texture_for_reader(resource, materialize_lazy_texture(resource));
+    if (!resource->own().tiled_address_srv)
+        return texture_for_reader(resource, static_cast<ID3D12Resource*>(resource->own().real));
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
     // An already-published token can outlive a write in a different layout.
@@ -674,6 +689,42 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     log("%s", line);
 }
 
+// Diagnostic for textures refused with the desktop "unknown" layout (Layout 0): nothing says how their rows are packed.
+// For the first 32 of them one line gives what a reader needs to infer the pitch: format, size, mips, the address
+// alignment, how many bytes after the address are readable (a lower bound of the allocation), the tightly packed byte
+// size, and a hash plus non-zero counts of the first rows. Only a hash and counts are logged, never pixel data.
+void log_layout0_texture(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input)
+{
+    if (!reason || std::strcmp(reason, "unsupported_description") != 0) return;
+    if (!x2w_local::readable(resource, sizeof(*resource)) || !x2w_local::readable(input, sizeof(*input))) return;
+    if (resource->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return;
+    static LONG lines;
+    if (!first_calls(lines, 32)) return;
+    const u64 address = input->address;
+    const auto element = x2w_startup::gfx10::element_of(resource->Format);
+    const u64 blocks_w = element.bytes ? (resource->Width + element.texels - 1) / element.texels : 0;
+    const u64 blocks_h = element.bytes ? (resource->Height + element.texels - 1) / element.texels : 0;
+    const u64 row_bytes = blocks_w * element.bytes;
+    const u64 first_mip_bytes = row_bytes * blocks_h;
+    constexpr u64 probe_cap = u64{64} << 20;   // one touch per page; the title's regions can be gigabytes, so only a lower bound
+    const u64 readable_bytes = address ? x2w_local::probe_readable(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(probe_cap)) : 0;
+    u64 hash = 0;
+    unsigned nonzero_rows[4] = {};
+    if (row_bytes && readable_bytes >= row_bytes * 4) {
+        const auto* data = reinterpret_cast<const unsigned char*>(address);
+        hash = hash_memory(data, static_cast<std::size_t>(row_bytes * 4));
+        for (unsigned row = 0; row < 4; ++row)
+            for (u64 i = 0; i < row_bytes; ++i) nonzero_rows[row] += data[row * row_bytes + i] != 0;
+    }
+    log("x2w-d3d12 layout0 texture: fmt=%d %llux%ux%u mips=%u flags=0x%x align=%llu view{dim=%d fmt=%d} address=0x%llx "
+        "addr_mod64k=0x%llx readable=%llu%s bpe=%u tight_mip0=%llu row_bytes=%llu first4rows_hash=%016llx nonzero_rows=%u/%u/%u/%u",
+        resource->Format, static_cast<unsigned long long>(resource->Width), resource->Height, resource->DepthOrArraySize,
+        resource->MipLevels, static_cast<UINT>(resource->Flags), static_cast<unsigned long long>(resource->Alignment),
+        input->view.ViewDimension, input->view.Format, address, address & 0xFFFF, readable_bytes,
+        readable_bytes >= probe_cap ? "+" : "", element.bytes, first_mip_bytes, row_bytes, hash, nonzero_rows[0],
+        nonzero_rows[1], nonzero_rows[2], nonzero_rows[3]);
+}
+
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
@@ -682,6 +733,7 @@ void refuse_memory_srv(LONG& refused, const char* what, const char* reason, cons
     const bool within_limit = first_calls(refused, 8);
     const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
+    log_layout0_texture(reason, resource, input);
 }
 
 // Counts a successful write (memory_srv_writes) and logs the first write to each of the first few
