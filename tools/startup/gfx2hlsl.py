@@ -2499,13 +2499,28 @@ class Stage:
         if isinstance(self.whole_read_v, set):
             self.whole_read_v.add(reg)
 
+    def scc_refusal(self, text, path):
+        """`text` plus the path that refused and the instruction's opcode and destination class, so a census of one SCC
+        refusal says which emitting path and which instruction shape dominate. The refusal itself is unchanged."""
+        parts = getattr(self, 'current_asm', '').split(None, 1)
+        opcode = parts[0] if parts else 'unknown'
+        first = parts[1].split(',')[0].strip() if len(parts) > 1 else ''
+        reg = reg_range(first) if first else None
+        if first in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0', 'null'):
+            dest = first
+        elif reg and reg[0] in ('s', 'v'):
+            dest = {'s': 'sgpr', 'v': 'vgpr'}[reg[0]]
+        else:
+            dest = 'none'
+        return '%s [%s: %s, destination %s]' % (text, path, opcode, dest)
+
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
         if tok == 'src_scc':
             # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
             # Refuse unless a modeled writer set SCC on the reaching path in this block.
             if not getattr(self, 'scc_verified', False):
-                raise Unsupported('src_scc with unverified SCC')
+                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'operand read'))
             return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
             self.read_vcc()
@@ -4710,6 +4725,7 @@ class Stage:
         llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
         The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
         The check runs after the form's own refusals, so those keep their messages."""
+        self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
             return None
         masks = []
@@ -5629,14 +5645,14 @@ class Stage:
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
-                raise Unsupported('src_scc with unverified SCC')
+                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
                 self.scc_verified = False
                 if self.tracks_uniformity():
                     self.scc_uniform = False
             if shift_add or word_complement or word_absdiff:
-                raise Unsupported('scc from descriptor data')
+                raise Unsupported(self.scc_refusal('scc from descriptor data', 'shift-add, complement or absdiff'))
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
             # Every path below writes the destination's symbol directly, not through set_s, or refuses. The
@@ -5651,13 +5667,13 @@ class Stage:
                 return None
             if dname == 'm0':
                 if scc:
-                    raise Unsupported('scc from descriptor data')
+                    raise Unsupported(self.scc_refusal('scc from descriptor data', 'm0 write'))
                 self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
                 return None
             if mask_dest:
                 raise Unsupported('mask from descriptor data')
             if dname == 'null':
-                raise Unsupported('scc from descriptor data' if (scc or base in SCC_UNMODELLED)
+                raise Unsupported(self.scc_refusal('scc from descriptor data', 'null destination') if (scc or base in SCC_UNMODELLED)
                                   else '%s into null on descriptor data' % base)
             if not dst or dst[0] != 's':
                 raise Unsupported('%s destination %s' % (base, ops[0]))
