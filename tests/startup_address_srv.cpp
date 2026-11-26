@@ -663,6 +663,17 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     raw.view.Buffer.FirstElement = 0;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(5);
+
+    // An unplaced structured view whose address is not a whole number of 12-byte elements past its 64 KiB page start
+    // (page offset 0x104): published from a copy that starts at the address, so the shader reads 201 at element 0.
+    static auto* const suballoc = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!suballoc) return 56;
+    auto* const odd = reinterpret_cast<std::uint32_t*>((reinterpret_cast<std::uintptr_t>(suballoc) & ~std::uintptr_t{0xffff}) + 65536 + 0x104);
+    odd[0] = 201;
+    structured.view.Buffer.FirstElement = 0;
+    structured.view.Buffer.StructureByteStride = 12;
+    structured.address = ptr(odd);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
     draw(6);
 
     // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
