@@ -802,7 +802,7 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
-def scalar_effects(name, asm):
+def scalar_effects(name, asm, wave=None):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
     _, ops, _ = parse(asm)
@@ -833,8 +833,9 @@ def scalar_effects(name, asm):
         may |= EXEC_KEYS
     if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
         writes.add('scc')
-    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
-    if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too
+    # (a known wave32 program writes only vcc_lo).
+    if wave != 32 and 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
         may.add('vcc_hi')
     return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
@@ -2159,7 +2160,7 @@ def guest_wave_size(code):
     sizes = set()
     for _, _, name, asm in ins:
         operands = parse(asm)[1]
-        if 'exec' in name:
+        if 'exec' in name and not name.startswith('s_cbranch'):  # a branch on exec names no wave size
             sizes.add(64 if name.endswith('_b64') else 32 if name.endswith('_b32') else 0)
         if re.match(r'v_cmpx?_', name) and operands and re.fullmatch(r's\[\d+:\d+\]', operands[0]):
             sizes.add(64)
@@ -2712,7 +2713,7 @@ class Stage:
         v_subb / v_add_co_ci style ops, and s_and_saveexec / s_and_b32 with exec."""
         offsets = [ins[0] for ins in self.ins]
         index = {off: i for i, off in enumerate(offsets)}
-        effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
+        effects = [scalar_effects(name, asm, getattr(getattr(self, 'pipe', None), 'wave', None)) for _, _, name, asm in self.ins]
         succ = []
         jumps = []  # (instruction, target) of every branch, the proven calculated s_setpc_b64 ones included
         for i, (off, n, name, asm) in enumerate(self.ins):
