@@ -75,6 +75,7 @@ param(
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [string[]]$ScanRoots = @(),                # folders searched after the run for files the title wrote (default: AppData, LocalAppData, Documents, Saved Games, ProgramData, the data folder): shows where it keeps a choice such as the privacy acceptance
     [switch]$FreshSave,                       # wipe the saved game folder first (out/startup/saves, or -SaveRoot): the title starts as a new profile and shows its legal/privacy screens again
     [string]$SaveRoot = "out/startup/saves",      # X2W_STORAGE_PATH for the title: its saves and persistent local storage, kept across runs so a screen accepted once is skipped next time
     [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
@@ -89,6 +90,7 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $repo $BuildDir }
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
+$runStart = Get-Date
 
 # Windows PowerShell 5.1 turns a native command's stderr into error records when the script's own stderr is redirected
 # (a caller that captures it), and "Stop" then ends the script on a harmless warning (cmake, git, python). Native commands
@@ -327,6 +329,17 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 }
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
+# Files written during this run outside the save folder (first 60, at most 20 s of searching, 4 levels deep): where the title keeps
+# what it saves by itself, e.g. the privacy acceptance.
+$scanRoots = if ($ScanRoots.Count) { $ScanRoots } else { @($env:LOCALAPPDATA, $env:APPDATA, [Environment]::GetFolderPath("MyDocuments"), (Join-Path $env:USERPROFILE "Saved Games"), $env:ProgramData, $DataDir) }
+$scanClock = [System.Diagnostics.Stopwatch]::StartNew()
+$changedFiles = @()
+foreach ($root in $scanRoots) {
+    if (-not $root -or -not (Test-Path -LiteralPath $root) -or $scanClock.Elapsed.TotalSeconds -gt 20) { continue }
+    $changedFiles += @(Get-ChildItem -LiteralPath $root -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $runStart -and $_.FullName.Substring($root.Length) -notmatch '\\(Temp|CrashDumps|Microsoft\\Windows|Packages|\.git)\\' -and -not $_.FullName.StartsWith($outRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 60 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName, $_.Length })
+}
 $saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
 $manifest = [ordered]@{
     commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
@@ -334,7 +347,7 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
+    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; files_written = @($changedFiles | Select-Object -First 60); saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
     pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
