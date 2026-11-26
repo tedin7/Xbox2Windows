@@ -675,7 +675,7 @@ def controls():
                [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
                ['params 1', 'targets 0'])
         text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
-        body = [line.strip() for line in text[text.index('void main('):].splitlines()]
+        body = [line.strip() for line in G.ORIGIN.sub('', text[text.index('void main('):]).splitlines()]
         want = ['if (tid == 0u) { lds[0] = s13; lds[1] = s14; }', 'GroupMemoryBarrierWithGroupSync();',
                 's13 = min(lds[0], 128u);', 's14 = min(lds[1], 128u);', 'if (s14 == 0u) s13 = 0u;',
                 'SetMeshOutputCounts(s14, s13);']

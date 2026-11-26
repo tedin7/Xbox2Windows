@@ -477,6 +477,17 @@ def check_cache_results():
             manifest = json.loads(z.read("manifest.json"))
             assert manifest["cache_keys"] == 12 and manifest["files"][T.RESULTS_NAME]["bytes"] == len(text.encode())
 
+        new_report = ("fxc ps compile failed\n"
+                      "16:9: error X3004: undeclared identifier\n"
+                      "emitted for v_mov_b32 (op_mov): synthetic_source_line;\n")
+        new_reason = "fxc ps compile failed: X3004 undeclared identifier (emitted for v_mov_b32)"
+        write(cache, "2000000000000003.fail", new_report.encode())
+        updated = {key: reason for key, _, _, reason in T.cache_results(str(cache))}
+        assert updated["2000000000000003"] == new_reason
+        family = "fxc ps compile failed: X3004 (emitted for v_mov_b32)"
+        assert T.normal_reason(new_reason) == family
+        assert T.normal_reason(T.clean_reason(new_report.replace("undeclared identifier", "another diagnostic"))) == family
+
 
 def check_request_files():
     """The request files of the worst refused keys travel in their own zip folder: ranked by draws not drawn / dispatches

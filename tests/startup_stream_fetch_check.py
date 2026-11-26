@@ -244,7 +244,8 @@ def translate(directory, vs, layout):
         (directory / ("req_%016x%s" % (key, ext))).write_bytes(data)
     status = gfx2hlsl.translate_request(str(directory), key)
     result = [directory / ("%016x%s" % (key, ext)) for ext in (".vs.hlsl", ".txt")]
-    return (status,) + tuple(p.read_text() if p.exists() else "" for p in result)
+    hlsl, manifest = (p.read_text() if p.exists() else "" for p in result)
+    return status, gfx2hlsl.ORIGIN.sub("", hlsl), manifest
 
 
 def translate_checks(directory):

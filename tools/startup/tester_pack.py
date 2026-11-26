@@ -356,15 +356,30 @@ KEY_RE = re.compile(r"(?:^|[^0-9a-f])([0-9a-f]{16})(?:[^0-9a-f]|$)")
 # request file extension -> kind; result marker: ready file suffix per kind, `.fail` for a refusal
 REQUEST_KINDS = {".a": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
 READY_SUFFIXES = {"graphics": (".txt",), "compute": (".txt",), "mesh57": (".ms57.txt",), "mesh86": (".mesh86.txt",)}
-REASON_CHARS = 200         # per key; the translator's own message, first line only
+REASON_CHARS = 200         # per key, including compiler detail
 COMPILER_CODE_RE = re.compile(r"\b(?:error|warning)\s+[A-Z]\d{3,5}\b")
 TOP_REASONS = 80
 
 
+COMPILE_FAILURE_RE = re.compile(r"(?:dxc|fxc) \w+ compile failed")
+COMPILE_DETAIL_RE = re.compile(r"(?:\d+:\d+: )?error(?: ([A-Z]\d{3,5}))?: (.+)")
+COMPILE_ORIGIN_RE = re.compile(r"emitted for ([a-z][a-z0-9_]*) \([a-z_][a-z0-9_]*\): .*")
+
+
 def clean_reason(text):
-    """One line of text from a `.fail` file, never shader code: the first line only, at most REASON_CHARS characters.
-    A compiler (dxc, fxc) message quotes the HLSL source, so only its stage and error codes are kept."""
-    line = text.strip().splitlines()[0].strip() if text.strip() else "(empty .fail)"
+    """Summarize a refusal without including the emitted source line."""
+    lines = text.strip().splitlines()
+    line = lines[0].strip() if lines else "(empty .fail)"
+    if COMPILE_FAILURE_RE.fullmatch(line):
+        for i, detail in enumerate(lines[1:], 1):
+            error = COMPILE_DETAIL_RE.fullmatch(detail)
+            if error:
+                origin = COMPILE_ORIGIN_RE.fullmatch(lines[i + 1]) if i + 1 < len(lines) else None
+                suffix = " (emitted for %s)" % origin[1] if origin else ""
+                prefix = "%s: %s" % (line, error[1] + " " if error[1] else "")
+                budget = REASON_CHARS - len(prefix) - len(suffix)
+                return prefix + re.sub(r"\s+", " ", error[2])[:budget] + suffix
+        return line
     compiler = re.match(r"(dxc|fxc)( \w+)?:", line)
     if compiler:
         codes = sorted(set(COMPILER_CODE_RE.findall(text)))
@@ -374,6 +389,12 @@ def clean_reason(text):
 
 def normal_reason(reason):
     """The reason without registers, numbers and addresses, so that the same wall counts as one."""
+    heading, _, detail = reason.partition(": ")
+    if COMPILE_FAILURE_RE.fullmatch(heading):
+        code = re.match(r"([A-Z]\d{3,5}) ", detail)
+        origin = re.search(r" \(emitted for ([a-z][a-z0-9_]*)\)$", detail)
+        if code or origin:
+            return heading + (": " + code[1] if code else "") + (origin[0] if origin else "")
     reason = re.sub(r"0x[0-9a-fA-F]+", "X", reason)
     reason = re.sub(r"\b[sv]\d+\b", "R", reason)
     return re.sub(r"\d+", "N", reason)[:110]
@@ -381,7 +402,7 @@ def normal_reason(reason):
 
 def cache_results(cache_dir):
     """[(key, kind, status, reason)] for every request key in a shader cache folder, sorted by kind and key. Status is
-    `ok` (the ready marker is published), `refused` (a `.fail` file: its first line is the reason) or `pending`."""
+    `ok` (the ready marker is published), `refused` (a `.fail` file: the report supplies the reason) or `pending`."""
     found, by_key = {}, {}
     if not os.path.isdir(cache_dir):
         return []

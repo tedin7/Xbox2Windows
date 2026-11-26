@@ -130,7 +130,7 @@ def main():
         set_s13 = struct.pack('<I', 0xbe800000 | (13 << 16) | (3 << 8) | 128)  # SOP1 s_mov_b32 s13, 0
         plain, name = request(folder, LOAD_DESCRIPTOR + set_s13 + DEFINE_V + plain_store + EXPORT_POSITION)
         check('plain store with a scalar offset translates', plain == 'ok', '%s %s' % (plain, fail_reason(name)))
-        plain_hlsl = name.with_suffix('.vs.hlsl').read_text() if plain == 'ok' else None
+        plain_hlsl = G.ORIGIN.sub('', name.with_suffix('.vs.hlsl').read_text()) if plain == 'ok' else None
         plain_manifest = name.with_suffix('.txt').read_text() if plain == 'ok' else None
         extract = sop2(SOP2['s_bfe_u32'], 12, 33, 255, 0xe0010)
         clamp = sop2(SOP2['s_max_u32'], 12, 12, 129)
@@ -146,7 +146,7 @@ def main():
                            ('stride clear', clear)):
             result, name = request(folder, LOAD_DESCRIPTOR + set_s13 + mod + DEFINE_V + plain_store + EXPORT_POSITION)
             check('%s translates as the plain store' % label, result == 'ok' and plain_hlsl is not None
-                  and name.with_suffix('.vs.hlsl').read_text() == plain_hlsl
+                  and G.ORIGIN.sub('', name.with_suffix('.vs.hlsl').read_text()) == plain_hlsl
                   and name.with_suffix('.txt').read_text() == plain_manifest, '%s %s' % (result, fail_reason(name)))
         # Captured programs set the high word of the 32-bit table pointer to 0 before loading; a second load through
         # the same untouched pointer and high word reads the same words, so its stride is the same value.
@@ -156,7 +156,8 @@ def main():
                                + clear + scale + oob_raw + DEFINE_V + plain_store + EXPORT_POSITION)
         reference, ref_name = request(folder, table_hi + LOAD_DESCRIPTOR + set_s13 + DEFINE_V + plain_store + EXPORT_POSITION)
         check('stride of a second load through the same pointer translates as the plain store', result == reference == 'ok'
-              and name.with_suffix('.vs.hlsl').read_text() == ref_name.with_suffix('.vs.hlsl').read_text(),
+              and G.ORIGIN.sub('', name.with_suffix('.vs.hlsl').read_text())
+                  == G.ORIGIN.sub('', ref_name.with_suffix('.vs.hlsl').read_text()),
               '%s %s' % (result, fail_reason(name)))
         # After an add on the table pointer, a second load reads other words under the same table offset.
         add_pointer = sop2(SOP2['s_add_u32'], 8, 8, 255, 32)

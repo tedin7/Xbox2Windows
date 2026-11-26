@@ -97,8 +97,9 @@ def check_requests(directory):
     os.environ['X2W_DXC'] = sys.executable
     assert (cache / ('%016x.txt' % key)).exists()
     result = G.translate_request(str(cache), key)
-    assert result.startswith('dxc cs failed: '), result
-    assert (cache / ('%016x.fail' % key)).read_text().startswith('dxc cs: '), (cache / ('%016x.fail' % key)).read_text()
+    assert result == 'dxc cs compile failed', result
+    report = (cache / ('%016x.fail' % key)).read_text()
+    assert report == 'dxc cs compile failed\n', report
     assert not (cache / ('%016x.txt' % key)).exists(), 'a manifest was left next to the failure'
     assert key in G.pending_keys(str(cache), skip_failed=False)
     # With compilation on (X2W_FXC unset), a compute request is done only with its manifest and non-empty

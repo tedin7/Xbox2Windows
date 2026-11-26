@@ -90,8 +90,9 @@ class StubPipeline:
     def __init__(self, *args, **kwargs):
         pass
 
-    def hlsl_vs(self):
-        return 'void main() {}\n'
+    def hlsl_vs(self, *, origins=False):
+        origin = ' // x2w-origin 0x0 s_nop one' if origins else ''
+        return 'void main() {}' + origin + '\n'
 
     hlsl_ps = hlsl_vs
 
@@ -193,6 +194,17 @@ def check_negative_discovery(failures):
                 failures.append('negative control: a Windows Kits tree with fxc.exe was not found')
 
 
+def check_dxc_failure(failures):
+    source = 'uint x = y; // x2w-origin 0x4 v_mov_b32 op_v_mov_b32\n'
+    output = "D:/scratch/fixture.hlsl:1:10: error: use of undeclared identifier 'y'"
+    result = subprocess.CompletedProcess([], 1, '', output + '\n' + source)
+    expected = ("dxc cs compile failed\n"
+                "1:10: error: use of undeclared identifier 'y'\n"
+                "emitted for v_mov_b32 (op_v_mov_b32): uint x = y;")
+    if gfx2hlsl.compiler_failure('dxc', 'cs', result, source) != expected:
+        failures.append('DXC report did not preserve location, diagnostic and origin')
+
+
 def check_pending_manifest_upgrade(failures):
     with tempfile.TemporaryDirectory() as work:
         out = Path(work)
@@ -209,7 +221,12 @@ def check_pending_manifest_upgrade(failures):
             runs.append(profile)
             Path(command[command.index('/Fo') + 1]).write_bytes(profile.encode('ascii'))
             if fail_pixel and profile == 'ps_5_1':
-                return subprocess.CompletedProcess(command, 1, '', 'synthetic compiler failure')
+                source_path = Path(command[-1])
+                lines = source_path.read_text().splitlines()
+                row = next(i for i, line in enumerate(lines, 1) if ' // x2w-origin ' in line)
+                errors = [f'{source_path}({row},{col}): error X3004: synthetic diagnostic {col}'
+                          for col in range(1, 5)]
+                return subprocess.CompletedProcess(command, 1, '\n'.join(errors[1:]), errors[0])
             return subprocess.CompletedProcess(command, 0, '', '')
 
         def pending(configured, retry=False):
@@ -231,12 +248,17 @@ def check_pending_manifest_upgrade(failures):
 
         fxc = out / 'fxc.exe'
         fxc.touch()
-        if 'fxc ps failed' not in pending(str(fxc)) or runs != ['vs_5_1', 'ps_5_1']:
+        if 'fxc ps compile failed' not in pending(str(fxc)) or runs != ['vs_5_1', 'ps_5_1']:
             failures.append('pending did not compile an existing manifest when FXC became available')
         if vs.exists() or ps.exists():
             failures.append('a failed compilation published partial shader bytecode')
         if not failure.is_file():
             failures.append('a failed compilation did not write a failure report')
+        else:
+            report = failure.read_text()
+            if (report.count('error X3004: synthetic diagnostic') != 3 or report.count('emitted for s_nop (one): void main() {}') != 3
+                    or str(work) in report or 'synthetic diagnostic 4' in report):
+                failures.append('a failed compilation did not retain three path-free diagnostics and HLSL lines')
 
         # A refusal the same translator build wrote is final: --pending leaves it alone unless X2W_RETRY_FAILED=1.
         runs.clear()

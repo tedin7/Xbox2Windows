@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import disasm_rdna2 as D  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_exec as LE  # noqa: E402
+from hlsl_self_check import ORIGIN, check_hlsl  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
@@ -31,6 +32,63 @@ READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 
 class Unsupported(Exception):
     pass
+
+
+COMPILER_ERROR = re.compile(
+    r'^(?:(?:.*?)(?:\((?P<fl>\d+),(?P<fc>\d+)(?:-\d+)?\)|:(?P<dl>\d+):(?P<dc>\d+)):\s*)?'
+    r'(?:(?:fxc|dxc)\s*:\s*)?(?:fatal )?error(?:\s+(?P<code>[A-Z]\d{3,5}))?:\s*(?P<message>.+)$',
+    re.IGNORECASE)
+
+
+class EmittedStatement(str):
+    """Carry origin through the translator's string-based block analyses."""
+
+    def __new__(cls, text, origin):
+        statement = super().__new__(cls, text)
+        statement.origin = origin
+        return statement
+
+    def render(self):
+        # A comment belongs after the complete statement, including any inline block.
+        return self + ' // x2w-origin ' + self.origin
+
+
+def render_statement(line):
+    return line.render() if isinstance(line, EmittedStatement) else line
+
+
+def checked_hlsl(lines, origins):
+    source = '\n'.join(lines) + '\n'
+    problem = check_hlsl(source)
+    if problem:
+        raise Unsupported(problem)
+    return source if origins else ORIGIN.sub('', source)
+
+
+def compiler_failure(compiler, stage, result, hlsl):
+    report = [f'{compiler} {stage} compile failed']
+    source = hlsl.splitlines()
+    errors = 0
+    for line in (result.stderr + '\n' + result.stdout).splitlines():
+        error = COMPILER_ERROR.fullmatch(line.strip())
+        if not error:
+            continue
+        row = error['fl'] or error['dl']
+        column = error['fc'] or error['dc']
+        code = ' ' + error['code'].upper() if error['code'] else ''
+        location = f'{row}:{column}: ' if row else ''
+        report.append(f'{location}error{code}: {error["message"]}')
+        errors += 1
+        if row and 1 <= int(row) <= len(source):
+            emitted = source[int(row) - 1].strip()
+            origin = ORIGIN.search(emitted)
+            report.append('emitted for %s (%s): %s' % (
+                origin['instruction'] if origin else 'stage_wrapper',
+                origin['handler'] if origin else 'stage_wrapper',
+                emitted[:origin.start()] if origin else emitted))
+        if errors == 3:
+            break
+    return '\n'.join(report)
 
 
 PREFETCH = bytes.fromhex('0300a0bf')
@@ -2821,6 +2879,15 @@ class Stage:
                     if not getattr(self, 'has_branches', False):
                         self.sym.pop(106, None)
                         self.sym.pop(107, None)
+        origin = getattr(self, 'emission_origin', None)
+        if origin:
+            frame = sys._getframe(1)
+            # Attribute helper writes to the handler selected by the instruction dispatcher.
+            dispatchers = ('_lower', 'lower', 'one', 'translate')
+            while (frame.f_code.co_name not in dispatchers and frame.f_back
+                   and frame.f_back.f_code.co_name not in dispatchers):
+                frame = frame.f_back
+            text = EmittedStatement(text, f'{origin} {frame.f_code.co_name}')
         self.lines.append(text)
 
     def divergent_exit_loop(self, at):
@@ -2846,9 +2913,10 @@ class Stage:
             choice['X2W_PLAIN_SAMPLE<%x>' % at] = level0 if spanned else implicit
 
         def text(line):
+            origin = getattr(line, "origin", None)
             for token, call in choice.items():
                 line = line.replace(token, call)
-            return line
+            return EmittedStatement(line, origin) if origin else line
         self.blocks = [(start, [text(l) for l in lines], term) for start, lines, term in self.blocks]
 
     def check_vcc_paths(self):
@@ -3842,6 +3910,7 @@ class Stage:
             uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
+            self.term_origins = {}
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.exec_narrow_only = init_narrow_only
@@ -3930,6 +3999,7 @@ class Stage:
                     self.lines, start = [], off
                     self.descriptor_block_first = instruction_index
                 self.pc = off
+                self.emission_origin = f'0x{off:x} {name}'
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
                 if off in targets:
@@ -4168,6 +4238,7 @@ class Stage:
                     self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
                     self.pinned_low16_v.update(self.low16_only_v)
+                    self.term_origins[start] = self.emission_origin + ' one'
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
                     self.descriptor_block_first = instruction_index + 1
@@ -8860,7 +8931,10 @@ class Stage:
             self.export(asm)
         finally:
             self.in_mesh_export = False
-        self.lines[first:] = ['if (exec & 1) { %s mesh_vertex = true; }' % ' '.join(self.lines[first:])]
+        wrapped = 'if (exec & 1) { %s mesh_vertex = true; }' % ' '.join(self.lines[first:])
+        if self.emission_origin:
+            wrapped = EmittedStatement(wrapped, self.emission_origin + ' mesh_export')
+        self.lines[first:] = [wrapped]
         return None
 
     def op_v_mbcnt_lo_u32_b32(self, ops, mods, high=False):
@@ -10303,14 +10377,15 @@ class Stage:
         return None
 
     # ---- output ------------------------------------------------------------------------------
-    def body(self):
+    def body(self, *, origins=False):
         """Statements of the whole program as structured HLSL."""
         out = []
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
         loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
+        render = render_statement if origins else str
         if len(self.blocks) == 1:
-            return ['    ' + line for line in self.blocks[0][1]]
+            return ['    ' + render(line) for line in self.blocks[0][1]]
 
         def goto(off):
             if off not in index:
@@ -10332,7 +10407,7 @@ class Stage:
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             if off in getattr(self, 'mesh_collect_reads', {}):
                 out.append('        uint mesh_first = mesh_first_%d;' % i)
-            out += ['        ' + line for line in lines]
+            out += ['        ' + render(line) for line in lines]
             if off in getattr(self, 'mesh_collect_votes', {}):
                 word = self.mesh_collect_votes[off]
                 out += ['    }',
@@ -10349,6 +10424,9 @@ class Stage:
                 out.append('        pc = %d;' % goto(term[1]))
             else:
                 out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
+            origin = getattr(self, 'term_origins', {}).get(off)
+            if origins and origin:
+                out[-1] = EmittedStatement(out[-1], origin).render()
             out.append('    }')
         if loops:
             out.append('    }')
@@ -11676,13 +11754,13 @@ class Pipeline:
         fields.append('    float4 pos : SV_Position;')
         return fields
 
-    def hlsl_vs(self):
+    def hlsl_vs(self, *, origins=False):
         s = self.vs
         out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
         s.used_v.add(0)
         flat = re.compile(r'\s*o\.fparam(\d+) = ')
         half = re.compile(r'\s*o\.hparam(\d+)_(?:lo|hi) = ')
-        body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)
+        body = [line for line in s.body(origins=True) if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)
                 and not (half.match(line) and int(half.match(line).group(1)) not in self.f16_plain)]
         if s.fetched:
             # Behind a fetch call a register read as 0 by default would hide a missing input, so every read must be
@@ -11716,21 +11794,21 @@ class Pipeline:
             out += ['    o.hparam%d_%s = p.hparam%d_%s + r.hparam%d_%s - q.hparam%d_%s;' % (p, h, p, h, p, h, p, h)
                     for h in ('lo', 'hi')]
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
-        return '\n'.join(out) + '\n'
+        return checked_hlsl(out, origins)
 
     def ps_profile(self):
         """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
         return 'ps_6_0' if self.ps.needs_sm6 else 'ps_5_1'
 
-    def hlsl_ps(self):
+    def hlsl_ps(self, *, origins=False):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         depth = 'depth' in s.exports
         quad = QUAD_ANY_HLSL if getattr(s, 'uses_quad_vote', False) else []
         out = self.common() + quad + ['struct PSIn {'] + self.interface(True) + ['};']
         if not targets and not depth:
-            out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
-            return '\n'.join(out) + '\n'
+            out += ['void main(PSIn i) {'] + s.declarations() + s.body(origins=True) + ['}']
+            return checked_hlsl(out, origins)
         out.append('struct PSOut {')
         if depth:
             out.append('    float depth : SV_Depth;')
@@ -11738,8 +11816,8 @@ class Pipeline:
             kind = self.mrt_kind(t)
             out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
         out += ['};', 'PSOut main(PSIn i) {', '    PSOut o = (PSOut)0;']
-        out += s.declarations() + s.body() + ['    return o;', '}']
-        return '\n'.join(out) + '\n'
+        out += s.declarations() + s.body(origins=True) + ['    return o;', '}']
+        return checked_hlsl(out, origins)
 
     def manifest(self):
         # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
@@ -11913,26 +11991,26 @@ class ComputePipeline(Pipeline):
                           'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }')
         return out
 
-    def hlsl_cs(self):
+    def hlsl_cs(self, *, origins=False):
         # The body can also meet a buffer that is both loaded and stored: translate again with it as one RW view.
         while True:
             try:
-                return self._hlsl_cs()
+                return self._hlsl_cs(origins)
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
                 self._build_stage()
 
-    def _hlsl_cs(self):
+    def _hlsl_cs(self, origins):
         s = self.cs
         if s.exports:
             raise Unsupported('export in a compute program')
-        body = s.body()
+        body = s.body(origins=True)
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
-        return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
+        return checked_hlsl(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}'], origins)
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
@@ -12013,12 +12091,12 @@ class MeshPipeline(Pipeline):
     """A slot 57 mesh pipeline with an optional pixel stage. The mesh stage is self.vs."""
     vertex_kind = 'ms'
 
-    def hlsl_ms(self):
+    def hlsl_ms(self, *, origins=False):
         s = self.vs
         lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
                         re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
                                lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
-                 for line in s.body()]
+                 for line in s.body(origins=True)]
         if self.ps is None:
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
@@ -12044,13 +12122,13 @@ class MeshPipeline(Pipeline):
                 '    return result;',
                 '}',
             ]
-        return '\n'.join(
+        return checked_hlsl(
             self.common() + collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
                 % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
             + s.declarations() + ['    ' + line for line in s.entry] + lines
-            + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
+            + ['    if (mesh_vertex) verts[tid] = o;', '}'], origins)
 
 
 def fnv(data, h=1469598103934665603):
@@ -12152,7 +12230,7 @@ def translate_compute(out_dir, key):
         os.remove(name + '.txt')  # the result is unpublished until validation and compilation finish
     try:
         pipe = load_compute_request(out_dir, key)
-        hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
+        hlsl, manifest = pipe.hlsl_cs(origins=True), pipe.manifest()
     except Unsupported as reason:
         reason = fail_reason(reason)
         write_failure(name + '.fail', reason)
@@ -12171,11 +12249,9 @@ def translate_compute(out_dir, key):
             r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
                                capture_output=True, text=True)
             if r.returncode or not has_bytecode(bytecode):
-                # DXC names the source path; keep only the diagnostic after it.
-                lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
-                write_failure(name + '.fail', 'dxc cs: %s' % detail[:500])
-                return 'dxc cs failed: %s' % detail[:500]
+                failure = compiler_failure('dxc', 'cs', r, hlsl)
+                write_failure(name + '.fail', failure)
+                return failure.splitlines()[0]
             os.replace(bytecode, name + '.cs.cso')
     temporary = '%s.txt.%d.tmp' % (name, os.getpid())
     with open(temporary, 'w') as result:
@@ -12267,7 +12343,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
                         ps_hw_inputs=ps_hw_inputs)
-        vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
+        vs, ps, manifest = pipe.hlsl_vs(origins=True), pipe.hlsl_ps(origins=True), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
@@ -12307,9 +12383,9 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                     command = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
-                    detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
-                    write_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
-                    return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
+                    failure = compiler_failure('dxc' if sm6 else 'fxc', stage, r, vs if stage == 'vs' else ps)
+                    write_failure(name + '.fail', failure)
+                    return failure.splitlines()[0]
             with suppress(FileNotFoundError, UnicodeError):
                 with open(manifest_path) as existing:
                     write_manifest = existing.read() != manifest
@@ -12549,9 +12625,9 @@ def translate_mesh57(out_dir, key):
         if 'null' in targets and not null_only and not kill_exit_block(pixel):
             raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
-    sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
+    sources = [('ms', 'ms_6_5', pipe.hlsl_ms(origins=True))]
     if ps:
-        sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
+        sources.append(('ps', 'ps_6_0', pipe.hlsl_ps(origins=True)))
     manifest = pipe.manifest()
     name = os.path.join(out_dir, '%016x' % key)
     for stage, _, hlsl in sources:
@@ -12563,14 +12639,12 @@ def translate_mesh57(out_dir, key):
         import subprocess
         # Publish bytecode only after all requested stages compile successfully.
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
-            for stage, profile, _ in sources:
+            for stage, profile, hlsl in sources:
                 bytecode = os.path.join(staging, stage + '.cso')
                 r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
                                    capture_output=True, text=True)
                 if r.returncode or not has_complete_mesh57_bytecode(bytecode):
-                    # DXC names the source path; keep only the diagnostic after it.
-                    lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
+                    raise Unsupported(compiler_failure('dxc', stage, r, hlsl))
             for stage, _, _ in sources:
                 os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
     temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
@@ -12591,7 +12665,7 @@ def translate_request(out_dir, key):
             return translate_mesh57(out_dir, key)
         except (Unsupported, OSError, UnicodeError, struct.error) as reason:
             write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
-            return 'unsupported: %s' % reason
+            return 'unsupported: %s' % str(reason).split('\n', 1)[0]
     try:
         try:
             _, base, _, description = request_source(out_dir, key)
@@ -12973,6 +13047,7 @@ def translator_version():
     script = Path(__file__).resolve()
     tools = script.parent.parent
     sources = (script, script.with_name('lane_exec.py'), script.with_name('ps_input_scan.py'),
+               script.with_name('hlsl_self_check.py'),
                *(tools / (name + '.py') for name in (
                    'disasm_rdna2', 'pixel_aot', 'resource_inventory', 'verify_build',
                    'shader_minmax', 'compute_store_aot', 'mesh_param_link')))
@@ -13001,7 +13076,10 @@ def write_failure(path, reason, *, version=None):
         with open(path, 'w') as handle:
             handle.write(reason + '\n')
         return
-    family = refusal_family(reason.split('\n', 1)[0])
+    from tester_pack import COMPILE_FAILURE_RE, clean_reason
+
+    first = reason.split('\n', 1)[0]
+    family = refusal_family(clean_reason(reason) if COMPILE_FAILURE_RE.fullmatch(first) else first)
     version = version or translator_version()
     atomic_retry_text(path, '%s\nx2w-refusal-v1 %s %s\n' % (reason, version, family))
 

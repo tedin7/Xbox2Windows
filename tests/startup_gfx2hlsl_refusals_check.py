@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from hlsl_self_check import Check as HlslCheck  # noqa: E402
 
 failures = []
 FIRST, SECOND = 'unsupported_first', 'unsupported_second'
@@ -460,6 +461,51 @@ def check_normalization():
         check('normalization of ' + normalized, G.normalize_refusal(raw) == normalized)
 
 
+def check_emission():
+    def decode_fixture(blob, offset):
+        words = (
+            ('v_mov_b32', 'v_mov_b32 v1, 1.0'),
+            ('exp', 'exp pos0 v1, v1, v1, v1 done'),
+            ('exp', 'exp mrt0 v1, v1, v1, v1 done'),
+            ('s_endpgm', 's_endpgm'),
+        )
+        name, asm = words[struct.unpack_from('<I', blob, offset)[0]]
+        return 4, name, asm, None
+
+    with patch.object(G.D, 'decode_instruction', decode_fixture):
+        pipe = G.Pipeline(struct.pack('<3I', 0, 1, 3), struct.pack('<3I', 0, 2, 3), root_blob())
+        hlsl = pipe.hlsl_ps(origins=True)
+        check('only trailing comments differ in diagnostic HLSL', G.ORIGIN.sub('', hlsl) == pipe.hlsl_ps())
+
+    check('synthetic emitted shader passes the checker', G.check_hlsl(hlsl) is None)
+    line = next(line for line in hlsl.splitlines() if ' // x2w-origin 0x0 v_mov_b32 ' in line)
+    tag = G.ORIGIN.search(line)
+    check('statement records the lowering handler', tag['handler'] == 'op_v_mov_b32')
+    origin = tag[0]
+    nested = hlsl.replace(line, '    if (exec) { if (v1) { v1 = missing_local; } }' + origin)
+    check('checker visits identifiers in nested guard blocks',
+          G.check_hlsl(nested) == 'internal: missing_local used but not declared (emitted for v_mov_b32)')
+    visible = HlslCheck.visible_name
+
+    def skip_nested(checker, identifier):
+        return len(checker.scopes) > 5 or visible(checker, identifier)
+
+    with patch.object(HlslCheck, 'visible_name', skip_nested):
+        check('nested-block mutant misses the synthetic error and fails the preceding assertion',
+              G.check_hlsl(nested) is None)
+    cases = hlsl.replace(line, '    switch (exec) { case 0: v1 = missing_case; break; default: break; }' + origin)
+    check('checker visits instructions in selector arms',
+          G.check_hlsl(cases) == 'internal: missing_case used but not declared (emitted for v_mov_b32)')
+    bad_member = hlsl.replace('o.mrt0 =', 'o.missing_output =')
+    check('checker rejects an unknown output field',
+          G.check_hlsl(bad_member) == 'internal: missing_output used but not declared (emitted for exp)')
+    conditional = hlsl.replace('PSOut o = (PSOut)0;', 'PSOut o;').replace('o.mrt0 =', 'if (exec) o.mrt0 =')
+    check('a conditional output store does not define the output at the return',
+          G.check_hlsl(conditional) == 'internal: o.mrt0 is not assigned on every output path (emitted for stage_wrapper)')
+    valid = conditional.replace('    return o;', '    else o.mrt0 = 0;\n    return o;')
+    check('assignment in both branches defines the output', G.check_hlsl(valid) is None)
+
+
 if __name__ == '__main__':
     # An empty X2W_FXC publishes the manifest only, so no default-path call here ever starts fxc
     # and the check behaves the same on hosts with and without the Windows SDK.
@@ -471,4 +517,5 @@ if __name__ == '__main__':
         check_request_failures()
         check_pairs()
         check_normalization()
+        check_emission()
     sys.exit(bool(failures))

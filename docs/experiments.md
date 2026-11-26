@@ -308,6 +308,18 @@ run publishes both bytecode files and clears the failure report. The next run
 skips the completed request. Restart the runtime if it already read the manifest
 before the bytecode was available.
 
+The failure report retains up to three compiler errors with their source
+locations, emitted HLSL lines and lowering handlers. Published HLSL marks
+lowered statements with their instruction offsets and names. The tester package
+summarizes the first diagnostic and groups coded errors by compiler, stage,
+code and instruction. Before calling a compiler, the translator checks names
+and definite assignments to returned shader outputs in the HLSL it generates.
+
+Run `python3 -B tools/run_checks_parallel.py -j 2 tests/startup_translator_check.py
+tests/startup_gfx2hlsl_refusals_check.py tests/startup_tester_pack_check.py` on one
+line to exercise the failure formats, nested-block mutant and conditional
+output controls with synthetic inputs.
+
 ## One-dimensional texture sampling in startup draws
 
 The startup translator accepts ordinary 1D image sampling with a single coordinate and a
