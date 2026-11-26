@@ -79,11 +79,13 @@ def main(consumer, dxc):
         assert mismatch is None, f'raw token output: first differing word {mismatch}\n{result.stderr[-3000:]}'
 
         # The token's buffer is placed over title memory the desktop cannot alias. A later list copy of it must carry the GPU's
-        # bytes; without note_placed_gpu_write it takes the title-memory copy and moves the stale 0xdddddddd words.
-        once = [transformed(C.input_word(i), i) for i in range(written)]
+        # bytes, never the stale title memory: the stand-in refuses the copy. Without note_placed_gpu_write it copies the stale
+        # 0xdddddddd words in title memory instead.
         got, result = dispatch(directory, consumer, dict(env, X2W_VIEW_TOKEN_UAV='1'), 'dispatch-view-token-placed')
-        mismatch = next((i for i, (a, b) in enumerate(zip(got, once)) if a != b), None)
-        assert mismatch is None, f'copy of a placed token output: first differing word {mismatch}\n{result.stderr[-3000:]}'
+        copies = lines(result, 'CopyBufferRegion from a placed buffer without title backing')
+        assert copies and copies[0].endswith('1296 bytes -> refused'), f'copy of a GPU-written placed buffer: {copies}\n{result.stderr[-3000:]}'
+        assert not lines(result, 'copied in title memory'), 'stale title memory was copied'
+        assert 0xdddddddd not in got, 'stale title words reached the readback'
         print(f'WARP: {C.WORDS} words match for SRV and slot-19 reads, including switch-off controls; '
               f'GPU-based validation {"on" if validated else "unavailable (no graphics tools)"}')
 
