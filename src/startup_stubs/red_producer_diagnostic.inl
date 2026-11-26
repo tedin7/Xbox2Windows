@@ -6,6 +6,10 @@ class RedProducers {
     using Fence = Microsoft::WRL::ComPtr<ID3D12Fence>;
     static constexpr UINT64 after_offset = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     static constexpr std::size_t history_limit = 64;
+    // Rolling ring of operations with their centre pixel before and after, recorded from auto_min_ on until the trigger fires,
+    // so the first writer of the target colour is still there when the colour is detected (capture used to begin 2 frames later).
+    static constexpr std::size_t rolling_limit = 128;
+    static constexpr unsigned ring_flag = 0x10000;  // ordinal bit: the entry lives in ring_, not in entries_
     struct Entry {
         ID3D12GraphicsCommandList* list;
         Resource readback, surface;
@@ -18,6 +22,9 @@ class RedProducers {
         bool live = true;
         bool pending = false;
         bool ambiguous = false;
+        bool rolling = false;  // a ring entry: its result is kept for the dump on the trigger instead of logged at once
+        bool done = false;
+        unsigned char rgba[4]{}, prior[4]{};
     };
     struct History {
         const void* list;
@@ -30,6 +37,8 @@ class RedProducers {
     std::mutex lock_;
     std::vector<Resource> surfaces_;
     std::vector<Entry> entries_;
+    std::vector<Entry> ring_;
+    std::size_t ring_next_ = 0;
     LONG first_ = 0, last_ = 0;
     LONG auto_min_ = 0, auto_count_ = 0;
     volatile LONG auto_first_ = 0, auto_last_ = 0;
@@ -37,7 +46,7 @@ class RedProducers {
     bool auto_last_match_ = false;
     History history_[history_limit]{};
     std::size_t history_next_ = 0, history_count_ = 0;
-    unsigned submit_order_ = 0;
+    unsigned submit_order_ = 0, ring_order_ = 0;
     bool full_logged_ = false;
 
 public:
@@ -80,6 +89,7 @@ public:
     {
         return rgba[0] == target_rgb_[0] && rgba[1] == target_rgb_[1] && rgba[2] == target_rgb_[2];
     }
+    bool rolling() const { return auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_; }
     bool interested() const
     {
         const LONG next = frame_number + 1;
@@ -107,6 +117,7 @@ public:
             log("x2w-red history record=%ld list=%p target=%p op=%s key=%016llx rt=%u",
                 e.frame, e.list, e.surface, e.operation, e.key, e.attachment);
         }
+        dump_rolling_locked(surface);
     }
 
     void present(ID3D12Resource* surface)
@@ -133,7 +144,7 @@ public:
             history_next_ = (history_next_ + 1) % history_limit;
             if (history_count_ < history_limit) ++history_count_;
         }
-        if (!interested()) return 0;
+        if (!interested()) return rolling() ? before_ring_locked(owner, list, *found, operation, key, attachment) : 0;
         if (entries_.size() >= 512) {
             if (!full_logged_) log("x2w-red producer capture limit reached at frame %ld", frame_number + 1);
             full_logged_ = true;
@@ -166,10 +177,78 @@ public:
     {
         if (!ordinal) return;
         std::lock_guard<std::mutex> guard(lock_);
-        copy_pixel(owner, entries_[ordinal - 1], after_offset);
+        copy_pixel(owner, entry_of(ordinal), after_offset);
     }
 
 private:
+    Entry& entry_of(unsigned ordinal)
+    {
+        return (ordinal & ring_flag) ? ring_[(ordinal & ~ring_flag) - 1] : entries_[ordinal - 1];
+    }
+    template <class Visit>
+    void each_entry(const Visit& visit)
+    {
+        for (Entry& entry : entries_) visit(entry);
+        for (Entry& entry : ring_) visit(entry);
+    }
+    // One ring slot per operation on a presentation target, reused oldest first; a slot still waiting for its GPU result is skipped.
+    unsigned before_ring_locked(Wrapper* owner, ID3D12GraphicsCommandList* list, const Resource& surface, const char* operation,
+                                u64 key, unsigned attachment)
+    {
+        const auto desc = surface->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return 0;
+        const std::size_t slot = ring_next_ % rolling_limit;
+        if (slot < ring_.size() && ring_[slot].pending) return 0;
+        const auto ordinal = static_cast<unsigned>(slot + 1) | ring_flag;
+        Entry entry{list, {}, surface, {}, nullptr, frame_number + 1, 0, attachment, ordinal, 0, operation, key};
+        entry.rolling = true;
+        if (slot < ring_.size()) {
+            entry.readback = std::move(ring_[slot].readback);
+        } else {
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC buffer{};
+            buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            buffer.Width = after_offset + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+            buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            const HRESULT hr = device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readback));
+            if (FAILED(hr)) {
+                log("x2w-red producer readback allocation failed hr=0x%08lx", static_cast<unsigned long>(hr));
+                return 0;
+            }
+            x2w_budget::committed(device_of(the_device), entry.readback.Get(), D3D12_HEAP_TYPE_READBACK);
+            ring_.emplace_back();
+        }
+        ++ring_next_;
+        ring_[slot] = std::move(entry);
+        copy_pixel(owner, ring_[slot], 0);
+        return ordinal;
+    }
+    // On the trigger: the ring in submit order with the centre pixel before and after each operation, then the first operation on the
+    // triggering target whose result is the target colour while its input was not.
+    void dump_rolling_locked(ID3D12Resource* target)
+    {
+        flush_locked();
+        std::vector<const Entry*> done;
+        for (const Entry& e : ring_) if (e.rolling && e.done && !e.ambiguous) done.push_back(&e);
+        std::sort(done.begin(), done.end(), [](const Entry* a, const Entry* b) { return a->submit_order < b->submit_order; });
+        log("x2w-red rolling history: %zu operations with a result (ring of %zu, target %p)", done.size(), rolling_limit, target);
+        const Entry* first = nullptr;
+        for (const Entry* e : done) {
+            log("x2w-red rolling order=%u record=%ld submit=%ld queue=%p target=%p op=%s key=%016llx rt=%u before=%u,%u,%u,%u after=%u,%u,%u,%u",
+                e->submit_order, e->record_frame, e->submit_frame, e->queue, e->surface.Get(), e->operation, e->key, e->attachment,
+                e->prior[0], e->prior[1], e->prior[2], e->prior[3], e->rgba[0], e->rgba[1], e->rgba[2], e->rgba[3]);
+            if (!first && e->surface.Get() == target && matches(e->rgba) && !matches(e->prior)) first = e;
+        }
+        if (first)
+            log("x2w-red first writer: order=%u record=%ld op=%s key=%016llx rt=%u before=%u,%u,%u after=%u,%u,%u target=%p",
+                first->submit_order, first->record_frame, first->operation, first->key, first->attachment,
+                first->prior[0], first->prior[1], first->prior[2], first->rgba[0], first->rgba[1], first->rgba[2], target);
+        else
+            log("x2w-red first writer: none in the ring (older than %zu operations, or not an operation on this target)", rolling_limit);
+    }
     void copy_pixel(Wrapper* owner, const Entry& entry, UINT64 offset)
     {
         ID3D12Resource* surface = entry.surface.Get();
@@ -191,7 +270,7 @@ public:
     {
         if (!enabled()) return;
         std::lock_guard<std::mutex> guard(lock_);
-        for (Entry& entry : entries_) if (entry.list == list) entry.live = false;
+        each_entry([=](Entry& entry) { if (entry.list == list) entry.live = false; });
     }
 
     template <class Invoke>
@@ -204,8 +283,8 @@ public:
         Fence fence;
         bool tried = false;
         for (ID3D12CommandList* list : lists) {
-            for (Entry& entry : entries_) {
-                if (!entry.live || entry.list != list) continue;
+            each_entry([&](Entry& entry) {
+                if (!entry.live || entry.list != list) return;
                 if (!tried) {
                     tried = true;
                     if (FAILED(device_of(the_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) ||
@@ -218,9 +297,9 @@ public:
                 entry.fence = fence;
                 entry.queue = queue;
                 entry.submit_frame = frame_number + 1;
-                entry.submit_order = ++submit_order_;
+                entry.submit_order = entry.rolling ? ++ring_order_ : ++submit_order_;  // capture frames keep their own numbering
                 entry.pending = true;
-            }
+            });
         }
     }
 
@@ -234,25 +313,29 @@ public:
 private:
     void flush_locked()
     {
-        for (Entry& entry : entries_) {
-            if (!entry.pending || !entry.fence || entry.fence->GetCompletedValue() != 1) continue;
+        each_entry([&](Entry& entry) {
+            if (!entry.pending || !entry.fence || entry.fence->GetCompletedValue() != 1) return;
             entry.pending = false;
             if (entry.ambiguous) {
-                log("x2w-red producer ambiguous resubmit ordinal=%u order=%u", entry.ordinal, entry.submit_order);
-                continue;
+                if (!entry.rolling) log("x2w-red producer ambiguous resubmit ordinal=%u order=%u", entry.ordinal, entry.submit_order);
+                return;
             }
             const D3D12_RANGE read{0, after_offset + 4}, none{};
             void* memory = nullptr;
-            if (FAILED(entry.readback->Map(0, &read, &memory))) continue;
+            if (FAILED(entry.readback->Map(0, &read, &memory))) return;
             unsigned char rgba[4], prior[4];
             std::memcpy(prior, memory, sizeof(prior));
             std::memcpy(rgba, static_cast<unsigned char*>(memory) + after_offset, sizeof(rgba));
             entry.readback->Unmap(0, &none);
+            std::memcpy(entry.rgba, rgba, sizeof(rgba));
+            std::memcpy(entry.prior, prior, sizeof(prior));
+            entry.done = true;
+            if (entry.rolling) return;  // kept for the dump on the trigger
             log("x2w-red producer order=%u ordinal=%u record=%ld submit=%ld queue=%p target=%p op=%s key=%016llx rt=%u rgba=%u,%u,%u,%u before=%u,%u,%u,%u",
                 entry.submit_order, entry.ordinal, entry.record_frame, entry.submit_frame, entry.queue, entry.surface.Get(),
                 entry.operation, entry.key, entry.attachment, rgba[0], rgba[1], rgba[2], rgba[3],
                 prior[0], prior[1], prior[2], prior[3]);
-        }
+        });
     }
 };
 

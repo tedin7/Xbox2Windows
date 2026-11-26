@@ -49,6 +49,13 @@ def check_auto(magenta=False):
             "x2w-red history record=5" in logs and "x2w-red history record=1" not in logs), logs
     assert records == [("1", "1", "7", target, GREEN, color), ("2", "2", "7", target, color, GREEN)], logs
     assert f"sample present=1 published_at=2 target={target} rgba={color} red={int(not magenta)} match=1 " in logs, logs
+    # The writer is found from the rolling ring recorded BEFORE the colour was detected: the first operation on the target whose
+    # centre pixel turns into the target colour while it was not that colour before.
+    first_writer = re.search(r"x2w-red first writer: order=(\d+) record=(\d+) op=clear-rtv key=0+ rt=0 before=(\d+),(\d+),(\d+) after=" +
+                             rgb + fr" target={target}", logs)
+    assert "x2w-red rolling history:" in logs and first_writer, logs
+    before = tuple(int(v) for v in first_writer.groups()[2:5])
+    assert before != tuple(int(v) for v in rgb.split(",")) and int(first_writer.group(2)) < 7, logs  # recorded before the capture frames
     print(f"auto {rgb} control: excludes early and near matches and compares paired samples within the armed window ({adapter})")
 
 
