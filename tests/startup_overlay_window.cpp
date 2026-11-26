@@ -9,8 +9,27 @@ static int fail(int code, int line)
     return code;
 }
 
+// The checks need an interactive desktop (z-order, foreground). A service or ssh session has a window station that is not
+// visible, or no input desktop: CTest SKIP code (77) with a message instead of a red that says nothing about the code.
+static bool interactive_desktop()
+{
+    USEROBJECTFLAGS flags{};
+    DWORD needed = 0;
+    if (!GetUserObjectInformationW(GetProcessWindowStation(), UOI_FLAGS, &flags, sizeof(flags), &needed) ||
+        !(flags.dwFlags & WSF_VISIBLE))
+        return false;
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
+    if (!input) return false;
+    CloseDesktop(input);
+    return true;
+}
+
 int main()
 {
+    if (!interactive_desktop()) {
+        std::puts("startup_overlay_window skipped: no interactive desktop in this session (window station not visible or no input desktop)");
+        return 77;
+    }
     WNDCLASSW wc{};
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpfnWndProc = DefWindowProcW;
@@ -60,7 +79,7 @@ int main()
     for (ULONGLONG until = GetTickCount64() + 3000; !ticked && GetTickCount64() < until; Sleep(10))
         ticked = PeekMessageW(&tick, output, WM_TIMER, WM_TIMER, PM_REMOVE) && tick.wParam == x2w_startup::hide_title_timer;
     KillTimer(output, x2w_startup::hide_title_timer);
-    if (!ticked) return fail(19, __LINE__);
+    if (!ticked) return fail(22, __LINE__);
     // Only the guest is hidden: the presenter, a window it owns and a dialog stay visible.
     HWND title = make(L"STATIC", nullptr, true);
     HWND dialog = make(x2w_startup::dialog_class, nullptr, true);
@@ -101,7 +120,7 @@ int main()
     if (focus_checked) {
         bool refused = true;
         if (hider.step(front_output, 5, 1, &refused) < 1 || refused || GetForegroundWindow() != front_output ||
-            !wait_visibility(front, false)) return fail(21, __LINE__);
+            !wait_visibility(front, false)) return fail(23, __LINE__);
     }
     DestroyWindow(front);
     DestroyWindow(front_output);
