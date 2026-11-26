@@ -27,7 +27,7 @@ param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
     [int]$Seconds = 420,
-    [string]$Input = "menus",
+    [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
@@ -83,7 +83,7 @@ New-Item -ItemType Directory -Force $cache | Out-Null
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
-$script = (& $python -B $pack input-preset $Input $Seconds)
+$script = (& $python -B $pack input-preset $InputMode $Seconds)
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
