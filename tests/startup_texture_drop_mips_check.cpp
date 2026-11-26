@@ -89,7 +89,7 @@ int main(int argc, char** argv)
     check("GetDimensions keeps every level", rule(big, one, dm::Use::size, top).reason == dm::Reason::size);
     check("GetLOD keeps every level", rule(big, one, dm::Use::lod, top).reason == dm::Reason::lod);
     check("a small texture keeps every level",
-          rule(texture(512, 512, 10), one, dm::Use::sample, top).reason == dm::Reason::small);
+          rule(texture(512, 512, 10), one, dm::Use::sample, top).reason == dm::Reason::below_min);
     check("a view that starts below the top level keeps every level",
           rule(big, one, dm::Use::sample, {2, 0.0f}).levels == 0 && rule(big, one, dm::Use::sample, {2, 0.0f}).reason == dm::Reason::view_clamp);
     check("a view with a minimum LOD clamp keeps every level", rule(big, one, dm::Use::sample, {0, 1.5f}).reason == dm::Reason::view_clamp);

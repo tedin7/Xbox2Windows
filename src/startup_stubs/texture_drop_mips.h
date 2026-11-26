@@ -27,7 +27,7 @@ enum class Use : std::uint8_t { unknown, sample, texel, size, lod };
 enum class Reason : std::uint8_t {
     none,           // dropped
     off,            // the opt-in is not set
-    small,          // below the byte threshold
+    below_min,        // below the byte threshold
     few_mips,       // not enough levels to drop and keep one
     not_2d,         // volume, 1D, array or cube
     flags,          // render target, depth, or UAV
@@ -48,7 +48,7 @@ inline const char* reason_name(Reason reason)
     switch (reason) {
     case Reason::none: return "dropped";
     case Reason::off: return "off";
-    case Reason::small: return "small";
+    case Reason::below_min: return "small";
     case Reason::few_mips: return "few_mips";
     case Reason::not_2d: return "not_2d";
     case Reason::flags: return "flags";
@@ -171,7 +171,7 @@ inline Decision decide(const D3D12_RESOURCE_DESC& desc, const Config& config, Us
                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return {0, Reason::flags};
     if (desc.SampleDesc.Count != 1) return {0, Reason::multisampled};
     if (planar(desc.Format)) return {0, Reason::format};
-    if (chain_estimate(desc) < config.min_bytes) return {0, Reason::small};
+    if (chain_estimate(desc) < config.min_bytes) return {0, Reason::below_min};
     if (view.most_detailed_mip != 0 || view.min_lod_clamp != 0.0f) return {0, Reason::view_clamp};
     const unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips <= config.levels) return {0, Reason::few_mips};
