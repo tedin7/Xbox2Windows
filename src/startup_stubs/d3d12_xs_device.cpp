@@ -1581,6 +1581,23 @@ struct TitleAllocator {
 SRWLOCK allocator_lock = SRWLOCK_INIT;
 std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
+// Protected by allocator_lock. A detached recording cannot be submitted again, but
+// its allocator's queue fences still cover any in-flight reads and writes.
+struct GpuMirrorRecording {
+    DesktopAllocator* allocator;
+    bool detached = false;
+    bool submitted = false;
+};
+std::unordered_map<Wrapper*, std::shared_ptr<GpuMirrorRecording>> gpu_mirror_recordings;
+
+void detach_gpu_mirror_recording(Wrapper* list)
+{
+    const auto found = gpu_mirror_recordings.find(list);
+    if (found == gpu_mirror_recordings.end()) return;
+    found->second->detached = true;
+    gpu_mirror_recordings.erase(found);
+}
+
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
 // Pages of finished list arenas, handed to the next arenas (allocator_lock).
@@ -1679,6 +1696,7 @@ void release_upload_recording(Wrapper* list)
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
     retire_list_arena(list);
+    detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
     if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
         if (found->second) --found->second->lists;
@@ -1902,6 +1920,8 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             if (auto* arena = list->own().list_uploads) arena->submitted(fence, value);
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
+            if (const auto mirror = gpu_mirror_recordings.find(list); mirror != gpu_mirror_recordings.end())
+                mirror->second->submitted = true;
             auto& submits = found->second->submits;
             const auto same = std::find_if(submits.begin(), submits.end(), [&](const auto& s) { return s.first == fence; });
             if (same == submits.end()) submits.emplace_back(fence, value);
@@ -2070,6 +2090,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                 title.current = target;
             }
             title.type = type;
+            detach_gpu_mirror_recording(self);
             DesktopAllocator*& on = list_recordings[self];
             if (on) --on->lists;
             on = title.current;

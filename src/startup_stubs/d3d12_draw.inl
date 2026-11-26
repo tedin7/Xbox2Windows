@@ -1586,6 +1586,199 @@ struct BigBindingCounts {
 };
 BigBindingCounts big_binding_counts;
 
+bool gpu_mirror_enabled()
+{
+    static const bool on = [] {
+        char value[2]{};
+        const DWORD saved = GetLastError();
+        const bool enabled = GetEnvironmentVariableA("X2W_GPU_MIRROR", value, sizeof(value)) == 1 && value[0] == '1';
+        SetLastError(saved);
+        return enabled;
+    }();
+    return on;
+}
+
+constexpr std::size_t gpu_mirror_min_bytes = 16u << 20;
+constexpr std::size_t gpu_mirror_block_bytes = 64u << 10;
+constexpr std::size_t gpu_mirror_budget = 256u << 20;
+
+struct GpuMirror {
+    x2w_startup::ComPtr<ID3D12Resource> resource;
+    std::shared_ptr<GpuMirrorRecording> recording;
+    std::vector<u64> hashes;
+    std::size_t bytes = 0;  // Valid prefix of the mirror, including any partial final block.
+    LONG frame = -1;
+};
+
+// Protected by draw_lock. Keyed by desktop device, title address, and declared span.
+using GpuMirrorKey = std::pair<u64, std::pair<u64, std::size_t>>;
+std::map<GpuMirrorKey, GpuMirror> gpu_mirrors;
+std::size_t gpu_mirror_bytes;
+
+// allocator_lock held. Reuse is safe after the old recording becomes unreplayable
+// and all queues that may still be reading it have finished.
+bool gpu_mirror_idle(const GpuMirror& mirror)
+{
+    const auto& recording = mirror.recording;
+    if (!recording) return true;
+    if (!recording->detached || recording->allocator->untracked) return false;
+    for (const auto& submit : recording->allocator->submits)
+        if (submit.first->GetCompletedValue() < submit.second) return false;
+    return true;
+}
+
+std::shared_ptr<GpuMirrorRecording> gpu_mirror_recording(Wrapper* self)
+{
+    std::shared_ptr<GpuMirrorRecording> recording;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto found = list_recordings.find(self);
+    if (self->own().list_open && found != list_recordings.end() && found->second) {
+        try {
+            const auto entry = gpu_mirror_recordings.find(self);
+            if (entry != gpu_mirror_recordings.end()) {
+                recording = entry->second;
+            } else {
+                auto created = std::make_shared<GpuMirrorRecording>(GpuMirrorRecording{found->second});
+                recording = gpu_mirror_recordings.emplace(self, std::move(created)).first->second;
+            }
+        } catch (const std::bad_alloc&) {
+            // The caller can still bind the upload-ring snapshot.
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return recording;
+}
+
+// Independent word accumulators keep the per-block scan off a single
+// dependency chain. memcpy handles unaligned title addresses and short tails.
+u64 gpu_mirror_hash(const unsigned char* data, std::size_t bytes)
+{
+    const auto mix = [](u64 hash, u64 word) {
+        hash ^= word;
+        return ((hash << 11) | (hash >> 53)) * 0x100000001b3ull;
+    };
+    u64 a = 0xcbf29ce484222325ull, b = 0x9e3779b97f4a7c15ull;
+    u64 c = 0x243f6a8885a308d3ull, d = 0x13198a2e03707344ull;
+    for (; bytes >= 32; bytes -= 32, data += 32) {
+        u64 words[4];
+        std::memcpy(words, data, sizeof(words));
+        a = mix(a, words[0]);
+        b = mix(b, words[1]);
+        c = mix(c, words[2]);
+        d = mix(d, words[3]);
+    }
+    u64 hash = mix(mix(mix(a, b), c), d);
+    for (; bytes >= sizeof(u64); bytes -= sizeof(u64), data += sizeof(u64)) {
+        u64 word;
+        std::memcpy(&word, data, sizeof(word));
+        hash = mix(hash, word);
+    }
+    u64 tail = 0;
+    std::memcpy(&tail, data, bytes);
+    return mix(hash, tail);
+}
+
+ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_bytes, std::size_t bytes, bool cache_hit)
+{
+    if (full_bytes < gpu_mirror_min_bytes || full_bytes > gpu_mirror_budget || !bytes || bytes > full_bytes) return nullptr;
+    auto* device = device_of(self->own().list_device);
+    const GpuMirrorKey key{reinterpret_cast<u64>(device), {address, full_bytes}};
+    auto found = gpu_mirrors.find(key);
+    if (cache_hit) {
+        if (found == gpu_mirrors.end() || found->second.frame != frame_number) return nullptr;
+        AcquireSRWLockShared(&allocator_lock);
+        const auto recording = gpu_mirror_recordings.find(self);
+        const bool owner = recording != gpu_mirror_recordings.end() && recording->second == found->second.recording;
+        ReleaseSRWLockShared(&allocator_lock);
+        return owner ? found->second.resource.Get() : nullptr;
+    }
+
+    bool valid = false;
+    AcquireSRWLockShared(&allocator_lock);
+    const bool idle = found == gpu_mirrors.end() || gpu_mirror_idle(found->second);
+    if (idle && found != gpu_mirrors.end() && found->second.recording)
+        valid = found->second.recording->submitted;
+    ReleaseSRWLockShared(&allocator_lock);
+    if (!idle) return nullptr;
+    const auto recording = gpu_mirror_recording(self);
+    if (!recording) return nullptr;
+
+    try {
+        if (found == gpu_mirrors.end()) {
+            // Reclaim finished mirrors on demand. Keep any resource that a command list can still name.
+            AcquireSRWLockShared(&allocator_lock);
+            for (auto it = gpu_mirrors.begin(); it != gpu_mirrors.end() && gpu_mirror_bytes + full_bytes > gpu_mirror_budget;) {
+                if (gpu_mirror_idle(it->second)) {
+                    gpu_mirror_bytes -= it->first.second.second;
+                    it = gpu_mirrors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            ReleaseSRWLockShared(&allocator_lock);
+            if (gpu_mirror_bytes + full_bytes > gpu_mirror_budget) return nullptr;
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto padded = (full_bytes + 3) & ~std::size_t{3};
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, padded, 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            GpuMirror created;
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created.resource)))) return nullptr;
+            x2w_budget::committed(device, created.resource.Get(), D3D12_HEAP_TYPE_DEFAULT);
+            found = gpu_mirrors.emplace(key, std::move(created)).first;
+            gpu_mirror_bytes += full_bytes;
+        }
+
+        auto& mirror = found->second;
+        auto* resource = mirror.resource.Get();
+        struct DirtyBlock {
+            std::size_t offset, bytes;
+            UploadReservation slice;
+        };
+        std::vector<DirtyBlock> dirty;
+        std::vector<u64> hashes((bytes + gpu_mirror_block_bytes - 1) / gpu_mirror_block_bytes);
+        const auto* title = reinterpret_cast<const unsigned char*>(address);
+        static const bool skip_updates = x2w_local::env_on("X2W_TEST_GPU_MIRROR_STALE");
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const std::size_t offset = i * gpu_mirror_block_bytes;
+            const std::size_t length = (std::min)(bytes - offset, gpu_mirror_block_bytes);
+            hashes[i] = gpu_mirror_hash(title + offset, length);
+            if (valid && offset < mirror.bytes &&
+                length == (std::min)(mirror.bytes - offset, gpu_mirror_block_bytes) &&
+                (skip_updates || hashes[i] == mirror.hashes[i])) continue;
+            const auto padded = (length + 3) & ~std::size_t{3};
+            auto slice = reserve_upload_ring(self, padded);
+            if (!slice.mapped) return nullptr;
+            std::memcpy(slice.mapped, title + offset, length);
+            std::memset(slice.mapped + length, 0, padded - length);
+            dirty.push_back({offset, length, slice});
+        }
+
+        // Allocate tracking space before recording any barriers or copies, so failure can fall back.
+        auto& states = pass_of(self).states;
+        states.reserve(states.size() + 1);
+        if (!dirty.empty()) {
+            require_state(self, resource, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+            for (const auto& block : dirty) {
+                const auto padded = (block.bytes + 3) & ~std::size_t{3};
+                list->CopyBufferRegion(resource, block.offset, block.slice.resource, block.slice.offset, padded);
+                big_binding_counts.copied_bytes += block.bytes;
+            }
+            big_binding_counts.copies += static_cast<unsigned>(dirty.size());
+            InterlockedIncrement64(&big_copies_made);
+        }
+        require_state(self, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        mirror.hashes.swap(hashes);
+        mirror.bytes = bytes;
+        mirror.recording = recording;
+        mirror.frame = frame_number;
+        return resource;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+
 // X2W_TEST_BIGBIND_NO_RESET=1 (fixtures only): the cache is not dropped at Present, so a later frame reads the first frame's
 // bytes. The control of startup_frame_copy_once: the second frame must then show the old colour.
 bool bigbind_no_reset_mutant()
@@ -3270,8 +3463,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
-        if (bytes > (16u << 20)) {
-            bytes = 16u << 20;
+        const bool mirror_candidate = address && !formatted.entry && srv.source != 2 &&
+            bytes >= gpu_mirror_min_bytes && bytes <= gpu_mirror_budget &&
+            gpu_mirror_enabled() && bigbind_once_enabled();
+        if (bytes > (16u << 20) && !mirror_candidate) {
+            // The fixture's switch-off control measures an equal-length upload.
+            static const bool full_copy_control = x2w_local::env_on("X2W_TEST_GPU_MIRROR_FULL_COPY");
+            if (!full_copy_control || formatted.entry) bytes = 16u << 20;
             // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
             if (formatted.entry) {
                 InterlockedIncrement(&formatted_draws_refused);
@@ -3398,7 +3596,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
         bool have = false;
-        if (readable_range && cached) {
+        if (readable_range && cached && mirror_candidate) {
+            chunk = bind_gpu_mirror(self, address, full_bytes, bytes, cache_hit);
+            if (chunk) {
+                offset = 0;
+                have = true;
+            }
+        }
+        if (readable_range && cached && !have) {
             auto& slice = cached->slice;
             if (slice.mapped) {
                 have = bind_upload_slice(self, slice);
@@ -3420,7 +3625,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 // A retry needs a fresh readability check before it can read title memory.
                 big_bindings.erase(bigbind_key(address, full_bytes));
             }
-        } else if (readable_range) {
+        } else if (readable_range && !have) {
             have = frame_copy(self, address, bytes, &offset, &chunk);
         }
         if (!cache_hit) {

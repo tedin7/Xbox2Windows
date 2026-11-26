@@ -589,8 +589,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
-        extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
-        if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
+        extern int draw_frame_copies(ID3D12Device*, void*, StreamTarget&, void*, UINT, UINT, const char*, const char*);
+        char mode[16]{};
+        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+        const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, mode);
+        if (result || !std::strcmp(mode, "once-mirror")) return result;
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);

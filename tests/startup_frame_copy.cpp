@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "startup_stream_setup.h"
@@ -26,17 +27,19 @@ static void* create_present_queue(void* guest)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
+//   once-mirror  two draws and a readback per frame for three separately submitted 32 MiB snapshots
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
 //            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
 //            the second view the first view's bytes.
-int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width, UINT height)
+int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, void* pso,
+                      UINT width, UINT height, const char* pixels, const char* mode)
 {
-    char mode[16]{};
-    GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+    void* list = target.list;
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
-    const bool once = keys || !std::strcmp(mode, "once");
+    const bool mirror = !std::strcmp(mode, "once-mirror");
+    const bool once = mirror || keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
     if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
@@ -59,14 +62,21 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
                                            reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
-    constexpr UINT large_bytes = 16u << 20;
+    const UINT large_bytes = (mirror ? 32u : 16u) << 20;
     float* large = nullptr;
-    constexpr UINT large_words = large_bytes / sizeof(float);
+    const UINT large_words = large_bytes / sizeof(float);
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;
-        if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
-        std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
+        if (mirror) {
+            constexpr UINT block_bytes = 64u << 10;
+            for (UINT block = 0; block < large_bytes / block_bytes; ++block)
+                large[block * (block_bytes / sizeof(float)) + 1] = static_cast<float>(block + 1);
+            large[large_words - 1] = 1.0f;  // Alpha and the nonzero tail in every frame.
+        } else {
+            if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
+            std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
+        }
     }
     const auto* memory = once ? large : constants;
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory),
@@ -82,6 +92,45 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 
     invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));  // SetDescriptorHeaps
     invoke(list, 36, 0, table);                                    // SetGraphicsRootDescriptorTable
+    if (mirror) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(target.rtv_heap, 9))};
+        const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+        const UINT edits[]{0, (11u << 20) / sizeof(float), large_words - 2};
+        for (UINT frame = 0; frame < 3; ++frame) {
+            if (frame) {
+                if (FAILED(static_cast<HRESULT>(invoke(target.allocator, 8))) ||
+                    FAILED(static_cast<HRESULT>(invoke(list, 139, reinterpret_cast<StreamWord>(target.allocator))))) return 46;
+                const float clear[]{0.0f, 0.0f, 1.0f, 1.0f};
+                invoke(list, 52, rtv.ptr, reinterpret_cast<StreamWord>(clear));
+                invoke(list, 50, 1, reinterpret_cast<StreamWord>(&rtv));
+                invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                invoke(list, 25, reinterpret_cast<StreamWord>(pso));
+                invoke(list, 32, 1, reinterpret_cast<StreamWord>(&heap));
+                invoke(list, 36, 0, table);
+            }
+            large[edits[frame]] = 1.0f;
+            invoke(list, 21, 1, reinterpret_cast<StreamWord>(&viewport));
+            for (UINT half = 0; half < 2; ++half) {
+                const D3D12_RECT rect{static_cast<LONG>(half * width / 2), 0,
+                                      static_cast<LONG>((half + 1) * width / 2), static_cast<LONG>(height)};
+                invoke(list, 22, 1, reinterpret_cast<StreamWord>(&rect));
+                invoke(list, 12, 3, 1);
+            }
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 47;
+            invoke(target.queue, 10, 1, reinterpret_cast<StreamWord>(&list));
+            const UINT64 fence_value = frame + 1;
+            if (FAILED(static_cast<HRESULT>(invoke(target.queue, 14, reinterpret_cast<StreamWord>(target.fence), fence_value))))
+                return 48;
+            const auto deadline = GetTickCount64() + 10000;
+            while (invoke(target.fence, 8) < fence_value && GetTickCount64() < deadline) Sleep(1);
+            if (invoke(target.fence, 8) != fence_value) return 49;
+            const std::string path = frame == 2 ? pixels : std::string(pixels) + "." + std::to_string(frame);
+            if (const int result = read_stream_target(desktop, target, path.c_str())) return result;
+            invoke(target.queue, 32, 0, 0, 0);
+        }
+        VirtualFree(large, 0, MEM_RELEASE);
+        return 0;
+    }
     if (keys) {
         const StreamWord large_table = table, small_table = table + increment;
         for (UINT draw = 0; draw < 4; ++draw) {
