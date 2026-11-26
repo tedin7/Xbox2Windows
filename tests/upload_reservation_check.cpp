@@ -63,6 +63,19 @@ int main()
           storage_a[2 * kAlign - 1] == 0x5a && storage_a[2 * kAlign] == 0x7d,
           "existing reservations survive exhaustion");
 
+    // Recycling: a chunk comes back only once the GPU is done with the frame that last reserved from it, plus the slack.
+    UploadRingChunk ring{nullptr, storage_a, sizeof(storage_a), 0, -1};
+    check(reserve_upload_chunk(ring, 4 * kAlign, 10).mapped == storage_a && ring.epoch == 10, "stamped with the frame");
+    check(!reserve_upload_chunk(ring, kAlign, 11).mapped && ring.epoch == 10, "a refused reservation does not move the stamp");
+    check(!recycle_upload_chunk(ring, -1, 1), "no completed frame yet: nothing recycled");
+    check(!recycle_upload_chunk(ring, 10, 1) && ring.used == 4 * kAlign, "the frame itself is still in flight");
+    check(recycle_upload_chunk(ring, 10, 0) && ring.used == 0 && ring.epoch == -1, "slack 0 recycles at the completed frame");
+    check(reserve_upload_chunk(ring, 4 * kAlign, 12).mapped == storage_a && ring.epoch == 12, "a recycled chunk hands out its start again");
+    check(!recycle_upload_chunk(ring, 12, 1) && !recycle_upload_chunk(ring, 11, 0), "a newer reservation keeps the chunk");
+    check(recycle_upload_chunk(ring, 13, 1) && ring.used == 0, "one frame of slack passes");
+    UploadRingChunk idle{nullptr, storage_b, sizeof(storage_b), 0, -1};
+    check(!recycle_upload_chunk(idle, 100, 1), "an unused chunk is left alone");
+
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

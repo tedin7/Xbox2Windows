@@ -2508,6 +2508,16 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
 // refuses new reservations rather than reusing storage without completion.
 
+extern LONG frame_number;
+// The last frame whose GPU work is complete (set after the window present has waited for its fence, which orders after
+// every earlier list of that queue). Chunks older than it are recycled when X2W_UPLOAD_RING_RECYCLE=1.
+LONG upload_ring_done_frame = -1;
+bool upload_ring_recycle()
+{
+    static const bool on = x2w_local::env_on("X2W_UPLOAD_RING_RECYCLE");
+    return on;
+}
+
 UploadReservation reserve_upload_ring(std::size_t bytes)
 {
     constexpr u64 initial_chunk_bytes = u64{16} << 20;
@@ -2524,7 +2534,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
 
     AcquireSRWLockExclusive(&lock);
     if (!chunks.empty()) {
-        reservation = reserve_upload_chunk(chunks[active], rounded);
+        reservation = reserve_upload_chunk(chunks[active], rounded, frame_number);
         if (reservation.mapped) {
             ReleaseSRWLockExclusive(&lock);
             return reservation;
@@ -2557,7 +2567,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
                         active = chunks.size() - 1;
-                        reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        reservation = reserve_upload_chunk(chunks.back(), rounded, frame_number);
                         ReleaseSRWLockExclusive(&lock);
                         return reservation;
                     } catch (const std::bad_alloc&) {
@@ -2572,9 +2582,17 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
             }
         }
     }
-    // Allocation failed or the cap was reached. Older unused tails are still safe.
+    // Allocation failed or the cap was reached. Chunks whose frames the GPU has finished are reused from the start
+    // (X2W_UPLOAD_RING_RECYCLE=1); without it the ring only ever hands out unused tails.
+    if (upload_ring_recycle()) {
+        static LONG recycled;
+        const LONG done = upload_ring_done_frame;
+        for (auto& chunk : chunks)
+            if (recycle_upload_chunk(chunk, done, 1) && first_calls(recycled, 4))
+                log("x2w-draw upload ring chunk of %llu bytes recycled (GPU done with frame %ld)", static_cast<unsigned long long>(chunk.capacity), done);
+    }
     for (std::size_t index = 0; index < chunks.size(); ++index) {
-        reservation = reserve_upload_chunk(chunks[index], rounded);
+        reservation = reserve_upload_chunk(chunks[index], rounded, frame_number);
         if (reservation.mapped) {
             active = index;
             ReleaseSRWLockExclusive(&lock);
@@ -7306,6 +7324,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (presented.count)
                 shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
                                                     presented.drawable, present_composite_enabled() ? window_planes : 1);
+            if (shown_in_window) InterlockedExchange(&upload_ring_done_frame, frame);  // the window present waited for its fence
             if (present_composite_enabled() && presented.top && presented.top_plane > 0) {
                 raw_surface = presented.top;
                 raw_plane = presented.top_plane;

@@ -163,6 +163,7 @@ def check_shell(shell):
         assert args["Lazy"] == "1" and manifest["lazy_textures"] is True and manifest["env"].get("X2W_D3D12_LAZY_TEXTURES") == "1"
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["Sysmem"] == "1" and manifest["sysmem_fallback"] is True and manifest["env"].get("X2W_D3D12_SYSMEM_FALLBACK") == "1"
+        assert manifest["upload_ring_recycle"] is True and manifest["env"].get("X2W_UPLOAD_RING_RECYCLE") == "1", manifest["env"]
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
         assert args["CacheFolder"] == "shader_cache_28-28-7", args["CacheFolder"]
         assert sorted(args["CacheEntries"]) == sorted(warm), \
@@ -227,6 +228,13 @@ def check_shell(shell):
             nosys_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert not nosys_args["Sysmem"] and nosys_manifest["sysmem_fallback"] is False
         assert "X2W_D3D12_SYSMEM_FALLBACK" not in nosys_manifest["env"]
+        # -NoUploadRingRecycle leaves its variable unset and the manifest says so.
+        noring = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-NoUploadRingRecycle")
+        assert noring.returncode == 0, (noring.stdout, noring.stderr)
+        newest_ring = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_ring) as z:
+            ring_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        assert ring_manifest["upload_ring_recycle"] is False and "X2W_UPLOAD_RING_RECYCLE" not in ring_manifest["env"], ring_manifest["env"]
 
         # The same commit keeps its cache across runs: the second run sees what the first one left.
         for name in ("req_2123456789abcdef.a", "2123456789abcdef.txt", "2123456789abcdef.vs.cso", "2123456789abcdef.ps.cso"):

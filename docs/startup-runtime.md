@@ -3412,6 +3412,12 @@ success (`not aliased` in the log). `reserve_upload_ring` grows in demand
 chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
 bytes for the process; the allocator may use an older unused tail but
 refuses exhaustion or allocation failure rather than resetting live storage.
+`X2W_UPLOAD_RING_RECYCLE=1` (tester_run turns it on, `-NoUploadRingRecycle` off) lets a spent ring reuse a chunk from its
+start once every reservation in it is at least one frame older than the last frame whose GPU work is complete (the
+window present waits for its fence, which orders after the earlier lists of that queue). Without it the ring is spent
+after 256 MiB and every later buffer binding of a translated draw is null (`upload ring reservation refused: no unused
+capacity`). A reservation older than the limit must not be read again by the title's later frames; the log prints
+`upload ring chunk ... recycled` for the first four recycles. `tests/upload_reservation_check.cpp` pins the rule.
 `upload_reservation` exercises the shared cursor and returned-pointer contract
 without D3D12; on non-Windows hosts run
 `c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
