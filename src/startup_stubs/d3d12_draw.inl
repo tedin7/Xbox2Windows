@@ -15,6 +15,8 @@
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
     bool array = false;
+    bool scalar_uint = false;
+    bool shared_float = false;
     bool load = false;  // manifest 'uavload N': the program also reads the texel back (partial-dmask store)
 };
 static_assert(x2w_startup::kSupport2UavTypedLoad == D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, "typed load bit");
@@ -94,7 +96,7 @@ bool srgb_uav_format(DXGI_FORMAT format)
 // for a manifest 'tex2da' view. Returns nullptr and fills out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
                            const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array, D3D12_UNORDERED_ACCESS_VIEW_DESC& out,
-                           bool needs_load)
+                           bool needs_load, bool scalar_uint, bool shared_float)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
     if (!array && resource.DepthOrArraySize != 1) return "resource is a texture array";
@@ -117,13 +119,20 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
         if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
     }
-    if (integer_uav_format(format)) return "integer format for a float view";
-    if (srgb_uav_format(format)) return "sRGB format";
-    if (!float_uav_format(format)) return "format is not a float colour format";
+    if (scalar_uint) {
+        if (format != DXGI_FORMAT_R32_UINT) return "scalar pixel UAV requires R32_UINT";
+    } else {
+        if (integer_uav_format(format)) return "integer format for a float view";
+        if (srgb_uav_format(format)) return "sRGB format";
+        if (!float_uav_format(format)) return "format is not a float colour format";
+    }
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
     const unsigned support2 = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
                                   ? 0u : static_cast<unsigned>(support.Support2);
     if (const char* unsupported = x2w_startup::pixel_uav_support_reason(support2, needs_load)) return unsupported;
+    if (shared_float && format != DXGI_FORMAT_R32G32B32A32_FLOAT && format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        format != DXGI_FORMAT_R32G32_FLOAT && format != DXGI_FORMAT_R11G11B10_FLOAT)
+        return "shared float UAV requires a floating-point view";
     out = {};
     out.Format = format;
     if (array) {
@@ -612,7 +621,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         } else if (line.compare(0, 8, "uavload ") == 0) {
             // The pixel program reads the stored image back (partial-dmask store); the view then needs typed load.
             unsigned index = 0;
-            const std::string digits = line.substr(8);
+            std::string digits = line.substr(8);
+            const bool scalar_uint = digits.size() > 5 && digits.compare(digits.size() - 5, 5, " uint") == 0;
+            const bool shared_float = digits.size() > 6 && digits.compare(digits.size() - 6, 6, " float") == 0;
+            if (scalar_uint) digits.resize(digits.size() - 5);
+            if (shared_float) digits.resize(digits.size() - 6);
             const bool well_formed = !digits.empty() && digits.size() <= 9 &&
                                      digits.find_first_not_of("0123456789") == std::string::npos;
             if (well_formed) index = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
@@ -621,6 +634,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             tr.uavs[index].load = true;
+            tr.uavs[index].scalar_uint = scalar_uint;
+            tr.uavs[index].shared_float = shared_float;
         } else if (line.compare(0, 4, "uav ") == 0) {
             // A pixel-stage image_store: the view is made at draw time from the title's unordered-access view at
             // that table entry (resolve_pixel_uavs).
@@ -2723,7 +2738,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
         const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav.array, out[i].view,
-                                            uav.load);
+                                            uav.load, uav.scalar_uint, uav.shared_float);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -3509,6 +3524,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (tr->uavs[j].load) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = uav_bindings[j].resource;
+            static_cast<ID3D12GraphicsCommandList*>(self->own().real)->ResourceBarrier(1, &barrier);
+        }
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
         if (first_calls(shown, 6)) {

@@ -31,15 +31,18 @@ std::vector<char> read_shader(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device)
+ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device, bool increment)
 {
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE ranges[]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1},
+    };
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, entry_constants};
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {1, &range};
+    params[1].DescriptorTable = {increment ? 2u : 1u, ranges};
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     const D3D12_ROOT_SIGNATURE_DESC desc{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob, errors;
@@ -54,12 +57,12 @@ ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device)
 // Returns 0 when texel (x, y) holds expected and every other texel holds -1.0; otherwise prints the first
 // differing texel as "texel_mismatch x=.. y=.. expected=.. actual=.." and returns 1.
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4])
+                              const std::uint32_t expected[4], bool increment)
 {
     if (x >= side || y >= side) throw std::runtime_error("Expected a texel inside the 4x4 image");
     const auto vs = read_shader(vertex_path);
     const auto ps = read_shader(pixel_path);
-    const auto root = store_root(device);
+    const auto root = store_root(device, increment);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -83,7 +86,7 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     td.Height = side;
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.Format = increment ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const auto image = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -95,19 +98,23 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image store upload");
+    const UINT components = increment ? 1 : 4;
+    const std::uint32_t initial = increment ? 0 : untouched;
     for (UINT row = 0; row < side; ++row)
-        for (UINT word = 0; word < side * 4; ++word)
+        for (UINT word = 0; word < side * components; ++word)
             std::memcpy(static_cast<std::uint8_t*>(mapped) + footprint.Offset + row * footprint.Footprint.RowPitch + 4 * word,
-                        &untouched, 4);
+                        &initial, 4);
     upload->Unmap(0, nullptr);
 
     D3D12_RESOURCE_DESC rd = td;
-    rd.Width = rd.Height = 1;
+    const UINT covered = increment ? 2 : 1;
+    rd.Width = rd.Height = covered;
+    rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R32G32B32A32_FLOAT, {0.0f, 0.0f, 0.0f, 0.0f}};
     const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, increment ? 2u : 1u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image store view heap");
     device->CreateUnorderedAccessView(image.Get(), nullptr, nullptr, views->GetCPUDescriptorHandleForHeapStart());
@@ -123,6 +130,18 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     upload_location.PlacedFootprint = footprint;
     list->CopyTextureRegion(&texture_location, 0, 0, 0, &upload_location, nullptr);
     transition(list, image.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ComPtr<ID3D12Resource> old_contents;
+    if (increment) {
+        auto old_desc = td;
+        old_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        old_contents = resource(device, old_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION old_location{old_contents.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        list->CopyTextureRegion(&old_location, 0, 0, 0, &upload_location, nullptr);
+        transition(list, old_contents.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto srv = views->GetCPUDescriptorHandleForHeapStart();
+        srv.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        device->CreateShaderResourceView(old_contents.Get(), nullptr, srv);
+    }
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};
@@ -130,13 +149,20 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};  // ud0 = 0: plain triangles
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(covered), static_cast<float>(covered), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(covered), static_cast<LONG>(covered)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
+    if (increment) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = image.Get();
+        list->ResourceBarrier(1, &barrier);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
     transition(list, image.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION readback_location{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     readback_location.PlacedFootprint = footprint;
@@ -148,9 +174,20 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     int result = 0;
     for (UINT ty = 0; ty < side && !result; ++ty)
         for (UINT tx = 0; tx < side && !result; ++tx) {
+            const auto* bits = static_cast<const std::uint8_t*>(mapped) + footprint.Offset +
+                               ty * footprint.Footprint.RowPitch + sizeof(std::uint32_t) * components * tx;
+            if (increment) {
+                std::uint32_t actual = 0;
+                std::memcpy(&actual, bits, sizeof(actual));
+                const auto want = tx < covered && ty < covered ? expected[0] : 0;
+                if (actual != want) {
+                    std::fprintf(stderr, "texel_mismatch x=%u y=%u expected=%u actual=%u\n", tx, ty, want, actual);
+                    result = 1;
+                }
+                continue;
+            }
             std::uint32_t texel[4];
-            std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + footprint.Offset + ty * footprint.Footprint.RowPitch +
-                                   16 * tx, sizeof(texel));
+            std::memcpy(texel, bits, sizeof(texel));
             const bool stored = tx == x && ty == y;
             const std::uint32_t want[4] = {stored ? expected[0] : untouched, stored ? expected[1] : untouched,
                                            stored ? expected[2] : untouched, stored ? expected[3] : untouched};
@@ -161,6 +198,7 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
             }
         }
     readback->Unmap(0, &none);
-    if (!result) std::printf("image store: texel (%u, %u) written, %u others untouched\n", x, y, side * side - 1);
+    if (!result && increment) std::puts("pixel UAV increment: all texels match");
+    if (!result && !increment) std::printf("image store: texel (%u, %u) written, %u others untouched\n", x, y, side * side - 1);
     return result;
 }

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 import compute_mimg_float_store_check as fixture
+from startup_compute_readfirstlane_check import vop1, vop2
 from startup_gfx2hlsl_compute_check import G, TGID_X, TGID_Y, assemble, refused, root_blob, tidig
 
 
@@ -95,6 +96,64 @@ def pipeline_1d():
 
 def pipeline_3d(z):
     return G.ComputePipeline(program_3d(z), root_blob(3), RSRC2, fixture.GROUP)
+
+
+NEW_STORE_PREFIX = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+s_waitcnt lgkmcnt(0)
+v_cvt_f32_u32_e32 v21, v0
+v_cvt_f32_u32_e32 v22, v1
+v_cvt_f32_u32_e32 v23, v2
+v_mov_b32_e32 v24, 2.0
+"""
+CUBE_SOURCE = NEW_STORE_PREFIX + """\
+image_store v[21:24], v[0:2], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_CUBE
+s_endpgm
+"""
+PACKED_VOLUME_SOURCE = NEW_STORE_PREFIX + """\
+v_lshlrev_b32_e32 v19, 16, v1
+v_or_b32_e32 v19, 257, v19
+v_mov_b32_e32 v20, v2
+image_store v[21:24], v[19:20], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_3D a16
+s_endpgm
+"""
+
+
+def new_store(wide_volume, faces=6):
+    # Local IDs drive the cube's three coordinates. The volume packs x=257 with local y,
+    # then uses the low half of the next word for z.
+    body = []
+    for dst, src in zip(range(21, 24), range(3)):
+        body += vop1('v_cvt_f32_u32_e32', f'v{dst}', f'v{src}')
+    body += vop1('v_mov_b32_e32', 'v24', '2.0')
+    if wide_volume:
+        body += vop2('v_lshlrev_b32_e32', 'v19', 16, 'v1')
+        pack_x = vop2('v_or_b32_e32', 'v19', 0, 'v19')[0]
+        body += [(pack_x & ~0x1ff) | 0xff, 257]  # literal for x
+        body += vop1('v_mov_b32_e32', 'v20', 'v2')
+        dim, address, a16 = 2, 19, 1 << 30
+        local = (1, 2, 2)
+    else:
+        dim, address, a16 = 3, 0, 0
+        local = (4, 4, faces)
+    body += [0xf0200f00 | dim << 3, a16 | (6 << 16) | (21 << 8) | address, 0xbf810000]
+    code = ARRAY_PROLOGUE[:16] + bytes.fromhex('7fc08cbf') + struct.pack(f'<{len(body)}I', *body)
+    return G.ComputePipeline(code, root_blob(3), (10 << 1) | tidig(3), local)
+
+
+def new_store_reference(wide_volume, faces=6):
+    width, height, layers = (260, 2, 2) if wide_volume else (4, 4, faces)
+    initial = [0] * (width * height * layers * 4)
+    expected = initial.copy()
+    for z in range(layers):
+        for y in range(height):
+            for x in range(width):
+                if not wide_volume or x == 257:
+                    at = ((z * height + y) * width + x) * 4
+                    expected[at:at + 4] = struct.unpack('<4I', struct.pack('<4f', 0 if wide_volume else x, y, z, 2))
+    return initial, expected
 
 
 def sentinel(mip, z, y, x, c):
@@ -226,13 +285,13 @@ def controls(llvm_mc):
     initial, expected = reference_1d()
     assert len(initial) == (32 + 16 + 8) * 4 and sum(a != b for a, b in zip(initial, expected)) == 8 * 4
     assert not set(ARRAY_VALUES) & set(G.D.INLINE_FLOAT_LITERALS)
-    # The address count is exact: 1D takes x only, 3D takes x, y and z, and a 1D array, cube or 2D MSAA is still refused.
+    # The address count is exact: 1D takes x only, 3D takes x, y and z, and a 1D array or 2D MSAA is still refused.
     for address in ('v[8:9]', 'v[8:10]'):
         refused('x expected', lambda: one.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_1D']))
     for address in ('v[8:9]', 'v[8:11]'):
         refused('x, y and z expected',
                 lambda: one.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_3D']))
-    for dim in ('SQ_RSRC_IMG_1D_ARRAY', 'SQ_RSRC_IMG_CUBE', 'SQ_RSRC_IMG_2D_MSAA'):
+    for dim in ('SQ_RSRC_IMG_1D_ARRAY', 'SQ_RSRC_IMG_2D_MSAA'):
         refused('only 2D images', lambda: one.cs.op_image_store(['v[14:17]', 'v[8:10]', 's[24:31]'], ['dmask:0xf', 'dim:' + dim]))
     # A pixel stage keeps the 2D-only contract.
 
@@ -245,7 +304,6 @@ def controls(llvm_mc):
     for asm, code, reason in (
         (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
          '080320f0080e0600', 'typed UAV store writes all four channels'),
-        (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
@@ -275,6 +333,14 @@ def controls(llvm_mc):
         if offset == 64:
             for body in (read + STORE, STORE + read):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
+    for wide in (False, True):
+        added = new_store(wide)
+        if llvm_mc:
+            assert assemble(llvm_mc, PACKED_VOLUME_SOURCE if wide else CUBE_SOURCE) == added.cs.raw_code
+        kind = 'tex3d' if wide else 'tex2da'
+        assert f'uav 0 {kind} float table 1 64 channels 4' in added.manifest().splitlines()
+        index = 'uint3(v19 & 0xffffu, v19 >> 16, v20 & 0xffffu)' if wide else 'uint3(v0, v1, v2)'
+        assert f'w0[{index}]' in added.hlsl_cs()
     print('Compute 32-bit float image_store, unorm, 1D, 2D array, 3D, EXEC, raw/texture binding order, alias and '
           'refusal checks passed')
 
@@ -302,6 +368,21 @@ def draw_cases(directory, compiler, renderer, adapter, payload, cases, selector=
 
 
 def dispatch(directory, compiler, renderer, adapter):
+    for wide, faces, label, selector, old, new, mismatches, needle in (
+            (False, 6, 'cube faces', 1 << 19, 'uint3(v0, v1, v2)', 'uint3(v0, v2, v1)', 208,
+             'mip=0 word=17 expected=3f800000 actual=00000000'),
+            (False, 12, 'cube array faces', (1 << 19) | (1 << 20),
+             'uint3(v0, v1, v2)', 'uint3(v0, v2, v1)', 544,
+             'mip=0 word=17 expected=3f800000 actual=00000000'),
+            (True, 0, 'packed volume', 1 << 20, 'v19 & 0xffffu', 'v19 & 0xffu', 16,
+             'mip=0 word=7 expected=00000000 actual=40000000')):
+        initial, expected = new_store_reference(wide, faces)
+        shader = new_store(wide, faces).hlsl_cs()
+        assert shader.count(old) == 1
+        cases = ((label, shader, 0, None), (label + ' mutant', shader.replace(old, new), mismatches, needle))
+        if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                      selector=selector | 1, compared=len(initial)) == 77:
+            return 77
     source = pipeline(STORE_UNORM).hlsl_cs()
     assert source.count(LINE) == 1
     cases = (

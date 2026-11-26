@@ -61,6 +61,20 @@ SOURCE_D = SOURCE_X.replace('s_waitcnt lgkmcnt', 's_load_dwordx4 s[20:23], s[10:
 WORDS_D = bytes.fromhex('06038abe' '80038bbe' '05030cf4000000fa' '050508f4200000fa' '7fc08cbf' '84000834'
                         '001038e004040380' '703f8cbf' '002010e200040580' + STORE_X + '000081bf')
 
+# Three literal floats in independently encoded VGPRs. A 16-byte record leaves room for a sentinel.
+XYZ_VALUES = (0x3e900000, 0xc0c80000, 0x42f60000)
+XYZ_SOURCE = PREAMBLE_X8 + """\
+v_mov_b32_e32 v21, 0x3e900000
+v_mov_b32_e32 v22, 0xc0c80000
+v_mov_b32_e32 v23, 0x42f60000
+buffer_store_format_xyz v[21:23], v0, s[16:19], 0 idxen
+s_endpgm
+"""
+XYZ_WORDS = (bytes.fromhex(LOAD_X[:40])
+             + b''.join(struct.pack('<II', 0x7e0002ff | reg << 17, value)
+                        for reg, value in zip(range(21, 24), XYZ_VALUES))
+             + encode_mubuf(0x06, 21, 0, 16, 0x80, idxen=True) + bytes.fromhex('000081bf'))
+
 VERIFIED_SNIPPETS = {
     'buffer_store_format_xyzw v[4:7], v0, s[16:19], 0 idxen': STORE_X,
     'buffer_store_format_xyzw v[4:7], v0, s[16:19], 4 idxen offset:12': '0c201ce000040484',
@@ -75,6 +89,7 @@ VERIFIED_SNIPPETS = {
 }
 
 PROGRAMS = {
+    'XYZ': (XYZ_SOURCE, XYZ_WORDS, USER7, (16, 1, 1), (1, 1, 1)),
     'X': (SOURCE_X, WORDS_X, USER7, (16, 1, 1), (1, 1, 1)),
     'R': (SOURCE_R, WORDS_R, USER7, (16, 1, 1), (1, 1, 1)),
     'E': (SOURCE_E, WORDS_E, USER7, (16, 1, 1), (1, 1, 1)),
@@ -245,13 +260,20 @@ X_VARIANTS = {
     'X-swizzle-en': (desc_word3(77), 16 | 0x8000, 12, 'raw', False),
     'X-stride8': (desc_word3(77), 8, 12, 'raw', False),                      # element larger than the stride
 }
-DISPATCH_CASES = (*X_VARIANTS, 'R-raw', 'R-raw-oob', 'R-struct', 'E')
+DISPATCH_CASES = ('XYZ-f32', 'XYZ-u32-legacy', 'XYZ-reject-rgba', *X_VARIANTS, 'R-raw', 'R-raw-oob', 'R-struct', 'E')
 
 
 def case_inputs(name):
     """Return (program key, t0 bytes, 16 entry constants, expected 320 words)."""
     out = bytearray(struct.pack('<%dI' % WORDS, *([SENTINEL] * WORDS)))
-    if name in X_VARIANTS:
+    if name.startswith('XYZ-'):
+        prog, lanes, stride, num_records = 'XYZ', [], 16, 9
+        word3 = {'XYZ-f32': desc_word3(74), 'XYZ-u32-legacy': (108 << 12) | 0xfac,
+                 'XYZ-reject-rgba': desc_word3(77)}[name]
+        if name != 'XYZ-reject-rgba':
+            for lane in range(num_records):
+                struct.pack_into('<3I', out, lane * stride, *XYZ_VALUES)
+    elif name in X_VARIANTS:
         word3, stride, num_records, kind, writes = X_VARIANTS[name]
         lanes = lane_words(kind)
         if writes:
@@ -324,7 +346,20 @@ def emitted_text_problems():
     return problems
 
 
+def xyz_controls():
+    translated = translate('XYZ')
+    assert 'uav 0 table 1 16 store_xyz' in translated.manifest().splitlines()
+    assert 'buf.Store3(addr, v);' in translated.hlsl_cs()
+    assert G.validate_formatted_store_word3(desc_word3(74), 3) == (74, 'BUF_FMT_32_32_32_FLOAT', 12)
+    refused('BUF_FMT_32_32_32_32_FLOAT', lambda: G.validate_formatted_store_word3(desc_word3(77), 3))
+    for name in ('XYZ-f32', 'XYZ-u32-legacy', 'XYZ-reject-rgba'):
+        _, _, _, expected = case_inputs(name)
+        assert expected[3::4] == [SENTINEL] * (WORDS // 4)
+        assert (expected[:3] == list(XYZ_VALUES)) == (name != 'XYZ-reject-rgba')
+
+
 def check_controls():
+    xyz_controls()
     check_reference()
 
     # 1. Decoder round trip of every recorded encoding.
@@ -385,7 +420,7 @@ def check_controls():
     for inserted, fragment in (('800392be', 'modified descriptor'),              # s_mov_b32 s18, 0
                                ('11ff1187ffff00c0', 'modified descriptor'),      # s_and_b32 s17, s17, 0xc000ffff
                                ('10841080', 'modified descriptor'),              # s_add_u32 s16, s16, 4
-                               ('000082bf', 'local table load')):                # s_branch +0, no local reload
+                               ('048006bf030085bf' + LOAD_X[16:40], 'local table load')):  # only one incoming path reloads
         refused(fragment, lambda i=inserted: translate('X', code=patch(WORDS_X, STORE_X, i + STORE_X)).hlsl_cs())
     for kind in ('ps', 'vs'):  # outside compute: the unknown-op refusal, the bare mnemonic
         stage = G.Stage.__new__(G.Stage)
@@ -440,7 +475,7 @@ def check_controls():
     # 7. Dispatch inputs are self-consistent: writing cases change words, no-op cases keep every sentinel.
     for name in DISPATCH_CASES:
         _, _, _, expected = case_inputs(name)
-        writes = X_VARIANTS[name][4] if name in X_VARIANTS else name != 'R-raw-oob'
+        writes = X_VARIANTS[name][4] if name in X_VARIANTS else name not in ('R-raw-oob', 'XYZ-reject-rgba')
         assert (expected != [SENTINEL] * WORDS) == writes, name
 
     print('buffer_store_format_xyzw reference, format, bounds, provenance, refusal and mutation checks pass')
@@ -459,6 +494,7 @@ def check_binary(llvm_mc):
 
 
 CONTROLS = {
+    'xyz-extra-word': ('XYZ-f32', 'buf.Store3(addr, v);', 'buf.Store4(addr, uint4(v, 0u));'),
     'x-drop-store': ('X-f32', '    store_format_xyzw(u0, ud2, ud3, ud4, v0, 0u, 0u, 0u, uint4(v4, v5, v6, v7));\n', ''),
     'x-swap-xy': ('X-f32', 'buf.Store4(addr, v);', 'buf.Store4(addr, v.yxzw);'),
     'x-drop-index-oob': ('X-f32',
@@ -496,7 +532,8 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out = ROOT / 'out'
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
-        runs = [(CONTROLS[control][0], control)] if control else [(name, None) for name in DISPATCH_CASES]
+        runs = ([(CONTROLS[control][0], control)] if control
+                else [(name, None) for name in DISPATCH_CASES] + [('XYZ-f32', 'xyz-extra-word')])
         for name, mutation in runs:
             run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
             print(run.stdout, end='')

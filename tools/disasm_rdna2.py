@@ -2756,7 +2756,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             and op_name in ("image_load", "image_store", "image_sample", "image_sample_lz")
             and dim_name == "SQ_RSRC_IMG_2D"
         )
-        if packed_2d:
+        if a16 and op_name == "image_store" and dim_code in (0, 1, 2, 5):
+            addr_count = (addr_count + 1) // 2
+        elif packed_2d:
             addr_count = 1  # Two 16-bit 2D coordinates share one VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.

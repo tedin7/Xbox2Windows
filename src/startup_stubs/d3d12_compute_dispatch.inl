@@ -26,6 +26,7 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool store_xyz = false;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
@@ -170,6 +171,11 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u table %d %d store_xyz%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b});
+            tr.uavs.back().store_xyz = true;
+        }
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.uavs.size())
             tr.uavs.push_back({a, b, true});
@@ -410,7 +416,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
                 reason = "an output texture view was not created on the desktop";
             else if (slot.array) {
-                // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
+                // Keep FirstArraySlice and ArraySize. A cube UAV uses the same 2D array view, with one slice per face.
                 const auto& a = desc.Texture2DArray;
                 if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
                     reason = "an output texture view is not a 2D array";
@@ -492,6 +498,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer was created without unordered access";
+        if (!reason && slot.store_xyz) {
+            const auto format = x2w_startup::formatted_buffer_code(words[3]);
+            const bool unified = (words[3] & (1u << 24)) != 0;
+            const bool supported = unified ? (format >= 72 && format <= 74) : (format == 108 || format == 109 || format == 111);
+            if (!supported) {
+                reason = "buffer_store_format_xyz requires BUF_FMT_32_32_32_UINT, SINT or FLOAT";
+                static LONG unsupported_xyz;
+                if (first_calls(unsupported_xyz, 16))
+                    log("x2w-draw compute %016llx output %zu: %s (encoded FORMAT %u, unified %u)", key, i, reason,
+                        format, static_cast<unsigned>(unified));
+            }
+        }
         static LONG size_logged;
         if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
             log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),

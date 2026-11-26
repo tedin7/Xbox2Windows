@@ -1422,6 +1422,13 @@ OperationResult run_startup_image_store(const OperationContext& ctx)
 {
     unsigned x = 0, y = 0;
     std::uint32_t expected[4]{};
+    if (std::string_view(ctx.argv[5]) == "increment") {
+        if (std::string_view(ctx.argv[6]) != "2") return {OutcomeKind::fail, "expected two draws"};
+        expected[0] = 2;
+        if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], 0, 0, expected, true))
+            return {OutcomeKind::fail, "pixel increment readback differs"};
+        return {OutcomeKind::pass, nullptr};
+    }
     if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};

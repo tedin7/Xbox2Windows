@@ -43,8 +43,11 @@ constexpr UINT texture_rgba16_float_flag = 1u << 22;
 constexpr UINT texture_array_flag = 1u << 31;
 constexpr UINT texture_volume_flag = texture_array_flag | texture_rgba32_float_flag;
 constexpr UINT texture_1d_flag = 1u << 23; // The image case uses only scalar X group counts.
+constexpr UINT texture_cube_flag = 1u << 19;
+constexpr UINT texture_wide_volume_flag = 1u << 20;
 constexpr UINT texture_format_mask = texture_1d_flag | texture_rgba8_flag | texture_atomic_mask |
-                                     texture_volume_flag | texture_rgba16_float_flag | texture_uav_load_flag;
+                                     texture_volume_flag | texture_rgba16_float_flag | texture_uav_load_flag |
+                                     texture_cube_flag | texture_wide_volume_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3, texture_layers = 4;
 
@@ -94,21 +97,23 @@ static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>
 static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                              const std::vector<UINT>& texels,
                                              DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false,
-                                             D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D)
+                                             D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D,
+                                             UINT width = texture_width, UINT image_height = texture_height,
+                                             UINT layers = texture_layers, UINT explicit_mips = 0)
 {
     const UINT words_per_texel = texture_words_per_texel(format);
     const bool one_dimensional = dimension == D3D12_UAV_DIMENSION_TEXTURE1D;
-    const UINT height = one_dimensional ? 1 : texture_height;
-    const UINT base_words = texture_width * height * words_per_texel;
-    const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
+    const UINT height = one_dimensional ? 1 : image_height;
+    const UINT base_words = width * height * words_per_texel;
+    const UINT mips = explicit_mips ? explicit_mips : texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
         : dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
         : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = texture_width;
+    desc.Width = width;
     desc.Height = height;
     desc.DepthOrArraySize = dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY ||
-        dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? texture_layers : 1;
+        dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? static_cast<UINT16>(layers) : 1;
     desc.SampleDesc.Count = 1;
     desc.MipLevels = static_cast<UINT16>(mips);
     desc.Format = format;
@@ -590,10 +595,13 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         dimension = D3D12_UAV_DIMENSION_TEXTURE1D;
         break;
+    case texture_cube_flag | texture_wide_volume_flag:  // two cubes in one array
+    case texture_cube_flag:
     case texture_array_flag:
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         dimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         break;
+    case texture_wide_volume_flag:
     case texture_volume_flag:
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
@@ -630,19 +638,25 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     const bool layered = dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY || dimension == D3D12_UAV_DIMENSION_TEXTURE3D;
     const bool half_image = selector == texture_rgba16_float_flag;
     const UINT words_per_texel = texture_words_per_texel(format);
+    const bool cube = (selector & texture_cube_flag) != 0;
+    const bool wide_volume = selector == texture_wide_volume_flag;
+    const UINT width = cube ? 4 : wide_volume ? 260 : texture_width;
+    const UINT height_base = cube ? 4 : wide_volume ? 2 : texture_height;
+    const UINT layers = cube ? ((selector & texture_wide_volume_flag) ? 12 : 6) : wide_volume ? 2 : texture_layers;
+    const UINT mips = cube || wide_volume ? 1 : texture_mip_levels;
     UINT all_words = 0;
-    for (UINT level = 0; level < texture_mip_levels; ++level) {
-        UINT depth = layered ? texture_layers : 1;
+    for (UINT level = 0; level < mips; ++level) {
+        UINT depth = layered ? layers : 1;
         if (dimension == D3D12_UAV_DIMENSION_TEXTURE3D) depth >>= level;
-        const UINT height = one_dimensional ? 1 : texture_height >> level;
-        all_words += (texture_width >> level) * height * depth * words_per_texel;
+        const UINT height = one_dimensional ? 1 : height_base >> level;
+        all_words += (width >> level) * height * depth * words_per_texel;
     }
     std::vector<UINT> initial(all_words), expected(all_words);
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
     std::vector<UINT> input_texels(separate_srv ? all_words : 0);
     if (separate_srv) source.read(reinterpret_cast<char*>(input_texels.data()), all_words * sizeof(UINT));
-    if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
+    if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= mips
         || (((selector & texture_atomic_mask) || uav_load) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
 
@@ -681,7 +695,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     ComputeCommands commands(device, pipeline.Get());
     auto* list = commands.list.Get();
     ComPtr<ID3D12Resource> staging, input_staging, input_image;
-    auto texture = upload_texture(device, list, initial, format, staging, true, dimension);
+    auto texture = upload_texture(device, list, initial, format, staging, true, dimension, width, height_base, layers, mips);
     if (separate_srv) input_image = upload_texture(device, list, input_texels, format, input_staging, false, dimension);
     auto constants_buffer = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
                                         D3D12_RESOURCE_STATE_GENERIC_READ);

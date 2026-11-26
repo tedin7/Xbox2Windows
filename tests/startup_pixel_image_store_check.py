@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / 'tools'))
 from startup_image_3d_check import FULLSCREEN_VS, G, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
 import disasm_rdna2 as D  # noqa: E402
+from startup_compute_readfirstlane_check import vop2
 
 VALUES = (1.0, 2.0, 3.0, 4.0)
 BITS = ['%08x' % struct.unpack('<I', struct.pack('<f', v))[0] for v in VALUES]
@@ -115,7 +116,52 @@ def patched(byte, mask, value=None):
     return bytes(store)
 
 
+INCREMENT_SOURCE = """\
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+s_waitcnt lgkmcnt(0)
+image_load v16, v0, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D a16
+s_waitcnt vmcnt(0)
+v_add_nc_u32_e32 v16, 1, v16
+image_store v16, v0, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D a16
+s_endpgm
+"""
+PACKED_DATA_SOURCE = """\
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+v_mov_b32_e32 v0, 1
+v_mov_b32_e32 v1, 2
+v_mov_b32_e32 v18, 0x40003c00
+v_mov_b32_e32 v19, 0x44004200
+s_waitcnt lgkmcnt(0)
+image_store v[18:19], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D d16
+s_endpgm
+"""
+
+
+def increment_program():
+    # Packed pixel position in v0. Read the red word, increment it, and write it back.
+    body = [0xf0000108, 0x40041000, 0xbf8c3f70]
+    body += vop2('v_add_nc_u32_e32', 'v16', 1, 'v16')
+    body += [0xf0200108, 0x40041000, 0xbf810000]
+    code = PREFIX[:8] + bytes.fromhex('7fc08cbf') + struct.pack(f'<{len(body)}I', *body)
+    return G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=(1 << 15, 1 << 15))
+
+
+def packed_data_program():
+    # Exactly representable, distinct binary16 lanes. Coordinates are (1, 2).
+    def mov(reg, value):
+        return struct.pack('<II', 0x7e0002ff | reg << 17, value)
+
+    code = (PREFIX[:16] + mov(18, 0x40003c00) + mov(19, 0x44004200)
+            + struct.pack('<4I', 0xbf8cc07f, 0xf0200f08, 0x80041200, 0xbf810000))
+    return translate(code)
+
+
 def controls():
+    increment = increment_program()
+    assert 'uavload 0 uint' in increment.manifest().splitlines()
+    assert 'RWTexture2D<uint> w0 : register(u0);' in increment.hlsl_ps()
+    assert 'v16 = w0[uint2(v0 & 0xffffu, v0 >> 16)];' in increment.hlsl_ps()
+    assert 'f16tof32(v18 & 0xffffu)' in packed_data_program().hlsl_ps()
     text = D.decode_instruction(STORE, 0)[2]
     assert text == 'image_store v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D', text
     pipe = translate(WORDS)
@@ -148,23 +194,23 @@ def controls():
 
     # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
     # a partial channel mask and other image dimensions.
-    # a16: x and y packed in v0 is lowered; other dimensions would pack a second register and stay refused.
+    # The existing packed 2D store remains byte-identical.
     decoded = D.decode_instruction(A16_STORE, 0)[2]
     assert decoded == 'image_store v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16', decoded
     a16_ps = translate(A16_WORDS).hlsl_ps()
     assert '    ' + A16_LINE in a16_ps and STORE_LINE not in a16_ps, a16_ps
-    print('a16 store: %s' % A16_LINE)
-    for name, store in (('a16 3D', bytes.fromhex('100f20f000040440')), ('a16 2D array', bytes.fromhex('280f20f000040440')),
-                        ('a16 1D', bytes.fromhex('000f20f000040440'))):
-        print('refused %-20s %s' % (name + ':', refused(with_store(store), 'a16 only on a 2D image')))
+    for store in (bytes.fromhex('100f20f000040440'), bytes.fromhex('000f20f000040440')):
+        refused(with_store(store), 'only 2D images')
+    assert 'w0[uint3(v0 & 0xffffu, v0 >> 16, v1 & 0xffffu)]' in translate(
+        with_store(bytes.fromhex('280f20f000040440'))).hlsl_ps()
     try:
         pipe_a16 = translate(A16_WORDS)
         pipe_a16.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'a16'])
     except G.Unsupported as error:
-        assert 'one packed register' in str(error), error
+        assert 'packed coordinates expected' in str(error), error
     else:
         raise AssertionError('a16 with two address registers was accepted')
-    cases = (('d16', patched(7, 0x80)), ('tfe', patched(2, 0x01)),
+    cases = (('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
              ('SQ_RSRC_IMG_CUBE', bytes.fromhex('180f20f000040400')),
@@ -174,19 +220,13 @@ def controls():
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
-    # 2D-array requires three address registers and still refuses pixel d16.
+    # 2D-array requires three address registers.
     try:
         array_pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY'])
     except G.Unsupported as error:
         assert 'x, y and layer expected' in str(error), error
     else:
         raise AssertionError('2D-array store with two address registers was accepted')
-    try:
-        array_pipe.ps.op_image_store(['v[4:5]', 'v[0:2]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY', 'd16'])
-    except G.Unsupported as error:
-        assert 'modifier d16' in str(error), error
-    else:
-        raise AssertionError('pixel 2D-array d16 store was accepted')
     # A partial channel mask, encoded: the decoder sizes VDATA from the mask (v[4:6], v4). The store reads the texel
     # back, replaces only the selected channels in order from consecutive VDATA registers, and writes it again.
     for mask, data, line in (
@@ -239,12 +279,16 @@ def controls():
         raise AssertionError('vertex-stage image_store accepted')
     print('refused image_store outside a pixel stage')
 
-    # Reading and storing the same image in one program would need a read-write view: refused.
+    # A plain texel load shares the writable view in either instruction order.
     load = bytes.fromhex('080f00f000080400')  # image_load v[8:11], v[0:1], s[16:23] dmask:0xf dim:2D
     assert D.decode_instruction(load, 0)[2].startswith('image_load v[8:11]'), D.decode_instruction(load, 0)
-    refused(PREFIX + load + STORE + SUFFIX, 'both read and stored')
+    for body in (load + STORE, STORE + load):
+        shared = translate(PREFIX + body + SUFFIX)
+        assert 'uavload 0 float' in shared.manifest().splitlines()
+        assert 't = w0[uint2(v0, v1)];' in shared.hlsl_ps()
+        assert 'srv 0' not in shared.manifest()
     assert translate(PREFIX + load + SUFFIX).manifest().startswith('x2w-manifest 1\n')
-    print('refused a load and a store of the same image')
+
 
     # Exec not known at translation time: the store, and only the store line, is guarded by the lane's bit.
     for constant, words in ((1, EXEC_ON), (2, EXEC_OFF)):
@@ -275,7 +319,10 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    for label, src, expected in (('2d', SOURCE, WORDS), ('2d_array', ARRAY_SOURCE, ARRAY_WORDS)):
+    for label, src, expected in (
+            ('2d', SOURCE, WORDS), ('2d_array', ARRAY_SOURCE, ARRAY_WORDS),
+            ('increment', INCREMENT_SOURCE, increment_program().ps.raw_code),
+            ('d16', PACKED_DATA_SOURCE, packed_data_program().ps.raw_code)):
         built = assemble(llvm_mc, src)
         if built != expected:
             raise AssertionError('%s: assembled %s, recorded %s' % (label, built.hex(), expected.hex()))
@@ -290,7 +337,9 @@ def mismatch_line(stderr):
 def check_draw(dxc, renderer, adapter):
     source = translate(WORDS).hlsl_ps()
     expected = ','.join(BITS)
-    with tempfile.TemporaryDirectory() as tmp:
+    out = HERE.parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'fullscreen', 'vs_6_0', directory)
 
@@ -298,6 +347,27 @@ def check_draw(dxc, renderer, adapter):
             ps = compile_hlsl(dxc, 'dxc', text, label, 'ps_6_0', directory)
             return subprocess.run([renderer, adapter, '--startup-image-store', str(vs), str(ps), '1,2', want],
                                   capture_output=True, text=True)
+
+        packed = packed_data_program().hlsl_ps()
+        run = draw(packed, 'packed_data')
+        assert run.returncode == 0, (run.stdout, run.stderr)
+        swapped = packed.replace('f16tof32(v18 & 0xffffu)', 'f16tof32(v18 >> 16)')
+        assert swapped != packed
+        run = draw(swapped, 'packed_data_mutant')
+        assert run.returncode == 1 and 'texel_mismatch x=1 y=2' in run.stderr, (run.stdout, run.stderr)
+
+        increment = increment_program().hlsl_ps()
+        load = 'v16 = w0[uint2(v0 & 0xffffu, v0 >> 16)];'
+        assert increment.count(load) == 1
+        stale = 'Texture2D<uint> old_contents : register(t0);\n' + increment.replace(
+            load, 'v16 = old_contents.Load(int3(v0 & 0xffffu, v0 >> 16, 0));')
+        for label, shader, expected_code in (('increment', increment, 0), ('stale_increment', stale, 1)):
+            ps = compile_hlsl(dxc, 'dxc', shader, label, 'ps_6_0', directory)
+            run = subprocess.run([renderer, adapter, '--startup-image-store', str(vs), str(ps), 'increment', '2'],
+                                 capture_output=True, text=True)
+            assert run.returncode == expected_code, (run.stdout, run.stderr)
+            if expected_code:
+                assert 'texel_mismatch x=0 y=0 expected=2 actual=1' in run.stderr, run.stderr
 
         run = draw(source, 'store')
         sys.stdout.write(run.stdout)

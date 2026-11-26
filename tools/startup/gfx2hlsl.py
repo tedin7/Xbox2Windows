@@ -33,6 +33,12 @@ class Unsupported(Exception):
     pass
 
 
+class SharedPixelImage(Unsupported):
+    def __init__(self, key, scalar):
+        super().__init__('resource %s is both read and stored to' % (key,))
+        self.key, self.scalar = key, scalar
+
+
 PREFETCH = bytes.fromhex('0300a0bf')
 
 # DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
@@ -248,8 +254,12 @@ STORE_FORMAT_XYZW_LEGACY_FORMATS = {
 
 
 def validate_store_format_xyzw_word3(word3):
-    """Validate V# word 3 for compute buffer_store_format_xyzw and return (code, name, elem_bytes)."""
-    name = 'buffer_store_format_xyzw'
+    """Validate V# word 3 and return (code, name, elem_bytes)."""
+    return validate_formatted_store_word3(word3, 4)
+
+
+def validate_formatted_store_word3(word3, channels):
+    name = 'buffer_store_format_' + 'xyzw'[:channels]
     if not isinstance(word3, int) or isinstance(word3, bool) or not 0 <= word3 <= 0xffffffff:
         raise Unsupported('%s invalid descriptor word 3 %r' % (name, word3))
     if word3 & STORE_D16_X_WORD3_ZERO_MASK:
@@ -260,11 +270,30 @@ def validate_store_format_xyzw_word3(word3):
     if oob_select not in (0, 3):
         raise Unsupported('%s unsupported OOB_SELECT %d' % (name, oob_select))
     field = (word3 >> DESC_FORMAT_SHIFT) & DESC_FORMAT_MASK
-    code = field if ((word3 >> 24) & 1) else STORE_FORMAT_XYZW_LEGACY_FORMATS.get(field)
-    info = STORE_FORMAT_XYZW_FORMATS.get(code)
+    unified = (word3 >> 24) & 1
+    formats, legacy = ((STORE_FORMAT_XYZW_FORMATS, STORE_FORMAT_XYZW_LEGACY_FORMATS) if channels == 4
+                       else (STORE_FORMAT_XYZ_FORMATS, STORE_FORMAT_XYZ_LEGACY_FORMATS))
+    code = field if unified else legacy.get(field)
+    info = formats.get(code)
     if info is None:
-        raise Unsupported('%s descriptor FORMAT %d is not a handled 4-channel format' % (name, field))
+        if channels == 4:
+            raise Unsupported('%s descriptor FORMAT %d is not a handled 4-channel format' % (name, field))
+        label = (D.MTBUF_FORMATS.get(field, 'FORMAT %d' % field) if unified
+                 else 'DFMT %d NFMT %d' % (field >> 3, field & 7))
+        raise Unsupported('%s descriptor %s is not a handled 3-channel format' % (name, label))
     return code, info[0], info[1]
+
+STORE_FORMAT_XYZ_FORMATS = {
+    72: ('BUF_FMT_32_32_32_UINT', 12),
+    73: ('BUF_FMT_32_32_32_SINT', 12),
+    74: ('BUF_FMT_32_32_32_FLOAT', 12),
+}
+STORE_FORMAT_XYZ_LEGACY_FORMATS = {108: 72, 109: 73, 111: 74}
+
+
+def unpack_image_address(words, count):
+    return ['%s %s' % (words[i // 2], '>> 16' if i % 2 else '& 0xffffu') for i in range(count)]
+
 
 def starts_with_fetch_call(code):
     return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
@@ -4134,6 +4163,8 @@ class Stage:
                     elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
+                    if isinstance(reason, SharedPixelImage):
+                        raise
                     if refusals is None:
                         if self.has_branches and ('read_vcc', None) in self.vcc_events.get(off, ()):
                             # Some operand handlers refuse VCC before emitting code. Check whether
@@ -7618,7 +7649,14 @@ class Stage:
         buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
         (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
         """
-        name = 'buffer_store_format_xyzw'
+        self.buffer_store_format(ops, mods, 4)
+
+    def op_buffer_store_format_xyz(self, ops, mods):
+        self.buffer_store_format(ops, mods, 3)
+
+    def buffer_store_format(self, ops, mods, channels):
+        suffix = 'xyzw'[:channels]
+        name = 'buffer_store_format_' + suffix
         if self.kind != 'cs':
             raise Unsupported(name)  # the unknown-op refusal
         raw = getattr(self, 'raw_code', b'')
@@ -7645,7 +7683,7 @@ class Stage:
         if not idxen:
             raise Unsupported('%s without idxen (only the idxen address form is modelled)' % name)
         src = reg_range(ops[0])
-        if not src or src[0] != 'v' or src[2] - src[1] != 3 or src[2] > 255:
+        if not src or src[0] != 'v' or src[2] - src[1] != channels - 1 or src[2] > 255:
             raise Unsupported('%s data %s' % (name, ops[0]))
         vaddr = reg_range(ops[1])
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
@@ -7660,15 +7698,19 @@ class Stage:
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
         idx = self.u(ops[1])
-        data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        data = 'uint%d(%s)' % (channels, ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1)))
         uav = self.pipe.uav(key, 'raw')
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
         num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
-        self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
-        call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
-            uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
+        if channels == 4:
+            self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
+        else:
+            self.pipe.uses_store_format_xyz = True
+            self.pipe.uavs[key]['store_xyz'] = True
+        call = 'store_format_%s(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
+            suffix, uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
@@ -7799,9 +7841,24 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
-        tex = self.pipe.resource(desc_key, kinds[dim])
-        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
-            self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
+        shared = getattr(self.pipe, 'shared_pixel_images', {})
+        shareable = (self.kind == 'ps' and how == 'load' and 'd16' not in mods
+                     and kinds[dim] in ('tex2d', 'tex2da') and desc_key[0][0] == 'table')
+        rw_image = shareable and desc_key in shared
+        scalar = rw_image and shared[desc_key]
+        if rw_image:
+            tex = self.pipe.pixel_image_uav(desc_key, kinds[dim], scalar)
+        else:
+            stored = self.pipe.stored_images().get(desc_key) if shareable and hasattr(self.pipe, 'stored_images') else None
+            if stored and 'scalar_candidate' in stored:
+                raise SharedPixelImage(desc_key, stored['scalar_candidate'] and dmask == 1)
+            tex = self.pipe.resource(desc_key, kinds[dim])
+            if hasattr(self.pipe, 'note_use'):
+                self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
+                if shareable:
+                    r = self.pipe.resources[desc_key]
+                    r['shareable_loads'] = r.get('shareable_loads', 0) + 1
+                    r['scalar_loads'] = dmask == 1 and r.get('scalar_loads', True)
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
@@ -7830,11 +7887,19 @@ class Stage:
                         raise Unsupported('%s d16 unsupported SRV format %d' % (op_name, fmt))
             if packed_2d:
                 packed = self.u(cs[0])
-                address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
+                address = unpack_image_address([packed], axes)
             else:
                 address = [self.u(c) for c in cs[:axes]]
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
-            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
+            if rw_image:
+                if scalar and dmask != 1:
+                    raise Unsupported('scalar pixel UAV load requires dmask 0x1')
+                call = '%s[uint%d(%s)]' % (tex, axes, ', '.join(address))
+                if scalar:
+                    self.set_v(dst[1], call)
+                    return
+            else:
+                call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
         else:
             packed_2d = False
             if not one and how in ('sample', 'lz'):
@@ -8090,21 +8155,20 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute, a full 2D-array texel.
+        """Store texels through a typed UAV for the supported shape and data layout.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. HLSL's typed UAV store writes every channel of the view, so only DMASK 0xf is exact here;
-        a partial mask would need a read-modify-write and is refused. The data is stored as float4, so the
-        bound view must be of a float or normalized format (the runtime side is not part of this lowering).
+        registers. Compute writes all four channels. Pixel stores may write a partial mask by loading
+        the other channels first, or use a scalar UINT UAV for a red-only load/store pair.
         The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
         from helper lanes as the hardware drops them for lanes outside exec.
         """
         name = 'image_store'
         if self.kind not in ('ps', 'cs'):
             raise Unsupported('%s outside a pixel stage' % name)
-        d16 = self.kind == 'cs' and mods.count('d16') == 1
+        d16 = mods.count('d16') == 1
         if len(ops) != 3:
             raise Unsupported('%s with %d operands' % (name, len(ops)))
         for m in mods:
@@ -8112,14 +8176,10 @@ class Stage:
                 continue
             # IMAGE_STORE always uses integer texel coordinates, so unorm is a no-op like on image_load.
             if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')
-                    or (m == 'a16' and mods.count('a16') == 1 and self.kind == 'ps')):
+                    or (m == 'a16' and mods.count('a16') == 1)):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
-        # a16 packs 16-bit texel coordinates two to a VGPR (x in the low half, y in the high half). Only the 2D form
-        # is lowered, like image_load; other dimensions would also pack the layer or z into a second register.
-        packed_2d = 'a16' in mods
-        if packed_2d and dims != ['SQ_RSRC_IMG_2D']:
-            raise Unsupported('%s modifier a16 only on a 2D image' % name)
+        packed_address = 'a16' in mods
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
@@ -8127,11 +8187,16 @@ class Stage:
         # view is a RWTexture1D, RWTexture2DArray or RWTexture3D (a 3D view keeps the caller's W range, as an
         # array view keeps its slices). Pixel stages store to 2D and 2D-array images (#2830); 1D and 3D stay compute-only.
         shapes = {'SQ_RSRC_IMG_2D': (2, 'tex2d', 'x and y'), 'SQ_RSRC_IMG_2D_ARRAY': (3, 'tex2da', 'x, y and layer'),
-                  'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z')}
-        if dims[0] not in shapes or (dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D') and self.kind != 'cs') or \
+                  'SQ_RSRC_IMG_1D': (1, 'tex1d', 'x'), 'SQ_RSRC_IMG_3D': (3, 'tex3d', 'x, y and z'),
+                  # The cube's third integer coordinate is its flattened face slice (face + 6 * layer).
+                  'SQ_RSRC_IMG_CUBE': (3, 'tex2da', 'x, y and face')}
+        if dims[0] not in shapes or (self.kind != 'cs' and dims[0] in
+                                    ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_CUBE')) or \
                 (d16 and dims[0] in ('SQ_RSRC_IMG_1D', 'SQ_RSRC_IMG_3D')):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
         address, image_kind, address_text = shapes[dims[0]]
+        if packed_address and dims[0] == 'SQ_RSRC_IMG_CUBE':
+            raise Unsupported('%s modifier a16 on a cube image' % name)
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -8156,9 +8221,9 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        if len(cs) != (1 if packed_2d else address):
+        if len(cs) != ((address + 1) // 2 if packed_address else address):
             raise Unsupported('%s with %d address registers: %s expected' % (
-                name, len(cs), 'one packed register' if packed_2d else address_text))
+                name, len(cs), 'packed coordinates' if packed_address else address_text))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -8172,13 +8237,27 @@ class Stage:
             value = 'float4(%s)' % ', '.join(rgba)
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, image_kind)
-        if packed_2d:
-            packed = self.u(cs[0])
-            index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
+        shared = getattr(self.pipe, 'shared_pixel_images', {})
+        if self.kind == 'ps' and key in shared:
+            if shared[key] and (mask != 1 or d16):
+                raise Unsupported('scalar pixel UAV store requires dmask 0x1 and full-width data')
+            image = self.pipe.pixel_image_uav(key, image_kind, shared[key])
         else:
-            index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        if len(channels) == 4 or d16:
+            prior = self.pipe.resources.get(key) if self.kind == 'ps' else None
+            if prior and prior['kind'] == image_kind and prior.get('shareable_loads') == prior.get('calls'):
+                raise SharedPixelImage(key, mask == 1 and not d16 and prior['scalar_loads'])
+            image = self.pipe.uav(key, image_kind)
+            if self.kind == 'ps':
+                candidate = mask == 1 and not d16
+                r = self.pipe.uavs[key]
+                r['scalar_candidate'] = candidate and r.get('scalar_candidate', True)
+        coords = [self.u(c) for c in cs]
+        if packed_address:
+            coords = unpack_image_address(coords, address)
+        index = coords[0] if address == 1 else 'uint%d(%s)' % (address, ', '.join(coords))
+        if shared.get(key, False):
+            body = '%s[%s] = %s;' % (image, index, words[0])
+        elif len(channels) == 4 or d16:
             body = '%s[%s] = %s;' % (image, index, value)
         else:
             sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
@@ -11104,6 +11183,7 @@ class Pipeline:
     uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
+    uses_store_format_xyz = False
     uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -11144,6 +11224,7 @@ class Pipeline:
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_store_format_xyz = False
         self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
@@ -11154,16 +11235,26 @@ class Pipeline:
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
-        self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
-                                 ps_attr_map, srv_formats)
-        self.rect = self.ud(('rect',))
-        if refusals is None:
-            self.vs = Stage(self, self.vertex_kind, vs_code)
-            self.ps = Stage(self, 'ps', ps_code) if ps_code is not None else None
-        else:
-            decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
-            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps')) if ps_code is not None else None
+        self.shared_pixel_images = {}
+        refusal_start = len(refusals) if refusals is not None else 0
+        decoded = {} if decoded is None else decoded
+        while True:
+            self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
+                                     ps_attr_map, srv_formats)
+            self.uavs = None
+            self.uses_cube_dir = False
+            self.rect = self.ud(('rect',))
+            try:
+                self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
+                self.ps = (Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
+                           if ps_code is not None else None)
+                break
+            except SharedPixelImage as conflict:
+                if conflict.key in self.shared_pixel_images:
+                    raise
+                self.shared_pixel_images[conflict.key] = conflict.scalar
+                if refusals is not None:
+                    del refusals[refusal_start:]
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
             if 'pos' not in self.vs.exports:
@@ -11249,6 +11340,11 @@ class Pipeline:
         if r['kind'] != kind:
             raise Unsupported('stored image %s used as %s and %s' % (key, r['kind'], kind))
         return ('u%d' if kind == 'raw' else 'w%d') % r['index']
+
+    def pixel_image_uav(self, key, kind, scalar):
+        image = self.uav(key, kind)
+        self.uavs[key].update(load=True, shared=True, scalar=scalar)
+        return image
 
     def sampler(self, key, comparison=False, lod_limits=False):
         if not isinstance(key[0], int):
@@ -11383,7 +11479,11 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            texture = {'tex1d': 'RWTexture1D', 'tex2d': 'RWTexture2D', 'tex2da': 'RWTexture2DArray',
+                       'tex3d': 'RWTexture3D'}.get(r['kind'])
+            ty = ('%s<%s>' % (texture, 'uint' if r.get('scalar') else 'float4')
+                  if texture else 'RWByteAddressBuffer')
+            out.append('%s %s%d : register(u%d);' % (ty, 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -11602,6 +11702,29 @@ class Pipeline:
         if 'v_msad_u8' in self.uses_sad:
             out.append(
                 'uint msad_u8(uint a, uint b, uint c) { return sad4_u8(a, b, true) + c; }')
+        formatted_store_bounds = (
+        '    if (elem_bytes == 0u) return;',
+        '    if (voff > 0xffffffffu - imm_off) return;',
+        '    uint rec_off = voff + imm_off;',
+        '    uint addr = 0u;',
+        '    if (oob_sel == 3u) {',
+        '        if (stride != 0u) return;',
+        '        if (soff > 0xffffffffu - rec_off) return;',
+        '        addr = soff + rec_off;',
+        '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
+        '    } else {',
+        '        if (stride == 0u) return;',
+        '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
+        '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+        '        uint elem_addr = idx * stride + rec_off;',
+        '        if (soff > 0xffffffffu - elem_addr) return;',
+        '        addr = elem_addr + soff;',
+        '    }',
+        '    if ((addr & 3u) != 0u) return;',
+        '    uint uav_bytes = 0u;',
+        '    buf.GetDimensions(uav_bytes);',
+        '    if (uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;',
+        )
         if self.uses_store_format_xyzw:
             legacy = ['        %sif (field == %du) fmt = %du;' % ('' if i == 0 else 'else ', field, code)
                       for i, (field, code) in enumerate(sorted(STORE_FORMAT_XYZW_LEGACY_FORMATS.items()))]
@@ -11626,27 +11749,7 @@ class Pipeline:
                 *legacy,
                 '    }',
                 '    uint elem_bytes = (fmt == 75u || fmt == 77u) ? 16u : fmt == 71u ? 8u : (fmt == 50u || fmt == 56u) ? 4u : 0u;',
-                '    if (elem_bytes == 0u) return;',
-                '    if (voff > 0xffffffffu - imm_off) return;',
-                '    uint rec_off = voff + imm_off;',
-                '    uint addr = 0u;',
-                '    if (oob_sel == 3u) {',
-                '        if (stride != 0u) return;',
-                '        if (soff > 0xffffffffu - rec_off) return;',
-                '        addr = soff + rec_off;',
-                '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
-                '    } else {',
-                '        if (stride == 0u) return;',
-                '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
-                '        uint elem_addr = idx * stride + rec_off;',
-                '        if (soff > 0xffffffffu - elem_addr) return;',
-                '        addr = elem_addr + soff;',
-                '    }',
-                '    if ((addr & 3u) != 0u) return;',
-                '    uint uav_bytes = 0u;',
-                '    buf.GetDimensions(uav_bytes);',
-                '    if (uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;',
+                *formatted_store_bounds,
                 '    if (elem_bytes == 16u) {',
                 '        buf.Store4(addr, v);',
                 '    } else if (fmt == 71u) {',
@@ -11659,6 +11762,22 @@ class Pipeline:
                 '        buf.Store(addr, store_unorm(v.x, 1023.0f) | (store_unorm(v.y, 1023.0f) << 10u) '
                 '| (store_unorm(v.z, 1023.0f) << 20u) | (store_unorm(v.w, 3.0f) << 30u));',
                 '    }',
+                '}',
+            ))
+        if self.uses_store_format_xyz:
+            out.extend((
+                'void store_format_xyz(RWByteAddressBuffer buf, uint word3, uint stride, uint num_records, '
+                'uint idx, uint voff, uint soff, uint imm_off, uint3 v) {',
+                '    if ((word3 & 0xcef80000u) != 0u || (word3 & 0xfffu) != 0xfacu) return;',
+                '    uint oob_sel = (word3 >> 28u) & 3u;',
+                '    if ((oob_sel != 0u && oob_sel != 3u) || stride > 0x3fffu) return;',
+                '    uint field = (word3 >> 12u) & 127u;',
+                '    bool unified = ((word3 >> 24u) & 1u) != 0u;',
+                '    uint elem_bytes = (unified ? (%s) : (%s)) ? 12u : 0u;' % (
+                    ' || '.join('field == %du' % field for field in STORE_FORMAT_XYZ_FORMATS),
+                    ' || '.join('field == %du' % field for field in STORE_FORMAT_XYZ_LEGACY_FORMATS)),
+                *formatted_store_bounds,
+                '    buf.Store3(addr, v);',
                 '}',
             ))
         return out
@@ -11763,7 +11882,8 @@ class Pipeline:
                 raise Unsupported('stored image through %s' % (source,))
             lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
             if r.get('load'):
-                lines.append('uavload %d' % r['index'])
+                qualifier = ' uint' if r.get('scalar') else ' float' if r.get('shared') else ''
+                lines.append('uavload %d%s' % (r['index'], qualifier))
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
@@ -11958,7 +12078,7 @@ class ComputePipeline(Pipeline):
                 raise Unsupported('store through %s' % (source,))
             where = 'table %d %d' % (source[1], off)
             if r['kind'] == 'raw':
-                lines.append('uav %d %s' % (r['index'], where))
+                lines.append('uav %d %s%s' % (r['index'], where, ' store_xyz' if r.get('store_xyz') else ''))
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
         lines += self.sampler_lines()
