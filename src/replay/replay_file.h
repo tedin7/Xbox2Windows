@@ -47,6 +47,7 @@ struct Step {
     CallRecord call;
     std::vector<ArgMemory> memory;  // in the order written: a parent before what it points at
     std::vector<Output> outputs;
+    const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
 };
 
 struct Blob {
@@ -81,6 +82,7 @@ struct Recording {
     std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
+    u64 descriptor_snapshot_seq = 0;
 
     ~Recording()
     {
@@ -148,6 +150,25 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             const auto found = by_seq.find(seq);
             if (found == by_seq.end()) return "ARGM before its CALL at " + std::to_string(at);
             out.steps[found->second].memory.push_back(m);
+        } else if (name == "DARR" && header_bytes == 8) {
+            u64 seq;
+            std::memcpy(&seq, h, 8);
+            const auto found = by_seq.find(seq);
+            if (found == by_seq.end()) return "DARR before its CALL at " + std::to_string(at);
+            Step& step = out.steps[found->second];
+            if (step.call.kind != 0 || step.call.slot != 23 || step.descriptor_arrays)
+                return "invalid DARR call at " + std::to_string(at);
+            const auto& args = step.call.args;
+            u64 expected = 0;
+            for (const unsigned arg : {1u, 2u, 4u, 5u})
+                if (args[arg]) expected += u64{static_cast<std::uint32_t>(args[arg < 3 ? 0 : 3])} *
+                                          ((arg == 1 || arg == 4) ? 8 : 4);
+            if (data_bytes != expected) return "DARR size mismatch at " + std::to_string(at);
+            step.descriptor_arrays = out.base + data_at;
+        } else if (name == "DSNP" && header_bytes == 8 && !data_bytes) {
+            if (out.descriptor_snapshot_seq) return "duplicate DSNP at " + std::to_string(at);
+            std::memcpy(&out.descriptor_snapshot_seq, h, 8);
+            if (!out.descriptor_snapshot_seq) return "zero DSNP sequence at " + std::to_string(at);
         } else if (name == "OUTP" && header_bytes >= 24) {
             u64 seq;
             Output o{};

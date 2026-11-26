@@ -44,6 +44,7 @@ bool volatile window_open;
 // Before the window (a timed window, not "all"): the calls that make the state the window's calls name are recorded
 // too, so a replay of a mid-game window knows every object: see prefix_slot. Cleared when the window opens.
 bool volatile prefix_open;
+bool descriptor_snapshot;
 // "slow": the window opens at the first present after slow_after_s whose gap to the previous present is at least
 // slow_gap_s, or at slow_fallback_s; it lasts slow_seconds.
 bool slow_mode;
@@ -192,9 +193,30 @@ struct Call {
     std::int32_t present, pad;
 };
 
+// Exact CopyDescriptors inputs. The prefix already contains heap and view creation, simple
+// copies, and object lifetimes. This supplies the counted arrays that generic ARGM can truncate.
+bool record_descriptor_arrays(ThreadBuffer& b, u64 seq, const u64* args)
+{
+    std::vector<unsigned char> arrays;
+    for (const unsigned arg : {1u, 2u, 4u, 5u}) {
+        const u64 count = static_cast<std::uint32_t>(args[arg < 3 ? 0 : 3]);
+        const u64 bytes = count * ((arg == 1 || arg == 4) ? sizeof(u64) : sizeof(UINT));
+        if (!args[arg] || !bytes) continue;
+        const auto start = arrays.size();
+        if (bytes > max_bytes || start > max_bytes - bytes) return false;
+        arrays.resize(start + static_cast<std::size_t>(bytes));
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(args[arg]),
+                               arrays.data() + start, static_cast<SIZE_T>(bytes), &got) || got != bytes)
+            return false;
+    }
+    append_chunk(b.bytes, "DARR", &seq, sizeof(seq), arrays.data(), arrays.size());
+    return true;
+}
+
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
-void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret)
+void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret, bool descriptor_copy)
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
@@ -202,12 +224,14 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
+    const bool typed_arrays = descriptor_copy && record_descriptor_arrays(b, seq, args);
     // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
     // memory after the call is the returned value; ARGM argument 15 (rcx_arg).
     if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, rcx_arg, object, 0, 0);
     // Words past a slot's own arguments are the caller's stack: recorded too (a replay passes them on, the slot ignores
     // them), the ones after followed_args with a short look only.
     for (std::uint32_t i = 0; i < call_args; ++i) {
+        if (typed_arrays && (i == 1 || i == 2 || i == 4 || i == 5)) continue;
         const u64 value = args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
         if (x2w_local::readable(reinterpret_cast<const void*>(value), 8)) {
@@ -247,7 +271,9 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
     if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    // Nothing but the sequence number (an interlocked instruction) before the real call.
+    // The extra flag read is limited to CopyDescriptors, which takes no float arguments.
+    bool descriptor_copy = false;
+    if constexpr (K == device_kind && N == 23) descriptor_copy = descriptor_snapshot && prefix_open;
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     // ExecuteCommandLists takes no float arguments, so the page scan may run before it.
     if constexpr (K == queue_kind && N == 10) {
@@ -260,7 +286,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     }
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
-    record_call(K, N, seq, rcx, args, ret);
+    record_call(K, N, seq, rcx, args, ret, descriptor_copy);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
     return ret;
 }
@@ -400,6 +426,8 @@ void present()
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
+        if (window_open && !was_open && descriptor_snapshot)
+            append_chunk(b.bytes, "DSNP", &seq, sizeof(seq), nullptr, 0);
         if (window_open && !was_open) pages_at_window_open(b, seq, present);
         else if (window_open) pages_at_present(b, seq, present);
         ReleaseSRWLockExclusive(&b.lock);
@@ -492,6 +520,9 @@ void install()
     write_raw(head.data(), head.size());
     armed = true;
     prefix_open = std::strcmp(value, "all") != 0;
+    char snapshot[2]{};
+    descriptor_snapshot = prefix_open &&
+        GetEnvironmentVariableA("X2W_REPLAY_DESCRIPTOR_SNAPSHOT", snapshot, sizeof(snapshot)) == 1 && snapshot[0] == '1';
     update_window();
     wrap_all(std::make_index_sequence<kind_count>{});
     log("x2w-replay record: on (%s) -> %s", value, path);

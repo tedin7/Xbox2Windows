@@ -339,6 +339,39 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
+    // The prefix reconstructs descriptors in call order, including copies from heaps retired
+    // before the window. DSNP publishes the complete prefix at the window boundary.
+    if (const auto* arrays = step.descriptor_arrays) {
+        if (!r.descriptor_snapshot_seq) return true;
+        std::vector<u64> handles[2];
+        std::vector<std::uint32_t> sizes[2];
+        for (unsigned side = 0; side < 2; ++side) {
+            const unsigned base = side * 3;
+            const auto count = static_cast<std::uint32_t>(c.args[base]);
+            a[base + 1] = a[base + 2] = 0;
+            if (count && c.args[base + 1]) {
+                auto& translated = handles[side];
+                translated.resize(count);
+                for (u64& handle : translated) {
+                    std::memcpy(&handle, arrays, sizeof(handle));
+                    arrays += sizeof(handle);
+                    handle = p.translate(handle);
+                }
+                a[base + 1] = reinterpret_cast<u64>(translated.data());
+            }
+            if (count && c.args[base + 2]) {
+                auto& lengths = sizes[side];
+                lengths.resize(count);
+                const auto bytes = lengths.size() * sizeof(lengths[0]);
+                std::memcpy(lengths.data(), arrays, bytes);
+                arrays += bytes;
+                a[base + 2] = reinterpret_cast<u64>(lengths.data());
+            }
+        }
+        call_slot(call.self, rcx, c.slot, a);
+        ++p.played;
+        return true;
+    }
     call.ret = call_slot(call.self, rcx, c.slot, a);
     if (c.kind == fence_kind && c.slot == fence_completed && call.ret < c.ret) {
         for (const ULONGLONG deadline = GetTickCount64() + 10000; call.ret < c.ret && GetTickCount64() < deadline; Sleep(1))
