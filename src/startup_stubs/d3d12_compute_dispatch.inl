@@ -692,23 +692,27 @@ void log_compute_census()
 // seconds since the process started. The report script keeps the earliest first and the latest last per key.
 void log_key_use_census()
 {
-    struct Row { const char* kind; u64 key; KeyUse use; };
+    struct Row { const char* kind; u64 key; KeyUse use; u64 base; };
     std::vector<Row> rows;
     AcquireSRWLockExclusive(&draw_lock);
     for (auto& item : compute_translations())
         if (item.second.use.uses != item.second.use.reported_uses) {
-            rows.push_back({"compute", item.second.key, item.second.use});
+            rows.push_back({"compute", item.second.key, item.second.use, 0});
             item.second.use.reported_uses = item.second.use.uses;
         }
     for (auto& item : translation_by_key())
         if (item.second && item.second->use.uses != item.second->use.reported_uses) {
-            rows.push_back({"graphics", item.second->key, item.second->use});
+            rows.push_back({"graphics", item.second->key, item.second->use, variant_base_of(item.second->key)});
             item.second->use.reported_uses = item.second->use.uses;
         }
     ReleaseSRWLockExclusive(&draw_lock);
     for (const Row& row : rows)
-        log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
-            row.use.last_ms / 1000.0, row.use.uses);
+        if (row.base)  // an RTV variant: the base key is the one with a shader_results row
+            log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu base %016llx", row.kind, row.key,
+                row.use.first_ms / 1000.0, row.use.last_ms / 1000.0, row.use.uses, row.base);
+        else
+            log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
+                row.use.last_ms / 1000.0, row.use.uses);
 }
 
 void log_compute_views()

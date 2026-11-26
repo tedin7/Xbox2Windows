@@ -407,13 +407,14 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)(?: base ([0-9a-f]{16}))?\s*$")
 LATEST_USED_KEYS = 40
 
 
 def key_use(logdir):
     """{key: (first_seconds, last_seconds, uses)} from the runtime's 'x2w-render key use' lines in stderr.txt: the earliest
-    first, the latest last and the largest count of each key (a line is printed again only when the count grew)."""
+    first, the latest last and the largest count of each key (a line is printed again only when the count grew); a line ending
+    in "base <key>" (an RTV variant of that pipeline) counts for the base key."""
     found = {}
     path = os.path.join(logdir, "stderr.txt") if logdir else None
     if not path or not os.path.isfile(path):
@@ -425,8 +426,9 @@ def key_use(logdir):
             match = KEY_USE_RE.match(line)
             if match:
                 first, last, uses = float(match.group(3)), float(match.group(4)), int(match.group(5))
-                old = found.get(match.group(2))
-                found[match.group(2)] = (min(first, old[0]), max(last, old[1]), max(uses, old[2])) if old else (first, last, uses)
+                key = match.group(6) or match.group(2)  # an RTV variant has no row of its own: its use counts for its base
+                old = found.get(key)
+                found[key] = (min(first, old[0]), max(last, old[1]), max(uses, old[2])) if old else (first, last, uses)
     return found
 
 
