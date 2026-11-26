@@ -40,9 +40,18 @@ int create_scene(void* device, Scene& s)
     const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                    {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
-    if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target)
+    // X2W_TEST_REPLAY_CREATE127=1: the target comes from device slot 127 (the console CreateCommittedResource: ten
+    // arguments after the device, the output last), so a recording must carry more than seven argument words.
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_CREATE127", nullptr, 0)) {
+        using Create = HRESULT (*)(void*, const void*, UINT, const void*, UINT, const void*, void*, UINT, const void*, const GUID*, void**);
+        const auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[127]);
+        if (FAILED(create(device, &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear, nullptr, 0, nullptr,
+                          &__uuidof(ID3D12Resource), &s.target)) || !s.target)
+            return 25;
+    } else if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE, arg(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                                  arg(&clear), arg(&__uuidof(ID3D12Resource)), arg(&s.target)))) || !s.target) {
         return 21;
+    }
     // The title's heap descriptor: the desktop one, then a title CPU address and its size (none here).
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;

@@ -9,6 +9,7 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
     object it knows, and one "x2w-replay score" line;
   - a window in the middle (f6,6: frames 7-12) replays to the same pictures, every object known
     (the state-making calls before the window are recorded too);
+  - a target made through device slot 127 (ten argument words) replays equal (format 3 records eleven);
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
 
@@ -28,7 +29,7 @@ from startup_stream_draw_check import pixel, vertex
 
 PRESENTS = 12
 LIST_KIND, CLEAR_SLOT = 4, 52
-CALL = struct.Struct("<QIHHQ7QQdii")
+CALL = struct.Struct("<QIHHQ11QQdii")
 
 
 def pixels(path):
@@ -178,6 +179,17 @@ def main(scene, player, backend):
         assert not differ, "window replay differs from the recorded run at %s\n%s" % (
             differ, explain(whole[differ[0]], played["present_%04d.png" % (int(differ[0][8:12]) - 6)],
                             directory / "window_replayed" / "stderr.txt"))
+        # The target made through device slot 127 (ten arguments: its output is the tenth): replays equal too.
+        wide_dir, wide = directory / "wide_recorded", directory / "wide.x2wr"
+        wide_dir.mkdir()
+        code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                         dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(wide), X2W_PRESENT_PICTURES=str(wide_dir),
+                              X2W_TEST_REPLAY_CREATE127="1"))
+        assert code == 0, text[-3000:]
+        wide_recorded = pictures(wide_dir)
+        _score, wide_played = replay(player, wide, directory / "wide_replayed", backend, env)
+        differ = [n for n in names if wide_played.get(n) != wide_recorded[n]]
+        assert not differ, "slot-127 replay differs at %s" % differ
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal; %s" % (PRESENTS, score))
     return 0

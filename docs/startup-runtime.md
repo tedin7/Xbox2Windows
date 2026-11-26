@@ -1886,7 +1886,7 @@ Unset, no slot is wrapped and nothing changes.
 
 Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
 the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
-to its thread's own buffer: the call (sequence, thread, kind, slot, object, seven argument words, return value, time,
+to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
 present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
 are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
 shader's is), and the wrapper an argument's memory holds after the call (a creation's
@@ -1902,7 +1902,8 @@ Before `XEND`, one `SHDR` per file directly in `X2W_SHADER_CACHE` (header: the n
 and anything past 512 MiB in total are left out and counted in the log).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
-passed first, the object second), its memory after the call is `ARGM` argument 7.
+passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven
+argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
 Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the

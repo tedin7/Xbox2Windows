@@ -50,8 +50,8 @@ enum Kind : std::uint16_t { device_kind = 0, queue_kind = 1, fence_kind = 2, des
 constexpr std::uint16_t device_create_descriptor_heap = 14, device_increment_size = 15;
 constexpr std::uint16_t heap_cpu_start = 9, heap_gpu_start = 10, fence_completed = 8, queue_present = 32;
 constexpr std::uint16_t resource_map = 8, resource_get_desc = 10, resource_gpu_address = 11;
-constexpr std::uint32_t rcx_arg = 7;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
-constexpr int top_slots = 8;
+constexpr std::uint32_t rcx_arg = 15;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
+constexpr int top_slots = 16;
 
 struct Options {
     std::wstring recording, out;
@@ -95,16 +95,16 @@ struct Played {
     u64 ret = 0;
 };
 
-using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
+using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
 
 // Calls `slot` of `object`'s table with `rcx` as the first register (the object itself, or a struct-return buffer
 // when the title passed the buffer first and the object second).
-u64 call_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[7])
+u64 call_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[call_args])
 {
     const auto table = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<Slot>(table[slot])(rcx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    return reinterpret_cast<Slot>(table[slot])(rcx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]);
 }
-u64 call_slot(u64 object, std::uint16_t slot, const u64 (&a)[7])
+u64 call_slot(u64 object, std::uint16_t slot, const u64 (&a)[call_args])
 {
     return call_slot(object, object, slot, a);
 }
@@ -139,7 +139,7 @@ u64 recorded_word(const Recording& r, const Step& step, std::uint32_t arg)
 }
 
 // The argument memory of one call, copied into the replay's arena. Fills the copy of each top-level argument
-// (top[0..6]: the stack and register arguments after rcx; top[7]: rcx when it is not an object).
+// (top[0..10]: the register and stack arguments after rcx; top[15]: rcx when it is not an object).
 void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_slots], std::vector<unsigned char*>& copies)
 {
     copies.assign(step.memory.size(), nullptr);
@@ -195,7 +195,7 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
 u64 buffer_bytes(u64 resource)
 {
     D3D12_RESOURCE_DESC desc{};
-    const u64 a[7] = {reinterpret_cast<u64>(&desc)};
+    const u64 a[call_args] = {reinterpret_cast<u64>(&desc)};
     call_slot(resource, resource_get_desc, a);
     return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc.Width : 0;
 }
@@ -207,7 +207,7 @@ void learn_after(Player& p, const Recording& r, const Played& call)
     const CallRecord& c = step.call;
     // Outputs: a wrapper the call put into an argument's memory, different from what was there: a new object.
     for (const Output& o : step.outputs) {
-        if (o.arg >= 7 || !call.top[o.arg]) continue;
+        if (o.arg >= static_cast<std::uint32_t>(call_args) || !call.top[o.arg]) continue;
         u64 now;
         std::memcpy(&now, reinterpret_cast<const void*>(call.top[o.arg]), 8);
         if (now && (now != p.translate(o.value) || !p.objects.count(o.value))) p.objects[o.value] = now;
@@ -226,7 +226,7 @@ void learn_after(Player& p, const Recording& r, const Played& call)
         const auto heap = p.heaps.find(recorded_object);
         u64 span = 1ull << 20;
         if (heap != p.heaps.end()) {
-            const u64 a[7] = {heap->second.type};
+            const u64 a[call_args] = {heap->second.type};
             const u64 increment = call_slot(reinterpret_cast<u64>(p.device), device_increment_size, a) & 0xffffffffu;
             span = static_cast<u64>(heap->second.count) * (increment ? increment : 64);
         }
@@ -264,8 +264,8 @@ bool play(Player& p, const Recording& r, const Step& step)
     apply_pages_before(r, c.seq);
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
-    u64 a[7];
-    for (int i = 0; i < 7; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
+    u64 a[call_args];
+    for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
     u64 rcx = call.self;
     if (call.buffer_first) {
         if (!call.top[rcx_arg]) {
