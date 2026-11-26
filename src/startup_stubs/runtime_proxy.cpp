@@ -19,6 +19,7 @@
 #include "startup_stubs/runtime_gpa_patch.h"
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
+#include "startup_stubs/save_write_log.h"
 #include "startup_stubs/storage_root.h"
 #include "startup_stubs/storage_root_utf8.h"
 
@@ -852,7 +853,20 @@ u64 submit_update(u64 update)
             actions = save_table.take(index);
         }
         if (container.empty() || actions.empty()) return 0;
+        SetLastError(0);
         const auto status = save_store().commit(container, actions);
+        const DWORD last_error = GetLastError();
+        {
+            // Every game-save write result (save_write_log.h): the first 20 in full, failures, totals every 25 writes.
+            static x2w_save::WriteLog write_log;
+            u64 staged = 0;
+            for (const auto& action : actions) staged += action.data.size();
+            AcquireSRWLockExclusive(&save_lock);
+            const std::string text = write_log.record(container, actions.size(), staged, status == x2w_save::Status::ok,
+                                                      static_cast<int>(status), last_error);
+            ReleaseSRWLockExclusive(&save_lock);
+            if (!text.empty()) x2w_local::logf("%s", text.c_str());
+        }
         if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: update refused (status %d)", static_cast<int>(status));
         return save_status(status);
     } catch (const std::bad_alloc&) {
@@ -1457,7 +1471,12 @@ HRESULT __stdcall storage_get_path(StorageObject*, std::size_t size, char* buffe
     if (used) *used = need;
     if (!buffer || size < need) return static_cast<HRESULT>(0x8007007A);
     std::memcpy(buffer, storage_path(), need);
-    x2w_local::logf("x2w-runtime storage path -> %s", storage_path());
+    {
+        // Whether the root exists on this PC: the title writes its settings below it itself, and a missing drive makes those writes fail.
+        const DWORD attributes = GetFileAttributesA(storage_path());
+        x2w_local::logf("x2w-runtime storage path -> %s (%s)", storage_path(),
+                        attributes == INVALID_FILE_ATTRIBUTES ? "DOES NOT EXIST on this PC: the title's writes below it fail" : "exists");
+    }
     return S_OK;
 }
 HRESULT __stdcall storage_space(StorageObject*, u64* out)

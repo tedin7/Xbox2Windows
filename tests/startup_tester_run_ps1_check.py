@@ -182,7 +182,7 @@ def check_shell(shell):
         assert manifest["hdd_mode"] is True and manifest["env"].get("X2W_STORAGE_HDD") == "1", manifest  # HDD mode on by default
         saves = tree / "out" / "startup" / "saves"  # the title's save folder: one per tree, kept across runs
         assert saves.is_dir() and manifest["save_root"].replace("/", "\\").rstrip("\\").endswith("out\\startup\\saves") and manifest["fresh_save"] is False, manifest
-        assert manifest["env"].get("X2W_STORAGE_PATH", "").endswith("saves\\") and manifest["saves_at_start"] == 0, manifest
+        assert manifest["env"].get("X2W_STORAGE_PATH", "").endswith("saves\\") and manifest["saves_at_start"] == 0 and manifest["saves_at_end"] == 0 and manifest["saves_files"] == [], manifest
         assert manifest["cache_repaired"] == -1, manifest  # no repair tool in the scratch tree: skipped with a warning, the run goes on
         # The default menus script: clock-free privacy passes, a press every second held 0.8 s (tester_pack.privacy_cycles)
         assert args["InputScript"].startswith("40@5+0.8,40@6+0.8,4@7+0.8,80@8+0.8,4@9+0.8,80@10+0.8,4@11+0.8"), args["InputScript"]
@@ -289,7 +289,7 @@ def check_shell(shell):
         newest_fresh = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_fresh) as z:
             fresh_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
-        assert fresh_manifest["fresh_save"] is True and fresh_manifest["saves_at_start"] == 0, fresh_manifest
+        assert fresh_manifest["fresh_save"] is True and fresh_manifest["saves_at_end"] == 0 and fresh_manifest["saves_at_start"] == 0, fresh_manifest
 
         # A tracked change in the runtime sources makes the checkout dirty: the build revision must carry -dirty to match.
         device = tree / "src" / "device.cpp"

@@ -1035,6 +1035,9 @@ add_test(NAME startup_root_constant_store COMMAND startup_root_constant_store)
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+add_executable(startup_save_write_log tests/startup_save_write_log.cpp)
+target_compile_features(startup_save_write_log PRIVATE cxx_std_17)
+add_test(NAME startup_save_write_log COMMAND startup_save_write_log)
 # Enumeration of the same store (Store::list_containers, Store::list_blobs): exact names, sizes and
 # order, what is not listed, the busy and untouched-output rules, and a second process that
 # publishes two-blob updates while this one lists.

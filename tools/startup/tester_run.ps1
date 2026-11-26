@@ -327,13 +327,14 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 }
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
+$saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
 $manifest = [ordered]@{
     commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue).Count
+    exit_code = $exitCode; stop_reason = $stopReason; end_cause = $endCause; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache); save_root = $saveDir; fresh_save = [bool]$FreshSave; saves_at_start = $saveBefore.Count; saves_at_end = $saveAfter.Count; saves_files = @($saveAfter | Select-Object -First 40 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName.Substring($saveDir.Length).TrimStart([char]92), $_.Length })
     pretranslate = $preTranslate; cache_repaired = $cacheRepaired; input_labels = $inputLabels
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
