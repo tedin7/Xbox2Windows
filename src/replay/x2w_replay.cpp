@@ -5,8 +5,8 @@
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
 //                   [--from-present K] [--max-seconds S]
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
-// one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 4 the stand-in made no
-// device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
+// one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
+// pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
 //
 // Version 1 plays on one thread. Per call:
 //   - the object and every argument naming a recorded wrapper get the replay's wrapper (wrappers are learned from the
@@ -18,8 +18,9 @@
 //   - a fence's completed value is waited for until it reaches the recorded one (10 s at most).
 //   - a buffer's mapped address and GPU address map to the replay's over the buffer's width;
 //   - a struct-returning slot called as (return buffer, object) is played the same way, with a buffer of its own.
-// Not yet: memory the title wrote through mapped pointers or into placed-resource memory, float arguments passed by
-// value, one thread per recorded thread.
+//   - title memory recorded as pages (PAGE/MAP) is reserved at its own addresses first and written before each call
+//     (replay_pages_apply.h); argument memory inside it is passed as is.
+// Not yet: float arguments passed by value, one thread per recorded thread.
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -72,7 +73,7 @@ struct Player {
     std::map<u64, Range> handles;              // recorded handle / mapped / GPU address start -> replay start, span
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
-    u64 mapped = 0, gpu_addresses = 0;
+    u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     void* device = nullptr;
 
     u64 translate(u64 value) const
@@ -144,6 +145,12 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
     copies.assign(step.memory.size(), nullptr);
     for (std::size_t i = 0; i < step.memory.size(); ++i) {
         const ArgMemory& m = step.memory[i];
+        // Title memory the pages replay (reserved at its own address): passed as is, never copied.
+        if (page_replay().reserved(m.address)) {
+            copies[i] = reinterpret_cast<unsigned char*>(m.address);
+            ++p.title_memory_args;
+            continue;
+        }
         const auto blob = r.blobs.find(m.hash);
         if (blob == r.blobs.end() || blob->second.bytes != m.bytes) {
             ++p.missing_blob;
@@ -322,9 +329,18 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.3f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"stopped_at_max_seconds\": %s}\n",
+                        "\"stopped_at_max_seconds\": %s, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, wall, fps,
                      p.arena_bytes, stopped ? "true" : "false");
+        const PageReplay& pages = page_replay();
+        std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
+                        "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
+                     r.maps.size(), pages.maps_applied, pages.pages_written, pages.zero_pages, pages.missing_pages, pages.bad_maps,
+                     p.title_memory_args);
+        for (std::size_t i = 0; i < pages.spans.size(); ++i)
+            std::fprintf(f, "%s{\"address\": \"0x%llx\", \"bytes\": %llu, \"hash\": \"%016llx\"}", i ? ", " : "", pages.spans[i].base,
+                         pages.spans[i].end - pages.spans[i].base, span_hash(pages.spans[i]));
+        std::fprintf(f, "]}\n");
         std::fclose(f);
     }
     std::printf("x2w-replay score presents %llu calls %llu of %zu unknown_object %llu missing_blob %llu fence_timeouts %llu "
@@ -408,6 +424,12 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 2;
     }
+    // First, before the stand-in or anything else can map there: the title ranges the pages replay.
+    if (std::string problem; !reserve_page_ranges(r, problem)) {
+        say("x2w-replay: %s", problem.c_str());
+        std::printf("x2w-replay: %s\n", problem.c_str());
+        return 3;
+    }
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
@@ -441,6 +463,7 @@ int run(const Options& o)
         }
         play(p, r, s);
     }
+    if (!stopped) apply_pages_before(r, ~0ull);  // the pages recorded after the last call
     const double wall = elapsed();
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",

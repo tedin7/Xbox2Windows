@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../startup_stubs/replay_pages.h"
+
 namespace x2w_replay {
 
 using u64 = std::uint64_t;
@@ -55,6 +57,14 @@ struct ShaderFile {
     Blob content;
 };
 
+// One MAP chunk (src/startup_stubs/replay_pages.h): page runs over [address, address + bytes) as they were at seq.
+struct PageMap {
+    u64 address, bytes, seq;
+    std::uint32_t runs;
+    const unsigned char* data;
+    u64 data_bytes;
+};
+
 struct Recording {
     HANDLE file = INVALID_HANDLE_VALUE, mapping = nullptr;
     const unsigned char* base = nullptr;
@@ -64,7 +74,9 @@ struct Recording {
     std::vector<Step> steps;  // sorted by seq
     std::unordered_map<u64, Blob> blobs;
     std::vector<std::string> settings;
-    std::vector<ShaderFile> shader_files;  // SHDR  // XENV: the recorded process's X2W_ settings, "name=value"
+    std::vector<ShaderFile> shader_files;  // SHDR
+    std::unordered_map<PageKey, const unsigned char*, PageKeyHash> pages;  // PAGE: key -> its 4 KiB
+    std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
 
@@ -150,6 +162,16 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             }
         } else if (name == "SHDR" && header_bytes) {
             out.shader_files.push_back({std::string(reinterpret_cast<const char*>(h), header_bytes), Blob{out.base + data_at, data_bytes}});
+        } else if (name == "PAGE" && header_bytes == sizeof(PageKey)) {
+            if (data_bytes != page_bytes) return "PAGE of " + std::to_string(data_bytes) + " bytes at " + std::to_string(at);
+            PageKey key;
+            std::memcpy(&key, h, sizeof(key));
+            out.pages[key] = out.base + data_at;
+        } else if (name == "MAP " && header_bytes == sizeof(MapHeader)) {
+            MapHeader map;
+            std::memcpy(&map, h, sizeof(map));
+            if (map.address % page_bytes || map.bytes % page_bytes) return "MAP not page aligned at " + std::to_string(at);
+            out.maps.push_back(PageMap{map.address, map.bytes, map.seq, map.runs, out.base + data_at, data_bytes});
         } else if (name == "PRES") {
             ++out.presents_marked;
         } else if (name == "XEND" && header_bytes >= 8) {
@@ -160,6 +182,7 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
     }
     if (!out.version) return "no XREC header";
     std::sort(out.steps.begin(), out.steps.end(), [](const Step& a, const Step& b) { return a.call.seq < b.call.seq; });
+    std::stable_sort(out.maps.begin(), out.maps.end(), [](const PageMap& a, const PageMap& b) { return a.seq < b.seq; });
     return {};
 }
 

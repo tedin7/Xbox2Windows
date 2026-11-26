@@ -1917,7 +1917,7 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 `SHDR` files that its shader cache (`X2W_SHADER_CACHE`, default `<out dir>\shader_cache`) does not hold yet, and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
 (the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
 `replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
-recording, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
+recording, 3 a page range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
 Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
@@ -1925,8 +1925,11 @@ memory with the pointers between the copies rewritten, words naming a wrapper or
 heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
 completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
 map to the replay's over the buffer's width, and a struct-returning slot called as (return buffer, object) is played
-with a buffer of the replayer's. Not replayed yet: memory written through mapped pointers or into placed-resource
-memory, float arguments passed by value, one thread per recorded thread.
+with a buffer of the replayer's. Title memory recorded as pages (`PAGE`/`MAP`, src/startup_stubs/replay_pages.h) is
+reserved and committed at its recorded addresses before the stand-in loads (merged into 64 KiB spans; a span that cannot
+be had stops the replay with exit 3 and its address), and every `MAP` is written before the first call with a larger
+sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
+span's final image hash. Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
