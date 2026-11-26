@@ -4578,6 +4578,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    # The debugger's function hooks and concurrent calls (#1281): the step window's bookkeeping, then two
+    # threads through one hooked function with the other thread held for each step, and without.
+    add_test(NAME startup_hook_window COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py")
+    add_test(NAME startup_hook_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_hook_window PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_hook_overlap PROPERTIES TIMEOUT 600)
     find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")

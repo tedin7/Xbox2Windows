@@ -16423,6 +16423,8 @@ The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` function
 
 Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
 
+Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
 ## Host-CPU RDFSBASE, RDGSBASE, and RDPID lifting in cpu_switch_aot
 
 [The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting read-only `rdfsbase`, `rdgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_rdpid_u32`):
@@ -16720,6 +16722,15 @@ ctest --preset dev --no-tests=error -R '^(cpu_aot_switch_sal|cpu_aot_switch_shif
 The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequences (because ML64 assembles the `sal` mnemonic as `/4` `SHL`) across 24 translated functions covering all 12 `SAL` `Code` encodings (`SAL_RM{8,16,32,64}_{1,CL,IMM8}`), register and memory destinations, count-`1` all-16 `SETcc` checks, count->1 10-condition `SETcc` checks, `Jcc`, `CMOVcc`, narrow returns, and nonvolatile/stack-frame operands, plus 11 negative exports. [The differential check](../tests/cpu/switch_sal_check.py) verifies 28,024 `dev` and 28,024 `/O2` comparisons against native execution and the Python reference, four `/O2` mutated-C++ controls (`shift_dir`, `cf_mask`, `of_mask`, `cl_mask`), 11 MASM, 4 unit, and 7 PE-patched rejection controls, and records decoded mnemonics via `iced_x86.Mnemonic` to `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
+
+## Concurrent calls through a startup debugger hook
+
+The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` turns the holding off. See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
 
 ### Startup shader translator: `v_bfm_b32`
 
