@@ -586,55 +586,104 @@ void test_probe_and_access(bool guard_drop_mutate)
     }
 }
 
-// Exceptions seen by a vectored handler: the check counts first-chance faults, which a debugger stops on.
+// Exceptions seen by a vectored handler, for the thread that runs the check only: a debugger stops on every
+// first-chance fault, and faults of other threads in the process do not belong to it.
 volatile LONG first_chance_faults = 0;
+volatile LONG counted_thread = 0;
 LONG CALLBACK count_first_chance(PEXCEPTION_POINTERS info)
 {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
-    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == 0x80000001u)
+    if (GetCurrentThreadId() == static_cast<DWORD>(counted_thread) &&
+        (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == 0x80000001u))
         InterlockedIncrement(&first_chance_faults);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+bool range_is_free(std::uintptr_t base, std::size_t bytes)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(reinterpret_cast<const void*>(base), &info, sizeof(info)) && info.State == MEM_FREE &&
+           info.RegionSize >= bytes;
+}
+
 // Free address space is refused with zero first-chance exceptions by the probe, readable() and both copy flavours,
 // each counted in faults_avoided; a mapped source still copies and counts nothing.
+//
+// The range is one this check released itself. Nothing else can be trusted to leave it free (another thread, or
+// this thread's own heap, may reuse it the moment it is released), so each round is only judged when the range is
+// verified MEM_FREE right before and right after the calls, the handler is installed beforehand and the calls
+// in between allocate nothing. A round that lost its range is dropped, not counted; the check needs enough stable
+// rounds and holds every stable one to zero faults.
 void test_unmapped_no_faults()
 {
     constexpr std::size_t kPage = 0x1000;
-    void* const block = VirtualAlloc(nullptr, 2 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    check(block != nullptr, "VirtualAlloc 2 pages for the unmapped-range check");
-    if (!block) return;
-    std::memset(block, 0x5A, 2 * kPage);
+    constexpr int rounds = 40, needed = 10;
     char copy[64] = {};
-    x2w_local::forget_mapped_spans();
-    const LONG avoided_before = x2w_local::faults_avoided;
-    check(x2w_local::guarded_memcpy(copy, block, sizeof(copy), false) && copy[0] == 0x5A,
-          "a mapped source is copied");
-    check(x2w_local::faults_avoided == avoided_before, "a mapped source avoids no fault");
-    const auto base = reinterpret_cast<std::uintptr_t>(block);
-    check(VirtualFree(block, 0, MEM_RELEASE) != 0, "release the block: its range is now free");
-    x2w_local::forget_mapped_spans();
+    {
+        void* const mapped = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check(mapped != nullptr, "VirtualAlloc a page for the mapped-source check");
+        if (!mapped) return;
+        std::memset(mapped, 0x5A, kPage);
+        x2w_local::forget_mapped_spans();
+        const LONG before = x2w_local::faults_avoided;
+        const bool copied = x2w_local::guarded_memcpy(copy, mapped, sizeof(copy), false);
+        check(copied && copy[0] == 0x5A, "a mapped source is copied");
+        check(x2w_local::faults_avoided == before, "a mapped source avoids no fault");
+        VirtualFree(mapped, 0, MEM_RELEASE);
+    }
+    counted_thread = static_cast<LONG>(GetCurrentThreadId());
     void* const handler = AddVectoredExceptionHandler(1, count_first_chance);
     check(handler != nullptr, "vectored handler installed");
-    InterlockedExchange(&first_chance_faults, 0);
-    check(x2w_local::probe_readable(base, 16) == 0, "probe_readable on free address space returns 0");
-    check(!x2w_local::readable(reinterpret_cast<const void*>(base), 16), "readable on free address space is false");
-    check(!x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), false),
-          "guarded_memcpy (access violations only) refuses free address space");
-    check(!x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), true),
-          "guarded_memcpy (any exception) refuses free address space");
-    check(first_chance_faults == 0, "free address space: zero first-chance exceptions");
-    check(x2w_local::faults_avoided - avoided_before == 4, "four refusals counted in faults_avoided");
-    // Control: the handler does see a real fault, so the zero above means something.
-    InterlockedExchange(&first_chance_faults, 0);
-    x2w_local::forget_mapped_spans();
-    __try {
-        volatile unsigned char sink = *reinterpret_cast<const volatile unsigned char*>(base);
-        (void)sink;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    int stable = 0, wrong_results = 0, faulted = 0, miscounted = 0, control_faults = 0, controls = 0;
+    for (int round = 0; round < rounds && stable < needed; ++round) {
+        void* const block = VirtualAlloc(nullptr, 2 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!block) continue;
+        const auto base = reinterpret_cast<std::uintptr_t>(block);
+        VirtualFree(block, 0, MEM_RELEASE);
+        x2w_local::forget_mapped_spans();
+        if (!range_is_free(base, 2 * kPage)) continue;
+        InterlockedExchange(&first_chance_faults, 0);
+        const LONG before = x2w_local::faults_avoided;
+        const bool probe_zero = x2w_local::probe_readable(base, 16) == 0;
+        const bool not_readable = !x2w_local::readable(reinterpret_cast<const void*>(base), 16);
+        const bool refused_av = !x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), false);
+        const bool refused_any = !x2w_local::guarded_memcpy(copy, reinterpret_cast<const void*>(base), sizeof(copy), true);
+        const LONG faults = first_chance_faults;
+        const LONG counted = x2w_local::faults_avoided - before;
+        if (!range_is_free(base, 2 * kPage)) continue;  // the range was taken meanwhile: this round proves nothing
+        ++stable;
+        if (!(probe_zero && not_readable && refused_av && refused_any)) ++wrong_results;
+        if (faults != 0) ++faulted;
+        if (counted != 4) ++miscounted;
+        if (stable == 1) {
+            // Control: the handler does see a real fault, so the zero above means something. Touch a freshly
+            // released range directly, again only when it is verified free around the touch.
+            void* const second = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (second) {
+                const auto at = reinterpret_cast<std::uintptr_t>(second);
+                VirtualFree(second, 0, MEM_RELEASE);
+                if (range_is_free(at, kPage)) {
+                    InterlockedExchange(&first_chance_faults, 0);
+                    __try {
+                        volatile unsigned char sink = *reinterpret_cast<const volatile unsigned char*>(at);
+                        (void)sink;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    }
+                    const LONG seen = first_chance_faults;
+                    if (range_is_free(at, kPage)) {
+                        ++controls;
+                        control_faults = seen;
+                    }
+                }
+            }
+        }
     }
-    check(first_chance_faults == 1, "control: touching the free range directly is one first-chance fault");
     RemoveVectoredExceptionHandler(handler);
+    check(stable >= needed, "enough rounds kept their released range free to be judged");
+    check(wrong_results == 0, "free address space: probe_readable 0, readable false, both copies refuse");
+    check(faulted == 0, "free address space: zero first-chance exceptions in every judged round");
+    check(miscounted == 0, "free address space: the four refusals of every judged round are counted");
+    check(controls == 1 && control_faults == 1, "control: touching a verified-free range directly is one first-chance fault");
 }
 
 }  // namespace
