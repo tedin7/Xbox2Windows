@@ -388,7 +388,10 @@ def main(scene, player, backend, mode=None):
         wide_recorded = pictures(wide_dir)
         _score, wide_played = replay(player, wide, directory / "wide_replayed", backend, env)
         differ = [n for n in names if wide_played.get(n) != wide_recorded[n]]
-        assert not differ, "slot-127 replay differs at %s" % differ
+        # A failure names the pictures and shows the first one's rows and the replay log, so a rare difference is diagnosable.
+        assert not differ, "slot-127 replay differs at %s\n%s" % (differ, explain(
+            wide_recorded[differ[0]], wide_played.get(differ[0], ((0, 0), b"")), directory / "wide_replayed" / "stderr.txt")
+            if differ else "")
         print("replay: %d presents equal to the recorded run; changed recording differs at the last present only; "
               "window f6,6 replays presents 7-12 equal and all six differ when the exact descriptor arrays are changed; %s" %
               (PRESENTS, score))

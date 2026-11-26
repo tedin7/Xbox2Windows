@@ -14,6 +14,7 @@ usage: startup_replay_cap_check.py <startup_replay_quad> <warp|hardware>
 import os
 from collections import defaultdict
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -116,6 +117,8 @@ def main(scene, backend):
         assert "X2W_REPLAY_MAX_MIB reached" in text, text[-3000:]
         calls, _, _, presents = end_totals(capped)
         assert presents == 0, "cap should stop the recording in the prefix"
+        # tools/startup/tester_pack.py reports such a file unusable by this line.
+        assert "the cap stopped the recording BEFORE the window opened: prefix only" in text, text[-3000:]
         prefix = "replay quad: recorder calls after scene "
         [after] = [int(line[len(prefix):]) for line in text.splitlines() if line.startswith(prefix)]
         assert after == calls, "recorder processed %d calls after the file was closed" % (after - calls)
@@ -123,14 +126,16 @@ def main(scene, backend):
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
 
-        # "slow": the window opens at the first present after a gap of 300 ms or more (a 400 ms pause before frame 15:
-        # present 16), lasts 0.15 s, and the file ends with its XEND.
+        # "slow": the window opens at the first present after a gap of 300 ms or more, lasts 0.15 s, and the file ends with
+        # its XEND. The 400 ms pause before frame 15 makes present 16 such a present; a loaded machine can stall 300 ms
+        # earlier on its own, so the check reads the gap the recorder measured instead of expecting present 16 exactly.
         slow = directory / "slow.x2wr"
         code, text, _ = timed(args + [30], dict(env, X2W_REPLAY_RECORD="slow,0,300,0.15,60", X2W_REPLAY_RECORD_FILE=str(slow),
                                                X2W_TEST_REPLAY_PAUSE="15,400"))
         assert code == 0, text[-3000:]
         opened = [line for line in text.splitlines() if "x2w-replay record: window opens at" in line]
-        assert len(opened) == 1 and "present 16 (first slowdown" in opened[0], opened or text[-3000:]
+        trigger = re.search(r"present (\d+) \(first slowdown, gap (\d+) ms\)", opened[0]) if len(opened) == 1 else None
+        assert trigger and int(trigger.group(1)) <= 16 and int(trigger.group(2)) >= 300, opened or text[-3000:]
         end_totals(slow)
 
         timings = {}

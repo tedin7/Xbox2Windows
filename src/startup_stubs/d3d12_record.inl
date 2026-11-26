@@ -597,6 +597,7 @@ void unwrap_all()
 void stop(bool at_exit)
 {
     if (!active.exchange(false)) return;
+    const bool in_prefix = prefix_open;  // for the log: tester_pack.py flags a prefix-only file by this line
     window_open = false;
     prefix_open = false;
     unwrap_all();
@@ -612,6 +613,9 @@ void stop(bool at_exit)
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
+    if (!at_exit && in_prefix && cap_reached)
+        log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
+            "%ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, presents, max_bytes >> 20);
     if (!at_exit)
         log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
             end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
