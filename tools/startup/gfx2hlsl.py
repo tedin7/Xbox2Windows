@@ -1089,7 +1089,7 @@ def vcc_hi_scalar_mask_read(ins):
         vcc_hi_whole_word_writer(name, parse(asm)[1]) for _o, _n, name, asm in ins))
 
 
-def wave32_vcc_hi(ins):
+def wave32_vcc_hi(ins, wave32=False):
     """`ins` with every vcc_hi operand renamed to an unused SGPR when vcc_hi is provably an ordinary scalar register,
     else `ins`.
 
@@ -1101,7 +1101,9 @@ def wave32_vcc_hi(ins):
     - no instruction names the 64-bit pair `vcc` (whose high word would then be vcc_hi), and
     - a VALU compare or carry writes vcc_hi or an odd SGPR, or a VOP3 mask source reads one (a misaligned pair in
       wave64, so the program is wave32), or no VALU instruction and no vcc branch uses vcc_lo as a lane mask.
-    Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused."""
+    Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused.
+    wave32=True is the caller's proof that the program is wave32 (RDNA 2 ISA, wave32: VCC is vcc_lo alone, so no VALU
+    instruction ever writes or reads vcc_hi as part of a mask): the two wave64 conditions above are then not needed."""
     if not any(re.search(r'\bvcc_hi\b', asm) for *_, asm in ins):
         return ins
     if any(re.search(r'\bvcc\b', asm) or name.startswith('s_movrel') for _o, _n, name, asm in ins):
@@ -1123,7 +1125,7 @@ def wave32_vcc_hi(ins):
     # see vcc_hi for lanes 32..63: none may be present.
     vcc_mask_use = any((name.startswith('v_') and re.search(r'\bvcc_lo\b', asm)) or name.startswith('v_div_fmas')
                        or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
-    if 'vcc_hi' not in masks and not odd and vcc_mask_use:
+    if not wave32 and 'vcc_hi' not in masks and not odd and vcc_mask_use:
         return ins
     if vcc_hi_scalar_mask_read(ins):
         return ins
@@ -2413,6 +2415,12 @@ class Stage:
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
+        elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
+            # A compute program also gets the rename, unless the caller says it is wave64. A program proven wave32 (the
+            # caller says so, or its exec writes are all 32-bit forms) gets it even where a VALU instruction reads vcc_lo
+            # as a lane mask.
+            pipe = getattr(self, 'pipe', None)
+            self.ins = wave32_vcc_hi(self.ins, wave32=getattr(pipe, 'wave_size', None) == 32 or wave32_exec_proof(self.ins))
         if kind == 'ps':
             self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
