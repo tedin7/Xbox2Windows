@@ -12,7 +12,7 @@ soffset + voffset (offen) + index * stride (idxen) + instruction offset; a read 
   structured   position and colour loads use `idxen` (index = the vertex slot) with the stride from the descriptor (16): same picture.
 Every case is first drawn against the picture its own address model gives (zero differing pixels: this verifies the model, including the wrong
 variants), and each wrong variant is then drawn against the picture of the right address and must differ by exactly the pixels the model gives:
-a colour read one vertex too far (soffset 208) and the structured load with stride 8 (a vertex reads half a slot further than the right one).
+a colour read one vertex too far (soffset 208) and the structured load with stride 0 (every vertex reads slot 0). Stride 8 is not drawn: the position export also takes z and w from the load, so a half-slot shift makes w negative and the picture needs a clip model.
 Reads past the end of the vertex buffer are not drawn: the harness binds it as a root descriptor, which has no view bound to model.
 Without arguments only the translation is checked (the variants translate; only the structured one asks the runtime for the stride constant).
 `binary` compares the embedded words with llvm-mc; `draw` compiles the request path's output (ms_6_5, ps_6_0) and draws it.
@@ -114,7 +114,7 @@ CASES = (
     ('soffset one vertex too far', SOFFSET_WRONG, None,
      model_image(lambda slot: 16 * slot, lambda slot: 208 + 16 * slot), RIGHT),
     ('structured, stride 16', STRUCTURED, 16, RIGHT, RIGHT),
-    ('structured, stride 8', STRUCTURED, 8, model_image(lambda slot: 8 * slot, lambda slot: 192 + 8 * slot), RIGHT),
+    ('structured, stride 0', STRUCTURED, 0, model_image(lambda slot: 0, lambda slot: 192), RIGHT),
 )
 
 
@@ -124,7 +124,7 @@ def controls():
     T.expect('the right picture is the standard draw of the fixture',
              RIGHT, T.rasterise(POINTS, COLOURS, INDICES, len(POINTS), len(INDICES)))
     for name, words, stride, drawn, compared in CASES:
-        T.expect(name + ': a wrong read draws another picture than the right one', drawn != RIGHT, words is SOFFSET_WRONG or stride == 8)
+        T.expect(name + ': a wrong read draws another picture than the right one', drawn != RIGHT, words is SOFFSET_WRONG or stride == 0)
         with tempfile.TemporaryDirectory() as tmp:
             key, result = T.request(tmp, words)
             T.expect(name + ' translates', result, 'ok')
