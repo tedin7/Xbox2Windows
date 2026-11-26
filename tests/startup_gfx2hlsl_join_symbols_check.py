@@ -37,6 +37,7 @@ The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
   VOP3 field layouts and checked against the decoder's text; they are not in SOURCES, so `binary` does not
   assemble them.
 """
+import re
 import struct
 import subprocess
 import sys
@@ -92,6 +93,38 @@ SOURCES = {
                   'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
                   '04040cf4000000fa80039ebe8002007e8002027e1e8006bf020085bf04040cf4000000fa7fc08cbf080f00f000040400'
                   '703f8cbf0f1800f804050607000081bf'),
+    # Rule R1 (wave64): s_and_saveexec + s_cbranch_execz skips an s_load of a descriptor. The image_load at the branch
+    # target runs before the exec restore, so the lanes that skipped the arm (exec == 0) do nothing and it keeps the arm's
+    # descriptor. EXEC_DESC_AFTER reads it after the restore, where a lane that skipped is active again: refused.
+    'EXEC_DESC_MASKED': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                         's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                         's_waitcnt lgkmcnt(0)\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                         's_waitcnt vmcnt(0)\ns_or_b64 exec, exec, s[6:7]\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                         '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf080f00f000040400'
+                         '703f8cbf7e06fe880f1800f804050607000081bf'),
+    # A scalar read of the kept descriptor at the join instruction itself ends the window (refused); a reload of it
+    # between the join and the restore is a fresh all-path definition (translated).
+    'EXEC_DESC_SCALAR_JOIN': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                              's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                              's_waitcnt lgkmcnt(0)\ns_mov_b32 s30, s17\ns_waitcnt lgkmcnt(0)\n'
+                              'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
+                              's_or_b64 exec, exec, s[6:7]\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                              '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf11039ebe7fc08cbf08'
+                              '0f00f000040400703f8cbf7e06fe880f1800f804050607000081bf'),
+    'EXEC_DESC_RELOAD': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                         's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                         's_waitcnt lgkmcnt(0)\ns_load_dwordx8 s[16:23], s[8:9], 0x0\ns_waitcnt lgkmcnt(0)\n'
+                         's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                         's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                         '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf04040cf4000000fa7f'
+                         'c08cbf7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_AFTER': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                        's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                        's_waitcnt lgkmcnt(0)\ns_or_b64 exec, exec, s[6:7]\n'
+                        'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
+                        'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                        '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf7e06fe88080f00f000040400'
+                        '703f8cbf0f1800f804050607000081bf'),
     # Compute, with the root of startup_gfx2hlsl_compute_check.py: the table descriptor is loaded before the loop, the
     # loop stores through it at its header and reloads it from the same place before the back edge. Each of 8 lanes
     # stores the counter (1, then 2) to two consecutive words.
@@ -161,7 +194,8 @@ def root(*params):
 
 
 ROOTS = {'DESC_CALC': ('t', 1), 'PAIR_READ': ('t', 1), 'PAIR_ROOT': ('t', 1), 'PAIR_WRITE': ('t', 1), 'DESC_LOAD': ('t', 1),
-         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1),
+         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1), 'EXEC_DESC_MASKED': ('t', 1),
+         'EXEC_DESC_AFTER': ('t', 1), 'EXEC_DESC_SCALAR_JOIN': ('t', 1), 'EXEC_DESC_RELOAD': ('t', 1),
          'PTR_OFFSETS': ('t', 1)}
 
 
@@ -226,6 +260,14 @@ def check_controls():
     assert '        v0 = s23;' in lines('JOIN_SAME')  # #2279 drops the constant at any join another path writes
     same = translate('DESC_SAME')
     assert '        t = r0.Load(int3(v0, v1, 0));' in same.hlsl_ps().splitlines(), same.hlsl_ps()
+    # Rule R1: a descriptor loaded in an s_cbranch_execz arm is kept for a read before the exec restore ...
+    masked = translate('EXEC_DESC_MASKED').hlsl_ps().splitlines()
+    assert '        t = r0.Load(int3(v0, v1, 0));' in masked, masked
+    # ... and still refused for a read after the restore (a lane that skipped the arm is active again).
+    refused('EXEC_DESC_AFTER', "holds ('joined at a branch target',)")
+    refused('EXEC_DESC_SCALAR_JOIN', 'numeric use of s17 holding joined at a branch target')
+    reloaded = translate('EXEC_DESC_RELOAD').hlsl_ps().splitlines()
+    assert '        t = r0.Load(int3(v0, v1, 0));' in reloaded, reloaded
     reload = translate_cs('CS_RELOAD')
     cs = reload.hlsl_cs().splitlines()
     assert '        u0.Store(a, v5);' in cs and '        s22 = s22 + 0x00000001u;' in cs, cs
@@ -395,7 +437,13 @@ def check_exec_join():
 
 def check_binary(llvm_mc):
     for name, (source, words) in SOURCES.items():
-        built = assemble(llvm_mc, source).hex()
+        if name.startswith('EXEC_DESC'):  # 64-bit exec mask forms: wave64
+            run = subprocess.run([llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64', '-show-encoding'],
+                                 input=source, capture_output=True, text=True, check=True)
+            built = ''.join(bytes(int(b, 16) for b in m.group(1).split(',')).hex() for m in
+                            (re.search(r'encoding: \[([^\]]*)\]', l) for l in run.stdout.splitlines()) if m)
+        else:
+            built = assemble(llvm_mc, source).hex()
         assert built == words, '%s: assembled %s, recorded %s' % (name, built, words)
     print('fixture words match llvm-mc')
 
