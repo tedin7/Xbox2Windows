@@ -8,7 +8,7 @@ Both pixel shaders are written in HLSL and installed in the shader cache by hand
 subject here). Checked per mode:
   - the recorded run presents pictures that change from frame to frame;
   - x2w_replay with no X2W_ setting plays every call on a known object and writes the same pictures, byte for byte;
-  - control: the recording with the last frame's root argument changed (the constant word, or the CBV address set to 0)
+  - control: the recording with the last frame's root argument changed (the constant word, or the recorded page behind the CBV)
     replays to a different last picture and the same earlier ones.
 
 usage: startup_replay_root_check.py <startup_replay_root> <x2w_replay> <warp|hardware> <fxc>
@@ -62,7 +62,14 @@ def change_last(source, target, mode):
         at = blobs[argm[(seq, 2)]]
         data[at] ^= 0xFF                                     # the red byte of the last frame's word
     else:
-        struct.pack_into("<Q", data, header + 24 + 8, 0)     # args[1] = the buffer address: unbound, the shader reads zeros
+        # The CBV's data is title memory the replay restores from PAGE chunks: damage the page that holds the last frame's colour.
+        last = struct.pack("<4f", (PRESENTS - 1) / PRESENTS, 0.25, 1.0 - (PRESENTS - 1) / PRESENTS, 1.0)
+        hit = 0
+        for tag, header, _hb, payload, size in chunks(data):
+            if tag == b"PAGE" and bytes(data[payload:payload + 16]) == last:
+                data[payload] ^= 0xFF
+                hit += 1
+        assert hit, "no PAGE chunk holds the last frame's constant buffer"
     target.write_bytes(bytes(data))
 
 
@@ -121,7 +128,7 @@ def one(directory, mode, scene, player, backend, fxc):
     _score, mutated = replay(player, changed, directory / "changed", backend, env, presents=PRESENTS)
     assert mutated[names[-1]] != recorded[names[-1]], "%s: a changed root argument replayed to the same last picture" % mode
     assert all(mutated[n] == recorded[n] for n in names[:-1]), "%s: the change reached other presents" % mode
-    print("replay root %s: %d presents equal to the recorded run; changed last root argument differs at the last present only"
+    print("replay root %s: %d presents equal to the recorded run; changed last root argument (word or CBV page) differs at the last present only"
           % (mode, PRESENTS))
     return 0
 
