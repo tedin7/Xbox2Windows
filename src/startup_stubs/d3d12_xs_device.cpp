@@ -2518,19 +2518,30 @@ bool upload_ring_recycle()
     return on;
 }
 
-UploadReservation reserve_upload_ring(std::size_t bytes)
+// Title input snapshots use their own pool (128 MiB) so draw and texture uploads
+// cannot starve them.
+struct UploadPool {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<UploadRingChunk> chunks;
+    std::size_t active = 0;
+    u64 total_bytes = 0;
+};
+
+UploadReservation reserve_upload_ring(std::size_t bytes, bool snapshot = false)
 {
     constexpr u64 initial_chunk_bytes = u64{16} << 20;
-    constexpr u64 max_total_bytes = u64{256} << 20;
-    constexpr u64 max_alloc_bytes = max_total_bytes / 4;
+    const u64 max_total_bytes = snapshot ? u64{128} << 20 : u64{256} << 20;
+    const u64 max_alloc_bytes = max_total_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
-    static SRWLOCK lock = SRWLOCK_INIT;
-    static std::vector<UploadRingChunk> chunks;
-    static std::size_t active = 0;
-    static u64 total_bytes = 0;
+    static UploadPool pools[2];
+    UploadPool& pool = pools[snapshot ? 1 : 0];
+    SRWLOCK& lock = pool.lock;
+    auto& chunks = pool.chunks;
+    auto& active = pool.active;
+    auto& total_bytes = pool.total_bytes;
 
     AcquireSRWLockExclusive(&lock);
     if (!chunks.empty()) {
@@ -2603,24 +2614,25 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
     ReleaseSRWLockExclusive(&lock);
     static LONG refused;
     if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+        log(snapshot ? "x2w-draw snapshot ring reservation refused: no unused capacity"
+                     : "x2w-draw upload ring reservation refused: no unused capacity");
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource, bool snapshot = false)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(bytes);
+    const UploadReservation reservation = reserve_upload_ring(bytes, snapshot);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, bool snapshot = false)
 {
-    auto* dest = reserve_upload_ring(bytes, offset, resource);
+    auto* dest = reserve_upload_ring(bytes, offset, resource, snapshot);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
