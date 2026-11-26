@@ -38,7 +38,7 @@ Gate = the independent check recorded before the PR was closed.
 | Branch | Head | What it brings here |
 |---|---|---|
 | `tx-stage-26` | `96e51beaf` | #2786 (slot 57 mesh buffer reads). Its #1951 duplicates #1408, already on `tester-loop`: `debug_launch.py` keeps #1408's hold-and-step; #1951's `step_gate.py`, its check and CI line are dropped |
-| `tx-stage-25` | `365b33319` | #2067, #2048, #1726 (merged clean) |
+| `tx-stage-25` | `50eace9c4` | #2067, #2048. #1726 dropped: its `startup_mrt_check` change needs a `startup_stream_draw` part that was not carried, and `startup_mrt` failed on Windows (reverted here too) |
 | `tx-stage-24` | `0435d6c8b` | nothing new: #1801 is the older copy of #1939 (kept as on `tester-loop`); #1170's concurrency block is already in main's `windows.yml` |
 | `tx-stage-shader` | `186904f55` | #1946, #2005, #2029 (translator PRs closed before 2026-11-26 that merged cleanly; the others need a hand merge) |
 | `w7-mesh-rfl-marker` | `90b0b747b` | the opt-in engine (`tools/startup/gfx2hlsl_engine.py`, `X2W_ENGINE=1`, default off; see `docs/startup-engine.md`) and its single-block mesh marker fix. The engine's copies of the WaveSync and slot 57 buffer-read checks are `tests/startup_engine_wavesync_check.py` and `tests/startup_engine_mesh57_buffer_read_check.py` (CTest `startup_engine_*`); the default checks keep their names. Engine keys use revision 29 like the runtime here |
