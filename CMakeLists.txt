@@ -1787,13 +1787,16 @@ endforeach()
 set_tests_properties(startup_indirect_index_copy_late_warp startup_indirect_index_copy_wide_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "index copy mutant rejected by WARP pixel readback")
 
-foreach(mode IN ITEMS on off stale)
-    add_test(NAME startup_indirect_index_shadow_${mode}_warp
+foreach(case IN ITEMS on off stale padding padding_control)
+    string(REPLACE "_" "-" mode "${case}")
+    add_test(NAME startup_indirect_index_shadow_${case}_warp
         COMMAND startup_indirect_draw_indexed warp index-shadow-${mode})
-    set_tests_properties(startup_indirect_index_shadow_${mode}_warp PROPERTIES TIMEOUT 60)
+    set_tests_properties(startup_indirect_index_shadow_${case}_warp PROPERTIES TIMEOUT 60)
 endforeach()
 set_tests_properties(startup_indirect_index_shadow_stale_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "stale index mutant failed the WARP pixel comparison")
+set_tests_properties(startup_indirect_index_shadow_padding_control_warp PROPERTIES
+    PASS_REGULAR_EXPRESSION "staged R16 padding mutant failed the WARP pixel comparison with a clear target")
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.

@@ -783,6 +783,7 @@ struct ShadowIndexDraw {
     D3D12_INDEX_BUFFER_VIEW view;
     std::array<std::uint16_t, 3> reference;
     bool matched_previous_frame = false;
+    bool matched_clear = false;
 };
 
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
@@ -1273,7 +1274,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
                 pixels_match = false;
             }
-        if (shadow) shadow->matched_previous_frame = previous_frame_matches;
+        if (shadow) {
+            shadow->matched_previous_frame = previous_frame_matches;
+            shadow->matched_clear = painted == 0;
+        }
         pixel_readback->Unmap(0, &untouched);
         std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
                     external_arguments ? "" : ", argument guards intact");
@@ -1834,11 +1838,16 @@ int main(int argc, char** argv) try
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool shadow_off = argc == 3 && std::strcmp(argv[2], "index-shadow-off") == 0;
     const bool shadow_stale = argc == 3 && std::strcmp(argv[2], "index-shadow-stale") == 0;
-    const bool shadow_index = shadow_off || shadow_stale ||
+    const bool shadow_skip_zero = argc == 3 && std::strcmp(argv[2], "index-shadow-padding-control") == 0;
+    const bool shadow_padding = shadow_skip_zero ||
+        (argc == 3 && std::strcmp(argv[2], "index-shadow-padding") == 0);
+    const bool shadow_index = shadow_off || shadow_stale || shadow_padding ||
         (argc == 3 && std::strcmp(argv[2], "index-shadow-on") == 0);
     if (shadow_index)
         check(SetEnvironmentVariableA("X2W_INDIRECT_INDEX_SHADOW", shadow_off ? "0" : "1") &&
               SetEnvironmentVariableA("X2W_INDIRECT_INDEX_COPY", "0") &&
+              SetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_COPY",
+                  shadow_skip_zero ? "skip-zero" : shadow_padding ? "seed-tail" : "none") &&
               SetEnvironmentVariableA("X2W_TEST_INDIRECT_INDEX_SHADOW_STALE", shadow_stale ? "1" : "0")
               ? S_OK : E_FAIL, "configure indirect index shadow");
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
@@ -2606,6 +2615,29 @@ int main(int argc, char** argv) try
         const std::unique_ptr<void, FreeMemory> memory(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!memory) return 1;
         auto* const source = static_cast<unsigned char*>(memory.get()) + 2;
+        if (shadow_padding) {
+            // The GPU writes StartIndexLocation=1 and IndexCountPerInstance=3.
+            // The staged tail supplies index 0, completing corners (1, 2, 0).
+            // The seeded value 0x0101 selects corner 2 again, giving zero area.
+            constexpr std::uint16_t words[]{29, 1, 2};
+            std::memcpy(source, words, sizeof(words));
+            ShadowIndexDraw draw{{reinterpret_cast<UINT64>(source), sizeof(words), DXGI_FORMAT_R16_UINT}, {1, 2, 0}};
+            const bool matches = run(device.Get(), guest.Get(), writer.Get(), left.Get(), graphics.Get(),
+                pso.Get(), signature.Get(), kind, false, Refusal::none, "staged R16 tail",
+                nullptr, false, nullptr, false, false, 0, false, false, nullptr, nullptr, false, nullptr, &draw);
+            std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+            x2w_d3d12_census_report(report.data(), report.size());
+            DeleteFileW(log_path.c_str());
+            if (report.find("indirect-other refusal") != std::string::npos ||
+                report.find("indirect-draw refusal") != std::string::npos ||
+                (info && info->GetNumStoredMessages())) return 1;
+            if (shadow_skip_zero) {
+                if (!matches && draw.matched_clear)
+                    std::puts("staged R16 padding mutant failed the WARP pixel comparison with a clear target");
+                return 1;
+            }
+            return matches ? 0 : 1;
+        }
         const std::array<std::uint16_t, 5> first{11, 0, 1, 2, 13}, next{19, 3, 4, 5, 23};
         ShadowIndexDraw draw{{reinterpret_cast<UINT64>(source), sizeof(first), DXGI_FORMAT_R16_UINT}, {}};
         const auto draw_with_reference = [&](const auto& words, Refusal refusal, const char* label) {
