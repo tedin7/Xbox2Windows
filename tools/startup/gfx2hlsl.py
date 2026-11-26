@@ -8653,8 +8653,9 @@ class Stage:
             return '(-%s)' % text if neg else text
 
         # v_fma_mix* is fused, but HLSL may round `a * b` before the add, so binary32 sources with long
-        # mantissas can differ from the hardware by 1 ULP (same as v_fma_f32 in VEC_F).
-        expr = '%s * %s + %s' % tuple(operand(*a) for a in zip(ops[1:4], half, hi))
+        # mantissas can differ from the hardware by 1 ULP (same as v_fma_f32 in VEC_F). mix32 is a precise
+        # mad: without it an RDNA 1 and an RDNA 4 driver drop the sign of a -0 product (#2729, #2746).
+        expr = 'mix32(%s, %s, %s)' % tuple(operand(*a) for a in zip(ops[1:4], half, hi))
         if clamp:
             expr = 'saturate(%s)' % expr
         d = reg_range(ops[0])[1]
@@ -9448,6 +9449,8 @@ VEC_F = {
     'v_min3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, false), false)'),
     'v_max3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, true), true)'),
 }
+# v_fma_mix*: precise keeps the sign of a zero result; mad still lets a backend fuse or round the product.
+MIX32 = 'float mix32(float a, float b, float c) { precise float result = mad(a, b, c); return result; }'
 # 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
 # binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
 # i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
@@ -9978,6 +9981,7 @@ class Pipeline:
                pixel_aot.SALU_HELPERS['fma16_rne'],
                # A binary16 product is exact in binary32. Keep its sign when the result is zero (#2746).
                'float mul16(float a, float b) { precise float product = a * b; return product; }',
+               MIX32,
                'float fma16o(float a, float b, float c) {',
                '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
                '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
@@ -10566,7 +10570,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-27'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-28'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10576,7 +10580,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-27cs')
+    key = fnv(b'x2w-startup-shader-28cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

@@ -274,6 +274,7 @@ jobs:
             tests/startup_image_sample_a16_check.py \
             tests/startup_image_load_d16_check.py \
             tests/startup_host_cpu_check.py \
+            tests/startup_window_capture_check.py \
             tests/startup_live_telemetry_check.py \
             tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_cvt_pk_u8_check.py \

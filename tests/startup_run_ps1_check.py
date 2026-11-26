@@ -250,6 +250,7 @@ def run_problems(shell, script, work, first_only):
         return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
+    found += run_case(shell, script, 0, work, switches=["-CaptureEvery", "5"], passed=["--capture-every", "5"])
     found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
     found += run_case(shell, script, 0, work, trace_api_env="1")
     if found and first_only:

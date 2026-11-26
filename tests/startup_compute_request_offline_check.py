@@ -25,12 +25,12 @@ ROOT = b'RTS0 synthetic root'
 DESC = struct.pack('<12Q', 0, 0, 24, 0, 20, 0, len(CODE), 0, len(DATA), 0, 0, 11)
 STATE_A = struct.pack('<3Q', 1, 0x2c, 0xfff0000000000003)
 STATE_B = struct.pack('<5I', 0x1234abcd, 0xffff0000, 0, 0, 0)
-KEY = 0xb52531cd9c15da3b  # framed key at revision 27cs
+KEY = 0x39e7422f5da15950  # framed key at revision 28cs
 
 
 def framed_key():
     h = 1469598103934665603
-    for b in b'x2w-startup-shader-27cs':
+    for b in b'x2w-startup-shader-28cs':
         h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
     for part in (CODE, DATA, ROOT, DESC, STATE_A, STATE_B):
         for b in struct.pack('<Q', len(part)) + part:

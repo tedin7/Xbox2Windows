@@ -15449,6 +15449,14 @@ Measured at `741ff02c` plus the dispatch mode, `dev` preset, Windows 11 26300.99
 ctest --preset dev --no-tests=error -j1 -R '^startup_gfx2hlsl_fma_mix(_fxc|_dispatch_(warp|hardware))?$' -V
 ```
 
+### Signed zero: a `precise` `mad` (cache revision 28)
+
+On an AMD Radeon RX 5700 XT (#2729) and an RX 9070 XT (#2746), the `-0` case read back `00000000` instead of `80000000`; WARP kept the sign. Their probes lost it only when a binary16 operand widened by `f16tof32` fed a non-`precise` multiply or `mad`, and kept it under `precise`. Non-`precise` HLSL arithmetic does not have to keep a zero's sign.
+
+All three forms now call `mix32(a, b, c)`, whose body is `precise float result = mad(a, b, c); return result;`. Operand order, half selection and modifiers are unchanged, and `saturate` stays outside the call. DXC 1.9.2602.17 emits it as `FMad` with `!dx.precise` on the `FMad` and on the `legacyF16ToF32` that feeds it. `mad` still lets a backend fuse or round the product, so the 1 ULP note above still applies. The dispatch mode prints `mad(4097, 4097, -16785408)` per adapter as information: `3f800000` means fused and `00000000` unfused. A second control shader uses a helper that clears the sign of a `-0` result. It must fail only the `-0` case.
+
+Measured on this branch, `dev` preset, Windows 11 26300, DXC 1.9.2602.17, D3D12 debug layer on with 0 errors and 0 warnings. WARP (1414:008c, 10.0.26100.9818): 17 of 17 words, `-0` kept, unfused. NVIDIA GeForce RTX 4090 (10de:2684, 32.0.16.1088): 17 of 17, fused. Both controls behaved as described. The RTX 4090 also passed before this change, so these runs do not show the fix on RDNA. The RX 5700 XT and RX 9070 XT retests are still pending.
+
 ## Non-fused multiply-add in the startup translator
 
 The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32` and

@@ -130,63 +130,63 @@ check('encoder matches llvm-mc: v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,
 plain = expect('f32 sources',
                encode(MIX_F32, 1, (v2, v3, v4)),
                'v_fma_mix_f32 v1, v2, v3, v4',
-               'v1 = U(F(v2) * F(v3) + F(v4));')
+               'v1 = U(mix32(F(v2), F(v3), F(v4)));')
 low = expect('binary16 low half of src0',
              encode(MIX_F32, 1, (v2, v3, v4), op_sel_hi=(1, 0, 0)),
              'v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[1,0,0]',
-             'v1 = U(f16tof32(v2) * F(v3) + F(v4));')
+             'v1 = U(mix32(f16tof32(v2), F(v3), F(v4)));')
 high = expect('binary16 high half of src0',
               encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(1, 0, 0)),
               'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]',
-              'v1 = U(f16tof32(v2 >> 16) * F(v3) + F(v4));')
+              'v1 = U(mix32(f16tof32(v2 >> 16), F(v3), F(v4)));')
 check('control: op_sel changes the selected half', low != high)
 check('control: op_sel_hi changes the source format', plain != low)
 expect('abs then neg after widening a high half, scalar source, clamp',
        encode(MIX_F32, 1, (v2, S5, v4), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0),
               abs_bits=(0, 1, 0), neg=(0, 1, 0), clamp=1),
        'v_fma_mix_f32 v1, v2, -|s5|, v4 op_sel:[0,1,0] op_sel_hi:[0,1,0] clamp',
-       'v1 = U(saturate(F(v2) * (-abs(f16tof32(s5 >> 16))) + F(v4)));')
+       'v1 = U(saturate(mix32(F(v2), (-abs(f16tof32(s5 >> 16))), F(v4))));')
 expect('inline 0 as a binary16 addend',
        encode(MIX_F32, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1)),
        'v_fma_mix_f32 v1, v2, v3, 0 op_sel_hi:[1,1,1]',
-       'v1 = U(f16tof32(v2) * f16tof32(v3) + 0.0);')
+       'v1 = U(mix32(f16tof32(v2), f16tof32(v3), 0.0));')
 expect('negated inline 0 addend keeps a -0 product',
        encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0), neg=(0, 0, 1)),
        'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,1,0] op_sel_hi:[0,1,0]',
-       'v1 = U(F(v2) * f16tof32(v3 >> 16) + (-0.0));')
+       'v1 = U(mix32(F(v2), f16tof32(v3 >> 16), (-0.0)));')
 expect('inline float on a binary32 source',
        encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel_hi=(1, 0, 0)),
        'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel_hi:[1,0,0]',
-       'v1 = U(f16tof32(v2) * 1.0 + F(v4));')
+       'v1 = U(mix32(f16tof32(v2), 1.0, F(v4)));')
 # neg on inline -0.5 prints as `--0.5`; `(--0.5)` would be an HLSL decrement (review on #2055).
 expect('negated negative inline float',
        encode(MIX_F32, 1, (MINUS_HALF_F, v3, v4), neg=(1, 0, 0)),
        'v_fma_mix_f32 v1, --0.5, v3, v4',
-       'v1 = U((-(-0.5)) * F(v3) + F(v4));')
+       'v1 = U(mix32((-(-0.5)), F(v3), F(v4)));')
 expect('control: an unnegated literal on a binary32 source still translates',
        encode(MIX_F32, 1, (LITERAL, v3, v4), literal=0x3f800000),
        'v_fma_mix_f32 v1, 0x3f800000, v3, v4',
-       'v1 = U(F(0x3f800000u) * F(v3) + F(v4));')
+       'v1 = U(mix32(F(0x3f800000u), F(v3), F(v4)));')
 
 # --- the binary16-destination forms keep their packing --------------------------------------------
 expect('mixlo writes the low half',
        encode(MIXLO_F16, 1, (v2, v3, v4), op_sel_hi=(1, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]',
-       'v1 = (v1 & 0xffff0000u) | f32tof16(f16tof32(v2) * f16tof32(v3) + F(v4));')
+       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(f16tof32(v2), f16tof32(v3), F(v4)));')
 expect('mixlo with a negated inline 0 on a binary16 source',
        encode(MIXLO_F16, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1), neg=(0, 0, 1)),
        'v_fma_mixlo_f16 v1, v2, v3, -0 op_sel_hi:[1,1,1]',
-       'v1 = (v1 & 0xffff0000u) | f32tof16(f16tof32(v2) * f16tof32(v3) + (-0.0));')
+       'v1 = (v1 & 0xffff0000u) | f32tof16(mix32(f16tof32(v2), f16tof32(v3), (-0.0)));')
 expect('mixhi writes the high half from a high-half source',
        encode(MIXHI_F16, 1, (v2, v3, v4), op_sel=(0, 0, 1), op_sel_hi=(0, 0, 1)),
        'v_fma_mixhi_f16 v1, v2, v3, v4 op_sel:[0,0,1] op_sel_hi:[0,0,1]',
-       'v1 = (v1 & 0xffffu) | (f32tof16(F(v2) * F(v3) + f16tof32(v4 >> 16)) << 16);')
+       'v1 = (v1 & 0xffffu) | (f32tof16(mix32(F(v2), F(v3), f16tof32(v4 >> 16))) << 16);')
 
 # A register whose upper 16 bits are undefined (odd-dmask D16 image_load) can feed a low-half read.
 expect('low half of a register with undefined upper bits',
        encode(MIX_F32, 1, (v2, v3, v4), op_sel_hi=(1, 0, 0)),
        'v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[1,0,0]',
-       'v1 = U(f16tof32(v2) * F(v3) + F(v4));', low16_only_v={2})
+       'v1 = U(mix32(f16tof32(v2), F(v3), F(v4)));', low16_only_v={2})
 
 # --- refusals -------------------------------------------------------------------------------------
 expect_refused('high half of a register with undefined upper bits',
@@ -212,7 +212,7 @@ expect_refused('inline float on a binary16 source of mixlo',
 expect('literal on a binary16 source',
                encode(MIX_F32, 1, (LITERAL, v3, v4), op_sel_hi=(1, 0, 0), literal=0x3c00),
                'v_fma_mix_f32 v1, 0x3c00, v3, v4 op_sel_hi:[1,0,0]',
-               'v1 = U(f16tof32(0x3c00u) * F(v3) + F(v4));')
+               'v1 = U(mix32(f16tof32(0x3c00u), F(v3), F(v4)));')
 # The decoder prints neg on inline 1..64 or a literal as a negative integer. Read as an integer, the
 # sign-bit flip is lost (neg on inline 1 is 0x80000001, not 0xffffffff), so these stay refused.
 # Inline -1 prints the same text as neg on inline 1, so it is refused too.
@@ -236,12 +236,12 @@ for high, bits in ((0, 0x3c00), (1, 0x4000)):
     suffix = (' op_sel:[1,0,0]' if high else '') + ' op_sel_hi:[1,0,0]'
     expect('select literal half %d' % high, raw,
            'v_fma_mix_f32 v1, 0x40003c00, v3, v4' + suffix,
-           'v1 = U(f16tof32(0x%04xu) * F(v3) + F(v4));' % bits)
+           'v1 = U(mix32(f16tof32(0x%04xu), F(v3), F(v4)));' % bits)
 
 expect('inline half on a low binary16 source',
        encode(MIX_F32, 1, (240, v3, v4), op_sel_hi=(1, 0, 0)),
        'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel_hi:[1,0,0]',
-       'v1 = U(0.5 * F(v3) + F(v4));')
+       'v1 = U(mix32(0.5, F(v3), F(v4)));')
 expect_refused('unverified high half of inline constant',
                encode(MIX_F32, 1, (240, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(1, 0, 0)),
                'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]')
@@ -250,7 +250,7 @@ expect_refused('unverified high half of inline constant',
 def compile_translated(fxc):
     """Compile every translated line in one ps_5_1 entry point; returns FXC's exit status and output."""
     regs = sorted({int(n) for line in translated for n in re.findall(r'\bv(\d+)\b', line)})
-    body = ['#define F asfloat', '#define U asuint',
+    body = ['#define F asfloat', '#define U asuint', G.MIX32,
             'uint main(nointerpolation uint4 p : TEXCOORD0) : SV_Target {',
             '    uint s5 = p.y;']
     body += ['    uint v%d = p.x + %du;' % (r, r) for r in regs]
@@ -370,9 +370,9 @@ def raw_fill(index):
     return ((index + 1) * 0x9E3779B1 & 0xffffffff) | 1
 
 
-def dispatch_source(rows, lines):
+def dispatch_source(rows, lines, helper=G.MIX32):
     """One thread: per case, load opaque inputs, run the translated line, store v1."""
-    body = ['#define F asfloat', '#define U asuint', 'RWByteAddressBuffer data : register(u0);',
+    body = ['#define F asfloat', '#define U asuint', helper, 'RWByteAddressBuffer data : register(u0);',
             '[numthreads(1, 1, 1)]', 'void main() {']
     for index, ((_label, words), line) in enumerate(zip(rows, lines)):
         base = index * 6
@@ -408,6 +408,10 @@ def check_dispatch(dxc, runner, adapter):
     rows = [(label, case_inputs(label, decode_mix(code))) for label, code, _line in cases]
     expected = [reference(decode_mix(code), words) for (_l, code, _), (_, words) in zip(cases, rows)]
     lines = [line for _l, _c, line in cases]
+    # Information, not a check: 4097 * 4097 = 16785409 rounds to 16785408 in binary32, so a fused mad
+    # returns 1.0 and an unfused one 0.0. mix32 allows either (#2729).
+    rows.append(('cancellation', {'v2': f32_word(4097.0), 'v3': f32_word(4097.0), 'v4': f32_word(-16785408.0)}))
+    lines.append('v1 = U(mix32(F(v2), F(v3), F(v4)));')
     out_dir = os.path.join(here, '..', 'out')
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out_dir) as directory:
@@ -417,6 +421,18 @@ def check_dispatch(dxc, runner, adapter):
             got = words[index * 6 + 5]
             check('%s: %s readback' % (adapter, label), got == expected[index],
                   'expected %08x, got %08x' % (expected[index], got))
+        fused = words[len(cases) * 6 + 5]
+        print('%s: mad(4097, 4097, -16785408) = %08x (%s)' % (
+            adapter, fused, {0x3f800000: 'fused', 0: 'unfused'}.get(fused, 'neither fused nor unfused')))
+        # Negative control: a helper that clears the sign of a zero result, as the RDNA 1 and RDNA 4 drivers
+        # did without precise, must fail exactly the -0 case.
+        lossy = G.MIX32.replace('return result;', 'return asfloat(asuint(result) == 0x80000000u ? 0u : asuint(result));')
+        assert lossy != G.MIX32
+        lost = run_dispatch(dxc, runner, adapter, dispatch_source(rows, lines, lossy), len(rows) * 6, directory,
+                            'fma_mix_sign_control')
+        caught = [label for i, (label, _c, _l) in enumerate(cases) if lost[i * 6 + 5] != expected[i]]
+        check('%s: control that clears a -0 result fails only the -0 product case' % adapter,
+              caught == ['negated inline 0 addend keeps a -0 product'], repr(caught))
         # Negative control: drop the high-half shift, so the device reads the low half. The readback must
         # then match a reference with op_sel cleared, and differ from the correct result somewhere.
         # (A zero product, as in the -0 case, hides the half it reads.)

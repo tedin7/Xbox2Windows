@@ -1190,6 +1190,10 @@ target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 # The DLL the probe calls for the debugger's call-hook case (--trace-calls).
 add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
 add_dependencies(startup_debug_probe startup_debug_calls)
+# A visible window that changes its picture at a known time: input for the --capture-every check (tests/startup_debug_window_check.py).
+add_executable(startup_window_probe tests/startup_window_probe.cpp)
+target_compile_features(startup_window_probe PRIVATE cxx_std_17)
+target_link_libraries(startup_window_probe PRIVATE user32 gdi32)
 # Input for tests/startup_inflate_check.py: the DirectStorage stand-in's zlib decoder on one stream.
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
@@ -4568,6 +4572,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:startup_debug_calls>" ${group})
         set_tests_properties(${startup_debug_test} PROPERTIES TIMEOUT 300)
     endforeach()
+    # Periodic window pictures (--capture-every): the pure parts, then a real window that turns red to blue.
+    add_test(NAME startup_window_capture_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_window_capture_check.py")
+    set_tests_properties(startup_window_capture_check PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
+    set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")

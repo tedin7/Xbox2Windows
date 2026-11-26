@@ -1,6 +1,6 @@
 """`s_mov_b32` copy of a plain constant SGPR in tools/startup/gfx2hlsl.py: run-time write and join.
 
-The copy folds the constant into later reads (revision x2w-startup-shader-27), and these two cases pin what must
+The copy folds the constant into later reads (revision x2w-startup-shader-28), and these two cases pin what must
 stay true next to the fold:
 - the copy still assigns its register at run time (`s12 = ...;` is emitted), so a reader the fold does not reach
   (a branch target after a join) sees a real value;
