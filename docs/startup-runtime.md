@@ -1930,6 +1930,14 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 recording, 3 a page range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
+Set `X2W_REPLAY_TIMING=1` in the player environment to benchmark replay steps. At each elapsed wall-second boundary,
+the player prints `x2w-replay timing` with calls played, presents, and up to five `kind:slot=us` entries ranked by
+time since the previous report. Reports are emitted between calls, and a blocking call can delay a report across
+several boundaries. The summary adds `slot_times` entries with `kind`, `slot`, `calls`, and `total_us`, plus more precision
+in `wall_s`. Step time includes argument relocation, page writes before the call, dispatch, fence waits,
+and output processing. Time spent checking a skipped call is charged to its recorded slot. The wall clock also
+includes reporting overhead and any page writes after the last call.
+
 Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack
 word past the slot's own arguments may point at the same variable), argument memory is copied into the replayer's
 memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a

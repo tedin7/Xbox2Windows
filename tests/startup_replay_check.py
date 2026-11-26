@@ -11,6 +11,7 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
     (the state-making calls before the window are recorded too). A prefix-only ranged descriptor copy
     supplies the render target. Changing the last destination handle in the exact arrays (DARR) leaves the fallback clear visible;
   - a target made through device slot 127 (ten argument words) replays equal (format 3 records eleven);
+  - opt-in player timing reports every recorded slot and accounts for at least 90% of playback wall time;
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
 
@@ -103,9 +104,48 @@ def run(args, env):
     return result.returncode, result.stdout + result.stderr
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS):
+def check_timing(summary, recording, progress):
+    data = recording.read_bytes()
+    expected = {struct.unpack_from("<QIHH", data, header)[2:]
+                for tag, header, *_ in chunks(data) if tag == b"CALL"}
+    slots = summary["slot_times"]
+    keys = [(entry["kind"], entry["slot"]) for entry in slots]
+    assert len(keys) == len(expected) and set(keys) == expected, keys
+    assert all(entry["total_us"] >= 0 for entry in slots), slots
+    # Per-call cost needs the call count: every recorded call is counted once, under its own slot.
+    counts = {}
+    for tag, header, *_ in chunks(data):
+        if tag == b"CALL":
+            key = struct.unpack_from("<QIHH", data, header)[2:]
+            counts[key] = counts.get(key, 0) + 1
+    assert {(e["kind"], e["slot"]): e["calls"] for e in slots} == counts, (slots, counts)
+    slot_us = sum(entry["total_us"] for entry in slots)
+    wall_us = summary["wall_s"] * 1_000_000
+    assert wall_us > 0 and abs(slot_us - wall_us) <= 0.10 * wall_us, (slot_us, wall_us)
+
+    if slot_us >= 1_000_000:
+        assert progress, "no timing report after a second of playback"
+    calls = presents = 0
+    for line in progress:
+        _, _, calls_label, call_count, presents_label, present_count, top_label, *top = line.split()
+        assert (calls_label, presents_label, top_label) == ("calls", "presents", "top_us"), line
+        calls += int(call_count)
+        presents += int(present_count)
+        assert 1 <= len(top) <= 5, line
+        times = []
+        for entry in top:
+            key, duration = entry.split("=")
+            assert tuple(map(int, key.split(":"))) in expected, line
+            times.append(float(duration))
+        assert times == sorted(times, reverse=True) and all(t >= 0 for t in times), line
+    assert calls <= summary["played"] and presents <= summary["presents"], progress
+
+
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
+    if timing:
+        env["X2W_REPLAY_TIMING"] = "1"
     code, text = run([player, recording, out, "--adapter", backend], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
@@ -116,6 +156,11 @@ def replay(player, recording, out, backend, env, presents=PRESENTS):
     summary = json.loads((out / "replay_summary.json").read_text())
     assert summary["unknown_object"] == 0 and summary["missing_blob"] == 0, summary
     assert summary["presents"] == presents and summary["fence_timeouts"] == 0, summary
+    progress = [line for line in text.splitlines() if line.startswith("x2w-replay timing ")]
+    if timing:
+        check_timing(summary, recording, progress)
+    else:
+        assert "slot_times" not in summary and not progress, (summary, progress)
     return score[0], pictures(out)
 
 
@@ -234,7 +279,7 @@ def main(scene, player, backend, mode=None):
         assert sorted(recorded) == names, sorted(recorded)
         assert recorded[names[0]] != recorded[names[-1]], "the scene does not change between presents"
 
-        score, replayed = replay(player, recording, directory / "replayed", backend, env)
+        score, replayed = replay(player, recording, directory / "replayed", backend, env, timing=True)
         assert sorted(replayed) == names, sorted(replayed)
         differ = [n for n in names if replayed[n] != recorded[n]]
         assert not differ, "replayed pictures differ from the recorded run: %s\n%s\n%s" % (
