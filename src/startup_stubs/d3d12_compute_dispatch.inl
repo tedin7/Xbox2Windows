@@ -421,7 +421,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // in its desktop copy and the later draws bind that (note_placed_gpu_write).
             ViewRecord record{};
             note_lock_acquire(false);
-            if (words[1] < view_records().size()) record = view_records()[words[1]];
+            if (view_token_known(words)) record = view_records()[words[1]];
             ReleaseSRWLockShared(&note_lock);
             Wrapper* const owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
