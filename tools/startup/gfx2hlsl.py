@@ -8901,7 +8901,8 @@ class Stage:
                 targets.add(target)
 
         def regs(tok):
-            r = reg_range(tok)
+            # A VOP3 source modifier (-v3, |v3|, -|v3|) still reads the register: strip it before the lookup.
+            r = reg_range(tok.lstrip('-').strip('|') if isinstance(tok, str) else tok)
             return set(range(r[1], r[2] + 1)) if r and r[0] == 'v' else set()
 
         def mix_low_only(n, ops, mods, r):
@@ -8947,6 +8948,15 @@ class Stage:
                 read = set().union(*(regs(o) for o in sources)) if sources else set()
             low_reader = (n == 'v_cvt_f32_f16' and not mods and len(ops) == 2 and
                           all(re.fullmatch(r'v\d+', o) for o in ops))
+            # A plain 32-bit copy (v_mov_b32, or both value sources of v_cndmask_b32) moves the whole register, undefined upper
+            # half included, so it only hands that state on to its destination; the half is checked where it is observed.
+            # The destination of v_mov_b32, v_cndmask_b32 and v_fma_mix_f32 is only written (the last rewrites all 32 bits): its old
+            # undefined half is no read. It still counts for the pending / stale p1ll checks, which refuse an overwrite.
+            value_read = (set().union(*(regs(o) for o in ops[1:])) if n in ('v_mov_b32', 'v_cndmask_b32', 'v_fma_mix_f32') and ops
+                          else read)
+            copy = (not mods and all(re.fullmatch(r'v\d+', o) for o in ops[:1]) and
+                    ((n == 'v_mov_b32' and len(ops) == 2) or (n == 'v_cndmask_b32' and len(ops) in (3, 4))))
+            copied = {int(o[1:]) for o in ops[1:3 if n == 'v_cndmask_b32' else 2] if re.fullmatch(r'v\d+', o)} if copy else set()
             for r in sorted(read):
                 if r in pending:
                     raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
@@ -8954,7 +8964,8 @@ class Stage:
                 if r in stale:
                     raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
                                       'a v_interp_p2_f16 that wrote another register' % (r, n))
-                if r in high_undefined and not (low_reader and r == int(ops[1][1:])) and not mix_low_only(n, ops, mods, r):
+                if r in high_undefined and r in value_read and not (low_reader and r == int(ops[1][1:])) and not mix_low_only(n, ops, mods, r) \
+                        and r not in copied:
                     raise Unsupported('%s reads the upper 16 bits of the v_interp_p2_f16 result v%d: not modelled' %
                                       (n, r))
             if n == 'v_interp_p1ll_f16' and interp:
@@ -8982,6 +8993,9 @@ class Stage:
             elif low_reader:
                 high_undefined.discard(int(ops[0][1:]))
                 stale.discard(int(ops[0][1:]))
+            elif copy:
+                # Whole-register copy: the destination holds the source's value, upper half as undefined as it was.
+                (high_undefined.add if copied & high_undefined else high_undefined.discard)(int(ops[0][1:]))
             elif n == 'v_fma_mix_f32' and ops:
                 # The whole 32-bit destination is rewritten (a binary32 result): no half of the old value survives.
                 high_undefined.difference_update(written)
