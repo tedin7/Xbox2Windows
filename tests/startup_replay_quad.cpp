@@ -5,7 +5,7 @@
 // Frame f: clear to a colour that moves with f, draw the stream pipeline's triangle in a scissor whose width moves
 // with f, execute, present the target (queue slot 32), signal and wait. No mapped memory is written.
 //
-// usage: startup_replay_quad <vs> <ps> <root> <warp|hardware> <presents>
+// usage: startup_replay_quad <vs> <ps> <root> <warp|hardware> <presents>   [X2W_TEST_REPLAY_PAUSE=<frame>,<ms>]
 #include <d3d12.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -117,8 +117,15 @@ int main(int argc, char** argv)
         return rc;
     Scene scene;
     if (const int rc = create_scene(device, scene)) return rc;
-    for (UINT frame = 0; frame < frames; ++frame)
+    // X2W_TEST_REPLAY_PAUSE=<frame>,<ms>: a pause before that frame (a slowdown for the recorder's "slow" trigger).
+    char pause[32]{};
+    unsigned pause_frame = ~0u, pause_ms = 0;
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PAUSE", pause, sizeof(pause)) && std::sscanf(pause, "%u,%u", &pause_frame, &pause_ms) != 2)
+        return 2;
+    for (UINT frame = 0; frame < frames; ++frame) {
+        if (frame == pause_frame) Sleep(pause_ms);
         if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
+    }
     std::printf("replay quad: %u presents drawn\n", frames);
     return 0;
 }

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "replay_file.h"
+#include "replay_pages_apply.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -253,6 +254,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.unknown_object;
         return false;
     }
+    apply_pages_before(r, c.seq);
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
     u64 a[7];
