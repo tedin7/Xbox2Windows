@@ -97,6 +97,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
@@ -3602,11 +3603,14 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                         pass.pipeline->own().mesh86_key);
             }
             if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-                u64 key = known_pipeline_key(pass.pipeline);
+                u64 key;
                 if (mesh && console_pipeline) {
+                    // Mesh already has its own key. The graphics lookup can take draw_lock.
                     const u64 stream_key = pass.pipeline->own().mesh86_key;
                     key = stream_key ? stream_key : pass.requested_mesh_key;
                     if (key) note_indirect_mesh_use(key);
+                } else {
+                    key = known_pipeline_key(pass.pipeline);
                 }
                 const char* reason = graphics_draw_candidate ? "switch off" :
                     (!pass.pipeline || console_pipeline) ? "no translation" : "root mismatch";

@@ -33,6 +33,7 @@
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
+extern "C" __declspec(dllimport) LONG64 x2w_d3d12_mesh_census_lock_probe(void (*exercise)(void*), void* context);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
 
 #if defined(OFFSCREEN_AGILITY_620)
@@ -2116,6 +2117,68 @@ int main(int argc, char** argv) try
         if (!dispatch(pair.Get(), root.Get(), "mesh with PS") ||
             !dispatch(depth.Get(), root.Get(), "mesh with no PS") ||
             (!control && !dispatch(pair.Get(), root.Get(), "repeat mesh with PS"))) return 1;
+        unsigned pair_uses = 2, depth_uses = 1;
+        if (!control && !exchange_size) {
+            constexpr unsigned pair_calls = 4000, depth_calls = 1000;
+            using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+            using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+            struct Recording {
+                ComPtr<ID3D12CommandAllocator> allocator;
+                ComPtr<IUnknown> list;
+            };
+            const PlacedBuffer arguments(device.Get(), guest.Get(), sizeof(initial), D3D12_RESOURCE_FLAG_NONE);
+            const auto execute = [&](IUnknown* list) {
+                slot<Execute>(list, 61)(list, signature.Get(), 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+            };
+            const auto record = [&](Recording& recording, IUnknown* pipeline) {
+                check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&recording.allocator)),
+                      "create concurrent mesh census allocator");
+                recording.list = begin_guest_list(guest.Get(), recording.allocator.Get());
+                auto* list = recording.list.Get();
+                slot<Bind>(list, 25)(list, pipeline);
+                slot<Bind>(list, 34)(list, root.Get());
+                execute(list);  // Resolve the request key before measuring repeated refusals.
+            };
+            Recording lists[2][2];
+            for (auto& worker_lists : lists) {
+                record(worker_lists[0], pair.Get());
+                record(worker_lists[1], depth.Get());
+            }
+
+            struct Probe {
+                std::atomic<bool> start{false};
+                HANDLE threads[2]{};
+                DWORD wait_result = WAIT_FAILED;
+            } probe;
+            const auto worker = [&](Recording* recordings) {
+                while (!probe.start.load(std::memory_order_acquire)) std::this_thread::yield();
+                for (unsigned i = 0; i < pair_calls; ++i) execute(recordings[0].list.Get());
+                for (unsigned i = 0; i < depth_calls; ++i) execute(recordings[1].list.Get());
+            };
+            std::thread first(worker, lists[0]);
+            std::thread second(worker, lists[1]);
+            probe.threads[0] = first.native_handle();
+            probe.threads[1] = second.native_handle();
+            const auto holds = x2w_d3d12_mesh_census_lock_probe([](void* context) {
+                auto& state = *static_cast<Probe*>(context);
+                state.start.store(true, std::memory_order_release);
+                state.wait_result = WaitForMultipleObjects(2, state.threads, TRUE, 5000);
+            }, &probe);
+            first.join();
+            second.join();
+            for (auto& worker_lists : lists)
+                for (auto& recording : worker_lists)
+                    check(slot<HRESULT (WINAPI*)(IUnknown*)>(recording.list.Get(), 9)(recording.list.Get()),
+                          "close concurrent mesh census list");
+            if (probe.wait_result != WAIT_OBJECT_0 || holds != 0) {
+                std::fprintf(stderr, "mesh census lock probe failed: wait result %lu, draw_lock holds %+lld\n",
+                             probe.wait_result, holds);
+                return 1;
+            }
+            pair_uses += 2 * (1 + pair_calls);
+            depth_uses += 2 * (1 + depth_calls);
+            std::puts("10000 concurrent mesh refusals completed during a draw_lock hold with no additional holds");
+        }
         std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
         x2w_d3d12_census_report(report.data(), report.size());
         unsigned requests = 0, with_ps = 0, files = 0;
@@ -2137,7 +2200,7 @@ int main(int argc, char** argv) try
             if (has_ps) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
             const auto key = path.stem().string().substr(4);  // req_<key>
-            const char* count = has_ps ? "2" : "1";
+            const auto count = std::to_string(has_ps ? pair_uses : depth_uses);
             const auto use = report.find("x2w-render key use mesh " + key + " first ");
             const auto use_count = report.find(" uses ", use);
             const auto expected_use = std::string(" uses ") + count + "\n";
@@ -2147,7 +2210,7 @@ int main(int argc, char** argv) try
                                                      count + "\n") != std::string::npos;
             if (!correct_use || !correct_refusal) {
                 std::fprintf(stderr, "mesh request census mismatch for %s (expected %s uses and refusals)\n%s",
-                             key.c_str(), count, report.c_str());
+                             key.c_str(), count.c_str(), report.c_str());
                 return 1;
             }
         }

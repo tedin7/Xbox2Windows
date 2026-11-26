@@ -668,10 +668,50 @@ void log_compute_census()
 }
 
 // Mesh requests have no entry in either draw or compute translation accounting.
-auto& indirect_mesh_key_uses()
+struct MeshKeyUse {
+    std::atomic<u64> key{0}, first_tick{0}, last_ms{0}, uses{0};
+    u64 reported_uses = 1;  // The first-use line is emitted by the recording thread.
+};
+
+constexpr std::size_t mesh_use_capacity = 4096;
+MeshKeyUse mesh_uses[mesh_use_capacity];
+static_assert(std::atomic<u64>::is_always_lock_free);
+
+// Keep counts exact even if a process exhausts the table. Overflow nodes are
+// appended once and remain valid for the lifetime of the census.
+struct MeshUseOverflow {
+    MeshKeyUse use;
+    MeshUseOverflow* next = nullptr;
+};
+std::atomic<MeshUseOverflow*> mesh_use_overflow{nullptr};
+static_assert(std::atomic<MeshUseOverflow*>::is_always_lock_free);
+
+MeshKeyUse& mesh_use_for(u64 key)
 {
-    static std::unordered_map<u64, KeyUse> uses;
-    return uses;
+    const auto hash = key ^ (key >> 32);
+    for (std::size_t probe = 0; probe < mesh_use_capacity; ++probe) {
+        auto& entry = mesh_uses[(hash + probe) & (mesh_use_capacity - 1)];
+        u64 seen = entry.key.load(std::memory_order_acquire);
+        if (!seen && entry.key.compare_exchange_strong(seen, key, std::memory_order_acq_rel))
+            return entry;
+        if (seen == key) return entry;
+    }
+
+    std::unique_ptr<MeshUseOverflow> pending;
+    auto* head = mesh_use_overflow.load(std::memory_order_acquire);
+    MeshUseOverflow* scanned = nullptr;
+    for (;;) {
+        for (auto* node = head; node != scanned; node = node->next)
+            if (node->use.key.load(std::memory_order_relaxed) == key) return node->use;
+        scanned = head;
+        if (!pending) {
+            pending = std::make_unique<MeshUseOverflow>();
+            pending->use.key.store(key, std::memory_order_relaxed);
+        }
+        pending->next = head;
+        if (mesh_use_overflow.compare_exchange_weak(head, pending.get(), std::memory_order_acq_rel))
+            return pending.release()->use;
+    }
 }
 
 template <class Emit>
@@ -685,19 +725,18 @@ void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use)
 
 void note_indirect_mesh_use(u64 key)
 {
-    KeyUse first_use;
-    {
-        x2w_startup::ExclusiveNoteLock guard(draw_lock);
-        auto& use = indirect_mesh_key_uses()[key];
-        // Publish the first use even if the title never reaches the periodic report.
-        use.note(process_ms());
-        if (use.uses == 1) {
-            use.reported_uses = use.uses;
-            first_use = use;
-        }
-    }
-    if (first_use.uses)
-        emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, first_use);
+    if (!key) return;
+    auto& use = mesh_use_for(key);
+    const u64 now = process_ms();
+    auto last = use.last_ms.load(std::memory_order_acquire);
+    while (last < now && !use.last_ms.compare_exchange_weak(last, now, std::memory_order_acq_rel)) {}
+    u64 unset = 0;
+    // Encode milliseconds plus one so a call at process time zero can claim the first line.
+    const bool first = use.first_tick.load(std::memory_order_acquire) == 0 &&
+        use.first_tick.compare_exchange_strong(unset, now + 1, std::memory_order_acq_rel);
+    use.uses.fetch_add(1, std::memory_order_release);
+    if (first)
+        emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, KeyUse{now, now, 1});
 }
 
 // The report script keeps the earliest first and the latest last per key.
@@ -717,8 +756,19 @@ void report_key_use_census(Emit emit, bool only_if_changed)
             collect("compute", item.second.key, item.second.use);
         for (auto& item : translation_by_key())
             if (item.second) collect("graphics", item.second->key, item.second->use);
-        for (auto& item : indirect_mesh_key_uses())
-            collect("mesh", item.first, item.second);
+        const auto collect_mesh = [&](MeshKeyUse& use) {
+            // The count publishes the timestamps for completed notes. A concurrent
+            // note may advance last_ms before the next count is visible.
+            const auto count = use.uses.load(std::memory_order_acquire);
+            if (!count || (only_if_changed && count == use.reported_uses)) return;
+            const auto first = use.first_tick.load(std::memory_order_relaxed) - 1;
+            const auto last = use.last_ms.load(std::memory_order_relaxed);
+            rows.push_back({"mesh", use.key.load(std::memory_order_relaxed), KeyUse{first, last, count}});
+            if (only_if_changed) use.reported_uses = count;
+        };
+        for (auto& item : mesh_uses) collect_mesh(item);
+        for (auto* item = mesh_use_overflow.load(std::memory_order_acquire); item; item = item->next)
+            collect_mesh(item->use);
     }
     for (const Row& row : rows)
         emit_key_use(emit, row.kind, row.key, row.use);
@@ -744,4 +794,13 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_refusal_stats(
     *repeated_reads = manifest_source().retry_opens();
     *background_reads = manifest_source().background_reads();
     *untranslated = InterlockedCompareExchange(&compute_dispatches_untranslated, 0, 0);
+}
+
+// Fixture: a raw lock hold leaves the measured hold counter untouched.
+extern "C" __declspec(dllexport) LONG64 x2w_d3d12_mesh_census_lock_probe(void (*exercise)(void*), void* context)
+{
+    x2w_startup::ExclusiveNoteLock guard(draw_lock);
+    const auto before = InterlockedCompareExchange64(&draw_lock_stats.hold_calls, 0, 0);
+    exercise(context);
+    return InterlockedCompareExchange64(&draw_lock_stats.hold_calls, 0, 0) - before;
 }
