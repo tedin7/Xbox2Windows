@@ -5002,6 +5002,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>" disabled)
     set_tests_properties(startup_compute_request_warp startup_compute_request_disabled_control PROPERTIES TIMEOUT 60)
     set_tests_properties(startup_compute_request_disabled_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: no compute request")
+    add_test(NAME startup_compute_request_key_use_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        key-use "${DXC_EXECUTABLE}")
+    add_test(NAME startup_compute_request_key_use_late_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        key-use-late "${DXC_EXECUTABLE}")
+    set_tests_properties(startup_compute_request_key_use_warp startup_compute_request_key_use_late_control
+        PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
     # Slot 67 request translation: request checks, then stand-in request -> --pending -> DXC -> dispatch; the
     # wrong-group control must mismatch.
     add_test(NAME startup_compute_translate_requests COMMAND "${INTAKE_PYTHON}" -B

@@ -22,6 +22,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char*, std::size_t);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
@@ -184,6 +185,7 @@ static void* desktop_pipeline(void* device)
 //   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
+static void* census_pipelines[3]; // another translated wrapper, refused, and no manifest
 static void* slot67_root;
 static void* slot67_other_root;  // a second root signature object, for the root-change controls
 
@@ -234,9 +236,10 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool census = mode == "dispatch-key-use";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, (indirect || census) ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
     for (UINT i = 0; i < words; ++i) {
@@ -325,7 +328,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    if (indirect || census) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
@@ -403,7 +406,18 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+    if (census) {
+        for (UINT i = 0; i < 7; ++i) {
+            if (i == 4) invoke(list, 25, word(census_pipelines[0]));
+            invoke(list, 37, 0, i, 0);
+            invoke(list, 14, 1, 1, 1);
+        }
+        invoke(list, 25, word(census_pipelines[1]));
+        for (UINT i = 0; i < 5; ++i) invoke(list, 14, 1, 1, 1);
+        for (UINT i = 0; i < 2; ++i) record.execute(list, 1, false, false);
+        invoke(list, 25, word(census_pipelines[2]));
+        for (UINT i = 0; i < 3; ++i) invoke(list, 14, 1, 1, 1);
+    } else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
@@ -516,10 +530,29 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (GetTickCount64() >= deadline) return 78;
         Sleep(1);
     }
-    if (indirect && !record.check_record(groups)) return 80;
+    if ((indirect || census) && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();
+    if (census) {
+        std::fputs("end of initial compute census\n", stderr);
+        if (invoke(census_pipelines[1], 2) != 0) return 85;
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
+        std::printf("after pipeline release:\n%s", report.c_str());
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 86;
+        invoke(list, 25, word(census_pipelines[2]));
+        invoke(list, 33, word(slot67_root));
+        const auto before = compute_refusal_stats();
+        for (UINT i = 0; i < 1000; ++i) invoke(list, 14, 1, 1, 1);
+        const auto after = compute_refusal_stats();
+        std::printf("key use burst: draw_lock holds +%lld, untranslated +%ld\n",
+                    after.holds - before.holds, after.untranslated - before.untranslated);
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 87;
+        char late[4]{};
+        if (GetEnvironmentVariableA("X2W_TEST_COMPUTE_USE_LATE", late, sizeof(late)) && late[0] == '0')
+            Sleep(11000);  // allow a ten-second report with no presents
+    }
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
@@ -709,6 +742,20 @@ static bool create_slot67(void* device, const char* code_path, const char* data_
         slot67_root = root;
         return created;
     };
+    if (m == "dispatch-key-use" || m == "key-use-requests") {
+        if (!create(desc)) return false;
+        void* translated = slot67_pipeline;
+        if (!create(desc)) return false;
+        census_pipelines[0] = slot67_pipeline;
+        const char original = data[0];
+        for (int i = 1; i <= 2; ++i) {
+            data[0] = static_cast<char>(original ^ i);
+            if (!create(desc)) return false;
+            census_pipelines[i] = slot67_pipeline;
+        }
+        slot67_pipeline = translated;
+        return true;
+    }
     if (m == "order") {
         if (!create(desc)) return false;
         UINT64 refused[12];

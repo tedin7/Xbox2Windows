@@ -255,7 +255,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const auto& pipeline = pass.pipeline->own();
+    auto& pipeline = pass.pipeline->own();
+    const bool count_use = compute_key_use_enabled();
+    const bool count_late = count_use && compute_use_late_control();
+    if (count_use && !count_late && !dispatch.signature) note_compute_use(pipeline);
     const u64 key = pipeline.compute_request_key;
     const auto [x, y, z] = dispatch.groups;
     const auto type = list->GetType();
@@ -268,6 +271,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         InterlockedIncrement(&compute_dispatches_untranslated);
         return "no translation";
     }
+    if (count_late) note_compute_use(pipeline);
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View {
@@ -288,7 +292,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     ComputeTranslation* const tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
-    tr->use.note(process_ms());
+    if (!count_use) tr->use.note(process_ms());
     std::uint32_t words[8] = {};
     if (!valid_type) reason = "the list type has no Dispatch";
     else if (!valid_groups) reason = "a group count is over the limit";
@@ -675,11 +679,11 @@ auto& indirect_mesh_key_uses()
 }
 
 template <class Emit>
-void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use)
+void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use, const char* status = "")
 {
     char line[160];
-    std::snprintf(line, sizeof(line), "x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu",
-                  kind, key, use.first_ms / 1000.0, use.last_ms / 1000.0, use.uses);
+    std::snprintf(line, sizeof(line), "x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu%s",
+                  kind, key, use.first_ms / 1000.0, use.last_ms / 1000.0, use.uses, status);
     emit(line);
 }
 
@@ -700,10 +704,98 @@ void note_indirect_mesh_use(u64 key)
         emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, first_use);
 }
 
+// Both periodic reports share one watermark. Full fixture snapshots leave it untouched.
+struct ComputeUseReportState {
+    std::mutex mutex;
+    std::unordered_map<u64, u64> reported;
+};
+
+ComputeUseReportState& compute_use_report_state()
+{
+    static ComputeUseReportState state;
+    return state;
+}
+
+// Take a cumulative snapshot. The registry is append-only, including released pipelines.
+template <class Emit>
+void report_compute_key_use(Emit emit, bool only_if_changed)
+{
+    auto& state = compute_use_report_state();
+    std::lock_guard guard(state.mutex);
+    struct Row {
+        KeyUse use;
+        bool loaded = false;
+        bool unmodelled = false;
+    };
+    std::unordered_map<u64, Row> rows;
+    for (auto* pipeline = compute_use_pipelines.load(); pipeline; pipeline = pipeline->next_compute_use) {
+        const auto count = InterlockedCompareExchange64(&pipeline->compute_uses, 0, 0);
+        if (!count) continue;
+        const u64 first = InterlockedCompareExchange64(&pipeline->compute_first_ms, 0, 0) - 1;
+        const u64 last = InterlockedCompareExchange64(&pipeline->compute_last_ms, 0, 0) - 1;
+        auto& use = rows[pipeline->compute_request_key].use;
+        use.first_ms = use.uses ? std::min(use.first_ms, first) : first;
+        use.last_ms = std::max(use.last_ms, last);
+        use.uses += count;
+    }
+    if (only_if_changed) {
+        for (auto it = rows.begin(); it != rows.end();) {
+            if (state.reported[it->first] == it->second.use.uses) it = rows.erase(it);
+            else ++it;
+        }
+    }
+    if (rows.empty()) return;
+    {
+        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+        for (auto& [key, row] : rows) {
+            const auto found = compute_translations().find(key);
+            if (found == compute_translations().end()) continue;
+            row.loaded = found->second.state == 1;
+            row.unmodelled = found->second.unmodelled != nullptr;
+        }
+    }
+    const auto exists = [](u64 key, const wchar_t* suffix) {
+        wchar_t path[MAX_PATH];
+        if (!cache_path(path, L"", key, suffix)) return false;
+        const DWORD attributes = GetFileAttributesW(path);
+        return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    for (const auto& [key, row] : rows) {
+        // A manifest present on disk but not yet loaded is pending.
+        const char* status = row.loaded ? " ok" :
+                             row.unmodelled || exists(key, L".fail") ? " refused" :
+                             exists(key, L".txt") ? " pending" : " none";
+        emit_key_use(emit, "compute", key, row.use, status);
+        if (only_if_changed) state.reported[key] = row.use.uses;
+    }
+}
+
+void start_compute_use_heartbeat()
+{
+    static const bool started = [] {
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                reinterpret_cast<LPCWSTR>(&compute_use_pipelines), &module))
+            return false;
+        const HANDLE thread = CreateThread(nullptr, 0, [](void*) -> DWORD {
+            for (;;) {
+                Sleep(10000);
+                report_compute_key_use([](const char* line) { log("%s", line); }, true);
+            }
+        }, nullptr, 0, nullptr);
+        if (!thread) return false;
+        CloseHandle(thread);
+        return true;
+    }();
+    (void)started;
+}
+
 // The report script keeps the earliest first and the latest last per key.
 template <class Emit>
 void report_key_use_census(Emit emit, bool only_if_changed)
 {
+    const bool compute_census = compute_key_use_enabled();
+    if (compute_census) report_compute_key_use(emit, only_if_changed);
     struct Row { const char* kind; u64 key; KeyUse use; };
     std::vector<Row> rows;
     {
@@ -713,8 +805,9 @@ void report_key_use_census(Emit emit, bool only_if_changed)
             rows.push_back({kind, key, use});
             if (only_if_changed) use.reported_uses = use.uses;
         };
-        for (auto& item : compute_translations())
-            collect("compute", item.second.key, item.second.use);
+        if (!compute_census)
+            for (auto& item : compute_translations())
+                collect("compute", item.second.key, item.second.use);
         for (auto& item : translation_by_key())
             if (item.second) collect("graphics", item.second->key, item.second->use);
         for (auto& item : indirect_mesh_key_uses())

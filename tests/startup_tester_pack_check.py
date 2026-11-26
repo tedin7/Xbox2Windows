@@ -410,13 +410,18 @@ def check_key_use():
         run.mkdir()
         (run / "stderr.txt").write_text(
             "x2w-render key use compute 2000000000000001 first 12.5 s last 30.0 s uses 4\n"
-            "x2w-render key use compute 2000000000000001 first 12.5 s last 250.5 s uses 900\n"  # printed again: the count grew
+            "x2w-render key use compute 2000000000000001 first 12.5 s last 250.5 s uses 900 refused\n"  # printed again: the count grew
+            "x2w-render key use compute 2000000000000002 first 1.0 s last 2.0 s uses 2000 none\n"
+            "x2w-render key use compute 2000000000000003 first 1.0 s last 2.0 s uses 7 refused\n"
+            "x2w-render compute census key 2000000000000001: 2 dispatches, 1 translated\n"
             "x2w-render key use graphics 1000000000000002 first 241.0 s last 242.0 s uses 3\n"
             "x2w-render key use graphics 0000000000000001 first 1.0 s last 2.0 s uses 7\n"  # ok key: only on its own line
             "x2w-render key use compute zzzz first 1 s last 2 s uses 1\n"  # malformed: ignored
             "x2w-render compute census: 3 keys dispatched\n", encoding="utf-8")
         use = T.key_use(str(run))
-        assert use == {"2000000000000001": (12.5, 250.5, 900), "1000000000000002": (241.0, 242.0, 3), "0000000000000001": (1.0, 2.0, 7)}, use
+        assert use == {"2000000000000001": (12.5, 250.5, 900), "2000000000000002": (1.0, 2.0, 2000),
+                       "2000000000000003": (1.0, 2.0, 7), "1000000000000002": (241.0, 242.0, 3),
+                       "0000000000000001": (1.0, 2.0, 7)}, use
         assert T.key_use(str(tmp / "missing")) == {} and T.key_use(None) == {}
         text = T.format_results(T.cache_results(str(cache)), use)
         assert "2000000000000001 compute refused image_store on SQ_RSRC_IMG_3D: only 2D images are lowered first=12.5s last=250.5s uses=900\n" in text, text
@@ -425,7 +430,19 @@ def check_key_use():
         # the refused keys used latest come first, latest last use on top; an ok key is not listed there
         section = text.split("## refused keys used latest")[1].split("## keys")[0].splitlines()[1:]
         keys = [line.split()[3] for line in section if line.strip()]
-        assert keys == ["2000000000000001", "1000000000000002"], keys
+        assert keys == ["2000000000000001", "1000000000000002", "2000000000000003"], keys
+        table = text.split("## refusals by reason, weighted by uses (compute)\n")[1].split("\n\n")[0]
+        assert table.splitlines() == [
+            "    900  image_store on SQ_RSRC_IMG_ND: only ND images are lowered",
+            "      7  dxc cs compile failed (error XN)",
+        ], table
+        from gfx2hlsl import run_weights, scene_weights
+        assert run_weights(run / "stderr.txt")[0x2000000000000001] == 900
+        assert scene_weights(run / "stderr.txt")[0x2000000000000003] == 7
+        heartbeat = tmp / "heartbeat.txt"
+        heartbeat.write_text("x2w-render key use compute 2000000000000003 first 1.0 s last 2.0 s uses 7 refused\n",
+                             encoding="ascii")
+        assert scene_weights(heartbeat) == {0x2000000000000003: 7}
         assert T.format_results(T.cache_results(str(cache))) == T.format_results(T.cache_results(str(cache)), {}), "no use lines: unchanged"
         assert "refused keys used latest" not in T.format_results(T.cache_results(str(cache))) and "first=1" not in T.format_results(T.cache_results(str(cache)))
         # packed with the cache, the zip's shader_results.txt carries the use

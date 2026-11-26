@@ -1,6 +1,7 @@
 """Device slot 67 compute requests on WARP: publishing, refusals and boundaries, and the offline handling.
 
 usage: startup_compute_request_check.py <startup_stream_consumer> [disabled]
+       startup_compute_request_check.py <startup_stream_consumer> key-use|key-use-late <dxc>
 
 The consumer creates a WARP device and a root signature, then slot-67 descriptions. The program, data blob and
 state blocks are synthetic, and their qwords are not addresses (each is below 0x10000 or at or above 2^47); the
@@ -64,6 +65,8 @@ def run(directory, consumer, env, mode=None, data=DATA, state=STATE, program=PRO
     args = [consumer, directory / "vertex", directory / "pixel", directory / "root", "slot67",
             directory / "program", directory / "data", directory / "state"] + ([mode] if mode else [])
     result = subprocess.run(args, env=env, capture_output=True, text=True)
+    if mode == "key-use-requests" and result.returncode == 77:
+        sys.exit(77)
     assert result.returncode == 0, f"consumer exit {result.returncode}\n{result.stderr[-2000:]}"
     return [line for line in result.stderr.splitlines() if "x2w-draw compute request" in line]
 
@@ -199,8 +202,82 @@ def check(directory, consumer, disabled):
     return 0
 
 
+KEY_USE = re.compile(r"^x2w-render key use compute ([0-9a-f]{16}) first ([0-9.]+) s "
+                     r"last ([0-9.]+) s uses (\d+) (ok|refused|pending|none)$", re.M)
+
+
+def census_rows(text):
+    rows = {}
+    for key, first, last, count, status in KEY_USE.findall(text):
+        assert float(first) <= float(last), (key, first, last)
+        uses = int(count)
+        assert key not in rows or rows[key][0] < uses, (key, text)
+        rows[key] = (uses, status)
+    return rows
+
+
+def check_key_use(directory, consumer, dxc, late):
+    from startup_compute_dispatch_check import dispatch
+    from startup_gfx2hlsl_compute_check import root_blob
+
+    cache, env = prepare(directory)
+    env.update(X2W_D3D12_LIST_NOOP="1", X2W_D3D12_DEBUG="1", X2W_NOLOCK_REFUSE="1",
+               X2W_COMPUTE_KEY_USE="1", X2W_TEST_COMPUTE_USE_LATE=str(int(late)))
+    for name in ("X2W_TEST_DISPATCH_HARDWARE", "X2W_TEST_DISPATCH_IN", "X2W_TEST_DISPATCH_FIELDS"):
+        env.pop(name, None)
+    root = directory / "compute_root"
+    root.write_bytes(root_blob(table_range=True))
+    env["X2W_TEST_COMPUTE_ROOT"] = str(root)
+    # The slot-67 bytes identify the request. The shader actually dispatched is compiled from the HLSL below.
+    program = struct.pack("<I", 0xbf810000)  # s_endpgm
+    data = struct.pack("<Q", 0x6d10)
+    state = struct.pack("<Q", 0x4321)
+    published = run(directory, consumer, env, "key-use-requests", program=program, data=data, state=state)
+    keys = [line.split()[3] for line in published if " published " in line]
+    assert len(set(keys)) == len(keys) == 3, published
+    ok, refused, missing = keys
+    (cache / f"{refused}.fail").write_text("synthetic compute refusal\n", encoding="ascii")
+    (cache / f"{ok}.txt").write_text("x2w-manifest 2\nstage cs\nud 1\n"
+                                    "udsrc 0 rootconst 0 0\nuav 0 table 1 16\n", encoding="ascii")
+    shader = directory / "census.hlsl"
+    shader.write_text("""
+cbuffer Index : register(b0) { uint i; }
+RWByteAddressBuffer result : register(u0);
+[numthreads(1, 1, 1)]
+void main() { result.Store(i * 4, 17 + i * (i + 3)); }
+""", encoding="ascii")
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", cache / f"{ok}.cs.cso", shader], check=True)
+    actual, run_result = dispatch(directory, consumer, env, "dispatch-key-use")
+    reference = [0xc5c5c5c5] * len(actual)
+    for i in range(7):
+        reference[i] = 17 + i * (i + 3)
+    assert actual == reference, (actual[:10], reference[:10], run_result.stderr[-3000:])
+    assert "key use burst: draw_lock holds +0, untranslated +1000" in run_result.stdout, run_result.stdout
+    assert "after pipeline release:" in run_result.stdout, run_result.stdout
+    assert "end of initial compute census" in run_result.stderr, run_result.stderr
+    initial, heartbeat = run_result.stderr.split("end of initial compute census", 1)
+    assert initial.count("ExecuteIndirect refused: no translation") == 2, initial
+    before = census_rows(initial)
+    after = census_rows(run_result.stdout.split("after pipeline release:", 1)[1])
+    expected = {ok: (7, "ok"), refused: (7, "refused"), missing: (3, "none")}
+    if late:
+        # Require this specific failure after the readback and lock checks pass.
+        assert before == after == {ok: (7, "ok")}, (before, after, expected)
+        assert before != expected
+        print("Late-count mutant rejected: refused and missing dispatches vanished from the census")
+    else:
+        assert before == after == expected, (before, after, expected, run_result.stderr[-3000:])
+        assert census_rows(heartbeat) == {missing: (1003, "none")}, heartbeat
+        print("WARP readback matched the CPU loop. Counts 7/7/3 survived Release.")
+        print("No draw lock holds in 1,000 refusals. The heartbeat reported only the changed key.")
+    return 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if len(args) == 3 and args[1] in ("key-use", "key-use-late"):
+        with tempfile.TemporaryDirectory() as temporary:
+            sys.exit(check_key_use(Path(temporary), args[0], args[2], args[1] == "key-use-late"))
     if len(args) not in (1, 2) or args[1:] not in ([], ["disabled"]):
         sys.exit(__doc__)
     with tempfile.TemporaryDirectory() as temporary:

@@ -16938,6 +16938,29 @@ cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
 ```
 
+### Compute key-use census
+
+Set `X2W_COMPUTE_KEY_USE=1` to count slot 67 requests at direct Dispatch and
+compute ExecuteIndirect entry. The census reports the earliest first use, the
+latest last use and total calls across wrappers with the same key, including
+released wrappers. It prints changed counts on a ten-second heartbeat and in
+the 300-frame render report. The suffix is `ok` for a loaded translation, `refused` for a cache
+failure or a rejected manifest, `pending` for an unloaded manifest, and
+`none` when neither manifest nor failure is available. The tester pack sums
+counts by normalized compute refusal reason, and the pre-run retry can use
+the complete compute counts.
+
+The WARP fixture uses `X2W_NOLOCK_REFUSE=1` to exercise the existing fast
+refusal path. It checks GPU output against a CPU loop, totals of 7, 7 and 3,
+persistence after Release, and zero draw-lock holds across 1,000 untranslated
+calls. The heartbeat must report the changed key without any presents.
+The late-count control exercises the same GPU path and must lose both
+untranslated rows. Run both on Windows with:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_request_key_use_(warp|late_control)$'
+```
+
 ### GPU-written indirect Dispatch
 
 For a translated slot 67 pipeline with fixed-table raw buffers, command-list slot 61 accepts one rootless

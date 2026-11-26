@@ -12,6 +12,7 @@
 // object in rdx (desktop: object first); those slots accept either order.
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
+#include <atomic>
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
@@ -212,6 +213,8 @@ struct alignas(16) WrapperOwn {
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    WrapperOwn* next_compute_use;     // immutable after insertion in the census list
+    volatile LONG64 compute_first_ms, compute_last_ms, compute_uses;
     ComputeManifest* compute_manifest; // PipelineState: shared manifest state for its request key
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
@@ -3447,6 +3450,49 @@ struct TranslatedDispatch {
     ID3D12Resource* argument = nullptr;
     u64 offset = 0;
 };
+bool compute_key_use_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_KEY_USE");
+    return enabled;
+}
+
+bool compute_use_late_control()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TEST_COMPUTE_USE_LATE");
+    return enabled;
+}
+
+// Slot 67 wrappers stay allocated after Release, so their counters also serve as retired records.
+std::atomic<WrapperOwn*> compute_use_pipelines{nullptr};
+
+void register_compute_use(WrapperOwn& pipeline)
+{
+    auto* head = compute_use_pipelines.load(std::memory_order_relaxed);
+    do {
+        pipeline.next_compute_use = head;
+    } while (!compute_use_pipelines.compare_exchange_weak(head, &pipeline));
+}
+
+std::uint64_t process_ms();
+
+void note_compute_use(WrapperOwn& pipeline)
+{
+    const auto stamp = static_cast<LONG64>(process_ms()) + 1;  // reserve zero for unused
+    auto first = InterlockedCompareExchange64(&pipeline.compute_first_ms, 0, 0);
+    while (!first || stamp < first) {
+        const auto prior = InterlockedCompareExchange64(&pipeline.compute_first_ms, stamp, first);
+        if (prior == first) break;
+        first = prior;
+    }
+    auto last = InterlockedCompareExchange64(&pipeline.compute_last_ms, 0, 0);
+    while (stamp > last) {
+        const auto prior = InterlockedCompareExchange64(&pipeline.compute_last_ms, stamp, last);
+        if (prior == last) break;
+        last = prior;
+    }
+    InterlockedIncrement64(&pipeline.compute_uses);
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch);
 u64 known_pipeline_key(Wrapper* pipeline);
 void note_indirect_mesh_use(u64 key);
@@ -3513,6 +3559,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     // Every refusal is counted under the signature's kind, including those before the signature is checked.
     Wrapper* sig = as_wrapper(signature);
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
+    if (kind == IndirectCommand::dispatch && compute_key_use_enabled() && !compute_use_late_control()) {
+        const auto* pass = static_cast<const Pass*>(self->own().pass);
+        auto* pipeline = pass ? pass->pipeline : nullptr;
+        if (pipeline && pipeline->own().compute_request_key) note_compute_use(pipeline->own());
+    }
     Wrapper* refusal_pipeline = nullptr;
     u64 trace_call = 0;
     const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
@@ -7269,6 +7320,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
             pipeline.compute_request_key = key;
             pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
             if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
+            if (compute_key_use_enabled()) {
+                register_compute_use(pipeline);
+                start_compute_use_heartbeat();
+            }
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);

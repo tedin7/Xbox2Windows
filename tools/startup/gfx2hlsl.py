@@ -12951,11 +12951,11 @@ PRE_RUN_RETRY_SECONDS = 180.0
 # what this build writes for the cases its lift does not cover (Run R: TG_SIZE_EN groups the wave32 lift does not prove,
 # compute image_store dmask), so a newer .fail of a lifted family is retried once per build, not at the head of every run.
 RETRIED_NAME = 'pre_run_retried.txt'
-# The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
+# The runtime's per-key draw, dispatch and use counters.
 NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')
 CENSUS_LINE = re.compile(r'x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated')
 # One line per pipeline key the title used (graphics and compute): a run killed before its census still has these.
-USE_LINE = re.compile(r'x2w-render key use \S+ ([0-9a-f]{16}) first \S+ s last \S+ s uses (\d+)')
+USE_LINE = re.compile(r'x2w-render key use (\S+) ([0-9a-f]{16}) first \S+ s last \S+ s uses (\d+)(?: (ok|refused|pending|none))?')
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
@@ -13091,7 +13091,7 @@ def run_weights(path):
     key's newest cumulative line; {} when the file cannot be read."""
     if family_retry_enabled():
         return scene_weights(Path(path))
-    weights, uses = {}, {}
+    weights, uses, compute_uses = {}, {}, {}
     try:
         with open(path, encoding='utf-8', errors='replace') as handle:
             for line in handle:
@@ -13103,11 +13103,15 @@ def run_weights(path):
                 elif census:
                     weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
                 elif use:
-                    uses[int(use.group(1), 16)] = int(use.group(2))
+                    kind, key, count, status = use.groups()
+                    key, count = int(key, 16), int(count)
+                    target = compute_uses if kind == 'compute' and status else uses
+                    target[key] = max(count, target.get(key, 0))
     except OSError:
         return {}
-    # A key with no draw/dispatch line (a run killed before its census) counts by how often the title used it.
-    return {**{key: count for key, count in uses.items() if count > 0}, **weights}
+    # Status-bearing compute lines include calls the older dispatch census omitted.
+    # Other key-use lines fill gaps in the draw/dispatch census.
+    return {**{key: count for key, count in uses.items() if count > 0}, **weights, **compute_uses}
 
 
 def scene_weights(path, need_census=True):
@@ -13138,6 +13142,8 @@ def scene_weights(path, need_census=True):
                     census = True
                 match = KEY_USE_RE.fullmatch(line)
                 if match:
+                    if match[1] == 'compute' and match[6]:
+                        census = True
                     key, count = int(match[2], 16), int(match[5])
                     weights[key] = max(count, weights.get(key, 0))
     except OSError:

@@ -407,7 +407,7 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute|mesh) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute|mesh) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)(?: (ok|refused|pending|none))?\s*$")
 LATEST_USED_KEYS = 40
 
 
@@ -450,6 +450,15 @@ def format_results(rows, use=None):
             entry[kind] = entry.get(kind, 0) + 1
     for reason, by_kind in sorted(ranked.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:TOP_REASONS]:
         lines.append("%5d  %s   [%s]" % (sum(by_kind.values()), reason, ", ".join("%s %d" % i for i in sorted(by_kind.items()))))
+    compute_uses = {}
+    for key, kind, status, reason in rows:
+        if kind == "compute" and status == "refused" and key in use:
+            family = normal_reason(reason)
+            compute_uses[family] = compute_uses.get(family, 0) + use[key][2]
+    if compute_uses:
+        lines += ["", "## refusals by reason, weighted by uses (compute)"]
+        lines += ["%7d  %s" % (uses, reason) for reason, uses in
+                  sorted(compute_uses.items(), key=lambda item: (-item[1], item[0]))[:TOP_REASONS]]
     if use:
         latest = sorted(((use[key][1], key, kind, reason) for key, kind, status, reason in rows if status == "refused" and key in use), reverse=True)
         lines += ["", "## refused keys used latest: last use, first use, uses, key kind reason"]
