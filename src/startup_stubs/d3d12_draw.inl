@@ -1306,6 +1306,16 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     return h;
 }
 bool list_wrote(Wrapper* list, ID3D12Resource* resource);  // list_copy.inl
+// X2W_TEST_UPLOAD_STAGING_FAIL=<n> (fixtures only): the first n uploads of a plain texture with more than one level fail while
+// staging its second level, as a full upload ring would. The upload must then report "not uploaded" and succeed when retried.
+bool upload_staging_fault()
+{
+    static LONG remaining = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_TEST_UPLOAD_STAGING_FAIL", value, sizeof(value)) ? std::atol(value) : 0L;
+    }();
+    return remaining > 0 && InterlockedDecrement(&remaining) >= 0;
+}
 bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
@@ -1469,7 +1479,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
                 if (!rows || !chunk) {
                     state.done = false;
-                    return true;
+                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
@@ -1483,7 +1493,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
         if (!rows || !chunk) {
             state.done = false;
-            return true;
+            return false;  // staging failed: not uploaded, so report it and retry at the next bind
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
@@ -1495,11 +1505,15 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
                 ID3D12Resource* chunk = nullptr;
+                if (i == 1 && upload_staging_fault()) {
+                    state.done = false;
+                    return false;  // fixture fault: a level could not be staged
+                }
                 if (is_compact) {
                     auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
                     if (!rows || !chunk) {
                         state.done = false;
-                        return true;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
                     }
                     const auto& level = compact.level[i];
                     for (u64 y = 0; y < level.rows; ++y)
@@ -1509,7 +1523,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     // Own buffer: copy the level's rows from the title's memory and name that buffer in the upload.
                     if (readable_window(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes)) < bytes) {
                         state.done = false;
-                        return true;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
                     }
                     offset = owned.cursor;
                     std::memcpy(owned.cpu + offset, memory + stride * s + fp.Offset, static_cast<std::size_t>(bytes));
@@ -1517,7 +1531,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     chunk = owned.resource.Get();
                 } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
                     state.done = false;
-                    return true;
+                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
                 }
                 plan.upload(list, texture, chunk, mips, slices, s, i, offset);
             }
