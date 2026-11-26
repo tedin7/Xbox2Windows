@@ -148,24 +148,29 @@ void page_scan(bool everything, u64 stamp)
 }
 
 // The window has just opened at present `present` (mark `seq`): the base image of the memory a replay needs.
+void init_page_writer()
+{
+    if (page_writer_tried) return;
+    page_writer_tried = true;
+    char value[32]{};
+    if (GetEnvironmentVariableA("X2W_REPLAY_PAGES", value, sizeof(value)) && !std::strcmp(value, "0")) return;
+    if (GetEnvironmentVariableA("X2W_REPLAY_SCAN_MS", value, sizeof(value))) {
+        const double ms = std::atof(value);
+        if (ms > 0.0) page_scan_ms = ms;
+    }
+    page_budget_bytes = max_bytes / 2;
+    if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
+        page_budget_bytes = static_cast<u64>(std::atof(value) * 1048576.0);
+    if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_RANGE_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
+        page_range_limit = static_cast<u64>(std::atof(value) * 1048576.0);
+    page_writer = new x2w_replay::PageWriter(page_sink);
+}
+
 inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
-    if (!page_writer_tried) {
-        page_writer_tried = true;
-        char value[32]{};
-        if (GetEnvironmentVariableA("X2W_REPLAY_PAGES", value, sizeof(value)) && !std::strcmp(value, "0")) return;
-        if (GetEnvironmentVariableA("X2W_REPLAY_SCAN_MS", value, sizeof(value))) {
-            const double ms = std::atof(value);
-            if (ms > 0.0) page_scan_ms = ms;
-        }
-        page_budget_bytes = max_bytes / 2;
-        if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
-            page_budget_bytes = static_cast<u64>(std::atof(value) * 1048576.0);
-        if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_RANGE_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
-            page_range_limit = static_cast<u64>(std::atof(value) * 1048576.0);
-        page_writer = new x2w_replay::PageWriter(page_sink);
-    }
+    if (replay_dump_enabled()) return; // Dump mode stamps each scan at its submission.
+    init_page_writer();
     page_prev_mark = seq;
     if (!page_writer || !TryAcquireSRWLockExclusive(&pages_lock)) return;
     page_target = &b;
@@ -178,6 +183,7 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
+    if (replay_dump_enabled()) return;
     const u64 stamp = page_prev_mark ? page_prev_mark : seq;
     page_prev_mark = seq;
     if (!page_writer || !TryAcquireSRWLockExclusive(&pages_lock)) return;
@@ -189,8 +195,14 @@ inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
 
 // Before an ExecuteCommandLists inside the window (queue slot 10; a compute-only stretch has no present): the pages
 // changed since the last capture. `seq` is the Execute call's sequence number minus one, so a replay writes them before
-// that call. Empty until the page store fills it.
+// that call. With dump mode the scene need not have a Present to start the page store.
 inline void pages_at_submit(ThreadBuffer& b, u64 seq)
 {
-    (void)b, (void)seq;
+    if (!replay_dump_enabled() || !TryAcquireSRWLockExclusive(&pages_lock)) return;
+    const bool first = !page_writer_tried;
+    init_page_writer();
+    page_target = &b;
+    page_scan(first, seq);
+    page_target = nullptr;
+    ReleaseSRWLockExclusive(&pages_lock);
 }

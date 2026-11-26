@@ -32,6 +32,8 @@ struct Scene {
     void* list = nullptr;
     void* fence = nullptr;
     SIZE_T rtv = 0;
+    void* signature = nullptr;
+    void* arguments = nullptr;
 };
 
 int create_scene(void* device, Scene& s)
@@ -80,6 +82,28 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
+int create_indirect_arguments(void* device, Scene& s)
+{
+    const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+    const D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 41, arg(&signature), 0,
+                                           arg(&__uuidof(ID3D12CommandSignature)), arg(&s.signature)))))
+        return 26;
+    constexpr UINT bytes = 64 * 1024;
+    // Keep the address away from the image and usual process allocations so the player can reserve it.
+    auto* words = static_cast<D3D12_DRAW_ARGUMENTS*>(
+        VirtualAlloc(reinterpret_cast<void*>(0x20000000000ull), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!words) return 27;
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 133, arg(words), arg(&buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                           arg(&__uuidof(ID3D12Resource)), arg(&s.arguments)))))
+        return 28;
+    // Written after creation, so replay must obtain the arguments from PAGE/MAP, not the creation call's ARGM.
+    *words = {3, 1, 0, 0};
+    return 0;
+}
+
 int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
 {
     const float t = static_cast<float>(frame) / static_cast<float>(frames);
@@ -88,23 +112,36 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
-    invoke(s.list, 52, s.rtv, arg(colour));
-    invoke(s.list, 50, 1, arg(&s.rtv));
-    invoke(s.list, 21, 1, arg(&viewport));
-    invoke(s.list, 22, 1, arg(&scissor));
-    invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    invoke(s.list, 25, arg(pso));
-    invoke(s.list, 12, 3, 1);
+    if (!s.signature || frame != 1) invoke(s.list, 52, s.rtv, arg(colour));
+    if (!s.signature || frame == 1) {
+        invoke(s.list, 50, 1, arg(&s.rtv));
+        invoke(s.list, 21, 1, arg(&viewport));
+        invoke(s.list, 22, 1, arg(&scissor));
+        invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(s.list, 25, arg(pso));
+        if (s.signature) {
+            invoke(s.list, 34, arg(stream_root_signature()));
+            invoke(s.list, 61, arg(s.signature), 1, arg(s.arguments), 0, 0, 0);
+        } else {
+            invoke(s.list, 12, 3, 1);
+        }
+    }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     invoke(s.queue, 10, 1, arg(&s.list));
-    // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
-    alignas(8) unsigned char plane[0x48]{};
-    const Word resources[1]{arg(s.target)};
-    const Word token = 7, one = 1, resources_at = arg(resources);
-    std::memcpy(plane + 0x00, &token, 8);
-    std::memcpy(plane + 0x08, &one, 8);
-    std::memcpy(plane + 0x10, &resources_at, 8);
-    invoke(s.queue, 32, 1, arg(plane), 0);
+    if (!s.signature) {
+        // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
+        alignas(8) unsigned char plane[0x48]{};
+        const Word resources[1]{arg(s.target)};
+        const Word token = 7, one = 1, resources_at = arg(resources);
+        std::memcpy(plane + 0x00, &token, 8);
+        std::memcpy(plane + 0x08, &one, 8);
+        std::memcpy(plane + 0x10, &resources_at, 8);
+        invoke(s.queue, 32, 1, arg(plane), 0);
+    }
+    if (s.signature) {
+        std::fprintf(stderr, "replay quad: about to signal submit %u\n", frame + 1);
+        std::fflush(stderr);
+    }
     const Word value = frame + 1;
     if (FAILED(static_cast<HRESULT>(invoke(s.queue, 14, arg(s.fence), value)))) return 32;
     for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(s.fence, 8) < value;) {
@@ -129,6 +166,10 @@ int main(int argc, char** argv)
         return rc;
     Scene scene;
     if (const int rc = create_scene(device, scene)) return rc;
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_INDIRECT", nullptr, 0)) {
+        if (frames != 3) return 2;
+        if (const int rc = create_indirect_arguments(device, scene)) return rc;
+    }
     // X2W_TEST_REPLAY_PAUSE=<frame>,<ms>: a pause before that frame (a slowdown for the recorder's "slow" trigger).
     char pause[32]{};
     unsigned pause_frame = ~0u, pause_ms = 0;
@@ -138,6 +179,6 @@ int main(int argc, char** argv)
         if (frame == pause_frame) Sleep(pause_ms);
         if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
     }
-    std::printf("replay quad: %u presents drawn\n", frames);
+    std::printf("replay quad: %u presents drawn\n", scene.signature ? 0 : frames);
     return 0;
 }

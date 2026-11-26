@@ -504,6 +504,7 @@ int run(const Options& o)
             r.pages.size(), r.maps.size(), page_replay().spans.size(), reserved);
     }
     phase = "applying settings";
+    // X2W_REPLAY_DUMP reaches the delay-loaded shim from the environment or the recording's XENV.
     apply_settings(r.settings);
     if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
     if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))

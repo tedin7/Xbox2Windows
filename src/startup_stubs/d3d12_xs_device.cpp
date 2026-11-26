@@ -104,6 +104,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -151,6 +152,16 @@ const char* const kind_names[kind_count] = {
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
 struct RootParameter;
+namespace replay_dump { struct Target; }
+bool replay_dump_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_REPLAY_DUMP", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+void replay_dump_tag(Wrapper* wrapper, ID3D12Resource* resource);
 enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
 struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
@@ -212,6 +223,8 @@ struct alignas(16) WrapperOwn {
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
+    u64 replay_resource_id;
+    std::vector<replay_dump::Target>* replay_writes;
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
     Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
@@ -531,7 +544,12 @@ Wrapper* wrap(IUnknown* real, Kind kind)
         _aligned_free(block);
         return nullptr;
     }
+    if (kind == resource_kind && replay_dump_enabled()) {
+        static volatile LONG64 next_id = 0;
+        w->own().replay_resource_id = InterlockedIncrement64(&next_id);
+    }
     ReleaseSRWLockExclusive(&registry_lock);
+    if (kind == resource_kind && real) replay_dump_tag(w, static_cast<ID3D12Resource*>(real));
     return w;
 }
 
@@ -3061,6 +3079,23 @@ D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 
+#include "startup_stubs/d3d12_replay_dump.inl"
+
+void replay_dump_tag(Wrapper* wrapper, ID3D12Resource* resource)
+{
+    const u64 id = wrapper->own().replay_resource_id;
+    if (id && FAILED(resource->SetPrivateData(replay_dump::resource_id, sizeof(id), &id)))
+        log("x2w-replay dump: cannot set creation id %llu", id);
+}
+
+void replay_dump_draw(Wrapper* list)
+{
+    if (!replay_dump_enabled()) return;
+    const auto& pass = pass_of(list);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        replay_dump::note(list, pass.bound_targets[i], pass.target_formats[i]);
+}
+
 #include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
 
@@ -3079,6 +3114,8 @@ void release_targets(Wrapper* self)
 // nothing changes.
 void retire_drop_recording(Wrapper* list)
 {
+    delete list->own().replay_writes;
+    list->own().replay_writes = nullptr;
     residency_discard_list(list);
     if (!release_retired_enabled()) return;
     if (list->own().pass) {
@@ -3791,6 +3828,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
+    if (graphics) replay_dump_draw(self);
     red_producer_draw_after(self, red_samples);
     if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
@@ -3982,6 +4020,7 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
+    if (replay_dump_enabled()) replay_dump::note(self, target, view_format_of(desktop, target));
     const auto red_sample = red_producers().before(self, list, target, "clear-rtv", 0, 0);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
@@ -4050,6 +4089,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     pass_of(self).heap_set = false;
     const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
+    replay_dump::note(self, target);
     if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
     else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
     InterlockedIncrement(&render_clears);
@@ -4384,6 +4424,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
+        if (vertices && instances) replay_dump_draw(self);
         red_producer_draw_after(self, red_samples);
         const LONG n = InterlockedIncrement(&render_draws);
         if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
@@ -4461,7 +4502,10 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 submitted.push_back(w);
             }
         }
+        std::unique_lock<std::mutex> dump_order(replay_dump::queue_mutex, std::defer_lock);
+        if (replay_dump_enabled()) dump_order.lock();
         bool split = false;
+        std::vector<Wrapper*> dump_lists;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             const int gpu_slot = gpu_time_on() ? gpu_time_probe().before(queue, static_cast<std::uint64_t>(gpu_time_frame)) : -1;
@@ -4473,6 +4517,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                     queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
+            if (split && replay_dump_enabled()) dump_lists.insert(dump_lists.end(), wrappers.begin(), wrappers.end());
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
@@ -4501,6 +4546,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         } else if (!ready.empty()) {
             submit(ready, submitted);
         }
+        replay_dump::submit(queue, split ? dump_lists : submitted);
+        if (dump_order.owns_lock()) dump_order.unlock();
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
         draw_lock_release_exclusive();
@@ -4588,7 +4635,8 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     static LONG calls;
     const bool log_it = first_calls(calls, 2);
     if (Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx)); fence && fence->own().kind == fence_kind) {
-        const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Signal(static_cast<ID3D12Fence*>(fence->own().real), r8);
+        const HRESULT hr = replay_dump::signal(static_cast<ID3D12CommandQueue*>(self->own().real),
+                                              static_cast<ID3D12Fence*>(fence->own().real), r8);
         if (SUCCEEDED(hr)) {
             if (render_mode() || InterlockedCompareExchange(&self->own().queue_wait_seen, 0, 0))
                 complete_when_reached(fence, r8);
@@ -5960,6 +6008,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                     create_desc.MipLevels, dropped);
         }
 
+        replay_dump_tag(w, created);
         publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
             AcquireSRWLockExclusive(&retire_lock);
