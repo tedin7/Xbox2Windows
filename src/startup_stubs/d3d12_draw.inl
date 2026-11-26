@@ -1395,21 +1395,37 @@ bool address_uploads_from_ring()
     return on;
 }
 
+// draw_lock held.
+void forget_address_uploads(ID3D12CommandList* list, const decltype(recorded_address_uploads)::mapped_type& uploads)
+{
+    for (const auto& upload : uploads) {
+        const auto state = texture_uploads().find(upload.texture.Get());
+        if (state != texture_uploads().end() && state->second.pending_list == list) {
+            state->second.done = false;
+            state->second.pending_list = nullptr;
+        }
+    }
+}
+
 void discard_address_uploads(ID3D12CommandList* list)
 {
     draw_lock_acquire_exclusive();
     const auto recorded = recorded_address_uploads.find(list);
     if (recorded != recorded_address_uploads.end()) {
-        for (const auto& upload : recorded->second) {
-            const auto state = texture_uploads().find(upload.texture.Get());
-            if (state != texture_uploads().end() && state->second.pending_list == list) {
-                state->second.done = false;
-                state->second.pending_list = nullptr;
-            }
-        }
+        forget_address_uploads(list, recorded->second);
         recorded_address_uploads.erase(recorded);
     }
     draw_lock_release_exclusive();
+}
+
+void discard_fast_draw_recording(ID3D12CommandList* list)
+{
+    draw_lock_acquire_exclusive();
+    const auto heaps = recorded_draw_sampler_heaps.extract(list);
+    const auto uploads = recorded_address_uploads.extract(list);
+    if (!uploads.empty()) forget_address_uploads(list, uploads.mapped());
+    draw_lock_release_exclusive();
+    // Submitted snapshots have their own fence-held references. Release the recording's references outside the lock.
 }
 
 // draw_lock held. The lists have already been executed on this queue. Each submit takes its own

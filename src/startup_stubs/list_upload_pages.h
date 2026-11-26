@@ -69,8 +69,9 @@ struct FreePages {
     void give(std::unique_ptr<Page> page) {
         if (!page || pages.size() >= max_free_pages || page->size > max_free_bytes - bytes) return;  // released here
         page->cursor = 0;
-        bytes += page->size;
+        const UINT64 size = page->size;
         pages.push_back(std::move(page));
+        bytes += size;
         InterlockedIncrement64(&page_counters.free);
     }
     // The smallest free page of at least `bytes`, or null.

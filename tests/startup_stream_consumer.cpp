@@ -22,6 +22,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_allocator_pool_size(void* allocator);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
@@ -432,6 +433,56 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(second_list, 9)))) return 83;
         invoke(queue, 10, 1, word(&second_list));
     }
+    else if (mode == "dispatch-reset-bench" || mode == "dispatch-reset-bench-missing-word") {
+        constexpr UINT cycles = 1000;
+        const bool mutant = mode == "dispatch-reset-bench-missing-word";
+        void* gate = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&gate)))) ||
+            FAILED(static_cast<HRESULT>(invoke(queue, 17, word(gate), 1)))) return 72;
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        LONGLONG allocator_ticks = 0, reset_ticks = 0;
+        const auto check_previous = [&](UINT cycle) {
+            for (const auto deadline = GetTickCount64() + 10000; invoke(fence, 8) < cycle;) {
+                if (GetTickCount64() >= deadline) return false;
+                Sleep(1);
+            }
+            const UINT written = mutant && cycle == cycles ? cycle - 1 : cycle;
+            const UINT expected = (input[0] * 33u) ^ (constants[0] + written);
+            if (buffers[1][0] == expected) return true;
+            std::fprintf(stderr, "Reset cycle %u: GPU word 0 = %08x, CPU expected %08x\n", cycle, buffers[1][0], expected);
+            return false;
+        };
+        for (UINT cycle = 1; cycle <= cycles; ++cycle) {
+            LARGE_INTEGER start, between, stop;
+            QueryPerformanceCounter(&start);
+            const auto allocator_hr = static_cast<HRESULT>(invoke(allocator, 8));
+            QueryPerformanceCounter(&between);
+            const auto list_hr = static_cast<HRESULT>(invoke(list, 139, word(allocator)));
+            QueryPerformanceCounter(&stop);
+            if (FAILED(allocator_hr) || FAILED(list_hr)) return 74;
+            allocator_ticks += between.QuadPart - start.QuadPart;
+            reset_ticks += stop.QuadPart - between.QuadPart;
+            bind(list);
+            invoke(list, 35, 1, gpu);
+            if (!mutant || cycle != cycles) invoke(list, 37, 0, constants[0] + cycle, 0);
+            invoke(list, 39, 0, 1, word(&constants[1]), 1);
+            invoke(list, 14, 3, 2, 2);
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+            // Reset and record cycle 2 while cycle 1 is still queued. Submit the re-recorded list
+            // only after its preceding execution finishes.
+            if (cycle == 2 && (invoke(fence, 8) != 0 || FAILED(static_cast<HRESULT>(invoke(gate, 10, 1))))) return 76;
+            if (cycle > 1 && !check_previous(cycle - 1)) return 78;
+            invoke(queue, 10, 1, word(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), cycle)))) return 76;
+        }
+        if (!check_previous(cycles)) return 78;
+        const double us_per_tick_per_cycle = 1e6 / static_cast<double>(frequency.QuadPart) / cycles;
+        std::printf("x2w-reset-bench cycles %u slot139 %.2f us/Reset pool %u allocator %.2f us/Reset\n",
+                    cycles, reset_ticks * us_per_tick_per_cycle, x2w_d3d12_allocator_pool_size(allocator),
+                    allocator_ticks * us_per_tick_per_cycle);
+    }
     else if (mode == "dispatch-bench") {
         // The speed bench: X2W_TEST_BENCH_CALLS (default 3000) rounds of the cliff's pattern per recording thread, each a descriptor
         // table (slot 35), a root constant (slot 39) and a Dispatch (slot 14), every call timed here. X2W_TEST_BENCH_THREADS (default 1)
@@ -500,12 +551,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(queue, 10, 1, word(&lists[t]));
         }
     } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
-        Sleep(1);
+    if (mode.rfind("dispatch-reset-bench", 0) != 0) {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
+        for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
+            if (GetTickCount64() >= deadline) return 78;
+            Sleep(1);
+        }
     }
     if (indirect && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)

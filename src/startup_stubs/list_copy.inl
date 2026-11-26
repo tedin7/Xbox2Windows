@@ -135,11 +135,16 @@ bool list_wrote(Wrapper* list, ID3D12Resource* resource)
     return found;
 }
 
-void discard_list_gpu_writes(Wrapper* self)
+void discard_list_gpu_writes(Wrapper* self, bool keep_capacity)
 {
     AcquireSRWLockExclusive(&pending_writes_lock);
-    pending_gpu_writes().erase(self);
-    pending_linear_writes().erase(self);
+    if (keep_capacity) {
+        if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) it->second.clear();
+        if (const auto it = pending_linear_writes().find(self); it != pending_linear_writes().end()) it->second.clear();
+    } else {
+        pending_gpu_writes().erase(self);
+        pending_linear_writes().erase(self);
+    }
     ReleaseSRWLockExclusive(&pending_writes_lock);
 }
 

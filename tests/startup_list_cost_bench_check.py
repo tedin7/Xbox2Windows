@@ -6,9 +6,12 @@ Runs the compute fixture of startup_compute_dispatch_check.py in mode dispatch-b
 {SetComputeRootDescriptorTable, SetComputeRoot32BitConstants, Dispatch}, each call timed by the fixture. The output words must still match
 the case's expectation (the dispatches really ran), and the run prints `x2w-bench` and the stand-in-shaped slots line that
 tools/startup/slot_compare.py reads. The numbers are the scoreboard of the translate-once work: compare runs, not WARP against the tester.
-With X2W_BENCH_OUT=<file> the slots line is also written there. Exit 77 when the adapter is not available.
+On WARP also times 1,000 list Resets with X2W_FAST_RESET off and on, checking GPU output against the CPU
+reference and an omitted-root-word control. With X2W_BENCH_OUT=<file> the original slots line is also
+written there. Exit 77 when the adapter is not available.
 """
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +24,38 @@ from startup_stream_check import gfx2hlsl as G
 CALLS = '2000'  # two recording threads by default: two lists record the same new pipeline at once (a refusal cached while the first read was in flight would show here)
 
 
+def reset_reference(cycle):
+    out = [C.SENTINEL] * C.WORDS
+    # Case A has 12 groups of 24 threads. Each thread writes its linear index.
+    for i in range(288):
+        out[i] = ((C.input_word(i) * 33) & C.MASK) ^ ((C.KEY + cycle + i * C.STRIDE) & C.MASK)
+    return out
+
+
+def check_reset_bench(directory, consumer, env):
+    expected = reset_reference(1000)
+    outputs = []
+    for switch, mode in (('0', 'dispatch-reset-bench'), ('1', 'dispatch-reset-bench'),
+                         ('1', 'dispatch-reset-bench-missing-word')):
+        got, result = dispatch(directory, consumer, dict(env, X2W_FAST_RESET=switch), mode)
+        timing = re.search(r'^x2w-reset-bench cycles 1000 slot139 (\d+\.\d+) us/Reset pool (\d+) allocator \d+\.\d+ us/Reset$',
+                           result.stdout, re.MULTILINE)
+        assert timing, result.stdout
+        errors = re.findall(r'^.*x2w-d3d12-debug .*sev=[01] .*$', result.stderr, re.MULTILINE)
+        assert not errors and 'DEVICE REMOVED' not in result.stderr, errors or result.stderr[-2000:]
+        print(f'X2W_FAST_RESET={switch} {mode}: {timing[0]}')
+        if switch == '1':
+            assert int(timing[2]) == 3, 'expected the original allocator plus two reused recording allocators'
+        if mode.endswith('missing-word'):
+            assert got != expected and got == reset_reference(999), 'the control must preserve cycle 999'
+        else:
+            assert got == expected, f'CPU reference mismatch with X2W_FAST_RESET={switch}'
+            outputs.append(got)
+    assert outputs[0] == outputs[1], 'the Reset paths produced different GPU output'
+
+
 def main(consumer, dxc, adapter):
+    assert reset_reference(0) == C.expected('A')
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare_case(directory, adapter)
@@ -64,6 +98,8 @@ def main(consumer, dxc, adapter):
         target = os.environ.get('X2W_BENCH_OUT')
         if target:
             Path(target).write_text(slots[0] + '\n')
+        if adapter == 'warp':
+            check_reset_bench(directory, consumer, env)
         print(f'startup_list_cost_bench: PASS on {adapter} (all {C.WORDS} words match; numbers above)')
 
 

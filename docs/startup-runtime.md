@@ -2364,6 +2364,17 @@ These are measured on one executable; treat them as hypotheses for others.
   survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
   created or signalled, that submit's allocator is never reset or reused again. Run
   `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
+- **Fast command-list Reset.** Set `X2W_FAST_RESET=1` to opt in. A list reserves a
+  desktop allocator from its title allocator's pool. The shim resets and opens the native
+  list outside the shared allocator lock. The guest allocator's Reset leaves selection
+  to the next list Reset. Allocators become reusable after their lists release their
+  recordings and all tracked submits complete. List state retains vector capacity, and
+  submitted snapshots keep their existing fence protection.
+  Run `ctest --preset dev --no-tests=error -V -R '^startup_list_cost_bench_warp$'` on
+  Windows to compare 1,000 Reset and Dispatch cycles per mode. The fixture prints
+  microseconds per list and allocator Reset, gates the first submit to exercise Reset
+  with work pending, and compares the GPU output against a CPU reference. Omitting the
+  last recording's first root word must leave the preceding cycle's output intact.
 - **Failed command-list Close.** A desktop list that fails Close cannot be reopened by desktop
   Reset. The renderer reports the failed HRESULT and excludes the failed recording from queue
   submission. The next Reset creates a fresh list of the same type on the requested allocator

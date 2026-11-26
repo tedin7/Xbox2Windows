@@ -224,6 +224,8 @@ struct alignas(16) WrapperOwn {
     IndirectGraphicsPipeline indirect_graphics;
     u64 mesh86_key{};
     UINT list_node_mask;
+    UINT fast_allocator_type; // Native type plus one, or zero for an allocator of unknown origin.
+    Wrapper* fast_allocator_device;
     D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
@@ -927,6 +929,18 @@ void retire_set_class(Wrapper* w, const D3D12_HEAP_PROPERTIES& props, D3D12_HEAP
     w->own().retire_when_idle = why == RetireNever::none;
 }
 
+bool fast_reset_enabled()
+{
+    static const bool enabled = [] {
+        const DWORD saved = GetLastError();
+        char value[2]{};
+        const bool on = GetEnvironmentVariableA("X2W_FAST_RESET", value, sizeof(value)) == 1 && value[0] == '1';
+        SetLastError(saved);
+        return on;
+    }();
+    return enabled;
+}
+
 template <int K, int N, int R, int Desc = -1>
 __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h)
 {
@@ -992,6 +1006,12 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
                         }
                     }
                 }
+            }
+        }
+        if constexpr (K == device_kind && N == 9) {
+            if (kind == allocator_kind && fast_reset_enabled()) {
+                child->own().fast_allocator_type = static_cast<UINT>(a) + 1;
+                child->own().fast_allocator_device = self;
             }
         }
         if (K == device_kind && kind == list_kind) {
@@ -1080,6 +1100,7 @@ void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
 void release_upload_recording(Wrapper* list);
+void discard_list_gpu_writes(Wrapper* self, bool keep_capacity = false);
 void retire_discard_holds(Wrapper* list);
 void residency_discard_list(Wrapper* list);
 void residency_title_touched(ID3D12Resource* desktop);
@@ -1151,6 +1172,7 @@ ULONG __stdcall release(Wrapper* self)
         }
         if (self->own().kind == list_kind && self->own().real) {
             release_upload_recording(self);
+            if (fast_reset_enabled()) discard_list_gpu_writes(self);
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
@@ -1467,10 +1489,10 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 void release_targets(Wrapper* self);
 void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_list_dynamic_state(Wrapper* self);
-void discard_list_gpu_writes(Wrapper* self);
 void commit_list_gpu_writes(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void discard_address_uploads(ID3D12CommandList* list);
+void discard_fast_draw_recording(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
 bool shader_dump_dir(wchar_t* out, DWORD size);
@@ -1658,9 +1680,10 @@ void recycle_arenas(DesktopAllocator& allocator)
 // allocator_lock held. A list recorded again and again on one allocator that the title rarely resets would otherwise
 // keep one arena (at least one 64 KB page) per recording until that Reset: the arenas whose recording is retired and
 // finished on the GPU are recycled now.
-void reclaim_finished_arenas(DesktopAllocator& allocator)
+void reclaim_finished_arenas(DesktopAllocator& allocator, bool release_without_pool = false)
 {
-    if (!upload_page_reuse() || upload_reuse_mutant()) return;
+    const bool reuse = upload_page_reuse();
+    if ((!reuse && !release_without_pool) || upload_reuse_mutant()) return;
     auto& arenas = allocator.uploads;
     for (auto it = arenas.begin(); it != arenas.end();) {
         const bool done = upload_mutant_is("unfenced") ? (*it)->retired : (*it)->finished(!upload_mutant_is("own-only"));
@@ -1668,9 +1691,9 @@ void reclaim_finished_arenas(DesktopAllocator& allocator)
             ++it;
             continue;
         }
-        (*it)->recycle(free_upload_pages);
+        if (reuse) (*it)->recycle(free_upload_pages);
         it = arenas.erase(it);
-        ++arenas_recycled_early;
+        if (reuse) ++arenas_recycled_early;
     }
 }
 
@@ -1680,8 +1703,11 @@ void release_upload_recording(Wrapper* list)
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
     retire_list_arena(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
-        if (found->second) --found->second->lists;
+    if (const auto found = list_recordings.find(list); (upload_page_reuse() || fast_reset_enabled()) && found != list_recordings.end()) {
+        if (found->second) {
+            if (fast_reset_enabled() && list->own().list_open) found->second->untracked = true;
+            --found->second->lists;
+        }
         list_recordings.erase(found);
     }
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -1692,8 +1718,10 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 {
     TitleAllocator& title = title_allocators[allocator];
     if (!title.current) {
-        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false, false};
-        title.pool.push_back(title.current);
+        auto initial = std::make_unique<DesktopAllocator>();
+        initial->real = static_cast<ID3D12CommandAllocator*>(allocator->own().real);
+        title.pool.push_back(initial.get());
+        title.current = initial.release();
     }
     return title;
 }
@@ -1830,6 +1858,8 @@ extern "C" __declspec(dllexport) UINT64 x2w_d3d12_upload_gpu_address(void* list,
 HRESULT __stdcall allocator_reset(Wrapper* self)
 {
     if (!render_mode()) return static_cast<ID3D12CommandAllocator*>(self->own().real)->Reset();
+    // Fast recordings select and reset a fence-safe allocator lazily at list Reset.
+    if (fast_reset_enabled() && self->own().fast_allocator_type) return S_OK;
     AcquireSRWLockExclusive(&allocator_lock);
     TitleAllocator& title = title_allocator(self);
     DesktopAllocator* next = nullptr;
@@ -2012,15 +2042,124 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* al
     return size;
 }
 
-// List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
-HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
+// Reserve an allocator for one recording before releasing the pool lock. The original allocator
+// stays available to slot 73, which opens and closes a native list during creation.
+HRESULT fast_list_reset(Wrapper* self, Wrapper* allocator, ID3D12GraphicsCommandList* previous,
+                        x2w_startup::ComPtr<ID3D12GraphicsCommandList>& replaced)
 {
-    Wrapper* a = as_wrapper(allocator);
+    auto& state = self->own();
+    const auto type = previous->GetType();
+    if (allocator->own().fast_allocator_type != static_cast<UINT>(type) + 1 ||
+        device_of(allocator->own().fast_allocator_device) != device_of(state.list_device)) return E_INVALIDARG;
+    DesktopAllocator* target = nullptr;
+    bool was_ready;
+    AcquireSRWLockExclusive(&allocator_lock);
+    try {
+        if (state.list_open) {
+            ReleaseSRWLockExclusive(&allocator_lock);
+            return E_FAIL;
+        }
+        TitleAllocator& title = title_allocator(allocator);
+        list_recordings.try_emplace(self, nullptr);
+        for (auto it = title.pool.begin() + 1; it != title.pool.end(); ++it) {
+            if (allocator_idle(*it)) {
+                target = *it;
+                ++target->lists;
+                break;
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return E_OUTOFMEMORY;
+    }
+    // Queue submission must see either the old closed recording or a list it cannot submit.
+    was_ready = state.list_ready;
+    state.list_ready = false;
+    ReleaseSRWLockExclusive(&allocator_lock);
+
+    auto* device = device_of(state.list_device);
+    HRESULT hr;
+    bool allocator_reset_failed = false;
+    if (target) {
+        hr = target->real->Reset();
+        allocator_reset_failed = FAILED(hr);
+        if (!allocator_reset_failed) {
+            // No list can read these vectors while the allocator is reserved.
+            target->indexed_validation.clear();
+            target->scratches.clear();
+            target->submits.clear();
+            target->close_failed = false;
+        }
+    } else {
+        x2w_startup::ComPtr<ID3D12CommandAllocator> created;
+        hr = device->CreateCommandAllocator(type, IID_PPV_ARGS(&created));
+        if (SUCCEEDED(hr)) {
+            std::unique_ptr<DesktopAllocator> entry(new (std::nothrow) DesktopAllocator{});
+            if (!entry) {
+                hr = E_OUTOFMEMORY;
+            } else {
+                entry->real = created.Get();
+                entry->lists = 1;
+                AcquireSRWLockExclusive(&allocator_lock);
+                try {
+                    title_allocators.at(allocator).pool.push_back(entry.get());
+                    target = entry.release();
+                    created.Detach();
+                } catch (const std::bad_alloc&) {
+                    hr = E_OUTOFMEMORY;
+                }
+                ReleaseSRWLockExclusive(&allocator_lock);
+                if (target) InterlockedIncrement(&allocator_creates);
+            }
+        }
+    }
+
+    const bool allocator_reset_succeeded = target && SUCCEEDED(hr);
+    ID3D12GraphicsCommandList* replacement = nullptr;
+    if (SUCCEEDED(hr)) {
+        if (state.list_close_failed)
+            hr = device->CreateCommandList(state.list_node_mask, type, target->real, nullptr, IID_PPV_ARGS(&replacement));
+        else
+            hr = previous->Reset(target->real, nullptr);
+    }
+    AcquireSRWLockExclusive(&allocator_lock);
+    DesktopAllocator*& old = list_recordings.at(self);
+    // Upload addresses may also be consumed by another list. Keep the arena's
+    // existing queue guards even after the native allocator becomes reusable.
+    if (allocator_reset_succeeded && !target->uploads.empty()) {
+        try { reclaim_finished_arenas(*target, true); } catch (const std::bad_alloc&) {}
+    }
+    if (FAILED(hr)) {
+        if (target) {
+            if (allocator_reset_failed) target->untracked = true;
+            --target->lists;
+        }
+        state.list_ready = was_ready;
+        if (!old) list_recordings.erase(self);
+    } else {
+        if (replacement) {
+            replaced.Attach(previous);
+            state.real = replacement;
+        }
+        if (old) --old->lists;
+        old = target;
+        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        retire_list_arena(self);
+        state.list_scratch = nullptr;
+        state.list_close_failed = false;
+        state.list_open = true;
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return hr;
+}
+
+HRESULT legacy_list_reset(Wrapper* self, Wrapper* a, ID3D12GraphicsCommandList*& previous,
+                          x2w_startup::ComPtr<ID3D12GraphicsCommandList>& replaced)
+{
     HRESULT hr = E_INVALIDARG;
-    x2w_startup::ComPtr<ID3D12GraphicsCommandList> replaced;
     AcquireSRWLockExclusive(&allocator_lock);
     auto& state = self->own();
-    auto* previous = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    previous = static_cast<ID3D12GraphicsCommandList*>(state.real);
     if (a && a->own().kind == allocator_kind && previous) {
         TitleAllocator& title = title_allocator(a);
         const auto type = previous->GetType();
@@ -2082,11 +2221,29 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         }
     }
     ReleaseSRWLockExclusive(&allocator_lock);
+    return hr;
+}
+
+// List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
+HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
+{
+    Wrapper* a = as_wrapper(allocator);
+    x2w_startup::ComPtr<ID3D12GraphicsCommandList> replaced;
+    ID3D12GraphicsCommandList* previous = nullptr;
+    const bool fast = fast_reset_enabled() && a && a->own().kind == allocator_kind &&
+                      a->own().fast_allocator_type && self->own().real && self->own().list_device;
+    if (fast) previous = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    const HRESULT hr = fast ? fast_list_reset(self, a, previous, replaced)
+                            : legacy_list_reset(self, a, previous, replaced);
     if (SUCCEEDED(hr)) {
         reset_list_dynamic_state(self);
-        discard_list_gpu_writes(self);
-        discard_draw_sampler_heaps(previous);
-        discard_address_uploads(previous);
+        discard_list_gpu_writes(self, fast);
+        if (fast) {
+            discard_fast_draw_recording(previous);
+        } else {
+            discard_draw_sampler_heaps(previous);
+            discard_address_uploads(previous);
+        }
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
@@ -2109,9 +2266,13 @@ HRESULT __stdcall list_close(Wrapper* self)
         return S_OK;
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    const bool fast = fast_reset_enabled();
+    // The open recording pins its allocator and queue submission only accepts closed lists.
+    if (fast) ReleaseSRWLockExclusive(&allocator_lock);
     end_open_queries(self, list);
     release_targets(self);
     const HRESULT hr = list->Close();
+    if (fast) AcquireSRWLockExclusive(&allocator_lock);
     state.list_open = false;
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
@@ -3124,7 +3285,21 @@ void release_targets(Wrapper* self)
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
     for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
-    pass = Pass{};
+    if (!fast_reset_enabled()) {
+        pass = Pass{};
+        return;
+    }
+    Pass next{};
+    const auto keep_storage = [](auto& source, auto& destination) {
+        source.clear();
+        destination.swap(source);
+    };
+    keep_storage(pass.copied_gpu_ranges, next.copied_gpu_ranges);
+    keep_storage(pass.states, next.states);
+    keep_storage(pass.mixed, next.mixed);
+    keep_storage(pass.open_queries, next.open_queries);
+    keep_storage(pass.ended_queries, next.ended_queries);
+    pass = std::move(next);
 }
 
 // A dropped recording (Reset, or its list destroyed) names no resource any more. The raw pointers the pass keeps for
