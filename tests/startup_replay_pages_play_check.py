@@ -35,7 +35,7 @@ def page_map(address, pages, seq, runs):
         else:
             body += struct.pack("<III", first, len(what), 0) + b"".join(what)
         count += 1
-    return chunk(b"MAP ", struct.pack("<QQII", address, pages * PAGE, seq, count), body)
+    return chunk(b"MAP ", struct.pack("<QQQII", address, pages * PAGE, seq, count, 0), body)
 
 
 def recording(path, address, second_map=True):
