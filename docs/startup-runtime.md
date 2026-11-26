@@ -1582,6 +1582,17 @@ D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
 budget in bytes for node 0 of the adapter matching the desktop device LUID.
 An unavailable segment reads `n/a`.
 
+The line ends with the system commit and the physical-page pool (#1199):
+`commit=<used>/<limit> avail=<free>` in MiB (all processes: RAM plus page files, what a new commit can still
+get) and `sections=<n> slabs=<n> slots=<in use>/<free>` (live 64 KiB physical-page sections, open slabs, slots in
+the open slabs). Each reads `n/a` when it cannot be read. A run that ends on error 1455 shows from these whether
+the pool (flat `sections`) or the resources below grew: in one run the sections stayed at 6.9 GiB while commit
+rose with the committed texture bytes. The first three commit failures (error 1455 or 8) of the page pool also
+log `x2w-xmem commit exhausted at <call> (error N): system commit=... avail=...; pool sections=... slabs=...
+slots=.../...` with the hint that `X2W_XMEM_LAZY_COMMIT=1` (`run.ps1 -LazyMemory`) keeps untouched pages out of
+the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/startup_triage_run_check.py` that
+`triage_run.py` still reads the line with and without these fields.
+
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
 buffers, upload buffers, readback buffers, and explicit heaps. Resource sizes
