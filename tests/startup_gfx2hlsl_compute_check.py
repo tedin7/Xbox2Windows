@@ -386,6 +386,42 @@ WORDS_O = bytes.fromhex(
     '6a3c80be' '030088bf' '8300887d' '7e6a7e87' '007e008a' '0003febe' '04060a3a' '001070e004050480' '1503febe'
     '000081bf')
 
+# The two-mask loop from #2645. The displacements name the join, exit and head, respectively.
+LOOP_BREAK_SOURCE = """\
+v_lshlrev_b32 v4, 2, v0
+v_mov_b32 v5, 9
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 s22, exec_lo, vcc_lo
+s_mov_b32 s23, s22
+s_mov_b32 s24, 1
+s_mov_b32 exec_lo, s22
+s_cbranch_execz 6
+v_cmpx_gt_u32 s24, v0
+s_andn2_b32 s22, s22, exec_lo
+s_andn2_b32 s23, s23, exec_lo
+s_cbranch_scc0 6
+s_mov_b32 exec_lo, s22
+v_mov_b32 v5, s24
+s_mov_b32 exec_lo, s23
+s_add_u32 s24, s24, 1
+s_cmp_ge_u32 s24, 4
+s_cbranch_scc0 65524
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_mov_b32 exec_lo, s21
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+LOOP_BREAK_WORDS = bytes.fromhex(
+    '82000834 89020a7e 7e0395be 8300887d 7e6a1687 160397be 810398be 1603febe '
+    '060088bf 1800a87d 167e168a 177e178a 060084bf 1603febe 18020a7e 1703febe '
+    '18811880 188409bf f4ff84bf 06038abe 80038bbe 05030cf4000000fa 7fc08cbf '
+    '1503febe 001070e004050480 000081bf')
+
+
 def saveexec_fixture():
     # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
     # A single-thread group makes the lane bit the whole participating wave mask.
@@ -1060,6 +1096,40 @@ MBCNT_REFUSALS = (
 )
 
 
+def check_execz_loop_break():
+    # Trace the fixture once as a wave and once per singleton. Both saved masks lose
+    # the same lanes. SCC tests the entire remaining mask at the early exit.
+    def trace(lanes):
+        remaining = {lane for lane in lanes if lane < 3}
+        values = dict.fromkeys(lanes, 9)
+        counter = 1
+        while counter < 4:
+            if remaining:  # otherwise execz goes straight to the join
+                remaining = {lane for lane in remaining if lane >= counter}
+                if not remaining:
+                    break
+                values.update(dict.fromkeys(remaining, counter))
+            counter += 1
+        return values, counter
+
+    lanes = range(8)
+    wave, counter = trace(lanes)
+    singles = [trace([lane]) for lane in lanes]
+    assert list(wave.values()) == [values[lane] for lane, (values, _) in enumerate(singles)] == [9, 1, 2, 9, 9, 9, 9, 9]
+    # Make the scalar counter observable after restoring EXEC. Lane 0 leaves before
+    # the wave, while lanes 3..7 follow the latch even after the wave has left.
+    assert counter == 3 and [c for _, c in singles] == [1, 2, 3, 4, 4, 4, 4, 4]
+    store = '001070e004050480'
+    with_counter = patch(LOOP_BREAK_WORDS, store, '18020a7e' + store)
+    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
+    for program in (LOOP_BREAK_WORDS, with_counter):
+        refused(reason, lambda: translate('O', code=program).hlsl_cs())
+    # Remove just the latch or just the guard to isolate the control-flow diagnostic.
+    refused('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block',
+            lambda: translate('O', code=patch(LOOP_BREAK_WORDS, 'f4ff84bf', '000080bf')).hlsl_cs())
+    translate('O', code=patch(LOOP_BREAK_WORDS, '060088bf', '000080bf')).hlsl_cs()
+
+
 def check_mbcnt():
     for _, words, reason in MBCNT_REFUSALS:
         refused(reason, lambda: translate('D', code=bytes.fromhex(words + '000081bf')))
@@ -1607,6 +1677,7 @@ def check_controls():
     check_descriptor_scc()
     check_scc_modelled()
     check_mbcnt()
+    check_execz_loop_break()
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
@@ -2224,6 +2295,7 @@ def assemble(llvm_mc, source):
 
 
 def check_binary(llvm_mc):
+    assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())

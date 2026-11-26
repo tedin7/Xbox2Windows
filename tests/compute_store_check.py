@@ -3739,6 +3739,32 @@ def mac_f32_binary(directory, assembler, objcopy, library):
     assert aot.lower(decoded, 64, **MAC_F32_BINDING) == aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
 
 
+def mac_f32_mad_fusion(run_mutated, case, expected):
+    """Whether this target fuses the `precise mad()` mutation: 'fused' or 'unfused' (#2730).
+
+    The mutated shader is read back against the fused and the unfused model. They differ at word 0, the
+    cancellation 4097 * 4097 - 16785408 (1.0 fused, +0 unfused). Exactly one model must match all 320 words;
+    a compile, dispatch or readback failure, or any other readback, fails the test.
+    """
+    matches = {}
+    for name, model in (("fused", mac_f32_words(fused=True)), ("unfused", expected)):
+        case.write_bytes(struct.pack("<321I", 1, *model))
+        run = run_mutated()
+        if run.returncode == 0:
+            matches[name] = True
+        elif run.returncode == 1 and "Compute readback differs" in run.stderr:
+            matches[name] = False
+        else:
+            raise AssertionError(f"mac_f32: mad() fusion probe against the {name} model failed "
+                                 f"(exit {run.returncode})\n{run.stdout}{run.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    if matches == {"fused": True, "unfused": False}:
+        return "fused"
+    if matches == {"fused": False, "unfused": True}:
+        return "unfused"
+    raise AssertionError(f"mac_f32: mad() fusion probe read back neither model alone: {matches}")
+
+
 def mac_f32_draw(directory, compiler, renderer, backend):
     src, cso, case = [directory / x for x in ("mac_f32.hlsl", "mac_f32.cso", "mac_f32.case")]
     source = aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
@@ -3779,7 +3805,17 @@ def mac_f32_draw(directory, compiler, renderer, backend):
         msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
         msrc.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
-        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        run_mutated = lambda: subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if label.startswith("fused mad()"):
+            # FMad may be fused or not (DXIL leaves it to the driver). Where it reads back the unfused model,
+            # as on an RX 5700 XT and an RX 9070 XT, this mutation equals the lowering and cannot be caught.
+            fusion = mac_f32_mad_fusion(run_mutated, case, expected)
+            print(f"mac_f32: mad() fusion probe ({backend}): {fusion}")
+            if fusion == "unfused":
+                print(f"mac_f32: mutation '{label}' is inapplicable on this adapter: "
+                      "mad() reads back the unfused model on all 320 words")
+                continue
+        bad = run_mutated()
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mac_f32: mutation '{label}' escaped detection")
     if record := os.environ.get("FORM_COVERAGE_RECORD"):

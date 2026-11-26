@@ -30,19 +30,27 @@ def write(folder, name, data):
 
 
 def check_preset():
-    script = T.input_preset("menus", 300)
+    script = T.input_preset("menus", 300, 0)
     items = script.split(",")
     assert items[:4] == ["80@5+1.2", "80@7+1.2", "4@9+1.2", "80@11+1.2"], items[:4]
     times = [int(i.split("@")[1].split("+")[0]) for i in items]
     assert times == list(range(5, 300, 2)), times
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
-    assert T.input_preset("menus", 5) == "", "no entry before the start second"
-    assert T.input_preset("menus", 420).count(",") + 1 == len(range(5, 300, 2))
-    long_menus = T.input_preset("menus", 600).split(",")
+    assert T.input_preset("menus", 5, 0) == "", "no entry before the start second"
+    assert T.input_preset("menus", 420, 0).count(",") + 1 == len(range(5, 300, 2))
+    long_menus = T.input_preset("menus", 600, 0).split(",")
     assert [int(i.split("@")[1].split("+")[0]) for i in long_menus] == list(range(5, 300, 2)), "the menus preset stops at 300 s"
     assert len(long_menus) <= T.MAX_ENTRIES
-    long_run = T.input_preset("menus", 100000).split(",")
+    long_run = T.input_preset("menus", 100000, 0).split(",")
     assert len(long_run) == len(range(5, 300, 2)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    passes = T.privacy_cycles(2)
+    assert passes == [["40", "40", "40", "80", "80", "4"],
+                      ["40", "40", "40", "4", "80", "80", "4"],
+                      ["40", "40", "40", "80", "4", "80", "4"],
+                      ["40", "40", "40", "4", "80", "80", "4"]], "none, box 1, box 2, box 1; each pass ends on Conferma"
+    flat = [i.split("@")[0] for i in T.input_preset("menus", 300).split(",")]
+    assert flat[:len(sum(passes, []))] == sum(passes, []), "the menus script is those passes in order"
+    assert T.input_preset("menus", 60, 0).startswith("80@5+1.2,80@7+1.2,4@9+1.2"), "0 boxes = the plain pattern"
     menus2 = T.input_preset("menus2", 600)
     items2 = menus2.split(",")
     assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5+1.2"
@@ -58,6 +66,60 @@ def check_preset():
         except ValueError:
             continue
         raise AssertionError("an oversized raw script was accepted")
+
+
+def run_ui(script, arrival_delay, start, legal_focus=0, boxes_at_start=(False, False)):
+    """A model of the screens the title shows before loading (Run L pictures): navigation and brightness (A continues), the
+    legal notice (two list items and Avanti), the privacy screen (two boxes and Conferma) and loading. Lists clamp at both
+    ends. A press only counts once its screen has arrived. Returns (screen at the end, boxes ticked, time loading began)."""
+    presses = []
+    for item in script.split(","):
+        mask, rest = item.split("@")
+        presses.append((int(rest.split("+")[0]), int(mask, 16)))
+    order = ["nav", "bright", "legal", "privacy", "loading"]
+    screen, active_at = 0, start
+    focus = {"legal": legal_focus, "privacy": 0}
+    boxes = list(boxes_at_start)
+    for at, mask in presses:
+        name = order[screen]
+        if name == "loading":
+            break
+        if at < active_at:
+            continue
+        moved = False
+        if name in ("nav", "bright"):
+            moved = mask == 4
+        else:
+            if mask == 0x40:
+                focus[name] = max(0, focus[name] - 1)
+            elif mask == 0x80:
+                focus[name] = min(2, focus[name] + 1)
+            elif mask == 4:
+                if name == "legal":
+                    moved = focus[name] == 2
+                elif focus[name] < 2:
+                    boxes[focus[name]] = not boxes[focus[name]]
+                else:
+                    moved = all(boxes)
+        if moved:
+            screen += 1
+            active_at = at + arrival_delay
+    return order[screen], boxes, active_at - arrival_delay if order[screen] == "loading" else None
+
+
+def check_privacy_screen():
+    script = T.input_preset("menus", 300)
+    for delay in (0, 3, 7, 15, 30):
+        for start in (0, 12, 33, 70):
+            for legal_focus in (0, 1):
+                for ticked in ((False, False), (True, False), (False, True), (True, True)):
+                    end, boxes, when = run_ui(script, delay, start, legal_focus, ticked)
+                    assert end == "loading" and boxes == [True, True] and when < 300, (delay, start, legal_focus, ticked, end, boxes, when)
+    # control: the old pattern walks down to Conferma without ticking both boxes and is stuck on the privacy screen
+    plain = T.input_preset("menus", 300, 0)
+    for delay in (0, 15):
+        end, boxes, _ = run_ui(plain, delay, 0)
+        assert end == "privacy", (delay, end, boxes)   # never gets through: it cannot tick both boxes and confirm
 
 
 def make_run(folder, captures, same_picture=False, events_bytes=1000):
@@ -383,10 +445,61 @@ def check_seed_cache():
         assert json.loads((root / "seed.json").read_text())["seeded"] == 5
 
 
+MSVC_MAP = """ d3d12_xs
+
+ Timestamp is 6563a1f2 (Wed Nov 26 15:00:02 2026)
+
+ Preferred load address is 0000000180000000
+
+ Start         Length     Name                   Class
+ 0001:00000000 00a00000H .text$mn                CODE
+
+  Address         Publics by Value              Rva+Base               Lib:Object
+
+ 0001:00001000       DllMain                    0000000180001000 f   dllmain.obj
+ 0001:00001400       ?Draw@Queue@@QEAAXXZ       0000000180001400 f   d3d12_draw.obj
+ 0001:00001800       g_table                    0000000180001800     d3d12_draw.obj
+ 0001:00002000       ?Present@Queue@@QEAAXXZ    0000000180002000 f i present.obj
+"""
+
+
+def check_symbols():
+    import subprocess
+    rows = T.parse_symbols(MSVC_MAP)  # functions only (flag f), RVA = address - preferred load address
+    assert rows == [(0x1000, "DllMain"), (0x1400, "?Draw@Queue@@QEAAXXZ"), (0x2000, "?Present@Queue@@QEAAXXZ")], rows
+    nm = "0000000000001000 T alpha\n0000000000001200 t beta\n0000000000001300 D data\n0000000000001000 T alias\n"
+    assert T.parse_symbols(nm) == [(0x1000, "alpha"), (0x1200, "beta")]
+    assert T.load_symbols(T.format_symbols(rows)) == rows
+    try:
+        T.parse_symbols("not a map\n")
+        raise AssertionError("a text without function symbols must be refused")
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        (tmp / "d3d12_xs.map").write_text(MSVC_MAP)
+        (tmp / "m.json").write_text(json.dumps(MANIFEST))
+        out = subprocess.run([sys.executable, "-B", T.__file__, "pack", str(run),
+                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map")],
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        with zipfile.ZipFile(tmp / "r.zip") as z:
+            assert z.read(T.SYMBOLS_NAME).decode() == "1000 DllMain\n1400 ?Draw@Queue@@QEAAXXZ\n2000 ?Present@Queue@@QEAAXXZ\n"
+            assert json.loads(z.read("manifest.json"))["symbols"] == 3
+        T.pack(str(run), MANIFEST, str(tmp / "plain.zip"))
+        with zipfile.ZipFile(tmp / "plain.zip") as z:
+            assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
+
+
 if __name__ == "__main__":
+    check_symbols()
     check_seed_cache()
     check_cache_results()
     check_preset()
+    check_privacy_screen()
     check_manifest()
     check_first_poll()
     check_cache_stats()

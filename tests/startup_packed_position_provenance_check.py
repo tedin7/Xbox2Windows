@@ -51,6 +51,20 @@ def ps_words(reg):
     return struct.pack('<III', 0xf800180f, reg * 0x01010101, 0xbf810000)
 
 
+def vop2(op, vdst, src0, vsrc1):
+    return struct.pack('<I', op << 25 | vdst << 17 | vsrc1 << 9 | src0)
+
+
+def split_words(reg, low=1, high=2, out=5):
+    """A pixel stage that splits the packed position register `reg` into its 16-bit halves and puts them back together
+    (v_and_b32 low, 0xffff, reg; v_lshrrev_b32 high, 16, reg; v_lshlrev_b32 high, 16, high; v_or_b32 out, low, high), then
+    exports `out`. The result is the packed position again, and the program's own register use says which register is
+    the position: the halves are the evidence a request without a stream description has."""
+    return b''.join((vop2(0x1b, low, 255, reg) + struct.pack('<I', 0xffff), vop2(0x16, high, 144, reg),
+                     vop2(0x1a, high, 144, high), vop2(0x1c, out, 256 + low, high),
+                     struct.pack('<III', 0xf800180f, out * 0x01010101, 0xbf810000)))
+
+
 def put_request(cache, ps, masks=None, line=None):
     """Write req_<key>.a/.b/.root for VS_WORDS and `ps` under pipeline_key() with `masks`, and the stream
     description: `line` when given, else the line naming that key and `masks` (none without masks)."""
@@ -137,6 +151,22 @@ def controls():
     pipe = G.Pipeline(VS_WORDS, ps_words(4), root_blob(), ps_hw_inputs=TARGET)
     check('distinct masks: position after the allocated PERSP_SAMPLE and PERSP_CENTER pairs (v4)',
           pipe.packed_position_vgpr == 4 and pipe.persp_center_vgpr == 2)
+    # No description (a bare request): the position register comes from the program's own 16-bit split of one live-in register.
+    pipe = G.Pipeline(VS_WORDS, split_words(4), root_blob())
+    text = pipe.hlsl_ps()
+    check('a bare request that splits v4 takes the packed position from v4', pipe.packed_position_vgpr == 4
+          and packed_line(text) == [4])
+    check('another register: the same program shape on v3 takes v3',
+          G.Pipeline(VS_WORDS, split_words(3), root_blob()).packed_position_vgpr == 3)
+    check('a bare request with no half split evidence is left alone', G.Pipeline(VS_WORDS, ps_words(4), root_blob()).packed_position_vgpr is None
+          and not packed_line(G.Pipeline(VS_WORDS, ps_words(4), root_blob()).hlsl_ps()))
+    two = b''.join((vop2(0x1b, 1, 255, 4) + struct.pack('<I', 0xffff), vop2(0x16, 2, 144, 4),
+                    vop2(0x1b, 6, 255, 3) + struct.pack('<I', 0xffff), vop2(0x16, 7, 144, 3),
+                    struct.pack('<III', 0xf800180f, 0x01010101, 0xbf810000)))
+    check('two split registers are ambiguous and leave the pipeline alone',
+          G.Pipeline(VS_WORDS, two, root_blob()).packed_position_vgpr is None)
+    check('published masks win over the program: the decoy masks still put the position in v2',
+          G.Pipeline(VS_WORDS, split_words(4), root_blob(), ps_hw_inputs=DECOY).packed_position_vgpr == 2)
     pipe = G.Pipeline(VS_WORDS, ps_words(4), root_blob(), ps_hw_inputs=(0x0002, 0x8002))
     check('position allocated but not enabled is not modelled', pipe.packed_position_vgpr is None)
     for masks in ((0x8003, 0x8002), (0x8100, 0x8000)):
@@ -359,6 +389,12 @@ def draw(dxc, renderer, adapter, fxc=None):
             text, result = translated_ps(cache, key)
             assert text is not None, (label, result)
             sources[label] = text
+        # A request with no description at all (the runtime publishes none): the position register is taken from the program's
+        # own 16-bit split of v4. With the decoy's masks (v2) the same code reads a register that holds no position.
+        bare = put_request(cache, split_words(4))
+        text, result = translated_ps(cache, bare)
+        assert text is not None and packed_line(text) == [4], (result, text)
+        sources['bare request, position derived from the program (v4)'] = text
         # After those results exist, two more pipelines with the target's exact stage bytes, root signature and
         # input layout arrive in the same cache: one whose masks also place the position in v4, and one whose
         # masks place it in v2 (wrong register for this code). Each is a request of its own and is translated.
@@ -372,6 +408,7 @@ def draw(dxc, renderer, adapter, fxc=None):
         for kind, compiler, profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'vs', 'vs_' + profile, folder)
             for label, good in (('target', True), ('decoy', True), ('same bytes, other masks (v4)', True),
+                                ('bare request, position derived from the program (v4)', True),
                                 ('same bytes, other masks (v2)', False)):
                 ps = compile_hlsl(compiler, kind, sources[label], 'ps', 'ps_' + profile, folder)
                 run = subprocess.run([renderer, adapter, '--startup-packed-position', vs, ps],

@@ -15,7 +15,7 @@ One command for a tester: check the build, run the title offline with a per-comm
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
-   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png ...), the debugger
+   finished, threads, files, trap.log, translate, translate_err, window*.png, bink_luma.png, memory.txt ...), the debugger
    summary and manifest.json, and prints each path and size. Not included: the shader cache, memory dumps and game
    files. Over -LimitMB (default 20, so each part fits a mail) the zip is split into numbered parts
    (report_..._part01of03.zip); no log is dropped.
@@ -25,6 +25,7 @@ commit passes the cap dies with error 1455. -MemoryGiB overrides it; the summary
 
 Lazy memory commit is ON by default (run.ps1 -LazyMemory): physical pages and the large startup blocks are committed on
 first touch, which cuts the section commit. -NoLazyMemory turns it off. The manifest records it.
+The shader cache is repaired once before the run (tools/startup/shader_cache_repair_packed.py: translations made before the packed-position derivation are withdrawn so the translator redoes them, no revision bump); the console says "repaired N packed-position translations" and the manifest records cache_repaired (-1 = skipped). -NoCacheRepair skips it.
 
 When the report is packed the script finishes the translation: one translator pass over the shader cache (no --watch), until
 nothing is pending or -FinishTranslateSeconds (default 900, 0 = skip) is over, then prints "pending before/after, ok, refused".
@@ -37,6 +38,11 @@ keeps video memory from running out. -NoLazyTextures turns it off. The manifest 
 
 -Input menus: D-pad down, D-pad down, A, one press every 2 s (each held 1.2 s) starting 5 s after the first pad poll, up to 300 s (input script
 time counts from that poll, which the title reaches late).
+-PrivacyBoxes N (default 2, with -Input menus): the privacy screen has N checkboxes and a Conferma button. The script does not depend on
+the clock or on the state of the boxes: from 5 s it repeats passes of "up x(N+1), toggle at most one box with A, down to Conferma, A",
+toggling a different single box in Gray-code order (none, box 1, box 2, box 1), so one pass in four reaches Conferma with both boxes
+ticked whatever state they start in; Conferma changes the screen and the presses go nowhere. On the screens before it the same passes
+only select items and end on the Avanti button, which opens the privacy screen. 0 keeps the plain DOWN,DOWN,A pattern.
 -Input menus2: the same presses, but after every A the script waits until the presented picture has changed and stayed
 still for 2 s (at most 90 s, then it goes on) before the next press, so nothing is pressed blind while a screen loads.
 Any other value is a raw
@@ -60,14 +66,21 @@ param(
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
     [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
+    [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
+    [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
     [switch]$NoLazyTextures,                    # lazy slot 133 textures are on (X2W_D3D12_LAZY_TEXTURES=1, PR #2773); this turns them off
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
     [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [switch]$NoHddMode,                       # the DirectStorage stand-in plans, merges and prefetches the title's file reads for a hard disk (X2W_STORAGE_HDD=1); this turns it off
+    [switch]$NoGpuTime,                        # GPU time per frame is logged every 300 frames (X2W_GPU_TIME=1, timestamp queries); this turns it off
     [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
-    [int]$CommitWarnMiB = 2048                  # a warning line in the log when the system commit has less than this free; 0 = off
+    [int]$CommitWarnMiB = 2048,                 # a warning line in the log when the system commit has less than this free; 0 = off
+    [int]$StallSeconds = 90,                    # stall watchdog: the run ends cleanly (zip packed) when frames presented, storage read, translator output and the window picture have all stood still this long; 0 = off
+    [int]$StallMinSeconds = 150,                # the watchdog never ends a run before this many seconds
+    [int]$MemoryStopPercent = 95                # the watchdog also ends the run when the committed memory is at or above this percent of the commit limit in 2 samples in a row; 0 = off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -164,13 +177,32 @@ $cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRo
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
 New-Item -ItemType Directory -Force $cache | Out-Null
+# Repair first (before the translator and before the counts below): results translated before the packed-position derivation
+# are withdrawn so the translator makes them again (tools/startup/shader_cache_repair_packed.py; no revision bump, so the rest of the
+# warm cache stays). -NoCacheRepair skips it. repaired = -1 in the manifest when skipped or when the tool failed.
+$cacheRepaired = -1
+if (-not $NoCacheRepair) {
+    try {
+        $repairTool = Join-Path $PSScriptRoot "shader_cache_repair_packed.py"
+        $repairLine = (Invoke-Native { & $python -B $repairTool $cache } | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $repairLine -match '(\d+) stale results withdrawn') {
+            $cacheRepaired = [int]$Matches[1]
+            Write-Host "tester_run: repaired $cacheRepaired packed-position translations"
+        } else {
+            Write-Warning "tester_run: the cache repair tool gave no usable answer, cache left as it was: $repairLine"
+        }
+    } catch {
+        Write-Warning "tester_run: cache repair skipped ($($_.Exception.Message))"
+    }
+}
 $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
 # Pre-translation: after a revision bump the new cache folder is empty and the title would be black until the --watch
 # translator caught up. The requests of the older shader_cache_* folders are copied under the new keys first (the translator
-# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through in
-# its process pool (all cores but one) while the title boots; what the title asks for meanwhile goes first. Never blocks the run.
+# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through
+# while the title boots; what the title asks for meanwhile goes first. Never blocks the run. The re-keying uses all cores
+# but one; the --watch pool beside the title keeps to 4 workers and leaves old refusals alone (gfx2hlsl.py watch_jobs),
+# and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
-if (-not $env:X2W_TRANSLATE_JOBS) { $env:X2W_TRANSLATE_JOBS = "$translateJobs" }
 $seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
 $preTranslate = $null
 # The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
@@ -188,7 +220,7 @@ try {
 }
 Write-Host "tester_run: $seedLine"
 Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
-$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
+$script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds --privacy-boxes $PrivacyBoxes })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
@@ -204,6 +236,10 @@ $LazyTextures = -not $NoLazyTextures
 if ($LazyTextures) { $env:X2W_D3D12_LAZY_TEXTURES = "1" } else { Remove-Item Env:X2W_D3D12_LAZY_TEXTURES -ErrorAction SilentlyContinue }
 $SysmemFallback = -not $NoSysmemFallback
 if ($SysmemFallback) { $env:X2W_D3D12_SYSMEM_FALLBACK = "1" } else { Remove-Item Env:X2W_D3D12_SYSMEM_FALLBACK -ErrorAction SilentlyContinue }
+$HddMode = -not $NoHddMode
+if ($HddMode) { $env:X2W_STORAGE_HDD = "1" } else { Remove-Item Env:X2W_STORAGE_HDD -ErrorAction SilentlyContinue }
+$GpuTime = -not $NoGpuTime
+if ($GpuTime) { $env:X2W_GPU_TIME = "1" } else { Remove-Item Env:X2W_GPU_TIME -ErrorAction SilentlyContinue }
 $StartupBelow40 = -not $NoStartupBelow40
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" } else { Remove-Item Env:X2W_XMEM_STARTUP_BELOW_40 -ErrorAction SilentlyContinue }
 $LowAddresses = -not $NoLowAddresses
@@ -215,7 +251,8 @@ $runArgs = @{
     MemoryGiB = $MemoryGiB; ShaderCache = $cache; ContinueAsserts = 1000; InputScript = $script
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
-if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
+if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true; $runArgs.TraceFiles = 1 }
+elseif ($runParams.ContainsKey("TraceFiles")) { $runArgs.TraceFiles = 0 }   # files.txt lists every open (one per ~5 ms on a hard disk): off unless -Deep
 if (-not $NoLazyMemory) { $runArgs.LazyMemory = $true }
 $runArgs.NoNullIdentity = $true   # X2W_DRAW_NULL_IDENTITY=1 replaced the real address of an empty buffer slot in the log (Run I); the tester run keeps it
 if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB }
@@ -223,6 +260,26 @@ if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
+}
+# memory.txt in the run folder (so in the zip): every 30 s the system commit and the 8 processes holding the most of it,
+# names and GiB only (memory_top.py), then one "end" line after the run. Never stops the run.
+$memoryTop = Join-Path $PSScriptRoot "memory_top.py"
+$memoryFile = Join-Path $logDir "memory.txt"
+$memorySampler = $null
+try {
+    $memorySampler = Start-Process -FilePath $python -PassThru -NoNewWindow `
+        -ArgumentList "-B", "`"$memoryTop`"", "`"$memoryFile`"", "--every", "30", "--top", "8", "--parent", "$PID"
+} catch { Write-Warning "tester_run: memory sampling is off: $($_.Exception.Message)" }
+# Stall watchdog (stall_watchdog.py): ends the run through the `stop` file when it is clearly stuck; the reason is printed as
+# "tester_run: STALL STOP at N s: ..." and recorded as stop_reason in the manifest.
+$stallFile = Join-Path $logDir "stall_stop.json"
+$stallWatch = $null
+if ($StallSeconds -gt 0 -or $MemoryStopPercent -gt 0) {
+    try {
+        $stallArgs = @("-B", "`"$(Join-Path $PSScriptRoot 'stall_watchdog.py')`"", "`"$logDir`"", "--parent", "$PID", "--seconds", "$Seconds",
+            "--stall-seconds", "$StallSeconds", "--min-seconds", "$StallMinSeconds", "--memory-percent", "$MemoryStopPercent")
+        $stallWatch = Start-Process -FilePath $python -PassThru -NoNewWindow -ArgumentList $stallArgs
+    } catch { Write-Warning "tester_run: the stall watchdog is off: $($_.Exception.Message)" }
 }
 $exitCode = 0
 try {
@@ -232,6 +289,13 @@ try {
     Write-Warning "tester_run: the run stopped with an error: $($_.Exception.Message)"
     $exitCode = 1
 }
+if ($stallWatch) { try { Stop-Process -Id $stallWatch.Id -Force -ErrorAction SilentlyContinue; [void]$stallWatch.WaitForExit(5000) } catch { } }
+$stopReason = ""
+if (Test-Path -LiteralPath $stallFile) {
+    try { $stall = Get-Content -LiteralPath $stallFile -Raw | ConvertFrom-Json; $stopReason = "stall watchdog at $($stall.at_seconds) s: $($stall.reason)" } catch { }
+}
+if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
+Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 
 # Manifest input: X2W_* variables only; the user's profile path is masked.
 $envSet = [ordered]@{}
@@ -248,15 +312,23 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
-    pretranslate = $preTranslate
+    exit_code = $exitCode; stop_reason = $stopReason; stall_seconds = $StallSeconds; stall_min_seconds = $StallMinSeconds; memory_stop_percent = $MemoryStopPercent; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; gpu_time = [bool]$GpuTime; hdd_mode = [bool]$HddMode; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    pretranslate = $preTranslate; cache_repaired = $cacheRepaired
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 
 $zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
-$parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache })
+# The linker map of our d3d12_xs.dll names its functions in the zip; only a map written with this DLL (within a minute of it).
+$mapArgs = @()
+$dllFile = Join-Path $buildRoot "d3d12_xs.dll"
+$mapFile = Join-Path $buildRoot "d3d12_xs.map"
+if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -and
+    ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
+    $mapArgs = @("--map", $mapFile)
+}
+$parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache @mapArgs })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
 foreach ($line in $parts) {

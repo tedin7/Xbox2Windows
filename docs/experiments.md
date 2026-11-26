@@ -83,6 +83,25 @@ cmake --build --preset dev --target startup_present_producer
 ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware)$' -V
 ```
 
+## Per-draw texel history
+
+`X2W_DRAW_DUMP_FRAME=<n>` with `X2W_DRAW_DUMP_PIXEL=<x>,<y>` keeps one texel of render target 0 after
+each translated draw of that frame instead of copying the whole target. The completed reads are
+written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordinal, `frame=` is the
+frame that recorded it, `x=` and `y=` name the texel, `key=` is the translated manifest key, and
+`rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
+The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
+name the one that last changed the texel.
+
+`startup_pixel_history` builds three draws on a 4x4 target. The first and third are scissored to the
+top-left texel; only the second covers the watched texel (1, 1). The report must name draw 2 with its
+manifest key, and the control that omits draw 2 must leave the texel black at draw 3.
+
+```powershell
+cmake --build --preset dev --target startup_pixel_history
+ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V
+```
+
 ### Translated indirect triangles
 
 `X2W_TRANSLATED_INDIRECT_DRAW=1` lets a slot 57 cached translation record one non-indexed
@@ -7033,7 +7052,7 @@ The `SUB_CO` fixture in `tests/compute_store_check.py` (`draw-sub-co`, `compute_
 
 `v_mac_f32_e32 vD, S0, vS1` (VOP2 `0x1f`) and `v_mac_f32_e64 vD, S0, S1` (VOP3) compute `D = S0 * S1 + D` as an unfused binary32 multiply-add: the intermediate product `S0 * S1` rounds to binary32 before the addition. `D` is both an input accumulator and the destination. Lowering uses `f32_mac(a, b, c)` with separate `precise float p = asfloat(a) * asfloat(b)` and `precise float r = p + asfloat(c)` so DXC does not contract the operation to FMA. NaN/Inf/denormal literal constants, uninitialized/unknown or pending `S0`/`S1`/`D`, `vD > 255`, source modifiers (`-`, `|.|`), `clamp`, `omod`, and bare `v_mac_f32` are refused.
 
-The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
+The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. DXIL lets the driver fuse `mad()` (`FMad`) or not, so on hardware the `mad()` mutation is first read back against the fused and the unfused model. Exactly one must match all 320 words; anything else fails the test. Where the unfused model matches (an RX 5700 XT and an RX 9070 XT, [#2730](https://github.com/R0Y00/Xbox2Windows/issues/2730)), the mutation equals the lowering, and the test logs it as inapplicable on that adapter. The full comparison, the reference controls and the other mutations stay mandatory. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
@@ -9741,7 +9760,30 @@ an earlier fixture that did so, the split left the result at its sentinel.
 The scratch is kept with the recording's desktop allocator
 (`x2w_d3d12_recording_scratches` reports how many it holds) and is released
 only when that allocator is reset after every queue that ran it has passed its
-fence.
+fence. The rewrite's root signature and pipeline are kept for the life of the
+process in an instance that is never destroyed. In #2683 the instance was a
+function-local static: on an RX 9070 XT (driver 32.0.32029.2010) its destructor
+released the pipeline during DLL detach and the process exited with 0xC0000409
+in `amdxc64.dll` after every readback had passed. A never-destroyed instance
+exited 0 in 3 of 3 runs there.
+[Review](https://github.com/R0Y00/Xbox2Windows/pull/2683)
+On the same adapter and driver, with this change merged onto main,
+`startup_indirect_count_split_hardware` passed and 6 of 6 direct runs exited 0;
+with only `split_indirect_dispatch.h` restored to the static, 4 of 4 runs ended
+in 0xC0000409, the dump showing the static's destructor in
+`_execute_onexit_table` at DLL detach.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/pull/2734)
+
+The cache is process-owned and released only by process exit. Explicitly
+unloading and reloading `d3d12_xs.dll` in a live host is not a supported path:
+each load allocates a new cache and nothing tears the previous one down outside
+the loader lock. Supporting it needs that teardown and its own coverage. The
+kept root signature and pipeline each hold a reference to their device: on the
+RX 5700 XT and WARP 10.0.26100.9818 the device count went from 1 to 3 with both
+objects created, and stayed at 2 after the application released its own
+reference. So a cached device is never destroyed, and `entry_for`, which matches
+devices by pointer, cannot see a new device at a reused address while an entry
+holds those objects. An entry whose build failed holds neither.
 
 `startup_indirect_count_(warp|hardware)` keep the native call. On the RX 5700
 XT (driver 32.0.21045.29003) the hardware test still fails at its first case
@@ -15769,6 +15811,20 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Counted loop exit inside a compute EXEC-zero block (#2645 T2)
+
+The 112-byte gfx1013 fixture in `tests/startup_gfx2hlsl_compute_check.py` starts with eight
+lanes and keeps lanes 0–2 in two saved masks. At counter values 1, 2 and 3 it removes each
+remaining lane whose ID is below the counter. The wave exits when the second mask becomes
+empty. The wave and singleton traces both store `[9, 1, 2, 9, 9, 9, 9, 9]`.
+
+Reading the counter after restoring EXEC exposes the difference. The wave exits with 3 for
+every lane. In the singleton model lanes 0 and 1 exit early with 1 and 2. Lanes 3–7 skip the
+guarded block and take the latch until the counter reaches 4. The translator reports
+`loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
+Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
@@ -16735,7 +16791,11 @@ would be folded at compile time and the lowering under test would never run. The
 `0x7fc00000`, `0x40400000`, `0x3fc00000` and `0x3f000000`; the expected words are `0x3f800000`,
 `0x40000000`, `0x3fc00000` and `0x3f800000`. The control that counts restores the branchless helper in the
 same pair and requires a mismatch on the NaN lane alone: `0x40000000` where the ISA asks `0x3f800000`, the
-other three lanes unchanged. A negative control that passes is reported as a failure, not accepted.
+other three lanes unchanged. A negative control that passes is reported as a failure, not accepted. The
+restored helper computes its median as `precise`. Without it, an RX 5700 XT (driver 32.0.21045.29003) folded
+the median against the constant bounds into a clamp and drew the ISA's `0x3f800000` on the NaN lane with FXC
+and DXC, so the defect escaped. With `precise` that adapter and WARP draw `0x40000000` there and match the
+other three lanes. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/2730)
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

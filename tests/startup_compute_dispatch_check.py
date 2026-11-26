@@ -114,9 +114,9 @@ def main(consumer, dxc, adapter):
         refused = lines(result, 'refused: ')
         census = lines(result, 'x2w-render compute census')
         assert len(census) == 3 and census[1].endswith(
-            'reason "an output is not an aliased placed buffer range with unordered access": 1 keys, 1 dispatches') \
+            'reason "an output buffer was created without unordered access": 1 keys, 1 dispatches') \
             and '[00000000 00000000 ' not in census[2], census
-        assert len(refused) == 1 and 'an output is not an aliased placed buffer range with unordered access' in refused[0], \
+        assert len(refused) == 1 and 'an output buffer was created without unordered access' in refused[0], \
             result.stderr[-3000:]
         got, result = dispatch(directory, consumer, env, 'dispatch-same-root')
         assert got == expected and not lines(result, 'refused'), 'setting the same compute root again lost the constants'

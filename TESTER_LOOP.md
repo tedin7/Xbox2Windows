@@ -1,5 +1,7 @@
 # Tester loop branch
 
+Real-hardware testing by @Makto94 - thanks for the help.
+
 This branch is `origin/main` plus the tooling a tester needs for one fast round trip: run one command, send back
 the zip it prints. It is not a release; upstream gets each piece through its own pull request.
 
@@ -63,7 +65,7 @@ What it does:
 4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
    already in the shader cache at start, and when the title first polled the pad.
 
-`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input
+`-Input menus` presses D-pad down, D-pad down, A, one press every 2 s held 1.2 s (the 0.3 s default fell between two polls of a title at 2 to 3 fps), starting 5 s after the first pad poll and up to 300 s. The input Default (-PrivacyBoxes 2): the presses are clock-free passes for the privacy screen (up x3, toggle at most one box, down to Conferma, A; a different single box each pass, Gray-code order), repeated until the screen changes; -PrivacyBoxes 0 gives the plain pattern.
 script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 `-Input menus2` presses the same buttons, but after every A it waits until the presented picture has changed and stayed still for 2 s (at most 90 s) before the next press, so nothing is pressed blind while a screen loads. It needs render mode, which the script always uses.
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
@@ -77,6 +79,14 @@ on first use and video memory does not run out. `-NoLazyTextures` turns it off; 
 The system-memory fallback is on too (`X2W_D3D12_SYSMEM_FALLBACK=1`): when a slot 133 texture runs out of video memory it is created
 once more in system memory instead of returning an error, and the `x2w-budget` line ends with `sysmem-fallback=N bytes=M`.
 `-NoSysmemFallback` turns it off; the manifest records the choice.
+
+GPU time per frame is on too (`X2W_GPU_TIME=1`): every 300 frames an `x2w-gpu-time` line gives the average and longest
+GPU time of a frame and how long the GPU sat idle. `-NoGpuTime` turns it off; the manifest records it as `gpu_time`.
+
+HDD mode is on (`X2W_STORAGE_HDD=1`, because the title package is read from a hard disk, Run M: about 125 reads per second at 3 MB/s): the
+DirectStorage stand-in plans the file reads of its next queue entries, merges neighbours and reads them ahead in file order on a second
+thread. `-NoHddMode` turns it off; the manifest records it as `hdd_mode`. Its effect shows on the `x2w-dstorage disk` and
+`x2w-dstorage hdd` lines (reads per second, MB/s while reading, cache hits).
 
 Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.
 
@@ -102,7 +112,8 @@ Send the zip it printed. If the zip is over 20 MB it is split into `report_..._p
 send every part (mail limit). The zip holds every file the run wrote in its log folder (stdout, stderr, events,
 finished, threads, files, trap.log, translate, translate_err, the window captures, the debugger summary) and
 `manifest.json` (commit, build commit, dirty flag, seconds, input script, `X2W_*` variables, graphics card and driver,
-Windows build, wall time). It holds no game files, no shader cache and no memory dumps.
+Windows build, wall time), and `memory.txt`: every 30 s the PC's committed memory and the 8 programs holding most of it
+(program names and GiB only, no paths or window titles). It holds no game files, no shader cache and no memory dumps.
 
 ## Waiting for a fix on their own branch (conflict with this branch)
 

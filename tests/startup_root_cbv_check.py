@@ -14,11 +14,11 @@ HLSL = (
 CLEAR = bytes((0, 0, 255, 255))
 
 
-def run(directory, consumer, backend, mode):
-    folder = directory / mode
+def run(directory, consumer, backend, mode, extra=None, name=None):
+    folder = directory / (name or mode)
     folder.mkdir()
     log = folder / "trap.log"
-    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_ROOT_CBV": mode, "X2W_TRAP_LOG": str(log)},
+    pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_ROOT_CBV": mode, "X2W_TRAP_LOG": str(log), **(extra or {})},
                           binding="srv 0 buf root 0")
     ignored = [line for line in log.read_text(errors="replace").splitlines() if "root CBV" in line] if log.exists() else []
     return pixels, ignored
@@ -33,17 +33,23 @@ def check(directory, consumer, backend):
         ("same_root", bytes((255, 255, 0, 255)), 0),
         ("switch_root", bytes(4), 0),
         ("wrong_type", bytes(4), 1),               # an SRV parameter ignores the call, with one log line for two calls
+        # A placed buffer that does not alias title memory, written by a recorded copy: the draw reads the buffer's own copy
+        # (the new colour), not the title memory behind it (the old colour); the second case is the snapshot behaviour.
+        ("placed_copy", bytes((0, 255, 255, 255)), 0),
+        ("placed_copy_snapshot", bytes((255, 255, 0, 255)), 0),
     )
-    for mode, drawn, lines in cases:
-        pixels, ignored = run(directory, consumer, backend, mode)
+    for case, drawn, lines in cases:
+        mode = "placed_copy" if case.startswith("placed_copy") else case
+        extra = {"X2W_TEST_SNAPSHOT_PLACED_BUFFERS": "1"} if case == "placed_copy_snapshot" else None
+        pixels, ignored = run(directory, consumer, backend, mode, extra, case)
         if pixels is None:
             return 77
         expected = (drawn * 4 + CLEAR * 4) * 4
         if pixels != expected:
-            raise AssertionError(f"{mode}: actual {pixels.hex()} expected {expected.hex()}")
+            raise AssertionError(f"{case}: actual {pixels.hex()} expected {expected.hex()}")
         if len(ignored) != lines:
-            raise AssertionError(f"{mode}: {len(ignored)} root CBV log lines, expected {lines}:\n" + "\n".join(ignored))
-        print(f"{backend} {mode}: 32 pixels exact, {lines} ignored-call log lines")
+            raise AssertionError(f"{case}: {len(ignored)} root CBV log lines, expected {lines}:\n" + "\n".join(ignored))
+        print(f"{backend} {case}: 32 pixels exact, {lines} ignored-call log lines")
     return 0
 
 

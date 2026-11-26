@@ -50,6 +50,12 @@ Gate = the independent check recorded before the PR was closed.
 
 - Since #2815 the runtime writes `revision.txt` into the shader cache: the draw checks that expect one `.txt` there
   (logical view, address SRV, joined table pointer, d16 SRV, MUBUF descriptor, pixel UAV, pixel heap SRV) skip it.
+- `image_store`: the d16 store from this branch and the pixel 2D-array and a16 stores from `tester-loop` live together.
+  Pixel stages store to 2D and 2D-array images; 1D and 3D stay compute-only. Two pairs no test covers stay refused:
+  d16 with a16, and d16 on a pixel 2D-array store.
+- `v_readfirstlane_b32`: this branch reads a value with no uniform proof through the thread group (WaveSync), where
+  `tester-loop` refuses it. The `tester-loop` refusal controls (log2/ceil, image_load) therefore check both sides: with
+  the guest wave the read goes through the group gather, and without it the translator refuses.
 
 ## Checks
 

@@ -1522,6 +1522,23 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-pixel-dump <vs.cso> <ps.cso> <width> <height> <out.bin>: the draw of --startup-pixel-words, but the
+// readback is written to the file (width * height * 4 little-endian words, row by row) for the caller to check.
+// Gated on wave operations: the caller's pixel stage reads its own lane and wave (tests that need a reference
+// per desktop wave, which only the readback can tell).
+OperationResult run_startup_pixel_dump(const OperationContext& ctx)
+{
+    const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
+    std::vector<std::uint32_t> pixels(size_t(width) * height * 4);
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    std::ofstream file(ctx.argv[7], std::ios::binary);
+    file.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(std::uint32_t)));
+    if (!file)
+        return {OutcomeKind::fail, "cannot write the readback file"};
+    std::printf("wrote %lu pixels\n", width * height);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
 // comma separated. An optional fourth argument sets the four entry constants (ud0..ud3) as four hex words;
@@ -1716,6 +1733,7 @@ const OperationSpec kOperations[] = {
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},

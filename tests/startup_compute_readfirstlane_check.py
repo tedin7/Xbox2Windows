@@ -139,6 +139,17 @@ def translate(code=None):
     return G.ComputePipeline(code or PROGRAM_WORDS, root_blob(), RSRC2, LOCAL, wave=32)
 
 
+FIRST_LANE_GATHER = 'InterlockedMin(x2w_first['
+
+
+def not_proven(code):
+    """`code`'s first-lane read has no uniform proof: with the guest wave it reads the lowest enabled lane through the
+    group (WaveSync), and without the guest wave the translator refuses it (the refusal the caller expects)."""
+    text = translate(code).hlsl_cs()
+    assert FIRST_LANE_GATHER in text, text
+    return G.ComputePipeline(code, root_blob(), RSRC2, LOCAL).hlsl_cs()
+
+
 def expected():
     out = [SENTINEL] * WORDS
     base_stride = STRIDE & 63
@@ -156,21 +167,25 @@ def expected():
     return out
 
 
-def llvm_lines():
+def llvm_decoded_lines(decoded):
+    """Format decoded instructions for llvm-mc, resolving label branches to dword offsets."""
     lines = []
-    for off, _n, _name, asm in DECODED:
+    for off, _n, _name, asm in decoded:
         m = re.fullmatch(r'(s_branch|s_cbranch_\w+) label_0x([0-9a-f]+)', asm)
         if m:
             lines.append('%s %d' % (m.group(1), (int(m.group(2), 16) - off - 4) // 4))
         else:
             lines.append(asm.replace('vcc_lo', 'vcc'))
-    lines += [
+    return lines
+
+
+def llvm_lines():
+    return llvm_decoded_lines(DECODED) + [
         's_cbranch_vccnz -8',
         's_cbranch_vccz 1',
         's_mov_b32 s20, 9',
         's_mov_b32 s22, vcc_lo',
     ]
-    return lines
 
 
 def check_binary(llvm_mc):
@@ -214,8 +229,243 @@ def controls(llvm_mc=None):
     refused('requires a proven uniform source', lambda: G.ComputePipeline(code, root_blob(), RSRC2, LOCAL).hlsl_cs())
     if llvm_mc:
         check_binary(llvm_mc)
+    log_ceil_controls(llvm_mc)
+    img_load_controls(llvm_mc)
     waterfall.controls(llvm_mc)
-    print('Compute readfirstlane one-path, loop-counter, waterfall and refusal checks passed')
+    print('Compute readfirstlane one-path, loop-counter, log2/ceil, image_load, waterfall and refusal checks passed')
+
+
+LOG_CEIL_LOG_LINE = 's21 = v8;'
+LOG_CEIL_CEIL_LINE = 's22 = v9;'
+
+
+def build_log_ceil_words():
+    ws = list(struct.unpack('<5I', bytes.fromhex('06038abe80038bbe05030cf4000000fa7fc08cbf')))
+    ws += sop2('s_lshl_b32', 's20', 's7', 2) + sop2('s_add_u32', 's20', 's20', 5)
+    ws += vop1('v_cvt_f32_u32_e32', 'v7', 's20') + vop1('v_log_f32_e32', 'v7', 'v7')
+    ws += vop2('v_mul_f32_e32', 'v8', '2.0', 'v7') + vop1('v_cvt_u32_f32_e32', 'v8', 'v8')
+    ws += vop1('v_readfirstlane_b32', 's21', 'v8')
+    ws += vop1('v_ceil_f32_e32', 'v9', 'v7') + vop1('v_cvt_u32_f32_e32', 'v9', 'v9')
+    ws += vop1('v_readfirstlane_b32', 's22', 'v9')
+    ws += sop2('s_lshl_b32', 's21', 's21', 8) + sop2('s_or_b32', 's21', 's21', 's22')
+    ws += sop2('s_lshl_b32', 's23', 's7', 2) + vop2('v_add_nc_u32_e32', 'v4', 's23', 'v0')
+    ws += vop2('v_add_nc_u32_e32', 'v5', 's21', 'v4') + vop2('v_lshlrev_b32_e32', 'v4', 2, 'v4')
+    ws += list(struct.unpack('<2I', bytes.fromhex('001070e004050480'))) + sopp('s_endpgm')
+    return struct.pack('<%dI' % len(ws), *ws)
+
+
+LOG_CEIL_WORDS = build_log_ceil_words()
+
+
+def log_ceil_expected():
+    out = [SENTINEL] * WORDS
+    for gx, base_val in ((0, 0x403), (1, 0x604)):
+        for tx in range(LOCAL[0]):
+            idx = gx * LOCAL[0] + tx
+            out[idx] = (base_val + idx) & MASK
+    return out
+
+
+def log_ceil_controls(llvm_mc=None):
+    hlsl = translate(LOG_CEIL_WORDS).hlsl_cs()
+    assert FIRST_LANE_GATHER not in hlsl, hlsl  # proven uniform: a plain read, no group gather
+    for snippet in ('v7 = U(log2(F(v7)));', 'v9 = U(ceil(F(v7)));', LOG_CEIL_LOG_LINE, LOG_CEIL_CEIL_LINE, 'u0.Store(a, v5);'):
+        assert hlsl.count(snippet) == 1, (snippet, hlsl)
+    for old_ws, new_ws in (
+            (vop1('v_log_f32_e32', 'v7', 'v7'), vop1('v_log_f32_e32', 'v7', 'v0')),
+            (vop1('v_ceil_f32_e32', 'v9', 'v7'), vop1('v_ceil_f32_e32', 'v9', 'v0'))):
+        refused('v_readfirstlane_b32 requires a proven uniform source',
+                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): not_proven(code))
+    saved = G.UNIFORM_VALU
+    try:
+        for removed in ('v_log_f32', 'v_ceil_f32'):
+            G.UNIFORM_VALU = saved - {removed}
+            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: not_proven(LOG_CEIL_WORDS))
+    finally:
+        G.UNIFORM_VALU = saved
+    if llvm_mc:
+        decoded = G.decode(LOG_CEIL_WORDS)
+        lines = [asm for _, _, _, asm in decoded]
+        proc = subprocess.run(
+            [llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64,-wavefrontsize32', '-show-encoding'],
+            input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True)
+        built = b''.join(bytes(int(b, 16) for b in m.group(1).split(','))
+                         for m in re.finditer(r'encoding: \[([^\]]*)\]', proc.stdout))
+        assert built == LOG_CEIL_WORDS, (built.hex(), LOG_CEIL_WORDS.hex())
+
+
+LOG_CEIL_CONTROLS = {
+    'dropped-log2-read': (LOG_CEIL_LOG_LINE, 's21 = 0u;', 'word=0 expected=00000403 actual=00000003'),
+    'dropped-ceil-read': (LOG_CEIL_CEIL_LINE, 's22 = 0u;', 'word=0 expected=00000403 actual=00000400'),
+}
+
+
+def log_ceil_dispatch(td, dxc, runner, adapter):
+    hlsl = translate(LOG_CEIL_WORDS).hlsl_cs()
+    case = td / 'log_ceil.case'
+    case.write_bytes(
+        struct.pack('<I', GROUPS[0] | (GROUPS[1] << 8) | (GROUPS[2] << 16))
+        + struct.pack('<%dI' % WORDS, *log_ceil_expected())
+        + struct.pack('<16I', KEY, STRIDE, *([0] * 14)))
+    for label, mutation in [('log_ceil_baseline', None)] + [(k, k) for k in LOG_CEIL_CONTROLS]:
+        text = hlsl
+        if mutation:
+            old, new, _ = LOG_CEIL_CONTROLS[mutation]
+            assert text.count(old) == 1, mutation
+            text = text.replace(old, new)
+        src, cso = td / f'{label}.hlsl', td / f'{label}.cso'
+        src.write_text(text, encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
+        proc = subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)],
+                              capture_output=True, text=True)
+        print(proc.stdout, end='')
+        if proc.returncode == 77:
+            return 77
+        diagnostics = []
+        for line in proc.stderr.splitlines():
+            if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                print(line, file=sys.stderr)
+            else:
+                diagnostics.append(line)
+        if mutation:
+            want = LOG_CEIL_CONTROLS[mutation][2]
+            first = diagnostics[:1]
+            if proc.returncode != 1 or first != [want]:
+                raise AssertionError('control %s: expected exit 1 with %r, got exit %d %r'
+                                     % (mutation, want, proc.returncode, proc.stderr))
+            print('control %s (%s): rejected at %s' % (mutation, adapter, first[0]))
+        elif proc.returncode or diagnostics:
+            raise AssertionError('log_ceil baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
+        else:
+            print('log_ceil baseline (%s): all %d words match' % (adapter, WORDS))
+    return 0
+
+
+IMG_LOAD_X_LINE = 's21 = ul30_7;'
+IMG_LOAD_Y_LINE = 's22 = ul30_8;'
+IMG_TEX_WIDTH = 32
+IMG_TEX_HEIGHT = 8
+IMG_TEX_RGBA32_FLOAT = 1 << 30
+
+
+def build_img_load_words():
+    ws = sop1('s_mov_b32', 's10', 's6') + sop1('s_mov_b32', 's11', 0)
+    ws += [0xf4080305, 0xfa000000]  # s_load_dwordx4 s[12:15], s[10:11], 0x0 (u0)
+    ws += [0xf40c0405, 0xfa000020]  # s_load_dwordx8 s[16:23], s[10:11], 0x20 (r0)
+    ws += [0xbf8cc07f]              # s_waitcnt lgkmcnt(0)
+    ws += sopc('s_cmp_eq_u32', 's7', 0) + sopp('s_cbranch_scc0', 1) + sopp('s_nop', 0)
+    ws += vop1('v_mov_b32_e32', 'v2', 's7') + vop1('v_mov_b32_e32', 'v3', 2)
+    ws += [0xf0000308, 0x00040702]  # image_load v[7:8], v[2:3], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D
+    ws += [0xbf8c3f70]              # s_waitcnt vmcnt(0)
+    ws += vop1('v_readfirstlane_b32', 's21', 'v7') + vop1('v_readfirstlane_b32', 's22', 'v8')
+    ws += sop2('s_xor_b32', 's21', 's21', 's22')
+    ws += sop2('s_lshl_b32', 's23', 's7', 2) + vop2('v_add_nc_u32_e32', 'v4', 's23', 'v0')
+    ws += vop2('v_add_nc_u32_e32', 'v5', 's21', 'v4') + vop2('v_lshlrev_b32_e32', 'v4', 2, 'v4')
+    ws += [0xe0701000, 0x80030504]  # buffer_store_dword v5, v4, s[12:15], 0 offen
+    ws += sopp('s_endpgm')
+    return struct.pack('<%dI' % len(ws), *ws)
+
+
+IMG_LOAD_WORDS = build_img_load_words()
+
+
+def img_load_texels():
+    """Distinct finite float32 bit patterns across (x, y) so groups 0 and 1 read distinct uniform x^y pairs."""
+    words = []
+    for y in range(IMG_TEX_HEIGHT):
+        for x in range(IMG_TEX_WIDTH):
+            base = 0x3f800000 + ((y * IMG_TEX_WIDTH + x) << 12)
+            words.extend((base, base + 0x100, base + 0x200, base + 0x300))
+    return words
+
+
+def img_load_expected(texels):
+    out = [SENTINEL] * WORDS
+    for gx in range(GROUPS[0]):
+        off = (2 * IMG_TEX_WIDTH + gx) * 4
+        combined = texels[off] ^ texels[off + 1]
+        for tx in range(LOCAL[0]):
+            idx = gx * LOCAL[0] + tx
+            out[idx] = (combined + idx) & MASK
+    return out
+
+
+def img_load_controls(llvm_mc=None):
+    hlsl = translate(IMG_LOAD_WORDS).hlsl_cs()
+    assert FIRST_LANE_GATHER not in hlsl, hlsl  # proven uniform: a plain read, no group gather
+    for snippet in ('t = r0.Load(int3(v2, v3, 0));', IMG_LOAD_X_LINE, IMG_LOAD_Y_LINE, 'u0.Store(a, v5);'):
+        assert hlsl.count(snippet) == 1, (snippet, hlsl)
+    # Varying coordinate control: image_load v[7:8], v[0:1], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D.
+    refused('v_readfirstlane_b32 requires a proven uniform source',
+            lambda: not_proven(patch(IMG_LOAD_WORDS, '080300f002070400', '080300f000070400')))
+    # Image store on a different descriptor slot in the same dispatch must block the uniform image_load proof.
+    store_prefix = (sop1('s_mov_b32', 's10', 's6') + sop1('s_mov_b32', 's11', 0)
+                    + [0xf40c0605, 0xfa000040, 0xbf8cc07f]  # s_load_dwordx8 s[24:31], s[10:11], 0x40; s_waitcnt lgkmcnt(0)
+                    + [0xf0200f08, 0x00060a02])             # image_store v[10:13], v[2:3], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D
+    refused('v_readfirstlane_b32 requires a proven uniform source',
+            lambda: not_proven(struct.pack('<%dI' % len(store_prefix), *store_prefix) + IMG_LOAD_WORDS[8:]))
+    saved = G.UNIFORM_IMAGE_LOADS
+    G.UNIFORM_IMAGE_LOADS = frozenset()
+    try:
+        refused('v_readfirstlane_b32 requires a proven uniform source', lambda: not_proven(IMG_LOAD_WORDS))
+    finally:
+        G.UNIFORM_IMAGE_LOADS = saved
+    if llvm_mc:
+        lines = llvm_decoded_lines(G.decode(IMG_LOAD_WORDS))
+        proc = subprocess.run(
+            [llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64,-wavefrontsize32', '-show-encoding'],
+            input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True)
+        built = b''.join(bytes(int(b, 16) for b in m.group(1).split(','))
+                         for m in re.finditer(r'encoding: \[([^\]]*)\]', proc.stdout))
+        assert built == IMG_LOAD_WORDS, (built.hex(), IMG_LOAD_WORDS.hex())
+
+
+IMG_LOAD_CONTROLS = {
+    'dropped-img-x-read': (IMG_LOAD_X_LINE, 's21 = 0u;', 'word=0 expected=00000100 actual=3f840100'),
+    'dropped-img-y-read': (IMG_LOAD_Y_LINE, 's22 = 0u;', 'word=0 expected=00000100 actual=3f840000'),
+}
+
+
+def img_load_dispatch(td, dxc, runner, adapter):
+    hlsl = translate(IMG_LOAD_WORDS).hlsl_cs()
+    texels = img_load_texels()
+    expected_words = img_load_expected(texels)
+    payload = expected_words + texels
+    case = td / 'img_load.case'
+    header = GROUPS[0] | (GROUPS[1] << 8) | (GROUPS[2] << 16) | IMG_TEX_RGBA32_FLOAT
+    case.write_bytes(struct.pack('<I%dI' % len(payload), header, *payload))
+    for label, mutation in [('img_load_baseline', None)] + [(k, k) for k in IMG_LOAD_CONTROLS]:
+        text = hlsl
+        if mutation:
+            old, new, _ = IMG_LOAD_CONTROLS[mutation]
+            assert text.count(old) == 1, mutation
+            text = text.replace(old, new)
+        src, cso = td / f'{label}.hlsl', td / f'{label}.cso'
+        src.write_text(text, encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
+        proc = subprocess.run([runner, adapter, '--compute-texture-case', str(cso), str(case)],
+                              capture_output=True, text=True)
+        print(proc.stdout, end='')
+        if proc.returncode == 77:
+            return 77
+        diagnostics = []
+        for line in proc.stderr.splitlines():
+            if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                print(line, file=sys.stderr)
+            else:
+                diagnostics.append(line)
+        if mutation:
+            want = IMG_LOAD_CONTROLS[mutation][2]
+            first = diagnostics[:1]
+            if proc.returncode != 1 or first != [want]:
+                raise AssertionError('control %s: expected exit 1 with %r, got exit %d %r'
+                                     % (mutation, want, proc.returncode, proc.stderr))
+            print('control %s (%s): rejected at %s' % (mutation, adapter, first[0]))
+        elif proc.returncode or diagnostics:
+            raise AssertionError('img_load baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
+        else:
+            print('img_load baseline (%s): all %d words match' % (adapter, WORDS))
+    return 0
 
 
 CONTROLS = {
@@ -271,6 +521,12 @@ def dispatch(dxc, runner, adapter):
                 raise AssertionError('baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
             else:
                 print('baseline (%s): all %d words match' % (adapter, WORDS))
+        rc = log_ceil_dispatch(td, dxc, runner, adapter)
+        if rc:
+            return rc
+        rc = img_load_dispatch(td, dxc, runner, adapter)
+        if rc:
+            return rc
         return waterfall.dispatch(td, dxc, runner, adapter)
 
 
