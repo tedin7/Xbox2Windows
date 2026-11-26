@@ -229,8 +229,8 @@ bool read_text(const wchar_t* path, std::string& out)
 // The revisions every request key starts with. tools/startup/gfx2hlsl.py hashes the same bytes, without a
 // trailing NUL (pipeline_key, compute_key, mesh57_key); a change of either side makes every cached request a miss.
 namespace shader_cache {
-constexpr char revision[] = "x2w-startup-shader-29";
-constexpr char compute_revision[] = "x2w-startup-shader-29cs";  // tools/startup/gfx2hlsl.py compute_key
+constexpr char revision[] = "x2w-startup-shader-28";
+constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup/gfx2hlsl.py compute_key
 constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
 }  // namespace shader_cache
 

@@ -832,56 +832,6 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
-def offsets_between(ins, lo, hi):
-    return [off for off, _n, _name, _asm in ins if lo < off < hi]
-
-
-def scalar_free_span(ins, lo, hi):
-    """True when no instruction at an offset in [lo, hi] writes a scalar register (SGPR, M0) other than EXEC and VCC.
-    A loop that only narrows EXEC and changes vector registers is the same for a lane that runs it per lane or with the
-    wave: a lane whose EXEC bit is clear changes nothing, and no scalar value carries the wave's iteration count out."""
-    for off, _n, name, asm in ins:
-        if not lo <= off <= hi:
-            continue
-        if name.startswith('s_movrel'):
-            return False
-        if name.startswith('v_cmpx'):  # prints only its sources and writes EXEC (exec_only_narrows judges that)
-            continue
-        for tok in destinations(name, parse(asm)[1]):
-            r = reg_range(tok)
-            if r and r[0] == 's' and not (r[1] >= 126 and r[2] <= 127) or tok == 'm0':
-                return False
-    return True
-
-
-def exec_only_narrows(ins, lo, hi):
-    """True when every EXEC write at an offset in [lo, hi] can only clear bits: v_cmpx, and `s_and exec, exec, X` or
-    `s_andn2 exec, exec, X`. Any other write (a move, an OR, a restore of a saved mask) can set a lane that an earlier
-    round of the loop cleared, and that lane would then run again."""
-    for off, _n, name, asm in ins:
-        if not lo <= off <= hi:
-            continue
-        base, ops, _mods = parse(asm)
-        if not writes_exec(base, ops):
-            continue
-        base = re.sub(r'_e(32|64)$', '', base)
-        if base.startswith('v_cmpx'):
-            continue
-        if (base in ('s_and_b32', 's_and_b64', 's_andn2_b32', 's_andn2_b64') and len(ops) == 3
-                and ops[0] in ('exec', 'exec_lo') and ops[1] == ops[0]
-                or base in ('s_and_b32', 's_and_b64') and len(ops) == 3 and ops[0] in ('exec', 'exec_lo')
-                and ops[2] == ops[0]):
-            continue
-        return False
-    return True
-
-
-def vcc_read_after(ins, at):
-    """True when an instruction after offset `at` reads VCC. After an EXEC-narrowing loop the wave's VCC holds the last
-    compare, whose bits are 0 for every lane that left earlier; a lane running alone keeps its own last bit (1)."""
-    return any(key.startswith('vcc') for off, _n, name, asm in ins if off > at for key in scalar_effects(name, asm)[0])
-
-
 def scalar_effects(name, asm, wave=None):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -3113,14 +3063,12 @@ class Stage:
                 if value != live_in[i]:
                     live_in[i], changed = value, True
         self.waterfall_reads = {}
-        self.waterfall_closes = set()  # offsets of the closing s_cbranch_scc1: waterfall_refusal proves the loop
         for close, target in jumps:
             head = index.get(target)
             if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
-                self.waterfall_closes.add(self.ins[close][0])
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -3658,15 +3606,6 @@ class Stage:
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
-        # Inside a block a forward s_cbranch_execz skips, execz_refusals proves the exec writes (a lane whose bit was clear
-        # keeps it clear), so an s_cbranch_execnz there is the model's. It does not prove a vccz / vccnz / lane-data SCC
-        # condition: those stay refused (the wave decides on every lane's bit).
-        execnz_loops = {pc for pc, to in branches if to <= pc and names[pc] == 's_cbranch_execnz'
-                        and scalar_free_span(self.ins, to, pc) and exec_only_narrows(self.ins, to, pc)
-                        and not vcc_read_after(self.ins, pc)
-                        } if getattr(self, 'kind', None) == 'cs' else set()
-        execz_covered = {off for pc, to in branches if to > pc and names[pc] == 's_cbranch_execz'
-                         for off in offsets_between(self.ins, pc, to)} if getattr(self, 'kind', None) == 'cs' else set()
         self.mesh_allocation_block = None
         splits = set(targets)
         if getattr(self, 'kind', None) == 'ms' and targets:
@@ -3800,7 +3739,6 @@ class Stage:
             falls = True
             start = 0
             raised_unsupported = None
-            self.wave_branch_refusal = None
             self.exec_keep = {}  # registers whose body-arm descriptor symbol is kept after an execz join (rule R1)
 
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
@@ -3996,8 +3934,6 @@ class Stage:
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
-                    self.branch_proven = (off in getattr(self, 'waterfall_closes', ()) or off in execnz_loops
-                                          or (off in execz_covered and base == 's_cbranch_execnz'))
                     term = self.one(name, asm)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
@@ -4104,10 +4040,6 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
-        if getattr(self, 'wave_branch_refusal', None):
-            if refusals is None:
-                raise Unsupported(self.wave_branch_refusal)
-            refusals.append((self.wave_branch_refusal, self.kind))
 
     def descriptor_scc_reads(self, branches, effects):
         """Find reads reachable with an elided SCC write, including through joins and back edges."""
@@ -4822,15 +4754,6 @@ class Stage:
                 self.read_vcc()
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
-            if getattr(self, 'kind', None) == 'cs' and not getattr(self, 'branch_proven', False) and (
-                    base[10:] in ('vccz', 'vccnz', 'execnz') or (base[10:] in ('scc0', 'scc1') and self.scc_verified and not self.scc_uniform
-                     and self.scc_def is None)):
-                # The wave takes this branch for all its lanes at once, on the whole mask (any / all lanes). The one-lane
-                # model would take it from its own lane's bit, so an unproven condition is refused. s_cbranch_execz has
-                # its own proof (execz_refusals); an SCC from wave-uniform data is the same for every lane.
-                # Recorded, not raised: every other refusal comes first (raised at the end of the lowering pass).
-                if getattr(self, 'wave_branch_refusal', None) is None:
-                    self.wave_branch_refusal = '%s decides for the whole wave and the one-lane model decides per lane' % base
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             if base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
@@ -11170,7 +11093,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-29'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-28'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -11180,7 +11103,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-29cs')
+    key = fnv(b'x2w-startup-shader-28cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

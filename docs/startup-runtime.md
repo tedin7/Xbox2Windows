@@ -208,9 +208,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-29` and `x2w-startup-shader-29cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
 Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
-Revision 29 refuses compute branches that decide for the whole wave but would be lowered per lane.
 Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
 treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
