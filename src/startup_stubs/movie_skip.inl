@@ -12,7 +12,7 @@
 //   frames1    after a successful open the header's frame count is set to 1.
 //   1          same as goto_end.
 // Nothing else is changed. A mode the title does not survive is found by running the modes one after the other on a real
-// title: that is the test plan in pilot/skip_movies_plan.md; none of this is on by default.
+// title (docs/startup-runtime.md, X2W_SKIP_MOVIES); none of this is on by default.
 
 enum MovieImport {
     movie_open, movie_close, movie_next_frame, movie_goto, movie_do_frame, movie_wait, movie_should_skip, movie_pause, movie_imports
