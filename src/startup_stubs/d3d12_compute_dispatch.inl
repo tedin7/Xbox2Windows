@@ -32,6 +32,7 @@ struct ComputeTranslation {
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    bool dynamic_heap = false;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -150,6 +151,11 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             return ComputeTranslation::root_constant;
         };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
+        if (line == "dynamic_resource_heap" && !tr.dynamic_heap) {
+            if (!x2w_local::env_on("X2W_DYNAMIC_RESOURCE_HEAP")) return "the dynamic resource heap is disabled";
+            tr.dynamic_heap = true;
+            continue;
+        }
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
             tr.uds.push_back({a, b});
@@ -212,7 +218,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             return why;
         }
     }
-    if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
+    if (tr.uds.size() != declared_uds || tr.uds.size() + tr.dynamic_heap > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
@@ -223,8 +229,22 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+    const UINT constants = static_cast<UINT>(tr.uds.size()) + tr.dynamic_heap;
+    if (tr.dynamic_heap) {
+        auto* device = device_of(the_device);
+        constexpr auto sm66 = static_cast<D3D_SHADER_MODEL>(0x66);
+        D3D12_FEATURE_DATA_SHADER_MODEL model{sm66};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+            model.HighestShaderModel < sm66 ||
+            FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+            return "the dynamic resource heap requires SM 6.6 and resource binding tier 3";
+    }
+    const auto flags = tr.dynamic_heap ? static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(x2w_startup::root_flag_view_heap_indexed)
+                                      : D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants ? constants : 1,
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), flags)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -305,6 +325,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
         }
     }
+    if (!reason && dispatch.signature && tr->dynamic_heap)
+        reason = "translated indirect Dispatch requires fixed-table raw buffers";
     // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
@@ -530,6 +552,45 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    // Keep the whole logical index range addressable. Put fixed table bindings after it in the same
+    // shader-visible heap, so the count, rather than physical heap size, bounds direct indexing.
+    UINT heap_count = 0;
+    std::vector<IndirectBufferView> heap_views;
+    RecordedDescriptorHeap heap_snapshot;
+    if (!reason && tr->dynamic_heap) {
+        constexpr UINT record_bytes = 32;
+        const auto& table = pass.title_view_heap;
+        if (!table.address || table.bytes % record_bytes || draw_heap_increment != record_bytes)
+            reason = "the dynamic resource heap has no 32-byte records bound";
+        else if (table.bytes / record_bytes > draw_heap_size - count)
+            reason = "the dynamic resource heap exceeds the translated heap capacity";
+        else {
+            heap_count = static_cast<UINT>(table.bytes / record_bytes);
+            heap_views.resize(heap_count);
+            for (UINT i = 0; i < heap_count && !reason; ++i) {
+                std::uint32_t record[4];
+                const auto* entry = reinterpret_cast<const void*>(table.record(u64{i} * record_bytes, sizeof(record)));
+                if (!entry || !x2w_local::readable(entry, sizeof(record))) {
+                    reason = "a dynamic resource heap record is unreadable";
+                    break;
+                }
+                std::memcpy(record, entry, sizeof(record));
+                if (!(record[0] | record[1] | record[2] | record[3])) continue;  // null raw SRV
+                auto& view = heap_views[i];
+                view = indirect_table_buffer(self, record, false, &reason, 16u << 20, true);
+                for (std::size_t o = inputs; !reason && o < count; ++o)
+                    if (view.resource == views[o].resource) reason = "a dynamic resource heap buffer aliases an output";
+            }
+            if (!reason) {
+                heap_snapshot.resources = std::make_shared<DescriptorResources>();
+                const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    heap_count + static_cast<UINT>(count), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+                if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap_snapshot.heap))))
+                    reason = "dynamic resource heap creation failed";
+                values[tr->uds.size()] = heap_count;
+            }
+        }
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -547,15 +608,29 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         return reason;
     }
     const UINT n = static_cast<UINT>(count);
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
-    if (first + n > draw_heap_size) {
-        first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+    ID3D12DescriptorHeap* const bound_heap = heap_snapshot.heap ? heap_snapshot.heap.Get() : draw_heap;
+    UINT first = heap_count;
+    if (!heap_snapshot.heap) {
+        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
+        if (first + n > draw_heap_size) {
+            first = 0;
+            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+        }
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
+    auto dest = bound_heap->GetCPUDescriptorHandleForHeapStart();
+    for (const auto& view : heap_views) {
+        if (view.resource) {
+            heap_snapshot.resources->emplace_back(view.resource);
+            if (!view.upload) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
+        dest.ptr += draw_heap_increment;
+    }
+    if (!heap_snapshot.heap) dest.ptr += std::size_t{first} * draw_heap_increment;
     phases.to(4);
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
+        if (heap_snapshot.heap && view.resource) heap_snapshot.resources->emplace_back(view.resource);
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
@@ -584,15 +659,17 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (!pass.heap_set) {
-        x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
-        pass.heap_set = true;
+    if (heap_snapshot.heap || !pass.heap_set) {
+        x2w_startup::bind_translated_heaps(list, bound_heap, nullptr);
+        pass.heap_set = !heap_snapshot.heap;
         pass.bound_sampler_heap = nullptr;
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());
-    if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (heap_snapshot.heap) recorded_translated_heaps[list].push_back(std::move(heap_snapshot));
+    const UINT constants = static_cast<UINT>(tr->uds.size()) + tr->dynamic_heap;
+    if (constants) list->SetComputeRoot32BitConstants(0, constants, values, 0);
+    if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{bound_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);

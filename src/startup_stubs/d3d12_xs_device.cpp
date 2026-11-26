@@ -1078,6 +1078,7 @@ void retire_release_view_ref(const void* object);
 void retire_drop_heap_views(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
+void discard_translated_heaps(ID3D12CommandList* list);
 void retire_drop_recording(Wrapper* list);
 void release_upload_recording(Wrapper* list);
 void retire_discard_holds(Wrapper* list);
@@ -1151,6 +1152,8 @@ ULONG __stdcall release(Wrapper* self)
         }
         if (self->own().kind == list_kind && self->own().real) {
             release_upload_recording(self);
+            if (x2w_local::env_on("X2W_DYNAMIC_RESOURCE_HEAP"))
+                discard_translated_heaps(static_cast<ID3D12CommandList*>(self->own().real));
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
@@ -1469,7 +1472,6 @@ void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_list_dynamic_state(Wrapper* self);
 void discard_list_gpu_writes(Wrapper* self);
 void commit_list_gpu_writes(Wrapper* self);
-void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void discard_address_uploads(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -2085,7 +2087,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     if (SUCCEEDED(hr)) {
         reset_list_dynamic_state(self);
         discard_list_gpu_writes(self);
-        discard_draw_sampler_heaps(previous);
+        discard_translated_heaps(previous);
         discard_address_uploads(previous);
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
@@ -2124,7 +2126,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
         discard_list_gpu_writes(self);
-        discard_draw_sampler_heaps(list);
+        discard_translated_heaps(list);
         discard_address_uploads(list);
         discard_mesh_lease_recording(list);
         retire_drop_recording(self);
@@ -4528,7 +4530,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             });
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
-            retire_draw_sampler_heaps(queue, native_lists);
+            retire_translated_heaps(queue, native_lists);
             note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
             residency_note_submission(queue, wrappers);

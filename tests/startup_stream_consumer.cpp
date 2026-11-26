@@ -311,7 +311,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
-    if (heap_record)
+    if (mode == "dispatch-heap-dynamic") {
+        // Keep the fixed UAV at byte 16. Heap records 0 and 2 read distinct, overlapping ranges of
+        // the input buffer. Records 1 and 3 are null, and record 4 is past the logical heap.
+        std::memset(reinterpret_cast<void*>(cpu + 32), 0, 96);
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[0] + 4);
+        const UINT shifted[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | 4u << 16, words - 4, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu + 64), shifted, sizeof(shifted));
+    } else if (heap_record)
         for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
                         sizeof(descriptors[0]));

@@ -16975,6 +16975,8 @@ python -B tests/startup_gfx2hlsl_heap_word_check.py --llvm-mc llvm-mc-15
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_heap_word_" -V
 ```
 
+See [dynamic compute heap records](experiments/dynamic-compute-heap.md) for the opt-in shader-side path.
+
 #### Named reasons for an input buffer range
 
 The refusal `an input is not a complete GPU-backed buffer range` is split into the condition that failed, in the same census lines: `an input buffer descriptor has zero records`; a range over 16 MiB or not whole dwords; a range that crosses the end of a placed buffer or of its upload allocation; an address outside any placed buffer; `an input is in a placed buffer that does not alias title memory`; a view token that is not a buffer view of a desktop resource, has no element size, names upload memory, is not on a default or upload heap, or whose resource does not hold its range; a null address; a range not 16-byte aligned in its resource; a released resource, one not created in the common state, one on another device, and a range outside its desktop buffer. The first refusal of a key also logs which input it was and where its descriptor was read (`x2w-draw compute <key> first refused input <i> (table|heap <a> <b>), descriptor at <address>`). Only the reason changes: what was bound is still bound, what was refused is still refused, and the draw paths that call the same function do not ask for it.

@@ -3589,6 +3589,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
     add_test(NAME startup_compute_cube COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_cube_check.py")
+    add_test(NAME startup_gfx2hlsl_heap_dynamic COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_dynamic_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
@@ -5038,6 +5040,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             startup_compute_dispatch_input_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_compute_dispatch_heap_dynamic_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_dynamic_check.py"
+        "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}")
+    set_tests_properties(startup_compute_dispatch_heap_dynamic_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_list_cost_bench_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py" "$<TARGET_FILE:startup_stream_consumer>"

@@ -3024,6 +3024,9 @@ class Stage:
                 any(self.sym.get(104 + i) != desc_word(s, s[3] + i) for i in range(1, 4))):
             raise Unsupported('descriptor operand %s needs four consecutive words of the same descriptor' % tok)
         if s and s[0] == 'desc':
+            if s[1][0] == 'dynamic_resheap' and (r[2] != r[1] + 3 or any(
+                    self.sym.get(r[1] + i) != ('desc', s[1], 0, i) for i in range(4))):
+                raise Unsupported('modified dynamic resource heap descriptor %s' % tok)
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
@@ -3679,6 +3682,7 @@ class Stage:
                 branches.append((off, target))
         if getattr(self, 'kind', None) == 'cs':
             self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
+            self.heap_back_edges = [(target, pc) for pc, target in branches if target <= pc]
         # Forward edges reach each block in disassembly order. A back edge could
         # repeat a pointer advance before the next table load.
         self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
@@ -6462,6 +6466,22 @@ class Stage:
         what = 's_load of a resource heap record'
         r = reg_range(token)
         index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        # Prefer the original fixed binding. The opt-in retry captures a proven uniform byte offset at the load,
+        # so subsequent SGPR writes do not change the descriptor that later raw reads see.
+        if (not index or index == ('buffer',)) and getattr(self.pipe, 'allow_dynamic_heap', False):
+            if (r and r[0] == 's' and r[1] == r[2] and r[1] <= 105 and count == 4 and imm is None
+                    and self.sym.get(base[2]) == ('const', 0) and self.tracks_uniformity()
+                    and self.uniform_cf and r[1] in self.defined_uniform_s and self.uniform_source(token)):
+                # A copied descriptor can outlive the load. A loop could otherwise overwrite its captured offset.
+                if any(start <= self.pc <= end for start, end in self.heap_back_edges):
+                    raise Unsupported('%s with a dynamic offset inside a loop' % what)
+                expr = self.smem_soffset(token)
+                self.pipe.dynamic_heap_offsets.add(self.pc)
+                self.emit('heap_offset_%x = %s;' % (self.pc, expr))
+                source = ('dynamic_resheap', self.pc)
+                for i in range(4):
+                    self.set_s(dst[1] + i, None, ('desc', source, 0, i), uniform=False)
+                return
         if index == ('buffer',):
             raise Unsupported('%s whose index is read from a buffer other than a table buffer at a dispatch-constant '
                               'offset' % what)
@@ -6683,7 +6703,9 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
-        buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
+        key = self.descriptor(ops[1])
+        dynamic = key[0][0] == 'dynamic_resheap'
+        buf = None if dynamic else self.pipe.resource(key, 'buf')
         token = smem_offset(ops[2])
         is_lit = bool(re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token))
         if is_lit:
@@ -6717,7 +6739,9 @@ class Stage:
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
+            address = '%s + %d' % (offset, extra + 4 * i)
+            expr = self.dynamic_heap_load(key, address) if dynamic else '%s.Load(%s)' % (buf, address)
+            self.set_s(dst[1] + i, expr, uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
             if hasattr(self, 'heap_index'):
@@ -6735,7 +6759,12 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods):
+    def dynamic_heap_load(self, key, address):
+        if key in self.pipe.modified:
+            raise Unsupported('load through a modified dynamic resource heap descriptor')
+        return 'load_heap_buffer(heap_offset_%x, %s)' % (key[0][1], address)
+
+    def buffer_address(self, ops, mods, *, dynamic_raw=False):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -6749,7 +6778,12 @@ class Stage:
         if len(ops) != 4:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         key = self.descriptor(ops[2])
-        buf = self.pipe.resource(key, 'buf')
+        if key[0][0] == 'dynamic_resheap':
+            if not dynamic_raw or 'idxen' in mods:
+                raise Unsupported('dynamic resource heap descriptor requires a raw buffer load without idxen')
+            buf = key
+        else:
+            buf = self.pipe.resource(key, 'buf')
         soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -6796,10 +6830,12 @@ class Stage:
         if not ops:
             raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
-        buf, address = self.buffer_address(ops, mods)
+        buf, address = self.buffer_address(ops, mods, dynamic_raw=True)
         self.emit('a = %s;' % address)
         for i in range(count):
-            self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i))
+            address = 'a + %d' % (4 * i)
+            expr = self.dynamic_heap_load(buf, address) if isinstance(buf, tuple) else '%s.Load(%s)' % (buf, address)
+            self.set_v(dst[1] + i, expr)
 
     def op_buffer_load_dwordx2(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 2)
@@ -11734,6 +11770,8 @@ class ComputePipeline(Pipeline):
         self.rw_keys = set()
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
+        self.dynamic_heap_enabled = os.environ.get('X2W_DYNAMIC_RESOURCE_HEAP') == '1'
+        self.allow_dynamic_heap = self.dynamic_heap_enabled and refusals is not None
         self._build_stage()
 
     def _build_stage(self):
@@ -11744,6 +11782,14 @@ class ComputePipeline(Pipeline):
                 return self._reset_stage()
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
+            except Unsupported as reason:
+                # Retry only a rejected translation. Successful programs retain their original lowering,
+                # including those whose first analysis pass speculatively encounters a rejected heap load.
+                if (self.allow_dynamic_heap or not self.dynamic_heap_enabled or not str(reason).startswith((
+                        's_load of a resource heap record whose offset is not a root constant',
+                        's_load of a resource heap record whose index is read from a buffer'))):
+                    raise
+                self.allow_dynamic_heap = True
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
@@ -11757,11 +11803,14 @@ class ComputePipeline(Pipeline):
         self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
+        self.dynamic_heap_offsets = set()
         if refusals is not None:
             del refusals[self._refusals_before:]
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
+        if key[0][0] == 'dynamic_resheap':
+            raise Unsupported('dynamic resource heap descriptor requires a raw buffer load')
         if key in self.rw_keys and kind == 'buf':
             return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
@@ -11807,14 +11856,37 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
-        return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
+        common = self.common()
+        locals_ = []
+        if self.dynamic_heap_offsets:
+            # Append an entry word after the ordinary manifest values, so their indices stay unchanged.
+            count = 'ud%d' % len(self.uds)
+            if self.uds:
+                common = [line.replace(' };', ' uint %s; };' % count) if line.startswith('cbuffer entry') else line
+                          for line in common]
+            else:
+                common.append('cbuffer entry : register(b0) { uint %s; };' % count)
+            common.extend([
+                'uint load_heap_buffer(uint offset, uint address) {',
+                '    uint index = offset / 32u;',
+                '    if ((offset & 31u) != 0u || index >= %s) return 0u;' % count,
+                '    ByteAddressBuffer buffer = ResourceDescriptorHeap[index];',
+                '    return buffer.Load(address);',
+                '}',
+            ])
+            locals_ = ['    uint heap_offset_%x = 0;' % pc for pc in sorted(self.dynamic_heap_offsets)]
+        return '\n'.join(common + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
-                         + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
+                         + s.declarations() + locals_ + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
         lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
+        if self.dynamic_heap_offsets:
+            if len(self.uds) >= 32:
+                raise Unsupported('no entry word available for the dynamic resource heap size')
+            lines.append('dynamic_resource_heap')
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             if source[0] == 'table':
                 where = 'table %d %d' % (source[1], off or 0)
@@ -12022,7 +12094,7 @@ def log_unvalidated_lod(key, pipe):
 
 
 def translate_compute(out_dir, key):
-    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
+    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
     with suppress(FileNotFoundError):
@@ -12039,13 +12111,16 @@ def translate_compute(out_dir, key):
     if os.environ.get('X2W_FXC') != '':
         compiler = find_dxc()
         if compiler is None:
-            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            model = '6.6' if pipe.dynamic_heap_offsets else '6.0'
+            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model %s' % (
+                os.environ.get('X2W_DXC', '<unset>'), model)
             open(name + '.fail', 'w').write(message + '\n')
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
             bytecode = os.path.join(staging, 'cs.cso')
-            r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
+            profile = 'cs_6_6' if pipe.dynamic_heap_offsets else 'cs_6_0'
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
                                capture_output=True, text=True)
             if r.returncode or not has_bytecode(bytecode):
                 # DXC names the source path; keep only the diagnostic after it.

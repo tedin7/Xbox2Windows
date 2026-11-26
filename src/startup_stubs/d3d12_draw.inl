@@ -1304,33 +1304,38 @@ bool ensure_draw_heap(Wrapper* device)
 // A recorded table is immutable. Keep it alive until its submission completes,
 // including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
-std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
-struct SubmittedDrawSamplerHeaps {
-    x2w_startup::ComPtr<ID3D12Fence> fence;
-    std::vector<DrawSamplerHeap> heaps;
+using DescriptorResources = std::vector<x2w_startup::ComPtr<ID3D12Resource>>;
+struct RecordedDescriptorHeap {
+    x2w_startup::ComPtr<ID3D12DescriptorHeap> heap;
+    std::shared_ptr<DescriptorResources> resources;  // only the dynamic resource heap needs this
 };
-std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
+std::unordered_map<ID3D12CommandList*, std::vector<RecordedDescriptorHeap>> recorded_translated_heaps;
+struct SubmittedTranslatedHeaps {
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    std::vector<RecordedDescriptorHeap> heaps;
+};
+std::vector<SubmittedTranslatedHeaps> submitted_translated_heaps;
 
-void discard_draw_sampler_heaps(ID3D12CommandList* list)
+void discard_translated_heaps(ID3D12CommandList* list)
 {
     draw_lock_acquire_exclusive();
-    recorded_draw_sampler_heaps.erase(list);
+    recorded_translated_heaps.erase(list);
     draw_lock_release_exclusive();
 }
 
 // draw_lock held. The lists have already been executed on this queue. A closed list can be
 // submitted again until its Reset, so each submit takes its own references and the recording
-// keeps its own until discard_draw_sampler_heaps.
-void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
+// keeps its own until discard_translated_heaps.
+void retire_translated_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
 {
-    submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
-        submitted_draw_sampler_heaps.end(), [](const SubmittedDrawSamplerHeaps& batch) {
+    submitted_translated_heaps.erase(std::remove_if(submitted_translated_heaps.begin(),
+        submitted_translated_heaps.end(), [](const SubmittedTranslatedHeaps& batch) {
             return batch.fence && batch.fence->GetCompletedValue() != 0;
-        }), submitted_draw_sampler_heaps.end());
-    SubmittedDrawSamplerHeaps batch;
+        }), submitted_translated_heaps.end());
+    SubmittedTranslatedHeaps batch;
     for (auto* list : lists) {
-        auto it = recorded_draw_sampler_heaps.find(list);
-        if (it == recorded_draw_sampler_heaps.end()) continue;
+        auto it = recorded_translated_heaps.find(list);
+        if (it == recorded_translated_heaps.end()) continue;
         for (const auto& heap : it->second) batch.heaps.push_back(heap);
     }
     if (batch.heaps.empty()) return;
@@ -1344,7 +1349,7 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
         batch.fence.Reset();
         log("x2w-draw sampler heap retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
     }
-    submitted_draw_sampler_heaps.push_back(std::move(batch));
+    submitted_translated_heaps.push_back(std::move(batch));
 }
 
 struct TextureUpload {
@@ -1511,7 +1516,7 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    recorded_draw_sampler_heaps[list].push_back(heap);
+    recorded_translated_heaps[list].push_back({heap, {}});
     pass.sampler_heap = std::move(heap);
     pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
     return true;
