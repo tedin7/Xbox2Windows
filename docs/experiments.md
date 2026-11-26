@@ -173,6 +173,16 @@ The source is a same-device desktop resource with no title shadow, a unique alia
 or an already covered range. Later overlapping copies invalidate earlier coverage.
 The recording discards this proof at Close, so another recording needs its own writer.
 
+`X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1` lets a translated compute Dispatch read an input that lies in a placed buffer which does
+not alias title memory. That buffer's desktop copy is a committed default buffer that holds zeros, so the bytes the title wrote
+exist only in title memory. The input resolves in this order: a validated GPU copy of the current recording (the proof above,
+which needs `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1`), else a snapshot of the range (at most 16 MiB) taken from title memory
+into the upload ring when the Dispatch is recorded, else the refusal `an input is in a placed buffer that does not alias title
+memory`. A guest write after the recording is not seen, and data a GPU pass wrote into such a buffer is not either. The first
+use per pipeline key logs `x2w-draw compute <key> input <n> (...) comes from a GPU copy this list made|a snapshot of title
+memory`, and the render totals line counts both paths. Off by default; `tools/startup/tester_run.ps1` turns it on
+(`-NoTitleInputSnapshot` turns it off). `startup_compute_dispatch_input` covers it with the `dispatch-input-snapshot` case.
+
 The source-built fixture reproduces a 68-byte request shape with source offset `0xbfffa0`.
 Its compute writer fills the source with contrasting colours. The consumer reads red
 from the second DWORD in the destination while the title-side green sentinel stays
