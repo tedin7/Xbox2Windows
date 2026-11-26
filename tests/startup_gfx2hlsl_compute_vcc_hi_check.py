@@ -103,7 +103,7 @@ def check_controls():
         assert line in asm, (line, asm)
     hlsl = translate().hlsl_cs()
     assert 'vcc_hi' not in hlsl, hlsl
-    assert re.search(r'\bs\d+ = 0x40400000u;', hlsl), hlsl
+    assert 'F(0x40400000u)' in hlsl, hlsl      # the scalar's value reaches the add
     # the caller's statement that the program is wave32 gives the same translation
     assert translate(wave_size=32).hlsl_cs() == hlsl
     # a program that names the 64-bit pair vcc keeps vcc_hi as the high half of the mask: refused as before
@@ -115,7 +115,7 @@ def check_controls():
 
 CONTROLS = {
     # vcc_hi read as zero: every lane's v9 is float(lane) and lane 0 shows 0 instead of 3.0
-    'vcc-hi-lost': (lambda h: re.sub(r'(\bs\d+) = 0x40400000u;', r'\1 = 0x00000000u;', h, count=1), dict(vcc_hi=0.0)),
+    'vcc-hi-lost': (lambda h: h.replace('F(0x40400000u)', 'F(0x00000000u)', 1), dict(vcc_hi=0.0)),
 }
 
 
