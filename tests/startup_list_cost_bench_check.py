@@ -89,7 +89,7 @@ def main(consumer, dxc, adapter):
         assert len(bench) == 1 and len(slots) == 1, (result.stdout[-800:], result.stderr[-800:])
         assert 'slot14 ' in slots[0] and 'slot35 ' in slots[0] and 'slot39 ' in slots[0], slots
         threads = int(env['X2W_TEST_BENCH_THREADS'])
-        refused = lines(result, 'refused')
+        rounds = int(env['X2W_TEST_BENCH_CALLS'])
         print(bench[0])
         print(slots[0])
         target = os.environ.get('X2W_BENCH_OUT')
