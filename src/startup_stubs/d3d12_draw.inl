@@ -1478,12 +1478,14 @@ struct FrameCopy {
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
+LONG64 big_copies_reused, big_copies_made;
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
-        frame_copies().clear();
         frame_copies_frame = frame_number;
+        x2w_local::trim_frame_copies(frame_copies());
     }
     const u64 key = address * 1099511628211ull ^ bytes;
     const auto* title = reinterpret_cast<const unsigned char*>(address);
@@ -1499,6 +1501,7 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
                 ReleaseSRWLockExclusive(&allocator_lock);
                 *offset = slice.offset;
                 if (resource) *resource = slice.resource;
+                if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
                 return true;
             }
         }
@@ -1517,6 +1520,7 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
     std::memcpy(slice.mapped, source, bytes);
+    if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_made);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))

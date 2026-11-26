@@ -19,6 +19,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/committed_range.h"
 #include "startup_stubs/zero_tail.h"
+#include "startup_stubs/copy_cache_trim.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -7568,6 +7569,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+        log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
         for (int size_class = 0; size_class < 2; ++size_class) {
             const auto& step = buffer_step_stats[size_class];
             log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
