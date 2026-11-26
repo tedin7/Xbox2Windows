@@ -6621,7 +6621,7 @@ class Stage:
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
         terms.append(str(offset))
-        return data, self.pipe.uav(key), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
+        return data, self.pipe.uav(key, rw=kind_label == 'buffer store'), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -10202,7 +10202,7 @@ class Pipeline:
     def stored_images(self):
         return self.uavs or {}
 
-    def uav(self, key, kind):
+    def uav(self, key, kind, rw=False):
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
         if self.uavs is None:
@@ -10782,6 +10782,7 @@ class ComputePipeline(Pipeline):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
         if refusals is not None:
@@ -10792,12 +10793,16 @@ class ComputePipeline(Pipeline):
         if key in self.rw_keys and kind == 'buf':
             return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
-            raise ReadWriteBuffer(key, self.uavs[key]['kind'] == 'raw' and kind == 'buf')
+            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
         return super().resource(key, kind)
 
-    def uav(self, key, kind='raw'):
+    def uav(self, key, kind='raw', rw=False):
+        # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
+        # atomics keep the refusal.
         if key in self.resources:
-            raise ReadWriteBuffer(key, self.resources[key]['kind'] == 'buf' and kind == 'raw')
+            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
+        if rw:
+            self.plain_stored.add(key)
         return super().uav(key, kind)
 
     def stored_images(self):

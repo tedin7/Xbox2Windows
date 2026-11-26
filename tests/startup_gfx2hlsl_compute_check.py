@@ -1657,8 +1657,8 @@ def check_controls():
     store = '001070e004050480'
     for word, fragment in (('000070e004050480', 'not proven wave-uniform'),  # off: one address, per-lane data
                            ('002070e004050480', 'modifier idxen'),         # idxen, no offen
-                           ('005070e004050480', 'modifier glc'),           # glc offen
-                           ('001070e004050380', 'used for a load and a store')):  # store through the read descriptor
+                           ('005070e004050480', 'modifier glc')):          # glc offen
+        # (a store through a descriptor the program also loads is lowered as one RW view: startup_compute_rw_buffer)
         refused(fragment, lambda w=word: translate('A', code=patch(WORDS_A, store, w)).hlsl_cs())
     # Graphics stages keep the unknown-op refusal text, so refusal census buckets do not move.
     for count, text in ((1, 'buffer_store_dword'), (4, 'buffer_store_dwordx4')):
