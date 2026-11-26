@@ -1,22 +1,24 @@
 // Memory pages for replay recordings (docs/startup-runtime.md#d3d12-replay-record), the page store of replay_pages.h:
 // PAGE chunks (one per distinct non-zero 4 KiB page) and MAP chunks (which pages a range holds, only runs that changed).
 // Included inside namespace replay_record by d3d12_record.inl; each hook appends to the caller's thread buffer `b` (its lock
-// held by the caller) and a replay applies a MAP before the call or mark with the MAP's seq.
+// held by the caller). Replay applies a MAP before the first call with a larger sequence number.
 //
 // Memory = the resources that have title_memory and a known size (placed resources, hook allocations), merged and cut to
 // whole pages. When the window opens one pass writes the base image of all of them; after each present a pass limited to
 // X2W_REPLAY_SCAN_MS (default 250) continues round-robin and writes only pages that changed since this recording last saw
-// them. A MAP read at present N is stamped with the mark of present N-1: the frame that used the memory starts after it.
+// them. By default a MAP read at present N is stamped with the mark of present N-1.
+// X2W_REPLAY_PAGES_AT_SUBMIT=1 also scans before each submission inside the window.
 // The size cap is X2W_REPLAY_MAX_MIB as for calls. X2W_REPLAY_PAGES=0 leaves the pages out.
-// One line of counters after the base image and about every 20th present:
+// One line of counters after the base image and about every 20th scan:
 //   x2w-replay pages: ranges N (M MiB), pages seen S, distinct D, zero Z, unchanged U, written W MiB, skipped (no size) K,
 //   unreadable R, scan T ms
 constexpr std::size_t page_slab_bytes = 1u << 20;
 
 struct PageRange { u64 address, bytes; };
-x2w_replay::PageWriter* page_writer;  // made at the first window open; never freed
+x2w_replay::PageWriter* page_writer;  // created lazily by the first page hook; never freed
 bool page_writer_tried;
 ThreadBuffer* page_target;            // the buffer the running scan appends to (its lock is held by the caller)
+u64 page_last_submit;                 // latest scanned ExecuteCommandLists call (pages_lock)
 u64 page_prev_mark;                   // the previous present's mark, the stamp of the next scan
 SRWLOCK pages_lock = SRWLOCK_INIT;   // one scan at a time; held for the whole scan
 double page_scan_ms = 250.0;
@@ -147,10 +149,9 @@ void page_scan(bool everything, u64 stamp)
     }
 }
 
-// The window has just opened at present `present` (mark `seq`): the base image of the memory a replay needs.
-inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
+// Either a Present or a submit can be the first scan (pages_lock held).
+void init_page_writer()
 {
-    (void)present;
     if (!page_writer_tried) {
         page_writer_tried = true;
         char value[32]{};
@@ -166,31 +167,46 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
             page_range_limit = static_cast<u64>(std::atof(value) * 1048576.0);
         page_writer = new x2w_replay::PageWriter(page_sink);
     }
-    page_prev_mark = seq;
-    if (!page_writer || !TryAcquireSRWLockExclusive(&pages_lock)) return;
+}
+
+void scan_pages_into(ThreadBuffer& b, bool everything, u64 stamp)
+{
+    if (!page_writer) return;
     page_target = &b;
-    page_scan(true, seq);
+    page_scan(everything, stamp);
     page_target = nullptr;
+}
+
+// The window has just opened at a Present: take the base image.
+inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
+{
+    (void)present;
+    page_prev_mark = seq;
+    if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
+    init_page_writer();
+    scan_pages_into(b, true, seq);
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
-// A present inside the window: the pages changed since the last capture, within the time budget.
+// With submit scans enabled, changes observed at Present must follow the latest scanned submission.
 inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
     const u64 stamp = page_prev_mark ? page_prev_mark : seq;
     page_prev_mark = seq;
-    if (!page_writer || !TryAcquireSRWLockExclusive(&pages_lock)) return;
-    page_target = &b;
-    page_scan(false, stamp);
-    page_target = nullptr;
+    if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
+    scan_pages_into(b, false, (std::max)(stamp, page_last_submit));
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
-// Before an ExecuteCommandLists inside the window (queue slot 10; a compute-only stretch has no present): the pages
-// changed since the last capture. `seq` is the Execute call's sequence number minus one, so a replay writes them before
-// that call. Empty until the page store fills it.
+// seq is one less than ExecuteCommandLists' sequence. The player applies the MAP before that call.
 inline void pages_at_submit(ThreadBuffer& b, u64 seq)
 {
-    (void)b, (void)seq;
+    if (stop_requested || stopped || !TryAcquireSRWLockExclusive(&pages_lock)) return;
+    init_page_writer();
+    if (page_writer && !page_budget_reached && !stop_requested && !stopped) {
+        scan_pages_into(b, false, seq);
+        page_last_submit = (std::max)(page_last_submit, seq + 1);
+    }
+    ReleaseSRWLockExclusive(&pages_lock);
 }

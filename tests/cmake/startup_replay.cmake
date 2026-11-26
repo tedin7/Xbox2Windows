@@ -16,3 +16,15 @@ if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:x2w_replay>")
     set_tests_properties(startup_replay_pages_play PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
+
+add_executable(startup_replay_submit_pages tests/startup_replay_submit_pages.cpp)
+target_compile_features(startup_replay_submit_pages PRIVATE cxx_std_17)
+target_link_libraries(startup_replay_submit_pages PRIVATE d3d12_xs_shim d3d12 dxgi)
+if(EXISTS "${INTAKE_PYTHON}")
+    foreach(backend warp hardware)
+        add_test(NAME startup_replay_submit_pages_${backend}
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_submit_pages_check.py"
+                "$<TARGET_FILE:startup_replay_submit_pages>" "$<TARGET_FILE:x2w_replay>" "${backend}")
+        set_tests_properties(startup_replay_submit_pages_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

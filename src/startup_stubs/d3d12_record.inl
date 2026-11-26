@@ -26,6 +26,7 @@ constexpr int record_depth = 2;  // argument memory, the memory it points at (a 
 
 void* original[kind_count][wide_slots];
 bool armed;
+bool scan_submit_pages;
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -251,7 +252,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     // ExecuteCommandLists takes no float arguments, so the page scan may run before it.
     if constexpr (K == queue_kind && N == 10) {
-        if (window_open) {
+        if (window_open && scan_submit_pages) {
             ThreadBuffer& b = my_buffer();
             AcquireSRWLockExclusive(&b.lock);
             pages_at_submit(b, seq - 1);
@@ -490,6 +491,7 @@ void install()
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
     write_raw(head.data(), head.size());
+    scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
     armed = true;
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();

@@ -1885,7 +1885,7 @@ same calls to the stand-in later: the runtime and the translator run for real on
 Unset, no slot is wrapped and nothing changes.
 
 Every slot of every object kind is wrapped once the tables are built. A wrapped slot takes a sequence number and calls
-the real slot first (nothing else runs before it, so float arguments in xmm registers arrive unchanged), then appends
+the real slot first except for the optional submit scan below, then appends
 to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
 present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
 are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
@@ -1904,7 +1904,13 @@ Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 *
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven
 argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
-Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
+Float argument values and device creation are not recorded.
+
+`X2W_REPLAY_PAGES_AT_SUBMIT=1` scans registered title-memory pages before `ExecuteCommandLists` inside the recording
+window. Use `X2W_REPLAY_RECORD=all` for a workload without Present. The first submit can initialize the page store.
+Submissions and Presents share the change-only page store and its `X2W_REPLAY_PAGES_MAX_MIB` budget. Submit scans
+use the same round-robin `X2W_REPLAY_SCAN_MS` limit as Present rescans (default 250 ms). A submit MAP carries the
+submit's sequence number minus one. `X2W_REPLAY_PAGES=0` disables page capture.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
@@ -1931,10 +1937,21 @@ with a buffer of the replayer's. Title memory recorded as pages (`PAGE`/`MAP`, s
 reserved and committed at its recorded addresses before the stand-in loads (merged into 64 KiB spans; a span that cannot
 be had stops the replay with exit 3 and its address), and every `MAP` is written before the first call with a larger
 sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
-span's final image hash. Not replayed yet: float arguments passed by value, one thread per recorded thread.
+span's final image hash. Set `X2W_REPLAY_DUMP_MAP_RANGES=1` in the player environment to write
+`map_<sequence>.bin` for an explicit, nonempty buffer Map read range, when the call succeeds and writes its
+output. Wait for GPU completion before Map in the recorded workload. Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
+```
+
+The no-Present fixture sends two copies on a compute queue, writes different bytes to a placed buffer before each
+submit, and fences each readback. It compares both pages with the live readback and checks that removing the second
+submit MAP leaves the first page's bytes in the second readback. The fixture requires an adapter with support for
+heaps backed by existing CPU memory.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_submit_pages_(warp|hardware)$' --output-on-failure
 ```
 
 ## D3D12 view census
