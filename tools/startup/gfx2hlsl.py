@@ -12344,20 +12344,23 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
 
 
 def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
-    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
-    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
-    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
+    then graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
+    since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
+    family: a .fail's time does not prove which build wrote it (Run P kept a pixel MRTZ request refused by a stale
+    .fail although that build translates it), and those families are few."""
     rows = []
-    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
+    for order, key in enumerate(pending_keys(out_dir, False, None)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
-            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
-                continue
+            newer = since_translator is not None and os.path.getmtime(fail) >= since_translator
             with open(fail, encoding='utf-8', errors='replace') as handle:
                 reason = handle.readline()
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
+        if newer and not lifted:
+            continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
         rows.append((not lifted, compute, order, key, lifted))
     return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
@@ -12403,6 +12406,10 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    for key, result in results.items():
+        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+            with suppress(OSError):
+                os.remove(os.path.join(out_dir, '%016x.fail' % key))
     ok = sum(1 for result in results.values() if result == 'ok')
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
                        sum(1 for _key, lifted in rows if lifted))
