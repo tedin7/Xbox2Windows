@@ -316,29 +316,43 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
     }
 
-    x2w_startup::PlacedBufferRange memory{};
-    if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
-        !memory.covered) {
-        if (memory.region_info)
-            prove(x2w_startup::SrvRefusalKind::fully_committed);
-        else if (memory.witness)
-            prove(x2w_startup::SrvRefusalKind::witness_page, memory.witness, reinterpret_cast<u64>(memory.base));
-        return nullptr;
-    }
-
-    const auto nearby = placed_buffer_range(device, page_start, page_span, true);
-    if (nearby.reject || nearby.owner) {
-        prove(x2w_startup::SrvRefusalKind::independent);
-        return nullptr;
-    }
-
     // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
-    // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
-    // starts at the address itself (checked above to lie inside memory the title owns).
-    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    // a multiple of the element size past it, no FirstElement can name the address; likewise when the surrounding page is not
+    // fully committed or shares its page with a placed resource. In those cases the view is backed by an upload copy that
+    // starts at the address itself, which only needs the viewed range to be committed and free of placed resources.
+    bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    x2w_startup::PlacedBufferRange memory{};
+    const bool page_committed = x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) && memory.covered;
+    bool page_clear = false;
+    if (page_committed) {
+        const auto nearby = placed_buffer_range(device, page_start, page_span, true);
+        page_clear = !nearby.reject && !nearby.owner;
+    }
+    if (!page_clear) exact = true;
     if (exact) {
         page_start = address;
         page_span = span_bytes;
+        if (!page_clear) {
+            x2w_startup::PlacedBufferRange range{};
+            const bool range_committed = x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(address), span_bytes, range) && range.covered;
+            const auto nearby = range_committed ? placed_buffer_range(device, address, span_bytes, true) : PlacedVertexView{};
+            if (!range_committed || nearby.reject || nearby.owner) {
+                static LONG logged;
+                if (first_calls(logged, 12))
+                    log("x2w-d3d12 slot70 unplaced buffer refused: gate=%s span=%llu elem=%llu",
+                        !range_committed ? "range_not_committed" : "range_shares_placed_resource", span_bytes, elem_bytes);
+                if (!range_committed) {
+                    if (range.region_info)
+                        prove(x2w_startup::SrvRefusalKind::fully_committed);
+                    else if (range.witness)
+                        prove(x2w_startup::SrvRefusalKind::witness_page, range.witness, reinterpret_cast<u64>(range.base));
+                } else {
+                    prove(x2w_startup::SrvRefusalKind::independent);
+                }
+                return nullptr;
+            }
+            memory = range;
+        }
     }
 
     auto* desktop = device_of(device);
