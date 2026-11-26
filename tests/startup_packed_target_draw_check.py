@@ -145,6 +145,9 @@ def check(work, consumer, dxc, backend):
             raise RuntimeError(f"{name}: draw failed on {backend} ({run.returncode})\n{run.stderr[-2000:]}")
         pixels = image.read_bytes()
         assert len(pixels) == 64 * 64 * 4, f"{name}: {len(pixels)} bytes"
+        distinct = len({tuple(pixels[i:i + 4]) for i in range(0, len(pixels), 4)})
+        uploads = [line for line in run.stderr.splitlines() if "texture upload" in line or "texture not uploaded" in line]
+        print(f"{backend} {name}: {distinct} distinct colours; upload log lines: {uploads[:3] or 'NONE (no upload was recorded)'}")
         good = 0
         for y in range(64):
             for x in range(64):

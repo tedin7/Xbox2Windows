@@ -175,11 +175,14 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
     std::fflush(stdout);
     binding.backing.resize(static_cast<std::size_t>(input.width) * input.height * 4 + 0x10000);
     if (fill) {
-        // Tight rows of 16-bit texels, as a title writes them for a linear texture of that description.
+        // The title's memory of a linear texture holds the DESKTOP footprint the XG stand-in reported: rows padded to
+        // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256), which upload_texture copies as one block from the base address
+        // (d3d12_draw.inl, plan.upload / ring_copy). Tight rows would shear the picture.
+        const std::size_t pitch = (static_cast<std::size_t>(input.width) * 2 + 255) & ~std::size_t{255};
         for (UINT y = 0; y < input.height; ++y)
             for (UINT x = 0; x < input.width; ++x) {
                 const std::uint16_t texel = packed_fill_texel(x, y);
-                const std::size_t at = (static_cast<std::size_t>(y) * input.width + x) * 2;
+                const std::size_t at = static_cast<std::size_t>(y) * pitch + x * 2;
                 binding.backing[at] = static_cast<unsigned char>(texel & 0xff);
                 binding.backing[at + 1] = static_cast<unsigned char>(texel >> 8);
             }
