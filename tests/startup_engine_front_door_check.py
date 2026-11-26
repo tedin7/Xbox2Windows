@@ -41,9 +41,9 @@ def expect(name, got, want):
 
 
 def run(call):
-    """(result, what was printed) of one call."""
+    """(result, what was logged on stderr) of one call: stdout stays the translator's result lines."""
     out = io.StringIO()
-    with contextlib.redirect_stdout(out):
+    with contextlib.redirect_stderr(out):
         result = call()
     return result, out.getvalue()
 

@@ -11899,13 +11899,13 @@ def translate_compute_via_engine(out_dir, key, refusal):
     if outcome == 'ok':
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
-        print('x2w: compute %016x translated via engine' % key, flush=True)
+        print('x2w: compute %016x translated via engine' % key, file=sys.stderr, flush=True)
         return 'ok'
     # Both refused: keep this translator's reason on record (the statistics stay comparable) and note the engine's.
     if fail_text is not None:
         with open(name + '.fail', 'w') as f:
             f.write(fail_text)
-    print('x2w: compute %016x engine also refused: %s' % (key, str(outcome)[:120]), flush=True)
+    print('x2w: compute %016x engine also refused: %s' % (key, str(outcome)[:120]), file=sys.stderr, flush=True)
     return refusal
 
 
