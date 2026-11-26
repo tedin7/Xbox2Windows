@@ -541,10 +541,12 @@ def controls():
     refused('dmask0', 'empty dmask')
     for name in RESERVED:
         refused(name, 'image_sample_b modifier reserved')
-    refused('sampler bias', 'image_sample_b with a sampler LOD bias (word 2 0x4000001)')
-    refused('sampler bias sec', 'image_sample_b with a sampler LOD bias (word 2 0x4004000)')
+    biased = stage('sampler bias')
+    assert '.SampleBias(' in biased.hlsl_ps()
+    assert 'smplb 0 0x0 0x200000 0x4000001 0x0' in biased.manifest().splitlines()
+    refused('sampler bias sec', 'image_sample_b with sampler LOD_BIAS_SEC (word 2 0x4004000)')
     print('refused: b_cl, c_b, offset, gather4_b, cube, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
-          'reserved bits, sampler LOD bias')
+          'reserved bits, secondary sampler LOD bias')
 
     # Guest sampler limits: carried over for a constant descriptor, refused where they cannot be shown irrelevant.
     for name, line in (('array max1', 'smpl 0 0x0 0x100000 0x4000000 0x0'), ('array max0', 'smpl 0 0x0 0x0 0x4000000 0x0'),

@@ -7854,7 +7854,7 @@ class Stage:
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
             if how == 'b':
                 # The guest clamps the biased LOD to the sampler's MIN_LOD and MAX_LOD. Only a constant descriptor
-                # can be read here, and only its limits are carried to the static sampler (line smpl), so a sampler
+                # can be read here, so a sampler
                 # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
                 words = self.sample_b_sampler(heap, words)
                 smp = self.pipe.sampler(tuple(words), lod_limits=True)
@@ -7905,8 +7905,7 @@ class Stage:
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'b':
                 # SampleBias adds the bias to the implicit LOD, like the ISA's _B suffix ("Add this BIAS to the LOD
-                # computed"). The sampler's LOD limits are carried by the smpl line; its LOD bias is refused in
-                # sample_b_sampler.
+                # computed"). The static sampler supplies the descriptor's separate bias and LOD limits.
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
             elif how == 'get_lod':
                 # HLSL CalculateLevelOfDetail (clamped) and CalculateLevelOfDetailUnclamped (SM 4.1+). Which clamps
@@ -8026,12 +8025,8 @@ class Stage:
     def sample_b_sampler(self, heap, words):
         """The constant sampler words of an image_sample_b, or Unsupported when the guest sampler state is not kept.
 
-        SQ_IMG_SAMP_WORD1 bits 11:0 MIN_LOD and 23:12 MAX_LOD are u4.8 and are carried to MinLOD and MaxLOD of the
-        static sampler (translated_sampler_bindings.h, line smpl). SQ_IMG_SAMP_WORD2 bits 13:0 LOD_BIAS (s6.8) and
-        19:14 LOD_BIAS_SEC (s2.4) are not carried: the ISA scales them by T#.perf_modulation, which the D3D12 sampler
-        has no field for, so a nonzero bias is refused. Mip filter 0 disables mipmapping (ISA: "0=none (disable
-        mipmapping, use base-level)"), which a D3D12 sampler cannot express and which would make the bias count, so
-        it is refused too. Field layout: Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json, SQ_IMG_SAMP_WORD1/2."""
+        The static sampler carries MIN_LOD, MAX_LOD and the supported primary LOD_BIAS. Mip filter 0
+        disables mipmapping and is refused here because the instruction supplies a bias."""
         if heap:
             raise Unsupported('image_sample_b through a sampler heap (LOD limits and bias unknown)')
         if not words:
@@ -8047,11 +8042,16 @@ class Stage:
     def lod_sampler_words(self, name, words, mip_filter_none_ok=False):
         """The words of a constant sampler whose LOD limits are carried to the static sampler, or Unsupported.
 
-        Shared by image_sample_b and by image_sample, _l and _lz (#2177). Only the bias form refuses a mip filter of
-        0 (mip_filter_none_ok False): there the bias would count; the other forms leave that sampler as it was."""
-        if words[2] & 0xfffff:
-            raise Unsupported('%s with a sampler LOD bias (word 2 %#x)' % (name, words[2]))
-        if (words[2] >> 26) & 3 == 0 and not mip_filter_none_ok:
+        A sampler with mipmapping disabled can keep its legacy binding when neither the instruction
+        nor the descriptor supplies a bias."""
+        if (words[2] >> 14) & 0x3f:
+            raise Unsupported('%s with sampler LOD_BIAS_SEC (word 2 %#x)' % (name, words[2]))
+        raw_bias = words[2] & 0x3fff
+        bias = (raw_bias ^ 0x2000) - 0x2000
+        # D3D12's [-16, 15.99] range, in representable guest increments of 1/256.
+        if not -4096 <= bias <= 4093:
+            raise Unsupported('%s with sampler LOD_BIAS outside the D3D12 range (word 2 %#x)' % (name, words[2]))
+        if (words[2] >> 26) & 3 == 0 and (bias or not mip_filter_none_ok):
             raise Unsupported('%s with mipmapping disabled (sampler mip filter 0)' % name)
         if words[1] & 0xfff > (words[1] >> 12) & 0xfff:
             raise Unsupported('%s with sampler MIN_LOD %#x above MAX_LOD %#x'
@@ -11259,13 +11259,19 @@ class Pipeline:
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def sampler_lines(self):
-        """The manifest lines of the static samplers, graphics and compute: smp, smpc or smpl by the key's prefix."""
+        """The manifest lines of the static samplers, shared by graphics and compute."""
         lines = []
         for key, i in self.samplers.items():
             prefixed = key[0] in ('cmp', 'lod')
-            lines.append('%s %d %s' % ({'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp'), i,
-                                       ' '.join('0x%x' % w for w in key[prefixed:])))
+            kind = {'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp')
+            if kind == 'smpl' and key[3] & 0x3fff:
+                kind = 'smplb'
+            lines.append('%s %d %s' % (kind, i, ' '.join('0x%x' % w for w in key[prefixed:])))
         return lines
+
+    def sampler_manifest_version(self, legacy_version):
+        # Older graphics readers can skip unknown sampler lines, so gate the whole manifest.
+        return 3 if any(key[0] == 'lod' and key[3] & 0x3fff for key in self.samplers) else legacy_version
 
     def common(self):
         import pixel_aot
@@ -11743,7 +11749,8 @@ class Pipeline:
 
     def manifest(self):
         # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
-        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
+        version = self.sampler_manifest_version(2 if self.stored_images() else 1)
+        lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
@@ -11936,7 +11943,7 @@ class ComputePipeline(Pipeline):
 
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
-        lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
+        lines = ['x2w-manifest %d' % self.sampler_manifest_version(2), 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             if source[0] == 'table':
@@ -12936,6 +12943,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('lod-bias', r'with a sampler LOD bias'),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),

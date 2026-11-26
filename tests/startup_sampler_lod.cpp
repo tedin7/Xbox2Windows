@@ -77,6 +77,10 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
                         D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
     if ((support.Support1 & needed) != needed) return 77;
 
+    // Raw +16 and -16 differ in bit 13. A 13-bit decoder aliases them before range validation.
+    if (sampler_lod_bias_fixed(0x1000) != 4096 || sampler_lod_bias_fixed(0x3000) != -4096)
+        throw std::runtime_error("Sampler LOD bias lost its 14-bit sign");
+
     TranslatedSamplers bindings;
     if (!bindings.read_manifest_line("smpheap 2048 1 fallback 2047") || !bindings.read_manifest_line(comparison_line))
         throw std::runtime_error("Sampler LOD manifest refused");

@@ -132,7 +132,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         at = end + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line_number == 0) {
-            if (line != "x2w-manifest 2") return "manifest version";
+            if (line != "x2w-manifest 2" &&
+                !(line == "x2w-manifest 3" && x2w_startup::sampler_lod_bias_enabled()))
+                return "manifest version";
             continue;
         }
         if (line_number == 1) {
@@ -194,15 +196,17 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.srvs.push_back({a, b, true});
             tr.srvs.back().cube = true;
         }
-        // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
+        // A static sampler, plain (smp), with LOD limits (smpl), or with limits and bias (smplb), decoded as the draw path does.
         // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
         else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
         else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
         else if ((std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
                   std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
-                 i == tr.samplers.statics.size())
-            tr.samplers.read_manifest_line(line.c_str());
-        else {
+                 i == tr.samplers.statics.size()) {
+            if (!tr.samplers.read_manifest_line(line.c_str())) return "an invalid static sampler";
+        } else if (line.rfind("smplb", 0) == 0) {
+            if (!tr.samplers.read_manifest_line(line.c_str())) return "an unsupported or invalid LOD-bias sampler";
+        } else {
             // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
             const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"

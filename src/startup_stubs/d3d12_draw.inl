@@ -573,9 +573,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
-        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
-            // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
-            // so a translation whose stores would be silently skipped is never drawn (#1723).
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" &&
+                   line != "x2w-manifest 2" && !(line == "x2w-manifest 3" && x2w_startup::sampler_lod_bias_enabled())) {
+            // Version 2 adds writable views. Version 3 requires support for biased static samplers.
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
@@ -634,7 +634,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             }
             tr.uavs.push_back(uav);
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
-            log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
+            log("x2w-draw invalid sampler manifest for %016llx", tr.key);
             return;
         }
     }

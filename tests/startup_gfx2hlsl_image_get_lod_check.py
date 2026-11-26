@@ -104,7 +104,9 @@ def controls():
         refused(stage(back_op=op), 'image_get_lod needs implicit derivatives')
     for op in (6, 7, 8, 9):  # vccz, vccnz, execz, execnz
         refused(stage(cf_op=op), 'image_get_lod needs implicit derivatives')
-    refused(stage(word2=MIP_POINT | 1), 'image_get_lod with a sampler LOD bias')
+    biased, text = ps(stage(word2=MIP_POINT | 1))
+    assert call in text and any(line.startswith('smplb ') for line in biased.manifest().splitlines())
+    refused(stage(word2=MIP_POINT | 0x4000), 'image_get_lod with sampler LOD_BIAS_SEC')
     refused(stage(word2=0), 'image_get_lod with mipmapping disabled')
     saved = G.Stage.op_image_get_lod
     del G.Stage.op_image_get_lod

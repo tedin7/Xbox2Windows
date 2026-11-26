@@ -3,6 +3,7 @@
   controls [form]                      translation controls, pure Python (the default); without a form, also the
                                        compute manifest sampler lines
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
+  draw-bias <dxc> <offscreen_check>     translated WARP draws with CPU mip selection and negative controls
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw each form
                                        on its own: the readback must name the mip level the descriptor's limit selects
@@ -10,7 +11,7 @@
 Semantics. SQ_IMG_SAMP_WORD1 bits 11:0 MIN_LOD and 23:12 MAX_LOD (u4.8, Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json)
 clamp the LOD of every sample form, not only of image_sample_b (#2051). A constant sampler of image_sample, _l and _lz now
 reaches the static sampler through the same smpl manifest line, with the validation of image_sample_b: a descriptor LOD
-bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused. A mip filter of 0 (word 2 bits 27:26) is NOT refused here
+bias uses smplb when the primary field is in range and the secondary field is zero. MIN_LOD above MAX_LOD is refused. A mip filter of 0 (word 2 bits 27:26) is NOT refused here
 (only the bias form needs it: the bias would count): such a sampler keeps its ordinary smp line, as before. A sampler read
 at run time (heap table or the default-sampler shortcut) keeps its ordinary static sampler too, is not validated, and is
 logged once per translated module (#2221).
@@ -30,8 +31,11 @@ footprint of two texels on the 4x4 base level, an implicit LOD of exactly 1. The
 """
 import contextlib
 import io
+import math
+import os
 import re
 import subprocess
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -242,8 +246,11 @@ def controls(only=None):
         assert not pipe.lod_unvalidated and not pipe.notes, (name, pipe.lod_unvalidated)
         assert mip != plain_mip
         # Refusals use the validation shared with image_sample_b, under this form's name.
-        refused('%s bias' % form, '%s with a sampler LOD bias (word 2 %#x)' % (op, POINT_MIP | 1))
-        refused('%s bias sec' % form, '%s with a sampler LOD bias (word 2 %#x)' % (op, POINT_MIP | 0x4000))
+        biased = stage('%s bias' % form)
+        assert CALLS[form] in biased.hlsl_ps()
+        assert biased.manifest() == pipe.manifest().replace('x2w-manifest 1', 'x2w-manifest 3', 1).replace(
+            line, 'smplb 0 0x0 0x%x 0x%x 0x0' % (w1, POINT_MIP | 1))
+        refused('%s bias sec' % form, '%s with sampler LOD_BIAS_SEC (word 2 %#x)' % (op, POINT_MIP | 0x4000))
         refused('%s range' % form, '%s with sampler MIN_LOD 0x300 above MAX_LOD 0x200' % op)
         # A mip filter of 0 keeps today's ordinary sampler: no smpl line, nothing refused.
         none = stage('%s mip filter none' % form)
@@ -266,7 +273,7 @@ def controls(only=None):
         with contextlib.redirect_stderr(clean):
             G.log_unvalidated_lod(0x1234, pipe)
         assert not clean.getvalue(), clean.getvalue()
-        print('%s: smpl line and call; refused: LOD bias, MIN_LOD > MAX_LOD; mip filter 0 stays smp; heap accepted and '
+        print('%s: smpl line and call; refused: LOD_BIAS_SEC, MIN_LOD > MAX_LOD; mip filter 0 stays smp; heap accepted and '
               'logged once' % op)
     # The log is written by the translation entry point, once per module, and only for a heap sampler.
     for name, logged in (('sample heap', True), ('sample limits', False)):
@@ -281,6 +288,7 @@ def controls(only=None):
     if only:
         return
     check_compute_manifest()
+    check_bias_translation()
     # The three forms differ from each other and from the ordinary line, and the model has distinct mips per form.
     assert len({texel_cell(m, s) for m in range(3) for s in range(2)}) == 6
     assert len({tuple(FORMS[f][3:5]) for f in FORMS}) == 3
@@ -288,22 +296,25 @@ def controls(only=None):
 
 
 def check_compute_manifest():
-    """The compute manifest names the same three sampler lines as the graphics one (#2463).
+    """The compute manifest uses the same sampler lines as the graphics one (#2463).
 
     The programs reuse the helpers of startup_compute_gather_l_check: its compute prefix (sampler words in s24-s27,
     s24 = 0x12), and gather_insn with a 2D sample opcode in place of the gather one. The binary mode of this check
     does not reassemble them with llvm-mc; each case asserts the sample call the translator decodes."""
     for form, opcode in (('lz', 0x27), ('l', 0x24)):
-        for variant, w2, tag in (('limits', 0x4500000, 'smpl'), ('mip filter none', 0x500000, 'smp')):
+        for variant, w2, tag in (('limits', 0x4500000, 'smpl'), ('bias', 0x4503f80, 'smplb'),
+                                 ('mip filter none', 0x500000, 'smp')):
             pipe = cs_pipe(compute_prefix(w2=w2) + gather_insn(0xf, 1, opcode) + COMPUTE_TAIL)
             assert '.SampleLevel(q0,' in pipe.hlsl_cs(), (form, variant)
-            lines = [line for line in pipe.manifest().splitlines() if line.startswith('smp')]
+            manifest = pipe.manifest().splitlines()
+            assert manifest[0] == 'x2w-manifest %d' % (3 if tag == 'smplb' else 2), manifest
+            lines = [line for line in manifest if line.startswith('smp')]
             assert lines == ['%s 0 0x12 0xfff000 0x%x 0x0' % (tag, w2)], (form, variant, lines)
     pipe = cs_pipe(compute_prefix() + gather_insn(1, 1, 0x2f) + COMPUTE_TAIL)
     assert '.SampleCmpLevelZero(q0,' in pipe.hlsl_cs()
     lines = [line for line in pipe.manifest().splitlines() if line.startswith('smp')]
     assert lines == ['smpc 0 0x12 0xfff000 0x4500000 0x0'], lines
-    print('compute manifest: smpl with LOD limits (lz, l); controls: smp with mip filter 0, smpc for comparison')
+    print('compute manifest: smpl and smplb (lz, l); controls: smp with mip filter 0, smpc for comparison')
 
 
 def check_binary(llvm_mc):
@@ -364,12 +375,104 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 print('%s %s: plain smp control fails as expected, reads mip %d' % (kind, op, plain_mip), flush=True)
 
 
+def bias_stage(form, word2):
+    # Reuse the source-built sample program with a [0, 2] mip window and the selected sampler word.
+    code = bytes.fromhex(WORDS[form + ' limits'])
+    original = struct.pack('<I', FORMS[form][2])
+    assert code.count(original) == 1 and code.count(struct.pack('<I', POINT_MIP)) == 1
+    code = code.replace(original, struct.pack('<I', 0x200000))
+    code = code.replace(struct.pack('<I', POINT_MIP), struct.pack('<I', word2))
+    return G.Pipeline(VS_WORDS, code, root_blob())
+
+
+def check_bias_translation():
+    for form in ('sample', 'lz'):
+        for fixed in (-4096, -128, 0, 256, 4093):
+            word2 = POINT_MIP | (fixed & 0x3fff)
+            pipe = bias_stage(form, word2)
+            assert CALLS[form] in pipe.hlsl_ps()
+            manifest = pipe.manifest().splitlines()
+            tag, version = ('smplb', 3) if fixed else ('smpl', 1)
+            assert manifest[0] == 'x2w-manifest %d' % version, manifest
+            assert '%s 0 0x0 0x200000 0x%x 0x0' % (tag, word2) in manifest, manifest
+        for word2, reason in ((POINT_MIP | 0x2fff, 'outside the D3D12 range'),
+                              (POINT_MIP | 4094, 'outside the D3D12 range'),
+                              (POINT_MIP | 0x1000, 'outside the D3D12 range'),
+                              (0x100, 'with mipmapping disabled')):
+            try:
+                bias_stage(form, word2).hlsl_ps()
+            except G.Unsupported as error:
+                assert reason in str(error), str(error)
+            else:
+                raise AssertionError((form, hex(word2), reason))
+    assert G.lifted_family('image_sample with a sampler LOD bias (word 2 0x4000001)') == 'lod-bias'
+    print('graphics sampler LOD bias: endpoints, overflow, no mipmapping, cache retry and legacy manifest')
+
+
+def check_bias_draw(dxc, renderer):
+    check_bias_translation()
+    switch = 'X2W_SAMPLER_LOD_BIAS'
+
+    def mip_color(form, bias):
+        # A 7/16 UV delta on a 4-wide texture yields a 7/4 texel footprint.
+        lod = math.log2(7 / 4) if form == 'sample' else 0
+        mip = max(0, min(2, math.floor(lod + bias + 0.5)))
+        return ','.join('%08x' % bits for bits in struct.unpack('<4I', struct.pack('<4f', 0.25 * (mip + 1), 0, 0, 1)))
+
+    def draw(vs, ps, line, expected, enabled, wrong=None):
+        env = os.environ.copy()
+        env.pop(switch, None)
+        if enabled:
+            env[switch] = '1'
+        run = subprocess.run([renderer, 'warp', '--startup-sampler-lod-bias', str(vs), str(ps), '0', expected, line],
+                             capture_output=True, text=True, env=env)
+        print(run.stdout, end='')
+        if 'debug_layer=enabled' in run.stdout:
+            assert 'debug_errors=0 debug_warnings=0' in run.stdout, (run.stdout, run.stderr)
+        if wrong is None:
+            assert run.returncode == 0, (line, run.stdout, run.stderr)
+        else:
+            assert run.returncode == 1 and 'actual=' + wrong in run.stderr, (line, run.stdout, run.stderr)
+
+    def manifest_line(bias):
+        return 'smplb 0 0x0 0x200000 0x%x 0x0' % (POINT_MIP | (round(bias * 256) & 0x3fff))
+
+    clear = ','.join(['bf800000'] * 4)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'sampler_lod_bias_vs', 'vs_6_0', directory)
+        for form in ('sample', 'lz'):
+            for bias in (-0.5, 1.0, 0.0):
+                pipe = bias_stage(form, POINT_MIP | (round(bias * 256) & 0x3fff))
+                hlsl = pipe.hlsl_ps()
+                line = next(line for line in pipe.manifest().splitlines() if line.startswith(('smpl ', 'smplb ')))
+                if form == 'sample':
+                    assert hlsl.count(U_INIT) == 1, hlsl
+                    hlsl = hlsl.replace(U_INIT, 'v0 = U(0.75 + 0.4375 * (i.pos.x - 0.5));')
+                ps = compile_hlsl(dxc, 'dxc', hlsl, 'sampler_lod_bias_%s_%s' % (form, bias), 'ps_6_0', directory)
+                expected = mip_color(form, bias)
+                draw(vs, ps, line, expected, enabled=True)
+                draw(vs, ps, line, clear if bias else expected, enabled=False)
+                # For explicit zero, +1 discriminates both mutants without using the +0.5 mip boundary.
+                if bias == 1.0 or (form == 'sample' and bias == -0.5):
+                    flipped, unbiased = mip_color(form, -bias), mip_color(form, 0)
+                    assert expected != flipped and expected != unbiased
+                    draw(vs, ps, manifest_line(-bias), expected, enabled=True, wrong=flipped)
+                    dropped = line.replace('smplb ', 'smpl ', 1)
+                    draw(vs, ps, dropped, expected, enabled=True, wrong=unbiased)
+                print('%s bias=%g CPU reference=%s' % (form, bias, expected), flush=True)
+            # +16 is invalid. A 13-bit decoder would read it as the legal value -16 and submit a draw.
+            draw(vs, ps, manifest_line(16), clear, enabled=True)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == 'controls':
         controls(args[1] if len(args) > 1 else None)
     elif args[0] == 'binary' and len(args) == 2:
         check_binary(args[1])
+    elif args[0] == 'draw-bias' and len(args) == 3:
+        check_bias_draw(*args[1:])
     elif args[0] == 'draw' and len(args) in (4, 5):
         controls()
         check_draw(*args[1:])

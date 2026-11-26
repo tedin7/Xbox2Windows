@@ -1332,7 +1332,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
-    const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool sampler_bias_probe = std::strcmp(ctx.argv[2], "--startup-sampler-lod-bias") == 0;
+    const bool array_mips = sampler_bias_probe || std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
     const bool one_dimensional_mips = std::strcmp(ctx.argv[2], "--startup-image-1d-mips") == 0;
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
@@ -1353,7 +1354,7 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
-                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
+                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional, 0, 0, sampler_bias_probe);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1724,6 +1725,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-sampler-lod-bias", 8, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},

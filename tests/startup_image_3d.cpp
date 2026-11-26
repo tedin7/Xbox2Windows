@@ -68,7 +68,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, bool sampler_bias_probe)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
@@ -78,26 +78,30 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+    const bool ready = samplers.read_manifest_line(sampler_line);
+    if ((!ready && !sampler_bias_probe) || (ready && samplers.statics.size() != 1))
         throw std::runtime_error("Expected one inline sampler in the image 3D draw");
     const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
-    const auto root = create_root(device, samplers);
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = root.Get();
-    pd.VS = {vs.data(), vs.size()};
-    pd.PS = {ps.data(), ps.size()};
-    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pd.SampleMask = UINT_MAX;
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    pd.SampleDesc.Count = 1;
+    ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
-    check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
+    if (ready) {
+        root = create_root(device, samplers);
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root.Get();
+        pd.VS = {vs.data(), vs.size()};
+        pd.PS = {ps.data(), ps.size()};
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        pd.SampleDesc.Count = 1;
+        check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
+    }
 
     D3D12_RESOURCE_DESC td{};
     td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
@@ -130,7 +134,13 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
-                    texel_value(tx, ty, tz, level, levels, texel);
+                    // Flat RGBA per mip isolates LOD selection from address selection.
+                    if (sampler_bias_probe) {
+                        const float flat[4]{0.25f * (level + 1), 0.0f, 0.0f, 1.0f};
+                        std::memcpy(texel, flat, sizeof(texel));
+                    } else {
+                        texel_value(tx, ty, tz, level, levels, texel);
+                    }
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
                     const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
@@ -183,22 +193,24 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
-    list->SetGraphicsRootSignature(root.Get());
-    ID3D12DescriptorHeap* heaps[]{views.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    // ud0 is the rectangle-list switch (0: plain triangles), ud1 the z coordinate's bits.
-    std::uint32_t z_bits;
-    std::memcpy(&z_bits, &z, sizeof(z_bits));
-    const std::uint32_t constants[entry_constants] = {0, z_bits, 0, 0};
-    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
-    list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &scissor);
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
+    if (ready) {
+        list->SetGraphicsRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[]{views.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        // ud0 is the rectangle-list switch (0: plain triangles), ud1 the z coordinate's bits.
+        std::uint32_t z_bits;
+        std::memcpy(&z_bits, &z, sizeof(z_bits));
+        const std::uint32_t constants[entry_constants] = {0, z_bits, 0, 0};
+        list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
+        list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
+        const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+        const D3D12_RECT scissor{0, 0, 1, 1};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
     transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION out{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     out.PlacedFootprint = target_footprint;
