@@ -1827,7 +1827,7 @@ def mesh_uniform_loop(ins, header, latch, offsets):
 # under any EXEC, is read exactly as the hardware reads it for the lanes that wrote it. True: refuse only reads of a VGPR that
 # some path never wrote (plus the lane-0-only registers of the exchanges). False: the lane-class coverage check above applies too.
 MESH_LANE_EXACT_READS = True
-# Opt-in (default off, ORCH0 11:00): reads of a VGPR never written on some path read 0 and are listed in ZERO_INIT_LOG ('unproven zero-init').
+# Opt-in (default off): reads of a VGPR never written on some path read 0 and are listed in ZERO_INIT_LOG ('unproven zero-init').
 MESH_ZERO_INIT_READS = False
 ZERO_INIT_LOG = []
 
