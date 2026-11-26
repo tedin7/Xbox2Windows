@@ -118,8 +118,53 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_pool(directory, consumer, backend):
+    # Large views contribute words from both ends. Every draw owns one pixel and
+    # its reference colour differs from the blue clear, including the small draws.
+    shader = HLSL.replace(
+        "return asfloat(constants.Load4(0));",
+        "float4 head = asfloat(constants.Load4(0)); "
+        "if (p.x < 7) return head; "
+        "float4 tail = asfloat(constants.Load4(16777200)); "
+        "return float4(head.r, tail.g, tail.b, head.a);",
+    )
+    expected = [bytes((255, 255 * ((x + y) % 2), 0, 255)) for y in range(4) for x in range(8)]
+    for name, enabled, once in (("ring-only", "0", "0"),
+                                ("pool", "1", "0"),
+                                ("pool-cached", "1", "1")):
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "pool", "X2W_TRAP_LOG": str(log),
+            "X2W_TEST_UPLOAD_RING_MAX_KIB": "65536", "X2W_BIG_UPLOAD_POOL": enabled,
+            "X2W_BIGBIND_ONCE": once, "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        trace = log.read_text(errors="replace")
+        refusals = re.findall(r"^.*x2w-draw .*reservation refused.*$", trace, re.MULTILINE)
+        missed_draws = re.findall(r"^.*x2w-draw not drawn: (\w+)", trace, re.MULTILINE)
+        if len(pixels) != len(expected) * 4:
+            raise AssertionError(f"{name}: wrong readback size {len(pixels)}")
+        actual = [pixels[i:i + 4] for i in range(0, len(pixels), 4)]
+        mismatches = [i for i, (got, want) in enumerate(zip(actual, expected)) if got != want]
+        if enabled == "1":
+            if refusals or missed_draws or mismatches:
+                raise AssertionError(f"{name}: {refusals=}, {missed_draws=}, {mismatches=}")
+            print(f"{backend} {name}: zero refusals, all 32 draws match the CPU reference")
+        else:
+            if (not any("asked 16777216 bytes" in line for line in refusals)
+                    or set(missed_draws) != {"buffer_copy_failed"}
+                    or not mismatches or any(i % 8 != 7 or actual[i] != BLUE for i in mismatches)):
+                raise AssertionError(f"{name}: expected refused 16 MiB draws, got {refusals=}, "
+                                     f"{missed_draws=}, {mismatches=}")
+            print(f"{backend} {name}: {len(mismatches)} large draws refused; all small draws match")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = check_once if sys.argv[3:] == ["once"] else check
+        check_mode = {"once": check_once, "pool": check_pool}.get(sys.argv[3] if len(sys.argv) > 3 else "", check)
         sys.exit(check_mode(Path(temporary), consumer, backend))

@@ -188,7 +188,7 @@ struct alignas(16) WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
-    UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
+    UploadChunkMask upload_chunks;    // Upload slots referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
@@ -1583,6 +1583,20 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+std::array<UploadRingChunk, big_upload_slots> big_upload_pool;
+static constexpr u64 big_upload_threshold = 2ull << 20;
+static constexpr u64 big_upload_pool_cap = 128ull << 20;
+
+// allocator_lock held. Pool slots occupy the upper bits of the same submission mask as the ring.
+void discard_upload_recording(UploadChunkMask& recording)
+{
+    auto ring = recording & ((UploadChunkMask{1} << max_upload_chunks) - 1);
+    auto pool = recording >> max_upload_chunks;
+    discard_upload_chunks(ring, upload_chunks.data());
+    discard_upload_chunks(pool, big_upload_pool.data());
+    recording = 0;
+}
+
 // Pages of finished list arenas, handed to the next arenas (allocator_lock).
 x2w_upload::FreePages free_upload_pages;
 
@@ -1677,7 +1691,7 @@ void reclaim_finished_arenas(DesktopAllocator& allocator)
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
-    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    discard_upload_recording(list->own().upload_chunks);
     retire_list_arena(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
     if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
@@ -2074,7 +2088,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
-            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            discard_upload_recording(state.upload_chunks);
             retire_list_arena(self);
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -2116,7 +2130,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
-        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        discard_upload_recording(state.upload_chunks);
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2777,8 +2791,106 @@ u64 upload_ring_max_bytes()
     return bytes;
 }
 
+// Keep each large snapshot in its own mapped buffer. Recording holds protect closed lists
+// that may be resubmitted. After those holds drop, every queue that used the slot must finish.
+UploadReservation reserve_big_upload(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold)
+{
+    // Buffer allocations are charged in 64 KiB units.
+    constexpr u64 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (bytes > big_upload_pool_cap) return {};
+    const u64 capacity = (static_cast<u64>(bytes) + alignment - 1) & ~(alignment - 1);
+    AcquireSRWLockExclusive(&allocator_lock);
+    static u64 total_bytes = 0;
+    unsigned best = big_upload_slots, empty = big_upload_slots;
+    std::array<bool, big_upload_slots> idle{};
+    for (unsigned i = 0; i < big_upload_slots; ++i) {
+        const auto& slot = big_upload_pool[i];
+        if (!slot.resource) {
+            empty = i;
+            continue;
+        }
+        idle[i] = upload_chunk_idle(slot, max_upload_chunks + i, queue_submits);
+        if (idle[i] && slot.capacity >= capacity &&
+            (best == big_upload_slots || slot.capacity < big_upload_pool[best].capacity))
+            best = i;
+    }
+    if (best == big_upload_slots) {
+        // Make room using only retired buffers. First prove there is enough reclaimable
+        // capacity so an impossible request cannot flush the available buffers.
+        u64 available = big_upload_pool_cap - total_bytes;
+        for (unsigned i = 0; i < big_upload_slots; ++i)
+            if (idle[i]) available += big_upload_pool[i].capacity;
+        auto* device = the_device ? device_of(the_device) : nullptr;
+        if (device && available >= capacity) {
+            for (unsigned i = 0; i < big_upload_slots &&
+                    (empty == big_upload_slots || total_bytes + capacity > big_upload_pool_cap); ++i) {
+                if (!idle[i]) continue;
+                auto& slot = big_upload_pool[i];
+                slot.resource->Unmap(0, nullptr);
+                slot.resource->Release();
+                total_bytes -= slot.capacity;
+                slot.resource = nullptr;
+                slot.mapped = nullptr;
+                slot.capacity = 0;
+                empty = i;
+            }
+            if (empty != big_upload_slots) {
+                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+                D3D12_RESOURCE_DESC buffer{};
+                buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                buffer.Width = capacity;
+                buffer.Height = 1;
+                buffer.DepthOrArraySize = 1;
+                buffer.MipLevels = 1;
+                buffer.SampleDesc.Count = 1;
+                buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                ID3D12Resource* resource = nullptr;
+                if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource)))) {
+                    void* mapped = nullptr;
+                    if (SUCCEEDED(resource->Map(0, nullptr, &mapped))) {
+                        x2w_budget::committed(device, resource, D3D12_HEAP_TYPE_UPLOAD);
+                        auto& slot = big_upload_pool[empty];
+                        slot.resource = resource;
+                        slot.mapped = static_cast<unsigned char*>(mapped);
+                        slot.capacity = capacity;
+                        total_bytes += capacity;
+                        best = empty;
+                    } else {
+                        resource->Release();
+                    }
+                }
+            }
+        }
+    }
+    UploadReservation reservation;
+    if (best != big_upload_slots) {
+        auto& slot = big_upload_pool[best];
+        const unsigned index = max_upload_chunks + best;
+        slot.hold(list->own().upload_chunks, index);
+        if (frame_hold) slot.hold(*frame_hold, index);
+        reservation = {slot.mapped, 0, slot.resource, ++slot.generation, best};
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return reservation;
+}
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
 {
+    static const bool big_pool = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_BIG_UPLOAD_POOL", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    if (big_pool && bytes > big_upload_threshold) {
+        const auto reservation = reserve_big_upload(list, bytes, frame_hold);
+        if (!reservation.mapped) {
+            InterlockedIncrement(&upload_ring_refusals);
+            static LONG refused;
+            if (first_calls(refused, 8))
+                log("x2w-draw big upload pool reservation refused (asked %zu bytes)", bytes);
+        }
+        return reservation;
+    }
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;

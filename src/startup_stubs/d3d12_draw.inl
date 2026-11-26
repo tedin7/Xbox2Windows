@@ -1609,8 +1609,7 @@ void finish_bigbind_frame(LONG frame)
     if (!bigbind_no_reset_mutant()) big_bindings.clear();
     if (big_binding_chunks && !bigbind_no_reset_mutant()) {
         AcquireSRWLockExclusive(&allocator_lock);
-        discard_upload_chunks(big_binding_chunks, upload_chunks.data());
-        big_binding_chunks = 0;
+        discard_upload_recording(big_binding_chunks);
         ReleaseSRWLockExclusive(&allocator_lock);
     }
     static const bool report = [] {
@@ -1627,6 +1626,13 @@ void finish_bigbind_frame(LONG frame)
 bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
 {
     AcquireSRWLockExclusive(&allocator_lock);
+    if (slice.pool_slot != big_upload_slots) {
+        auto& slot = big_upload_pool[slice.pool_slot];
+        const bool valid = slot.resource == slice.resource && slot.generation == slice.generation;
+        if (valid) slot.hold(self->own().upload_chunks, max_upload_chunks + slice.pool_slot);
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return valid;
+    }
     for (unsigned i = 0; i < upload_chunks.size(); ++i) {
         auto& chunk = upload_chunks[i];
         if (chunk.resource == slice.resource && chunk.generation == slice.generation) {

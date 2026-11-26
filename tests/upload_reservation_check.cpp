@@ -64,6 +64,29 @@ void check_ring_reuse()
     check(!reuse_upload_chunk(chunk, 0, bytes, queues).mapped, "untracked submit prevents reuse");
 }
 
+void check_pool_fences()
+{
+    constexpr unsigned index = upload_slot_count - 1;
+    UploadRingChunk slot;
+    UploadChunkMask recording = 0;
+    slot.hold(recording, index);
+
+    TestFence a{1}, b{1};
+    std::map<unsigned, UploadQueue<TestFence>> queues{{0, {&a, 1}}, {1, {&b, 2}}};
+    for (auto& queue : queues) queue.second.submitted(recording, true);
+    check(!upload_chunk_idle(slot, index, queues), "pool slot held by recording");
+
+    auto pool = recording >> max_upload_chunks;
+    std::array<UploadRingChunk, big_upload_slots> slots{};
+    slots.back() = slot;
+    discard_upload_chunks(pool, slots.data());
+    check(!upload_chunk_idle(slots.back(), index, queues), "pool slot waits for both queues");
+    b.value = 2;
+    check(upload_chunk_idle(slots.back(), index, queues), "pool slot reusable after both fences");
+    queues[0].submitted(recording, false);
+    check(!upload_chunk_idle(slots.back(), index, queues), "pool slot with untracked work stays pinned");
+}
+
 }  // namespace
 
 int main()
@@ -111,6 +134,7 @@ int main()
           "existing reservations survive exhaustion");
 
     check_ring_reuse();
+    check_pool_fences();
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

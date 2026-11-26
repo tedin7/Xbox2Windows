@@ -25,6 +25,7 @@ static void* create_present_queue(void* guest)
 //   same     the memory is left alone (red both times)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
+//   pool     32 one-pixel draws, with four 16 MiB bindings interleaved with small updates
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
@@ -34,18 +35,19 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
 {
     char mode[16]{};
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+    const bool pool = !std::strcmp(mode, "pool");
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool once = keys || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
-    if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
+    if (!pool && !once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
     alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
     if (big)
         for (int i = 4; i < 16384; ++i) constants[i] = 0.5f;
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const UINT entries = keys ? 2 : (32 + increment - 1) / increment;
+    const UINT entries = pool ? width * height : keys ? 2 : (32 + increment - 1) / increment;
     static std::vector<unsigned char> views;
     views.assign(static_cast<std::size_t>(entries) * increment, 0);
     const struct {
@@ -60,6 +62,43 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
     constexpr UINT large_bytes = 16u << 20;
+    if (pool) {
+        if (width != 8 || height != 4) return 46;
+        auto* memory = static_cast<float*>(VirtualAlloc(nullptr, height * large_bytes,
+                                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!memory) return 45;
+        const StreamWord table = invoke(heap, 10);
+        if (!table) {
+            VirtualFree(memory, 0, MEM_RELEASE);
+            return 43;
+        }
+        invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));
+        for (UINT y = 0; y < height; ++y) {
+            for (UINT x = 0; x < width; ++x) {
+                // One draw per pixel. Put the large binding after small allocations
+                // so ring-only mode cannot fit four full 16 MiB reservations.
+                const bool large = x == width - 1;
+                auto* source = large ? memory + y * (large_bytes / sizeof(float)) : constants;
+                const float colour[] = {1.0f, static_cast<float>((x + y) % 2), 0.0f, 1.0f};
+                std::memcpy(source, colour, sizeof(colour));
+                if (large) {
+                    std::memcpy(source + large_bytes / sizeof(float) - 4, colour, sizeof(colour));
+                    source[1] = 1.0f - colour[1];  // The shader must get green from the tail.
+                }
+                const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(source),
+                                                           large ? large_bytes : 256u};
+                const StreamWord offset = (y * width + x) * increment;
+                invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu + offset);
+                invoke(list, 36, 0, table + offset);
+                const D3D12_RECT pixel{static_cast<LONG>(x), static_cast<LONG>(y),
+                                       static_cast<LONG>(x + 1), static_cast<LONG>(y + 1)};
+                invoke(list, 22, 1, reinterpret_cast<std::uintptr_t>(&pixel));
+                invoke(list, 12, 3, 1);
+            }
+        }
+        VirtualFree(memory, 0, MEM_RELEASE);
+        return 0;
+    }
     float* large = nullptr;
     constexpr UINT large_words = large_bytes / sizeof(float);
     if (once) {
