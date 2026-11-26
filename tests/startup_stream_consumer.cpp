@@ -8,9 +8,11 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
@@ -20,6 +22,20 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
+    LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
+
+struct ComputeRefusalStats {
+    LONG64 holds, repeated_reads, background_reads;
+    LONG untranslated;
+};
+
+static ComputeRefusalStats compute_refusal_stats()
+{
+    ComputeRefusalStats stats{};
+    x2w_d3d12_compute_refusal_stats(&stats.holds, &stats.repeated_reads, &stats.background_reads, &stats.untranslated);
+    return stats;
+}
 
 // A slot-55 patch is a tagged union with room for the full eight-target blend state.
 struct Patch { UINT tag; D3D12_BLEND_DESC blend; };
@@ -302,7 +318,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
     const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
-    const auto bind = [&] {
+    const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));
         invoke(list, 25, word(slot67_pipeline));
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
@@ -310,7 +326,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     Slot67Indirect record;
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
-    bind();
+    bind(list);
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
@@ -359,7 +375,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (mode == "dispatch-root-changed" || mode == "dispatch-same-root") invoke(list, 33, word(slot67_root));
     if (mode == "dispatch-reset") {
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
-        bind();
+        bind(list);
     }
     if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     if (mode == "dispatch-heap-word-null")
@@ -383,7 +399,107 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
-    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    else if (mode == "dispatch-nolock-burst") {
+        const auto before = compute_refusal_stats();
+        for (UINT i = 0; i < 10000; ++i) {
+            if (i == 5000) Sleep(300);  // Cross the legacy retry interval.
+            invoke(list, 14, 3, 2, 2);
+        }
+        const auto after = compute_refusal_stats();
+        std::printf("compute refusal window: manifest lookups: repeated reads %lld, draw_lock holds +%lld, untranslated +%ld\n",
+                    after.repeated_reads, after.holds - before.holds, after.untranslated - before.untranslated);
+    } else if (mode == "dispatch-nolock-retry") {
+        void* second_allocator = nullptr;
+        void* second_list = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&second_allocator)))) ||
+            FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(second_allocator), 0,
+                                              word(&__uuidof(ID3D12GraphicsCommandList)), word(&second_list)))) ||
+            FAILED(static_cast<HRESULT>(invoke(second_list, 139, word(second_allocator))))) return 82;
+        bind(second_list);
+        invoke(second_list, 37, 0, constants[0], 0);
+        invoke(second_list, 39, 0, 1, word(&constants[1]), 1);
+        invoke(second_list, 35, 1, gpu);
+        std::atomic<bool> ready{false}, start{false};
+        std::thread other([&] {
+            ready.store(true, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) SwitchToThread();
+            invoke(second_list, 14, 3, 2, 2);
+        });
+        while (!ready.load(std::memory_order_acquire)) SwitchToThread();
+        start.store(true, std::memory_order_release);
+        invoke(list, 14, 3, 2, 2);
+        other.join();
+        if (FAILED(static_cast<HRESULT>(invoke(second_list, 9)))) return 83;
+        invoke(queue, 10, 1, word(&second_list));
+    }
+    else if (mode == "dispatch-bench") {
+        // The speed bench: X2W_TEST_BENCH_CALLS (default 3000) rounds of the cliff's pattern per recording thread, each a descriptor
+        // table (slot 35), a root constant (slot 39) and a Dispatch (slot 14), every call timed here. X2W_TEST_BENCH_THREADS (default 1)
+        // records that many lists at once, one per thread, so the share of waiting for the stand-in's global lock shows. Prints the totals
+        // in the shape of the stand-in's own `command-list slots over 20 ms` line, so tools/startup/slot_compare.py can diff a bench run
+        // against a tester log.
+        char text[16]{};
+        GetEnvironmentVariableA("X2W_TEST_BENCH_CALLS", text, sizeof(text));
+        const int rounds = text[0] ? std::atoi(text) : 3000;
+        char thread_text[16]{};
+        GetEnvironmentVariableA("X2W_TEST_BENCH_THREADS", thread_text, sizeof(thread_text));
+        const int threads = thread_text[0] ? std::atoi(thread_text) : 1;
+        if (threads < 1 || threads > 16) return 2;
+        std::vector<void*> lists{list};
+        for (int t = 1; t < threads; ++t) {
+            void *more_allocator = nullptr, *more_list = nullptr;
+            if (FAILED(static_cast<HRESULT>(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&more_allocator)))) ||
+                FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(more_allocator), 0,
+                                                   word(&__uuidof(ID3D12GraphicsCommandList)), word(&more_list))))) return 72;
+            if (FAILED(static_cast<HRESULT>(invoke(more_list, 139, word(more_allocator))))) return 74;
+            invoke(more_list, 32, 1, word(&heap));
+            invoke(more_list, 25, word(slot67_pipeline));
+            invoke(more_list, 33, word(slot67_root));
+            invoke(more_list, 37, 0, constants[0], 0);
+            invoke(more_list, 40, 0, 2, word(graphics), 0);
+            invoke(more_list, 39, 0, 1, word(&constants[1]), 1);
+            lists.push_back(more_list);
+        }
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        std::vector<std::array<double, 3>> per_thread(threads);
+        const auto work = [&](int t) {
+            LARGE_INTEGER a, b;
+            double* ms = per_thread[t].data();
+            const auto timed = [&](int which, auto&& call) {
+                QueryPerformanceCounter(&a);
+                call();
+                QueryPerformanceCounter(&b);
+                ms[which] += 1000.0 * static_cast<double>(b.QuadPart - a.QuadPart) / static_cast<double>(frequency.QuadPart);
+            };
+            void* const mine = lists[t];
+            for (int i = 0; i < rounds; ++i) {
+                timed(0, [&] { invoke(mine, 35, 1, gpu); });
+                timed(1, [&] { invoke(mine, 39, 0, 1, word(&constants[1]), 1); });
+                timed(2, [&] { invoke(mine, 14, 3, 2, 2); });
+            }
+        };
+        LARGE_INTEGER wall_start, wall_end;
+        QueryPerformanceCounter(&wall_start);
+        std::vector<std::thread> workers;
+        for (int t = 1; t < threads; ++t) workers.emplace_back(work, t);
+        work(0);
+        for (auto& w : workers) w.join();
+        QueryPerformanceCounter(&wall_end);
+        double ms[3] = {};
+        for (const auto& p : per_thread)
+            for (int k = 0; k < 3; ++k) ms[k] += p[k];
+        const double wall_ms = 1000.0 * static_cast<double>(wall_end.QuadPart - wall_start.QuadPart) / static_cast<double>(frequency.QuadPart);
+        const long long calls = static_cast<long long>(rounds) * threads;
+        std::printf("x2w-bench threads %d, rounds %d each, wall %.0f ms: slot35 %.2f us/call, slot39 %.2f us/call, slot14 %.2f us/call\n", threads,
+                    rounds, wall_ms, ms[0] * 1000.0 / calls, ms[1] * 1000.0 / calls, ms[2] * 1000.0 / calls);
+        std::fprintf(stderr, "x2w-d3d12 command-list slots over 20 ms: slot35 %.0f ms/%lld slot39 %.0f ms/%lld slot14 %.0f ms/%lld\n", ms[0],
+                     calls, ms[1], calls, ms[2], calls);
+        for (std::size_t t = 1; t < lists.size(); ++t) {
+            invoke(lists[t], 9);
+            invoke(queue, 10, 1, word(&lists[t]));
+        }
+    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
@@ -708,11 +824,20 @@ int main(int argc, char** argv)
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
-        if (std::strcmp(argv[8], "dispatch-retry") == 0) {
-            if (int rc = dispatch_slot67(adapter.Get(), device, "dispatch")) return rc;
+        const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
+        if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
+            if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;
+            const auto before = nolock_retry ? compute_refusal_stats().background_reads : 0;
             std::puts("first slot 67 Dispatch fenced");
             std::fflush(stdout);
             if (std::getchar() != '\n') return 2;
+            if (nolock_retry) {
+                const ULONGLONG deadline = GetTickCount64() + 10000;
+                while (compute_refusal_stats().background_reads == before) {
+                    if (GetTickCount64() >= deadline) return 84;
+                    Sleep(10);
+                }
+            }
         }
         return dispatch_slot67(adapter.Get(), device, argv[8]);
     }

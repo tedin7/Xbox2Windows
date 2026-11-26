@@ -72,13 +72,53 @@ std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
+// Both wrappers and the prefetch worker use stable entries, even after a wrapper is released.
+struct ComputeManifest {
+    x2w_startup::ManifestPrefetch::Publication publication;
+    std::once_flag probe;
+};
+
+bool nolock_compute_refuse()
+{
+    static const bool enabled = x2w_local::env_on("X2W_NOLOCK_REFUSE");
+    return enabled;
+}
+
+ComputeManifest& compute_manifest_for(u64 key)
+{
+    static auto* const entries = new std::unordered_map<u64, ComputeManifest>;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    return (*entries)[key];
+}
+
+bool compute_manifest_missing(ComputeManifest& manifest, u64 key)
+{
+    using State = x2w_startup::ManifestPrefetch::Publication::State;
+    auto& publication = manifest.publication;
+    const State state = publication.state.load(std::memory_order_acquire);
+    if (state != State::unprobed) return state == State::missing;
+    // Competing callers for this key wait for the same first read with draw_lock free.
+    std::call_once(manifest.probe, [&] {
+        auto& source = manifest_source();
+        if (source.read_first(key, publication.text))
+            publication.state.store(State::ready, std::memory_order_release);
+        else
+            source.prefetch().watch_missing(key, publication);
+    });
+    return publication.state.load(std::memory_order_acquire) == State::missing;
+}
+
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
-const char* load_compute_translation(ComputeTranslation& tr)
+const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* prefetched)
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
+    if (prefetched) {
+        // The manifest is ready and draw_lock serializes its consumption and PSO creation.
+        manifest = std::move(prefetched->publication.text);
+    } else if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }
@@ -214,8 +254,19 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const u64 key = pass.pipeline->own().compute_request_key;
+    const auto& pipeline = pass.pipeline->own();
+    const u64 key = pipeline.compute_request_key;
     const auto [x, y, z] = dispatch.groups;
+    const auto type = list->GetType();
+    ComputeManifest* const manifest = pipeline.compute_manifest;
+    const bool valid_type = type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    const bool valid_groups = x <= x2w_startup::max_dispatch_groups && y <= x2w_startup::max_dispatch_groups &&
+                              z <= x2w_startup::max_dispatch_groups;
+    const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
+    if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
+        InterlockedIncrement(&compute_dispatches_untranslated);
+        return "no translation";
+    }
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View {
@@ -228,7 +279,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         UINT stride;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
-    const auto type = list->GetType();
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
     draw_lock_acquire_exclusive();
@@ -239,15 +289,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     ++tr->dispatches;
     tr->use.note(process_ms());
     std::uint32_t words[8] = {};
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
-    else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
-        reason = "a group count is over the limit";
-    else if (pass.compute_root_wrapper != pass.pipeline->own().compute_request_root)
+    if (!valid_type) reason = "the list type has no Dispatch";
+    else if (!valid_groups) reason = "a group count is over the limit";
+    else if (!valid_root)
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
         if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            tr->unmodelled = load_compute_translation(*tr);
+            tr->unmodelled = load_compute_translation(*tr, manifest);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
         if (tr->state != 1) {
@@ -640,4 +689,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
     log_key_use_census();
+}
+
+// Fixtures: snapshot the counters without acquiring or resetting draw_lock.
+extern "C" __declspec(dllexport) void x2w_d3d12_compute_refusal_stats(
+    LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated)
+{
+    *holds = InterlockedCompareExchange64(&draw_lock_stats.hold_calls, 0, 0);
+    *repeated_reads = manifest_source().retry_opens();
+    *background_reads = manifest_source().background_reads();
+    *untranslated = InterlockedCompareExchange(&compute_dispatches_untranslated, 0, 0);
 }
