@@ -7564,9 +7564,15 @@ class Stage:
             if d16 and m == 'd16':
                 continue
             # IMAGE_STORE always uses integer texel coordinates, so unorm is a no-op like on image_load.
-            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')):
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')
+                    or (m == 'a16' and mods.count('a16') == 1 and self.kind == 'ps')):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
+        # a16 packs 16-bit texel coordinates two to a VGPR (x in the low half, y in the high half). Only the 2D form
+        # is lowered, like image_load; other dimensions would also pack the layer or z into a second register.
+        packed_2d = 'a16' in mods
+        if packed_2d and dims != ['SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s modifier a16 only on a 2D image' % name)
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
@@ -7595,8 +7601,9 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        if len(cs) != address:
-            raise Unsupported('%s with %d address registers: %s expected' % (name, len(cs), address_text))
+        if len(cs) != (1 if packed_2d else address):
+            raise Unsupported('%s with %d address registers: %s expected' % (
+                name, len(cs), 'one packed register' if packed_2d else address_text))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -7611,7 +7618,11 @@ class Stage:
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         image = self.pipe.uav(key, image_kind)
-        index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
+        if packed_2d:
+            packed = self.u(cs[0])
+            index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
+        else:
+            index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
