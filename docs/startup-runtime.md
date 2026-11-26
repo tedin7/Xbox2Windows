@@ -2600,8 +2600,8 @@ These are measured on one executable; treat them as hypotheses for others.
   not say which failure came first or what the title expects for a refused request.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_failure_counts' -V`.
 - **DirectStorage loading progress and disk lines.** Every heartbeat (10 s), changed or not, the stand-in prints
-  `x2w-dstorage progress <n> s: pending <p> (oldest <ms> ms), read <x> MB/s, inflated <y> MB/s, enqueued <e> completed <c>, total read <KiB> inflated <KiB>`
-  (pending = enqueued minus completed; the oldest age comes from a ring of 4096 enqueue ticks and is approximate with several queues)
+  `x2w-dstorage progress <n> s: pending <p> (oldest <ms> ms), read <x> MB/s, inflated <y> MB/s, enqueued <e> retired <r> (written <w>, failed <f>), total read <KiB> inflated <KiB>`
+  (pending = enqueued minus retired; retired = written + failed, "written" = requests that really wrote their destination; the oldest age comes from a ring of 4096 enqueue ticks and is approximate with several queues)
   and `x2w-dstorage disk <n> s: <r> reads (+<d>), <x> MB/s while reading, reading <p>% of the window; read sizes <=4K <=16K <=64K <=256K <=1M >1M;
   offsets sequential/forward/backward/first; read failures`. A high share of the window in reads with low MB/s is a seek-bound disk (a
   hard disk); a low share means the time goes to inflating or to waiting for the title. `startup_storage_failure_counts` checks the
