@@ -6990,7 +6990,20 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
     static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0, red_producers().enabled());
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
+    // Cost of the sampler itself (it is meant to be cheap: 18 one-texel rows every 4th present, never waiting): total and worst
+    // call time, logged for the first sample and then every 200 calls, so a run shows whether a picture wait slows the presents.
+    LARGE_INTEGER cost_start, cost_end, cost_frequency;
+    QueryPerformanceCounter(&cost_start);
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
+    QueryPerformanceCounter(&cost_end);
+    QueryPerformanceFrequency(&cost_frequency);
+    static LONG64 cost_calls, cost_total_us, cost_worst_us;
+    const LONG64 cost_us = (cost_end.QuadPart - cost_start.QuadPart) * 1000000 / cost_frequency.QuadPart;
+    cost_total_us += cost_us;
+    if (cost_us > cost_worst_us) cost_worst_us = cost_us;
+    if (++cost_calls == 1 || cost_calls % 200 == 0)
+        log("x2w-present picture signature cost: %lld present calls, total %lld us, worst %lld us, sampling %s",
+            cost_calls, cost_total_us, cost_worst_us, block && block->sampling_wanted ? "requested" : "idle");
     static LONG first, refused, failed;
     if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* rgba = sampler->last_rgba();
