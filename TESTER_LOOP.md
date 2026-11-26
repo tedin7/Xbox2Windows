@@ -7,7 +7,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 
 | Piece | Source | Head taken |
 |---|---|---|
-| `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `7e6774f0a` |
+| `raw=` and `completed=` in the DirectStorage status lines | PR #2817 | `0355a7745` |
 | revision warning for the shader cache and the translator (`revision.txt`, `-FreshShaderCache`) | PR #2820 (issue #2815) | `1bc4a534a` |
 | periodic window capture (`-CaptureEvery`, `--capture-every`) | PR #2822 (issue #2819) | `0d4a8afe4` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
