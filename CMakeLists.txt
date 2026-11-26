@@ -574,6 +574,8 @@ target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_build_rev)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
+# Linker map of our own DLL beside it: tester_run packs its function table so a thread-snapshot frame d3d12_xs.dll+0xNNNN gets a name.
+target_link_options(d3d12_xs_shim PRIVATE "/MAP:$<TARGET_FILE_DIR:d3d12_xs_shim>/d3d12_xs.map")
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Exactly what tools/startup/run.ps1 copies next to the title (xmem, d3d12_xs, AcpHal, XCRDAPI, chad, xapu, xg_xs and
