@@ -1924,6 +1924,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
+    nested_saves, nested_restores = {}, {}  # nested if of a wave block: save index -> restore index, and back
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
     def live_at_join(reg, join):
@@ -1978,7 +1979,28 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
-                    scalar = [i for i in range(source + 1, target) if i not in inner and not (no_effect(i) or lane_only(i))]
+                    # A nested if of the block: s_and_saveexec_b64 sK:sK+1, vcc / s_cbranch_execz over a body / the restore
+                    # s_or_b64 exec, exec, sK:sK+1. Every thread holds its own EXEC bit and the saved mask is one bit per
+                    # thread, so narrowing and restoring is per lane in the one-lane model; the per-lane skip of the
+                    # branch is the generic execz rule, checked on its own edge below. The save, the branch and the
+                    # restore are not scalar instructions the wave block would run once per wave.
+                    nested = set()
+                    for i in range(source + 2, target):
+                        if ins[i][2] != 's_cbranch_execz' or i not in edges or not i < edges[i] < target:
+                            continue
+                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[i - 1][3])
+                        done = ins[edges[i]][3]
+                        if (not save or int(save[2]) != int(save[1]) + 1 or done != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
+                                or not ins[i - 2][2].startswith('v_cmp_')
+                                or any(writes_exec(ins[k][2], parse(ins[k][3])[1]) or re.search(r'\bs\[?%s\b|\bs%s\b' % (save[1], save[2]), ins[k][3])
+                                       for k in range(i + 1, edges[i]))
+                                or any(live_at_join(reg, edges[i] + 1) for reg in ('s' + save[1], 's' + save[2]))):
+                            continue
+                        nested |= {i - 1, i, edges[i]}
+                        nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
+                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    scalar = [i for i in range(source + 1, target)
+                              if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
                     # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
                     # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
@@ -2000,6 +2022,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     # land between the compare and the execz branch, and the block itself is straight-line code.
                     entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
+                    def branch_kinds():
+                        """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
+                        kinds = set()
+                        for k in range(source + 1, target):
+                            if k in edges and k not in inner:
+                                where = ('backward' if edges[k] <= k else 'past the block' if edges[k] > target
+                                         else 'forward in the block')
+                                kinds.add('%s %s' % (ins[k][2], where))
+                        return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
                         ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
@@ -2007,7 +2038,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch',
+                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
@@ -2117,7 +2148,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         base_name = re.sub(r'_e(32|64)$', '', name)
         complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
                       and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
-        if name != 's_and_saveexec_b64' and not complement and scalar_registers(asm) & saved_masks:
+        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores
+                and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
             if scc_stale and reads_scc(name, asm):
@@ -2187,6 +2219,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             mask = None
             stale |= pending
             pending.clear()
+        elif index in nested_saves and mask == 'wave_load':
+            mask, scc_stale = ('nest', index), True
+        elif index in nested_restores and mask == ('nest', nested_restores[index]):
+            mask = 'wave_load'
         elif (name == 's_and_saveexec_b64' and mask is None and index > 0 and index not in targets
               and re.fullmatch(r's_and_saveexec_b64 s\[\d+:\d+\], vcc', asm)
               and ins[index - 1][2].startswith('v_cmp_')
@@ -8461,6 +8497,60 @@ class Stage:
         self.set_s(dst[1] + 1, '0u', ('const', 0))
         return None
 
+    def op_s_bitreplicate_b64_b32(self, ops, mods):
+        """Write each bit of a 32-bit source twice: D.u64 bit 2i and 2i+1 = S0 bit i; SCC unchanged (Run R, 3c50f16a).
+
+        RDNA 2 ISA SOP1 S_BITREPLICATE_B64_B32 (the same result as pixel_aot's s_bitreplicate_b64_b32). The low
+        destination dword holds the replicated source bits 15:0, the high dword bits 31:16. An integer inline
+        constant or a 32-bit literal is the 32-bit source and folds. Lane masks and a source that is also a
+        destination register are refused (the pair would be written before the second half reads the source).
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_bitreplicate_b64_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105 or dst[1] % 2:
+            raise Unsupported('s_bitreplicate_b64_b32 destination %s' % ops[0])
+        if any(r in self.masks for r in range(dst[1], dst[2] + 1)) or self.is_lane_mask(ops[0]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+
+        def replicate(word, shift):
+            folded = 0
+            for bit in range(16):
+                if (word >> (shift + bit)) & 1:
+                    folded |= 3 << (2 * bit)
+            return folded
+
+        def fold(word):
+            lo, hi = replicate(word, 0), replicate(word, 16)
+            self.set_s(dst[1], '0x%08xu' % lo, ('const', lo))
+            self.set_s(dst[1] + 1, '0x%08xu' % hi, ('const', hi))
+
+        if re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1]):
+            fold(int(ops[1], 0) & 0xffffffff)
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s' % ops[1])
+        if src[1] in self.masks or self.is_lane_mask(ops[1]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_bitreplicate_b64_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            fold(sym[1] & 0xffffffff)
+            return None
+        if dst[1] <= src[1] <= dst[2]:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s is a destination register' % ops[1])
+        value = self.S(src[1])
+
+        def expr(shift):
+            return '(%s)' % ' | '.join('((%s & 0x%xu) != 0u ? 0x%xu : 0u)' % (value, 1 << (shift + bit), 3 << (2 * bit))
+                                       for bit in range(16))
+
+        self.set_s(dst[1], expr(0))
+        self.set_s(dst[1] + 1, expr(16))
+        return None
+
     def op_s_quadmask_b32(self, ops, mods):
         """Collapse each nibble of S0 to one bit of D; SCC = result != 0 (#1723).
 
@@ -9322,12 +9412,12 @@ class Stage:
         self.mix(ops, mods, 'hi')
 
     def packed_half(self, base, arity, text, ops, mods):
-        """v_pk_{mul,add,fma}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
+        """v_pk_{mul,add,fma,min,max}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR
-        (an inline constant or a literal reaches the high lane in a way that is not proven; hold it in a VGPR first).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR or a literal read
+        through its low half in both lanes (an inline constant, or a literal's high half, reaches a lane in a way that is not proven).
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -9340,14 +9430,27 @@ class Stage:
             if len(bits) != arity or any(b not in ('0', '1') for b in bits):
                 raise Unsupported('%s with %s' % (base, m))
             sel[key] = [int(b) for b in bits]
-        for tok in ops:
+        literal = {}   # source index -> its 32-bit literal, read through its LOW half only (see below)
+        for i, tok in enumerate(ops):
             r = reg_range(tok)
-            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
-                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
+            if r and r[0] == 'v' and r[1] == r[2] and tok == 'v%d' % r[1]:
+                continue
+            if i >= 1 and re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                # A literal is one dword and each lane picks a half of it by op_sel / op_sel_hi. Only a source whose two lanes both
+                # read the low half is accepted: that is the plain binary16 constant (LLVM prints `0x7bef op_sel_hi:[1,0]`); a read of
+                # the high half of a literal, and an inline constant (how it reaches each half is not proven), stay refused.
+                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                    raise Unsupported('%s literal source %s read through its high half' % (base, tok))
+                literal[i - 1] = int(tok, 16) & 0xffff
+                continue
+            raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
         lanes = []
         for picks in (sel['op_sel'], sel['op_sel_hi']):
             args = []
-            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
+            for n, (tok, hi, both) in enumerate(zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi']))):
+                if n in literal:
+                    args.append('f16tof32(0x%xu)' % literal[n])
+                    continue
                 word = self.u(tok, low16_only=not any(both))
                 args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
             lanes.append('f16rn(%s)' % text.format(*args))
@@ -9362,6 +9465,14 @@ class Stage:
 
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
+    # v_pk_{min,max}_f16: the lane values are exact binary32 images of binary16, so the binary32 helper that orders -0 below +0 and passes a
+    # NaN to D3D min/max (the one v_min_f32 and v_max_f32 use) is exact, and f16rn gives the result back its binary16 word.
+    def op_v_pk_min_f16(self, ops, mods):
+        self.packed_half('v_pk_min_f16', 2, 'minmax_zero32({0}, {1}, false)', ops, mods)
+
+    def op_v_pk_max_f16(self, ops, mods):
+        self.packed_half('v_pk_max_f16', 2, 'minmax_zero32({0}, {1}, true)', ops, mods)
 
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
