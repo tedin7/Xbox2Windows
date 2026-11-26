@@ -2335,6 +2335,8 @@ class Stage:
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
+        if kind == 'ps':
+            self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -2413,6 +2415,23 @@ class Stage:
             self.sym[3] = ('ud', self.pipe.ud(('startinstance',)))
         else:
             self.sym[reg] = ('const', 0)  # primitive mask: only ever moved to m0
+
+    def derive_packed_position(self):
+        """Without a published SPI_PS_INPUT_ENA / ADDR (a request with no .psin), take the packed pixel position from the
+        program's own register use: the one live-in VGPR that is split into both 16-bit halves (tools/startup/
+        ps_input_scan.py: read before any write, low half and high half used) is the POS_FIXED_PT input, which the entry
+        code of the declarations fills from SV_Position. Several such registers, or none, leave the pipeline as it was."""
+        pipe = getattr(self, 'pipe', None)
+        if pipe is None or getattr(pipe, 'ps_inputs_known', True) or getattr(pipe, 'packed_position_vgpr', 0) is not None:
+            return
+        try:
+            from ps_input_scan import contract_of_decoded
+            halves = sorted(contract_of_decoded(self.ins).split16)
+        except Exception:  # noqa: BLE001  (an undecodable stream keeps the old behaviour)
+            return
+        if len(halves) == 1:
+            pipe.packed_position_vgpr = halves[0]
+            pipe.packed_position_derived = True
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
@@ -7628,9 +7647,15 @@ class Stage:
             if d16 and m == 'd16':
                 continue
             # IMAGE_STORE always uses integer texel coordinates, so unorm is a no-op like on image_load.
-            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')):
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')
+                    or (m == 'a16' and mods.count('a16') == 1 and self.kind == 'ps')):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
+        # a16 packs 16-bit texel coordinates two to a VGPR (x in the low half, y in the high half). Only the 2D form
+        # is lowered, like image_load; other dimensions would also pack the layer or z into a second register.
+        packed_2d = 'a16' in mods
+        if packed_2d and dims != ['SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s modifier a16 only on a 2D image' % name)
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
@@ -7659,8 +7684,9 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        if len(cs) != address:
-            raise Unsupported('%s with %d address registers: %s expected' % (name, len(cs), address_text))
+        if len(cs) != (1 if packed_2d else address):
+            raise Unsupported('%s with %d address registers: %s expected' % (
+                name, len(cs), 'one packed register' if packed_2d else address_text))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -7675,7 +7701,11 @@ class Stage:
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         image = self.pipe.uav(key, image_kind)
-        index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
+        if packed_2d:
+            packed = self.u(cs[0])
+            index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
+        else:
+            index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
@@ -10378,6 +10408,8 @@ class Pipeline:
         self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
+        # False without SPI_PS_INPUT_ENA / ADDR: Stage.derive_packed_position then reads the register from the program.
+        self.ps_inputs_known = ps_hw_inputs is not None
         # First VGPR of the PERSP_CENTER I/J entry pair (SPI_PS_INPUT_ADDR bit 1, after the PERSP_SAMPLE pair when that
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0

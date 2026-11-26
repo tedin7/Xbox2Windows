@@ -4093,6 +4093,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # description, stale or missing masks and contradictory enable/address masks; then the #1634 gradient draw.
     add_test(NAME startup_packed_screen_position_provenance COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_provenance_check.py")
+    # A warm cache keeps results translated before the packed position was derived from the program (no revision bump):
+    # the repair tool withdraws exactly those and nothing else.
+    add_test(NAME startup_shader_cache_repair_packed COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_shader_cache_repair_packed_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
