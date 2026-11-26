@@ -2473,9 +2473,13 @@ class Stage:
             # Put the synthetic definition within the compare's byte span so real targets stay fixed.
             for old, new in zip(original, self.ins):
                 if old != new:
-                    at = re.search(r'\bvcc_hi\b', old[3]).start()
-                    self.execz_vcc_high = re.match(r's\d+\b', new[3][at:])[0]
+                    found = re.search(r'\bvcc_hi\b', old[3])
+                    renamed = re.match(r's\d+\b', new[3][found.start():]) if found else None
+                    if renamed:
+                        self.execz_vcc_high = renamed[0]
                     break
+            if self.execz_vcc_high is None:
+                raise Unsupported('EXECZ VCC vote: the renamed vcc_hi register was not found')
             expanded = []
             for off, n, name, asm in self.ins:
                 if writes_compare_vcc(name, asm):
