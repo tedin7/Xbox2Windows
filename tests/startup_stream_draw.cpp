@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
@@ -190,7 +191,8 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
     return binding.table ? 0 : 41;
 }
 
-bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding);
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding,
+                const D3D12_SHADER_RESOURCE_VIEW_DESC* view = nullptr);
 
 int draw_pixel_history(ID3D12Device* desktop, void* guest, void* pso, const char* pixels)
 {
@@ -392,7 +394,8 @@ bool bind_dropmips(ID3D12Device* desktop, void* guest, Bc7Binding& binding)
 }
 
 // A shader-visible heap whose first entry is a view of every mip of texture; binding.table is its GPU handle.
-bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding)
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding,
+                const D3D12_SHADER_RESOURCE_VIEW_DESC* view)
 {
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment;
@@ -407,7 +410,7 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
         return false;
     const auto cpu = invoke(heap, 9);
     if (cpu != arg(binding.views.data())) return false;
-    invoke(guest, 18, arg(texture), 0, cpu);
+    invoke(guest, 18, arg(texture), arg(view), cpu);
     binding.table = invoke(heap, 10);
     return binding.table != 0;
 }
@@ -416,6 +419,7 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
+    const bool vertex_sample = GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", nullptr, 0) != 0;
     const bool console_view = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", nullptr, 0) != 0;
     const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
     const bool bc = console_view || console_gate || GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
@@ -442,7 +446,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain && !vertex_sample ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -592,6 +596,19 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
     } else {
+        if (vertex_sample) {
+            extern bool copy_vertex_sample_texture(void*, void*, bool, void*&);
+            wchar_t mode[8]{};
+            GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", mode, 8);
+            const bool cube = std::wcscmp(mode, L"cube") == 0;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURECUBE,
+                                                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            view.TextureCube.MipLevels = 1;
+            void* texture = nullptr;
+            if (!copy_vertex_sample_texture(guest, list, cube, texture) ||
+                !bind_table(desktop.Get(), guest, texture, binding, cube ? &view : nullptr)) return 78;
+            invoke(list, 36, 0, binding.table);
+        }
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
@@ -721,5 +738,20 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (const int rc = root_heap_report()) return rc;
     }
 
+    if (vertex_sample) {
+        // GPU validation can report after ExecuteCommandLists returns. The fence has completed here.
+        ComPtr<ID3D12InfoQueue> messages;
+        if (SUCCEEDED(desktop.As(&messages))) {
+            for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+                SIZE_T size = 0;
+                if (FAILED(messages->GetMessage(i, nullptr, &size)) || size > 8192 || !size) continue;
+                alignas(D3D12_MESSAGE) unsigned char storage[8192];
+                auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage);
+                if (SUCCEEDED(messages->GetMessage(i, message, &size)))
+                    std::fprintf(stderr, "vertex sample debug: sev=%d id=%d %s\n",
+                                 message->Severity, message->ID, message->pDescription);
+            }
+        }
+    }
     return read_stream_target(desktop.Get(), frame, pixels);
 }

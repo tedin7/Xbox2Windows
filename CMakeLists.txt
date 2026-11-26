@@ -4991,6 +4991,12 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    if(DXC_EXECUTABLE)
+        add_test(NAME startup_sampled_state_stages_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampled_state_stages_check.py"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_stream_consumer>")
+        set_tests_properties(startup_sampled_state_stages_warp PROPERTIES TIMEOUT 420)
+    endif()
     # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
     add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"

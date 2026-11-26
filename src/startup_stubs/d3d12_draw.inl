@@ -149,12 +149,25 @@ std::uint64_t process_ms()
     return GetTickCount64() - base;
 }
 
+bool sampled_state_stages_enabled()
+{
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_SAMPLED_STATE_STAGES", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+constexpr auto all_sampled_stages =
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
 struct Translation {
     struct Srv {
-        int kind;    // 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture
+        int kind;    // 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube
         int source;  // 0 table (parameter a, byte b), 1 vertex stream a, 2 root parameter a
         int a, b;
         bool pointer_choice = false;
+        D3D12_RESOURCE_STATES shader_state = all_sampled_stages; // Legacy manifests have no stage metadata.
     };
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, table_word };
     struct Ud { int kind, a, b; };
@@ -601,10 +614,20 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             } else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
+            const bool cube = !std::strcmp(kind, "texcube");
+            if (cube && !sampled_state_stages_enabled()) return;
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
+                                     cube ? 5 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (sampled_state_stages_enabled() && line.compare(0, 9, "srvstage ") == 0) {
+            if (std::sscanf(line.c_str(), "srvstage %d %15s", &i, kind) != 2 || i < 0 ||
+                static_cast<std::size_t>(i) >= tr.srvs.size() || tr.srvs[i].kind == 0) return;
+            if (!std::strcmp(kind, "pixel")) tr.srvs[i].shader_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            else if (!std::strcmp(kind, "nonpixel")) tr.srvs[i].shader_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            else if (!std::strcmp(kind, "both")) tr.srvs[i].shader_state = all_sampled_stages;
+            else return;
         } else if (line.compare(0, 10, "srvchoice ") == 0) {
             int used = 0;
             if (std::sscanf(line.c_str(), "srvchoice %d%n", &i, &used) != 1 ||
@@ -2761,7 +2784,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             return refuse(i, "the texture is also a render or depth target of this draw", reinterpret_cast<u64>(texture));
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
-            if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
+            if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
             const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
@@ -3090,6 +3113,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
+    const bool stage_states = sampled_state_stages_enabled();
+    std::array<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>, 32> sampled_states;
+    UINT sampled_state_count = 0;
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
@@ -3124,10 +3150,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
         if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
-        if (srv.kind >= 1 && srv.kind <= 4) {
+        if (srv.kind >= 1 && srv.kind <= 5) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D :
+                                   srv.kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE3D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -3196,7 +3223,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) {
-                require_state(self, texture, sampled_state(self, texture));
+                if (!stage_states) require_state(self, texture, sampled_state(self, texture));
                 if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
             }
             const bool had_texture = texture != nullptr;
@@ -3207,7 +3234,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             const bool wrong_1d_resource = texture && srv.kind == 4 &&
                 (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
-            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
+            // A default SRV for a six-slice resource is an array, so a cube always needs an explicit view.
+            const bool missing_cube_desc = srv.kind == 5 && record.desc_bytes < 40;
+            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) ||
+                            wrong_1d_resource || missing_cube_desc)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
                 texture = nullptr;
@@ -3248,6 +3278,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
+            if (stage_states && texture) {
+                // Separate slots can resolve to the same desktop resource.
+                auto end = sampled_states.begin() + sampled_state_count;
+                auto state = std::find_if(sampled_states.begin(), end,
+                                          [texture](const auto& entry) { return entry.first == texture; });
+                if (state == end) sampled_states[sampled_state_count++] = {texture, srv.shader_state};
+                else state->second |= srv.shader_state;
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
@@ -3546,6 +3584,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 tr->key, i, static_cast<long>(frame_number), address, bytes, text, bits, holder.owner != nullptr, holder.alias != nullptr,
                 holder.reject, recorded_copy, indirect_copy_ranges());
         }
+    }
+    for (UINT i = 0; i < sampled_state_count; ++i) {
+        const auto& [texture, state] = sampled_states[i];
+        require_state(self, texture, sampled_state(self, texture, state));
     }
     phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {

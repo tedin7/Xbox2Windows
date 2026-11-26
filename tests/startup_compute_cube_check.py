@@ -56,8 +56,9 @@ def pipeline(words=WORDS):
 
 
 def texel(face, x, y):
-    """One float4 per texel; no two of the 96 are equal in any channel combination."""
-    return (float(face + 1), float(x), float(y), float(100 * (face + 1) + 10 * y + x))
+    """Face ID and two gradients with different slopes on each face."""
+    return (float(face + 1), float(7 * face + (face + 2) * x),
+            float(11 * face + (face + 3) * y), 1.0)
 
 
 def samples():
@@ -151,11 +152,13 @@ def dispatch(directory, compiler, exe, adapter):
     assert not wrong, 'sample %d: got %s expected %s (%d of %d samples differ)' % (
         wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), THREADS)
     print('all %d samples match (6 faces, 4 off-centre samples each)' % THREADS)
-    # Mutants: the table swaps +X and -X (every sample of the two faces reads the other), and S/T swapped (the 12 samples
-    # whose texel has x != y read the transposed texel). Each must fail the same comparison.
+    # Each U or V reversal must change every sample, including all four reads on each face.
     swapped = source.replace('f == 0u', 'f == @u').replace('f == 1u', 'f == 0u').replace('f == @u', 'f == 1u')
     transposed = source.replace(CALL, 'x2w_cube_dir(F(v2), F(v1), F(v3))')
-    for name, text, count in (('wrong face order', swapped, 8), ('S and T swapped', transposed, 12)):
+    reverse_u = source.replace(CALL, 'x2w_cube_dir(3.0 - F(v1), F(v2), F(v3))')
+    reverse_v = source.replace(CALL, 'x2w_cube_dir(F(v1), 3.0 - F(v2), F(v3))')
+    for name, text, count in (('wrong face order', swapped, 8), ('S and T swapped', transposed, 12),
+                              ('U reversed', reverse_u, THREADS), ('V reversed', reverse_v, THREADS)):
         assert text != source, name
         got = compile_and_run(directory, compiler, exe, adapter, text, name.replace(' ', '_'))
         wrong = mismatches(got)

@@ -7769,6 +7769,12 @@ class Stage:
     def op_tbuffer_load_format_xyzw(self, ops, mods):
         self.tbuffer(ops, mods, 4)
 
+    def texture_srv(self, key, kind):
+        binding = self.pipe.resource(key, kind)
+        if getattr(self, 'kind', None) in ('ps', 'vs', 'ms') and hasattr(self.pipe, 'note_srv_stage'):
+            self.pipe.note_srv_stage(key, 'pixel' if self.kind == 'ps' else 'nonpixel')
+        return binding
+
     def image(self, ops, mods, how):
         if getattr(self, 'kind', None) == 'cs' and 'd16' in mods:
             raise Unsupported('compute d16 image load requires validated SRV formats')
@@ -7785,8 +7791,10 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
-        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        # Cube maps support explicit levels. The draw binder's cube view is opt-in.
+        cube = (dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l')
+                and (getattr(self, 'kind', None) == 'cs'
+                     or (type(self.pipe) is Pipeline and os.environ.get('X2W_SAMPLED_STATE_STAGES') == '1')))
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:
@@ -7896,7 +7904,7 @@ class Stage:
             keys = [(source, at + 4 * word) for source, at in locations]
         else:
             keys = [self.descriptor(ops[2])]
-        textures = [self.pipe.resource(key, kinds[dim]) for key in keys]
+        textures = [self.texture_srv(key, kinds[dim]) for key in keys]
         desc_key, tex = keys[0], textures[0]
         if choice:
             for key in keys:
@@ -8102,7 +8110,7 @@ class Stage:
             pixel_aot.comparison_sampler_state(tuple(words), level_zero=how == 'c_lz', allow_border=True)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
+        tex = self.texture_srv(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type.
         location = ('float3(%s, %s, %s)' % (self.f(cs[1]), self.f(cs[2]), self.f(cs[3])) if array
@@ -8338,7 +8346,7 @@ class Stage:
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
         key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
-        tex = self.pipe.resource(key, 'tex2d')
+        tex = self.texture_srv(key, 'tex2d')
         return dst, addr, words, channels[masks[0]], tex
 
     def op_image_gather4(self, ops, mods):
@@ -8472,7 +8480,7 @@ class Stage:
             check_gather_sampler(words, 1, comparison=True)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        tex = self.texture_srv(self.descriptor(ops[2]), 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         reference, u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         # The gather is read before any destination register is written, so an alias between the address
@@ -11390,6 +11398,9 @@ class Pipeline:
         r.setdefault('uses', set()).add(use)
         r['classified'] = r.get('classified', 0) + 1
 
+    def note_srv_stage(self, key, stage):
+        self.resources[key].setdefault('stages', set()).add(stage)
+
     @staticmethod
     def srv_use_line(r):
         """`srvuse N sample|texel|lod` for a read texture whose every use was classified, else None: a runtime that
@@ -11918,6 +11929,9 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+            stages = r.get('stages')
+            if stages:
+                lines.append('srvstage %d %s' % (r['index'], 'both' if len(stages) == 2 else next(iter(stages))))
             if r.get('pointer_choice'):
                 lines.append('srvchoice %d' % r['index'])
             if self.srv_use_line(r):

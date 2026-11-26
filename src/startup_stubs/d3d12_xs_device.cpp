@@ -3105,15 +3105,16 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
     pass.states.emplace_back(resource, state);
 }
 // State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
-D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
+D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource,
+                                   D3D12_RESOURCE_STATES shader_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
 {
     for (const auto& planes : pass_of(self).mixed)
         if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            return D3D12_RESOURCE_STATE_DEPTH_READ | shader_state;
     for (const auto& known : pass_of(self).states)
         if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            return D3D12_RESOURCE_STATE_DEPTH_READ | shader_state;
+    return shader_state;
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 

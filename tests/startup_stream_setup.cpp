@@ -147,7 +147,9 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+        table.ShaderVisibility = GetEnvironmentVariableW(L"X2W_TEST_VERTEX_SAMPLE", nullptr, 0)
+            ? D3D12_SHADER_VISIBILITY_ALL
+            : vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = textured_parameters;
         if (joined_table || GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
