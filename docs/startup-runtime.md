@@ -887,7 +887,10 @@ the debugger and stops it, with its worker processes, when the debugger returns 
 without `-Render` is ignored with a warning). The watcher repeats the `--pending` scan every
 2 seconds (`--watch <dir> <seconds>` sets another interval), so a pipeline the title creates during
 the run is translated within seconds, and the runtime picks it up on a later draw instead of on the
-next run. The cache persists: a later run reads every published `<key>.txt` and translates only new
+next run. Each pass serves the requests in the order the title published them, those published since the
+watcher started first, then the older backlog; during a pass the watcher looks for new requests about every
+second between results, so a request the title publishes while a long backlog is being translated starts next
+instead of after the backlog. The cache persists: a later run reads every published `<key>.txt` and translates only new
 requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
 requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
 ready marker is not retried during the run (the runtime writes each request once and never rewrites

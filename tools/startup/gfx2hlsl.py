@@ -11316,8 +11316,9 @@ def main():
         # The first pass retries earlier failures once (the runtime never rewrites a request, so a
         # translator fix would otherwise not reach them); later passes skip failures already written.
         skip_failed = False
+        started = time.time()  # requests published after this are the running title's: they go first
         while True:
-            if watch_pass(out_dir, skip_failed):
+            if watch_pass(out_dir, skip_failed, started):
                 skip_failed = True
             time.sleep(interval)
     translate_pending(out_dir)
@@ -11325,12 +11326,13 @@ def main():
 
 
 
-def watch_pass(out_dir, skip_failed):
-    """One --watch pass. A worker killed from outside (out of memory) breaks the pool; the pass is
+def watch_pass(out_dir, skip_failed, since=None):
+    """One --watch pass: translate_pending with rescans, so a request the title publishes during a long pass starts
+    within about RESCAN_SECONDS. A worker killed from outside (out of memory) breaks the pool; the pass is
     reported and its requests are retried on the next pass instead of ending the watcher."""
     from concurrent.futures.process import BrokenProcessPool
     try:
-        translate_pending(out_dir, skip_failed=skip_failed)
+        translate_pending(out_dir, skip_failed=skip_failed, rescan=True, since=since)
         return True
     except BrokenProcessPool as error:
         print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
@@ -11384,23 +11386,85 @@ def translation_jobs():
     return min(jobs, 61) if os.name == 'nt' else jobs  # ProcessPoolExecutor refuses more than 61 on Windows
 
 
-def translate_pending(out_dir, skip_failed=False, jobs=None):
-    """Translate every request that has no result yet. The runtime writes the ready markers last.
+RESCAN_SECONDS = 1.0  # --watch: how often a pass looks for requests published since it started
+READY_MARKERS = ('a', 'rtv', 'c67', 'm57')
+
+
+def request_stamps(out_dir, keys):
+    """{key: modification time of its ready marker}: when the runtime published the request (it writes the marker
+    last). A request whose marker is gone sorts last."""
+    stamps = {}
+    for key in keys:
+        stamps[key] = float('inf')
+        for ext in READY_MARKERS:
+            with suppress(OSError):
+                stamps[key] = os.path.getmtime(os.path.join(out_dir, 'req_%016x.%s' % (key, ext)))
+                break
+    return stamps
+
+
+def request_order(stamps, since=None):
+    """Keys in the order the title asked for them: oldest ready marker first. With since (the watcher's start), the
+    requests published after it, which the running title is waiting for, come before the older backlog."""
+    return sorted(stamps, key=lambda key: (since is None or stamps[key] < since, stamps[key], key))
+
+
+def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None):
+    """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
+    the ready markers last.
 
     Requests are independent (each writes only its own <key>.* files), so several run in parallel
     processes; X2W_TRANSLATE_JOBS (default: the processor count, at most 61 on Windows) sets how many.
+    Each worker gets one request at a time. With rescan (--watch), the pending list is read again at most every
+    RESCAN_SECONDS between results, so a request published during the pass is queued in its order instead of
+    waiting for the next pass; a request already handled in this pass is queued again only when its marker is
+    rewritten. Results are printed as they finish.
     """
-    keys = pending_keys(out_dir, skip_failed)
-    jobs = min(jobs or translation_jobs(), len(keys))
-    if jobs < 2:
-        for key in keys:
-            print('%016x: %s' % (key, translate_one(out_dir, key)), flush=True)
+    stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed)))
+    queue = request_order(stamps, since)
+    if not queue:
         return
-    from concurrent.futures import ProcessPoolExecutor
-    chunk = max(1, len(keys) // (jobs * 4))  # small batches keep every worker busy
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        for key, result in zip(keys, pool.map(translate_one, [out_dir] * len(keys), keys, chunksize=chunk)):
-            print('%016x: %s' % (key, result), flush=True)
+    handled = {}  # key -> marker time it was queued with in this pass
+
+    def refill(queue):
+        # A failure written during this pass is final for the pass (skip_failed), as on the next pass.
+        queued = set(queue)
+        fresh = request_stamps(out_dir, [key for key in pending_keys(out_dir, True) if key not in queued])
+        stamps.update((key, t) for key, t in fresh.items() if handled.get(key) != t)
+        return request_order({key: stamps[key] for key in queued | {k for k in fresh if handled.get(k) != fresh[k]}},
+                             since)
+
+    jobs = jobs or translation_jobs()
+    if not rescan:
+        jobs = min(jobs, len(queue))
+    last_scan = time.monotonic()
+    pool = running = None
+    if jobs >= 2:
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+        pool, running = ProcessPoolExecutor(max_workers=jobs), {}
+    try:
+        while True:
+            while queue and (pool is None or len(running) < jobs):
+                key = queue.pop(0)
+                handled[key] = stamps[key]
+                if pool is None:
+                    print('%016x: %s' % (key, translate_one(out_dir, key)), flush=True)
+                    break
+                running[pool.submit(translate_one, out_dir, key)] = key
+            if running:
+                done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
+                for future in done:
+                    print('%016x: %s' % (running.pop(future), future.result()), flush=True)
+            idle = not queue and not running
+            if rescan and (idle or time.monotonic() - last_scan >= RESCAN_SECONDS):
+                queue = refill(queue)
+                last_scan = time.monotonic()
+                idle = not queue and not running
+            if idle:
+                return
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
 
 def pending_keys(out_dir, skip_failed):
