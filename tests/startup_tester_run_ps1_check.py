@@ -69,7 +69,8 @@ mkey = fnv(b'x2w-startup-mesh-57-7')
 # --retry-lifted <cache> <s> --jobs N: count the .fail files and print the line gfx2hlsl.py prints, record the arguments
 if len(sys.argv) > 2 and sys.argv[1] == '--retry-lifted':
     fails = [n for n in os.listdir(sys.argv[2]) if n.endswith('.fail')]
-    open(os.path.join(sys.argv[2], 'retry_args.txt'), 'w').write(' '.join(sys.argv[3:]))
+    if os.environ.get('STUB_RETRY_ARGS'):  # outside the cache: the next run lists the cache's entries
+        open(os.environ['STUB_RETRY_ARGS'], 'w').write(chr(10).join(sys.argv[3:]))
     print('pre-run retry: %%d keys (%%d in lifted families), ok 0, still refused %%d, 0 s' %% (len(fails), len(fails), len(fails)))
     sys.exit(0)
 # one pass (argv: --once <cache>): publish a ready marker for every request that has none; STUB_HANG never ends (the cap)
@@ -379,11 +380,16 @@ def check_shell(shell):
         (fresh_cache / "req_dddddddddddddddd.a").write_bytes(b"x")
         (fresh_cache / "dddddddddddddddd.fail").write_text("unsupported: MRTZ requires one uncompressed depth export\n")
         capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
-                            extra_env={"STUB_HANG": "1"})
+                            extra_env={"STUB_HANG": "1", "STUB_RETRY_ARGS": str(tree.parent / "retry_args.txt")})
         assert capped.returncode == 0, (capped.stdout, capped.stderr)
         assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
         assert "tester_run: pre-run retry: 1 keys (1 in lifted families)" in capped.stdout, capped.stdout
-        assert (fresh_cache / "retry_args.txt").read_text().split() == ["180", "--jobs", "4"], "pre-run retry arguments"
+        # the earlier runs left their stderr.txt: the newest ranks the retry by draws/dispatches
+        retry_args = (tree.parent / "retry_args.txt").read_text().splitlines()
+        assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
+        weights_file = Path(retry_args[4])
+        assert weights_file.name == "stderr.txt" and weights_file.parent.name.startswith("run_") and weights_file.is_file(), \
+            retry_args
         assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
