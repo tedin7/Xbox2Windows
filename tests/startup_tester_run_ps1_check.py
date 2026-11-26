@@ -166,10 +166,9 @@ def check_shell(shell):
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
             memory = z.read("memory.txt").decode("utf-8").splitlines()
-        # The end line after the run (the system commit and the top processes by commit; this shell is one of them),
-        # then the line the memory left after exit is measured with.
-        assert len(memory) >= 2 and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-2]), memory
-        assert memory[-1].startswith("0 s after exit commit "), memory
+        # The end line after the run: the system commit and the top processes by commit (this shell is one of them);
+        # with -MemoryLeftSeconds 0 the memory left after exit is measured on it.
+        assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
                                 "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt"]), names

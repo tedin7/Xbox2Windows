@@ -324,13 +324,17 @@ if (Test-Path -LiteralPath $stallFile) {
 $endCause = ((Invoke-Native { & $python -B $pack end-cause $logDir }) -join " ").Trim()
 Write-Host "tester_run: the run ended: $endCause"
 if ($memorySampler) { try { Stop-Process -Id $memorySampler.Id -Force -ErrorAction SilentlyContinue; [void]$memorySampler.WaitForExit(5000) } catch { } }
-Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
 # What our run leaves behind: -MemoryLeftSeconds (10) after the title exits, the system commit and the commit no process
-# holds against the run's first memory.txt line (a leak until reboot shows here run after run).
+# holds against the run's first memory.txt line (a leak until reboot shows here run after run). With 0 the "end" line
+# itself is compared.
 $memoryLeft = $null
 try {
-    if ($MemoryLeftSeconds -gt 0) { Start-Sleep -Seconds $MemoryLeftSeconds }
-    $memoryLeft = (Invoke-Native { & $python -B $memoryTop $memoryFile --once "$MemoryLeftSeconds s after exit" --top 8 --left } | Out-String).Trim()
+    if ($MemoryLeftSeconds -gt 0) {
+        Invoke-Native { & $python -B $memoryTop $memoryFile --once "end" --top 8 } | Out-Null
+        Start-Sleep -Seconds $MemoryLeftSeconds
+    }
+    $leftLabel = if ($MemoryLeftSeconds -gt 0) { "$MemoryLeftSeconds s after exit" } else { "end" }
+    $memoryLeft = (Invoke-Native { & $python -B $memoryTop $memoryFile --once $leftLabel --top 8 --left } | Out-String).Trim()
     if ($memoryLeft) { Write-Host "tester_run: $memoryLeft" }
 } catch { Write-Warning "tester_run: memory left after exit not measured ($($_.Exception.Message))" }
 
