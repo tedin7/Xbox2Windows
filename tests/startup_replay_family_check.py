@@ -19,6 +19,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 from startup_replay_check import CALL, chunks, pictures, run
 
@@ -44,6 +45,13 @@ def call_list(recording, limit=60):
     return "\n".join(out)
 
 
+def phase(text):
+    print('[%.1f s] %s' % (time.monotonic() - START, text), flush=True)
+
+
+START = time.monotonic()
+
+
 def main(argv):
     if "--" not in argv or argv.index("--") < 2:
         print(__doc__)
@@ -57,12 +65,14 @@ def main(argv):
     env = scrub(os.environ)
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
+        phase("plain run")
         code, text = run(scene, env)
         if code == 77:
             print("scene skipped (77):", name)
             return 77
         assert code == 0, "the scene fails on its own, not a replay question:\n" + text[-2000:]
 
+        phase("recorded run")
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()
         recorded_code, recorded_text = run(scene, dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
@@ -80,6 +90,7 @@ def main(argv):
             summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
             return code, text, summary, pictures(out)
 
+        phase("replay")
         code, text, summary, replayed = replay(recording, directory / "replayed")
         log = directory / "replayed" / "stderr.txt"
         tail = log.read_text(errors="replace")[-2500:] if log.exists() else ""
