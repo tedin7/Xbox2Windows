@@ -39,6 +39,7 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
+#include "startup_stubs/d3d12_replay_slots.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/sysmem_create.h"

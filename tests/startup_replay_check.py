@@ -13,7 +13,7 @@ startup_replay_quad draws an animated scene only through the stand-in and presen
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
 
-usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware>
+usage: startup_replay_check.py <startup_replay_quad> <x2w_replay> <warp|hardware> [slot-layouts]
 """
 import json
 import os
@@ -118,7 +118,86 @@ def replay(player, recording, out, backend, env, presents=PRESENTS):
     return score[0], pictures(out)
 
 
-def main(scene, player, backend):
+def check_slot_layouts(scene, player, backend, env, directory, vs, ps, root):
+    # The first wait is in the prefix. The list no-op enters the log only after the window opens.
+    frames = 3
+    recorded_dir = directory / "recorded"
+    recorded_dir.mkdir()
+    recording = directory / "slots.x2wr"
+    code, text = run([scene, vs, ps, root, backend, frames],
+                     dict(env, X2W_REPLAY_RECORD="f1,2", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_REPLAY_SLOT_LAYOUTS="1", X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    data = bytearray(recording.read_bytes())
+    calls, call_headers, memory, blobs = {}, {}, {}, {}
+    for tag, header, _hb, payload, size in chunks(data):
+        if tag == b"CALL":
+            call = CALL.unpack_from(data, header)
+            calls[call[0]] = call
+            call_headers[call[0]] = header
+        elif tag == b"ARGM":
+            seq, arg, depth, _address, length, blob_hash = struct.unpack_from("<QIIQQQ", data, header)
+            memory.setdefault(seq, []).append((arg, depth, length, blob_hash))
+        elif tag == b"BLOB":
+            blobs[struct.unpack_from("<Q", data, header)[0]] = (payload, size)
+
+    def sequences(kind, slot):
+        return sorted(seq for seq, call in calls.items() if call[2:4] == (kind, slot))
+
+    waits, barriers = sequences(0, 80), sequences(LIST_KIND, 146)
+    assert len(waits) == 3 and len(barriers) == 2, (waits, barriers)
+    assert all(not memory.get(seq) for seq in barriers), barriers
+    for expected, seq in enumerate(waits, 1):
+        [(arg, depth, length, blob_hash)] = memory[seq]
+        assert (arg, depth, length) == (4, 0, 8), memory[seq]
+        at, size = blobs[blob_hash]
+        assert size == 8 and struct.unpack_from("<Q", data, at)[0] == expected, seq
+
+    memory_views, uploads = sequences(0, 70), sequences(LIST_KIND, 148)
+    assert len(memory_views) == 3 and len(uploads) == 2, (memory_views, uploads)
+    assert all(not memory.get(seq) for seq in uploads), uploads
+    for seq in memory_views:
+        assert [(arg, depth, length) for arg, depth, length, _hash in memory[seq]] == [(0, 0, 56), (1, 0, 48)]
+
+    [list_create] = sequences(0, 73)
+    assert [(arg, length) for arg, _depth, length, _hash in memory[list_create]] == [(0, 16), (3, 16), (4, 8)]
+    pipeline_creates = sequences(0, 86)
+    assert len(pipeline_creates) == 2, pipeline_creates
+    for seq in pipeline_creates:
+        args = memory[seq]
+        assert [(arg, length) for arg, _depth, length, _hash in args if arg < 256] == [(0, 16), (1, 16), (2, 8)]
+        [stream_length] = [length for arg, depth, length, _hash in args if (arg, depth) == (512, 1)]
+        desc_at, _ = blobs[args[0][3]]
+        assert stream_length == struct.unpack_from("<Q", data, desc_at)[0], args
+
+    out = directory / "replayed"
+    _score, rendered = replay(player, recording, out, backend, env, presents=2)
+    recorded = pictures(recorded_dir)
+    assert sorted(rendered) == ["present_0001.png", "present_0002.png"]
+    for frame in (1, 2):
+        assert rendered["present_%04d.png" % frame] == recorded["present_%04d.png" % (frame + 1)], frame
+    summary = json.loads((out / "replay_summary.json").read_text())
+    assert summary["slot_layouts"] == {"frame_waits": 3, "barrier_noops": 2, "upload_ranges": 2, "result_mismatches": 0}, summary
+
+    # Mutate both expected results. The calls and rendered pixels should be unaffected.
+    struct.pack_into("<Q", data, at, 99)
+    ret_offset = CALL.size - struct.calcsize("<Qdii")
+    struct.pack_into("<Q", data, call_headers[barriers[-1]] + ret_offset, 1)
+    mutant = directory / "bad-results.x2wr"
+    mutant.write_bytes(data)
+    out = directory / "mutant"
+    clean_env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
+    code, text = run([player, mutant, out, "--adapter", backend], clean_env)
+    assert code == 6, text[-3000:]
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert f"WaitFrameEvent result mismatch at seq {waits[-1]}" in log, log[-3000:]
+    assert f"BarrierLikeNoop result mismatch at seq {barriers[-1]}" in log, log[-3000:]
+    assert pictures(out) == rendered
+    print("slot layouts: 3 matching waits including the prefix, 2 matching no-ops, 2 matching pictures, both mutations detected")
+    return 0
+
+
+def main(scene, player, backend, mode=None):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         cache = directory / "cache"
@@ -129,7 +208,7 @@ def main(scene, player, backend):
         env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
-        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES"):
+        for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_PRESENT_PICTURES", "X2W_REPLAY_SLOT_LAYOUTS"):
             env.pop(name, None)
         code, text = run([scene, vs, ps, root, backend, 1], env)
         if code == 77 and backend == "hardware":
@@ -137,6 +216,9 @@ def main(scene, player, backend):
             return 77
         assert code == 0, text[-3000:]
         subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
+
+        if mode == "slot-layouts":
+            return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
 
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()

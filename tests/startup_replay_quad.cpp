@@ -80,7 +80,7 @@ int create_scene(void* device, Scene& s)
     return 0;
 }
 
-int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
+int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool slot_layouts)
 {
     const float t = static_cast<float>(frame) / static_cast<float>(frames);
     const float colour[] = {t, 0.25f, 1.0f - t, 1.0f};
@@ -88,6 +88,24 @@ int draw_frame(Scene& s, void* pso, UINT frame, UINT frames)
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
+    if (slot_layouts) {
+        Word token = ~Word{0};
+        if (invoke(device, 80, 0, 0, 0, 0, arg(&token), arg(&token)) != S_OK || token != frame + 1)
+            return 34;
+        // The capture probe suggests count and array. The stand-in must return zero
+        // with a readable array and leave the rendered scene unchanged.
+        Word barrier_like[8]{0x42};
+        if (invoke(s.list, 146, 1, arg(barrier_like)) != 0) return 35;
+        const Word upload = invoke(s.list, 148, 32, 16);
+        if (!upload || (upload & 15)) return 36;
+        const D3D12_RESOURCE_DESC resource{};
+        const struct {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            Word address;
+        } memory_view{{}, upload};
+        // Exercise the argument layout using a null destination, which refuses the descriptor write.
+        invoke(device, 70, arg(&resource), arg(&memory_view), 0);
+    }
     invoke(s.list, 52, s.rtv, arg(colour));
     invoke(s.list, 50, 1, arg(&s.rtv));
     invoke(s.list, 21, 1, arg(&viewport));
@@ -134,9 +152,11 @@ int main(int argc, char** argv)
     unsigned pause_frame = ~0u, pause_ms = 0;
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PAUSE", pause, sizeof(pause)) && std::sscanf(pause, "%u,%u", &pause_frame, &pause_ms) != 2)
         return 2;
+    char layouts[2]{};
+    const bool slot_layouts = GetEnvironmentVariableA("X2W_REPLAY_SLOT_LAYOUTS", layouts, sizeof(layouts)) == 1 && layouts[0] == '1';
     for (UINT frame = 0; frame < frames; ++frame) {
         if (frame == pause_frame) Sleep(pause_ms);
-        if (const int rc = draw_frame(scene, pso, frame, frames)) return rc;
+        if (const int rc = draw_frame(scene, device, pso, frame, frames, slot_layouts)) return rc;
     }
     std::printf("replay quad: %u presents drawn\n", frames);
     return 0;

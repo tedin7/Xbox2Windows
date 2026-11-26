@@ -26,6 +26,8 @@ constexpr int record_depth = 2;  // argument memory, the memory it points at (a 
 
 void* original[kind_count][wide_slots];
 bool armed;
+bool use_slot_layouts;
+static_assert(device_kind == x2w_replay_slots::device && list_kind == x2w_replay_slots::list);
 LONG64 volatile next_seq;
 LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
@@ -140,12 +142,12 @@ u64 content_hash(const unsigned char* data, std::size_t bytes)
 // plausible size: a shader is a pointer, then its byte count). depth > 0 follows pointer words in its first bytes. A
 // followed pointer's ARGM names its direct parent: `arg` = the call's argument | 0x100 * (word index + 1), and the
 // parent is the last ARGM of the same call with depth one higher (they are written parent first).
-void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth)
+void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std::size_t size_hint, int depth, bool exact = false)
 {
     if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address))) return;
-    const std::size_t wanted = size_hint > blob_default_bytes ? size_hint : blob_default_bytes;
+    const std::size_t wanted = exact || size_hint > blob_default_bytes ? size_hint : blob_default_bytes;
     const std::size_t bytes = readable_window(address, wanted);
-    if (!bytes) return;
+    if (!bytes || (exact && bytes != wanted)) return;
     std::vector<unsigned char> copy(bytes);
     SIZE_T got = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), copy.data(), bytes, &got) || got != bytes)
@@ -163,6 +165,16 @@ void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std
         InterlockedIncrement64(&blobs_stored);
     }
     if (depth <= 0) return;
+    // The typed stream descriptor is (size, pointer). Follow just the stream,
+    // and limit its copy to the declared size. Shader pointers inside still use the generic scan.
+    if (exact && depth == record_depth) {
+        u64 stream_bytes, stream;
+        std::memcpy(&stream_bytes, copy.data(), 8);
+        std::memcpy(&stream, copy.data() + 8, 8);
+        if (stream_bytes && stream_bytes <= blob_max_bytes)
+            record_memory(b, seq, arg | 0x200u, stream, static_cast<std::size_t>(stream_bytes), depth - 1, true);
+        return;
+    }
     const std::size_t scan = (bytes < blob_follow_bytes ? bytes : blob_follow_bytes) / 8;
     const auto* words = reinterpret_cast<const u64*>(copy.data());
     for (std::size_t i = 0; i < scan; ++i) {
@@ -192,6 +204,46 @@ struct Call {
     std::int32_t present, pad;
 };
 
+void record_wrapper_output(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address)
+{
+    if (!x2w_local::readable(reinterpret_cast<const void*>(address), 8)) return;
+    const u64 now = *reinterpret_cast<const u64*>(address);
+    if (!as_wrapper(reinterpret_cast<const void*>(now))) return;
+    struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{seq, arg, 0, now};
+    append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
+}
+
+void record_arguments(ThreadBuffer& b, const Call& call)
+{
+    const auto& args = call.args;
+    const u64 seq = call.seq;
+    const auto* layout = use_slot_layouts ? x2w_replay_slots::find(call.kind, call.slot) : nullptr;
+    if (layout && layout->known_memory) {
+        for (std::uint32_t i = 0; i < 5; ++i) {
+            if (!layout->memory[i]) continue;
+            const int depth = static_cast<int>(i) == layout->follow ? record_depth : 0;
+            record_memory(b, seq, i, args[i], layout->memory[i], depth, true);
+            if (static_cast<int>(i) == layout->wrapper_output && SUCCEEDED(static_cast<HRESULT>(call.ret)))
+                record_wrapper_output(b, seq, i, args[i]);
+        }
+        return;
+    }
+    if (!as_wrapper(reinterpret_cast<const void*>(call.object))) record_memory(b, seq, rcx_arg, call.object, 0, 0);
+    // Words past a slot's own arguments are the caller's stack: recorded too (a replay passes them on, the slot ignores
+    // them), the ones after followed_args with a short look only.
+    for (std::uint32_t i = 0; i < call_args; ++i) {
+        const u64 value = args[i];
+        if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
+        record_wrapper_output(b, seq, i, value);
+        if (i >= followed_args) {
+            record_memory(b, seq, i, value, 0, 0);
+            continue;
+        }
+        const u64 next = i + 1 < followed_args ? args[i + 1] : 0;
+        record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
+    }
+}
+
 // After the call: the call, then for each pointer argument the wrapper its memory holds (OUTP: a creation's result
 // when the replayer has not seen that wrapper yet, else an input such as a list array) and its memory (ARGM).
 void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call_args], u64 ret)
@@ -202,28 +254,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
     append_chunk(b.bytes, "CALL", &call, sizeof(call), nullptr, 0);
-    // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
-    // memory after the call is the returned value; ARGM argument 15 (rcx_arg).
-    if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, rcx_arg, object, 0, 0);
-    // Words past a slot's own arguments are the caller's stack: recorded too (a replay passes them on, the slot ignores
-    // them), the ones after followed_args with a short look only.
-    for (std::uint32_t i = 0; i < call_args; ++i) {
-        const u64 value = args[i];
-        if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
-        if (x2w_local::readable(reinterpret_cast<const void*>(value), 8)) {
-            const u64 now = *reinterpret_cast<const u64*>(value);
-            if (as_wrapper(reinterpret_cast<const void*>(now))) {
-                struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{seq, i, 0, now};
-                append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
-            }
-        }
-        if (i >= followed_args) {
-            record_memory(b, seq, i, value, 0, 0);
-            continue;
-        }
-        const u64 next = i + 1 < followed_args ? args[i + 1] : 0;
-        record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
-    }
+    record_arguments(b, call);
     InterlockedIncrement64(&calls_written);
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
@@ -474,6 +505,8 @@ void install()
         const u64 alive = ticks(now) > ticks(created) ? ticks(now) - ticks(created) : 0;  // 100 ns units
         started.QuadPart -= static_cast<LONGLONG>(alive / 10000 * static_cast<u64>(frequency.QuadPart) / 1000);
     }
+    char layouts[2]{};
+    use_slot_layouts = GetEnvironmentVariableA(x2w_replay_slots::setting, layouts, sizeof(layouts)) == 1 && layouts[0] == '1';
     std::vector<unsigned char> head;
     struct { std::uint32_t version, call_bytes; u64 frequency; } header{3, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);

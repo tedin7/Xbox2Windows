@@ -6,7 +6,8 @@
 //                   [--from-present K] [--max-seconds S]
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
-// pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
+// pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 6 a slot result differs,
+// 77 no D3D12 adapter.
 //
 // Version 1 plays on one thread. Per call:
 //   - the object and every argument naming a recorded wrapper get the replay's wrapper (wrappers are learned from the
@@ -39,6 +40,7 @@
 
 #include "replay_file.h"
 #include "replay_pages_apply.h"
+#include "../startup_stubs/d3d12_replay_slots.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -75,6 +77,8 @@ struct Player {
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
+    bool use_slot_layouts = false;
+    u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
     void* device = nullptr;
 
     // A recorded byte range inside a translated range: the replay's address, `bytes` clipped to that range.
@@ -339,7 +343,29 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
         rcx = call.top[rcx_arg];
     }
+    const auto* layout = p.use_slot_layouts ? x2w_replay_slots::find(c.kind, c.slot) : nullptr;
+    const bool wait = layout && c.kind == device_kind && c.slot == 80;
+    const bool barrier_noop = layout && c.kind == x2w_replay_slots::list && c.slot == 146;
+    constexpr int token_arg = 4;
+    const u64 expected_token = wait ? recorded_word(r, step, token_arg) : 0;
+    u64 token = ~expected_token;
+    // The recording holds the post-call token. Start with a different value to prove that replay writes it.
+    if (wait && c.args[token_arg]) a[token_arg] = reinterpret_cast<u64>(&token);
     call.ret = call_slot(call.self, rcx, c.slot, a);
+    if (wait || barrier_noop) {
+        p.frame_waits += wait;
+        p.barrier_noops += barrier_noop;
+        const bool output_differs = wait && c.args[token_arg] && token != expected_token;
+        const bool return_differs = wait ? static_cast<UINT>(call.ret) != static_cast<UINT>(c.ret) : call.ret != c.ret;
+        if (output_differs || return_differs) {
+            ++p.slot_result_mismatches;
+            say("x2w-replay: %s result mismatch at seq %llu", layout->name, c.seq);
+        }
+    }
+    if (layout && c.kind == x2w_replay_slots::list && c.slot == 148 && c.ret && call.ret && c.args[0]) {
+        p.handles[c.ret] = Range{call.ret, c.args[0]};
+        ++p.upload_ranges;
+    }
     if (c.kind == fence_kind && c.slot == fence_completed && call.ret < c.ret) {
         for (const ULONGLONG deadline = GetTickCount64() + 10000; call.ret < c.ret && GetTickCount64() < deadline; Sleep(1))
             call.ret = call_slot(call.self, rcx, c.slot, a);
@@ -403,7 +429,12 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
         for (std::size_t i = 0; i < pages.spans.size(); ++i)
             std::fprintf(f, "%s{\"address\": \"0x%llx\", \"bytes\": %llu, \"hash\": \"%016llx\"}", i ? ", " : "", pages.spans[i].base,
                          pages.spans[i].end - pages.spans[i].base, span_hash(pages.spans[i]));
-        std::fprintf(f, "]}\n");
+        std::fprintf(f, "]");
+        if (p.use_slot_layouts)
+            std::fprintf(f, ", \"slot_layouts\": {\"frame_waits\": %llu, \"barrier_noops\": %llu, "
+                            "\"upload_ranges\": %llu, \"result_mismatches\": %llu}",
+                         p.frame_waits, p.barrier_noops, p.upload_ranges, p.slot_result_mismatches);
+        std::fprintf(f, "}\n");
         std::fclose(f);
     }
     std::printf("x2w-replay score presents %llu calls %llu of %zu unknown_object %llu missing_blob %llu fence_timeouts %llu "
@@ -519,6 +550,9 @@ int run(const Options& o)
         return 77;
     }
     Player p;
+    const std::string slot_layout_setting = std::string(x2w_replay_slots::setting) + "=1";
+    for (const std::string& entry : r.settings)
+        if (entry == slot_layout_setting) p.use_slot_layouts = true;
     unsigned char parameters[64]{};
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters, __uuidof(ID3D12Device), &p.device)) || !p.device) {
         say("x2w-replay: the stand-in made no device");
@@ -550,7 +584,8 @@ int run(const Options& o)
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     write_summary(o, p, r, wall, stopped);
-    return stopped ? 5 : 0;
+    if (stopped) return 5;
+    return p.slot_result_mismatches ? 6 : 0;
 }
 
 }  // namespace

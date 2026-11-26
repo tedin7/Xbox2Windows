@@ -1933,6 +1933,35 @@ be had stops the replay with exit 3 and its address), and every `MAP` is written
 sequence number; argument memory inside those spans is passed as is. `replay_summary.json` adds the page counts and each
 span's final image hash. Not replayed yet: float arguments passed by value, one thread per recorded thread.
 
+Set `X2W_REPLAY_SLOT_LAYOUTS=1` when recording to use the D3D12 slot layouts
+in [d3d12_replay_slots.h](../src/startup_stubs/d3d12_replay_slots.h). The
+recorder keeps format 3 and stores the switch in `XENV`. The player reads
+formats 2 and 3. The switch bounds argument copies for device slots 70, 73,
+80 and 86, and the player maps the CPU pointer returned by list slot 148
+over the requested range. As with other memory-backed views, replay of slot
+70 needs the backing address to be available through replayed pages or a
+translated range. Tracking the slot 148 pointer alone does not record writes
+made through it.
+
+List slot 146 currently returns zero through the list no-op. The capture
+probe suggests a barrier array, but the stand-in does not consume one.
+Opaque no-ops with unknown argument layouts retain the generic capture
+path. List slots 28–30 use query objects and scalar arguments when
+`X2W_D3D12_QUERY_SLOTS=1` selects the experimental bindings. For switched
+recordings, replay checks the slot 146 result and the slot 80 HRESULT and
+written frame token. A mismatch returns exit 6.
+
+`startup_replay_slot_layouts_warp` and `startup_replay_slot_layouts_hardware`
+record a two-present window with three frame waits, including one in the
+prefix, and two list no-ops. They check exact argument captures for slots 70,
+73, 80 and 86, check two translated slot 148 upload allocations, compare the
+two replayed pictures pixel for pixel, and mutate the stored frame token and
+no-op return to check that replay detects both mismatches.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_slot_layouts_(warp|hardware)$' --output-on-failure
+```
+
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_replay_' --output-on-failure
 ```
