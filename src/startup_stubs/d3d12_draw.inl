@@ -138,7 +138,7 @@ struct Translation {
     x2w_startup::ComPtr<ID3D12CommandSignature> indexed_signature;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
-    LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
+    LONG logged_draws = 0, logged_bindings = 0, logged_constants = 0, constants_seen = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
 // Per title pipeline: its translation and the blend state found in its state block (if any).
@@ -2832,6 +2832,35 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
+        }
+        // Log only, with the red-producer switches: the first words of a small constant range as floats, and what holds the
+        // range, so a constant buffer with stale bytes can be traced to its writer (a title write after this snapshot, or a
+        // GPU write into a placed buffer that does not alias title memory, which this path never reads).
+        static const bool constants_log = GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", nullptr, 0) != 0 ||
+                                          GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", nullptr, 0) != 0;
+        // The first 3 draws of a translation, then every 300th (a constant that changes later, or never does, shows in the series).
+        const bool constants_due = constants_log && have && bytes >= 16 && bytes <= 4096 &&
+                                   (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
+        if (constants_due) {
+            const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);
+            const std::size_t shown = (std::min<std::size_t>)(bytes / 4, 52);
+            char text[52 * 14 + 1] = "";
+            std::size_t used = 0;
+            for (std::size_t k = 0; k < shown && used + 14 < sizeof(text); ++k) {
+                float value;
+                std::memcpy(&value, &memory_words[k], 4);
+                used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, "%s%g", k % 4 ? " " : (k ? " | " : ""), static_cast<double>(value)));
+            }
+            // Raw bits too, so NaN payloads and pointer-like words are not hidden by the %g text.
+            char bits[52 * 9 + 1] = "";
+            for (std::size_t k = 0, at = 0; k < shown && at + 9 < sizeof(bits); ++k)
+                at += static_cast<std::size_t>(std::snprintf(bits + at, sizeof(bits) - at, "%s%08x", k ? " " : "", memory_words[k]));
+            const auto holder = placed_buffer_range(self->own().list_device, address, bytes);
+            auto* native = holder.owner ? static_cast<ID3D12Resource*>(holder.owner->own().real) : nullptr;
+            const bool recorded_copy = native && list_copied_gpu_range(self, native, address - reinterpret_cast<u64>(holder.owner->own().title_memory), bytes);
+            log("x2w-draw   %016llx srv %u constants frame %ld at 0x%llx (%zu bytes) as floats: %s; bits: %s; placed owner=%d alias=%d reject=%d recorded_copy_in_list=%d copy_ranges_env=%d",
+                tr->key, i, static_cast<long>(frame_number), address, bytes, text, bits, holder.owner != nullptr, holder.alias != nullptr,
+                holder.reject, recorded_copy, indirect_copy_ranges());
         }
     }
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
