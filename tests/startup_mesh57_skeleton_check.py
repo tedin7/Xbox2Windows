@@ -431,8 +431,6 @@ REFUSALS = (
      'slot 57 mesh count exchange: instruction 4 of the accepted shape (s_mov_b64) has other operands'),
     ('no wait before the first barrier', mutate('bfa3ffe3', 'bf800000'),
      'slot 57 mesh group-index exchange: instruction 8 of the accepted shape (s_waitcnt_depctr) is replaced by s_nop'),
-    ('a program that ends inside the count exchange', MESH[:MESH.index('bf8a0000') + 1],
-     'slot 57 mesh count exchange: instruction 14 of the accepted shape (s_mov_b64) is absent: the program ends first'),
     ('a branch that leaves the count exchange', mutate('bf82000d', 'bf82000e'),
      'slot 57 mesh count exchange: a branch leaves the accepted shape'),
     ('a barrier after the count exchange', mutate('bf8c3f70', 'bf8a0000'),
@@ -1367,8 +1365,26 @@ def draw_shift(dxc, renderer, adapter):
     return 0
 
 
+def check_match_causes():
+    """The matcher names which of three causes stopped it: the program ended, another opcode, or other operands."""
+    ins = [(0, 1, 's_mov_b64', 's_mov_b64 exec, -1'), (4, 1, 's_nop', 's_nop 0')]
+    patterns = [r's_mov_b64 exec, -1', r's_mov_b64 exec, 0']
+    for patterns_, want in (
+            (patterns, 'instruction 2 of the accepted shape (s_mov_b64) has other operands'),
+            ([patterns[0], 's_barrier'], 'instruction 2 of the accepted shape (s_barrier) is replaced by s_nop'),
+            ([patterns[0], 's_nop 0', 's_endpgm'], 'instruction 3 of the accepted shape (s_endpgm) is absent: the program ends first')):
+        other = [ins[0], (4, 1, 's_mov_b64', 's_mov_b64 exec, 1')] if 'other operands' in want else ins
+        try:
+            G.mesh_run(other, 0, 'count exchange', patterns_, {})
+        except G.Unsupported as reason:
+            expect('match cause ' + want, str(reason), 'slot 57 mesh count exchange: ' + want)
+        else:
+            expect('match cause ' + want, 'accepted', want)
+
+
 def main(argv):
     status = 0
+    check_match_causes()
     if argv[1:2] == ['binary'] and len(argv) == 3:
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
