@@ -49,6 +49,7 @@ def main(consumer, dxc, adapter):
         rounds = int(env['X2W_TEST_BENCH_CALLS'])
         # The list that reads the manifest first translates all of its Dispatches; a racing list is refused while that read is in flight
         # (the stand-in's existing behaviour), so only this lower bound holds for every thread count.
+        refused = lines(result, 'refused')
         census = lines(result, 'x2w-render compute census key ')
         assert len(census) == 1, census
         translated = int(census[0].split(' dispatches, ')[1].split(' translated')[0])
