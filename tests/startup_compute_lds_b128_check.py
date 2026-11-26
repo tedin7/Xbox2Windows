@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops across s_barrier.
+"""Verify bounded LDS exchanges across s_barrier, including mixed widths and forward control flow.
 
 With no arguments, checks offline RSRC2 sizing, 4-VGPR quad validation, dword alignment/bounds, mixed 32/64/128-bit
 LDS interoperability, and barrier/waitcnt/branch/EXEC/1D-group/gds/non-compute refusals.
@@ -166,7 +166,81 @@ WORDS_R = bytes.fromhex(
     '7fc08cbf0785158f15001a4a841a1a34001078e00d090480000081bf'
 )
 
+# The first 64 of 128 lanes fill LDS. All lanes read a neighbour in that
+# prefix, then only the first 64 lanes read the broadcast word.
+SOURCE_LANE = PREAMBLE + """\
+s_mov_b64 s[22:23], exec
+v_cmpx_gt_u32 64, v0
+s_cbranch_execz 4
+v_add_nc_u32 v5, 7, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5
+s_mov_b64 exec, s[22:23]
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_lshlrev_b32 v8, 2, v0
+v_xor_b32 v8, 4, v8
+v_and_b32 v8, 0xfc, v8
+ds_read_b32 v9, v8
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v12, 0
+v_cmpx_gt_u32 64, v0
+v_mov_b32 v10, 0
+ds_read_b32 v12, v10
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, s[22:23]
+v_add_nc_u32 v9, v12, v9
+v_lshlrev_b32 v13, 2, v0
+buffer_store_dword v9, v13, s[16:19], 0 offen
+s_endpgm
+"""
+
+# Dispatch two groups to take opposite SCC arms at both exchanges.
+SOURCE_SCC = PREAMBLE + """\
+s_cmp_eq_u32 s7, 0
+s_cbranch_scc1 5
+v_add_nc_u32 v5, 17, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5
+s_branch 4
+v_add_nc_u32 v5, 8, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5
+s_waitcnt lgkmcnt(0)
+s_barrier
+s_cmp_eq_u32 s7, 0
+s_cbranch_scc1 5
+v_mov_b32 v8, 12
+ds_read_b32 v9, v8
+s_waitcnt lgkmcnt(0)
+s_branch 4
+v_mov_b32 v8, 4
+ds_read_b32 v9, v8
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s21, s7, 6
+v_add_nc_u32 v13, s21, v0
+v_lshlrev_b32 v13, 2, v13
+buffer_store_dword v9, v13, s[16:19], 0 offen
+s_endpgm
+"""
+
+WORDS_LANE = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf7e0496bec000a87d040088bf87000a4a'
+    '82000834000034d8040500001604febe7fc08cbf00008abf820010348410103aff101036'
+    'fc0000000000d8d8080000097fc08cbf8002187ec000a87d8002147e0000d8d80a00000c'
+    '7fc08cbf1604febe0c13124a82001a34001070e00d090480000081bf'
+)
+WORDS_SCC = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf078006bf050085bf91000a4a82000834'
+    '000034d804050000040082bf88000a4a82000834000034d8040500007fc08cbf00008abf'
+    '078006bf050085bf8c02107e0000d8d8080000097fc08cbf040082bf8402107e0000d8d8'
+    '080000097fc08cbf0786158f15001a4a821a1a34001070e00d090480000081bf'
+)
+
+
 CASES = {
+    'lane': (SOURCE_LANE, WORDS_LANE, USER7 | TGID_X | (1 << 15), (128, 1, 1), (1, 1, 1)),
+    'scc': (SOURCE_SCC, WORDS_SCC, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     'Q': (SOURCE_Q, WORDS_Q, USER7 | TGID_X | (2 << 15), (32, 1, 1), (2, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | (2 << 15), (64, 1, 1), (1, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | (1 << 15), (32, 1, 1), (1, 1, 1)),
@@ -188,7 +262,12 @@ SENTINEL = 0xc5c5c5c5
 
 def expected_words(name):
     out = [SENTINEL] * WORDS
-    if name == 'Q':
+    if name == 'lane':
+        for lane in range(128):
+            out[lane] = ((lane & 63) ^ 1) + 7 + (7 if lane < 64 else 0)
+    elif name == 'scc':
+        out[:128] = [8 + 1] * 64 + [17 + 3] * 64
+    elif name == 'Q':
         for g in range(2):
             for l in range(32):
                 peer = (g << 8) + (l ^ 17)
@@ -242,6 +321,7 @@ def translate_case(name, code=None, rsrc2=None, group=None):
 
 
 def check_controls():
+    check_control_flow()
     # Positive HLSL lowering: declarations, single-eval alias-safe index, barrier, and all 4 dwords.
     hlsl_q = translate_case('Q').hlsl_cs()
     assert 'groupshared uint lds[256];' in hlsl_q, hlsl_q
@@ -370,7 +450,7 @@ def check_controls():
     refused('after the fill barrier',
             lambda: translate_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', nop)))                               # non-producer s_nop before read
     refused('entry EXEC', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '8003febe' + store_q)))
-    refused('straight-line', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
+    refused('completed fill', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
     refused('1D group', lambda: translate_case('Q', group=(16, 2, 1)))
     refused('completed read', lambda: G.check_lds_exchange(b64_to_b128[:4] + [b64_to_b128[-1]], (4, 1, 1), 128))
     refused('does not cover', lambda: G.check_lds_exchange([
@@ -435,10 +515,14 @@ def check_binary(llvm_mc):
     for line, hex_words in VERIFIED_SNIPPETS.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == hex_words, '%s: assembled %s, recorded %s' % (line, built, hex_words)
-    print('128-bit LDS fixture words match llvm-mc (%d programs, %d snippets)' % (len(CASES), len(VERIFIED_SNIPPETS)))
+    print('LDS fixture words match llvm-mc (%d programs, %d snippets)' % (len(CASES), len(VERIFIED_SNIPPETS)))
 
 
 CONTROLS = {
+    'lane-wrong-peer': ('lane', '        if (exec & 1) v8 = 0x00000004u ^ v8;\n', ''),
+    'lane-unmasked-read': ('lane', 'if (exec & 1) v12 = lds[(v10 + 0u) >> 2];', 'v12 = lds[(v10 + 0u) >> 2];'),
+    'scc-invert-fill': ('scc', 'pc = (scc) ? 2 : 1;', 'pc = (scc) ? 1 : 2;'),
+    'scc-invert-read': ('scc', 'pc = (scc) ? 5 : 4;', 'pc = (scc) ? 4 : 5;'),
     'q-same-lane': ('Q', '    v9 = 0x00000110u ^ v4;\n', '    v9 = v4;\n'),
     'q-swap-dwords': ('Q', '    v11 = lds[a + 2u];\n    v12 = lds[a + 3u];\n',
                       '    v11 = lds[a + 3u];\n    v12 = lds[a + 2u];\n'),
@@ -453,6 +537,32 @@ def mutate(hlsl, control):
     _, old, new = CONTROLS[control]
     assert hlsl.count(old) == 1, (control, hlsl)
     return hlsl.replace(old, new)
+
+
+def check_control_flow():
+    barrier = '    GroupMemoryBarrierWithGroupSync();'
+    for name in ('lane', 'scc'):
+        hlsl = translate_case(name).hlsl_cs()
+        assert hlsl.count(barrier.strip()) == 1 and barrier in hlsl.splitlines(), hlsl
+        assert hlsl.index('] = v5;') < hlsl.index(barrier) < hlsl.index('v9 = lds['), hlsl
+        if name == 'lane':
+            assert 'if (exec & 1) lds[' in hlsl and 'if (exec & 1) v12 = lds[' in hlsl, hlsl
+        for control, (case, _, _) in CONTROLS.items():
+            if name == case:
+                assert mutate(hlsl, control) != hlsl
+
+    for old, new, reason in (
+        ('040088bf', '070088bf', 'barrier reached by the whole group'),
+        ('040088bf', 'ffff88bf', 'to a block before it'),
+        ('c000a87d040088bf', 'a000a87d040088bf', 'initialized span'),
+        ('7e0496be', '7e0496be800396be', 'entry EXEC'),
+    ):
+        refused(reason, lambda: translate_case('lane', code=patch(WORDS_LANE, old, new)))
+    for old, new, reason in (
+        ('040082bf88000a4a', '060082bf88000a4a', 'barrier reached by the whole group'),
+        ('050085bf91000a4a', '090085bf91000a4a', 'completed fill'),
+    ):
+        refused(reason, lambda: translate_case('scc', code=patch(WORDS_SCC, old, new)))
 
 
 def run_case(name, dxc, runner, adapter, directory, control=None):

@@ -1426,7 +1426,7 @@ def check_lds():
         ('8002107e', '0403107e', 'literal or literal-masked'),        # unbounded VGPR address
         (peer + wait, peer + nop, 'completed LGKM wait'),
         (store, '8003febe' + store, 'entry EXEC'),
-        (store, '020084bf' + store, 'straight-line'),
+        (store, '020084bf' + store, 'completed fill'),
     ):
         refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
     base = USER7 | TGID_X

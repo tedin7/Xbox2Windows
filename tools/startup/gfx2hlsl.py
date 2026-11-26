@@ -1446,7 +1446,24 @@ LDS_EXCHANGE_OPS = {
 }
 
 
-def check_lds_exchange(ins, group, words):
+LDS_STRAIGHT_LINE = 'LDS exchange needs straight-line code and entry EXEC'
+LDS_UNIFORM_BARRIER = 'LDS exchange needs a barrier reached by the whole group'
+LDS_GROUP_SYNC = 'GroupMemoryBarrierWithGroupSync();'
+LDS_SYNC_SITE = '// proven LDS exchange barrier'
+
+
+def check_lds_exchange(ins, group, words, *, wave_size=None):
+    """Keep the original straight-line lowering and prove bounded control flow when needed."""
+    try:
+        _check_lds_path(ins, group, words)
+    except Unsupported as error:
+        if str(error) != LDS_STRAIGHT_LINE or not any(name in LDS_EXCHANGE_OPS for _, _, name, _ in ins):
+            raise
+        return check_lds_paths(ins, group, words, wave_size)
+    return None
+
+
+def _check_lds_path(ins, group, words, *, active_lanes=None, narrow_sites=()):
     """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
 
     RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
@@ -1463,6 +1480,8 @@ def check_lds_exchange(ins, group, words):
     if not 0 < words <= 8192:
         raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
+    fill_layout = []
+    entry_x = True
     published = False
     read = False
     prev = (None, [], [])
@@ -1471,7 +1490,9 @@ def check_lds_exchange(ins, group, words):
         base = name.removesuffix('_e32').removesuffix('_e64')
         if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc')) or writes_exec(base, ops)
                 or base == 's_endpgm' and i + 1 < len(ins)):
-            raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
+            raise Unsupported(LDS_STRAIGHT_LINE)
+        if i in narrow_sites and not entry_x:
+            raise Unsupported('LDS EXEC comparison needs the unchanged entry local X ID')
         if base == 's_barrier':
             if (not fill_spans or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
                     or mods or ops not in ([], ['0'], ['0x0'])):
@@ -1495,7 +1516,7 @@ def check_lds_exchange(ins, group, words):
             producer, args, modifiers = prev
             if write:
                 offset, = offsets
-                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
+                # The prefix below preserves entry X in v0. Each participating lane writes one distinct element.
                 # 8-byte / 16-byte alignment is not required for LDS dword-addressed writes.
                 end = offset + group[0] * width
                 if (offset % 4 or end > words * 4 or published
@@ -1512,7 +1533,9 @@ def check_lds_exchange(ins, group, words):
                         raise Unsupported('LDS dword fills must be disjoint')
                 elif producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0'] or modifiers:
                     raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
-                fill_spans.append((offset, end))
+                lanes = active_lanes[i] if active_lanes is not None else group[0]
+                fill_spans.append((offset, offset + lanes * width))
+                fill_layout.append((offset, width, lanes))
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
                     raise Unsupported('LDS read needs a bounded address after the fill barrier')
@@ -1532,17 +1555,135 @@ def check_lds_exchange(ins, group, words):
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
                 read = True
+                dest = reg_range(val_op)
+                entry_x &= dest[1] != 0
         elif base.startswith('ds_') or 'lds' in mods:
             raise Unsupported('LDS exchange does not cover ' + asm)
-        elif not fill_spans and not base.startswith('s_'):
+        elif not base.startswith('s_'):
             # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
             # can also change a source. After the fill, each read proves its own address without the entry X ID.
             if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
                     or not ops or not re.fullmatch(r'v[0-9]+', ops[0]) or ops[0] == 'v0'):
-                raise Unsupported('LDS fill needs the unchanged entry local X ID')
+                entry_x = False
+                if not fill_spans:
+                    raise Unsupported('LDS fill needs the unchanged entry local X ID')
         prev = base, ops, mods
-    if not read:
+    if not published or (not read and active_lanes is None):
         raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
+    return tuple(sorted(fill_layout)), read
+
+
+def check_lds_paths(ins, group, words, wave_size):
+    """Check forward SCC paths and EXEC blocks narrowed to a literal prefix of local X IDs."""
+    barriers = [off for off, _, name, _ in ins if name == 's_barrier']
+    if len(barriers) != 1:
+        raise Unsupported(LDS_UNIFORM_BARRIER)
+    barrier, = barriers
+    wave32 = wave_size == 32 or wave_size is None and wave32_exec_proof(ins)
+    move = 's_mov_b32' if wave32 else 's_mov_b64'
+    exec_mask = 'exec_lo' if wave32 else 'exec'
+    mask_width = 1 if wave32 else 2
+    index = {off: i for i, (off, _, _, _) in enumerate(ins)}
+    branches = {}
+    scc_branches = set()
+    for i, (_, _, name, asm) in enumerate(ins):
+        if name.startswith(('s_branch', 's_cbranch')):
+            target = index.get(int(parse(asm)[1][0].split('_')[1], 16), -1)
+            if target <= i or name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz'):
+                raise Unsupported(LDS_STRAIGHT_LINE)
+            branches[i] = target
+            if name in ('s_cbranch_scc0', 's_cbranch_scc1'):
+                scc_branches.add(ins[i][0])
+        elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe')):
+            raise Unsupported(LDS_STRAIGHT_LINE)
+
+    for source, target in branches.items():
+        if ins[source][2] != 's_cbranch_execz':
+            continue
+        # An inactive lane may skip only lane-predicated operations and waits. Its
+        # execution state is unchanged across the skip, and no barrier is inside it.
+        for _, _, name, asm in ins[source + 1:target]:
+            if not (name in LDS_EXCHANGE_OPS or name in ('s_waitcnt', 's_nop')
+                    or Stage.vector_only_instruction(name, asm)):
+                raise Unsupported(LDS_UNIFORM_BARRIER)
+        if source < index[barrier] - 1 < target:
+            raise Unsupported('LDS exchange needs an unconditional fill wait')
+        if any(source < dest < target for dest in branches.values()):
+            raise Unsupported(LDS_STRAIGHT_LINE)
+
+    # Each path carries its own address producers, waits and EXEC prefix. Bound the
+    # number of paths so the refusal scan also handles large branch graphs.
+    pending = [(0, [], [], set(), {}, group[0])]
+    layouts = set()
+    has_read = False
+    path_count = 1
+    while pending:
+        i, path, active, narrow, saved, lanes = pending.pop()
+        while i < len(ins):
+            off, size, name, asm = ins[i]
+            if i in branches:
+                target = branches[i]
+                if name == 's_branch':
+                    i = target
+                    continue
+                if name != 's_cbranch_execz':
+                    path_count += 1
+                    if path_count > 64:
+                        raise Unsupported('LDS exchange exceeds the control-flow path limit')
+                    pending.append((target, path.copy(), active.copy(), narrow.copy(), saved.copy(), lanes))
+                i += 1
+                continue
+
+            base, ops, mods = parse(asm)
+            base = base.removesuffix('_e32').removesuffix('_e64')
+            _, _, clobbered = scalar_effects(name, asm)
+            if 'any' in scalar_destinations(name, asm):
+                saved.clear()
+            for reg in tuple(saved):
+                if scalar_tokens(reg) & clobbered:
+                    del saved[reg]
+            if base == move and len(ops) == 2 and ops[1] == exec_mask and not mods:
+                reg = reg_range(ops[0])
+                if reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] + 1 == mask_width:
+                    saved[ops[0]] = lanes
+            if writes_exec(base, ops) or clobbered & EXEC_KEYS:
+                # CMPX intersects the incoming mask with (local_x < unsigned literal).
+                predicate = ops[::-1] if base == 'v_cmpx_lt_u32' else ops
+                if (not mods and base in ('v_cmpx_gt_u32', 'v_cmpx_lt_u32') and len(predicate) == 2
+                        and predicate[1] == 'v0' and re.fullmatch(r'0x[0-9a-f]+|[0-9]+', predicate[0])):
+                    narrow.add(len(path))
+                    lanes = min(lanes, int(predicate[0], 0))
+                elif not mods and base == move and len(ops) == 2 and ops[0] == exec_mask:
+                    if ops[1] in saved:
+                        lanes = saved[ops[1]]
+                    elif ops[1] == '-1' and group[0] % (32 if wave32 else 64) == 0:
+                        lanes = group[0]
+                    else:
+                        raise Unsupported(LDS_STRAIGHT_LINE)
+                else:
+                    raise Unsupported(LDS_STRAIGHT_LINE)
+                # An EXEC change must not be mistaken for an adjacent address producer or wait.
+                name = asm = 's_nop'
+            active.append(lanes)
+            path.append((off, size, name, asm))
+            if base == 's_endpgm':
+                break
+            i += 1
+        if not any(off == barrier for off, _, _, _ in path):
+            raise Unsupported(LDS_UNIFORM_BARRIER)
+        layout, read = _check_lds_path(path, group, words, active_lanes=active, narrow_sites=narrow)
+        layouts.add(layout)
+        has_read |= read
+
+    # SCC is proved uniform by the emitter's scalar analysis. Additionally, keep the
+    # same writer for every initialized word even if different guest waves choose
+    # different SCC paths. The lanes in one wave cannot supply another wave's fill.
+    if len(layouts) != 1:
+        raise Unsupported('LDS exchange needs the same fill layout on all SCC paths')
+    if not has_read:
+        raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
+    return scc_branches
+
 
 
 # ---- slot 57 mesh stage: the group-memory count exchange (#2413) --------------------------------
@@ -4193,6 +4334,11 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+        if getattr(self, 'lds_flow', None) is not None and not self.lds_flow <= self.uniform_branches:
+            reason = 'LDS exchange SCC branch needs a proven uniform condition'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, self.kind))
         if mesh_reads or mesh_votes:
             self.check_mesh_collectives(mesh_reads | mesh_votes.keys(), branches)
         if self.lines:
@@ -5100,21 +5246,24 @@ class Stage:
                 try:
                     if getattr(self, 'pipe', None) is None:
                         raise Unsupported('LDS exchange needs pipeline metadata')
-                    check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                    self.lds_flow = check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words,
+                                                       wave_size=getattr(self.pipe, 'wave_size', None))
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
             if self.lds_error is not None:
                 raise Unsupported(self.lds_error)
             if base == 's_barrier':
-                self.emit('GroupMemoryBarrierWithGroupSync();')
+                self.emit(LDS_SYNC_SITE if self.lds_flow is not None else LDS_GROUP_SYNC)
             else:
                 write = base.startswith('ds_write')
                 address = self.u(ops[0 if write else 1])
                 offsets = lds_byte_offsets(base, mods)
+                write_guard = ('if (exec & 1) '
+                               if write and not self.exec_known and getattr(self, 'lds_flow', None) is not None else '')
                 if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32'):
                     if write:
-                        self.emit('lds[(%s + %du) >> 2] = %s;' % (address, offsets[0], self.u(ops[1])))
+                        self.emit('%slds[(%s + %du) >> 2] = %s;' % (write_guard, address, offsets[0], self.u(ops[1])))
                     else:
                         if base == 'ds_read2_b32':
                             # Either destination can overlap the incoming address VGPR.
@@ -5130,7 +5279,7 @@ class Stage:
                         vals = [self.u('v%d' % (lo + k)) for k in range(dwords)]
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
                         for k, val in enumerate(vals):
-                            self.emit('lds[%s] = %s;' % ('a' if k == 0 else 'a + %du' % k, val))
+                            self.emit('%slds[%s] = %s;' % (write_guard, 'a' if k == 0 else 'a + %du' % k, val))
                     else:
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
                         for k in range(dwords):
@@ -10310,7 +10459,7 @@ class Stage:
         index = {off: i for i, off in enumerate(offsets)}
         loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
         if len(self.blocks) == 1:
-            return ['    ' + line for line in self.blocks[0][1]]
+            return ['    ' + (LDS_GROUP_SYNC if line == LDS_SYNC_SITE else line) for line in self.blocks[0][1]]
 
         def goto(off):
             if off not in index:
@@ -10332,7 +10481,12 @@ class Stage:
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             if off in getattr(self, 'mesh_collect_reads', {}):
                 out.append('        uint mesh_first = mesh_first_%d;' % i)
-            out += ['        ' + line for line in lines]
+            for line in lines:
+                if line == LDS_SYNC_SITE:
+                    # Every path reaches this site. Close PC dispatch across the group sync.
+                    out.extend(('    }', '    ' + LDS_GROUP_SYNC, '    if (pc == %d) {' % i))
+                else:
+                    out.append('        ' + line)
             if off in getattr(self, 'mesh_collect_votes', {}):
                 word = self.mesh_collect_votes[off]
                 out += ['    }',
@@ -10706,7 +10860,7 @@ MUBUF_ATOMIC_OPS = {
     'buffer_atomic_xor': ('Xor', False, False, 1),
 }
 
-# Legacy straight-line LDS exchange ops checked by check_lds_exchange().
+# Bounded LDS exchange ops checked by check_lds_exchange().
 LEGACY_LDS_EXCHANGE_OPS = frozenset((
     'ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64', 'ds_write_b128', 'ds_read_b128',
 ))

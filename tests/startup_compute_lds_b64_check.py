@@ -218,7 +218,7 @@ def check_controls():
     refused('completed LGKM wait', lambda: translate_case('P', code=patch(WORDS_P, read_p + wait, read_p + nop)))
     refused('optional byte offset', lambda: translate_case('P', code=patch(WORDS_P, store, '100036d904050000')))  # GDS
     refused('entry EXEC', lambda: translate_case('P', code=patch(WORDS_P, store, '8003febe' + store)))
-    refused('straight-line', lambda: translate_case('P', code=patch(WORDS_P, store, '020084bf' + store)))
+    refused('completed fill', lambda: translate_case('P', code=patch(WORDS_P, store, '020084bf' + store)))
     refused('1D group', lambda: translate_case('P', group=(32, 2, 1)))
 
     # Mixed-width interoperability: in-span b32 after b64 succeeds, while out-of-span b32/read2_b32/b64 stay refused.
