@@ -21,6 +21,7 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | fast draw path | PR #2766 | `619ae7009` |
 | `-Input menus2` (waits for a new picture after each confirm) | fork branch `c24-menus2`, gate PASS | `43a382c7b` |
 | fix for #2773 (lazy textures), gate PASS | fork branch `fix-2773` | `5ad90a328` |
+| slot 70 texture_unavailable causes (row 3), gate PASS | fork branch `c23-slot70-texture-causes` | `d814a2e9e` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
