@@ -242,13 +242,15 @@ def controls(llvm_mc):
     refused('fixed table image descriptor',
             lambda: pipe.cs.op_image_store(['v[14:17]', 'v[8:9]', 's[28:35]'], mods))
 
-    for asm, code, reason in (
-        (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'),
-         '080320f0080e0600', 'typed UAV store writes all four channels'),
-        (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640', 'modifier a16'),
+    # A partial dmask reads the texel back and replaces only the selected channels; a16 packs x and y in one VGPR.
+    for asm, code, needle in (
+        (fixture.STORE.replace('v[14:17]', 'v[14:15]').replace('dmask:0xf', 'dmask:0x3'), '080320f0080e0600',
+         't = w0[uint2(v8, v9)]; t.x = asfloat(v14); t.y = asfloat(v15); w0[uint2(v8, v9)] = t;'),
+        (fixture.STORE.replace('v[8:9]', 'v8') + ' a16', '080f20f0080e0640',
+         'w0[uint2(v8 & 0xffffu, v8 >> 16)] = asfloat(uint4(v14, v15, v16, v17));'),
     ):
-        instruction = encoded(asm, code)
-        refused(reason, lambda: pipeline(instruction))
+        text = pipeline(encoded(asm, code)).hlsl_cs()
+        assert needle in text, (needle, text)
 
 
     wait = encoded('s_waitcnt lgkmcnt(0)', '7fc08cbf')

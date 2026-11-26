@@ -7570,12 +7570,17 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        if mask != 0xf:
-            raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
+        # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
+        # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
+        channels = [i for i in range(4) if mask >> i & 1]
+        if not channels or mask > 0xf or (d16 and mask != 0xf):
+            raise Unsupported('%s with dmask %s: %s' % (
+                name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
+                else 'no channel selected or out of range'))
         data = reg_range(ops[0])
-        count = 2 if d16 else 4
+        count = 2 if d16 else len(channels)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
-            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
+            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], {1: 'one', 2: 'two', 3: 'three', 4: 'four'}[count]))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7604,7 +7609,11 @@ class Stage:
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
             index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        body = '%s[%s] = %s;' % (image, index, value)
+        if len(channels) == 4 or d16:
+            body = '%s[%s] = %s;' % (image, index, value)
+        else:
+            sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
+            body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
