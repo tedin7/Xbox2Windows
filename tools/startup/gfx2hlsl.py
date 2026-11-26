@@ -2303,6 +2303,34 @@ class Stage:
                         self.sym.pop(107, None)
         self.lines.append(text)
 
+    def divergent_exit_loop(self, at):
+        """True when the offset sits in a loop (a backward branch of any kind, also an unconditional one) that holds a
+        wave-divergent branch: lanes of one quad can leave through the forward exit at different passes, so the next pass
+        runs the sample on uneven quads."""
+        for _o, _n, name, asm in self.ins:
+            if name == 's_branch' or name.startswith('s_cbranch_'):
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+                if target <= _o and target <= at <= _o and any(target <= d <= _o for d in self.divergent_branches):
+                    return True
+        return False
+
+    def resolve_plain_samples(self):
+        """Writes each plain image_sample past a join into the blocks: the implicit-LOD Sample unless a divergent back
+        edge spans it (the same proof as image_sample_b / image_get_lod), else the level-0 call as before. It never
+        refuses: a plain sample that translated before still does."""
+        if not self.plain_samples:
+            return
+        choice = {}
+        for at, (level0, implicit) in self.plain_samples.items():
+            spanned = any(target <= at <= branch for target, branch in self.divergent_back_edges) or self.divergent_exit_loop(at)
+            choice['X2W_PLAIN_SAMPLE<%x>' % at] = level0 if spanned else implicit
+
+        def text(line):
+            for token, call in choice.items():
+                line = line.replace(token, call)
+            return line
+        self.blocks = [(start, [text(l) for l in lines], term) for start, lines, term in self.blocks]
+
     def check_vcc_paths(self):
         """An overlapping descriptor must reach its use on every path, and VCC must be numeric at a mask read."""
         if not self.has_branches or not any(event == 'load_descriptor' for events in self.vcc_events.values()
@@ -2977,6 +3005,8 @@ class Stage:
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
+            self.divergent_branches = []    # offsets of every wave-divergent conditional branch (forward exits too)
+            self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
@@ -3178,6 +3208,7 @@ class Stage:
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
+                            self.divergent_branches.append(off)
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
@@ -3251,6 +3282,7 @@ class Stage:
                 if refusals is None:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
+        self.resolve_plain_samples()
         self.pinned_low16_v.update(self.low16_only_v)
         try:
             self.check_vcc_paths()
@@ -5890,8 +5922,16 @@ class Stage:
                 # each side applies besides the sampler's (the view's mip range) is assumed to agree.
                 call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
                     tex, smp, uv, tex, smp, uv)
-            elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+            elif how == 'lz' or not self.exec_known or self.kind != 'ps':
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
+            elif len(self.blocks) > 0:
+                # Past a join the guest still takes the LOD from the quad's derivatives. Where the rule of image_sample_b
+                # holds (entry EXEC, wave-uniform control flow, no divergent back edge over the call) the call is the
+                # implicit-LOD Sample; otherwise it stays level 0 (resolve_plain_samples).
+                call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
+                if getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
+                    self.plain_samples[self.pc] = (call, '%s.Sample(%s, %s)' % (tex, smp, uv))
+                    call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)

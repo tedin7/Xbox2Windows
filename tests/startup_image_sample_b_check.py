@@ -437,8 +437,8 @@ def sopp(op, simm):
 
 
 def with_join_before_sample(data):
-    """Uniform forward join (every lane takes the same path) immediately before the sample_b."""
-    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    """Uniform forward join (every lane takes the same path) immediately before the sample (sample_b or plain)."""
+    off = next(o for o, _s, _n, a in G.decode(data) if a.startswith('image_sample'))
     join = (bytes.fromhex('800380be') + bytes.fromhex('008006bf') + sopp(5, 1) + bytes.fromhex('810381be'))
     return data[:off] + join + data[off:]
 
@@ -665,6 +665,24 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 if run.returncode:
                     raise AssertionError('%s join sample_b slice=%d\n%s\n%s' % (kind, slice_index, run.stdout, run.stderr))
                 print('%s sample_b join-before bias=-1 slice=%d: %s' % (kind, slice_index, expected), flush=True)
+            # A plain image_sample after a uniform join keeps the implicit LOD: it reads mip 1, not the mip 0 of
+            # SampleLevel(.., 0). The mip-0 expectation is the negative control and must fail on the readback.
+            plain_pipe = G.Pipeline(VS_WORDS, with_join_before_sample(bytes.fromhex(WORDS['array nobias'])), root_blob())
+            plain_hlsl = plain_pipe.hlsl_ps()
+            assert '.Sample(' in plain_hlsl and 'SampleLevel' not in plain_hlsl, plain_hlsl
+            plain_shader = compile_hlsl(compiler, kind, drawable(plain_hlsl), 'ps_plain_join_%s' % kind, ps_profile, directory)
+            plain_line = sampler_line(plain_pipe)
+            for slice_index in (0, 1):
+                expected = texel_cell(1, slice_index)
+                run = draw_once(vs, plain_shader, slice_index, expected, plain_line)
+                if run.returncode:
+                    raise AssertionError('%s plain image_sample join slice=%d\n%s\n%s' % (kind, slice_index, run.stdout, run.stderr))
+                level0 = draw_once(vs, plain_shader, slice_index, texel_cell(0, slice_index), plain_line)
+                if level0.returncode == 0 or 'actual=%s' % expected not in level0.stderr:
+                    raise AssertionError('%s plain image_sample join slice=%d: the level-0 expectation did not fail\n%s\n%s'
+                                         % (kind, slice_index, level0.stdout, level0.stderr))
+                print('%s image_sample join-before slice=%d: %s (level 0 fails as expected)' % (kind, slice_index, expected),
+                      flush=True)
             # Negative control: without a bias the draw reads mip 1, so the bias -1 and bias +1 expectations must fail.
             line = sampler_line(stage('array nobias'))
             nobias = compile_hlsl(compiler, kind, drawable(translated['array nobias']), 'ps_nobias_%s' % kind, ps_profile, directory)
