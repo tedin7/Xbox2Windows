@@ -95,6 +95,11 @@ int main(int argc, char** argv)
     if (second.bytes_written - first.bytes_written != 2 * page_bytes) return fail("second capture bytes");
     if (stream.size() - after_first > 2 * (page_bytes + 16 + 16) + 16 + 32 + 4 * 64) return fail("second capture wrote more than the changes");
 
+    // The same memory again changes nothing: no chunk at all.
+    const std::size_t before_again = stream.size();
+    if (!writer.capture(address, memory.data(), memory.size(), 3)) return fail("third capture");
+    if (stream.size() != before_again) return fail("an unchanged range wrote a chunk");
+
     // Replay the stream through the reader (with the mutant applied) and compare the image at each MAP.
     auto chunks = unframe(stream);
     ImageReader reader;
