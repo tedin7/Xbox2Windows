@@ -64,7 +64,7 @@ if ($built -ne $wanted) {
     if ($NoBuild) {
         throw "tester_run: the build in $buildRoot is from $have, this checkout is $wanted. Build it (cmake --build `"$buildRoot`") or run without -NoBuild."
     }
-    Write-Host "tester_run: build is from $have, checkout is $wanted: building"
+    Write-Host "tester_run: build is from $have, checkout is ${wanted}: building"
     & cmake --build $buildRoot
     if ($LASTEXITCODE -ne 0) { throw "tester_run: the build failed (cmake exit $LASTEXITCODE)" }
     $built = Get-BuildRevision
