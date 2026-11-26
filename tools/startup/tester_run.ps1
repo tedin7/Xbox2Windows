@@ -150,6 +150,29 @@ if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
 New-Item -ItemType Directory -Force $cache | Out-Null
 $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
+# Pre-translation: after a revision bump the new cache folder is empty and the title would be black until the --watch
+# translator caught up. The requests of the older shader_cache_* folders are copied under the new keys first (the translator
+# of this checkout hashes them; no old result is reused), so the watcher the run starts has a backlog it works through in
+# its process pool (all cores but one) while the title boots; what the title asks for meanwhile goes first. Never blocks the run.
+$translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+if (-not $env:X2W_TRANSLATE_JOBS) { $env:X2W_TRANSLATE_JOBS = "$translateJobs" }
+$seedFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_seed_$PID.json"
+$preTranslate = $null
+# The re-keying pool is a child of this process: it runs at BELOW_NORMAL, like the --watch translator, and this process
+# gets its own priority back afterwards.
+$self = [System.Diagnostics.Process]::GetCurrentProcess()
+$ownPriority = $self.PriorityClass
+try {
+    try { $self.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { Write-Warning "could not lower the priority: $($_.Exception.Message)" }
+    $seedLine = (Invoke-Native { & $python -B $pack seed-cache $cacheRoot $cache --jobs $translateJobs --json $seedFile } | Out-String).Trim()
+    if (Test-Path -LiteralPath $seedFile) { $preTranslate = Get-Content -Raw -LiteralPath $seedFile | ConvertFrom-Json }
+} catch {
+    $seedLine = "pre-translate: skipped ($($_.Exception.Message))"
+} finally {
+    try { $self.PriorityClass = $ownPriority } catch { }
+}
+Write-Host "tester_run: $seedLine"
+Remove-Item -LiteralPath $seedFile -Force -ErrorAction SilentlyContinue
 $script = (Invoke-Native { & $python -B $pack input-preset $InputMode $Seconds })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
@@ -206,6 +229,7 @@ $manifest = [ordered]@{
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    pretranslate = $preTranslate
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${stamp}_$PID.json"
