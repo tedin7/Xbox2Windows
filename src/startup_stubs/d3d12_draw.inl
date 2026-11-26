@@ -1079,10 +1079,14 @@ struct TextureUpload {
     bool staged = false;       // the last upload attempt put the title memory into the desktop texture
     bool gpu_written = false;  // a list copy or resolve wrote the texture; its title memory is stale and must not be uploaded
     UINT uploads = 0;          // X2W_D3D12_RESIDENCY observation: copies of title memory into this texture over the run
+    u64 bytes = 0;             // size of the last upload (residency accounting)
+    bool resident = true, pinned = false, evictable = false;  // residency state (d3d12_residency.inl)
+    LONG evicted_at = -1000000;
     LONG last_use = -1;        // frame_number of the last upload_texture call that named it (a bind, a copy or a dispatch)
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 u64 address_upload_revision;
+#include "startup_stubs/d3d12_residency.inl"
 
 // A texture published in a newly supported console layout is not filled through the shared upload ring.
 // The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
@@ -1307,12 +1311,6 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
 LONG textures_reuploaded;  // uploads of a texture that had been uploaded before (X2W_D3D12_RESIDENCY observation)
 
-bool residency_observe()
-{
-    static const bool on = std::getenv("X2W_D3D12_RESIDENCY") != nullptr && std::getenv("X2W_D3D12_RESIDENCY")[0] == '1';
-    return on;
-}
-
 // One "x2w-residency" line: how many textures the run uploaded, how many were uploaded again, the highest repeat counts
 // and how many textures were used in the last 120 frames (counts only; nothing is evicted by this).
 void residency_report(LONG frame)
@@ -1385,6 +1383,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         return false;
     }
     TextureUpload& state = *cached;
+    if (residency_observe() && !residency_use(self, texture, resource->own().retire_when_idle, state, frame_number)) return false;
     state.last_use = frame_number;
     TextureWrite written;
     AcquireSRWLockShared(&written_lock);
@@ -1554,6 +1553,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     state.staged = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
+    state.bytes = total;
     if (state.uploads++) InterlockedIncrement(&textures_reuploaded);
     static LONG shown;
     if (first_calls(shown, 12))

@@ -1038,6 +1038,8 @@ void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
 void retire_discard_holds(Wrapper* list);
+void residency_discard_list(Wrapper* list);
+void residency_title_touched(ID3D12Resource* desktop);
 void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists);
 void drain_retired_resources();
 bool retire_reasons_enabled();
@@ -1389,6 +1391,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
         retire_leave_class(objects[i], RetireLeft::residency);  // no hold tracks the residency of a desktop object
         if (auto* p = reinterpret_cast<ID3D12Pageable*>(unwrap(reinterpret_cast<u64>(objects[i]))))
             real.push_back(p);
+        if (auto* r = reinterpret_cast<ID3D12Resource*>(unwrap(reinterpret_cast<u64>(objects[i])))) residency_title_touched(r);
     }
     if (real.empty()) return S_OK;
     const UINT active = static_cast<UINT>(real.size());
@@ -2748,6 +2751,7 @@ void release_targets(Wrapper* self)
 // nothing changes.
 void retire_drop_recording(Wrapper* list)
 {
+    residency_discard_list(list);
     if (!release_retired_enabled()) return;
     if (list->own().pass) pass_of(list).states.clear();
     retire_discard_holds(list);
@@ -4107,6 +4111,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
+            residency_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
             return trace_mesh_xmem_submission(queue, native_lists, split);
@@ -7131,6 +7136,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         ReleaseSRWLockExclusive(&draw_lock);
     }
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
+    if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
