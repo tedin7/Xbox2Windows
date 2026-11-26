@@ -4,14 +4,17 @@ import re
 import subprocess
 import sys
 
+NEAR_RED = "254,0,0,255"
 RED, GREEN, BLUE, MAGENTA = "255,0,0,255", "0,255,0,255", "0,0,255,255", "255,0,255,255"
 BACKEND, EXECUTABLE, *OPTIONS = sys.argv[1:]
 
 
-def run(mode, rgb=""):
+def run(mode, rgb="", *, onset=False, default_cadence=False):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_PRESENT_SIGNATURE_EVERY="1", X2W_RED_PRODUCER_FRAMES="", X2W_RED_PRODUCER_AUTO="",
-               X2W_RED_PRODUCER_RGB=rgb)
+               X2W_RED_PRODUCER_RGB=rgb, X2W_RED_PRODUCER_ONSET="1" if onset else "")
+    if default_cadence:
+        env.pop("X2W_PRESENT_SIGNATURE_EVERY")
     if mode.startswith("auto"):
         env["X2W_RED_PRODUCER_AUTO"] = "4,2"
     else:
@@ -52,6 +55,29 @@ def check_auto(magenta=False):
     print(f"auto {rgb} control: excludes early and near matches and compares paired samples within the armed window ({adapter})")
 
 
+def check_default_cadence():
+    logs, records, adapter = run("auto-default", "255,0,0", default_cadence=True)
+    assert len(records) == 2, logs
+    target = records[0][3]
+    assert f"auto armed sampled_present=5 published_at=6 target={target} capture=7..8" in logs, logs
+    assert records == [("1", "1", "7", target, GREEN, RED), ("2", "2", "7", target, RED, GREEN)], logs
+    print(f"automatic producer readback with no explicit signature cadence ({adapter})")
+
+
+def check_onset():
+    logs, records, adapter = run("auto-onset", onset=True)
+    assert len(records) == 2, logs
+    target = records[0][3]
+    assert f"x2w-red flat onset previous_present=4 sampled_present=5 previous_rgba={NEAR_RED}" in logs, logs
+    assert f"sample present=5 published_at=6 target={target} rgba={NEAR_RED} red=0 match=1 " in logs, logs
+    assert "x2w-red history record=3 " in logs, logs
+    assert records == [("1", "1", "7", target, GREEN, NEAR_RED),
+                       ("2", "2", "7", target, NEAR_RED, GREEN)], logs
+    logs, records, _ = run("auto-onset")
+    assert "auto armed" not in logs and not records, logs
+    print(f"flat near-red edge arms after the nonuniform frame, with an onset-off control ({adapter})")
+
+
 def check_barriers():
     logs, _, adapter = run("barriers")
     records = re.findall(r"CommandList::slot26\(ResourceBarrier\): forwarded=(\d+) refused=(\d+)", logs)
@@ -66,6 +92,8 @@ elif __name__ == "__main__":
     check(True)
     check_auto()
     check_auto(magenta=True)
+    check_default_cadence()
+    check_onset()
     logs, records, adapter = run("auto-magenta", "255,0,256")
     assert "auto disabled: X2W_RED_PRODUCER_RGB" in logs and "auto armed" not in logs and not records, logs
     print(f"invalid RGB disables automatic arming ({adapter})")

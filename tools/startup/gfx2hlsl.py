@@ -8,7 +8,9 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 import bisect
 from contextlib import suppress
 import functools
+import hashlib
 import os
+from pathlib import Path
 import re
 import struct
 import sys
@@ -22,6 +24,9 @@ import disasm_rdna2 as D  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
+
+
+READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 
 
 class Unsupported(Exception):
@@ -1638,6 +1643,8 @@ def mesh_wave_block_scalar(name, asm):
     an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
     if name in MESH_WAVE_BLOCK_LOADS:
         pass
+    elif name == 'v_readfirstlane_b32':
+        return bool(re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm))
     elif name.startswith('v_cmp_'):
         # A per-lane compare whose only scalar effect is its VCC destination; the caller refuses a VCC live at the join.
         return not re.search(r'\b(exec|m0|src_)', asm) and scalar_effects(name, asm)[2] <= VCC_KEYS
@@ -1790,13 +1797,15 @@ def mesh_constant_trip(ins, header, latch, offsets):
     return (trips,) if trips is not None else None
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
     - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
-    - Code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+    - Code up to the next barrier. Its only read of the exchanged v5 may be a v_readfirstlane_b32 under exec = -1.
+      Other first-lane reads require a defined source and wave-coherent control flow. Wave-load blocks can use
+      the original prefix test or vote on the current EXEC after an unsigned thread comparison.
       After a full EXEC reset, an unsigned GT or LT EXEC compare with defined operands may guard a forward
       execz branch to that barrier. The skipped instructions only affect active lanes or dead scalars, and
       both exchange arms replace EXEC, so a per-lane skip has the same visible effects as a per-wave skip.
@@ -1962,6 +1971,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         _, must, may = scalar_effects(name, asm)
         return not any(live_at_join(reg, join) for reg in must | may)
 
+    inner_vcc = set()
+    load_branches = {}
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
@@ -1975,9 +1986,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
-                    match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    prefix = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    vector_limit = re.fullmatch(r'v_cmpx_lt_u32_e32 v(\d+), v\d+', ins[compare][3])
                     # Inner forward scalar branches of the block (decided by SCC) stay inside it: the translation takes them
                     # per lane, which is the wave's decision when the SCC is wave-uniform (the emitter checks that).
+                    vcc_edges = {
+                        i for i in range(source + 2, target)
+                        if ins[i][2] in MESH_VCC_BRANCHES and i < edges[i] <= target and i not in targets
+                        and re.fullmatch(r'v_cmp_\w+_e(?:32|64) vcc(?:_lo)?, .+', ins[i - 1][3])
+                    }
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
@@ -2000,7 +2017,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                             continue
                         nested |= {i - 1, i, edges[i]}
                         nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
-                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    inner += sorted(vcc_edges | {i for i in nested if ins[i][2] == 's_cbranch_execz'})
                     scalar = [i for i in range(source + 1, target)
                               if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
@@ -2013,16 +2030,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         written |= {reg for reg in must | may if re.fullmatch(r's\d+', reg)}
                         masks |= ((must | may) & VCC_KEYS) | (must & {'scc'})  # every s_ op may-writes SCC
                     live = sorted((reg for reg in written if live_at_join(reg, target)), key=lambda r: int(r[1:]))
-                    # EXEC is full at the compare when a reset precedes it with no EXEC or VCC use and no branch
-                    # target in between.
+                    # Keep the prefix fast path for its original reset shape. Otherwise vote on the
+                    # actual EXEC bits after the compare, including any earlier narrowing.
                     reset = compare - 1
                     while (reset > a_end and ins[reset][3] != 's_mov_b64 exec, -1'
                            and not writes_exec(ins[reset][2], parse(ins[reset][3])[1])
                            and not re.search(r'\b(exec|vcc)', ins[reset][3])):
                         reset -= 1
                     # A branch may land between the reset and the compare only from inside that range, none may
-                    # land between the compare and the execz branch, and the block itself is straight-line code.
-                    entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
+                    # land between the compare and the execz branch.
+                    full_reset = ins[reset][3] == 's_mov_b64 exec, -1'
+                    entries = [s for s, d in edges.items()
+                               if (full_reset and reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
                     def branch_kinds():
                         """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
@@ -2035,12 +2054,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
-                        ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
-                        ('compare is not v_cmpx_gt_u32 sN, vK', not match),
+                        ('compare is not a supported unsigned thread comparison', not (prefix or vector_limit)),
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
+                        ('an unsupported branch inside the block (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
@@ -2048,8 +2066,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     if causes:
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
-                    load_compares[compare] = int(match[2])
-                    wave_loads[ins[source][0]] = (ins[compare][0], match[1],
+                    inner_vcc.update(vcc_edges)
+                    load_compares[compare] = int(prefix[2] if prefix else vector_limit[1])
+                    load_branches.setdefault(compare, []).append(source)
+                    wave_loads[ins[source][0]] = (ins[compare][0], prefix[1] if prefix and full_reset else None,
                                                   tuple(ins[i][0] for i in loads), tuple(live))
                     continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
@@ -2163,7 +2183,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 if mask != index - 1 or not cmp or int(cmp[2]) != thread:
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
-            if name in MESH_VCC_BRANCHES:
+            if index in inner_vcc:
+                wave_votes[off] = ('vcc', name.endswith('z'))
+            elif name in MESH_VCC_BRANCHES:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                 vcc_branches[off] = vcc_compares
@@ -2182,11 +2204,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             raise Unsupported('slot 57 mesh: lane spills are not covered')
         keep = ins[index]
         if base_name == 'v_readfirstlane_b32':
-            if (not a_end <= index < count_at or asm != 'v_readfirstlane_b32 %s, v5' % ops[0]
-                    or mask is not None or 5 not in stale):
-                raise Unsupported('slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered')
-            keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
-            ops = ops[:1]
+            if (a_end <= index < count_at and asm == 'v_readfirstlane_b32 %s, v5' % ops[0]
+                    and mask is None and 5 in stale):
+                keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
+                ops = ops[:1]
+            elif re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm):
+                keep = (off, size, 'x2w_mesh_firstlane', 'x2w_mesh_firstlane ' + ', '.join(ops))
+            else:
+                raise Unsupported('slot 57 mesh: unsupported v_readfirstlane_b32 operands')
         writes_s = set()
         if not base_name.startswith(('v_cmpx', 'exp', 'ds_write', 'buffer_store')):
             for tok in destinations(name, ops):
@@ -2195,7 +2220,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     writes_s.update(range(r[1], r[2] + 1))
         if 3 in writes_s or writes_s & lane:
             raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
-        if (writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group'
+        if (writes_s and name.startswith('v_') and keep[2] not in ('x2w_mesh_group', 'x2w_mesh_firstlane')
                 and base_name != 'v_readlane_b32'):
             raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
         # Only the wave index of s3 is modelled.
@@ -2239,8 +2264,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 raise Unsupported(exchange_branch_refusal)
             mask = 'count_entry'
         elif index in load_compares:
-            if mask is not None or thread != load_compares[index] or thread in stale:
+            if thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
+            for source in load_branches[index]:
+                branch_off = ins[source][0]
+                compare_off, bound, loads, live = wave_loads[branch_off]
+                if mask is not None or bound is None:
+                    wave_loads[branch_off] = (compare_off, None, loads, live)
+                    wave_votes[branch_off] = ('exec', True)
             mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
@@ -2409,10 +2440,12 @@ class Stage:
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
+            self.mesh_wave_votes = {}
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
+                                     self.mesh_wave_loads, self.mesh_wave_votes)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
@@ -3084,6 +3117,7 @@ class Stage:
                 if value != live_in[i]:
                     live_in[i], changed = value, True
         self.waterfall_reads = {}
+        self.waterfall_scalar_loads = {}
         for close, target in jumps:
             head = index.get(target)
             if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
@@ -3265,6 +3299,7 @@ class Stage:
         body_writes = {key, 'scc'}  # WREXEC supplies SCC for the next iteration.
         numeric_writes = {key}
         descriptor_inputs, buffer_descriptors = set(), set()
+        scalar_loads = set()
         reads_before_write = set()
         defined = {key}
         keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
@@ -3272,28 +3307,32 @@ class Stage:
             base, ops, mods = parse(ins[j][3])
             base = re.sub(r'_e(32|64)$', '', base)
             if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
-                            'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32', 's_load_dwordx4', 'buffer_load_dword'):
+                            's_bfe_u32', 's_max_u32', 's_mul_i32', 'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32',
+                            's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2', 'buffer_load_dword'):
                 return 'body instruction %s is not proven lane-local' % base
             if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
                 return 'body instruction %s has unproved modifiers' % base
             reads, writes, may_write = effects[j]
             if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
                 return 'body reads or changes a lane mask or special register'
-            if base == 's_load_dwordx4':
+            if base in ('s_load_dwordx8', 's_buffer_load_dwordx2'):
+                scalar_loads.add(ins[j][0])
+            if base in ('s_load_dwordx4', 's_load_dwordx8'):
                 dst = reg_range(ops[0]) if len(ops) == 3 else None
                 if not dst or dst[0] != 's' or dst[2] > 105:
                     return 'descriptor load overlaps a special register'
                 descriptor_inputs.update(reads)
             else:
                 numeric_writes.update(may_write)
-            if base == 'buffer_load_dword':
-                if len(ops) < 3:
+            if base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
+                descriptor_index = 1 if base.startswith('s_buffer') else 2
+                if len(ops) <= descriptor_index:
                     return 'buffer load has no descriptor'
-                buffer_descriptors.update(scalar_tokens(ops[2]))
+                buffer_descriptors.update(scalar_tokens(ops[descriptor_index]))
             reads_before_write.update(reads - defined)
             defined.update(writes)
             body_writes.update(may_write)
-            if (reads & keyed) or base == 'buffer_load_dword':
+            if (reads & keyed) or base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
                 keyed.update(may_write)
             else:
                 keyed -= writes
@@ -3312,6 +3351,7 @@ class Stage:
             return 'body scalar is live at the loop exit'
         if any(name.startswith('s_movrel') for _, _, name, _ in ins):
             return 'relative scalar indexing can observe a loop register'
+        self.waterfall_scalar_loads[ins[head][0]] = scalar_loads
         return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
@@ -3622,12 +3662,79 @@ class Stage:
                 out.add(reg)
         return out
 
+    def entry_exec_sites(self, cfg):
+        """Prove entry EXEC and its saved copies on every incoming CFG edge."""
+        bounds, _, succ, _ = cfg
+        if not bounds or any(name.startswith(('s_wqm', 's_swappc', 's_call', 's_rfe'))
+                             for _, _, name, _ in self.ins):
+            return set()
+        wave = self.pipe.wave_size
+        wave32 = wave == 32 or wave is None and wave32_exec_proof(self.ins)
+        width = 1 if wave32 else 2
+        mask = ('exec_lo', 'exec') if wave32 else ('exec',)
+        copy_op = 's_mov_b32' if wave32 else 's_mov_b64'
+
+        operations = []
+        for _, _, name, asm in self.ins:
+            _, ops, mods = parse(asm)
+            _, _, writes = scalar_effects(name, asm)
+            if 'any' in scalar_destinations(name, asm):
+                writes |= {'s%d' % i for i in range(106)}
+            move = None
+            if name == copy_op and len(ops) == 2 and not mods:
+                dst, src = ops
+                reg = reg_range(src if dst in mask else dst)
+                if reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] + 1 == width:
+                    words = ('s%d' % reg[1],) if wave32 else ('s%d' % reg[1], 's%d' % reg[2])
+                    if src in mask:
+                        move = ('save', words)
+                    elif dst in mask:
+                        move = ('restore', words)
+            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move))
+
+        # Missing blocks are unreachable so far. At a join or back edge keep only facts common to all paths.
+        before = {0: {()}}  # () is current EXEC; other facts name the SGPRs of an entry mask copy.
+        pending = {0}
+        known = set()
+        while pending:
+            b = pending.pop()
+            facts = before[b].copy()
+            lo, hi = bounds[b]
+            for i in range(lo, hi):
+                off = self.ins[i][0]
+                if () in facts:
+                    known.add(off)
+                else:
+                    known.discard(off)
+                exec_write, writes, move = operations[i]
+                entry = () in facts
+                restore = move is not None and move[0] == 'restore' and move[1] in facts
+                facts = {copy for copy in facts if writes.isdisjoint(copy)}
+                if exec_write:
+                    facts.discard(())
+                if restore:
+                    facts.add(())
+                if entry and move is not None and move[0] == 'save':
+                    facts.add(move[1])
+            for target in succ[b]:
+                merged = before.get(target, facts) & facts
+                if before.get(target) != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return known
+
+    def uniform_entry_exec(self):
+        sites = getattr(self, 'entry_exec_proof', None)
+        return self.exec_known if sites is None else self.pc in sites
+
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
         wave_limits = getattr(self, 'mesh_wave_limits', {})
         wave_loads = getattr(self, 'mesh_wave_loads', {})
-        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
+        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values() if bound is not None}
+        mesh_votes = getattr(self, 'mesh_wave_votes', {})
+        mesh_reads = {off for off, _, name, _ in self.ins if name == 'x2w_mesh_firstlane'}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
@@ -3660,8 +3767,8 @@ class Stage:
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
         self.mesh_allocation_block = None
-        splits = set(targets)
-        if getattr(self, 'kind', None) == 'ms' and targets:
+        splits = targets | mesh_reads
+        if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads):
             at = next(i for i, item in enumerate(self.ins) if item[2] == 'x2w_mesh_counts')
             self.mesh_allocation_block = self.ins[at][0]
             # The exchange and its EXEC restore always run. Keep the group barrier and allocation outside
@@ -3703,6 +3810,8 @@ class Stage:
                         lo, hi = bounds[block]
                         reached.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
                         pending.extend(succ[block])
+        self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
+                                 if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
@@ -3745,6 +3854,7 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
+            self.active_waterfall_loads = set()
             self.wave_unsound = None
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
@@ -3762,6 +3872,7 @@ class Stage:
             self.uses_pos = False
             self.fetched = False
             self.uniform_v = set()
+            self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
             self.varying_s = set()
             self.align4_v = set()
             self.align4_s = set()
@@ -3805,6 +3916,7 @@ class Stage:
             falls = True
             start = 0
             raised_unsupported = None
+            self.mesh_collect_reads, self.mesh_collect_votes = {}, {}
             self.exec_keep = {}  # registers whose body-arm descriptor symbol is kept after an execz join (rule R1)
 
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
@@ -3889,6 +4001,7 @@ class Stage:
                     }
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
+                    self.entry_written_v.clear()
                     self.since_join, self.scc_uniform = kept_u, False
                     self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
@@ -3972,7 +4085,7 @@ class Stage:
                                     raise Unsupported(execz_effects)
                                 self.u(dst)  # declare the variable; refuses a symbol with no run-time value
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
-                                        or off in wave_limits or off in wave_loads)
+                                        or off in wave_limits or off in wave_loads or off in mesh_votes)
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -4014,7 +4127,11 @@ class Stage:
                     term = self.one(name, asm)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
-                    if off in wave_loads:
+                    if off in mesh_votes:
+                        word, zero = mesh_votes[off]
+                        self.mesh_collect_votes[start] = word
+                        term = ('branch', 'mesh_vote %s 0u' % ('==' if zero else '!='), term[2])
+                    elif off in wave_loads:
                         term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
                     if refusals is None:
@@ -4076,6 +4193,8 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+        if mesh_reads or mesh_votes:
+            self.check_mesh_collectives(mesh_reads | mesh_votes.keys(), branches)
         if self.lines:
             self.blocks.append((start, self.lines, None))
         for at, reason in self.quad_flow_refusals(branches, targets):
@@ -4468,7 +4587,7 @@ class Stage:
         # proof no longer needs a known exec (see op_v_readfirstlane_b32).
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
                 (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
-                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)) and
+                 not getattr(self, 'past_entry', True) and self.uniform_entry_exec()) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -4485,7 +4604,7 @@ class Stage:
                      all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
                      not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
                      (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
-        loaded = load_form and not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)
+        loaded = load_form and not getattr(self, 'past_entry', True) and self.uniform_entry_exec()
         # With empty EXEC, READFIRSTLANE uses the old VGPR in lane zero. An unguarded reload
         # cannot reproduce it. Require the entry mask until the path proves a nonempty wave.
         vaddr = reg_range(ops[1]) if load_form and ops[1] != 'off' else None
@@ -4493,7 +4612,8 @@ class Stage:
         # A uniform address gives every active lane the same words, so the first active lane's value is the recomputed
         # temporary whatever lanes a v_cmpx removed (an empty wave observes nothing); any other EXEC write ends the proof.
         recomputed = (load_form and getattr(self, 'past_entry', False) and exprs is not None
-                      and (getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
+                      and (getattr(self, 'entry_exec_proof', None) is not None and self.uniform_entry_exec()
+                           or getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
                            or getattr(self, 'exec_narrow_only', False) and self.pc not in self.loads_after_wide_exec_write))
         loaded_regs = ()
         if loaded or recomputed:
@@ -4536,6 +4656,13 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if getattr(self, 'entry_exec_proof', None) is not None:
+            for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
+                reg = reg_range(token)
+                if reg and reg[0] == 'v':
+                    self.entry_written_v.difference_update(range(reg[1], reg[2] + 1))
+            if dst is not None and self.uniform_entry_exec() and (base in UNIFORM_VALU or base in UNIFORM_LOADS):
+                self.entry_written_v.update(loaded_regs or (dst,))
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
             self.since_join -= (wrote_s - uniform_written)
@@ -4717,6 +4844,8 @@ class Stage:
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
         if writes_exec(name, ops):
             self.uniform_expr.clear()
+            if getattr(self, 'entry_exec_proof', None) is not None:
+                self.uniform_v.clear()
         regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
         for tok in destinations(name, ops):
             r = reg_range(tok)
@@ -6337,6 +6466,9 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
+        waterfall = count == 8 and getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
+        if waterfall and p[1][0] != 'table':
+            raise Unsupported('compute readfirstlane waterfall: s_load_dwordx8 requires a fixed descriptor table')
         if len(p) > 2 and not isinstance(p[2], int):
             # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
             raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
@@ -6380,6 +6512,8 @@ class Stage:
                 load = (-1 - hi[1],)
             else:
                 load = (self.pc,)
+            if waterfall and (base_off | off) & 3:
+                raise Unsupported('compute readfirstlane waterfall: descriptor table address requires dword alignment')
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
             if into_vcc:
@@ -6646,8 +6780,12 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
-        buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
+        key = self.descriptor(ops[1])
         token = smem_offset(ops[2])
+        waterfall = getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
+        if waterfall and key in self.pipe.rw_keys:
+            raise Unsupported('compute readfirstlane waterfall: scalar buffer load requires a read-only descriptor')
+        buf = self.pipe.resource(key, 'buf')
         is_lit = bool(re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token))
         if is_lit:
             val = int(token, 0)
@@ -6677,6 +6815,11 @@ class Stage:
                     and first[0] == 'desc' and key[0][0] == 'table' and key not in getattr(self.pipe, 'modified', ())  # probes build a bare pipe
                     and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
                 where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
+        # RDNA 2 scalar buffer addressing clears the low two bits of the final address.
+        # The raw view starts at the aligned descriptor base. Align once before loading either word.
+        if waterfall and (extra % 4 or not self.operand_align4(token)):
+            self.emit('a = (%s + %du) & ~3u;' % (offset, extra))
+            offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
@@ -8660,6 +8803,31 @@ class Stage:
         # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
         self.sym[reg_range(ops[0])[1]] = ('the mesh group index',)
 
+    def op_x2w_mesh_firstlane(self, ops, mods):
+        self.mesh_collect_reads[self.pc] = self.u(ops[1])
+        self.set_s(reg_range(ops[0])[1], 'mesh_first', uniform=True)
+
+    def check_mesh_collectives(self, sites, branches):
+        # A logical wave must reach a collective with all its lanes or none. A lane-only
+        # branch is safe before the collective if both paths reconverge there or both miss it.
+        offsets = [off for off, _, _, _ in self.ins]
+        indices = {off: i for i, off in enumerate(offsets)}
+        jumps = dict(branches)
+        for site in sites:
+            if offsets.count(site) != 1 or any(target <= source for source, target in branches):
+                raise Unsupported('slot 57 mesh: a wave collective in a loop is not covered')
+            at = indices[site]
+            reach = [0] * (len(offsets) + 1)
+            reach[at] = 1
+            for i in range(at - 1, -1, -1):
+                off, _, name, _ = self.ins[i]
+                paths = [] if name in ('s_branch', 's_endpgm') else [reach[i + 1]]
+                if off in jumps:
+                    paths.append(reach[indices[jumps[off]]])
+                if off in self.divergent_branches and paths and (min(paths) != max(paths) or 2 in paths):
+                    raise Unsupported('slot 57 mesh: a wave collective can be bypassed by part of a wave')
+                reach[i] = paths[0] if paths and min(paths) == max(paths) else 2 if paths else 0
+
     def op_x2w_mesh_counts(self, ops, mods):
         prims, verts, temporary = (reg_range(tok)[1] for tok in ops)
         self.emit('if (tid == 0u) { lds[0] = %s; lds[1] = %s; }' % (self.S(prims), self.S(verts)))
@@ -8742,22 +8910,26 @@ class Stage:
         # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
         if getattr(self, 'past_entry', True):
             return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
-        return getattr(self, 'exec_known', False)
+        return self.uniform_entry_exec()
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
         waterfalls = getattr(self, 'waterfall_reads', {})
-        if getattr(self, 'pc', None) in waterfalls and not (src and self.proven_uniform_v(src[1])):
+        # A value defined with entry EXEC is still in the VGPR if no path since then could overwrite it.
+        direct = src and src[1] in getattr(self, 'entry_written_v', ()) and self.uniform_entry_exec()
+        uniform = src and (direct or self.proven_uniform_v(src[1]))
+        if getattr(self, 'pc', None) in waterfalls and not uniform:
             reason = waterfalls[self.pc]
             if reason:
                 raise Unsupported('compute readfirstlane waterfall: ' + reason)
+            self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
-            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
-        if past_entry:
+                not src or src[0] != 'v' or src[1] != src[2] or not uniform):
+            raise Unsupported(READFIRSTLANE_UNIFORM)
+        if past_entry and not direct:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
             # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
             # so the read recomputes the definition from the scalars instead of reading this lane's copy.
@@ -10149,12 +10321,25 @@ class Stage:
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(self.blocks):
+            if off in getattr(self, 'mesh_collect_reads', {}):
+                value = self.mesh_collect_reads[off]
+                out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
+                           'pc == %d ? %s : 0u, false);' % (i, i, i, value))
             if off == getattr(self, 'mesh_allocation_block', None):
                 out.append('    {')
             else:
                 attribute = '[branch] ' if off in wave_load_blocks else ''
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
+            if off in getattr(self, 'mesh_collect_reads', {}):
+                out.append('        uint mesh_first = mesh_first_%d;' % i)
             out += ['        ' + line for line in lines]
+            if off in getattr(self, 'mesh_collect_votes', {}):
+                word = self.mesh_collect_votes[off]
+                out += ['    }',
+                        '    uint mesh_vote_%d = mesh_first_active(tid, pc == %d && (%s & 1u) != 0u, 0u, true);'
+                        % (i, i, word),
+                        '    if (pc == %d) {' % i,
+                        '        uint mesh_vote = mesh_vote_%d;' % i]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
                 out.append('        pc = %d;' % nxt)
@@ -10183,7 +10368,7 @@ class Stage:
         if getattr(self, 'uniform_load_temps', None):
             lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in sorted(self.uniform_load_temps)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
-        if getattr(self, 'mesh_wave_loads', {}):
+        if any(bound is not None for _, bound, _, _ in getattr(self, 'mesh_wave_loads', {}).values()):
             lines.append('    bool wave_any = false;')
         if getattr(self, 'used_atomic', None):
             if 'uint' in self.used_atomic:
@@ -11657,18 +11842,31 @@ class ComputePipeline(Pipeline):
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
+        self.retry_entry_exec = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
 
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
-        part-way: translate again with that descriptor as one RW view, once per such descriptor."""
+        part-way: translate again with that descriptor as one RW view, once per such descriptor.
+        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
         while True:
             try:
-                return self._reset_stage()
+                self._reset_stage()
+                refusals = self._stage_args[1]
+                if (not self.retry_entry_exec and refusals is not None
+                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
+                    self.retry_entry_exec = True
+                    continue
+                return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
+            except Unsupported as reason:
+                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                    raise
+                # Keep the original lowering for every shader that already translates.
+                self.retry_entry_exec = True
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
@@ -11825,8 +12023,29 @@ class MeshPipeline(Pipeline):
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
             lines = [re.sub(r' o\.param\d+ = [^;]*;', '', line) for line in lines]
+        collectives = []
+        if s.mesh_collect_reads or s.mesh_collect_votes:
+            # One logical wave spans 64 guest threads regardless of the desktop wave width.
+            # Every group thread calls each site, including threads whose guest PC skips it.
+            collectives = [
+                'groupshared uint mesh_first_lane[2];',
+                'groupshared uint mesh_lane_value[%d];' % MESH_THREADS,
+                'uint mesh_first_active(uint tid, bool active, uint value, bool vote) {',
+                '    uint wave = tid >> 6u, base = tid & ~63u;',
+                '    if (tid == base) mesh_first_lane[wave] = 64u;',
+                '    mesh_lane_value[tid] = value;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    if (active) InterlockedMin(mesh_first_lane[wave], tid & 63u);',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint first = mesh_first_lane[wave];',
+                # With empty EXEC, the guest read uses lane zero. 64 maps to zero here.
+                '    uint result = vote ? uint(first < 64u) : mesh_lane_value[base + (first & 63u)];',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return result;',
+                '}',
+            ]
         return '\n'.join(
-            self.common() + ['struct VSOut {'] + self.interface(False) + [
+            self.common() + collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
                 % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
@@ -11936,7 +12155,7 @@ def translate_compute(out_dir, key):
         hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
     except Unsupported as reason:
         reason = fail_reason(reason)
-        open(name + '.fail', 'w').write(reason + '\n')
+        write_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
@@ -11944,7 +12163,7 @@ def translate_compute(out_dir, key):
         compiler = find_dxc()
         if compiler is None:
             message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
-            open(name + '.fail', 'w').write(message + '\n')
+            write_failure(name + '.fail', message)
             return message
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
@@ -11955,7 +12174,7 @@ def translate_compute(out_dir, key):
                 # DXC names the source path; keep only the diagnostic after it.
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                 detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
-                open(name + '.fail', 'w').write('dxc cs: %s\n' % detail[:500])
+                write_failure(name + '.fail', 'dxc cs: %s' % detail[:500])
                 return 'dxc cs failed: %s' % detail[:500]
             os.replace(bytecode, name + '.cs.cso')
     temporary = '%s.txt.%d.tmp' % (name, os.getpid())
@@ -12053,7 +12272,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             manifest += rtv_request + '\n'
     except Unsupported as reason:
         reason = fail_reason(reason)
-        open(name + '.fail', 'w').write(reason + '\n')
+        write_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
@@ -12061,7 +12280,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     fxc = find_fxc() if check else ''
     if fxc is None:
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
-        open(name + '.fail', 'w').write(message + '\n')
+        write_failure(name + '.fail', message)
         return message
     manifest_path = name + '.txt'
     write_manifest = True
@@ -12071,7 +12290,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         compiler = find_dxc()
         if compiler is None:
             message = 'dxc not found (X2W_DXC=%s): a DPP quad read needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
-            open(name + '.fail', 'w').write(message + '\n')
+            write_failure(name + '.fail', message)
             return message
         profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))
     else:
@@ -12089,7 +12308,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
-                    open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
+                    write_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
                     return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
             with suppress(FileNotFoundError, UnicodeError):
                 with open(manifest_path) as existing:
@@ -12140,7 +12359,6 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     name = os.path.join(out_dir, 'req_%016x' % base)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     if pair_info is not None and not request:
-        import hashlib
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
@@ -12372,7 +12590,7 @@ def translate_request(out_dir, key):
         try:
             return translate_mesh57(out_dir, key)
         except (Unsupported, OSError, UnicodeError, struct.error) as reason:
-            open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
+            write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
             return 'unsupported: %s' % reason
     try:
         try:
@@ -12389,10 +12607,10 @@ def translate_request(out_dir, key):
                 os.remove(os.path.join(out_dir, '%016x.txt' % key))
             raise
     except (Unsupported, OSError, UnicodeError) as reason:
-        open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
-        open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), 'stages %s' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
                           vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
@@ -12619,8 +12837,7 @@ def main():
             print('pso %x -> request %016x' % (w & 0xffffff, key))
     jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <last run's stderr.txt>]: before the title starts, the
-        # old refusals (lifted families first, then what the last run used most)
+        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <stderr.txt or runs directory>]
         given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
         seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
         at = sys.argv.index('--weights') if '--weights' in sys.argv[3:] else None
@@ -12643,7 +12860,11 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True, clock=clock)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+    if family_retry_enabled():
+        build = None if os.environ.get('X2W_RETRY_FAILED') == '1' else translator_version()
+    else:
+        build = translator_stamp()
+    translate_pending(out_dir, since_translator=build, jobs=jobs)
 
 
 def jobs_argument(args):
@@ -12722,6 +12943,8 @@ LIFTED_REASONS = (
     ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
+    ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),
+    ('mesh57-firstlane', r'^slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
@@ -12731,11 +12954,80 @@ RETRIED_NAME = 'pre_run_retried.txt'
 # The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
 NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')
 CENSUS_LINE = re.compile(r'x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated')
+# One line per pipeline key the title used (graphics and compute): a run killed before its census still has these.
+USE_LINE = re.compile(r'x2w-render key use \S+ ([0-9a-f]{16}) first \S+ s last \S+ s uses (\d+)')
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
     """The LIFTED_REASONS family whose pattern the refusal text contains, or None."""
     return next((name for name, pattern in families if re.search(pattern, reason)), None)
+
+
+def family_retry_enabled():
+    return os.environ.get('X2W_PRE_RUN_FAMILY_RETRY') == '1'
+
+
+@functools.lru_cache(maxsize=1)
+def translator_version():
+    """Content fingerprint of the translator and its shader input and lowering modules."""
+    script = Path(__file__).resolve()
+    tools = script.parent.parent
+    sources = (script, script.with_name('lane_exec.py'), script.with_name('ps_input_scan.py'),
+               *(tools / (name + '.py') for name in (
+                   'disasm_rdna2', 'pixel_aot', 'resource_inventory', 'verify_build',
+                   'shader_minmax', 'compute_store_aot', 'mesh_param_link')))
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.name.encode('ascii') + b'\0')
+        digest.update(source.read_bytes().replace(b'\r\n', b'\n') + b'\0')
+    return digest.hexdigest()
+
+
+def refusal_family(reason):
+    from tester_pack import normal_reason
+
+    known = lifted_family(reason)
+    if known:
+        return known
+    normalized = normal_reason(reason.removeprefix('unsupported: ').strip())
+    return 'reason-' + hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+
+FAILURE_METADATA = re.compile(r'x2w-refusal-v1 ([0-9a-f]{64}) ([a-z0-9-]+)')
+
+
+def write_failure(path, reason, *, version=None):
+    if not family_retry_enabled():
+        with open(path, 'w') as handle:
+            handle.write(reason + '\n')
+        return
+    family = refusal_family(reason.split('\n', 1)[0])
+    version = version or translator_version()
+    atomic_retry_text(path, '%s\nx2w-refusal-v1 %s %s\n' % (reason, version, family))
+
+
+def atomic_retry_text(path, content):
+    handle = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(path) or '.',
+                                         prefix='.retry-', delete=False)
+    temporary = handle.name
+    try:
+        with handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
+
+
+def read_failure(path):
+    with open(path, encoding='utf-8', errors='replace') as handle:
+        reason = handle.readline()
+        metadata = None
+        for line in handle:
+            metadata = FAILURE_METADATA.fullmatch(line.rstrip())
+    if metadata:
+        return reason, metadata[2], metadata[1]
+    return reason, refusal_family(reason), None
 
 
 def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
@@ -12745,8 +13037,9 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
 
 
 def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=frozenset(), weights=None):
-    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
-    then the requests the last run used most (`weights`: draws not drawn or dispatches without a translation), then
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the requests the last run
+    used first, most used first (`weights`: draws not drawn, dispatches without a translation, else the key's uses),
+    then the lifted families, then
     graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
     since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
     family and this build has not retried it yet (`final`): a .fail's time does not prove which build wrote it (Run P
@@ -12765,8 +13058,8 @@ def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=froze
         if newer and (not lifted or key in final):
             continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
-        rows.append((not lifted, -weights.get(key, 0), compute, order, key, lifted))
-    return [(key, lifted) for _l, _w, _c, _o, key, lifted in sorted(rows)]
+        rows.append((not weights.get(key, 0), -weights.get(key, 0), not lifted, compute, order, key, lifted))
+    return [(key, lifted) for _u, _w, _l, _c, _o, key, lifted in sorted(rows)]
 
 
 def retried_by_build(out_dir, stamp):
@@ -12796,31 +13089,73 @@ def note_retried(out_dir, stamp, keys):
 def run_weights(path):
     """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
     key's newest cumulative line; {} when the file cannot be read."""
-    weights = {}
+    if family_retry_enabled():
+        return scene_weights(Path(path))
+    weights, uses = {}, {}
     try:
         with open(path, encoding='utf-8', errors='replace') as handle:
             for line in handle:
                 if not line.startswith('x2w-render '):
                     continue
-                drawn, census = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line)
+                drawn, census, use = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line), USE_LINE.match(line)
                 if drawn:
                     weights[int(drawn.group(1), 16)] = int(drawn.group(2))
                 elif census:
                     weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
+                elif use:
+                    uses[int(use.group(1), 16)] = int(use.group(2))
     except OSError:
         return {}
-    return weights
+    # A key with no draw/dispatch line (a run killed before its census) counts by how often the title used it.
+    return {**{key: count for key, count in uses.items() if count > 0}, **weights}
+
+
+def scene_weights(path, need_census=True):
+    from tester_pack import KEY_USE_RE
+
+    if path.is_dir():
+        candidates = []
+        for run in path.glob('run_*'):
+            with suppress(OSError):
+                if run.is_dir():
+                    candidates.append((run.stat().st_mtime_ns, run))
+        # The newest run with scene census lines; a title killed before any census still ranks by key use.
+        for need in (True, False):
+            for _, run in sorted(candidates, reverse=True):
+                weights = scene_weights(run / 'stderr.txt', need)
+                if weights:
+                    return weights
+        return {}
+
+    census = False
+    weights = {}
+    try:
+        with path.open(encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if (line.startswith(('x2w-render scene census', 'x2w-render compute census:',
+                                     'x2w-render not drawn by pipeline key:'))
+                        or CENSUS_LINE.match(line) or NOT_DRAWN_LINE.match(line)):
+                    census = True
+                match = KEY_USE_RE.fullmatch(line)
+                if match:
+                    key, count = int(match[2], 16), int(match[5])
+                    weights[key] = max(count, weights.get(key, 0))
+    except OSError:
+        return {}
+    return weights if census or not need_census else {}
 
 
 class RetryReport:
-    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0):
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0, skipped=0):
         self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
-        self.lifted, self.used = lifted, used
+        self.lifted, self.used, self.skipped = lifted, used, skipped
 
     def line(self):
         """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
         the pass after the run."""
         left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
+        if self.skipped:
+            left += ', %d skipped after family probes' % self.skipped
         used = ', %d used in the last run' % self.used if self.used else ''
         return 'pre-run retry: %d keys (%d in lifted families%s), ok %d, still refused %d%s, %.0f s' % (
             self.keys, self.lifted, used, self.ok, self.refused, left, self.seconds)
@@ -12831,11 +13166,23 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
     """Translate again the old refusals (old_failures: lifted families first, then by the last run's use `weights`)
     before the title starts. No new request is started after `seconds`; what is left keeps its .fail for the pass after
     the run. What this build retried and still refuses is recorded (RETRIED_NAME) and not retried again by it."""
+    if family_retry_enabled():
+        return retry_families(out_dir, seconds, jobs, clock, weights or {})
     start = clock()
     stamp = translator_stamp()
     already = retried_by_build(out_dir, stamp)
     rows = old_failures(out_dir, stamp, families, already, weights)
     keys = [key for key, _lifted in rows]
+    results = retry_batch(out_dir, keys, jobs, clock, start, seconds)
+    clear_successful_failures(out_dir, results)
+    if results:
+        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
+    ok = sum(1 for result in results.values() if result == 'ok')
+    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
+                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
+
+
+def retry_batch(out_dir, keys, jobs, clock, start, seconds):
     results = {}
     if keys:
         jobs = max(1, min(jobs or translation_jobs(), len(keys)))
@@ -12857,15 +13204,64 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    return results
+
+
+def clear_successful_failures(out_dir, results):
     for key, result in results.items():
-        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+        if result == 'ok':
             with suppress(OSError):
                 os.remove(os.path.join(out_dir, '%016x.fail' % key))
-    if results:
-        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
-    ok = sum(1 for result in results.values() if result == 'ok')
-    return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
-                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
+
+
+FAMILY_PROBES = 8
+FAMILY_CURSOR = 'pre_run_family_cursor.txt'
+
+
+def retry_families(out_dir, seconds, jobs, clock, weights):
+    start = clock()
+    version = translator_version()
+    force = os.environ.get('X2W_RETRY_FAILED') == '1'
+    groups = {}
+    keys = sorted(set(pending_keys(out_dir, False)), key=lambda key: (-weights.get(key, 0), key))
+    lifted = 0
+    for key in keys:
+        try:
+            reason, family, written_by = read_failure(os.path.join(out_dir, '%016x.fail' % key))
+        except OSError:
+            continue
+        if not force and written_by == version:
+            continue
+        groups.setdefault(family, []).append(key)
+        lifted += lifted_family(reason) is not None
+
+    # Interleave families so an expensive graphics family cannot occupy every probe slot.
+    families = list(groups)
+    cursor_path = Path(out_dir) / FAMILY_CURSOR
+    with suppress(OSError, ValueError):
+        offset = families.index(cursor_path.read_text(encoding='utf-8').strip()) + 1
+        families = families[offset:] + families[:offset]
+    probes = [(family, groups[family][index]) for index in range(FAMILY_PROBES)
+              for family in families if index < len(groups[family])]
+    results = retry_batch(out_dir, [key for _, key in probes], jobs, clock, start, seconds)
+    for family, key in reversed(probes):
+        if key in results:
+            with suppress(OSError):
+                atomic_retry_text(cursor_path, family + '\n')
+            break
+
+    passing_families = {family for family, key in probes if results.get(key) == 'ok'}
+    incomplete = {family for family, key in probes if key not in results}
+    rest = sorted((key for family in passing_families - incomplete for key in groups[family][FAMILY_PROBES:]),
+                  key=lambda key: (-weights.get(key, 0), key))
+    skipped = sum(max(0, len(groups[family]) - FAMILY_PROBES)
+                  for family in groups.keys() - passing_families - incomplete)
+    results.update(retry_batch(out_dir, rest, jobs, clock, start, seconds))
+    clear_successful_failures(out_dir, results)
+    total = sum(map(len, groups.values()))
+    ok = sum(result == 'ok' for result in results.values())
+    return RetryReport(total, ok, len(results) - ok, total - len(results) - skipped, clock() - start, lifted,
+                       sum(bool(weights.get(key)) for group in groups.values() for key in group), skipped)
 
 
 def translate_one(out_dir, key):
@@ -12879,8 +13275,7 @@ def translate_one(out_dir, key):
         frame = raise_site(error)
         if frame:
             reason += ' (in %s, %s line %d)' % (frame.name, os.path.basename(frame.filename), frame.lineno)
-        with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
-            fail.write(reason + '\n')
+        write_failure(os.path.join(out_dir, '%016x.fail' % key), reason)
         return reason
 
 
@@ -13078,9 +13473,10 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
 
 def pending_keys(out_dir, skip_failed, since_translator=None):
     """Keys whose request has no finished result. A key with a .fail is skipped when the .fail is newer than its
-    request and stream description and, unless skip_failed, also newer than since_translator (translator_stamp:
-    the translator files themselves). Without either, every failure is tried again."""
+    request and stream description. Outside watch mode it must also match the translator content fingerprint,
+    or postdate the legacy translator timestamp. With neither cutoff, every failure is tried again."""
     keys = []
+    version = since_translator if isinstance(since_translator, str) and not skip_failed else None
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
@@ -13119,9 +13515,12 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         # the manifest-only path leaves in place.
         recheck = lost and os.path.isfile(manifest)
         inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
-        cutoff = inputs if skip_failed else None if since_translator is None else max(inputs, since_translator)
-        if cutoff is not None and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= cutoff:
-            continue
+        cutoff = inputs if skip_failed or version else (
+            None if since_translator is None else max(inputs, since_translator))
+        if cutoff is not None and not recheck:
+            with suppress(OSError):
+                if os.path.getmtime(fail) >= cutoff and (version is None or read_failure(fail)[2] == version):
+                    continue
         keys.append(key)
     return keys
 

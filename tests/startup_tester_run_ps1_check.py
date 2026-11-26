@@ -126,9 +126,9 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     if extra_path:
         env["PATH"] = str(extra_path) + os.pathsep + env["PATH"]
-    env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
+    env.update(extra_env or {})
     if "-ScanRoots" not in args:
         args = (*args, "-ScanRoots", str(tree / "scan_none"))  # no search of the real AppData during the checks
     if "-FinishTranslateSeconds" not in args:
@@ -434,9 +434,8 @@ def check_shell(shell):
         # the earlier runs left their stderr.txt: the newest ranks the retry by draws/dispatches
         retry_args = (tree.parent / "retry_args.txt").read_text().splitlines()
         assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
-        weights_file = Path(retry_args[4])
-        assert weights_file.name == "stderr.txt" and weights_file.parent.name.startswith("run_") and weights_file.is_file(), \
-            retry_args
+        # on by default: the runs folder, so the retry reads the newest run that has census lines
+        assert Path(retry_args[4]) == tree / "out" / "tester", retry_args
         assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
@@ -444,6 +443,14 @@ def check_shell(shell):
         with zipfile.ZipFile(newest) as z:
             retried = json.loads(z.read("manifest.json").decode("utf-8-sig"))["pre_run_retry"]
         assert retried.startswith("pre-run retry: 1 keys (1 in lifted families)"), retried
+        family_args = tree.parent / "family_retry_args.txt"
+        family_run = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", extra_env={
+            "X2W_PRE_RUN_FAMILY_RETRY": "1", "STUB_RETRY_ARGS": str(family_args),
+        })
+        assert family_run.returncode == 0, (family_run.stdout, family_run.stderr)
+        retry_args = family_args.read_text().splitlines()
+        assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
+        assert Path(retry_args[4]) == tree / "out" / "tester", retry_args
         (fresh_cache / "dddddddddddddddd.fail").unlink()
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"

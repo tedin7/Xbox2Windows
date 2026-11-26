@@ -109,10 +109,10 @@ with tempfile.TemporaryDirectory() as tmp:
                4 in [key for key, _ in G.old_failures(str(d), built)], True)
         (d / G.RETRIED_NAME).write_text('build-0.0\n%016x\n' % 4, encoding='ascii')
         expect('the record of another build is ignored', G.retried_by_build(str(d), built), frozenset())
-        # The last run's use ranks each group: lifted 3 (50), 2 (10), then 1 and 4; then compute 5 (100) before 6.
+        # The last run's use ranks first, in any family: 5 (100), 3 (50), 2 (10); then the unused lifted 1 and 4; then 6.
         fixture(d, built)
         expect('retry order with the last run\'s draws/dispatches',
-               [key for key, _ in G.old_failures(str(d), built, weights={3: 50, 2: 10, 5: 100})], [3, 2, 1, 4, 5, 6])
+               [key for key, _ in G.old_failures(str(d), built, weights={3: 50, 2: 10, 5: 100})], [5, 3, 2, 1, 4, 6])
         # The time cap: no new request after it, the rest is left for the pass after the run.
         called.clear()
         now = [0.0]
@@ -146,6 +146,12 @@ with tempfile.TemporaryDirectory() as tmp:
                       'x2w-render compute census key %016x: 7 dispatches, 7 translated\n' % 2 +
                       'x2w-render key use %016x 1.0 2.0 3\nother line\n' % 1, encoding='utf-8')
     expect('weights from the last run', G.run_weights(str(stderr)), {6: 40, 5: 90, 2: 0})
+    killed = d.parent / ('%s_killed.txt' % d.name)
+    killed.write_text('x2w-render key use compute %016x first 1.0 s last 9.0 s uses 1443\n' % 7 +
+                      'x2w-render key use graphics %016x first 1.0 s last 9.0 s uses 12\n' % 6 +
+                      'x2w-render not drawn key %016x: 40\n' % 6, encoding='utf-8')
+    expect('a run killed before its census ranks by key use; draw lines win', G.run_weights(str(killed)), {7: 1443, 6: 40})
+    killed.unlink()
     expect('no stderr: no weights', G.run_weights(str(d / 'missing.txt')), {})
     started = time.time()
     run = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--retry-lifted', str(d),
@@ -217,8 +223,107 @@ finally:
     else:
         os.environ['X2W_FXC'] = saved_fxc
 
+# Versioned refusals are eligible regardless of timestamps or membership in LIFTED_REASONS.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    cache = root / 'cache'
+    cache.mkdir()
+    old = '0' * 64
+    saved_retry = os.environ.get('X2W_PRE_RUN_FAMILY_RETRY')
+    os.environ['X2W_PRE_RUN_FAMILY_RETRY'] = '1'
+    translate = G.translate_one
+    try:
+        # The CLI's workers migrate legacy refusals even when their mtimes are ahead of the translator.
+        legacy = root / 'legacy'
+        legacy.mkdir()
+        for key in (1, 2):
+            (legacy / ('req_%016x.a' % key)).touch()
+            touch(legacy / ('%016x.fail' % key), (OTHER[0] + '\n').encode('ascii'), time.time() + 3600)
+        run = subprocess.run(
+            [sys.executable, '-B', G.__file__, '--retry-lifted', str(legacy), '--jobs', '2'],
+            capture_output=True, text=True, timeout=120)
+        expect('legacy refusals retried through the CLI', (run.returncode, 'still refused 2' in run.stdout),
+               (0, True))
+        expect('worker failure files have the current version',
+               [G.read_failure(path)[2] for path in sorted(legacy.glob('*.fail'))], [G.translator_version()] * 2)
+
+        for key in range(1, 13):
+            extension = 'c67' if key >= 11 else 'a'
+            (cache / ('req_%016x.%s' % (key, extension))).touch()
+            reason = OTHER[key >= 11]
+            version = G.translator_version() if key == 10 else old
+            failure = cache / ('%016x.fail' % key)
+            G.write_failure(str(failure), reason, version=version)
+            if key != 10:
+                os.utime(failure, (time.time() + 3600,) * 2)
+        expect('pending uses version rather than refusal mtime', sorted(
+            G.pending_keys(str(cache), False, G.translator_version())), [*range(1, 10), 11, 12])
+        calls = []
+
+        def probe(out_dir, key):
+            calls.append(key)
+            if key >= 11:
+                return 'ok'
+            G.write_failure(str(cache / ('%016x.fail' % key)), OTHER[0])
+            return 'unsupported'
+
+        G.translate_one = probe
+        first = G.retry_lifted(str(cache), jobs=1, weights={11: 100, 1: 1})
+        expect('stale compute probed first', calls[0], 11)
+        expect('unchanged family stops after eight probes', [k for k in calls if k < 11], list(range(1, 9)))
+        expect('two stale unregistered refusals lifted', (first.ok, first.skipped, first.left), (2, 1, 0))
+        expect('still refused metadata', G.read_failure(cache / ('%016x.fail' % 1))[2], G.translator_version())
+        calls.clear()
+        G.retry_lifted(str(cache), jobs=1)
+        expect('next run advances beyond completed probes', calls, [9])
+
+        # A capped pass stops mid-probe. Keep the weights biased toward graphics to exercise the family cursor.
+        (cache / G.FAMILY_CURSOR).unlink()
+        for key in (1, 2, 11):
+            G.write_failure(str(cache / ('%016x.fail' % key)), OTHER[key >= 11], version=old)
+
+        def capped_clock():
+            return float(bool(calls))
+
+        calls.clear()
+        capped = G.retry_lifted(str(cache), seconds=1, jobs=1, clock=capped_clock, weights={1: 2, 2: 1})
+        expect('cap leaves later probes pending', (calls, capped.left), ([1], 2))
+        calls.clear()
+        G.retry_lifted(str(cache), jobs=1, weights={2: 1})
+        expect('persisted cursor starts with the next family', calls, [11, 2])
+
+        for key in range(13, 23):
+            (cache / ('req_%016x.c67' % key)).touch()
+            G.write_failure(str(cache / ('%016x.fail' % key)), OTHER[1], version=old)
+        calls.clear()
+        expanded = G.retry_lifted(str(cache), jobs=1)
+        expect('a successful probe opens the rest of its family', (calls, expanded.ok), (list(range(13, 23)), 10))
+
+        for index, content in enumerate((
+            'x2w-render compute census: 1 keys dispatched\n'
+            'x2w-render key use compute 000000000000000b first 2.0 s last 9.0 s uses 90\n',
+            'x2w-render compute census: 1 keys dispatched\n',
+            'x2w-render key use graphics 0000000000000001 first 0.0 s last 1.0 s uses 5\n',
+        )):
+            run = root / ('run_%d' % index)
+            run.mkdir()
+            (run / 'stderr.txt').write_text(content, encoding='ascii')
+            os.utime(run, (100 + index,) * 2)
+        expect('newest run with both telemetry types supplies weights', G.run_weights(root), {11: 90})
+        killed_runs = root / 'killed'
+        (killed_runs / 'run_0').mkdir(parents=True)
+        (killed_runs / 'run_0' / 'stderr.txt').write_text(
+            'x2w-render key use graphics 0000000000000001 first 0.0 s last 1.0 s uses 5\n', encoding='ascii')
+        expect('no run has a census: the key-use lines rank', G.run_weights(killed_runs), {1: 5})
+    finally:
+        G.translate_one = translate
+        if saved_retry is None:
+            os.environ.pop('X2W_PRE_RUN_FAMILY_RETRY', None)
+        else:
+            os.environ['X2W_PRE_RUN_FAMILY_RETRY'] = saved_retry
+
 if failures:
     print('\n'.join('FAIL ' + f for f in failures))
     sys.exit(1)
-print('startup_gfx2hlsl_retry_lifted_check passed: every old refusal retried before the run, lifted families '
-      'first, then graphics, then compute; time cap, log line, command line form')
+print('startup_gfx2hlsl_retry_lifted_check passed: legacy ordering and CLI, versioned family probes, '
+      'cross-run cursor, and scene weights')

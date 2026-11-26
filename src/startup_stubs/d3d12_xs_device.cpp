@@ -105,6 +105,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -129,6 +130,7 @@ x2w_startup::MemorySrvCensus memory_srv_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
+x2w_startup::PerReasonRefusalCensus indirect_graphics_refusal_census{"indirect-graphics"};
 x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};
 
 enum Kind : int {
@@ -171,6 +173,8 @@ enum class RetireNever : std::uint8_t { slot, none, buffer, dimension, msaa, rt_
                                         aliased, reserved, count };
 enum class RetireLeft : std::uint8_t { none, view, view_copy, residency, present, hold_missed, count };
 
+struct ComputeManifest;
+
 struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
@@ -208,6 +212,7 @@ struct alignas(16) WrapperOwn {
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    ComputeManifest* compute_manifest; // PipelineState: shared manifest state for its request key
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
@@ -266,7 +271,7 @@ void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 // True when `handle` lies in a title descriptor heap but not on the start of one of its slots.
@@ -2787,7 +2792,7 @@ u64 upload_ring_max_bytes()
     return bytes;
 }
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
 {
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
@@ -2805,6 +2810,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
         InterlockedIncrement(&upload_ring_reservations);
         chunks[index].hold(list->own().upload_chunks, index);
+        if (frame_hold) chunks[index].hold(*frame_hold, index);
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
@@ -2941,6 +2947,7 @@ struct Pass {
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
     const std::vector<RootParameter>* root = nullptr;
+    const Wrapper* guest_root_wrapper = nullptr;
     // Heap-indexing flags of the title root signature last set by slot 34. While nonzero, that root signature is
     // deferred: it is not set on the desktop list, root SRVs are not forwarded, and real draws go through decide_real_root.
     UINT root_heap_flags = 0;
@@ -2952,6 +2959,7 @@ struct Pass {
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
     Wrapper* requested_mesh_pipeline = nullptr;
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
+    u64 requested_mesh_key = 0;
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
@@ -3455,6 +3463,7 @@ struct TranslatedDispatch {
 };
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch);
 u64 known_pipeline_key(Wrapper* pipeline);
+void note_indirect_mesh_use(u64 key);
 
 namespace indirect_other_refusal_code {
 constexpr const char* list_closed = "list_closed";
@@ -3502,6 +3511,13 @@ constexpr const char* unknown = "unknown";
 bool split_indirect_dispatch_enabled()
 {
     return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
+}
+
+void note_indirect_graphics_refusal(u64 key, const char* kind, const char* reason)
+{
+    char detail[64];
+    std::snprintf(detail, sizeof(detail), "%s %s", kind, reason);
+    indirect_graphics_refusal_census.note(key, detail);
 }
 
 // The guest method has independent resource and byte-offset arguments.
@@ -3569,8 +3585,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
-    const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
-        (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+    const bool console_pipeline = pass.pipeline && !pass.pipeline->own().real;
+    const bool graphics_draw_candidate = graphics && !mesh && console_pipeline && (pass.graphics_root || pass.deferred_root);
+    const bool translated = graphics_draw_candidate && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+    const char* graphics_kind = mesh ? "mesh" : indexed ? "indexed" : "draw";
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer))
         return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
@@ -3586,7 +3604,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 (pass.requested_mesh_pipeline != pass.pipeline || pass.requested_mesh_root != pass.root)) {
                 pass.requested_mesh_pipeline = pass.pipeline;
                 pass.requested_mesh_root = pass.root;
-                request_slot57_mesh(pass.pipeline, pass.root);
+                pass.requested_mesh_key = request_slot57_mesh(pass.pipeline, pass.root);
             } else if (!mesh && pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
@@ -3596,6 +3614,17 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 if (first_calls(mesh_cache_refusals, 16))
                     log("x2w-render slot86 mesh %016llx: no matching desktop pipeline/root for indirect execution",
                         pass.pipeline->own().mesh86_key);
+            }
+            if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                u64 key = known_pipeline_key(pass.pipeline);
+                if (mesh && console_pipeline) {
+                    const u64 stream_key = pass.pipeline->own().mesh86_key;
+                    key = stream_key ? stream_key : pass.requested_mesh_key;
+                    if (key) note_indirect_mesh_use(key);
+                }
+                const char* reason = graphics_draw_candidate ? "switch off" :
+                    (!pass.pipeline || console_pipeline) ? "no translation" : "root mismatch";
+                note_indirect_graphics_refusal(key, graphics_kind, reason);
             }
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
                           indirect_graphics_pipeline);
@@ -3608,8 +3637,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 !std::equal(pso.cached_targets, pso.cached_targets + pso.cached_target_count, pass.target_formats))
                 return refuse("cached mesh requires matching color and depth attachments, viewport and scissor",
                               indirect_other, indirect_other_refusal_code::cached_mesh_attachments);
-            if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags)
+            if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags) {
+                const u64 key = known_pipeline_key(pass.pipeline);
+                if (key) note_indirect_mesh_use(key);
+                note_indirect_graphics_refusal(key, graphics_kind, "root mismatch");
                 return refuse("cached mesh requires a recorded root without heap indexing", indirect_graphics_pipeline);
+            }
             for (std::size_t i = 0; i < pass.root->size(); ++i) {
                 if (i == pso.cached_srv_root) continue;
                 const auto mask = (1u << (*pass.root)[i].constants_count) - 1;
@@ -3874,6 +3907,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;
+    pass.guest_root_wrapper = params ? w : nullptr;
     pass.srv_bound = 0;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
     pass.root_heap_flags = real ? root_heap_flags(w) : 0;
@@ -7254,8 +7288,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
         Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
-            static_cast<Wrapper*>(*out)->own().compute_request_key = key;
-            static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+            auto& pipeline = static_cast<Wrapper*>(*out)->own();
+            pipeline.compute_request_key = key;
+            pipeline.compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+            if (nolock_compute_refuse()) pipeline.compute_manifest = &compute_manifest_for(key);
         }
     }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
@@ -7492,7 +7528,8 @@ void log_gpu_time(LONG frame, ULONGLONG now_ms)
 
 // Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
 // present_signature_sampler.h). The block always counts presents; samples are taken every 4 presents
-// only while a script with a picture wait has asked for them (request_sampling). X2W_PRESENT_SIGNATURE_EVERY=<n>
+// while a picture wait has asked for them (request_sampling), or while the red-producer diagnostic is enabled.
+// Flat-onset mode defaults to every present. X2W_PRESENT_SIGNATURE_EVERY=<n>
 // samples every n presents from the start without a request, and 0 turns the signature off.
 // 18 one-texel rows are copied on the presenting queue and read back on a later present; nothing waits.
 void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
@@ -7502,24 +7539,28 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
         return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : -1;
     }();
     if (explicit_every == 0) return;
-    static const int every = explicit_every > 0 ? explicit_every : 4;
+    static const bool producer_enabled = red_producers().enabled();
+    static const bool always = explicit_every > 0 || producer_enabled;
+    static const bool onset = red_producers().onset();
+    static const int every = explicit_every > 0 ? explicit_every : (onset ? 1 : 4);
     static x2w_present_signature::Block* const block = [] {
         auto* created = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
         log("x2w-present picture signature: Local\\x2w_present_signature_%lu, every %d presents %s",
             static_cast<unsigned long>(GetCurrentProcessId()), every,
-            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" : "once a script wait asks for it");
+            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" :
+            producer_enabled ? "from the start (red producer diagnostic)" : "once a script wait asks for it");
         return created;
     }();
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
-    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0, red_producers().enabled());
+    static auto* const sampler = new x2w_present_signature::Sampler(every, always, producer_enabled, onset);
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
     if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* rgba = sampler->last_rgba();
         const bool red = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0;
-        const bool matched = red_producers().matches(rgba);
-        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), matched);
+        const bool matched = red_producers().matches(rgba, sampler->last_flat());
+        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), rgba, matched);
         static bool was_matched;
         if (matched != was_matched || red_producers().interested()) {
             log("x2w-red sample present=%lld published_at=%ld target=%p rgba=%u,%u,%u,%u red=%u match=%u tick=%llu",
@@ -7740,9 +7781,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_FRAME_MARK;
     static LONG frames;
     static ULONGLONG started, last_report;
+    const bool reuse_large_bindings = bigbind_once_enabled();
+    if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;
+    if (reuse_large_bindings) {
+        finish_bigbind_frame(frame);
+        draw_lock_release_exclusive();
+    }
     draw_dump_flush();
     red_producers().flush();
     {
@@ -7977,6 +8024,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        indirect_graphics_refusal_census.report([](const char* line) { log("%s", line); }, true);
         indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
@@ -8005,6 +8053,8 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     token_null_census.report(emit, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
+    if (indirect_graphics_refusal_census.total()) indirect_graphics_refusal_census.report(emit, false);
+    report_key_use_census(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;

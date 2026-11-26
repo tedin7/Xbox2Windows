@@ -42,6 +42,20 @@ public:
         return true;
     }
 
+    struct Publication {
+        enum class State { unprobed, missing, ready };
+        std::string text;
+        std::atomic<State> state{State::unprobed};
+    };
+
+    // The publication belongs to the process-lifetime compute key cache.
+    void watch_missing(std::uint64_t key, Publication& publication)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publication.state.store(Publication::State::missing, std::memory_order_release);
+        watched_[key] = &publication;
+    }
+
     // The key was read some other way: drop it from the wanted and ready sets.
     void forget(std::uint64_t key)
     {
@@ -54,7 +68,7 @@ public:
     bool has_wanted() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return !wanted_.empty();
+        return !wanted_.empty() || !watched_.empty();
     }
 
     // The background pass. Returns how many manifests it loaded. File access happens with the mutex released.
@@ -64,6 +78,8 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             wanted.assign(wanted_.begin(), wanted_.end());
+            for (const auto& entry : watched_)
+                if (!wanted_.count(entry.first)) wanted.push_back(entry.first);
         }
         if (wanted.empty()) return 0;
         const std::vector<std::uint64_t> present = io_.list();
@@ -74,8 +90,16 @@ public:
             std::string text;
             if (!io_.read(key, text)) continue;  // vanished or still being written: stays wanted
             std::lock_guard<std::mutex> lock(mutex_);
-            ready_[key] = std::move(text);
-            wanted_.erase(key);
+            const auto watched = watched_.find(key);
+            const bool ordinary = wanted_.erase(key) != 0;
+            if (watched == watched_.end()) {
+                ready_[key] = std::move(text);
+            } else {
+                if (ordinary) ready_[key] = text;
+                watched->second->text = std::move(text);
+                watched->second->state.store(Publication::State::ready, std::memory_order_release);
+                watched_.erase(watched);
+            }
             ++loaded;
         }
         background_reads_ += loaded;
@@ -89,6 +113,7 @@ private:
     Io io_;
     mutable std::mutex mutex_;
     std::unordered_set<std::uint64_t> wanted_;
+    std::unordered_map<std::uint64_t, Publication*> watched_;
     std::unordered_map<std::uint64_t, std::string> ready_;
 };
 
@@ -159,7 +184,7 @@ private:
     std::uint64_t window_start_ms_ = 0;
     int tokens_ = 0;
     std::unordered_set<std::uint64_t> claimed_, read_;
-    long long first_opens_ = 0, retry_opens_ = 0;
+    std::atomic<long long> first_opens_{0}, retry_opens_{0};
 };
 
 }  // namespace x2w_startup

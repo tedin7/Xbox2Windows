@@ -39,6 +39,7 @@ struct ComputeTranslation {
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     KeyUse use;                            // when a Dispatch first and last had this key bound
     const char* first_refusal = nullptr;   // reason of the first refused call
+    bool unfilled_heap_slot_logged = false;
     bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
@@ -72,13 +73,53 @@ std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
+// Both wrappers and the prefetch worker use stable entries, even after a wrapper is released.
+struct ComputeManifest {
+    x2w_startup::ManifestPrefetch::Publication publication;
+    std::once_flag probe;
+};
+
+bool nolock_compute_refuse()
+{
+    static const bool enabled = x2w_local::env_on("X2W_NOLOCK_REFUSE");
+    return enabled;
+}
+
+ComputeManifest& compute_manifest_for(u64 key)
+{
+    static auto* const entries = new std::unordered_map<u64, ComputeManifest>;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    return (*entries)[key];
+}
+
+bool compute_manifest_missing(ComputeManifest& manifest, u64 key)
+{
+    using State = x2w_startup::ManifestPrefetch::Publication::State;
+    auto& publication = manifest.publication;
+    const State state = publication.state.load(std::memory_order_acquire);
+    if (state != State::unprobed) return state == State::missing;
+    // Competing callers for this key wait for the same first read with draw_lock free.
+    std::call_once(manifest.probe, [&] {
+        auto& source = manifest_source();
+        if (source.read_first(key, publication.text))
+            publication.state.store(State::ready, std::memory_order_release);
+        else
+            source.prefetch().watch_missing(key, publication);
+    });
+    return publication.state.load(std::memory_order_acquire) == State::missing;
+}
+
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
-const char* load_compute_translation(ComputeTranslation& tr)
+const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* prefetched)
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
+    if (prefetched) {
+        // The manifest is ready and draw_lock serializes its consumption and PSO creation.
+        manifest = std::move(prefetched->publication.text);
+    } else if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }
@@ -210,12 +251,83 @@ void log_dispatch_phases()
     log("%s", line);
 }
 
+// Buffer translations use RWByteAddressBuffer. Rebuild the token's exact byte range as
+// a raw view in the translated heap, independent of where the title stored or copied its token.
+const char* resolve_compute_buffer_uav(Wrapper* device, const std::uint32_t* token, Wrapper*& wrapper,
+                                      ID3D12Resource*& resource, u64& offset, u64& bytes, std::uint32_t (&words)[4])
+{
+    ViewRecord record{};
+    bool created = false;
+    note_lock_acquire(false);
+    if (token[1] < view_records().size()) {
+        record = view_records()[token[1]];
+        created = view_materialized()[token[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    if (record.slot != 19) return "an output token is not an unordered access view";
+    if (!created || record.desc_bytes < sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))
+        return "an output token has no materialized UAV description";
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    std::memcpy(&view, record.desc, sizeof(view));
+    if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+        return "an output token does not match the buffer manifest";
+    if (record.counter || view.Buffer.CounterOffsetInBytes)
+        return "an output buffer view has a UAV counter";
+    wrapper = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    if (!wrapper || wrapper->own().kind != resource_kind || !wrapper->own().real ||
+        !InterlockedCompareExchange(&wrapper->own().refs, 0, 0))
+        return "an output buffer view has no live desktop resource";
+    const auto* info = resource_info(wrapper);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return "an output buffer view resource was not created in the common state";
+    resource = static_cast<ID3D12Resource*>(wrapper->own().real);
+    x2w_startup::ComPtr<ID3D12Device> native_device;
+    if (FAILED(resource->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device))
+        return "an output buffer view belongs to another device";
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return "an output view resource is not a UAV buffer";
+
+    const auto format = desktop_format(view.Format);
+    const UINT stride = view.Buffer.StructureByteStride;
+    const bool raw = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW && !stride && format == DXGI_FORMAT_R32_TYPELESS;
+    const bool structured = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && stride && format == DXGI_FORMAT_UNKNOWN;
+    const bool typed = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && !stride;
+    const UINT element = raw ? 4 : structured ? stride : typed ? x2w_startup::typed_buffer_format_bytes(format) : 0;
+    if (!element || element > 0x3fff || view.Buffer.FirstElement > desc.Width / element)
+        return "an output buffer view has an unsupported element size or start";
+    offset = view.Buffer.FirstElement * element;
+    bytes = u64{view.Buffer.NumElements} * element;
+    if (!bytes || bytes > (16u << 20) || bytes > desc.Width - offset ||
+        bytes % 4 || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+        return "an output buffer view range cannot be bound as a raw UAV";
+
+    words[1] = raw ? 0 : element << 16;
+    words[2] = raw ? static_cast<UINT>(bytes) : view.Buffer.NumElements;
+    const UINT code = typed ? x2w_startup::buffer_format_code(format) : 0;
+    // Identity channel selection, unified FORMAT for typed views, and byte bounds for raw views.
+    words[3] = 0xfacu | (raw ? 3u << 28 : 0) | (code ? (1u << 24) | (code << 12) : 0);
+    return nullptr;
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const u64 key = pass.pipeline->own().compute_request_key;
+    const auto& pipeline = pass.pipeline->own();
+    const u64 key = pipeline.compute_request_key;
     const auto [x, y, z] = dispatch.groups;
+    const auto type = list->GetType();
+    ComputeManifest* const manifest = pipeline.compute_manifest;
+    const bool valid_type = type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    const bool valid_groups = x <= x2w_startup::max_dispatch_groups && y <= x2w_startup::max_dispatch_groups &&
+                              z <= x2w_startup::max_dispatch_groups;
+    const bool valid_root = pass.compute_root_wrapper == pipeline.compute_request_root;
+    if (manifest && valid_type && valid_groups && valid_root && compute_manifest_missing(*manifest, key)) {
+        InterlockedIncrement(&compute_dispatches_untranslated);
+        return "no translation";
+    }
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View {
@@ -228,7 +340,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         UINT stride;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
-    const auto type = list->GetType();
     x2w_phase::Timer timer;
     timer.start(dispatch_phase_totals);
     draw_lock_acquire_exclusive();
@@ -239,15 +350,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     ++tr->dispatches;
     tr->use.note(process_ms());
     std::uint32_t words[8] = {};
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
-    else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
-        reason = "a group count is over the limit";
-    else if (pass.compute_root_wrapper != pass.pipeline->own().compute_request_root)
+    if (!valid_type) reason = "the list type has no Dispatch";
+    else if (!valid_groups) reason = "a group count is over the limit";
+    else if (!valid_root)
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
         if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            tr->unmodelled = load_compute_translation(*tr);
+            tr->unmodelled = load_compute_translation(*tr, manifest);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
         if (tr->state != 1) {
@@ -399,6 +509,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
             const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
+                tr->unfilled_heap_slot_logged = true;
+                log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
+            }
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
             if (view.source == 2) {
                 InterlockedIncrement(&compute_inputs_snapshot);
@@ -413,7 +527,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
                     slot.heap ? "heap" : "table", slot.a, slot.b, entry);
-            views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            // buffer_view creates a native null SRV when the token has no resource.
+            views[i] = {view.resource, view.offset, view.bytes, !view.upload && !view.null_token};
             views[i].wrapper = view.token_owner;
             views[i].stride = view.stride;
             std::memcpy(views[i].words, words, sizeof(views[i].words));
@@ -426,6 +541,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             views[i] = {view.resource, view.offset, view.bytes, true};
             views[i].wrapper = view.token_owner;
             views[i].words[0] = view_token_magic;
+            if (!reason) {
+                // The descriptor words a typed or raw view gives the shader: channel selection, format and the byte bound.
+                Wrapper* owner = nullptr;
+                ID3D12Resource* resource = nullptr;
+                u64 offset = 0, bytes = 0;
+                std::uint32_t described[4]{};
+                reason = resolve_compute_buffer_uav(self->own().list_device, words, owner, resource, offset, bytes, described);
+                if (!reason) views[i].words[3] = described[3];
+            }
             views[i].words[1] = view.stride << 16;
             // A raw view (stride 0) counts records in bytes, a structured or typed view in elements.
             views[i].words[2] = static_cast<UINT>(view.stride ? view.bytes / view.stride : view.bytes);
@@ -544,6 +668,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
         }
+        if (view.wrapper) retire_hold(self, view.wrapper);
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -633,27 +758,66 @@ void log_compute_census()
             keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
 }
 
-// One line per pipeline key (graphics and compute) whose use count changed since the last line: first and last use in
-// seconds since the process started. The report script keeps the earliest first and the latest last per key.
-void log_key_use_census()
+// Mesh requests have no entry in either draw or compute translation accounting.
+auto& indirect_mesh_key_uses()
+{
+    static std::unordered_map<u64, KeyUse> uses;
+    return uses;
+}
+
+template <class Emit>
+void emit_key_use(Emit emit, const char* kind, u64 key, const KeyUse& use)
+{
+    char line[160];
+    std::snprintf(line, sizeof(line), "x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu",
+                  kind, key, use.first_ms / 1000.0, use.last_ms / 1000.0, use.uses);
+    emit(line);
+}
+
+void note_indirect_mesh_use(u64 key)
+{
+    KeyUse first_use;
+    {
+        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+        auto& use = indirect_mesh_key_uses()[key];
+        // Publish the first use even if the title never reaches the periodic report.
+        use.note(process_ms());
+        if (use.uses == 1) {
+            use.reported_uses = use.uses;
+            first_use = use;
+        }
+    }
+    if (first_use.uses)
+        emit_key_use([](const char* line) { log("%s", line); }, "mesh", key, first_use);
+}
+
+// The report script keeps the earliest first and the latest last per key.
+template <class Emit>
+void report_key_use_census(Emit emit, bool only_if_changed)
 {
     struct Row { const char* kind; u64 key; KeyUse use; };
     std::vector<Row> rows;
-    AcquireSRWLockExclusive(&draw_lock);
-    for (auto& item : compute_translations())
-        if (item.second.use.uses != item.second.use.reported_uses) {
-            rows.push_back({"compute", item.second.key, item.second.use});
-            item.second.use.reported_uses = item.second.use.uses;
-        }
-    for (auto& item : translation_by_key())
-        if (item.second && item.second->use.uses != item.second->use.reported_uses) {
-            rows.push_back({"graphics", item.second->key, item.second->use});
-            item.second->use.reported_uses = item.second->use.uses;
-        }
-    ReleaseSRWLockExclusive(&draw_lock);
+    {
+        x2w_startup::ExclusiveNoteLock guard(draw_lock);
+        const auto collect = [&](const char* kind, u64 key, KeyUse& use) {
+            if (!use.uses || (only_if_changed && use.uses == use.reported_uses)) return;
+            rows.push_back({kind, key, use});
+            if (only_if_changed) use.reported_uses = use.uses;
+        };
+        for (auto& item : compute_translations())
+            collect("compute", item.second.key, item.second.use);
+        for (auto& item : translation_by_key())
+            if (item.second) collect("graphics", item.second->key, item.second->use);
+        for (auto& item : indirect_mesh_key_uses())
+            collect("mesh", item.first, item.second);
+    }
     for (const Row& row : rows)
-        log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
-            row.use.last_ms / 1000.0, row.use.uses);
+        emit_key_use(emit, row.kind, row.key, row.use);
+}
+
+void log_key_use_census()
+{
+    report_key_use_census([](const char* line) { log("%s", line); }, true);
 }
 
 // Fixtures: the census without waiting for the frame that logs it.
@@ -661,4 +825,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
 {
     log_compute_census();
     log_key_use_census();
+}
+
+// Fixtures: snapshot the counters without acquiring or resetting draw_lock.
+extern "C" __declspec(dllexport) void x2w_d3d12_compute_refusal_stats(
+    LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated)
+{
+    *holds = InterlockedCompareExchange64(&draw_lock_stats.hold_calls, 0, 0);
+    *repeated_reads = manifest_source().retry_opens();
+    *background_reads = manifest_source().background_reads();
+    *untranslated = InterlockedCompareExchange(&compute_dispatches_untranslated, 0, 0);
 }

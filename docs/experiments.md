@@ -53,12 +53,21 @@ paths using source-built allocations.
 
 ## Present color producer trace
 
-Set `X2W_RED_PRODUCER_AUTO=3700,12` and `X2W_PRESENT_SIGNATURE_EVERY=1` to sample the
-title-selected RGBA8 presentation texture. `X2W_RED_PRODUCER_RGB=255,0,255` selects a
+Set `X2W_RED_PRODUCER_AUTO=3700,12` to sample the title-selected RGBA8 presentation
+texture every four presents. `X2W_PRESENT_SIGNATURE_EVERY=1` samples every present. `X2W_RED_PRODUCER_RGB=255,0,255` selects a
 specific RGB triplet. The default match is `255,0,0`. A transition to the match at or
 after present 3700 arms the next 12 frames after the sample is published. The log also
 reports up to 64 earlier recording identities for the known presentation targets.
 Use `X2W_RED_PRODUCER_FRAMES=4100,4110` for an explicit frame window.
+
+Set `X2W_RED_PRODUCER_ONSET=1` to arm when a nonmatching sample is followed by a
+flat sample near the selected color. The center RGB must be within four 8-bit
+levels per channel of the selected color, and each pixel on the sampled rows
+must be within four levels per channel of the center. This mode samples every
+present by default and logs the preceding completed sample. It also follows one
+hop through resolved texture SRVs of translated draws to known present targets.
+Once discovered, up to 32 such textures are eligible for producer history and
+readback under the same format and operation limits.
 
 The producer rows report one RGBA8 texel before and after a clear or supported
 graphics draw to a known present target. They include the submitting queue and
@@ -66,8 +75,8 @@ operation order. Present samples use the same texel, and attachment rows identif
 the bound render targets and depth view. A queue fence guards the readbacks.
 Recording history gives candidate commands. Attribution requires a completed
 producer read and a matching presentation resource. The trace covers direct-list
-graphics writes to previously seen single-sample present targets. Compute writes,
-alias writes and resources upstream of those targets require separate evidence.
+graphics writes to previously seen single-sample present targets and eligible
+inputs in onset mode. Compute writes and alias writes require separate evidence.
 The diagnostic retains up to eight present resources and 512 paired readbacks in
 an opted-in process.
 
@@ -75,7 +84,10 @@ an opted-in process.
 checks exact colors on both sides of each clear, compared to subsequent presents,
 then resubmits the closed recording and reverses the writes. The automatic cases
 check red and magenta, ignore an early exact match and a later near match, and
-refuse an out-of-range RGB component. Run the WARP and hardware checks separately
+refuse an out-of-range RGB component. The default-cadence case omits the signature
+override. The onset case compares a near-red center in a nonuniform picture with
+a uniform near-red picture, then checks the producer readbacks with onset on and
+automatic capture with onset off. Run the WARP and hardware checks separately
 when reporting adapter results.
 
 ```powershell
@@ -10127,6 +10139,14 @@ and the changed root or argument page at submission.
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_warp_dual-trace$' -V
 ```
 
+For a rejected indirect graphics pipeline, the runtime census records the
+command kind, key and refusal reason. A refused mesh dispatch with a known
+request key contributes to `x2w-render key use mesh`. The tester bundle ranks
+refused mesh requests by these counts and includes their request files within
+its existing limits. The `startup_indirect_mesh_request_warp` fixture checks
+per-key counts for both stage layouts. The `startup_tester_pack` check
+exercises request ranking and zip contents.
+
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound
@@ -16144,6 +16164,17 @@ each. Two 2×2 source-built textures have different values in both rows. The tes
 between their addresses, compares an ordinary resource-object SRV, and tries zero,
 interior, and mismatched addresses after a successful publication.
 
+With `X2W_PLACED_SRV_1D=1`, slot 70 also accepts matching typed 1D and
+1D-array views of live textures placed at the supplied address. The view uses the
+default component mapping, zero minimum LOD clamp and mip and slice ranges within
+the resource. The switch defaults to off.
+
+The WARP case also samples eight synthetic R8 ramp texels at their centers with
+`Texture1D.SampleLevel` and compares all 32 RGBA pixels with a CPU reference.
+With the switch unset, both view shapes are refused and the draw reads zeros from
+the seeded null descriptor. The enabled case also checks 1D-array descriptor
+publication and verifies that an out-of-range slice update preserves it.
+
 ```powershell
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
@@ -16986,6 +17017,8 @@ Local observation, one run, counts only, from the four descriptor words the cens
 ```powershell
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_input_" -V
 ```
+
+`X2W_NULL_TOKEN_ZERO=1` lets translated compute bind a native null buffer SRV when a buffer view token names no resource. The switch defaults off. An input descriptor of the form `[n,0,0,0]` with nonzero `n` still refuses the dispatch and logs `unfilled heap slot <n-1> key <key>` once per compute key with either switch setting. The synthetic fixture checks the unchanged output when the switch is off, all 320 words against the CPU reference when it is on, and one slot diagnostic across two refusals.
 
 ## Startup compute dual-offset/stride-64 LDS ops and 32-bit LDS atomics
 

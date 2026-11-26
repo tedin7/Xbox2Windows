@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -596,7 +597,7 @@ struct Gate {
 };
 
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
-                     alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
+                     alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, equivalent_root_disabled, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
@@ -1770,12 +1771,14 @@ int main(int argc, char** argv) try
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
+    const bool root_fix_control = argc == 3 && std::strcmp(argv[2], "translated-root-control") == 0;
+    const bool root_fix = root_fix_control || (argc == 3 && std::strcmp(argv[2], "translated-root") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -2109,9 +2112,12 @@ int main(int argc, char** argv) try
             !dispatch(aliased_vertex.Get(), root.Get(), "mesh descriptor with a vertex slot") ||
             !dispatch(incomplete.Get(), root.Get(), "mesh descriptor with an incomplete PS span") ||
             !std::filesystem::is_empty(cache)) return 1;
+        const bool control = GetEnvironmentVariableA("X2W_MESH_REQUEST_CONTROL", nullptr, 0) != 0;
         if (!dispatch(pair.Get(), root.Get(), "mesh with PS") ||
             !dispatch(depth.Get(), root.Get(), "mesh with no PS") ||
-            !dispatch(pair.Get(), root.Get(), "repeat mesh with PS")) return 1;
+            (!control && !dispatch(pair.Get(), root.Get(), "repeat mesh with PS"))) return 1;
+        std::string report(x2w_d3d12_census_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_census_report(report.data(), report.size());
         unsigned requests = 0, with_ps = 0, files = 0;
         const auto matches = [](const std::filesystem::path& path, const void* bytes, std::size_t size) {
             std::ifstream stream(path, std::ios::binary);
@@ -2127,8 +2133,23 @@ int main(int argc, char** argv) try
             ++requests;
             if (!matches(path, ms, ms_size) ||
                 !matches(path.replace_extension(".root"), root_blob->GetBufferPointer(), root_blob->GetBufferSize())) return 1;
-            if (matches(path.replace_extension(".ps57"), ps, ps_size)) ++with_ps;
+            const bool has_ps = matches(path.replace_extension(".ps57"), ps, ps_size);
+            if (has_ps) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
+            const auto key = path.stem().string().substr(4);  // req_<key>
+            const char* count = has_ps ? "2" : "1";
+            const auto use = report.find("x2w-render key use mesh " + key + " first ");
+            const auto use_count = report.find(" uses ", use);
+            const auto expected_use = std::string(" uses ") + count + "\n";
+            const bool correct_use = use_count != std::string::npos && use_count < report.find('\n', use) &&
+                report.compare(use_count, expected_use.size(), expected_use) == 0;
+            const bool correct_refusal = report.find("key=" + key + " reason=mesh no translation calls=" +
+                                                     count + "\n") != std::string::npos;
+            if (!correct_use || !correct_refusal) {
+                std::fprintf(stderr, "mesh request census mismatch for %s (expected %s uses and refusals)\n%s",
+                             key.c_str(), count, report.c_str());
+                return 1;
+            }
         }
         if (requests != 2 || with_ps != 1 || files != 6) return 1;
         if (!exchange_size) std::filesystem::remove_all(cache);
@@ -2226,6 +2247,27 @@ int main(int argc, char** argv) try
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
         const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+        if (root_fix) {
+            check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", "1") ? S_OK : E_FAIL, "enable indirect root fix");
+            if (root_fix_control)
+                check(SetEnvironmentVariableA("X2W_INDIRECT_ROOT_FIX", nullptr) ? S_OK : E_FAIL, "unset indirect root fix");
+            ComPtr<ID3D12RootSignature> equivalent_root;
+            check(guest->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                                             IID_PPV_ARGS(&equivalent_root)), "create second guest root from the same blob");
+            const auto refusal = root_fix_control ? Refusal::equivalent_root_disabled : Refusal::none;
+            const bool pixels_ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), equivalent_root.Get(),
+                pso.Get(), signature.Get(), DrawKind::vertices, false, refusal,
+                root_fix_control ? "equivalent root refused with switch unset" : "equivalent root draws with switch on",
+                &red_binding);
+            const auto needed = x2w_d3d12_census_report(nullptr, 0);
+            std::vector<char> report(needed + 1);
+            x2w_d3d12_census_report(report.data(), report.size());
+            const std::string_view census(report.data());
+            const bool refused = census.find("reason=missing_guest_root calls=1") != std::string_view::npos;
+            if (refused != root_fix_control) std::fprintf(stderr, "unexpected root refusal census:\n%s", report.data());
+            std::filesystem::remove_all(cache);
+            return pixels_ok && refused == root_fix_control && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         TranslatedDrawFixture full_buffer(guest.Get(), 0, device.Get()), short_buffer(guest.Get(), 0, device.Get(), true),
             copied_buffer(guest.Get(), green, device.Get(), false, true);
         const TranslatedDrawFixture raw_upload(guest.Get(), 0);

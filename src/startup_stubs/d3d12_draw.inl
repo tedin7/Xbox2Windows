@@ -181,6 +181,7 @@ struct Translation {
 struct BoundPipeline {
     Translation* translation = nullptr;
     const std::vector<RootParameter>* guest_root = nullptr;
+    const Wrapper* guest_root_wrapper = nullptr;
     bool has_blend = false;
     D3D12_BLEND_DESC blend{};
     bool has_depth_stencil = false;
@@ -814,27 +815,27 @@ u64 publish_compute_request(const void* desc)
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
 // The vertex span must be absent. A null/zero PS span is valid for depth-only work.
-void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+u64 request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
 {
     wchar_t marker[MAX_PATH];
-    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return 0;
     const PipelineInfo* info = pipeline_info(pipeline);
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
         info = pipeline_info(info->base);
     constexpr std::size_t fields = 15;  // through the MS length at +0x70
-    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return 0;
     u64 words[fields];
     std::memcpy(words, info->desc.data(), sizeof(words));
-    if (words[9] || words[10]) return;  // VS at +0x48
+    if (words[9] || words[10]) return 0;  // VS at +0x48
     const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
-    if (!root || root_info(root) != bound_root) return;
+    if (!root || root_info(root) != bound_root) return 0;
     std::vector<unsigned char> root_blob;
     {
         note_lock_acquire(false);
         if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
         ReleaseSRWLockShared(&note_lock);
     }
-    if (root_blob.empty()) return;
+    if (root_blob.empty()) return 0;
     std::vector<unsigned char> mesh, pixel;
     const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
         const auto* pointer = reinterpret_cast<const void*>(words[field]);
@@ -844,13 +845,13 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         out.resize(static_cast<std::size_t>(bytes));
         return copy_title_bytes(out.data(), pointer, out.size());
     };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return 0;
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
                                                                                  sizeof(shader_cache::mesh57_revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
-    if (written.count(key)) return;
+    if (written.count(key)) return key;
     const unsigned char none = 0;
     if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
@@ -860,7 +861,9 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         if (first_calls(logged, 12))
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
+        return key;
     }
+    return 0;
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -1103,6 +1106,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         std::memcpy(words, info->desc.data(), sizeof(words));
         Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
         bound->guest_root = root ? root_info(root) : nullptr;
+        bound->guest_root_wrapper = bound->guest_root ? root : nullptr;
         std::vector<unsigned char> root_blob;
         if (root) {
             note_lock_acquire(false);
@@ -1557,6 +1561,88 @@ bool stale_large_copy_mutant()
     return on;
 }
 
+// Large raw bindings opt in to a snapshot that stays fixed until Present. Leave the switch off
+// to debug writes between draws with the regular validation and byte comparison.
+bool bigbind_once_enabled()
+{
+    static const bool on = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_BIGBIND_ONCE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
+struct BigBinding {
+    std::size_t bytes = 0;
+    bool readable = false;
+    UploadReservation slice;
+};
+
+// Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
+// taken by command lists, so the ring cannot recycle a cached slice before Present.
+std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
+UploadChunkMask big_binding_chunks;
+struct BigBindingCounts {
+    unsigned trims = 0, copies = 0, hits = 0;
+    std::size_t copied_bytes = 0;
+};
+BigBindingCounts big_binding_counts;
+
+// X2W_TEST_BIGBIND_NO_RESET=1 (fixtures only): the cache is not dropped at Present, so a later frame reads the first frame's
+// bytes. The control of startup_frame_copy_once: the second frame must then show the old colour.
+bool bigbind_no_reset_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_BIGBIND_NO_RESET", nullptr, 0) != 0;
+    return on;
+}
+
+// X2W_TEST_BIGBIND_KEY_ADDRESS=1 (fixtures only): the cache is keyed by address alone. The control of startup_frame_copy_once
+// (once-keys): two views of one address with different lengths must then read each other's bytes.
+bool bigbind_key_address_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_BIGBIND_KEY_ADDRESS", nullptr, 0) != 0;
+    return on;
+}
+std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
+{
+    return {address, bigbind_key_address_mutant() ? 0 : full_bytes};
+}
+
+void finish_bigbind_frame(LONG frame)
+{
+    if (!bigbind_no_reset_mutant()) big_bindings.clear();
+    if (big_binding_chunks && !bigbind_no_reset_mutant()) {
+        AcquireSRWLockExclusive(&allocator_lock);
+        discard_upload_chunks(big_binding_chunks, upload_chunks.data());
+        big_binding_chunks = 0;
+        ReleaseSRWLockExclusive(&allocator_lock);
+    }
+    static const bool report = [] {
+        char mode[16]{};
+        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+        return std::strncmp(mode, "once", 4) == 0;
+    }();
+    if (report && big_binding_counts.trims)
+        log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
+            big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    big_binding_counts = {};
+}
+
+bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+        auto& chunk = upload_chunks[i];
+        if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
+            chunk.hold(self->own().upload_chunks, i);
+            ReleaseSRWLockExclusive(&allocator_lock);
+            return true;
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return false;
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
@@ -1571,19 +1657,12 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
         const auto& slice = found->second.slice;
-        AcquireSRWLockExclusive(&allocator_lock);
-        for (unsigned i = 0; i < upload_chunks.size(); ++i) {
-            auto& chunk = upload_chunks[i];
-            if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
-                chunk.hold(self->own().upload_chunks, i);
-                ReleaseSRWLockExclusive(&allocator_lock);
-                *offset = slice.offset;
-                if (resource) *resource = slice.resource;
-                if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
-                return true;
-            }
+        if (bind_upload_slice(self, slice)) {
+            *offset = slice.offset;
+            if (resource) *resource = slice.resource;
+            if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
+            return true;
         }
-        ReleaseSRWLockExclusive(&allocator_lock);
     }
     const auto slice = reserve_upload_ring(self, bytes);
     if (!slice.mapped) return false;
@@ -2371,11 +2450,18 @@ struct IndirectBufferView {
     bool upload = false;
     int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
     Wrapper* token_owner = nullptr;
+    bool null_token = false;
 };
+
+bool unfilled_heap_slot(const std::uint32_t* words)
+{
+    return words[0] && !words[1] && !words[2] && !words[3];
+}
 
 bool view_token_uav_enabled()
 {
-    static const bool enabled = x2w_local::env_on("X2W_VIEW_TOKEN_UAV");
+    // X2W_OUTPUT_VIEW_TOKENS is the older name of the same switch.
+    static const bool enabled = x2w_local::env_on("X2W_VIEW_TOKEN_UAV") || x2w_local::env_on("X2W_OUTPUT_VIEW_TOKENS");
     return enabled;
 }
 
@@ -2454,7 +2540,7 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool allow_title_snapshot = false)
+                                         bool compute_input = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2465,6 +2551,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
+    if (unfilled_heap_slot(words)) return refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
         if (words[2] == 19 && view_token_uav_enabled()) {
             const char* reason = nullptr;
@@ -2483,6 +2570,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         } else if (record.slot == 18 && record.desc_bytes >= 40) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
             std::memcpy(&view, record.desc, 40);
+            if (compute_input && !record.resource && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                static const bool enabled = x2w_local::env_on("X2W_NULL_TOKEN_ZERO");
+                if (enabled) return {nullptr, 0, 0, 0, false, 0, nullptr, true};
+            }
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
                 view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
@@ -2519,7 +2610,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     }
     // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
     // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
-    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+    if (!bytes && compute_input && !words[0] && !words[1] && !words[2] && !words[3]) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
@@ -2562,7 +2653,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (!placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
-            } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+            } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
                 // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
                 // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
                 // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
@@ -2850,6 +2941,23 @@ void log_not_drawn_causes()
             render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
+// Root parameter metadata is keyed by wrapper identity. Identical serialized
+// guest signatures have the same layout even when created as separate objects.
+bool indirect_guest_root_matches(const BoundPipeline& bound, const Pass& pass)
+{
+    if (!bound.guest_root || !pass.root) return false;
+    if (bound.guest_root == pass.root) return true;
+    if (!x2w_local::env_on("X2W_INDIRECT_ROOT_FIX")) return false;
+
+    note_lock_acquire(false);
+    const auto& blobs = root_blobs();
+    const auto expected = blobs.find(bound.guest_root_wrapper);
+    const auto actual = blobs.find(pass.guest_root_wrapper);
+    const bool match = expected != blobs.end() && actual != blobs.end() && expected->second == actual->second;
+    ReleaseSRWLockShared(&note_lock);
+    return match;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -2881,7 +2989,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         return not_drawn(1);
     }
     if (indirect) {
-        if (!bound->guest_root || bound->guest_root != pass.root) {
+        if (!indirect_guest_root_matches(*bound, pass)) {
             indirect->set_refusal("translated draw requires the guest pipeline's root signature",
                                   indirect_refusal_code::missing_guest_root);
             draw_lock_release_exclusive();
@@ -2947,6 +3055,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         draw_lock_release_exclusive();
         return not_drawn(8);
     }
+    const bool trace_inputs = red_producers().onset();
+    ID3D12Resource* sampled_textures[32];
+    unsigned sampled_count = 0;
+    const auto follow_inputs = [&] {
+        red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
+    };
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
@@ -3167,6 +3281,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
         }
         if (indirect) {
@@ -3332,25 +3447,72 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         }
         ID3D12Resource* chunk = nullptr;
-        // A raw view reads zero past its end and memory the title has not written is zero: copy only the part that can hold data.
-        // Pages that are only reserved (lazy commit) are zero and are left out without being touched; a write commits them, which
-        // the next draw sees. Of the committed part, the trailing zero bytes are left out too. (A 16 MiB binding copied whole on
-        // every draw emptied the 256 MiB upload ring.)
+        // A raw view reads zero past its end. Skip reserved pages and trim the committed zero tail.
         const std::size_t full_bytes = bytes;
-        const LONG64 step_t0 = step_now_us();
-        if (address && bytes >= (64u << 10) && !formatted.entry) {
-            bool extent_ok = false;
-            const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
-            if (extent_ok) bytes = extent ? extent : 256;
+        const bool large_raw = !formatted.entry && full_bytes >= x2w_local::big_copy_bytes;
+        BigBinding* cached = nullptr;
+        bool cache_hit = false;
+        // A root address has no declared length. Its span is inferred by probing above.
+        if (address && large_raw && srv.source != 2 && bigbind_once_enabled()) {
+            try {
+                const auto [entry, inserted] = big_bindings.try_emplace(bigbind_key(address, full_bytes));
+                cached = &entry->second;
+                cache_hit = !inserted;
+            } catch (const std::bad_alloc&) {
+                // Fall back to regular binding when the table cannot grow.
+            }
         }
-        const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
-        if (readable_range && !formatted.entry && full_bytes >= (64u << 10)) {
-            bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
-            if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
+        const LONG64 step_t0 = cache_hit ? 0 : step_now_us();
+        bool readable_range;
+        if (cache_hit) {
+            bytes = cached->bytes;
+            readable_range = cached->readable;
+            ++big_binding_counts.hits;
+        } else {
+            if (address && large_raw) {
+                bool extent_ok = false;
+                const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
+                if (extent_ok) bytes = extent ? extent : 256;
+            }
+            readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+            if (readable_range && large_raw) {
+                bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
+                if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
+            }
+            if (cached) {
+                cached->bytes = bytes;
+                cached->readable = readable_range;
+                ++big_binding_counts.trims;
+            }
         }
-        const LONG64 step_t1 = step_now_us();
-        bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
-        {
+        const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
+        bool have = false;
+        if (readable_range && cached) {
+            auto& slice = cached->slice;
+            if (slice.mapped) {
+                have = bind_upload_slice(self, slice);
+                if (have) InterlockedIncrement64(&big_copies_reused);
+            } else {
+                slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
+                if (slice.mapped) {
+                    std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
+                    ++big_binding_counts.copies;
+                    big_binding_counts.copied_bytes += bytes;
+                    InterlockedIncrement64(&big_copies_made);
+                    have = true;
+                }
+            }
+            if (have) {
+                offset = slice.offset;
+                chunk = slice.resource;
+            } else {
+                // A retry needs a fresh readability check before it can read title memory.
+                big_bindings.erase(bigbind_key(address, full_bytes));
+            }
+        } else if (readable_range) {
+            have = frame_copy(self, address, bytes, &offset, &chunk);
+        }
+        if (!cache_hit) {
             const LONG64 step_t2 = step_now_us();
             auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
             InterlockedIncrement64(&step.calls);
@@ -3395,7 +3557,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         count_buffer(have);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
-            if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
+            if (have && !cache_hit) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
@@ -3406,7 +3568,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         static const bool constants_log = GetEnvironmentVariableA("X2W_RED_PRODUCER_AUTO", nullptr, 0) != 0 ||
                                           GetEnvironmentVariableA("X2W_RED_PRODUCER_FRAMES", nullptr, 0) != 0;
         // The first 3 draws of a translation, then every 300th (a constant that changes later, or never does, shows in the series).
-        const bool constants_due = constants_log && have && bytes >= 16 && bytes <= 4096 &&
+        const bool constants_due = constants_log && have && !cache_hit && bytes >= 16 && bytes <= 4096 &&
                                    (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
         if (constants_due) {
             const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);
@@ -3508,6 +3670,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     if (indirect) {
+        follow_inputs();
+        const auto red_samples = trace_inputs
+            ? red_producer_draw_before(self, list, "translated-indirect-draw", tr->key) : RedDrawSamples{};
         if (validated) {
             list->IASetIndexBuffer(&indirect->indices.view);
             list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
@@ -3515,6 +3680,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
         }
+        red_producer_draw_after(self, red_samples);
         // The translated root invalidated the desktop arguments of the tracked guest root.
         if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
         pass.srv_bound = 0;
@@ -3538,12 +3704,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);
+            follow_inputs();
             const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
             red_producer_draw_after(self, red_samples);
             drawn = true;
         }
     } else {
+        follow_inputs();
         const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         red_producer_draw_after(self, red_samples);
@@ -3577,6 +3745,11 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
         if (draw.shader_key) {
+            const char* kind = indices.resource ? "indexed" : "draw";
+            if (draw.refusal_code == indirect_refusal_code::translation_not_ready)
+                note_indirect_graphics_refusal(draw.shader_key, kind, "no translation");
+            else if (draw.refusal_code == indirect_refusal_code::missing_guest_root)
+                note_indirect_graphics_refusal(draw.shader_key, kind, "root mismatch");
             const bool first_pair = indirect_draw_refusal_census.note(draw.shader_key, draw.refusal_code);
             if (first_pair || first_calls(refused, 32))
                 log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);

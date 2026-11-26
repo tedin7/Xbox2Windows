@@ -1723,6 +1723,12 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_draw_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend})
     add_test(NAME startup_indirect_draw_${backend} COMMAND startup_indirect_draw_indexed ${backend} draw)
     add_test(NAME startup_indirect_translated_draw_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated)
+    add_test(NAME startup_indirect_translated_root_${backend}
+        COMMAND startup_indirect_draw_indexed ${backend} translated-root)
+    add_test(NAME startup_indirect_translated_root_control_${backend}
+        COMMAND startup_indirect_draw_indexed ${backend} translated-root-control)
+    set_tests_properties(startup_indirect_translated_root_${backend} startup_indirect_translated_root_control_${backend}
+        PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME startup_indirect_translated_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-refusal-census)
     add_test(NAME startup_indirect_translated_targets_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-targets)
     add_test(NAME startup_indirect_other_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} indirect-other-refusal-census)
@@ -1769,6 +1775,10 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_mesh_request_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1")
 endforeach()
+add_test(NAME startup_indirect_mesh_request_control_warp COMMAND startup_indirect_draw_indexed warp mesh)
+set_tests_properties(startup_indirect_mesh_request_control_warp PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1;X2W_MESH_REQUEST_CONTROL=1"
+    PASS_REGULAR_EXPRESSION "mesh request census mismatch for [0-9a-f]+ .expected 2 uses and refusals.")
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
@@ -5050,6 +5060,24 @@ if(EXISTS "${INTAKE_PYTHON}")
             startup_compute_dispatch_input_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_compute_dispatch_output_view_tokens_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        "${DXC_EXECUTABLE}" warp --output-view-tokens)
+    set_tests_properties(startup_compute_dispatch_output_view_tokens_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_list_cost_bench_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_list_cost_bench_nolock_refuse_${adapter} COMMAND "${CMAKE_COMMAND}" -E env X2W_NOLOCK_REFUSE=1
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_list_cost_bench_${adapter} startup_list_cost_bench_nolock_refuse_${adapter}
+            PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+    endforeach()
+    add_test(NAME startup_compute_nolock_refuse_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+        "${DXC_EXECUTABLE}" warp --nolock)
+    set_tests_properties(startup_compute_nolock_refuse_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
         "$<TARGET_FILE:startup_stream_rasterizer>" hardware filter)
@@ -5230,6 +5258,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_frame_copy_once_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" ${backend} once)
+        set_tests_properties(startup_frame_copy_once_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -10421,6 +10453,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_mesh57_skeleton_draw_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_mesh57_skeleton_wave_collectives_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" wave_collectives "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_mesh57_skeleton_wave_collectives_${adapter}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_loop_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_loop_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

@@ -1089,6 +1089,25 @@ Its `wrong_group` control swaps the group size in the state block and must misma
 request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
 the fixture builds the block at the offsets the translator reads.
 
+### Compute buffer output view tokens
+
+Set `X2W_OUTPUT_VIEW_TOKENS=1` to let a translated compute buffer output resolve a
+UAV token from a title descriptor table. The default is off. The runtime reads
+the recorded UAV and builds a raw view of its byte range in a whole slot of the
+translated heap. The range must start on a 16-byte boundary and contain a whole
+number of dwords, up to 16 MiB. Counter views and views of released resources
+are refused. Texture outputs use the manifest's existing texture binding.
+
+`startup_compute_dispatch_output_view_tokens_warp` checks raw, structured and
+typed buffer views by reading back all 320 dwords after a dispatch. The fixture
+copies the token and replaces its source descriptor before dispatch. The
+switch-off control expects the original refusal and unchanged readback. A
+shifted-range control expects 12 mismatches against the correct CPU reference.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_output_view_tokens_warp$' -V
+```
+
 ### Shader requests from the archive, before a run
 
 `tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes
@@ -1256,6 +1275,13 @@ Every file in `OUT` is written by untrusted code. Read it; do not execute anythi
 Archive each run's logs together with a copy of `shader_cache/`, and leave the cache in place for the next run. With a cold cache, every draw whose pipeline has not been translated yet is counted as "not drawn" and is missing from the frame.
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
+
+Set `X2W_PRE_RUN_FAMILY_RETRY=1` before running `tester_run.ps1` to enable the versioned pre-run retry.
+Refusals retain their reason text and record the reason family and translator content fingerprint.
+The pre-run pass samples up to eight stale refusals per family, interleaves families, and continues a
+family when a sample translates. The cache records where probing stopped so a capped pass can resume
+with the next family. The newest run with both render census and per-key use records supplies the
+weights. The switch defaults to off.
 
 **Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies graphics, RTV variant, slot 67 compute and slot 57 mesh requests under their current keys. It uses `pipeline_key`, `compute_key` and `mesh57_key` from the adjacent `gfx2hlsl.py` and updates each RTV variant with its new graphics key. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
 
