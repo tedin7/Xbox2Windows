@@ -23,9 +23,12 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     if (!changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
-    alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
+    alignas(256) static float small_constants[64] = {1.0f, 0.0f, 0.0f, 1.0f};
+    alignas(65536) static float big_constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
     if (big)
-        for (int i = 4; i < 16384; ++i) constants[i] = 0.5f;
+        for (int i = 4; i < 16384; ++i) big_constants[i] = 0.5f;
+    float* const constants = big ? big_constants : small_constants;
+    const std::size_t constants_bytes = big ? sizeof(big_constants) : sizeof(small_constants);
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment;
     static std::vector<unsigned char> views;
@@ -41,7 +44,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
                                            reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(constants), big ? sizeof(constants) : 256};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(constants), static_cast<UINT>(constants_bytes)};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
     const StreamWord table = invoke(heap, 10);
     if (!table) return 43;
