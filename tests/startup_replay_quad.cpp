@@ -10,6 +10,7 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -109,7 +110,16 @@ int draw_frame(void* device, Scene& s, void* pso, UINT frame, UINT frames, bool 
     invoke(s.list, 50, 1, arg(&s.rtv));
     invoke(s.list, 21, 1, arg(&viewport));
     invoke(s.list, 22, 1, arg(&scissor));
-    invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // X2W_TEST_REPLAY_BIG_ARG=1: the words after the topology are a pointer to 4 MiB and its size, new content each
+    // frame (stale stack words can look like that); the slot ignores them, a recorder follows them.
+    static const bool big_arg = GetEnvironmentVariableA("X2W_TEST_REPLAY_BIG_ARG", nullptr, 0) != 0;
+    if (big_arg) {
+        static std::vector<unsigned char> big(4u << 20);
+        std::fill(big.begin(), big.end(), static_cast<unsigned char>(frame + 1));
+        invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, arg(big.data()), big.size());
+    } else {
+        invoke(s.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
     invoke(s.list, 25, arg(pso));
     invoke(s.list, 12, 3, 1);
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;

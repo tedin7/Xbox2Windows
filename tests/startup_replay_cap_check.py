@@ -60,7 +60,7 @@ def main(scene, backend):
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
         for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_DIR", "X2W_REPLAY_MAX_MIB",
-                     "X2W_PRESENT_PICTURES"):
+                     "X2W_PRESENT_PICTURES", "X2W_TEST_REPLAY_BIG_ARG"):
             env.pop(name, None)
         args = [scene, vs, ps, root, backend]
         code, text, _ = timed(args + [1], env)
@@ -80,6 +80,16 @@ def main(scene, backend):
         assert presents < PRESENTS, "the capped file holds every present (%d): the cap did not stop it" % presents
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
+
+        # One call that asks for 4 MiB each frame (a pointer and size pair in its stack words): the cap is checked
+        # before that memory is written, so the file still ends near the cap.
+        big = directory / "big.x2wr"
+        code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(big),
+                                                      X2W_REPLAY_MAX_MIB=str(CAP_MIB), X2W_TEST_REPLAY_BIG_ARG="1"))
+        assert code == 0, "the scene did not finish under a recording cap:\n" + text[-3000:]
+        assert "X2W_REPLAY_MAX_MIB reached" in text, text[-3000:]
+        big_size = big.stat().st_size
+        assert big_size <= (CAP_MIB << 20) + SLACK, "capped file with 4 MiB arguments is %d bytes" % big_size
 
         # "slow": the window opens at the first present after a gap of 300 ms or more (a 400 ms pause before frame 15:
         # present 16), lasts 0.15 s, and the file ends with its XEND.

@@ -22,6 +22,7 @@ constexpr std::size_t flush_bytes = 1u << 20;
 constexpr std::size_t blob_follow_bytes = 0x400;  // pointer words looked at inside an argument's memory
 constexpr std::size_t blob_default_bytes = 0x100;
 constexpr std::size_t blob_max_bytes = 4u << 20;
+constexpr std::size_t call_memory_max = 16u << 20;  // argument memory one call may add (stale pointer and size words)
 constexpr int record_depth = 2;  // argument memory, the memory it points at (a pipeline stream), and one more (its shaders)
 
 void* original[kind_count][wide_slots];
@@ -54,6 +55,7 @@ struct ThreadBuffer {
     SRWLOCK lock = SRWLOCK_INIT;
     std::vector<unsigned char> bytes;
     std::unordered_map<u64, u64> blobs;  // address -> content hash last recorded from this thread
+    std::size_t call_memory = 0;         // argument memory the call being recorded has added
 };
 std::vector<ThreadBuffer*>& thread_buffers() { static std::vector<ThreadBuffer*> v; return v; }
 std::unordered_set<u64>& stored_blobs() { static std::unordered_set<u64> s; return s; }  // blob_lock
@@ -149,6 +151,15 @@ void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std
     const std::size_t wanted = exact_size ? size_hint : (std::max)(size_hint, blob_default_bytes);
     const std::size_t bytes = readable_window(address, wanted);
     if (!bytes) return;
+    // The size cap before writing, not after the next flush: one call's memory (a stale pointer and size pair can ask
+    // for MiBs) must not run the file past X2W_REPLAY_MAX_MIB. The memory that does not fit is left out and the
+    // recording stops; a call past call_memory_max loses the rest of its memory.
+    if (bytes_written + b.bytes.size() + bytes > max_bytes) {
+        if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+        return;
+    }
+    if (b.call_memory + bytes > call_memory_max) return;
+    b.call_memory += bytes;
     std::vector<unsigned char> copy(bytes);
     SIZE_T got = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), copy.data(), bytes, &got) || got != bytes)
@@ -234,6 +245,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
 {
     ThreadBuffer& b = my_buffer();
     AcquireSRWLockExclusive(&b.lock);
+    b.call_memory = 0;
     Call call{seq, GetCurrentThreadId(), static_cast<std::uint16_t>(kind), static_cast<std::uint16_t>(slot), object, {}, ret,
               seconds_now(), presents, 0};
     std::memcpy(call.args, args, sizeof(call.args));
