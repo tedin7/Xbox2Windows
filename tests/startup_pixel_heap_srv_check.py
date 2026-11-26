@@ -156,7 +156,8 @@ def draw(folder, consumer, backend, kind, compiler, case='rootconst'):
         raise SystemExit(77)
     assert first.returncode == 0, first.stdout + first.stderr
     subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], env=env, check=True)
-    text_file, = cache.glob('*.txt')
+    # revision.txt is the cache revision the runtime writes with its first request (#2815), not a translation.
+    text_file, = (path for path in cache.glob('*.txt') if path.name != 'revision.txt')
     text = text_file.read_text(encoding='ascii')
     assert text.splitlines().count(manifest_line) == 1, text
     for stage in ('vs', 'ps'):
