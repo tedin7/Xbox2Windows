@@ -704,6 +704,16 @@ EXECZ_REFUSED = ('s_endpgm', 's_store', 's_atomic', 's_buffer_store', 's_buffer_
                  's_setreg', 's_setpc', 's_swappc', 's_dcache', 's_icache', 's_gl1', 's_memtime', 's_memrealtime',
                  's_trap', 's_sleep', 'v_writelane', 's_movrel', 'v_movrel')
 
+BUFFER_STORE_OFF_UNIFORM = 'buffer store off with data not proven wave-uniform'
+EXECZ_WAVE_SCALARS = ('s_buffer_load_dword', 's_lshl_b32')
+
+
+def compute_wave_retry(reason):
+    return reason == BUFFER_STORE_OFF_UNIFORM or (
+        reason.startswith(tuple(op + ' inside a block s_cbranch_execz skips per lane: definition of '
+                                for op in EXECZ_WAVE_SCALARS))
+        and ', live where the block joins' in reason)
+
 
 def scalar_tokens(text):
     out = set()
@@ -3170,7 +3180,7 @@ class Stage:
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
-                reason = None
+                reason, words = None, []
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
@@ -3194,7 +3204,14 @@ class Stage:
                     if named:
                         reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
-                    refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+                    diagnostic = '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason)
+                    # Wave-voted control flow runs a straight block's scalar assignment in every
+                    # host lane, preserving the incoming value when the whole wave skips.
+                    if (self.compute_wave and straight and compute_wave_retry(diagnostic)
+                            and all(re.fullmatch(r's(?:[0-9]|[1-9][0-9]|10[0-5])', word) for word in words)):
+                        self.execz_wave_scalars[at] = diagnostic
+                    else:
+                        refused.setdefault(at, diagnostic)
         return refused
 
     def execz_read_cause(self, j, word, b, t, effects, into):
@@ -3775,6 +3792,21 @@ class Stage:
             # the pc dispatch even when the preceding region took different paths.
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
+        self.compute_wave = False
+        self.compute_wave_size = None
+        self.execz_wave_scalars = {}
+        self.wave_store = False
+        if getattr(self, 'kind', None) == 'cs' and getattr(self.pipe, 'retry_compute_wave', False):
+            x, y, z = self.pipe.group
+            threads = x * y * z
+            guest_width = self.pipe.wave_size or 32
+            # Four threads fit the minimum SM6 wave. Larger groups need an explicit host wave size
+            # and must still fit in one guest wave.
+            if (threads <= 4 or guest_width in (32, 64) and threads <= guest_width) and all(
+                    t > pc for pc, t in branches):
+                self.compute_wave = True
+                if threads > 4:
+                    self.compute_wave_size = guest_width
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
         # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
@@ -3784,8 +3816,10 @@ class Stage:
         # A pixel program with a wave-wide read (a whole-wave reduction) and only forward branches decides every EXEC / VCC
         # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
         # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
-        self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
-                          and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
+        self.wave_exec = self.compute_wave or (
+            getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
+            and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
+        wave_vote_conditions = ('execz',) if self.compute_wave else ('execz', 'execnz', 'vccz', 'vccnz')
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
@@ -4059,6 +4093,13 @@ class Stage:
                     if off in refused:
                         raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
+                    if off in self.execz_wave_scalars:
+                        _, ops, _ = parse(asm)
+                        sources = (smem_offset(ops[2]),) if base == 's_buffer_load_dword' else ops[1:]
+                        if not all(self.uniform_source(tok) for tok in sources):
+                            raise Unsupported(self.execz_wave_scalars[off])
+                        if base == 's_buffer_load_dword' and self.descriptor(ops[1]) in self.pipe.rw_keys:
+                            raise Unsupported(self.execz_wave_scalars[off])
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
                         if not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s:
@@ -4092,7 +4133,7 @@ class Stage:
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
-                        elif self.wave_exec and cond in ('execz', 'execnz', 'vccz', 'vccnz'):
+                        elif self.wave_exec and cond in wave_vote_conditions:
                             # Decided over the host wave (WaveActiveAnyTrue): every thread takes it together.
                             self.wave_voted_branches.add(off)
                             self.uniform_branches.add(off)
@@ -6816,8 +6857,9 @@ class Stage:
                     and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
                 where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
         # RDNA 2 scalar buffer addressing clears the low two bits of the final address.
-        # The raw view starts at the aligned descriptor base. Align once before loading either word.
-        if waterfall and (extra % 4 or not self.operand_align4(token)):
+        # The raw view starts at the aligned descriptor base. Align once before loading any word.
+        wave_scalar = getattr(self, 'pc', None) in getattr(self, 'execz_wave_scalars', ())
+        if (waterfall or wave_scalar) and (extra % 4 or not self.operand_align4(token)):
             self.emit('a = (%s + %du) & ~3u;' % (offset, extra))
             offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
@@ -7095,17 +7137,39 @@ class Stage:
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
         src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
                                                         uniform_off=True)
-        # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
-        # lanes race; with one proven value in all of them any order stores the same words.
-        if ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1)):
-            raise Unsupported('buffer store off with data not proven wave-uniform')
+        # All active lanes of an off store share an address. Keep the legacy store for equal data.
+        elect = ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1))
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
+        if elect:
+            if not getattr(self, 'compute_wave', False) or not self.uniform_source(ops[3]):
+                raise Unsupported(BUFFER_STORE_OFF_UNIFORM)
+            self.wave_store = True
+            x, y, _ = self.pipe.group
+            self.emit('{')
+            self.emit('    bool x2w_store_active = (exec & 1u) != 0u;')
+            self.emit('    uint x2w_guest_lane = tid.x + %du * (tid.y + %du * tid.z);' % (x, y))
+            # D3D12 need not assign host lanes in guest thread-ID order. Find the
+            # winning guest lane first, then use the ballot to find its host lane.
+            self.emit('    uint x2w_store_last = WaveActiveMax(x2w_store_active ? x2w_guest_lane : 0u);')
+            self.emit('    uint4 x2w_store_mask = WaveActiveBallot(x2w_store_active && x2w_guest_lane == x2w_store_last);')
+            # Keep the reads wave-uniform, with a valid source whenever the ballot is non-empty.
+            self.emit('    if (any(x2w_store_mask != 0u)) {')
+            self.emit('        uint x2w_store_lane = x2w_last_lane(x2w_store_mask);')
+            for i, word in enumerate(words):
+                self.emit('        uint x2w_store_word%d = WaveReadLaneAt(%s, x2w_store_lane);' % (i, word))
+            words = ['x2w_store_word%d' % i for i in range(count)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
         # an assumption that a dword access ignores the low two address bits, not a measurement.
-        self.emit('a = %s;' % address)
         store = '%s.Store%s(a, %s);' % (uav, '' if count == 1 else count, data)
-        self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
+        if elect:
+            self.emit('        a = %s;' % address)
+            self.emit('        if (WaveGetLaneIndex() == x2w_store_lane) %s' % store)
+            self.emit('    }')
+            self.emit('}')
+        else:
+            self.emit('a = %s;' % address)
+            self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
     def buffer_atomic(self, name, ops, mods):
         """Lower 32-bit compute MUBUF atomics with optional glc pre-atomic return."""
@@ -11843,6 +11907,7 @@ class ComputePipeline(Pipeline):
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
         self.retry_entry_exec = False
+        self.retry_compute_wave = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -11850,7 +11915,7 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
+        A uniform-source or wave-state refusal can also retry, leaving successful legacy HLSL intact."""
         while True:
             try:
                 self._reset_stage()
@@ -11859,14 +11924,21 @@ class ComputePipeline(Pipeline):
                         and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
                     self.retry_entry_exec = True
                     continue
+                if (not self.retry_compute_wave and refusals is not None
+                        and any(compute_wave_retry(reason) for reason, _ in refusals[self._refusals_before:])):
+                    self.retry_compute_wave = True
+                    continue
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
-                    raise
                 # Keep the original lowering for every shader that already translates.
-                self.retry_entry_exec = True
+                if not self.retry_entry_exec and str(reason) == READFIRSTLANE_UNIFORM:
+                    self.retry_entry_exec = True
+                elif not self.retry_compute_wave and compute_wave_retry(str(reason)):
+                    self.retry_compute_wave = True
+                else:
+                    raise
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
@@ -11930,6 +12002,15 @@ class ComputePipeline(Pipeline):
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+        if s.wave_store:
+            shared += ['uint x2w_last_lane(uint4 mask) {',
+                       '    if (mask.w) return 96u + uint(firstbithigh(mask.w));',
+                       '    if (mask.z) return 64u + uint(firstbithigh(mask.z));',
+                       '    if (mask.y) return 32u + uint(firstbithigh(mask.y));',
+                       '    return uint(firstbithigh(mask.x));',
+                       '}']
+        if s.compute_wave_size:
+            shared.append('[WaveSize(%d)]' % s.compute_wave_size)
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
@@ -12145,7 +12226,7 @@ def log_unvalidated_lod(key, pipe):
 
 
 def translate_compute(out_dir, key):
-    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
+    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
     with suppress(FileNotFoundError):
@@ -12168,7 +12249,8 @@ def translate_compute(out_dir, key):
         import subprocess
         with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
             bytecode = os.path.join(staging, 'cs.cso')
-            r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
+            profile = 'cs_6_6' if pipe.cs.compute_wave_size else 'cs_6_0'
+            r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
                                capture_output=True, text=True)
             if r.returncode or not has_bytecode(bytecode):
                 # DXC names the source path; keep only the diagnostic after it.

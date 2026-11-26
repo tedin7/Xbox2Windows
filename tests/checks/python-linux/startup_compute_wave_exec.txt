@@ -1,0 +1,1 @@
+tests/startup_compute_wave_exec_check.py

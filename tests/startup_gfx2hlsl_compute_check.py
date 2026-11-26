@@ -1608,17 +1608,17 @@ def check_off_stores():
     hlsl = lines(*guard, 's_cbranch_execz 4', 'v_lshrrev_b64 v[5:6], 4, s[20:21]',
                  'buffer_store_dwordx2 v[5:6], off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
     assert 'if (exec & 1) u0.Store2(a, uint2(v5, v6));' in [line.strip() for line in hlsl], hlsl
-    # The saveexec between the definition and the store ends the proof (conservative: these lanes are a subset).
-    refused('buffer store off with data not proven wave-uniform', lambda: lines(
-        'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
-        'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0'))
-    # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
-    # before an EXEC change, where the entry-block proof no longer knows which lanes store.
-    for code in (('v_lshrrev_b64 v[5:6], 4, v[3:4]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0'),
-                 ('buffer_store_dword v5, off, s[16:19], 0',),
-                 ('v_mov_b32 v5, s20', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 exec_lo, vcc_lo',
-                  'buffer_store_dword v5, off, s[16:19], 0')):
-        refused('buffer store off with data not proven wave-uniform', lambda code=code: lines(*code))
+    # An EXEC change ends the old uniformity proof. The retry can elect a writer.
+    hlsl = lines('v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
+                 'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
+    assert any('WaveReadLaneAt(v5,' in line for line in hlsl), hlsl
+    for count, code in (
+            (2, ('v_lshrrev_b64 v[5:6], 4, v[3:4]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0')),
+            (1, ('buffer_store_dword v5, off, s[16:19], 0',)),
+            (1, ('v_mov_b32 v5, s20', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 exec_lo, vcc_lo',
+                 'buffer_store_dword v5, off, s[16:19], 0'))):
+        hlsl = '\n'.join(lines(*code))
+        assert hlsl.count('WaveReadLaneAt(') == count, hlsl
 
 
 def check_execz_mask_exact():
@@ -1728,8 +1728,9 @@ def check_controls():
     refused('numeric use of s7', lambda: translate('A', rsrc2=(8 << 1) | tidig(3)).hlsl_cs())
     # Store forms outside this slice (the store is the dword at +0x60 of WORDS_A: offen, soffset 0x80, s[16:19]).
     store = '001070e004050480'
-    for word, fragment in (('000070e004050480', 'not proven wave-uniform'),  # off: one address, per-lane data
-                           ('002070e004050480', 'modifier idxen'),         # idxen, no offen
+    off = translate('A', code=patch(WORDS_A, store, '000070e004050480')).hlsl_cs()
+    assert '[WaveSize(32)]' in off and 'WaveReadLaneAt(v5,' in off, off
+    for word, fragment in (('002070e004050480', 'modifier idxen'),         # idxen, no offen
                            ('005070e004050480', 'modifier glc')):          # glc offen
         # (a store through a descriptor the program also loads is lowered as one RW view: startup_compute_rw_buffer)
         refused(fragment, lambda w=word: translate('A', code=patch(WORDS_A, store, w)).hlsl_cs())
