@@ -2053,6 +2053,99 @@ def adjacent_address_carries(ins, targets):
     return pairs
 
 
+class WaveSync:
+    """Wave-wide decisions of a guest wave, computed from groupshared words, independent of the host wave size.
+
+    A translated compute thread is one guest lane; a guest wave is WAVE (32 or 64) consecutive threads of the group in
+    linear thread order (x fastest). Anything that depends on the other lanes of the wave (does any lane have the bit
+    set, which lane is the first with its exec bit set, the value of one lane) is a gather site: every thread publishes
+    its bit and value, the group meets at GroupMemoryBarrierWithGroupSync(), and every thread reads the wave's word. No
+    host wave intrinsic is used, so the result is the guest wave's for any host wave size.
+
+    The barrier has to be reached by every thread of the group in the same order, so a site is only legal where control
+    flow is uniform across the whole group: the caller passes uniform=False for anything else and gets a refusal.
+
+    Hazards, by construction (site number n counts the sites a thread has run; all threads run the same sequence):
+    - values live in two buffers by n parity: a thread writes buffer n % 2 after the barrier of site n - 1, and every
+      reader of site n - 2 left that buffer before it reached that barrier;
+    - the per-wave words (any, first lane) live in three buffers by n % 3: the lane 0 of each wave clears the buffer of
+      site n + 1 while site n runs. It was last used by site n - 2, whose readers are past the barrier of site n - 1,
+      and its first user is after the barrier of site n.
+    The prologue clears all three before the first site and ends in a barrier.
+    """
+    FIRST_NONE = '0xffffffffu'
+
+    def __init__(self, group, wave_size):
+        if wave_size not in (32, 64):
+            raise Unsupported('guest wave size %s' % (wave_size,))
+        threads = group[0] * group[1] * group[2]
+        if not 1 <= threads <= 1024:
+            raise Unsupported('thread group of %d threads' % threads)
+        self.group, self.wave, self.threads = tuple(group), wave_size, threads
+        self.waves = (threads + wave_size - 1) // wave_size
+        self.sites = 0
+
+    def declarations(self):
+        return ['groupshared uint x2w_any[3][%d];' % self.waves, 'groupshared uint x2w_first[3][%d];' % self.waves,
+                'groupshared uint x2w_val[2][%d];' % self.threads]
+
+    def prologue(self):
+        """Declares the thread's place in its guest wave and clears the words; ends with the barrier of the prologue."""
+        g = self.group
+        return ['uint x2w_n = 0;',
+                'uint x2w_lin = tid.x + tid.y * %du + tid.z * %du;' % (g[0], g[0] * g[1]),
+                'uint x2w_lane = x2w_lin %% %du, x2w_wave = x2w_lin / %du;' % (self.wave, self.wave),
+                'if (x2w_lane == 0u) { for (uint b = 0u; b < 3u; ++b) { x2w_any[b][x2w_wave] = 0u; '
+                'x2w_first[b][x2w_wave] = %s; } }' % self.FIRST_NONE,
+                'GroupMemoryBarrierWithGroupSync();']
+
+    def site(self, uniform, active=None, bit=None, value=None):
+        """The lines of one gather site and its number. active: lane-active expression (the first such lane is wanted);
+        bit: expression whose OR over the wave is wanted; value: published per-lane value. Results are read with
+        x2w_any_<k>, x2w_first_<k> (the lane index, x2w_none when no lane is active) and x2w_value_<k> (see lane_value)."""
+        if not uniform:
+            raise Unsupported('wave gather in control flow that is not uniform across the thread group')
+        k = self.sites
+        self.sites += 1
+        lines = ['{ uint b = x2w_n % 3u, nb = (x2w_n + 1u) % 3u, v = x2w_n & 1u;']
+        if active is not None:
+            lines.append('  if (%s) InterlockedMin(x2w_first[b][x2w_wave], x2w_lane);' % active)
+        if bit is not None:
+            lines.append('  if (%s) InterlockedOr(x2w_any[b][x2w_wave], 1u);' % bit)
+        lines.append('  x2w_val[v][x2w_lin] = %s;' % (value if value is not None else '0u'))
+        lines.append('  if (x2w_lane == 0u) { x2w_any[nb][x2w_wave] = 0u; x2w_first[nb][x2w_wave] = %s; }' % self.FIRST_NONE)
+        lines.append('  GroupMemoryBarrierWithGroupSync();')
+        lines.append('  x2w_any_%d = x2w_any[b][x2w_wave]; x2w_first_%d = x2w_first[b][x2w_wave];' % (k, k))
+        lines.append('  x2w_snap_%d = v; }' % k)
+        lines.append('x2w_n++;')
+        return k, lines
+
+    def gather_any(self, bit, uniform=True):
+        """(variable, lines): 1u when the bit is set in any lane of the wave, else 0u."""
+        k, lines = self.site(uniform, bit=bit)
+        return 'x2w_any_%d' % k, self.vars(k) + lines
+
+    def gather_first(self, active, value, uniform=True):
+        """(lane variable, value variable, lines): the lane index of the lowest lane whose `active` expression is true
+        (x2w_none, 0xffffffff, when there is none) and `value` as that lane published it (0u when there is none)."""
+        k, lines = self.site(uniform, active=active, value=value)
+        lines.append('uint x2w_value_%d = x2w_first_%d == %s ? 0u : x2w_val[x2w_snap_%d][x2w_wave * %du + x2w_first_%d];'
+                     % (k, k, self.FIRST_NONE, k, self.wave, k))
+        return 'x2w_first_%d' % k, 'x2w_value_%d' % k, self.vars(k) + lines
+
+    def gather_lane(self, value, lane, uniform=True):
+        """(variable, lines): `value` of lane `lane` (a wave-uniform expression below the wave size) of this wave. A lane
+        past the end of a short last wave reads 0u."""
+        k, lines = self.site(uniform, value=value)
+        lines.append('uint x2w_value_%d = (%s) < %du && x2w_wave * %du + (%s) < %du ? x2w_val[x2w_snap_%d][x2w_wave * %du + (%s)] : 0u;'
+                     % (k, lane, self.wave, self.wave, lane, self.threads, k, self.wave, lane))
+        return 'x2w_value_%d' % k, self.vars(k) + lines
+
+    @staticmethod
+    def vars(k):
+        return ['uint x2w_any_%d = 0u, x2w_first_%d = 0u, x2w_snap_%d = 0u;' % (k, k, k)]
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
