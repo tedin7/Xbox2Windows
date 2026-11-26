@@ -21,14 +21,17 @@ import tempfile
 from startup_stream_check import container, gfx2hlsl
 from startup_stream_draw_check import vertex, vop1
 
-PIXEL = container(0, [
-    0xf4080304, 0xfa000000,  # s_load_dwordx4 s[12:15], s[8:9], 0x0
-    0xbf8cc07f,              # s_waitcnt lgkmcnt(0)
-    vop1(1, 4, 129),         # v_mov_b32 v4, 1
-    0xe00c2000, 0x80030004,  # buffer_load_format_xyzw v[0:3], v4, s[12:15], 0 idxen
-    0xbf8c3f70,              # s_waitcnt vmcnt(0)
-    0xf800180f, 0x03020100,  # exp mrt0 v0, v1, v2, v3 done vm
-    0xbf810000])             # s_endpgm
+def pixel(element):
+    return container(0, [
+        0xf4080304, 0xfa000000,  # s_load_dwordx4 s[12:15], s[8:9], 0x0
+        0xbf8cc07f,              # s_waitcnt lgkmcnt(0)
+        vop1(1, 4, 128 + element),
+        0xe00c2000, 0x80030004,  # buffer_load_format_xyzw v[0:3], v4, s[12:15], 0 idxen
+        0xbf8c3f70,              # s_waitcnt vmcnt(0)
+        0xf800180f, 0x03020100,  # exp mrt0 v0, v1, v2, v3 done vm
+        0xbf810000])             # s_endpgm
+
+
 TARGET = 2  # DXGI_FORMAT_R32G32B32A32_FLOAT
 IDENTITY = 0x1688
 F = lambda x: struct.unpack('<I', struct.pack('<f', x))[0]  # noqa: E731
@@ -74,7 +77,7 @@ def check(work, consumer, backend, fxc):
     cache.mkdir()
     vs, ps, root, output = (work / name for name in ('vs', 'ps', 'root', 'pixels'))
     vs.write_bytes(vertex())
-    ps.write_bytes(PIXEL)
+    ps.write_bytes(pixel(1))
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
                X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc, X2W_TEST_FORMATTED_VIEW=spec(CASES[0]))
     args = [consumer, vs, ps, root, backend, output, str(TARGET)]
@@ -86,7 +89,7 @@ def check(work, consumer, backend, fxc):
             raise SystemExit(77)
         assert result.returncode == 0, (result.returncode, result.stderr[-1500:])
         assert not re.search(r'x2w-d3d12-debug.*sev=[012]\b', result.stderr), result.stderr[-3000:]
-        return struct.unpack('<4I', output.read_bytes()[:16]), result.stderr
+        return struct.unpack('<4I', output.read_bytes()), result.stderr + result.stdout
 
     # The first draw publishes the base request and the second its R32G32B32A32_FLOAT target variant.
     for _ in range(2):
@@ -97,7 +100,7 @@ def check(work, consumer, backend, fxc):
     for case in CASES:
         label, expected = case[0], case[5]
         words, log = draw(case)
-        refusals = re.findall(r'srv 0: formatted buffer refused \((.+) 0\)', log)
+        refusals = re.findall(r'srv 0 not ready: (.+)', log)
         if isinstance(expected, str):
             assert '-> drawn;' not in log and refusals == [expected], (label, refusals)
             assert words == CLEAR, (label, [hex(w) for w in words])
@@ -106,7 +109,11 @@ def check(work, consumer, backend, fxc):
             assert words == expected, (label, [hex(w) for w in words], [hex(w) for w in expected])
         print('%s: %s' % (label, 'refused and logged' if isinstance(expected, str) else 'bit-exact'))
 
+    if backend == 'warp':
+        readiness_draws(work, cache, ps, draw, env, fxc)
+
     # Negative control: the same translation with the W selector read from the Z field must fail the first case.
+    ps.write_bytes(pixel(1))
     variant = next(p for p in manifests if 'rtv1' in p.read_text())
     hlsl = variant.with_suffix('.ps.hlsl')
     source = hlsl.read_text()
@@ -120,6 +127,99 @@ def check(work, consumer, backend, fxc):
     print('control: a W selector read from the Z field fails (w = z)')
     print('%s: %d typed-view cases through the translated buffer_load_format_xyzw' % (backend, len(CASES)))
     return 0
+
+
+CAUSES = (
+    'translation_pending', 'translation_refused', 'translation_failed_to_load',
+    'd16_view_not_ready', 'formatted_buffer_not_ready',
+)
+
+# A fixture shader that reads the exact-depth resource declared as SRV 1.
+D16_PIXEL = """\
+Texture2D<float> depth_view : register(t1);
+float4 main() : SV_Target {
+    return depth_view.Load(int3(0, 0, 0));
+}
+"""
+
+
+def check_draw_report(log, key, expected_cause, resource, availability):
+    cause_line, = re.findall(r'^x2w-render not drawn by cause:(.*)$', log, re.M)
+    expected_counts = {expected_cause: 1} if expected_cause else {}
+    counts = {name: int(count) for name, count in re.findall(r'([a-z0-9_]+) ([0-9]+),', cause_line)}
+    assert counts == expected_counts, (expected_cause, counts)
+    expected_key_line = [(key, '1', f'{expected_cause} 1')] if expected_cause else []
+    key_lines = re.findall(r'^x2w-render not drawn key ([0-9a-f]{16}): ([0-9]+) \((.*)\)$', log, re.M)
+    assert key_lines == expected_key_line, (expected_key_line, key_lines)
+    resource_lines = re.findall(r'^x2w-draw ([0-9a-f]{16}) srv ([0-9]+) not ready: (.*)$', log, re.M)
+    assert resource_lines == ([(key, *resource)] if resource else []), resource_lines
+    ready, pending, refused, failed = availability
+    totals = f'pipelines translated {ready} / pending {pending} / refused {refused} / failed to load {failed}'
+    assert totals + '\n' in log, (totals, log[-1500:])
+    legacy_count, = re.findall(r'^untranslated draws (\d+)$', log, re.M)
+    return sum(counts.values()), int(legacy_count)
+
+
+def readiness_draws(work, cache, ps, draw, env, fxc):
+    report_env = dict(env, X2W_TEST_DRAW_CAUSE_REPORT='1')
+    ready_variant, = cache.glob('req_*.rtv')
+    words, log = draw(CASES[0], report_env)
+    assert words == CASES[0][5], words
+    split_total, legacy_total = check_draw_report(log, ready_variant.stem[4:], None, None, (2, 0, 0, 0))
+
+    # Each case gets a different source key and a fresh consumer. The target is always one pixel.
+    for element, cause in zip((0, 2, 3, 4, 5), CAUSES):
+        ps.write_bytes(pixel(element))
+        case_cache = work / cause
+        case_cache.mkdir()
+        case_env = dict(report_env, X2W_SHADER_CACHE=str(case_cache))
+        words, log = draw(CASES[0], case_env)
+        request, = case_cache.glob('req_*.rtv')
+        key = request.stem[4:]
+        resource = None
+        availability = (0, 2, 0, 0)
+        if cause != 'translation_pending':
+            if cause == 'translation_refused':
+                gfx2hlsl.write_failure(str(case_cache / f'{key}.fail'), 'synthetic unsupported operation')
+                availability = (0, 1, 1, 0)
+            else:
+                subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', case_cache],
+                               env=case_env, check=True, timeout=30)
+                manifest = case_cache / f'{key}.txt'
+                assert 'srv 0 buf table 0 0' in manifest.read_text(), manifest
+                availability = (2, 0, 0, 0)
+                if cause == 'translation_failed_to_load':
+                    manifest.with_suffix('.ps.cso').unlink()
+                    availability = (1, 0, 0, 1)
+                elif cause == 'd16_view_not_ready':
+                    manifest.write_text(manifest.read_text() + 'srv 1 tex2d table 15 0\nd16srv 1 exact\n')
+                    source = case_cache / 'depth.ps.hlsl'
+                    source.write_text(D16_PIXEL, encoding='ascii')
+                    subprocess.run([fxc, '/nologo', '/T', 'ps_5_1', '/E', 'main', '/Fo',
+                                    manifest.with_suffix('.ps.cso'), source],
+                                   check=True, capture_output=True, timeout=30)
+                    resource = ('1', 'unreadable table entry')
+                else:
+                    resource = ('0', CASES[-2][5])
+            case = CASES[-2] if cause == 'formatted_buffer_not_ready' else CASES[0]
+            words, log = draw(case, case_env)
+        assert words == CLEAR and '-> drawn;' not in log, (cause, words)
+        split_count, legacy_count = check_draw_report(log, key, cause, resource, availability)
+        split_total += split_count
+        legacy_total += legacy_count
+        print(f'warp: {cause} counted once, target stayed clear')
+        if cause == 'translation_failed_to_load':
+            # A compiler error publishes a sidecar without publishing the manifest.
+            manifest.unlink()
+            gfx2hlsl.write_failure(str(case_cache / f'{key}.fail'), 'fxc ps: synthetic compiler failure')
+            compiler_words, compiler_log = draw(case, case_env)
+            assert compiler_words == CLEAR and '-> drawn;' not in compiler_log, compiler_words
+            assert check_draw_report(compiler_log, key, cause, None, availability) == (1, 1)
+
+    # These draws reach the same early gate as the old single bucket. Its population is
+    # independently counted by the caller's untranslated-draw counter on this fixture.
+    assert split_total == legacy_total == 5, (split_total, legacy_total)
+    print('warp: the five readiness buckets account for all five untranslated draws')
 
 
 if __name__ == '__main__':

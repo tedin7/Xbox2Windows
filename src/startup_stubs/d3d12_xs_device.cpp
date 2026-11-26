@@ -80,6 +80,7 @@
 #include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
+#include "draw_cause.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
 #include "key_use.h"
@@ -7850,10 +7851,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
-    // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
+    // Snapshot pipeline availability and null-binding counts while draw_lock protects both.
+    char translation_totals[128] = {};
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
         draw_lock_acquire_exclusive();
+        format_translation_totals(translation_totals);
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         draw_lock_release_exclusive();
@@ -7863,11 +7866,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+            "translated draws %ld (not drawn %ld), %s, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
+            translated_draws, untranslated_draws, translation_totals, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],

@@ -448,7 +448,7 @@ RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12
 
 def runtime_gate(source):
     """Check that both FORMAT metadata and usable backing are required before submission."""
-    assert 'formatted_buffers_ready(*tr, pass, formatted_buffers)' in source
+    assert 'formatted_buffers_ready(*tr, pass, formatted_buffers, srv_failure)' in source
     decoder = source[source.index('const char* formatted_buffer_word3('):source.index('bool formatted_buffers_ready(')]
     assert 'formatted_buffer_supported(' in decoder
     preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
@@ -456,7 +456,7 @@ def runtime_gate(source):
         assert condition in preflight, condition
     start = source.index('bool draw_translated(')
     gate = source.index('if (!have && formatted.entry)', start)
-    assert source.index('formatted_buffers_ready(*tr, pass, formatted_buffers)', start) < gate
+    assert source.index('formatted_buffers_ready(*tr, pass, formatted_buffers, srv_failure)', start) < gate
     assert gate < source.index('if (!have && identity_for_null)', gate)
     assert gate < source.index('list->SetPipelineState(pipeline)', gate)
 

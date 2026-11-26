@@ -485,7 +485,7 @@ The draw is refused, not read as zeros, whenever a translated formatted load has
 - an invalid component mapping or a reserved DST_SEL (2, 3);
 - a buffer larger than the 16 MiB copy.
 
-Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for the first 6 occurrences and counts as `formatted-load draws refused` in the `x2w-render totals` line. Because the shader reads the raw copy at `vindex * stride`, the alignment of the upload ring does not constrain 12-byte formats.
+Descriptor readiness failures count toward `formatted-load draws refused` in the `x2w-render totals` line. Because the shader reads the raw copy at `vindex * stride`, the alignment of the upload ring does not constrain 12-byte formats.
 
 `startup_buffer_format_word3_table` checks that the DXGI table equals `DESC_FORMAT_CODES`, agrees with `FETCH_DXGI` and with `formatted_buffer_supported()`; a header that gives `R32G32B32A32_FLOAT` code 74 must fail it. `startup_buffer_format_word3` checks words and refusal reasons, and its `mapping` control, which ignores the view mapping, must fail. `startup_formatted_view_draw_{warp,hardware}` draws one source-built pixel stage through the stand-in: `buffer_load_format_xyzw` with `idxen` of element 1 into an `R32G32B32A32_FLOAT` target, compared as four 32-bit words with distinct sentinels per channel. One translation serves every view:
 
@@ -499,6 +499,37 @@ An `R32_UINT` view and a raw view must refuse the draw with their reasons, logge
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3|formatted_view_draw_(warp|hardware)|vertex_fetch_formats_)' -V
+```
+
+### Translated draw readiness diagnostics
+
+The early translated-draw gate reports five causes in the cumulative counters.
+Translation can be pending, refused, or failed to load. A ready translation can
+still wait for an exact 16-bit depth view or a formatted buffer descriptor. For
+each static resource reason, the log prints the first four distinct pipeline
+keys with the failing SRV index and reports the cumulative draw count at the
+render heartbeat. Pipeline availability counts unique cache keys, including
+render-target variants. The diagnostics are always on.
+
+The WARP fixture compares one-pixel readbacks with CPU references for one ready
+pipeline and five skipped pipelines. It checks every cause counter, both
+resource indices, and the ready, pending, refused and failed pipeline totals.
+The five causes must add up to the independent untranslated-draw count on this
+fixture. The failed-load case covers missing bytecode and a compiler failure
+sidecar.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(formatted_view_draw_warp|null_cause_labels(_buffer_token_control)?|d16_srv_warp|mubuf_descriptor_warp|vertex_fetch_formats_controls|tester_pack|triage_run)$' -V
+```
+
+For the booking control, configure a Windows test build with
+`-DX2W_TEST_MUTATE_D16_DRAW_CAUSE=ON` and rebuild `startup_stream_consumer`.
+The following test must fail at the cause-count assertion with one
+`translation_refused` draw where it expects one `d16_view_not_ready` draw.
+The option defaults to off.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_formatted_view_draw_warp$' -V
 ```
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks

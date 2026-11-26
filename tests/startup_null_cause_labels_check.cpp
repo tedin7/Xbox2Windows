@@ -1,6 +1,7 @@
 // Checks src/startup_stubs/null_binding_cause.h without a device: the slot of the x2w-render totals
 // line each cause is counted in, and the label printed for that slot. The device indexes its counts
 // by the cause's value and prints slots 0 to 4 as entry, buffer, token, wrapper and dimension.
+#include "startup_stubs/draw_cause.h"
 #include "startup_stubs/null_binding_cause.h"
 
 #include <cstdio>
@@ -148,6 +149,13 @@ int main(int argc, char** argv)
     std::snprintf(line, sizeof(line), "null bindings %ld (%s %ld, %s %ld, %s %ld, %s %ld, %s %ld, %s %ld)", total, n[0], by_slot[0],
                   n[1], by_slot[1], n[2], by_slot[2], n[3], by_slot[3], n[4], by_slot[4], n[5], by_slot[5]);
     same_text("totals line from the header's names", line, expected);
+
+    using namespace x2w_startup;
+    same_text("pending draw", not_drawn_names[translation_pending_site], "translation_pending");
+    same_text("refused draw", not_drawn_names[translation_refused_site], "translation_refused");
+    same_text("failed load", not_drawn_names[translation_failed_to_load_site], "translation_failed_to_load");
+    same_text("unproven depth view", not_drawn_names[d16_view_not_ready_site], "d16_view_not_ready");
+    same_text("unready formatted buffer", not_drawn_names[formatted_buffer_not_ready_site], "formatted_buffer_not_ready");
 
     if (failures) {
         std::printf("startup_null_cause_labels: %d of %d FAILED\n", failures, cases);

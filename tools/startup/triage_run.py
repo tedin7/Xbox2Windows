@@ -74,6 +74,17 @@ DSTORAGE_FAIL_OUTCOMES = {
     "zlib failed",
 }
 TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
+DRAW_CAUSE_PREFIX = "x2w-render not drawn by cause:"
+DRAW_READINESS_CAUSES = (
+    "translation_pending", "translation_refused", "translation_failed_to_load",
+    "d16_view_not_ready", "formatted_buffer_not_ready",
+)
+RE_DRAW_CAUSE = re.compile(r"([a-z0-9_]+) ([0-9]{1,10})")
+PIPELINE_AVAILABILITY = ("translated", "pending", "refused", "failed to load")
+RE_PIPELINE_AVAILABILITY = re.compile(
+    r"^x2w-render totals: .*?, pipelines translated ([0-9]{1,10}) / pending ([0-9]{1,10})"
+    r" / refused ([0-9]{1,10}) / failed to load ([0-9]{1,10}),"
+)
 INDIRECT_PREFIX = "x2w-render indirect: "
 # Ordered fields emitted by the slot-61 census in d3d12_xs_device.cpp.
 INDIRECT_OUTCOMES = (
@@ -375,6 +386,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
     d3d12_unhandled: Counter[str] = Counter()
     slot133_outcomes: Counter[str] = Counter()
     indirect_peaks: Counter[tuple[str, str]] | None = None
+    draw_readiness: Counter[str] | None = None
+    pipeline_availability: dict[str, int] | None = None
     gpu_budget = GpuBudgetSummary()
     d3d12_debug: Counter[tuple[str, str]] = Counter()
     dstorage_failures: Counter[str] = Counter()
@@ -391,6 +404,20 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
         budget_match = RE_GPU_BUDGET.fullmatch(line)
         if budget_match:
             gpu_budget.observe(budget_match)
+            continue
+
+        if line.startswith(DRAW_CAUSE_PREFIX):
+            for item in line.removeprefix(DRAW_CAUSE_PREFIX).split(","):
+                match = RE_DRAW_CAUSE.fullmatch(item.strip())
+                if match and match[1] in DRAW_READINESS_CAUSES:
+                    if draw_readiness is None:
+                        draw_readiness = Counter()
+                    draw_readiness[match[1]] = max(draw_readiness[match[1]], int(match[2]))
+            continue
+
+        availability = RE_PIPELINE_AVAILABILITY.match(line)
+        if availability:
+            pipeline_availability = dict(zip(PIPELINE_AVAILABILITY, map(int, availability.groups())))
             continue
 
         if line.startswith(INDIRECT_PREFIX):
@@ -532,6 +559,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
         "d3d12_unhandled": d3d12_unhandled,
         "slot133_outcomes": slot133_outcomes,
         "indirect_peaks": indirect_peaks,
+        "draw_readiness": draw_readiness,
+        "pipeline_availability": pipeline_availability,
         "gpu_budget": gpu_budget,
         "d3d12_debug": d3d12_debug,
         "dstorage_failures": dstorage_failures,
@@ -690,6 +719,20 @@ def format_markdown(
         out.extend(["### `Device::slot133` Placed Resources", ""])
         s133_rows = [[s133[name], name] for name in SLOT133_OUTCOMES if s133[name]]
         out.extend(_format_table(["Count", "Outcome"], s133_rows, len(s133_rows), sum(s133.values()), max_items))
+
+    draw_readiness = summary["draw_readiness"]
+    if draw_readiness is not None:
+        out.extend(["### Draw Readiness", "", "Peak sampled cumulative draw counts by cause.", "",
+                    "| Cause | Draws |", "|---|---:|"])
+        out.extend(f"| {name} | {draw_readiness[name]} |" for name in DRAW_READINESS_CAUSES)
+        out.append("")
+
+    pipeline_availability = summary["pipeline_availability"]
+    if pipeline_availability is not None:
+        out.extend(["### Pipeline Availability", "", "Last sampled totals by cache key.", "",
+                    "| Status | Pipelines |", "|---|---:|"])
+        out.extend(f"| {name} | {pipeline_availability[name]} |" for name in PIPELINE_AVAILABILITY)
+        out.append("")
 
     indirect = summary["indirect_peaks"]
     if indirect is not None:

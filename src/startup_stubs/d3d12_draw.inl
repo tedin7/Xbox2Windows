@@ -153,8 +153,11 @@ struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
+    enum class Availability { uncounted, pending, refused, failed_to_load, ready };
+    Availability availability = Availability::uncounted;
     int state = 0;                           // 1 ready, 2 unavailable
     KeyUse use;                              // when a draw first and last used this pipeline key
+    ULONGLONG retry_failure_at = 0;           // Throttle diagnostic sidecar refreshes independently.
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
@@ -372,7 +375,7 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
 }
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
-LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+LONG translated_draws, untranslated_draws, translation_ready, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
 // Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
@@ -420,21 +423,21 @@ bool read_text(const wchar_t* path, std::string& out);
 // the thread has not read yet counts as absent and is asked for again soon; the thread lists the cache directory about
 // four times a second while any key is waiting.
 constexpr ULONGLONG manifest_retry_ms = 250;
-x2w_startup::ManifestPrefetch::Io manifest_io()
+x2w_startup::ManifestPrefetch::Io manifest_io(const wchar_t* extension = L".txt")
 {
     x2w_startup::ManifestPrefetch::Io io;
-    io.list = [] {
+    io.list = [extension] {
         std::vector<u64> keys;
         wchar_t dir[MAX_PATH], pattern[MAX_PATH + 8];
         const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
         if (!n || n >= MAX_PATH) return keys;
-        swprintf(pattern, MAX_PATH + 8, L"%s\\*.txt", dir);
+        swprintf(pattern, MAX_PATH + 8, L"%s\\*%s", dir, extension);
         WIN32_FIND_DATAW found;
         HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) return keys;
         do {
-            // <16 hex digits>.txt only; the other manifests (.mesh86.txt, ...) have longer names.
-            if (wcslen(found.cFileName) != 20) continue;
+            // Only the canonical <16 hex digits><extension> names.
+            if (wcslen(found.cFileName) != 16 + wcslen(extension)) continue;
             wchar_t* end = nullptr;
             const u64 key = wcstoull(found.cFileName, &end, 16);
             if (end == found.cFileName + 16) keys.push_back(key);
@@ -442,18 +445,26 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
         FindClose(find);
         return keys;
     };
-    io.read = [](u64 key, std::string& text) {
+    io.read = [extension](u64 key, std::string& text) {
         wchar_t path[MAX_PATH];
-        return cache_path(path, L"", key, L".txt") && read_text(path, text);
+        return cache_path(path, L"", key, extension) && read_text(path, text);
     };
     return io;
 }
+x2w_startup::ManifestSource& translation_failure_source()
+{
+    static x2w_startup::ManifestSource source(manifest_io(L".fail"));
+    return source;
+}
+
 x2w_startup::ManifestSource& manifest_source()
 {
     static x2w_startup::ManifestSource source(manifest_io());
     static const HANDLE worker = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
         for (;;) {
             const std::size_t loaded = manifest_source().prefetch().has_wanted() ? manifest_source().prefetch().scan() : 0;
+            auto& failures = translation_failure_source().prefetch();
+            if (failures.has_wanted()) failures.scan();
             Sleep(loaded ? 50 : 250);
         }
     }, nullptr, 0, nullptr);
@@ -539,15 +550,65 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
+// Current availability of each unique cache key (including target variants). draw_lock held.
+LONG translation_pending, translation_refused, translation_failed_to_load;
+
+// draw_lock held.
+void format_translation_totals(char (&text)[128])
+{
+    snprintf(text, sizeof(text), "pipelines translated %ld / pending %ld / refused %ld / failed to load %ld",
+             translation_ready, translation_pending, translation_refused, translation_failed_to_load);
+}
+
+void note_translation_availability(Translation& tr, Translation::Availability next)
+{
+    using Availability = Translation::Availability;
+    const auto counter = [](Availability status) -> LONG* {
+        switch (status) {
+        case Availability::pending: return &translation_pending;
+        case Availability::refused: return &translation_refused;
+        case Availability::failed_to_load: return &translation_failed_to_load;
+        case Availability::ready: return &translation_ready;
+        default: return nullptr;
+        }
+    };
+    if (tr.availability == next) return;
+    if (auto* previous = counter(tr.availability)) --*previous;
+    ++*counter(next);
+    tr.availability = next;
+}
+
+Translation::Availability unpublished_translation(Translation& tr)
+{
+    using Availability = Translation::Availability;
+    const ULONGLONG now = GetTickCount64();
+    if (now < tr.retry_failure_at) return tr.availability;
+    auto& source = translation_failure_source();
+    std::string failure;
+    // First lookup can observe an existing sidecar. Refreshes only consume a
+    // background read. Keep the last observation while a refresh is in flight.
+    const bool first = tr.availability == Availability::uncounted;
+    const bool read = first ? source.read_first(tr.key, failure) : source.prefetch().fetch(tr.key, failure);
+    if (!read || failure.empty()) return first ? Availability::pending : tr.availability;
+    tr.retry_failure_at = now + 2000;
+    const std::string_view reason(failure);
+    if (reason.substr(0, 4) == "fxc " || reason.substr(0, 17) == "fxc.exe not found" || reason.substr(0, 4) == "dxc ")
+        return Availability::failed_to_load;
+    return Availability::refused;
+}
+
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt")) return;
+    if (!cache_path(path, L"", tr.key, L".txt")) {
+        note_translation_availability(tr, Translation::Availability::pending);
+        return;
+    }
     if (!lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, false)) {
+        note_translation_availability(tr, unpublished_translation(tr));
         if (!tr.retry_manifest_at) {
-            InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
@@ -556,7 +617,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     // The writer publishes this marker last. A malformed published result stays rejected.
-    const bool previously_missing = tr.retry_manifest_at != 0;
+    if (tr.retry_manifest_at) translation_failure_source().prefetch().forget(tr.key);
+    note_translation_availability(tr, Translation::Availability::failed_to_load);
     tr.retry_manifest_at = 0;
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
@@ -657,8 +719,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     tr.state = 1;
-    if (previously_missing) InterlockedDecrement(&translation_missing);
-    InterlockedIncrement(&translation_ready);
+    note_translation_availability(tr, Translation::Availability::ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
@@ -2171,51 +2232,55 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
-bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
+struct SrvReadinessFailure {
+    int index = 0;
+    const char* reason = nullptr;
+};
+
+bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32],
+                   SrvReadinessFailure& failure)
 {
     if (!tr.d16_srvs.any()) return true;
-    const auto refuse = [&](UINT slot, const char* reason, int detail) {
-        static LONG refused;
-        if (first_calls(refused, 6))
-            log("x2w-draw %016llx srv %u: d16 exact refused (%s %d)", tr.key, slot, reason, detail);
+    const auto refuse = [&](UINT slot, const char* reason) {
+        failure = {static_cast<int>(slot), reason};
         return false;
     };
     for (UINT i = 0; i < tr.srvs.size(); ++i) {
         if (!tr.d16_srvs.requires_exact(i)) continue;
         const Translation::Srv& srv = tr.srvs[i];
         if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
-            return refuse(i, "non-table texture binding", srv.kind);
+            return refuse(i, "non-table texture binding");
         const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
-            return refuse(i, "unreadable table entry", srv.a);
+            return refuse(i, "unreadable table entry");
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
-        if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
+        if (words[0] != view_token_magic) return refuse(i, "missing view token");
         ViewRecord record{};
         bool known = false;
         note_lock_acquire(false);
         known = words[1] < view_records().size();
         if (known) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
-        if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
+        if (!known || record.slot != 18) return refuse(i, "view slot");
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
         ID3D12Resource* texture = sampled_address_texture(resource);
-        if (!texture) return refuse(i, "missing texture resource", 0);
+        if (!texture) return refuse(i, "missing texture resource");
         if (x2w_startup::packed_stand_in_of(texture) != DXGI_FORMAT_UNKNOWN)
-            return refuse(i, "packed stand-in resource", static_cast<int>(x2w_startup::packed_stand_in_of(texture)));
+            return refuse(i, "packed stand-in resource");
         const D3D12_RESOURCE_DESC tex_desc = texture->GetDesc();
         if (srv.kind == 4 && (tex_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || tex_desc.DepthOrArraySize != 1))
-            return refuse(i, "1D resource mismatch", static_cast<int>(tex_desc.Dimension));
+            return refuse(i, "1D resource mismatch");
         const auto* original = resource_info(resource);
         DXGI_FORMAT effective = original ? original->console.Format : tex_desc.Format;
         if (record.desc_bytes >= 40) {
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             std::memcpy(&desc, record.desc, 40);
             if (desc.ViewDimension != dimension)
-                return refuse(i, "view dimension", static_cast<int>(desc.ViewDimension));
+                return refuse(i, "view dimension");
             if (desc.Format != DXGI_FORMAT_UNKNOWN) effective = desc.Format;
         } else if (record.desc_bytes == 0) {
             const bool dim_ok =
@@ -2223,13 +2288,13 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
                 (srv.kind == 2 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
                 (srv.kind == 3 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
                 (srv.kind == 4 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && tex_desc.DepthOrArraySize == 1);
-            if (!dim_ok) return refuse(i, "default view dimension", static_cast<int>(tex_desc.Dimension));
+            if (!dim_ok) return refuse(i, "default view dimension");
         } else {
-            return refuse(i, "truncated view desc", static_cast<int>(record.desc_bytes));
+            return refuse(i, "truncated view desc");
         }
         const auto mode = x2w_startup::d16_srv_mode(effective);
         if (mode == x2w_startup::D16SrvMode::refused)
-            return refuse(i, "format", static_cast<int>(effective));
+            return refuse(i, "view format is unsupported for exact 16-bit depth sampling");
         d16_unorm16[i] = mode == x2w_startup::D16SrvMode::unorm16 ? 1u : 0u;
     }
     return true;
@@ -2648,13 +2713,12 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
     return x2w_startup::descriptor_word3_refusal(words[3]);
 }
 
-bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
+bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32],
+                             SrvReadinessFailure& failure)
 {
-    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+    const auto refuse = [&](int slot, const char* reason) {
         InterlockedIncrement(&formatted_draws_refused);
-        static LONG refused;
-        if (first_calls(refused, 6))
-            log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
+        failure = {slot, reason};
         return false;
     };
     for (const auto& ud : tr.uds) {
@@ -2671,7 +2735,7 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
         std::uint32_t format = 0;
-        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason);
         descriptor.entry = entry;
     }
     return true;
@@ -2758,28 +2822,16 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
 }
 
 // Why draw_translated returned false: one counter per refusal site, the first few per site logged, all printed with the totals.
-static const char* const not_drawn_names[] = {
-    "state_not_ready",
-    "translation_or_d16_or_formatted_not_ready",
-    "missing_guest_root",
-    "live_compute_pipeline",
-    "writable_texture_indirect",
-    "unsupported_resource_or_entry",
-    "read_only_depth_write",
-    "pipeline_or_sampler_heap_unavailable",
-    "pixel_uav_unresolved",
-    "sampled_texture_mismatch",
-    "sampled_texture_unbindable",
-    "incomplete_vertex_or_table_buffer",
-    "formatted_buffer_too_large",
-    "formatted_buffer_unresolved",
-    "indexed_validation_failed",
-    "buffer_copy_failed",
-    "index_data_unavailable",
-};
-constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
-constexpr int index_data_unavailable_site = not_drawn_sites - 1;
+using x2w_startup::not_drawn_names;
+using x2w_startup::not_drawn_sites;
+using x2w_startup::translation_pending_site;
+using x2w_startup::translation_refused_site;
+using x2w_startup::translation_failed_to_load_site;
+using x2w_startup::d16_view_not_ready_site;
+using x2w_startup::formatted_buffer_not_ready_site;
+using x2w_startup::buffer_copy_failed_site;
+using x2w_startup::index_data_unavailable_site;
+
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -2794,7 +2846,14 @@ std::unordered_map<u64, NotDrawnKey>& not_drawn_keys()
     return keys;
 }
 thread_local u64 not_drawn_key = 0;  // set by draw_translated once the pipeline's translation is known
-static bool not_drawn(int site)
+struct SrvReadinessCount {
+    std::array<u64, 4> keys{};
+    std::size_t key_count = 0;
+    unsigned long long total = 0;
+};
+std::map<std::string_view, SrvReadinessCount> srv_readiness_counts; // not_drawn_key_lock held
+
+static bool not_drawn(int site, SrvReadinessFailure failure = {})
 {
     const LONG seen = InterlockedIncrement(&not_drawn_counts[site]);
     if (seen <= 3)
@@ -2803,7 +2862,19 @@ static bool not_drawn(int site)
     NotDrawnKey& entry = not_drawn_keys()[not_drawn_key];
     ++entry.total;
     ++entry.by_site[site];
+    bool report = false;
+    if (failure.reason) {
+        auto& count = srv_readiness_counts[failure.reason];
+        ++count.total;
+        const auto end = count.keys.begin() + count.key_count;
+        if (end != count.keys.end() && std::find(count.keys.begin(), end, not_drawn_key) == end) {
+            count.keys[count.key_count++] = not_drawn_key;
+            report = true;
+        }
+    }
     ReleaseSRWLockExclusive(&not_drawn_key_lock);
+    if (report)
+        log("x2w-draw %016llx srv %d not ready: %s", not_drawn_key, failure.index, failure.reason);
     return false;
 }
 // With the periodic totals (about every 60 s): the pipeline keys that were not drawn, most draws first, each with its
@@ -2842,11 +2913,20 @@ void log_not_drawn_keys()
 {
     for (const std::string& line : not_drawn_key_lines()) log("%s", line.c_str());
 }
-// Fixture export (startup_indirect_draw_indexed): the lines log_not_drawn_keys prints, '\n'-separated, as census_report does.
+std::string not_drawn_cause_line();
+
+// Fixture export: the renderer's per-key and per-cause lines, '\n'-separated, as census_report does.
 extern "C" __declspec(dllexport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity)
 {
     std::string text;
     for (const std::string& line : not_drawn_key_lines()) text += line + "\n";
+    text += not_drawn_cause_line() + "\n";
+    char totals[128];
+    draw_lock_acquire_exclusive();
+    format_translation_totals(totals);
+    draw_lock_release_exclusive();
+    text += std::string(totals) + "\n";
+    text += "untranslated draws " + std::to_string(InterlockedCompareExchange(&untranslated_draws, 0, 0)) + "\n";
     if (out && capacity) {
         const std::size_t n = text.size() < capacity - 1 ? text.size() : capacity - 1;
         std::memcpy(out, text.data(), n);
@@ -2854,13 +2934,28 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_not_drawn_keys_report(cha
     }
     return text.size();
 }
+std::string not_drawn_cause_line()
+{
+    std::string text = "x2w-render not drawn by cause:";
+    for (int i = 0; i < not_drawn_sites; ++i) {
+        const LONG count = InterlockedCompareExchange(&not_drawn_counts[i], 0, 0);
+        if (count) {
+            text += " ";
+            text += not_drawn_names[i];
+            text += " " + std::to_string(count) + ",";
+        }
+    }
+    return text;
+}
+
 void log_not_drawn_causes()
 {
-    char text[768];
-    int used = snprintf(text, sizeof(text), "x2w-render not drawn by cause:");
-    for (int i = 0; i < not_drawn_sites && used > 0 && used < static_cast<int>(sizeof(text)) - 80; ++i)
-        if (not_drawn_counts[i]) used += snprintf(text + used, sizeof(text) - used, " %s %ld,", not_drawn_names[i], not_drawn_counts[i]);
-    log("%s", text);
+    log("%s", not_drawn_cause_line().c_str());
+    AcquireSRWLockShared(&not_drawn_key_lock);
+    const auto counts = srv_readiness_counts;
+    ReleaseSRWLockShared(&not_drawn_key_lock);
+    for (const auto& [reason, count] : counts)
+        log("x2w-render srv not ready: %s: %llu draws", reason.data(), count.total);
     // Passes whose depth view has one plane read-only (list_targets binds them with per-plane states; they were refused before).
     if (render_target_mixed_dsv[1] || render_target_mixed_dsv[2])
         log("x2w-render OMSetRenderTargets with a depth view with one read-only plane: depth read-only %ld, stencil read-only %ld",
@@ -2904,15 +2999,28 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
     const bool translation_ok = tr && tr->state == 1;
-    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
-    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    SrvReadinessFailure srv_failure;
+    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16, srv_failure);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers, srv_failure);
     if (!formatted_ok) {
         if (indirect && tr)
             indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
                                      : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
+        const auto availability = tr ? tr->availability : Translation::Availability::pending;
         draw_lock_release_exclusive();
-        return not_drawn(1);
+        if (translation_ok) {
+#if defined(X2W_TEST_MUTATE_D16_DRAW_CAUSE)
+            const int d16_site = translation_refused_site;
+#else
+            const int d16_site = d16_view_not_ready_site;
+#endif
+            return not_drawn(d16_ok ? formatted_buffer_not_ready_site : d16_site, srv_failure);
+        }
+        using Availability = Translation::Availability;
+        if (availability == Availability::refused) return not_drawn(translation_refused_site);
+        if (availability == Availability::failed_to_load) return not_drawn(translation_failed_to_load_site);
+        return not_drawn(translation_pending_site);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {

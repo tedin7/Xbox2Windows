@@ -25,6 +25,8 @@ extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char*, std::size_t);
+
 struct ComputeRefusalStats {
     LONG64 holds, repeated_reads, background_reads;
     LONG untranslated;
@@ -908,5 +910,12 @@ int main(int argc, char** argv)
         release_placed_vertices(true);
         return rc;
     }
-    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word, two_targets);
+    const int rc = check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr,
+                                     format, export_word, two_targets);
+    if (!rc && GetEnvironmentVariableW(L"X2W_TEST_DRAW_CAUSE_REPORT", nullptr, 0)) {
+        std::string report(x2w_d3d12_not_drawn_keys_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_not_drawn_keys_report(report.data(), report.size());
+        std::fputs(report.c_str(), stdout);
+    }
+    return rc;
 }

@@ -630,6 +630,28 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
             failures.append("an unavailable DXGI budget hid the retained-texture sample or produced a ratio")
 
 
+def check_draw_readiness(failures: list[str]) -> None:
+    lines = [
+        "x2w-render not drawn by cause: translation_pending 3, d16_view_not_ready 2,",
+        "x2w-render not drawn by cause: translation_pending 4, translation_refused 1, "
+        "translation_failed_to_load 1, d16_view_not_ready 2, formatted_buffer_not_ready 3, private_reason 9,",
+        "x2w-render totals: draws 5, pipelines translated 1 / pending 3 / refused 0 / failed to load 0,",
+        "x2w-render totals: draws 9, pipelines translated 2 / pending 0 / refused 1 / failed to load 1,",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "stderr.txt"
+        log.write_text("\n".join(lines), encoding="utf-8")
+        report = triage_run.triage_run(log)
+        for name, count in (("translation_pending", 4), ("translation_refused", 1),
+                            ("translation_failed_to_load", 1), ("d16_view_not_ready", 2),
+                            ("formatted_buffer_not_ready", 3), ("translated", 2), ("pending", 0),
+                            ("refused", 1), ("failed to load", 1)):
+            if f"| {name} | {count} |" not in report:
+                failures.append(f"draw readiness report missing {name} = {count}")
+        if "private_reason" in report or "| pending | 3 |" in report:
+            failures.append("draw readiness reported an unknown reason or stale pipeline total")
+
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
@@ -640,6 +662,7 @@ def main() -> int:
     check_cli_invocation(failures)
     check_slot133_outcomes(failures)
     check_indirect_outcomes(failures)
+    check_draw_readiness(failures)
     check_gpu_memory_budget(failures)
     check_run_endpoint(failures)
     check_every_shader_reason_entry_is_reachable(failures)

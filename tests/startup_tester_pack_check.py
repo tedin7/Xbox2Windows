@@ -491,7 +491,8 @@ def check_request_files():
         write(cache, "req_2000000000000001.sa", b"T" * 500)
         write(cache, "req_2000000000000001.txt", b"not a request file")
         stderr = (b"x2w-render not drawn key 1000000000000002: 500 (translation_not_ready)\n"
-                  b"x2w-render not drawn key 1000000000000003: 900 (translation_not_ready)\n"
+                  b"x2w-render not drawn key 1000000000000003: 600 (translation_pending 600)\n"
+                  b"x2w-render not drawn key 1000000000000003: 900 (translation_refused 800, d16_view_not_ready 100)\n"
                   b"x2w-render not drawn key 0000000000000001: 99999 (an ok key is never picked)\n"
                   b"x2w-render compute census key 2000000000000001: 1000 dispatches, 100 translated, first refusal: x\n"
                   b"x2w-render compute census key 2000000000000001: 7000 dispatches, 100 translated, first refusal: x\n"
@@ -521,6 +522,8 @@ def check_request_files():
             assert listed["keys"] == 3 and listed["files"] == len(folder) and listed["folder"] == T.REQUESTS_DIR
             assert listed["bytes"] == sum(b for c in chosen for _, b in c[3]) <= T.REQUESTS_CAP_BYTES
             assert [r["key"] for r in listed["ranked"]] == [c[0] for c in chosen] and listed["ranked"][0]["weight"] == 6900
+            assert listed["ranked"][1]["readiness_causes"] == {"translation_refused": 800, "d16_view_not_ready": 100}
+            assert "readiness_causes" not in listed["ranked"][2]
         # no stderr or no counters: no request files, still a valid zip
         write(run, "stderr.txt", b"err\n")
         T.pack(str(run), MANIFEST, str(tmp / "none.zip"), cache_dir=str(cache))

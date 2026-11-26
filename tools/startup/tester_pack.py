@@ -465,7 +465,26 @@ REQUESTS_DIR = "shader_requests"
 REQUESTS_TOP = 40                   # keys
 REQUESTS_CAP_BYTES = 4 * 1024 * 1024  # all request files together, uncompressed; the zip must stay mailable
 REQUEST_PART_EXTS = (".a", ".b", ".root", ".ia", ".psin", ".desc", ".sa", ".sb", ".data", ".c67", ".ps57", ".m57", ".m86", ".rtv")
-NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)", re.M)
+NOT_DRAWN_KEY_RE = re.compile(r"^x2w-render not drawn key ([0-9a-f]{16}): (\d+)(?: \(([^\r\n)]*)\))?", re.M)
+DRAW_READINESS_CAUSE_RE = re.compile(
+    r"(translation_pending|translation_refused|translation_failed_to_load|d16_view_not_ready|"
+    r"formatted_buffer_not_ready) ([0-9]{1,10})"
+)
+
+
+def key_readiness_causes(stderr_text):
+    """Keep the displayed readiness buckets from each key's newest cumulative sample."""
+    snapshots = {}
+    for key, _, causes in NOT_DRAWN_KEY_RE.findall(stderr_text):
+        counts = {}
+        for item in causes.split(", "):
+            if match := DRAW_READINESS_CAUSE_RE.fullmatch(item):
+                name, count = match.groups()
+                counts[name] = int(count)
+        snapshots[key] = counts
+    return snapshots
+
+
 CENSUS_KEY_RE = re.compile(r"^x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated", re.M)
 
 
@@ -810,9 +829,12 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     if cache_dir:  # the request files of the worst refused keys (select_requests)
         stderr_path = os.path.join(logdir, "stderr.txt")
         weights = {}
+        readiness = {}
         if os.path.isfile(stderr_path):
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
-                weights = key_weights(handle.read())
+                stderr_text = handle.read()
+                weights = key_weights(stderr_text)
+                readiness = key_readiness_causes(stderr_text)
         chosen = select_requests(cache_dir, rows, weights, uses=key_use(logdir))
         for key, kind, weight, files_of_key, _missing in chosen:
             for name, _ in files_of_key:
@@ -820,7 +842,9 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                     add(REQUESTS_DIR + "/" + name, handle.read())
         manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
                                      "bytes": sum(b for c in chosen for _, b in c[3]),
-                                     "ranked": [{"key": k, "kind": kd, "weight": w, "missing_code_files": m} for k, kd, w, _, m in chosen]}
+                                     "ranked": [{"key": k, "kind": kd, "weight": w, "missing_code_files": m,
+                                                 **({"readiness_causes": readiness[k]} if readiness.get(k) else {})}
+                                                for k, kd, w, _, m in chosen]}
     texts = {}
     for name in ("stderr.txt", "timeline.txt"):
         path = os.path.join(logdir, name)

@@ -102,8 +102,9 @@ def check(directory, consumer, backend):
         raise AssertionError(f'actual {actual.hex()} expected {expected.hex()}')
 
     log_text = trap_log.read_text(errors='replace')
-    for expected_reason in ('(format 57)', '(format 58)', '(missing texture resource 0)', '(missing view token 0)'):
-        assert f'srv 0: d16 exact refused {expected_reason}' in log_text, (expected_reason, log_text)
+    for expected_reason in ('view format is unsupported for exact 16-bit depth sampling',
+                            'missing texture resource', 'missing view token'):
+        assert f'srv 0 not ready: {expected_reason}' in log_text, (expected_reason, log_text)
 
     # Negative control: a malformed d16srv manifest line must be rejected by load_translation (all draws skipped).
     bad_log = directory / 'bad_trap.log'
