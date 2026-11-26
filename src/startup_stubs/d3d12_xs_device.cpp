@@ -1580,6 +1580,19 @@ LONG64 arenas_recycled_early;  // arenas recycled before their allocator's Reset
 
 // X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse (fixtures only): the list upload pages are not reused before their
 // allocator's Reset, as before the reuse; startup_upload_page_reuse must then fail.
+// X2W_UPLOAD_PAGE_REUSE=1: list upload pages go to a free pool for the next recordings (at the allocator's Reset, or
+// once a retired recording's submits passed), and a destroyed list stops pinning its allocator. Off by default since
+// Run P (a movie drew white with it on; the suspect is a GPU read of the memory by a list of another allocator, which
+// that allocator's submits do not cover): the pages are then released at the allocator's Reset, as before.
+bool upload_page_reuse()
+{
+    static const bool on = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_UPLOAD_PAGE_REUSE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return on;
+}
+
 bool upload_reuse_mutant()
 {
     static const bool on = [] {
@@ -1603,7 +1616,8 @@ void retire_list_arena(Wrapper* list)
 // submits) goes back to the free pages.
 void recycle_arenas(DesktopAllocator& allocator)
 {
-    for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
+    if (upload_page_reuse())
+        for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
     allocator.uploads.clear();
 }
 
@@ -1612,7 +1626,7 @@ void recycle_arenas(DesktopAllocator& allocator)
 // finished on the GPU are recycled now.
 void reclaim_finished_arenas(DesktopAllocator& allocator)
 {
-    if (upload_reuse_mutant()) return;
+    if (!upload_page_reuse() || upload_reuse_mutant()) return;
     auto& arenas = allocator.uploads;
     for (auto it = arenas.begin(); it != arenas.end();) {
         if (!(*it)->finished()) {
@@ -1631,7 +1645,7 @@ void release_upload_recording(Wrapper* list)
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
     retire_list_arena(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
+    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
         if (found->second) --found->second->lists;
         list_recordings.erase(found);
     }
@@ -1676,7 +1690,7 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
                 state.list_uploads = found->second->uploads.back().get();
             }
             allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment,
-                                                          upload_reuse_mutant() ? nullptr : &free_upload_pages);
+                                                          !upload_page_reuse() || upload_reuse_mutant() ? nullptr : &free_upload_pages);
         } catch (const std::bad_alloc&) {
             // Refuse the allocation without invalidating any range already recorded.
         }
