@@ -164,6 +164,7 @@ struct IndirectGraphicsPipeline {
     bool cached_depth_writes{};
     const std::vector<RootParameter>* guest_root_params{};
     UINT cached_srv_root = UINT_MAX;
+    DXGI_FORMAT depth_only_format = DXGI_FORMAT_UNKNOWN;
 };
 
 // Why a resource is outside the retire class (X2W_D3D12_RELEASE_RETIRED), decided at creation, and why it left it later.
@@ -1547,7 +1548,7 @@ bool gpu_time_on()
 // OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
 LONG render_target_binds, render_target_unresolved;
 // OMSetRenderTargets refused for a depth stencil view with one read-only plane (depth read-only, stencil writable or the
-// reverse): nothing is bound, so every later draw of that pass is 'state_not_ready'. Counted by flags (index: DSV flags 0..3).
+// reverse): nothing is bound, so later translated draws of that pass report 'targets_not_bound'. Counted by flags (index: DSV flags 0..3).
 LONG render_target_mixed_dsv[4];
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
@@ -2492,7 +2493,24 @@ bool readable_shader_container(const D3D12_SHADER_BYTECODE& code)
         !std::memcmp(code.pShaderBytecode, "DXBC", 4);
 }
 
-bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage)
+bool draw_topologies_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_DRAW_TOPOLOGIES");
+    return enabled;
+}
+
+bool has_no_color_outputs(ID3D12ShaderReflection* shader, UINT outputs)
+{
+    for (UINT i = 0; i < outputs; ++i) {
+        D3D12_SIGNATURE_PARAMETER_DESC output{};
+        if (FAILED(shader->GetOutputParameterDesc(i, &output)) || output.SystemValueType == D3D_NAME_TARGET ||
+            (output.SemanticName && _stricmp(output.SemanticName, "SV_Target") == 0)) return false;
+    }
+    return true;
+}
+
+bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage,
+                                      bool* no_color_outputs)
 {
     if (!readable_shader_container(code)) return false;
     x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
@@ -2508,6 +2526,7 @@ bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_S
                 return false;
         }
     }
+    if (no_color_outputs) *no_color_outputs = has_no_color_outputs(shader.Get(), desc.OutputParameters);
     return true;
 }
 
@@ -2577,6 +2596,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     const Wrapper* root = nullptr;
     bool vertex = false, pixel = false, mesh = false, input_layout = false;
     bool amplification = false, console_mesh = false;
+    bool no_color_outputs = true;
+    const bool allow_depth_only = !cached_mesh && draw_topologies_enabled();
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
     D3D12_RT_FORMAT_ARRAY targets{};
     DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
@@ -2635,7 +2656,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
                 if ((mesh ? native_mesh_root : empty_root) && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
                     // The native PSO validates the DXIL stages against the empty root.
                     supported = mesh ? !is_vertex && readable_shader_container(*code)
-                        : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER);
+                        : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER,
+                            !is_vertex && allow_depth_only ? &no_color_outputs : nullptr);
                 }
                 if (!supported) {
                     std::snprintf(why, why_size, "stage %u has no translation or supported desktop binding", type);
@@ -2674,7 +2696,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             *format = desktop_format(*format);
             depth = *format;
-        } else if (cached_mesh && (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+        } else if ((cached_mesh || allow_depth_only) && (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
                                   type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)) {
             D3D12_DEPTH_STENCIL_DESC1 state{};
             const auto size = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ?
@@ -2696,10 +2718,12 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         std::snprintf(why, why_size, "cached mesh needs tracked color attachments or writable depth-only state");
         ok = false;
     }
+    const bool depth_only = allow_depth_only && !mesh && !targets.NumRenderTargets && no_color_outputs &&
+        depth != DXGI_FORMAT_UNKNOWN && depth_writes && !untracked_depth_state;
     if (ok && (vertex || pixel || mesh || amplification) &&
-        ((!vertex && !mesh) || (amplification && !mesh) || (!pixel && !cached_mesh) || compute || input_layout ||
+        ((!vertex && !mesh) || (amplification && !mesh) || (!pixel && !cached_mesh && !depth_only) || compute || input_layout ||
          topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
-         (!cached_mesh && (targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN ||
+         (!cached_mesh && !depth_only && (targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN ||
                            depth != DXGI_FORMAT_UNKNOWN)) ||
          samples.Count != 1 || samples.Quality)) {
         std::snprintf(why, why_size, "desktop indirect graphics stream needs VS/PS or MS/PS, triangles, one single-sample target and no vertex layout or depth");
@@ -2726,9 +2750,10 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     }
     if (pipeline && compute && root && root->own().kind == root_signature_kind)
         pipeline_root = static_cast<ID3D12RootSignature*>(root->own().real);
-    if (pipeline && (vertex || mesh) && (pixel || cached_mesh)) {
+    if (pipeline && (vertex || mesh) && (pixel || cached_mesh || depth_only)) {
         graphics = {cached_mesh ? cached_root : static_cast<ID3D12RootSignature*>(root->own().real),
             targets.RTFormats[0], mesh, cached_mesh};
+        if (depth_only) graphics.depth_only_format = depth;
         if (cached_mesh) {
             graphics.cached_target_count = targets.NumRenderTargets;
             std::copy_n(targets.RTFormats, targets.NumRenderTargets, graphics.cached_targets);
@@ -3155,6 +3180,39 @@ void reset_list_dynamic_state(Wrapper* self)
     pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
 }
 
+enum class DrawStateRefusal { no_list_or_pipeline, targets_not_bound, topology, indexed_rectangle, count };
+
+void log_refused_topology(UINT topology, DrawStateRefusal cause, bool indirect)
+{
+    struct Seen {
+        std::array<UINT, 8> values{};
+        std::size_t count = 0;
+    };
+    static std::mutex mutex;
+    static Seen seen[2][static_cast<unsigned>(DrawStateRefusal::count)];
+    {
+        const std::lock_guard guard(mutex);
+        auto& entry = seen[indirect][static_cast<unsigned>(cause)];
+        const auto end = entry.values.begin() + entry.count;
+        if (end == entry.values.end() || std::find(entry.values.begin(), end, topology) != end) return;
+        entry.values[entry.count++] = topology;
+    }
+    log("x2w-draw topology %u refused: %s", topology, indirect ? "indirect" : "direct");
+}
+
+void log_refused_targets(const Pass& pass)
+{
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = (u64{pass.target_count} << 33) | (u64{pass.targets_bound} << 32) | static_cast<UINT>(pass.dsv_format);
+    {
+        const std::lock_guard guard(mutex);
+        if (!seen.insert(key).second) return;
+    }
+    log("x2w-draw no_render_target targets_bound=%u target_count=%u depth_format=%u",
+        static_cast<UINT>(pass.targets_bound), pass.target_count, static_cast<UINT>(pass.dsv_format));
+}
+
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list: translated draws and indirect
 // non-indexed draws expand it to triangles; the topology is not forwarded as such.
 void __stdcall list_topology(Wrapper* self, UINT topology)
@@ -3465,7 +3523,7 @@ constexpr const char* depth_target_bound = "depth_target_bound";
 constexpr const char* missing_viewport_or_scissor = "missing_viewport_or_scissor";
 constexpr const char* target_format_mismatch = "target_format_mismatch";
 constexpr const char* rect_list_indexed = "rect_list_indexed";
-constexpr const char* unsupported_topology = "unsupported_topology";
+constexpr const char* topology = "topology";
 constexpr const char* multisample_target = "multisample_target";
 constexpr const char* compute_root_mismatch = "compute_root_mismatch";
 constexpr const char* dispatch_root_multi_command = "dispatch_root_multi_command";
@@ -3532,7 +3590,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
     auto* list = recording(self);
-    if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
+    if (!list) {
+        if (kind == IndirectCommand::draw || kind == IndirectCommand::draw_indexed)
+            log_refused_topology(pass_of(self).topology, DrawStateRefusal::no_list_or_pipeline, true);
+        return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
+    }
     if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
         const auto& pass = pass_of(self);
         if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
@@ -3612,6 +3674,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                     (!pass.pipeline || console_pipeline) ? "no translation" : "root mismatch";
                 note_indirect_graphics_refusal(key, graphics_kind, reason);
             }
+            if (!mesh && !pass.pipeline)
+                log_refused_topology(pass.topology, DrawStateRefusal::no_list_or_pipeline, true);
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
                           indirect_graphics_pipeline);
         }
@@ -3635,34 +3699,44 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 if ((pass.constant_words_bound[i] & mask) != mask)
                     return refuse("cached mesh root constants are incomplete", indirect_graphics_pipeline);
             }
-        } else if (translated) {
-            if (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN) ||
-                !pass.viewport_set || !pass.scissor_set) {
-                const char* code =
-                    (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN))
-                        ? indirect_other_refusal_code::no_render_target
-                        : indirect_other_refusal_code::missing_viewport_or_scissor;
-                return refuse("translated indirect draw requires bound target or depth view, viewport and scissor", indirect_other, code);
-            }
-            if (!pass.targets_single_sample)
+        } else {
+            const bool extended = draw_topologies_enabled();
+            const DXGI_FORMAT native_depth = pass.indirect_graphics.depth_only_format;
+            const bool native_depth_only = !translated && extended && native_depth != DXGI_FORMAT_UNKNOWN;
+            const bool has_depth = translated
+                ? pass.dsv_format != DXGI_FORMAT_UNKNOWN && (!extended || pass.depth_view_writable)
+                : native_depth_only && pass.dsv_format == native_depth && pass.depth_view_writable;
+            const bool target_missing = !pass.targets_bound ||
+                (!pass.target_count ? !has_depth : !translated && (!pass.target0 || native_depth_only));
+            const char* code = nullptr;
+            if (!translated && pass.target_count > 1) code = indirect_other_refusal_code::multiple_render_targets;
+            else if (target_missing) {
+                log_refused_targets(pass);
+                if (!mesh) log_refused_topology(pass.topology, DrawStateRefusal::targets_not_bound, true);
+                code = indirect_other_refusal_code::no_render_target;
+            } else if (!translated && !native_depth_only && pass.dsv_format != DXGI_FORMAT_UNKNOWN)
+                code = indirect_other_refusal_code::depth_target_bound;
+            else if (!pass.viewport_set || !pass.scissor_set)
+                code = indirect_other_refusal_code::missing_viewport_or_scissor;
+            else if (!translated && !native_depth_only && pass.target_formats[0] != pass.indirect_graphics.target_format)
+                code = indirect_other_refusal_code::target_format_mismatch;
+            if (code)
+                return refuse(translated ? "translated indirect draw requires bound target or depth view, viewport and scissor"
+                                         : "indirect graphics requires one matching target, viewport and scissor", indirect_other, code);
+            if ((translated || native_depth_only) && !pass.targets_single_sample)
                 return refuse("draw requires single-sample targets", indirect_other, indirect_other_refusal_code::multisample_target);
-        } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
-            (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
-            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set) {
-            const char* code =
-                pass.target_count > 1                                 ? indirect_other_refusal_code::multiple_render_targets
-                : (!pass.targets_bound || !pass.target_count || !pass.target0) ? indirect_other_refusal_code::no_render_target
-                : pass.dsv_format != DXGI_FORMAT_UNKNOWN              ? indirect_other_refusal_code::depth_target_bound
-                : (!pass.viewport_set || !pass.scissor_set)           ? indirect_other_refusal_code::missing_viewport_or_scissor
-                                                                      : indirect_other_refusal_code::target_format_mismatch;
-            return refuse("indirect graphics requires one matching target, viewport and scissor", indirect_other, code);
         }
         const bool rect_list = !mesh && pass.topology == 0x11;
-        if (rect_list && indexed && !translated)
+        if (rect_list && indexed && !translated) {
+            log_refused_topology(pass.topology, DrawStateRefusal::indexed_rectangle, true);
             return refuse("indirect rectangle list requires a non-indexed draw", indirect_other, indirect_other_refusal_code::rect_list_indexed);
-        if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            return refuse("indirect draw requires triangle-list or rectangle-list topology", indirect_other, indirect_other_refusal_code::unsupported_topology);
-        if (!pass.indirect_graphics.cached_mesh && !translated) {
+        }
+        const bool extended_topology = translated && draw_topologies_enabled() && pass.topology >= 1 && pass.topology <= 5;
+        if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !extended_topology) {
+            log_refused_topology(pass.topology, DrawStateRefusal::topology, true);
+            return refuse("unsupported indirect draw topology", indirect_other, indirect_other_refusal_code::topology);
+        }
+        if (!pass.indirect_graphics.cached_mesh && !translated && pass.target0) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);

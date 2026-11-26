@@ -13,6 +13,7 @@
 
 #include "startup_stream_draw.h"
 #include "../src/startup_stubs/packed_target_format.h"
+#include "startup_draw_topologies.h"
 #include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
@@ -413,6 +414,42 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 }
 }  // namespace
 
+
+static int check_direct_topologies(ID3D12Device* desktop, void* guest, void* pso, const char* pixels)
+{
+    using namespace draw_topology_fixture;
+    constexpr const Shape* cases[]{&strip, &lines, &line_strip, &points, &patch};
+    for (const auto* shape : cases) {
+        StreamTarget frame;
+        if (const int rc = open_stream_target(desktop, guest, pso, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 16, frame))
+            return rc;
+        invoke(frame.list, 20, shape->topology);
+        // The translated direct entry receives a zero-based vertex ID and the
+        // guest's first vertex in the fixture's start-instance root word.
+        invoke(frame.list, 12, shape->count, 1, 0, shape->first);
+        if (FAILED(static_cast<HRESULT>(invoke(frame.list, 9)))) return 24;
+        invoke(frame.queue, 10, 1, arg(&frame.list));
+        if (FAILED(static_cast<HRESULT>(invoke(frame.queue, 14, arg(frame.fence), 1)))) return 24;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(frame.fence, 8) < 1 && GetTickCount64() < deadline) Sleep(1);
+        if (invoke(frame.fence, 8) != 1) return 25;
+        if (const int rc = read_stream_target(desktop, frame, pixels)) return rc;
+        std::ifstream image(pixels, std::ios::binary);
+        for (UINT y = 0; y < 16; ++y) {
+            for (UINT x = 0; x < 16; ++x) {
+                const std::uint32_t expected = shape->rows[y] & (1u << x) ? 0xff0000ff : 0xffff0000;
+                std::uint32_t actual{};
+                if (!image.read(reinterpret_cast<char*>(&actual), sizeof(actual)) || actual != expected) {
+                    std::fprintf(stderr, "%s pixel (%u,%u): got %08x, expected %08x\n",
+                                 shape->label, x, y, actual, expected);
+                    return 78;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
@@ -429,6 +466,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_TOPOLOGIES", nullptr, 0))
+        return check_direct_topologies(desktop.Get(), guest, pso, pixels);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_HISTORY", nullptr, 0))
         return draw_pixel_history(desktop.Get(), guest, pso, pixels);
     Bc7Binding binding;

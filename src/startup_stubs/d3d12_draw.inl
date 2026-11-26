@@ -1220,6 +1220,9 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
 
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
 {
+    const auto topology_type = pass.topology == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+        : pass.topology == 2 || pass.topology == 3 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                                   : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
@@ -1229,6 +1232,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    if (draw_topologies_enabled()) key = fnv_bytes(&topology_type, sizeof(topology_type), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -1269,7 +1273,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         desc.RasterizerState.DepthClipEnable = TRUE;
     }
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.PrimitiveTopologyType = topology_type;
     desc.NumRenderTargets = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
     desc.DSVFormat = dsv_format;
@@ -2759,7 +2763,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
 
 // Why draw_translated returned false: one counter per refusal site, the first few per site logged, all printed with the totals.
 static const char* const not_drawn_names[] = {
-    "state_not_ready",
+    "no_list_or_pipeline",
     "translation_or_d16_or_formatted_not_ready",
     "missing_guest_root",
     "live_compute_pipeline",
@@ -2776,10 +2780,16 @@ static const char* const not_drawn_names[] = {
     "indexed_validation_failed",
     "buffer_copy_failed",
     "index_data_unavailable",
+    "targets_not_bound",
+    "topology",
+    "indexed_rectangle",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
-constexpr int index_data_unavailable_site = not_drawn_sites - 1;
+constexpr int buffer_copy_failed_site = 15;
+constexpr int index_data_unavailable_site = 16;
+constexpr int targets_not_bound_site = 17;
+constexpr int topology_site = 18;
+constexpr int indexed_rectangle_site = 19;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -2892,8 +2902,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
     const bool indexed_rect = rect && indexed && indirect;
-    if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
-        (rect && indexed && !indexed_rect)) return not_drawn(0);
+    const auto refuse_state = [&](DrawStateRefusal cause, int site) {
+        log_refused_topology(pass.topology, cause, indirect != nullptr);
+        return not_drawn(site);
+    };
+    if (!list || !pass.pipeline) return refuse_state(DrawStateRefusal::no_list_or_pipeline, 0);
+    if (!pass.targets_bound) return refuse_state(DrawStateRefusal::targets_not_bound, targets_not_bound_site);
+    const bool extended = draw_topologies_enabled() && pass.topology >= 1 && pass.topology <= 3;
+    if (!(rect || pass.topology == 4 || pass.topology == 5 || extended))
+        return refuse_state(DrawStateRefusal::topology, topology_site);
+    if (rect && indexed && !indexed_rect)
+        return refuse_state(DrawStateRefusal::indexed_rectangle, indexed_rectangle_site);
     draw_lock_acquire_exclusive();
     DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
@@ -3580,7 +3599,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
-    list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->IASetPrimitiveTopology(rect ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST : static_cast<D3D_PRIMITIVE_TOPOLOGY>(pass.topology));
     bool drawn = false;
     if (indirect) {
         follow_inputs();

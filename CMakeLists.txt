@@ -1719,6 +1719,11 @@ add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)
 target_include_directories(startup_indirect_draw_indexed PRIVATE src)
 target_link_libraries(startup_indirect_draw_indexed PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+add_test(NAME startup_indirect_topologies_warp COMMAND startup_indirect_draw_indexed warp topologies)
+add_test(NAME startup_indirect_topologies_off_warp COMMAND startup_indirect_draw_indexed warp topologies-off)
+set_tests_properties(startup_indirect_topologies_warp startup_indirect_topologies_off_warp PROPERTIES
+    ENVIRONMENT "X2W_TEST_TOPOLOGY_SHADER=${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_topologies.hlsl"
+    TIMEOUT 60)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_draw_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend})
     add_test(NAME startup_indirect_draw_${backend} COMMAND startup_indirect_draw_indexed ${backend} draw)
@@ -5070,6 +5075,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardware_adapter_filter_check.py"
         "$<TARGET_FILE:startup_indirect_dispatch>" hardware count)
     set_tests_properties(startup_indirect_dispatch_adapter_filter PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_stream_topologies_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+        "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
+        "$<TARGET_FILE:startup_stream_consumer>" topologies)
+    set_tests_properties(startup_stream_topologies_warp PROPERTIES TIMEOUT 100)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"

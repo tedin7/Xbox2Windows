@@ -90,6 +90,34 @@ def check(directory, consumer, backend):
     return 0
 
 
+def check_topologies(directory, consumer):
+    cache = directory / "cache"
+    cache.mkdir()
+    vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
+    vs.write_bytes(container(1))
+    ps.write_bytes(container(0))
+    args = [consumer, vs, ps, root]
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_SHADER_CACHE=str(cache), X2W_DRAW_TOPOLOGIES="1", X2W_TEST_DRAW_TOPOLOGIES="1")
+    subprocess.run(args, env=env, check=True, timeout=30)
+    key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+    source = Path(__file__).with_name("startup_draw_topologies.hlsl")
+    for stage, entry in (("vs", "direct_vertex"), ("ps", "solid_red")):
+        subprocess.run([gfx2hlsl.find_fxc(), "/nologo", "/T", f"{stage}_5_1", "/E", entry,
+                        "/Fo", cache / f"{key:016x}.{stage}.cso", source], check=True, timeout=20)
+    (cache / f"{key:016x}.txt").write_text(
+        "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 startinstance\nparams 0\ntargets 0\n")
+    run = subprocess.run(args + ["warp", output], env=env, capture_output=True, text=True, timeout=40)
+    assert run.returncode == 0, run.stderr
+    assert "x2w-draw topology 33 refused: direct" in run.stderr, run.stderr
+    assert "x2w-draw not drawn: topology" in run.stderr, run.stderr
+    creations = run.stderr.count(f"x2w-draw desktop pipeline for {key:016x},")
+    assert creations == 3, f"expected triangle, line, and point PSOs, saw {creations}\n{run.stderr}"
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp:
-        sys.exit(check(Path(temp), *sys.argv[1:]))
+        if sys.argv[2:] == ["topologies"]:
+            check_topologies(Path(temp), sys.argv[1])
+        else:
+            sys.exit(check(Path(temp), *sys.argv[1:]))

@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include "desktop_gpu.h"
+#include "startup_draw_topologies.h"
 #include "xmem_section_lease.h"
 #include "startup_stubs/rect_indirect_args.h"
 #include "startup_indirect_mesh_mesh.h"
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1378,6 +1380,237 @@ bool check_translated_refusal_census(const std::wstring& log_path)
     return true;
 }
 
+ComPtr<ID3DBlob> compile_topology_shader(const wchar_t* path, const char* entry, const char* profile)
+{
+    ComPtr<ID3DBlob> shader, errors;
+    const HRESULT hr = D3DCompileFromFile(path, nullptr, nullptr, entry, profile, 0, 0, &shader, &errors);
+    if (FAILED(hr) && errors)
+        std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
+    check(hr, entry);
+    return shader;
+}
+
+bool check_indirect_topologies(ID3D12Device* device, ID3D12Device* guest, bool enabled, const std::wstring& log_path)
+{
+    using namespace draw_topology_fixture;
+    wchar_t source[MAX_PATH]{};
+    const DWORD source_size = GetEnvironmentVariableW(L"X2W_TEST_TOPOLOGY_SHADER", source, MAX_PATH);
+    check(source_size && source_size < MAX_PATH ? S_OK : E_FAIL, "find topology fixture shader");
+    check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable translated indirect test");
+    check(SetEnvironmentVariableA("X2W_DRAW_TOPOLOGIES", enabled ? "1" : "0") ? S_OK : E_FAIL, "set topology test switch");
+
+    const auto cache = std::filesystem::current_path() / ("indirect-topologies-" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directory(cache);
+    check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set topology fixture cache");
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants = {0, 0, 1};
+    const D3D12_ROOT_SIGNATURE_DESC guest_root_desc{1, &parameter};
+    ComPtr<ID3DBlob> root_blob;
+    const auto translated_root = create_root(guest, guest_root_desc, &root_blob);
+    const D3D12_ROOT_SIGNATURE_DESC native_root_desc{};
+    const auto native_root = create_root(guest, native_root_desc);
+    const auto vertex = compile_topology_shader(source, "indirect_vertex", "vs_5_1");
+    const auto line_vertex = compile_topology_shader(source, "indirect_line_strip_vertex", "vs_5_1");
+    const auto depth_vertex = compile_topology_shader(source, "depth_vertex", "vs_5_1");
+    const auto pixel = compile_topology_shader(source, "solid_red", "ps_5_1");
+    const auto depth_pixel = compile_topology_shader(source, "solid_depth", "ps_5_1");
+    const auto bytecode = [](ID3DBlob* blob) -> D3D12_SHADER_BYTECODE {
+        return {blob->GetBufferPointer(), blob->GetBufferSize()};
+    };
+    const auto make_pso = [&](ID3DBlob* vs, ID3DBlob* ps, bool depth, bool translated) {
+        if (translated) {
+            // The nonempty guest root selects the translated stream path. Publish
+            // these source-built shader objects under that stream's cache key.
+            constexpr char revision[] = "x2w-startup-shader-28";
+            std::uint64_t key = 1469598103934665603ull;
+            for (const auto& bytes : {D3D12_SHADER_BYTECODE{revision, sizeof(revision) - 1},
+                                     bytecode(vs), bytecode(ps), bytecode(root_blob.Get())}) {
+                const auto* data = static_cast<const unsigned char*>(bytes.pShaderBytecode);
+                for (std::size_t i = 0; i < bytes.BytecodeLength; ++i)
+                    key = (key ^ data[i]) * 1099511628211ull;
+            }
+            char stem[32]{};
+            std::snprintf(stem, sizeof(stem), "%016llx", static_cast<unsigned long long>(key));
+            const auto write = [&](const char* suffix, const void* data, std::size_t size) {
+                std::ofstream file(cache / (std::string(stem) + suffix), std::ios::binary);
+                file.write(static_cast<const char*>(data), size);
+                check(file.good() ? S_OK : E_FAIL, "publish topology fixture cache");
+            };
+            write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
+            write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
+            const std::string manifest = std::string("x2w-manifest 1\nud 1\nudsrc 0 rect\nparams 0\ntargets") +
+                (depth ? "\n" : " 0\n");
+            write(".txt", manifest.data(), manifest.size());
+        }
+        return guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(guest,
+            translated ? translated_root.Get() : native_root.Get(), bytecode(vs), bytecode(ps), {},
+            depth ? 0 : 1, depth ? StreamDepth::writable : StreamDepth::none);
+    };
+    const auto pso = make_pso(vertex.Get(), pixel.Get(), false, true);
+    const auto line_pso = make_pso(line_vertex.Get(), pixel.Get(), false, true);
+
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create topology draw signature");
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(guest->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create topology guest queue");
+    const auto native_queue = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create topology fence");
+    UINT64 submitted = 0;
+
+    const auto run_case = [&](const Shape& shape, IUnknown* pipeline, bool visible, bool depth, bool translated, bool bind_color = true) {
+        constexpr UINT size = 16;
+        const D3D12_DRAW_ARGUMENTS draw{shape.count, 1, 0, 0};
+        PlacedBuffer args(device, guest, sizeof(draw), D3D12_RESOURCE_FLAG_NONE);
+        const auto upload = make_buffer(device, sizeof(draw), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* memory = nullptr;
+        const D3D12_RANGE none{};
+        check(upload->Map(0, &none, &memory), "map topology argument upload");
+        std::memcpy(memory, &draw, sizeof(draw));
+        upload->Unmap(0, nullptr);
+
+        const D3D12_RESOURCE_DESC color_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, format, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        const D3D12_CLEAR_VALUE color_clear{format, {0, 0, 0, 1}};
+        const auto color = resource(device, color_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &color_clear);
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        ComPtr<ID3D12DescriptorHeap> rtv_heap;
+        check(guest->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap)), "create topology RTV heap");
+        using GetCpu = UINT64(WINAPI*)(IUnknown*, void*);
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv{slot<GetCpu>(rtv_heap.Get(), 9)(rtv_heap.Get(), nullptr)};
+        guest->CreateRenderTargetView(color.Get(), nullptr, rtv);
+
+        ComPtr<ID3D12Resource> depth_target;
+        ComPtr<ID3D12DescriptorHeap> dsv_heap;
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{}, native_dsv{};
+        if (depth) {
+            auto desc = color_desc;
+            desc.Format = DXGI_FORMAT_D16_UNORM;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE clear{};
+            clear.Format = desc.Format;
+            clear.DepthStencil.Depth = 1.0f;
+            depth_target = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &clear);
+            const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+            check(guest->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&dsv_heap)), "create topology DSV heap");
+            dsv.ptr = slot<GetCpu>(dsv_heap.Get(), 9)(dsv_heap.Get(), nullptr);
+            native_dsv = native_object<ID3D12DescriptorHeap>(device, guest, dsv_heap.Get())->GetCPUDescriptorHandleForHeapStart();
+            const D3D12_DEPTH_STENCIL_VIEW_DESC view{desc.Format, D3D12_DSV_DIMENSION_TEXTURE2D};
+            guest->CreateDepthStencilView(depth_target.Get(), &view, dsv);
+        }
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create topology allocator");
+        const auto wrapped = begin_guest_list(guest, allocator.Get());
+        auto* w = wrapped.Get();
+        const auto list = native_object<ID3D12GraphicsCommandList>(device, guest, w);
+        transition(list.Get(), args.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(args.native.Get(), 0, upload.Get(), 0, sizeof(draw));
+        transition(list.Get(), args.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        slot<void(WINAPI*)(IUnknown*, SIZE_T, const float*, UINT, const D3D12_RECT*)>(w, 52)(w, rtv.ptr, color_clear.Color, 0, nullptr);
+        slot<void(WINAPI*)(IUnknown*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*)>(w, 50)(
+            w, !depth && bind_color ? 1 : 0, !depth && bind_color ? &rtv : nullptr, FALSE, depth ? &dsv : nullptr);
+        if (depth) list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        const D3D12_VIEWPORT viewport{0, 0, size, size, 0, 1};
+        const D3D12_RECT scissor{0, 0, size, size};
+        using Bind = void(WINAPI*)(IUnknown*, IUnknown*);
+        slot<Bind>(w, 25)(w, pipeline);
+        slot<Bind>(w, 34)(w, translated ? translated_root.Get() : native_root.Get());
+        slot<void(WINAPI*)(IUnknown*, UINT, const D3D12_VIEWPORT*)>(w, 21)(w, 1, &viewport);
+        slot<void(WINAPI*)(IUnknown*, UINT, const D3D12_RECT*)>(w, 22)(w, 1, &scissor);
+        slot<void(WINAPI*)(IUnknown*, D3D12_PRIMITIVE_TOPOLOGY)>(w, 20)(w, shape.topology);
+        const auto execute = slot<void(WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64)>(w, 61);
+        execute(w, signature.Get(), 1, args.wrapped.Get(), 0, nullptr, 0);
+        if (!bind_color) execute(w, signature.Get(), 1, args.wrapped.Get(), 0, nullptr, 0);
+        check(slot<HRESULT(WINAPI*)(IUnknown*)>(w, 9)(w), "close topology guest list");
+        slot<void(WINAPI*)(IUnknown*, UINT, IUnknown* const*)>(queue.Get(), 10)(queue.Get(), 1, &w);
+        check(native_queue->Signal(fence.Get(), ++submitted), "signal topology queue");
+        check(fence->SetEventOnCompletion(submitted, nullptr), "wait for topology queue");
+        check(device->GetDeviceRemovedReason(), "topology draw completion");
+
+        const auto read = [&](ID3D12Resource* target, bool is_depth) {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            const auto desc = target->GetDesc();
+            UINT64 bytes = 0;
+            device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+            const auto download = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            transition(copy.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION src{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION dst{download.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            dst.PlacedFootprint = footprint;
+            copy.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            copy.submit_and_wait(device);
+            const D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
+            check(download->Map(0, &range, &memory), "map topology readback");
+            bool ok = true;
+            const UINT pixel_bytes = is_depth ? 2 : 4;
+            for (UINT y = 0; y < size && ok; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    const std::uint32_t expected = is_depth ? 0x4000u
+                        : !depth && visible && (shape.rows[y] & (1u << x)) ? red : black;
+                    std::uint32_t actual{};
+                    std::memcpy(&actual, static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes, pixel_bytes);
+                    if (actual != expected) {
+                        std::fprintf(stderr, "%s pixel (%u,%u): got %08x, expected %08x\n",
+                                     shape.label, x, y, actual, expected);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            download->Unmap(0, &none);
+            return ok;
+        };
+        return read(color.Get(), false) && (!depth || read(depth_target.Get(), true));
+    };
+
+    // The strip and the following line list bind the same guest PSO and format.
+    if (!run_case(strip, pso.Get(), enabled, false, true)) return false;
+    if (enabled) {
+        if (!run_case(lines, pso.Get(), true, false, true) ||
+            !run_case(line_strip, line_pso.Get(), true, false, true) ||
+            !run_case(points, pso.Get(), true, false, true) ||
+            !run_case(patch, pso.Get(), false, false, true)) return false;
+        constexpr Shape depth_case{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3, 0, "depth-only", {}};
+        for (bool translated : {true, false}) {
+            const auto depth_pso = make_pso(depth_vertex.Get(), depth_pixel.Get(), true, translated);
+            if (!run_case(depth_case, depth_pso.Get(), true, true, translated)) return false;
+        }
+    }
+    constexpr Shape no_targets{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3, 0, "no targets", {}};
+    if (!run_case(no_targets, pso.Get(), false, false, true, false)) return false;
+    std::ifstream log(log_path, std::ios::binary);
+    const std::string contents{std::istreambuf_iterator<char>(log), std::istreambuf_iterator<char>()};
+    const char* wanted = enabled ? "x2w-draw topology 33 refused: indirect" : "x2w-draw topology 5 refused: indirect";
+    constexpr std::string_view target_log = "x2w-draw no_render_target targets_bound=1 target_count=0 depth_format=0";
+    const auto first_target_log = contents.find(target_log);
+    if (first_target_log == std::string::npos || contents.find(target_log, first_target_log + 1) != std::string::npos) {
+        std::fputs("expected one diagnostic for two draws with the same empty target binding\n", stderr);
+        return false;
+    }
+    constexpr std::string_view pipeline_log = "x2w-draw desktop pipeline for ";
+    unsigned pipelines = 0;
+    for (std::size_t pos = contents.find(pipeline_log); pos != std::string::npos;
+         pos = contents.find(pipeline_log, pos + pipeline_log.size())) ++pipelines;
+    // Three topology types on pso, one on line_pso, and one translated depth PSO.
+    if (pipelines != (enabled ? 5u : 0u)) {
+        std::fprintf(stderr, "unexpected translated topology PSO count: %u\n", pipelines);
+        return false;
+    }
+    if (contents.find(wanted) == std::string::npos || contents.find("[topology]") == std::string::npos) {
+        std::fprintf(stderr, "missing topology refusal diagnostic: %s\n", wanted);
+        return false;
+    }
+    std::filesystem::remove_all(cache);
+    return true;
+}
+
 bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root,
                               ID3D12PipelineState* writer, ID3D12RootSignature* title_root, IUnknown* pso,
                               ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding)
@@ -1768,6 +2001,9 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool topology_on = argc == 3 && std::strcmp(argv[2], "topologies") == 0;
+    const bool topology_off = argc == 3 && std::strcmp(argv[2], "topologies-off") == 0;
+    const bool topology_fixture = topology_on || topology_off;
     const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
@@ -1781,7 +2017,7 @@ int main(int argc, char** argv) try
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    if (topology_fixture || (translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
@@ -1821,7 +2057,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
+    if (topology_fixture || indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1845,6 +2081,11 @@ int main(int argc, char** argv) try
     check(SetEnvironmentVariableA("X2W_D3D12_RENDER", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable recording");
     const std::array<unsigned char, 64> parameters{};
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
+    if (topology_fixture) {
+        const bool ok = check_indirect_topologies(device.Get(), guest.Get(), topology_on, log_path);
+        DeleteFileW(log_path.c_str());
+        return ok ? 0 : 1;
+    }
     if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");

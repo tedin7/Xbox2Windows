@@ -1,0 +1,10 @@
+--- a/src/startup_stubs/d3d12_draw.inl
++++ b/src/startup_stubs/d3d12_draw.inl
+@@ -1232,7 +1232,6 @@
+     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
+     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+-    if (draw_topologies_enabled()) key = fnv_bytes(&topology_type, sizeof(topology_type), key);
+     const auto found = bound.pipelines.find(key);
+     if (found != bound.pipelines.end()) return found->second;
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
