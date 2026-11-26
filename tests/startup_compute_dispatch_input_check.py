@@ -53,6 +53,23 @@ def walk_reference(threads, rounds):
     ]
 
 
+def describe_difference(name, got, want, rounds=500, lanes=8):
+    """Where two readbacks differ: count per list, first bad (list, round, lane) and its values."""
+    if got == want:
+        return ''
+    words = min(len(got), len(want)) // 4
+    a = struct.unpack(f'<{words}I', got[:words * 4])
+    b = struct.unpack(f'<{words}I', want[:words * 4])
+    bad = [i for i in range(words) if a[i] != b[i]]
+    per_list = {}
+    for i in bad:
+        per_list[i // (rounds * lanes)] = per_list.get(i // (rounds * lanes), 0) + 1
+    i = bad[0] if bad else 0
+    return (f'{name}: sizes {len(got)}/{len(want)}, {len(bad)} words differ, per list {per_list}, first at list '
+            f'{i // (rounds * lanes)} round {i % (rounds * lanes) // lanes} lane {i % lanes}: '
+            f'{a[i] if bad else 0:#x} vs {b[i] if bad else 0:#x}')
+
+
 def check_shared_walk(directory, cache, env, key, consumer, dxc):
     # Use an original desktop artifact under the synthetic request's key. This isolates
     # the stand-in's binding and recording from the instruction translator.
@@ -97,7 +114,9 @@ def check_shared_walk(directory, cache, env, key, consumer, dxc):
     assert lines(result, f'{key:016x}: 2000 dispatches, 2000 translated'), result.stderr[-5000:]
     off, baseline = run('parallel', False)
     on, parallel = run('parallel', True)
-    assert off == on == serial, 'parallel readback differs from the CPU reference or switch-OFF control'
+    assert off == on == serial, ('parallel readback differs from the CPU reference or switch-OFF control: '
+                                 + describe_difference('off vs serial', off, serial) + ' | '
+                                 + describe_difference('on vs serial', on, serial))
     for result in (baseline, parallel):
         assert lines(result, f'{key:016x}: 2000 dispatches, 2000 translated'), result.stderr[-5000:]
         assert not lines(result, ' refused:'), result.stderr[-5000:]
