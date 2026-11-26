@@ -176,7 +176,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     if real_log_error:
-        for name in ("debug_launch.py", "launch.py", "host_cpu.py", "window_capture.py", "commit_headroom.py", "hook_window.py"):
+        for name in ("debug_launch.py", "launch.py", "host_cpu.py", "window_capture.py", "commit_headroom.py", "hook_window.py",
+                     "log_tail.py"):
             shutil.copyfile(RUN_PS1.parent / name, startup / name)
     else:
         (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit, emit_stderr=emit_stderr), encoding="utf-8")
