@@ -19,20 +19,22 @@ Each merge into this branch is a merge commit that names the heads it took. Both
 From a PowerShell in the checkout, with the title's executable folder prepared as for `run.ps1`:
 
 ```powershell
-.\tools\startup\tester_run.ps1 -Exe <path to the exe> -DataDir <package root> -Seconds 420 -Input menus -CaptureEvery 15
+.\tools\startup\tester_run.ps1 -Exe <path to the exe> -DataDir <package root> -Seconds 600 -Input menus -CaptureEvery 15
 ```
 
 What it does:
 
 1. Checks that the build in `out/build/release` was made from this checkout's current commit and builds when it was
    not (`-NoBuild` stops with a message instead).
-2. Moves the old shader cache aside (`shader_cache.old-<time>`, through `run.ps1 -FreshShaderCache`) and starts with an empty one.
+2. Uses one shader cache folder per commit, `out/startup/shader_cache_<commit>`: kept across runs at the same commit,
+   a new empty one when the commit changes. The `--watch` translator needs minutes to catch up, so emptying the
+   cache on every run would leave pipelines untranslated and the screen black.
 3. Runs `run.ps1 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000` with `X2W_D3D12_BUDGET=1`.
-4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size and when the title first
-   polled the pad.
+4. Writes `out/tester/report_<commit>_<yyyymmdd-hhmm>.zip` and prints its path, its size, how many translations were
+   already in the shader cache at start, and when the title first polled the pad.
 
-`-Input menus` presses D-pad down, D-pad down, A, one press every 6 s, starting 5 s after the first pad poll. The input
-script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 420).
+`-Input menus` presses D-pad down, D-pad down, A, one press every 6 s, starting 5 s after the first pad poll and up to 500 s. The input
+script clock starts at that poll, which the title reaches late, so give the run enough seconds (the default is 600).
 Any other `-Input` value is a raw `X2W_INPUT_SCRIPT`.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.

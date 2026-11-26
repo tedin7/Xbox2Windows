@@ -2,6 +2,7 @@
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
   tester_pack.py input-preset <menus|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
   tester_pack.py pack <logdir> <manifest_in.json> <zip> [--limit-mb N]   write the zip, print its path and size
 
@@ -22,12 +23,13 @@ MAX_ENTRIES = 256          # X2W_INPUT_SCRIPT accepts at most 256 timed entries
 MAX_SCRIPT_CHARS = 4095
 MENUS_START_S = 5          # script time counts from the first pad poll (the default time base), not from process start
 MENUS_STEP_S = 6
+MENUS_END_S = 500          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
 BUTTON_A = "4"
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
 SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
-                 "windows_build", "wall_seconds", "deep")
+                 "windows_build", "wall_seconds", "deep", "shader_cache", "translations_at_start")
 DEFAULT_LIMIT_MB = 20
 MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip bookkeeping
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
@@ -35,7 +37,7 @@ CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered p
 
 def input_preset(spec, seconds):
     """`menus` is D-pad down, D-pad down, A, one press every 6 s from 5 s after the first pad poll; entries run to
-    `seconds` of script time (the poll comes late, so most are never reached), at most 256. Anything else is a raw script."""
+    `seconds` of script time, but not past 500 s, at most 256 entries. Anything else is a raw script."""
     if spec != "menus":
         if len(spec) > MAX_SCRIPT_CHARS:
             raise ValueError("input script longer than %d characters" % MAX_SCRIPT_CHARS)
@@ -44,7 +46,7 @@ def input_preset(spec, seconds):
         return spec
     items = []
     press, at = 0, MENUS_START_S
-    while at < seconds and len(items) < MAX_ENTRIES:
+    while at < min(seconds, MENUS_END_S) and len(items) < MAX_ENTRIES:
         items.append("%s@%d" % (BUTTON_A if press % 3 == 2 else DPAD_DOWN, at))
         press += 1
         at += MENUS_STEP_S
@@ -59,6 +61,25 @@ def validate_manifest(manifest):
         if not key.startswith("X2W_"):
             raise ValueError("manifest env holds a non X2W_ variable: " + key)
     return manifest
+
+
+READY_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:ms57\.)?txt$")
+REQUEST_RE = re.compile(r"^req_[0-9a-f]{16}\.(?:a|rtv|c67|m57)$")
+
+
+def cache_stats(cache_dir):
+    """(translations ready, requests, failures) in a shader cache folder: a request is translated once its
+    ready marker req_<key>.txt (or .ms57.txt for a mesh pipeline) is published."""
+    ready = requests = failed = 0
+    if os.path.isdir(cache_dir):
+        for name in os.listdir(cache_dir):
+            if READY_RE.match(name):
+                ready += 1
+            elif REQUEST_RE.match(name):
+                requests += 1
+            elif name.endswith(".fail"):
+                failed += 1
+    return ready, requests, failed
 
 
 def log_files(logdir):
@@ -145,6 +166,8 @@ def main(argv):
     p = sub.add_parser("input-preset")
     p.add_argument("spec")
     p.add_argument("seconds", type=int)
+    c = sub.add_parser("cache-stats")
+    c.add_argument("cache")
     f = sub.add_parser("first-poll")
     f.add_argument("logdir")
     q = sub.add_parser("pack")
@@ -155,6 +178,9 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.cmd == "input-preset":
         print(input_preset(args.spec, args.seconds))
+        return 0
+    if args.cmd == "cache-stats":
+        print("%d %d %d" % cache_stats(args.cache))
         return 0
     if args.cmd == "first-poll":
         poll = first_poll(args.logdir)

@@ -17,7 +17,8 @@ import tester_pack as T  # noqa: E402
 
 MANIFEST = {"commit": "abcdef12", "build_commit": "abcdef12", "dirty": False, "seconds": 300,
             "input_script": "4@70", "env": {"X2W_D3D12_BUDGET": "1"}, "gpu": "GPU", "gpu_driver": "1.0",
-            "windows_build": "26100", "wall_seconds": 305.5, "deep": False}
+            "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "shader_cache": "shader_cache_abcdef12",
+            "translations_at_start": 0}
 
 
 def write(folder, name, data):
@@ -33,9 +34,11 @@ def check_preset():
     assert [i.split("@")[0] for i in items[:6]] == ["80", "80", "4", "80", "80", "4"]
     assert T.input_preset("menus", 5) == "", "no entry before the start second"
     assert T.input_preset("menus", 420).count(",") + 1 == 70
+    long_menus = T.input_preset("menus", 600).split(",")
+    assert [int(i.split("@")[1]) for i in long_menus] == list(range(5, 500, 6)), "the menus preset stops at 500 s"
+    assert len(long_menus) <= T.MAX_ENTRIES
     long_run = T.input_preset("menus", 100000).split(",")
-    assert len(long_run) == T.MAX_ENTRIES, len(long_run)
-    assert len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    assert len(long_run) == len(range(5, 500, 6)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"
     for bad in ("4@1," * 300, "x" * 5000):
         try:
@@ -131,6 +134,17 @@ def check_zip():
         assert b"".join(pieces[n] for n in sorted(pieces)) == big
 
 
+def check_cache_stats():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        assert T.cache_stats(str(tmp / "missing")) == (0, 0, 0)
+        for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_0123456789abcdef.cs.cso",
+                     "req_1123456789abcdef.a", "req_1123456789abcdef.fail", "req_2123456789abcdef.m57",
+                     "req_2123456789abcdef.ms57.txt", "req_3123456789abcdef.c67", "revision.txt", "notes.txt"):
+            write(tmp, name, b"x")
+        assert T.cache_stats(str(tmp)) == (2, 4, 1), T.cache_stats(str(tmp))
+
+
 def check_first_poll():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -158,5 +172,6 @@ if __name__ == "__main__":
     check_preset()
     check_manifest()
     check_first_poll()
+    check_cache_stats()
     check_zip()
     print("startup_tester_pack_check: preset, manifest and zip checks pass")

@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
-One command for a tester: check the build, run the title offline with a fresh shader cache, mail-sized zip at the end.
+One command for a tester: check the build, run the title offline with a per-commit shader cache, mail-sized zip at the end.
 
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
    into generated\x2w_build_rev.cpp). If not, it builds (cmake --build) or, with -NoBuild, stops with a message.
-2. Moves the old shader cache aside and starts with an empty one (run.ps1 -FreshShaderCache).
+2. Uses one shader cache folder per commit (out\startup\shader_cache_<commit>): kept across runs at the same commit,
+   new when the commit changes. The --watch translator needs minutes to catch up, so an emptied cache would leave
+   pipelines untranslated and the screen black. The summary says how many translations were present at start.
 3. Runs run.ps1 with -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 and X2W_D3D12_BUDGET=1,
    the input script and, when run.ps1 knows it, the capture interval.
 4. Packs report_<commit>_<yyyymmdd-hhmm>.zip with EVERY file the run wrote in its log folder (stdout, stderr, events,
@@ -16,22 +18,22 @@ One command for a tester: check the build, run the title offline with a fresh sh
 
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
 
--Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll (input script
-time counts from that poll, which the title reaches late: about 150 s after start in one tester run). Any other value is a raw
+-Input menus: D-pad down, D-pad down, A, one press every 6 s starting 5 s after the first pad poll, up to 500 s (input script
+time counts from that poll, which the title reaches late). Any other value is a raw
 X2W_INPUT_SCRIPT (docs/startup-runtime.md, "Input script").
 
 .EXAMPLE
-.\tools\startup\tester_run.ps1 -Exe D:\run\title.exe -DataDir G:\ -Seconds 420 -Input menus -CaptureEvery 15
+.\tools\startup\tester_run.ps1 -Exe D:\run\title.exe -DataDir G:\ -Seconds 600 -Input menus -CaptureEvery 15
 #>
 param(
     [Parameter(Mandatory)] [string]$Exe,
     [Parameter(Mandatory)] [string]$DataDir,
-    [int]$Seconds = 420,
+    [int]$Seconds = 600,
     [Alias("Input")] [string]$InputMode = "menus",   # $Input is a PowerShell automatic variable: the parameter is -InputMode, -Input is its alias
     [int]$CaptureEvery = 15,                    # seconds between window captures; 0 = only the final window.png
     [string]$BuildDir = "out/build/release",
     [string]$OutDir = "out/tester",
-    [string]$ShaderCache = "out/startup/shader_cache",
+    [string]$ShaderCacheRoot = "out/startup",     # one folder per commit inside: shader_cache_<commit>
     [int]$LimitMB = 20,
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep                               # also -TraceCalls and -TraceApi: slower, more detailed
@@ -73,20 +75,18 @@ if ($built -ne $wanted) {
     }
 }
 
-# A fresh shader cache: run.ps1 -FreshShaderCache moves a cache that is not empty aside (shader_cache.old-<time>).
-# An older run.ps1 without that switch gets the same move from here.
-$cache = if ([System.IO.Path]::IsPathRooted($ShaderCache)) { $ShaderCache } else { Join-Path $repo $ShaderCache }
+# One shader cache folder per commit, kept across runs at the same commit and fresh when the commit changes: the
+# --watch translator needs minutes to catch up, so an emptied cache leaves pipelines untranslated (a black screen).
 $runScript = Join-Path $PSScriptRoot "run.ps1"
 $runParams = (Get-Command $runScript).Parameters
-$runFresh = $runParams.ContainsKey("FreshShaderCache")
-if (-not $runFresh -and (Test-Path -LiteralPath $cache)) {
-    Move-Item -LiteralPath $cache -Destination ("{0}.old-{1}" -f $cache, (Get-Date -Format "yyyyMMdd-HHmmss"))
-}
+$cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCacheRoot } else { Join-Path $repo $ShaderCacheRoot }
+$cache = Join-Path $cacheRoot "shader_cache_$wanted"
 New-Item -ItemType Directory -Force $cache | Out-Null
 
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $pack = Join-Path $PSScriptRoot "tester_pack.py"
+$cacheAtStart = (& $python -B $pack cache-stats $cache) -split " "
 $script = (& $python -B $pack input-preset $InputMode $Seconds)
 if ($LASTEXITCODE -ne 0) { throw "tester_run: the input script was refused (see above)" }
 
@@ -102,7 +102,6 @@ $runArgs = @{
     Render = $true; Translate = $true; FakeUser = $true; GpuMirror = $true
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
-if ($runFresh) { $runArgs.FreshShaderCache = $true }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
@@ -131,7 +130,8 @@ $manifest = [ordered]@{
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep
+    exit_code = $exitCode; deep = [bool]$Deep; shader_cache = (Split-Path -Leaf $cache)
+    translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }
 $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_$stamp.json"
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
@@ -144,6 +144,7 @@ foreach ($line in $parts) {
     $path, $bytes = $line -split " (?=\d+$)"
     Write-Host ("Send this file: {0} ({1:N1} MB)" -f $path, ([double]$bytes / 1MB))
 }
+Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
 Write-Host (& $python -B $pack first-poll $logDir)
 if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send all of them." }
 exit $exitCode

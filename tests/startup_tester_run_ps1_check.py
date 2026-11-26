@@ -7,7 +7,8 @@ debugger and no GPU are involved. Needs git and a PowerShell (powershell or pwsh
 notice and passes, because Linux hosts cannot run the script.
 
   - a build from another commit is refused with -NoBuild, and accepted when its revision matches HEAD
-  - the old shader cache folder is moved aside and the stub sees an empty one
+  - one shader cache folder per commit: kept across runs at a commit, a new empty one for the next commit,
+    and the summary says how many translations were present at start
   - run.ps1 gets -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000, the menus input script, the capture
     interval and X2W_D3D12_BUDGET=1; -Deep adds -TraceCalls and -TraceApi
   - the zip holds every file of the run folder and a valid manifest, and never the shader cache
@@ -26,17 +27,13 @@ STARTUP = REPO / "tools" / "startup"
 STUB_RUN = r"""
 param([string]$Exe, [string]$DataDir, [string]$LogDir, [int]$Seconds, [string]$BuildDir, [string]$ShaderCache,
       [int]$ContinueAsserts, [string]$InputScript, [int]$CaptureEvery, [switch]$Render, [switch]$Translate,
-      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi, [switch]$FreshShaderCache)
-if ($FreshShaderCache -and @(Get-ChildItem -LiteralPath $ShaderCache -Force).Count -gt 0) {
-    Move-Item -LiteralPath $ShaderCache -Destination ("{0}.old-stub" -f $ShaderCache)
-    New-Item -ItemType Directory -Force $ShaderCache | Out-Null
-}
+      [switch]$FakeUser, [switch]$GpuMirror, [switch]$TraceCalls, [switch]$TraceApi)
 $seen = @(Get-ChildItem -LiteralPath $ShaderCache -Force | ForEach-Object { $_.Name })
 $record = [ordered]@{
     Exe = $Exe; DataDir = $DataDir; Seconds = $Seconds; ContinueAsserts = $ContinueAsserts; InputScript = $InputScript
     CaptureEvery = $CaptureEvery; Render = [bool]$Render; Translate = [bool]$Translate; FakeUser = [bool]$FakeUser
-    GpuMirror = [bool]$GpuMirror; Fresh = [bool]$FreshShaderCache; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
-    Budget = $env:X2W_D3D12_BUDGET; CacheEntries = $seen
+    GpuMirror = [bool]$GpuMirror; TraceCalls = [bool]$TraceCalls; TraceApi = [bool]$TraceApi
+    Budget = $env:X2W_D3D12_BUDGET; CacheEntries = $seen; CacheFolder = (Split-Path -Leaf $ShaderCache)
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
@@ -92,15 +89,17 @@ def run_script(shell, tree, *args):
 def check_shell(shell):
     with tempfile.TemporaryDirectory() as root:
         tree, head, rev_file = make_tree(root)
-        cache = tree / "out" / "startup" / "shader_cache"
+        cache = tree / "out" / "startup" / ("shader_cache_" + head)
         cache.mkdir(parents=True)
-        (cache / "old_request.bin").write_bytes(b"x")
+        for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_1123456789abcdef.a", "revision.txt"):
+            (cache / name).write_bytes(b"x")
 
         rev_file.write_text(REV_CPP % "00000000", encoding="ascii")
         stale = run_script(shell, tree, "-NoBuild")
         assert stale.returncode != 0 and "00000000" in stale.stdout + stale.stderr and head in stale.stdout + stale.stderr, \
             (shell, "a build from another commit was not refused", stale.stdout, stale.stderr)
-        assert (cache / "old_request.bin").exists(), "the cache was touched before the build check passed"
+        assert sorted(os.listdir(cache)) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
+                                                     "req_1123456789abcdef.a", "revision.txt"]), "the cache was touched"
         assert not list((tree / "out" / "tester").glob("*.zip")) if (tree / "out" / "tester").exists() else True
 
         rev_file.write_text(REV_CPP % head, encoding="ascii")
@@ -121,31 +120,19 @@ def check_shell(shell):
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["Budget"] == "1" and not args["TraceCalls"] and not args["TraceApi"], args
         assert args["InputScript"].startswith("80@5,80@11,4@17,80@23"), args["InputScript"]
-        assert not args["CacheEntries"], "the run saw the old shader cache: %r" % (args["CacheEntries"],)
-        assert args["Fresh"], "run.ps1 was not asked for -FreshShaderCache"
+        assert args["CacheFolder"] == "shader_cache_" + head, args["CacheFolder"]
+        assert sorted(args["CacheEntries"]) == sorted(["req_0123456789abcdef.a", "req_0123456789abcdef.txt",
+                                                                  "req_1123456789abcdef.a", "revision.txt"]), \
+            "the run did not see the kept shader cache: %r" % (args["CacheEntries"],)
+        assert "1 translations were already present at start (2 requests, 0 failed)" in ok.stdout, ok.stdout
         assert manifest["commit"] == head and manifest["build_commit"] == head and manifest["dirty"] is False
         assert manifest["seconds"] == 200 and manifest["deep"] is False and manifest["input_script"] == args["InputScript"]
         assert manifest["env"].get("X2W_D3D12_BUDGET") == "1" and all(k.startswith("X2W_") for k in manifest["env"])
         assert manifest["first_poll_seconds"] == 151.9
         assert manifest["parts"] == 1 and "gpu" in manifest and "windows_build" in manifest
-        moved = [p.name for p in cache.parent.iterdir() if p.name.startswith("shader_cache.old-")]
-        assert len(moved) == 1 and (cache.parent / moved[0] / "old_request.bin").exists(), moved
-
-        # A run.ps1 without -FreshShaderCache (an older checkout) still gets a fresh cache from tester_run.ps1.
-        (cache / "second_old.bin").write_bytes(b"y")
-        old_run = (tree / "tools" / "startup" / "run.ps1")
-        full_stub = old_run.read_text(encoding="utf-8")
-        old_run.write_text(full_stub.replace(", [switch]$FreshShaderCache)", ")").replace("$FreshShaderCache -and", "$false -and")
-                           .replace("Fresh = [bool]$FreshShaderCache", "Fresh = $false"), encoding="utf-8")
-        older = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
-        assert older.returncode == 0, (shell, older.stdout, older.stderr)
-        newest_old = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
-        with zipfile.ZipFile(newest_old) as z:
-            older_args = json.loads(z.read("args.json").decode("utf-8-sig"))
-        assert not older_args["CacheEntries"] and not older_args["Fresh"], older_args
-        assert len([p for p in cache.parent.iterdir() if p.name.startswith("shader_cache.old-")]) == 2
-        old_run.write_text(full_stub, encoding="utf-8")
-        assert not any(n.endswith(".bin") for n in names), "shader cache content travelled"
+        assert manifest["shader_cache"] == "shader_cache_" + head and manifest["translations_at_start"] == 1
+        assert not any(p.name.startswith("shader_cache.old") for p in cache.parent.iterdir()), "the cache was moved aside"
+        assert not any(n.endswith(".bin") or n.startswith("req_") for n in names), "shader cache content travelled"
 
         deep = run_script(shell, tree, "-NoBuild", "-Deep", "-CaptureEvery", "0", "-Input", "4@60,1@70")
         assert deep.returncode == 0, (shell, deep.stdout, deep.stderr)
@@ -156,12 +143,25 @@ def check_shell(shell):
         assert deep_args["TraceCalls"] and deep_args["TraceApi"] and deep_args["InputScript"] == "4@60,1@70", deep_args
         assert deep_manifest["deep"] is True and deep_args["CaptureEvery"] == 0, deep_manifest
 
+        # The same commit keeps its cache across runs: the second run sees what the first one left.
+        (cache / "req_2123456789abcdef.txt").write_bytes(b"x")
+        again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
+
         # A tracked change makes the checkout dirty: the build revision must carry -dirty to match.
-        (tree / "tools" / "startup" / "tester_pack.py").write_text(
-            (tree / "tools" / "startup" / "tester_pack.py").read_text() + "\n# local edit\n")
+        pack = tree / "tools" / "startup" / "tester_pack.py"
+        pack.write_text(pack.read_text() + "\n# local edit\n")
         dirty = run_script(shell, tree, "-NoBuild")
         assert dirty.returncode != 0 and head + "-dirty" in dirty.stdout + dirty.stderr, (dirty.stdout, dirty.stderr)
-    print("tester_run.ps1 under %s: stale build refused, fresh cache, run arguments, -Deep, zip and manifest pass"
+
+        # A new commit gets its own, empty shader cache folder; the old one stays.
+        git(tree, "commit", "-q", "-am", "second")
+        head2 = git(tree, "rev-parse", "--short=8", "HEAD")
+        rev_file.write_text(REV_CPP % head2, encoding="ascii")
+        fresh = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert fresh.returncode == 0 and "0 translations were already present at start" in fresh.stdout, fresh.stdout
+        assert (cache.parent / ("shader_cache_" + head2)).is_dir() and len(list(cache.glob("req_*.txt"))) == 2
+    print("tester_run.ps1 under %s: stale build refused, per-commit shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 
 
