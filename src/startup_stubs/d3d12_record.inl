@@ -350,7 +350,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
                                     (K == device_kind && (N == 23 || N == 24)) || submit;
     u64 seq;
     if constexpr (consumes_pages)
-        seq = (extra_title_pages || (submit && scan_submit_pages && window_open)) ? pages_before_call(root, r8, submit)
+        seq = (extra_title_pages || (submit && (scan_submit_pages || replay_dump_enabled()) && window_open)) ? pages_before_call(root, r8, submit)
                                                                                    : static_cast<u64>(InterlockedIncrement64(&next_seq));
     else
         seq = static_cast<u64>(InterlockedIncrement64(&next_seq));

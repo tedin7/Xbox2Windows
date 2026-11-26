@@ -58,3 +58,15 @@ if(TARGET startup_stream_consumer AND TARGET x2w_replay AND EXISTS "${INTAKE_PYT
         set_tests_properties(startup_replay_compute_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+# Submission dumps compare scenes without Present, including a changed-clear control.
+if(TARGET startup_replay_quad AND TARGET startup_stream_consumer AND TARGET x2w_replay
+    AND DXC_EXECUTABLE AND EXISTS "${INTAKE_PYTHON}")
+    foreach(backend IN ITEMS warp hardware)
+        add_test(NAME startup_replay_dump_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_replay_dump_check.py"
+            "$<TARGET_FILE:startup_replay_quad>" "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:x2w_replay>"
+            "${DXC_EXECUTABLE}" "${backend}")
+        set_tests_properties(startup_replay_dump_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

@@ -409,6 +409,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8;
+    const bool replay = mode == "texture-store-replay";
     const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
     const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
     const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
@@ -418,24 +419,27 @@ static int texture_slot67(void* device, const std::string& mode)
     };
     const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
+    D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    if (replay)
+        texture_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(texture_desc.Flags | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
     void* const texture = make(D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
-    void* const upload = make(D3D12_HEAP_TYPE_UPLOAD, buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* const upload = replay ? nullptr : make(D3D12_HEAP_TYPE_UPLOAD, buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
-    if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
+    if (!texture || !readback) return 71;
+    if (!replay && (!upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory)) return 71;
     if (fp32) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;
-    } else {
+    } else if (!replay) {
         for (UINT i = 0; i < bytes / 2; ++i) static_cast<UINT16*>(memory)[i] = static_cast<UINT16>(0x5000 + i);
     }
-    invoke(upload, 9, 0, 0);
+    if (upload) invoke(upload, 9, 0, 0);
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;
@@ -482,13 +486,41 @@ static int texture_slot67(void* device, const std::string& mode)
     source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
     D3D12_TEXTURE_COPY_LOCATION result = source;
     result.pResource = static_cast<ID3D12Resource*>(readback);
+    const auto finish = [&](UINT64 value) {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), value)))) return 76;
+        for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < value;) {
+            if (GetTickCount64() >= deadline) return 78;
+            Sleep(1);
+        }
+        return 0;
+    };
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    if (replay) {
+        // Initialize in a separate submission, so the next dump can only come from the Dispatch.
+        decltype(heap_desc) rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+        void* rtv_heap = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&rtv_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&rtv_heap)))))
+            return 73;
+        const StreamWord rtv = invoke(rtv_heap, 9);
+        if (!rtv) return 73;
+        const D3D12_RENDER_TARGET_VIEW_DESC rtv_view{format, D3D12_RTV_DIMENSION_TEXTURE2D};
+        invoke(device, 20, word(texture), word(&rtv_view), rtv);
+        const float clear[]{0, 0, 0, 0};
+        invoke(list, 52, rtv, word(clear));
+        if (const int rc = finish(1)) return rc;
+        if (FAILED(static_cast<HRESULT>(invoke(allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    }
     invoke(list, 32, 1, word(&heap));
-    for (UINT layer = 0; layer < layers; ++layer) {
-        image.SubresourceIndex = layer;
-        source.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
-        invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+    if (!replay) {
+        for (UINT layer = 0; layer < layers; ++layer) {
+            image.SubresourceIndex = layer;
+            source.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
     }
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));
@@ -500,13 +532,7 @@ static int texture_slot67(void* device, const std::string& mode)
         result.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
         invoke(list, 16, word(&result), 0, 0, 0, word(&image), 0);
     }
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
-        Sleep(1);
-    }
+    if (const int rc = finish(replay ? 2 : 1)) return rc;
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);

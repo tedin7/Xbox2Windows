@@ -79,7 +79,7 @@ def chunks(data):
         at += 16 + header_bytes + data_bytes
 
 
-def change_last_clear(source, target):
+def change_last_clear(source, target, clear_count=PRESENTS):
     """Copies the recording with the colour of the last ClearRenderTargetView changed (its blob's first float)."""
     data = bytearray(source.read_bytes())
     clears, argm, blobs = [], {}, {}
@@ -93,7 +93,7 @@ def change_last_clear(source, target):
             argm[(seq, arg)] = blob_hash
         elif tag == b"BLOB":
             blobs[struct.unpack_from("<Q", data, header)[0]] = payload
-    assert len(clears) == PRESENTS, clears
+    assert len(clears) == clear_count, clears
     at = blobs[argm[(clears[-1], 1)]]
     struct.pack_into("<f", data, at, 1.0 - struct.unpack_from("<f", data, at)[0])
     target.write_bytes(bytes(data))

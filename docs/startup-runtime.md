@@ -1946,6 +1946,30 @@ allocation and opens one heap per ID. Each placement uses that heap and its reco
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a
 GPU round trip per present. A recorded run and its replay write the same names.
 
+### Submission dumps without Present
+
+Set `X2W_REPLAY_DUMP=1` with render mode and `X2W_REPLAY_RECORD=all` to compare scenes that never call
+Present. The player inherits the switch from `XENV`. Set it explicitly to `1` to enable it on an older
+recording, or to `0` to disable it on the player. The recorder uses the existing `PAGE` and `MAP` chunks
+to capture eligible title memory before each recorded submission, subject to the page budgets and
+`X2W_REPLAY_PAGES`.
+
+The shim queues a copy after the submitted batch and logs its rows when the next guest Signal on
+that queue completes. Each row has the form
+`x2w-replay dump submit <n> resource <id> <w>x<h> fmt <f> hash <16 hex digits>`.
+Submission and resource creation numbers start at one. There is one row per written resource per
+submission. Compare the row sets from the recorder log and the player's `stderr.txt`.
+
+The 64-bit FNV-1a hash covers buffer bytes or the texture's subresources in copy order, excluding
+readback row padding. A supported multisample target is resolved before hashing. A failed or
+unsupported copy produces a diagnostic. Initialize the contents that will be compared, including
+regions a shader leaves untouched. Submissions without a following recorded Signal have no dump row.
+Dump mode adds GPU work and can delay the Signal call while the CPU collects the hashes.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_replay_dump_(warp|hardware)$'
+```
+
 ### Replayer
 
 `x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a

@@ -275,6 +275,7 @@ void scan_pages_into(ThreadBuffer& b, bool everything, u64 stamp, bool placed = 
 inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
+    if (replay_dump_enabled()) return;  // Dump mode stamps each scan at its submission.
     page_prev_mark = seq;
     if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
     init_page_writer();
@@ -286,6 +287,7 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 inline void pages_at_present(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
+    if (replay_dump_enabled()) return;
     const u64 stamp = page_prev_mark ? page_prev_mark : seq;
     page_prev_mark = seq;
     if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
