@@ -39,7 +39,12 @@ def dispatch(directory, consumer, env, mode):
     out.unlink(missing_ok=True)
     args = [consumer, directory / 'vertex', directory / 'pixel', directory / 'root', 'slot67',
             directory / 'program', directory / 'data', directory / 'state', mode]
-    result = subprocess.run(args, env=dict(env, X2W_TEST_DISPATCH_OUT=str(out)), capture_output=True, text=True)
+    try:
+        result = subprocess.run(args, env=dict(env, X2W_TEST_DISPATCH_OUT=str(out)), capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as hung:
+        # A consumer that never finishes (a fence nobody signals, a stuck queue) names its mode and the last of its log.
+        tail = (hung.stderr.decode(errors='replace') if isinstance(hung.stderr, bytes) else hung.stderr or '')[-3000:]
+        raise AssertionError(f'{mode}: consumer still running after 120 s\n{tail}')
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
