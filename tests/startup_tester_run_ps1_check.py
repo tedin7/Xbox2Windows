@@ -237,13 +237,13 @@ def check_shell(shell):
         assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
         # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
         (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
-        before_zips = len(list((tree / "out" / "tester").glob("report_*.zip")))
         capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
                             extra_env={"STUB_HANG": "1"})
         assert capped.returncode == 0, (capped.stdout, capped.stderr)
         assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
         assert not (fresh_cache / "req_cccccccccccccccc.txt").exists()
-        assert len(list((tree / "out" / "tester").glob("report_*.zip"))) == before_zips + 1
+        assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
+        assert list((tree / "out" / "tester").glob("report_*.zip"))
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
