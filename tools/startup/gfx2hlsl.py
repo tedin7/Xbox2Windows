@@ -4859,6 +4859,20 @@ class Stage:
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
+    def exec_writers_note(self):
+        """' (EXEC written before it by: <mnemonic> x<count>, ...)' naming the mnemonics only, so a refusal says which
+        EXEC shape the quad read sits behind; empty when no instruction before it wrote EXEC."""
+        seen = {}
+        for off, _n, name, asm in getattr(self, 'ins', ()):
+            if off >= getattr(self, 'pc', 1 << 62):
+                break
+            if writes_exec(name, parse(asm)[1]):
+                base = re.sub(r'_e(32|64)$', '', name)
+                seen[base] = seen.get(base, 0) + 1
+        if not seen:
+            return ''
+        return ' (EXEC written before it by %s)' % ', '.join('%s x%d' % item for item in sorted(seen.items()))
+
     def dpp_broadcast(self, base, ops, mods):
         fields, rest = {}, []
         for m in mods:
@@ -4883,7 +4897,8 @@ class Stage:
         # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
         if (not getattr(self, 'exec_known', False) or
                 (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
-            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
+                              % (base, self.exec_writers_note()))
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.

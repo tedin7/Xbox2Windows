@@ -280,6 +280,15 @@ def controls():
     check('refused: broadcast after a branch target', refused_in_stage(AFTER_BRANCH_WORDS))
     check('refused: branch back to the broadcast entry block', refused_in_stage(ENTRY_BACKEDGE_WORDS))
     check('refused: divergent EXEC before the broadcast', refused_in_stage(DIVERGENT_WORDS))
+    # The refusal names the mnemonics of the EXEC writers before the read (never operands), so a run says which shape it is.
+    for words, expect in ((DIVERGENT_WORDS, 'EXEC written before it by s_mov_b32 x1'), (NO_WQM_WORDS, None)):
+        try:
+            pixel_stage(words).hlsl_ps()
+            reason = ''
+        except G.Unsupported as error:
+            reason = str(error)
+        check('refusal text for EXEC writers: %s' % (expect or 'no writer, no note'),
+              ('entry prefix' in reason and expect in reason) if expect else 'EXEC written before' not in reason, reason)
     check('control: the sane line itself translates', not refused(sane))
     # fi:1 only decides what a disabled source lane returns, and the whole quad is proven active.
     with_fi = 'v_subrev_f32_dpp v1, v0, v0 quad_perm:[0,0,0,0]' + DPP + ' bound_ctrl:1 fi:1'
