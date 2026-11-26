@@ -1998,6 +1998,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     # land between the compare and the execz branch, and the block itself is straight-line code.
                     entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
+                    def branch_kinds():
+                        """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
+                        kinds = set()
+                        for k in range(source + 1, target):
+                            if k in edges and k not in inner:
+                                where = ('backward' if edges[k] <= k else 'past the block' if edges[k] > target
+                                         else 'forward in the block')
+                                kinds.add('%s %s' % (ins[k][2], where))
+                        return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
                         ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
@@ -2005,7 +2014,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch',
+                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
