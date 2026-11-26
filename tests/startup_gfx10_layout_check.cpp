@@ -167,6 +167,8 @@ void check_distinct_and_round_trip()
         {640, 360, 10, 1, DXGI_FORMAT_BC7_UNORM, 0x10a},   {257, 129, 9, 3, DXGI_FORMAT_R8G8B8A8_UNORM, 0x106},
         {96, 40, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 0x102}, {4, 4, 3, 1, DXGI_FORMAT_BC3_UNORM, 0x109},
         {2048, 2048, 12, 1, DXGI_FORMAT_BC5_UNORM, 0x109},
+        {16, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105}, {16, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x109},
+        {16, 4, 3, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x109}, {33, 5, 1, 2, DXGI_FORMAT_R16G16B16A16_FLOAT, 0x10a},
     };
     for (const Shape& s : shapes) {
         const D3D12_RESOURCE_DESC d = texture(s.width, s.height, s.mips, s.slices, s.format, s.layout);
@@ -179,6 +181,7 @@ void check_distinct_and_round_trip()
         const std::size_t total = static_cast<std::size_t>(l.bytes());
         std::vector<unsigned char> used(total / l.bytes_per_element, 0), tiled(total, 0);
         bool ok = total % l.block_bytes == 0;
+        std::uint64_t highest = 0;
         for (UINT slice = 0; ok && slice < s.slices; ++slice)
             for (UINT mip = 0; ok && mip < s.mips; ++mip) {
                 const UINT w = l.columns(mip), h = l.rows(mip);
@@ -190,6 +193,7 @@ void check_distinct_and_round_trip()
                         const std::uint64_t at = l.address(mip, x, y, slice);
                         ok = at % l.bytes_per_element == 0 && at + l.bytes_per_element <= total && !used[at / l.bytes_per_element];
                         if (ok) used[at / l.bytes_per_element] = 1;
+                        highest = (std::max)(highest, at + l.bytes_per_element);
                     }
                 if (!ok) break;
                 l.tile(mip, slice, tiled.data(), rows.data(), pitch);
@@ -198,6 +202,9 @@ void check_distinct_and_round_trip()
                     ok = std::memcmp(rows.data() + y * pitch, back.data() + y * pitch, std::size_t{w} * l.bytes_per_element) == 0;
             }
         if (!ok) fail(name + ": an element outside the texture, shared by two subresources, or changed by a round trip");
+        // The bytes a read must have mapped end at the highest element any texel uses, not at the end of the block.
+        else if (l.used_bytes() != highest || l.used_bytes() > l.bytes())
+            fail(name + ": used_bytes " + std::to_string(l.used_bytes()) + " is not the end of the highest element " + std::to_string(highest));
     }
 }
 
