@@ -4,7 +4,10 @@ One command for a tester: check the build, run the title offline with a per-comm
 
 .DESCRIPTION
 1. Checks that the build in -BuildDir was made from this checkout's current commit (the revision the build writes
-   into generated\x2w_build_rev.cpp). If not, or a DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
+   into generated\x2w_build_rev.cpp). A build from another commit is used as it is when the runtime sources (src, cmake,
+   CMakeLists.txt, CMakePresets.json) are the same there and here, so a commit that changes only tools, tests or docs needs
+   no rebuild; the summary says why (runtime_sources.py) and the manifest records it as build_check. Otherwise, or when a
+   DLL run.ps1 copies is missing, it builds only the startup_runtime target (the eight DLLs and the
    revision stamp; -FullBuild builds everything) or, with -NoBuild, stops with a message.
 2. Uses one shader cache folder per shader revision (out\startup\shader_cache_<rev>, from the x2w-startup-shader-N
    strings of gfx2hlsl.py): kept across runs and across branch updates that do not bump the revision. The --watch translator needs minutes to catch up, so an emptied cache would leave
@@ -62,7 +65,9 @@ param(
     [switch]$NoStartupBelow40,                  # the 0x283 startup blocks are placed below 2^40 (X2W_XMEM_STARTUP_BELOW_40=1, #1758); this turns it off
     [switch]$NoLowAddresses,                   # the title starts with bottom-up ASLR off so its memory stays below 2^40 (X2W_LOW_ADDRESSES=1); this turns it off
     [switch]$NoTitleInputSnapshot,              # translated compute inputs in a placed buffer that does not alias title memory are read from title memory (X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1, with X2W_TRANSLATED_INDIRECT_COPY_RANGES=1 for ranges a list copied); this turns both off
-    [switch]$NoSysmemFallback                  # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [switch]$NoSysmemFallback,                 # a texture that runs out of video memory is created in system memory (X2W_D3D12_SYSMEM_FALLBACK=1); this turns it off
+    [int]$CommitHeadroomMiB = 256,              # last resort before error 1455: the run ends cleanly (logs packed) when the system commit has less than this free; 0 = off
+    [int]$CommitWarnMiB = 2048                  # a warning line in the log when the system commit has less than this free; 0 = off
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -103,11 +108,23 @@ function Get-MissingDlls {
     return @($runDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $buildRoot "$_.dll")) })
 }
 
+$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
+$pack = Join-Path $PSScriptRoot "tester_pack.py"
+
 $source = Get-CheckoutRevision
 $wanted = if ($source.Dirty) { "$($source.Commit)-dirty" } else { $source.Commit }
 $built = Get-BuildRevision
 $missing = Get-MissingDlls
-if ($built -ne $wanted -or $missing.Count -gt 0) {
+# A build from another commit is used as it is when the runtime sources (src, cmake, CMakeLists.txt, CMakePresets.json)
+# are the same there and here: a commit that changes only tools, tests or docs needs no rebuild (runtime_sources.py).
+$buildCheck = if ($built -eq $wanted) { "same commit" } else { $null }
+if ($built -and $built -ne $wanted -and $missing.Count -eq 0) {
+    $why = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "runtime_sources.py") $repo $built } | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) { $buildCheck = $why; Write-Host "tester_run: using the build: $why" }
+    elseif ($why) { Write-Host "tester_run: $why" }
+}
+if (-not $buildCheck -or $missing.Count -gt 0) {
     $have = if ($built) { $built } else { "no build" }
     if ($built -eq $wanted) { $have = "$built without " + ($missing -join ", ") + ".dll" }
     if ($NoBuild) {
@@ -134,6 +151,7 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
     if ($built -ne $wanted) {
         throw "tester_run: after the build the revision is $built, expected $wanted"
     }
+    $buildCheck = "built here"
 }
 
 # One shader cache folder per shader revision (the x2w-startup-shader-N strings of gfx2hlsl.py), kept across runs and across
@@ -142,10 +160,6 @@ if ($built -ne $wanted -or $missing.Count -gt 0) {
 $runScript = Join-Path $PSScriptRoot "run.ps1"
 $runParams = (Get-Command $runScript).Parameters
 $cacheRoot = if ([System.IO.Path]::IsPathRooted($ShaderCacheRoot)) { $ShaderCacheRoot } else { Join-Path $repo $ShaderCacheRoot }
-
-$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
-$pack = Join-Path $PSScriptRoot "tester_pack.py"
 $cacheTag = (Invoke-Native { & $python -B $pack cache-tag (Join-Path $PSScriptRoot "gfx2hlsl.py") } | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $cacheTag) { throw "tester_run: cannot read the shader revisions of gfx2hlsl.py" }
 $cache = Join-Path $cacheRoot "shader_cache_$cacheTag"
@@ -203,6 +217,8 @@ $runArgs = @{
 }
 if ($Deep) { $runArgs.TraceCalls = $true; $runArgs.TraceApi = $true }
 if (-not $NoLazyMemory) { $runArgs.LazyMemory = $true }
+if ($CommitHeadroomMiB -gt 0) { $runArgs.CommitHeadroomMiB = $CommitHeadroomMiB }
+if ($CommitWarnMiB -gt 0) { $runArgs.CommitWarnMiB = $CommitWarnMiB }
 if ($CaptureEvery -gt 0) {
     if ($runParams.ContainsKey("CaptureEvery")) { $runArgs.CaptureEvery = $CaptureEvery }
     else { Write-Warning "run.ps1 has no -CaptureEvery here: only the final window.png is saved" }
@@ -226,12 +242,12 @@ foreach ($item in (Get-ChildItem Env: | Where-Object { $_.Name -like "X2W_*" } |
 $video = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic Display|Remote Display" })
 $os = Get-CimInstance Win32_OperatingSystem
 $manifest = [ordered]@{
-    commit = $source.Commit; build_commit = $built; dirty = $source.Dirty; seconds = $Seconds
+    commit = $source.Commit; build_commit = $built; build_check = $buildCheck; dirty = $source.Dirty; seconds = $Seconds
     input_script = $script; env = $envSet
     gpu = (($video | ForEach-Object { $_.Name }) -join "; ")
     gpu_driver = (($video | ForEach-Object { $_.DriverVersion }) -join "; ")
     windows_build = $os.BuildNumber; wall_seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
+    exit_code = $exitCode; deep = [bool]$Deep; lazy_textures = [bool]$LazyTextures; sysmem_fallback = [bool]$SysmemFallback; commit_headroom_mib = $CommitHeadroomMiB; commit_warn_mib = $CommitWarnMiB; startup_below_40 = [bool]$StartupBelow40; low_addresses = [bool]$LowAddresses; title_input_snapshot = [bool]$TitleInputSnapshot; lazy_memory = (-not $NoLazyMemory); memory_gib = $MemoryGiB; physical_ram_gib = [math]::Round($physicalBytes / 1GB, 1); shader_cache = (Split-Path -Leaf $cache)
     pretranslate = $preTranslate
     translations_at_start = [int]$cacheAtStart[0]; requests_at_start = [int]$cacheAtStart[1]; failed_at_start = [int]$cacheAtStart[2]
 }

@@ -179,6 +179,7 @@ struct alignas(16) WrapperOwn {
     std::uint64_t predication_offset;
     UINT predication_operation;
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
+    UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool lazy_slot133_texture; // Slot 133 read-only texture whose desktop CreateCommittedResource is deferred.
@@ -1065,6 +1066,7 @@ void retire_drop_heap_views(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
+void release_upload_recording(Wrapper* list);
 void retire_discard_holds(Wrapper* list);
 void residency_discard_list(Wrapper* list);
 void residency_title_touched(ID3D12Resource* desktop);
@@ -1135,6 +1137,7 @@ ULONG __stdcall release(Wrapper* self)
                 linear_buffers().retire(static_cast<ID3D12Resource*>(self->own().real));
         }
         if (self->own().kind == list_kind && self->own().real) {
+            release_upload_recording(self);
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
@@ -1550,8 +1553,17 @@ struct TitleAllocator {
 SRWLOCK allocator_lock = SRWLOCK_INIT;
 std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
-std::unordered_map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, UINT64>> queue_submits;
+std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
+std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+
 LONG allocator_swaps, allocator_creates;
+
+void release_upload_recording(Wrapper* list)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    ReleaseSRWLockExclusive(&allocator_lock);
+}
 
 // allocator_lock held.
 TitleAllocator& title_allocator(Wrapper* allocator)
@@ -1746,7 +1758,9 @@ bool submit_fence_fails()
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
 void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
-    auto& [fence, value] = queue_submits[queue];
+    auto& submit = queue_submits[queue];
+    auto& fence = submit.fence;
+    auto& value = submit.value;
     if (!fence && !submit_fence_fails()) {
         ID3D12Device* device = nullptr;
         if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
@@ -1754,8 +1768,12 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             device->Release();
         }
     }
-    if (fence && SUCCEEDED(queue->Signal(fence, value + 1))) {
-        ++value;
+    UploadChunkMask chunks = 0;
+    for (auto* list : lists) chunks |= list->own().upload_chunks;
+    const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
+    if (signaled) ++value;
+    submit.submitted(chunks, signaled);
+    if (signaled) {
         for (Wrapper* list : lists) {
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
@@ -1888,6 +1906,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
+            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
             state.list_uploads = nullptr;
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -1930,6 +1949,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
+        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2511,35 +2531,35 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 }
 
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
-// 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
-// refuses new reservations rather than reusing storage without completion.
+// 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
+// no recording can submit its bytes and every queue that used it has finished.
 
-UploadReservation reserve_upload_ring(std::size_t bytes)
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
-    constexpr u64 initial_chunk_bytes = u64{16} << 20;
-    constexpr u64 max_total_bytes = u64{256} << 20;
-    constexpr u64 max_alloc_bytes = max_total_bytes / 4;
+    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
-    static SRWLOCK lock = SRWLOCK_INIT;
-    static std::vector<UploadRingChunk> chunks;
-    static std::size_t active = 0;
+    auto& chunks = upload_chunks;
+    static unsigned active = 0;
     static u64 total_bytes = 0;
 
-    AcquireSRWLockExclusive(&lock);
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto finish = [&](unsigned index) {
+        active = index;
+        chunks[index].hold(list->own().upload_chunks, index);
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return reservation;
+    };
     if (!chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) {
-            ReleaseSRWLockExclusive(&lock);
-            return reservation;
-        }
+        if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
+    const u64 remaining = total_bytes < max_upload_ring_bytes ? max_upload_ring_bytes - total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() ? initial_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
@@ -2562,10 +2582,8 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
-                        active = chunks.size() - 1;
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
-                        ReleaseSRWLockExclusive(&lock);
-                        return reservation;
+                        return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
                         if (budget) budget->end_use();
@@ -2579,46 +2597,47 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
         }
     }
     // Allocation failed or the cap was reached. Older unused tails are still safe.
-    for (std::size_t index = 0; index < chunks.size(); ++index) {
+    for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reserve_upload_chunk(chunks[index], rounded);
-        if (reservation.mapped) {
-            active = index;
-            ReleaseSRWLockExclusive(&lock);
-            return reservation;
-        }
+        if (reservation.mapped) return finish(index);
     }
 
-    ReleaseSRWLockExclusive(&lock);
+    for (unsigned index = 0; index < chunks.size(); ++index) {
+        reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
+        if (reservation.mapped) return finish(index);
+    }
+
+    ReleaseSRWLockExclusive(&allocator_lock);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity");
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
 {
-    auto* dest = reserve_upload_ring(bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(Wrapper* list, u64 title_address, std::size_t bytes)
 {
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
-    return ring_copy(title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
+    return ring_copy(list, title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -4027,7 +4046,7 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         return;
     }
     const std::size_t bytes = readable_window(address, 0x10000);
-    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
+    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(self, address, bytes) : 0;
     static LONG logged;
     if (first_calls(logged, 4)) {
         char head[3 * 32 + 1];

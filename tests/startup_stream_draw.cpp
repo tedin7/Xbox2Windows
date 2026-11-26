@@ -499,7 +499,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         Sleep(250);
         if (invoke(fence, 8) != 0) return 46;  // a submit completed although the queue was held
         if (FAILED(static_cast<HRESULT>(invoke(gate, 10, 1)))) return 47;
-        // One more recording without a draw: its submit is where the stand-in visits the completed ones.
+        // The last submit visits the completed uploads. In the ring-reuse case it also draws a new payload.
         const auto reached = [&](UINT64 value) {
             const auto deadline = GetTickCount64() + 60000;
             while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
@@ -507,6 +507,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         };
         if (!reached(payloads)) return 25;
         if (!next_recording()) return 35;
+        if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)) {
+            if (const int result = draw_gated_console_payload(guest, list, payloads, false)) return result;
+        }
         invoke(list, 9);
         invoke(queue, 10, 1, arg(&list));
         if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;

@@ -1140,8 +1140,7 @@ u64 address_upload_revision;
 #include "startup_stubs/d3d12_residency.inl"
 
 // A texture published in a newly supported console layout is not filled through the shared upload ring.
-// The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
-// recorded copy long after later uploads have passed over its source bytes. Each such upload owns
+// The bounded ring can fill while a queue waits on a fence. Each such upload owns
 // its upload buffer instead. The buffer and the texture it fills stay referenced by the recording,
 // and by every submit of that recording until the queue it went to has completed the submit, as
 // for the sampler heaps above.
@@ -1293,15 +1292,14 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
 // upload ring is write-combined memory that is slow to read, so the comparison is against this copy, not the ring.
 struct FrameCopy {
     u64 address = 0;
-    u64 offset = 0;
-    ID3D12Resource* resource = nullptr;
+    UploadReservation slice;
     std::vector<unsigned char> content;
 };
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
-bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
         frame_copies().clear();
@@ -1312,32 +1310,40 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** re
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
-        *offset = found->second.offset;
-        if (resource) *resource = found->second.resource;
-        return true;
+        const auto& slice = found->second.slice;
+        AcquireSRWLockExclusive(&allocator_lock);
+        for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+            auto& chunk = upload_chunks[i];
+            if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
+                chunk.hold(self->own().upload_chunks, i);
+                ReleaseSRWLockExclusive(&allocator_lock);
+                *offset = slice.offset;
+                if (resource) *resource = slice.resource;
+                return true;
+            }
+        }
+        ReleaseSRWLockExclusive(&allocator_lock);
     }
-    u64 fresh = 0;
-    ID3D12Resource* chunk = nullptr;
-    auto* ring = reserve_upload_ring(bytes, &fresh, &chunk);
-    if (!ring || !chunk) return false;
+    const auto slice = reserve_upload_ring(self, bytes);
+    if (!slice.mapped) return false;
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
         std::vector<unsigned char> content(title, title + bytes);
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
-        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, std::move(content)});
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, slice, std::move(content)});
         source = entry.first->second.content.data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
-    std::memcpy(ring, source, bytes);
+    std::memcpy(slice.mapped, source, bytes);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
             log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
     }
-    *offset = fresh;
-    if (resource) *resource = chunk;
+    *offset = slice.offset;
+    if (resource) *resource = slice.resource;
     return true;
 }
 
@@ -1551,7 +1557,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 if (owned.cpu) {
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                 } else {
-                    rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
                     if (!rows || !chunk) {
                         state.done = false;
                         return false;
@@ -1573,7 +1579,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
                 ID3D12Resource* chunk = nullptr;
-                auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
+                auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
                 if (!rows || !chunk) {
                     state.done = false;
                     return true;
@@ -1587,7 +1593,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         ID3D12Resource* chunk = nullptr;
-        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
+        auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
         if (!rows || !chunk) {
             state.done = false;
             return true;
@@ -1603,7 +1609,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 u64 offset = 0;
                 ID3D12Resource* chunk = nullptr;
                 if (is_compact) {
-                    auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk);
+                    auto* const rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
                     if (!rows || !chunk) {
                         state.done = false;
                         return true;
@@ -1612,7 +1618,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     for (u64 y = 0; y < level.rows; ++y)
                         std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
                                     static_cast<std::size_t>(level.row_bytes));
-                } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
+                } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
                     state.done = false;
                     return true;
                 }
@@ -2057,7 +2063,7 @@ struct IndirectBufferView {
     u64 offset = 0, bytes = 0;
     UINT stride = 0;
     bool upload = false;
-    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory
+    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
 };
 
 // X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
@@ -2132,6 +2138,16 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
+    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
+    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
+    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+        u64 zero_offset = 0;
+        ID3D12Resource* zero_ring = nullptr;
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
+        if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
+        std::memset(zero_bytes, 0, 16);
+        return {zero_ring, zero_offset, 16, 0, true, 3};
+    }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
     if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
         ? "an input buffer range is over 16 MiB or not whole dwords"
@@ -2170,7 +2186,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 ID3D12Resource* ring = nullptr;
                 if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
                     return refuse("an input range in title memory is not readable");
-                if (!ring_copy(address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
                     return refuse("an input range could not be copied from title memory");
                 return {ring, ring_offset, bytes, stride, true, 2};
             } else {
@@ -2837,7 +2853,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
             ID3D12Resource* chunk = nullptr;
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(padded, &offset, &chunk) : nullptr;
+            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
@@ -2852,7 +2868,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         ID3D12Resource* chunk = nullptr;
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset, &chunk);
+        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
@@ -2870,7 +2886,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
             address = reinterpret_cast<u64>(identity);
             bytes = sizeof(identity);
-            have = frame_copy(address, bytes, &offset, &chunk);
+            have = frame_copy(self, address, bytes, &offset, &chunk);
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
@@ -2968,7 +2984,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         auto view = live_indices;
         if (live_index_resource) {
             require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
-        } else if (indices_ok && frame_copy(index_address, index_total, &offset, &index_chunk) && index_chunk) {
+        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         }

@@ -81,8 +81,10 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
+    (tree / "src").mkdir()
+    (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
     (tree / "tools" / "startup" / "run.ps1").write_text(STUB_RUN, encoding="utf-8")
     (tree / "tools" / "startup" / "gfx2hlsl.py").write_text((TRANSLATOR % (28, 28)), encoding="utf-8")
     git(tree, "init", "-q")
@@ -156,6 +158,7 @@ def check_shell(shell):
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
+        assert manifest["build_check"] == "same commit", manifest
         assert manifest["title_input_snapshot"] is True and manifest["env"].get("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT") == "1" \
             and manifest["env"].get("X2W_TRANSLATED_INDIRECT_COPY_RANGES") == "1", manifest["env"]
         assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)
@@ -234,18 +237,30 @@ def check_shell(shell):
         again = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert again.returncode == 0 and "2 translations were already present at start" in again.stdout, again.stdout
 
-        # A tracked change makes the checkout dirty: the build revision must carry -dirty to match.
-        pack = tree / "tools" / "startup" / "tester_pack.py"
-        pack.write_text(pack.read_text() + "\n# local edit\n")
+        # A tracked change in the runtime sources makes the checkout dirty: the build revision must carry -dirty to match.
+        device = tree / "src" / "device.cpp"
+        device.write_text(device.read_text() + "// local edit\n")
         dirty = run_script(shell, tree, "-NoBuild")
         assert dirty.returncode != 0 and head + "-dirty" in dirty.stdout + dirty.stderr, (dirty.stdout, dirty.stderr)
+        assert "local changes in the runtime sources (src/device.cpp)" in dirty.stdout, dirty.stdout
+        git(tree, "checkout", "-q", "--", "src")
+        # A local edit of the tools only: the build of HEAD is used as it is, and the summary and manifest say why.
+        pack = tree / "tools" / "startup" / "tester_pack.py"
+        pack.write_text(pack.read_text() + "\n# local edit\n")
+        tools_only = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
+        assert tools_only.returncode == 0 and "using the build: the build %s has the same runtime sources" % head in tools_only.stdout, \
+            (tools_only.stdout, tools_only.stderr)
 
-        # A new commit that leaves the shader revision alone keeps the warm cache.
+        # A new commit that leaves the shader revision alone keeps the warm cache. It changes only tools, so the build of
+        # the first commit is used without a rebuild (the tester pulled a tools fix).
         git(tree, "commit", "-q", "-am", "second")
         head2 = git(tree, "rev-parse", "--short=8", "HEAD")
-        rev_file.write_text(REV_CPP % head2, encoding="ascii")
         kept = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert kept.returncode == 0 and "2 translations were already present at start" in kept.stdout, kept.stdout
+        assert "the build %s has the same runtime sources as %s" % (head, head2) in kept.stdout, kept.stdout
+        manifest = json.loads(zipfile.ZipFile(sorted((tree / "out" / "tester").glob("report_%s_*.zip" % head2))[-1]).read("manifest.json").decode("utf-8-sig"))
+        assert manifest["build_commit"] == head and manifest["build_check"].startswith("the build %s" % head), manifest
+        rev_file.write_text(REV_CPP % head2, encoding="ascii")
 
         # A bumped revision gets its own, empty shader cache folder; the old one stays.
         translator = tree / "tools" / "startup" / "gfx2hlsl.py"
