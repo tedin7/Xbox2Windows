@@ -5,7 +5,7 @@ guarded by the thread's own exec bit. Anything that depends on the other lanes o
 (WaveSync in gfx2hlsl_engine.py); this module takes the gathered word as a variable name and never emits a gather or a
 barrier itself, so none of its statements can end up under a guard some thread skips.
 
-Range with scalar writes (rule 3b, the restore rule seen in #2603 by denn0x): a guest wave in which no lane is active
+Range with scalar writes (rule 3b, the restore rule seen in #2603): a guest wave in which no lane is active
 never runs the range, so every scalar the range writes reads as its pre-range value afterwards. Two lowerings, same answer:
   skip_flag   the range sits under `if (!skip)`; a skipped wave never assigns, so nothing needs restoring.
   run_restore every thread of the group runs the range with exec 0 for inactive lanes (a barrier or LDS access in the
