@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers of tools/startup/tester_run.ps1: the input preset, the manifest and the zip of one tester run.
 
-  tester_pack.py input-preset <menus|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
+  tester_pack.py input-preset <menus|menus2|raw script> <seconds>      print the X2W_INPUT_SCRIPT value
   tester_pack.py cache-tag <gfx2hlsl.py>                        print the translation revisions, e.g. 28-28-1
   tester_pack.py cache-stats <cache dir>                        print "<translated> <requests> <failed>"
   tester_pack.py first-poll <logdir>                            print when the title first polled the pad
@@ -27,6 +27,9 @@ MENUS_STEP_S = 6
 MENUS_END_S = 500          # the preset stops here however long the run is
 DPAD_DOWN = "80"           # GameInput button mask, hexadecimal
 BUTTON_A = "4"
+MENUS2_GAP_S = "1"         # between the presses of one cycle; the first press follows the previous wait by the same gap
+MENUS2_SETTLE_S = 2        # the picture must stay unchanged this long after it changed
+MENUS2_TIMEOUT_S = 90      # a screen that never changes (or loads slower) lets the script go on after this
 EXCLUDED_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
 SUMMARY_NAME = "debugger_summary.out"
 MANIFEST_KEYS = ("commit", "build_commit", "dirty", "seconds", "input_script", "env", "gpu", "gpu_driver",
@@ -36,9 +39,25 @@ MANIFEST_ROOM = 256 * 1024     # headroom per part for the manifest and zip book
 CHUNK_BYTES = 48 * 1024 * 1024  # a file larger than this is cut into numbered pieces
 
 
+def menus2_script():
+    """`menus2`: the same presses as `menus` (down, down, A), but after every A the script waits for the presented
+    picture to change and settle (docs/startup-runtime.md, "Waiting for the presented picture") before it presses again,
+    so nothing is pressed blind while a screen loads. Each press is timed from the previous item (`@+`). A wait that
+    times out logs it and the script goes on. Needs render mode, which tester_run.ps1 always uses. The cycle count fills
+    the entry limit; the run's own length ends the script."""
+    items = ["%s@%d" % (DPAD_DOWN, MENUS_START_S)]
+    cycle = ["%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S), "%s@+%s" % (BUTTON_A, MENUS2_GAP_S), "wait=%d/%d/go" % (MENUS2_SETTLE_S, MENUS2_TIMEOUT_S)]
+    while len(items) + 1 + len(cycle) <= MAX_ENTRIES:
+        items.append("%s@+%s" % (DPAD_DOWN, MENUS2_GAP_S))   # first down of the cycle
+        items.extend(cycle)
+    return ",".join(items)
+
+
 def input_preset(spec, seconds):
     """`menus` is D-pad down, D-pad down, A, one press every 6 s from 5 s after the first pad poll; entries run to
     `seconds` of script time, but not past 500 s, at most 256 entries. Anything else is a raw script."""
+    if spec == "menus2":
+        return menus2_script()
     if spec != "menus":
         if len(spec) > MAX_SCRIPT_CHARS:
             raise ValueError("input script longer than %d characters" % MAX_SCRIPT_CHARS)

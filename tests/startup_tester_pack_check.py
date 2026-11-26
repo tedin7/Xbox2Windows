@@ -39,6 +39,14 @@ def check_preset():
     assert len(long_menus) <= T.MAX_ENTRIES
     long_run = T.input_preset("menus", 100000).split(",")
     assert len(long_run) == len(range(5, 500, 6)) and len(",".join(long_run)) <= T.MAX_SCRIPT_CHARS
+    menus2 = T.input_preset("menus2", 600)
+    items2 = menus2.split(",")
+    assert len(items2) <= T.MAX_ENTRIES and len(menus2) <= T.MAX_SCRIPT_CHARS and items2[0] == "80@5"
+    assert menus2 == T.input_preset("menus2", 30), "menus2 does not depend on the run length"
+    assert items2[1:5] == ["80@+1", "80@+1", "4@+1", "wait=2/90/go"], "down, down, A, then wait for the new picture"
+    for n, item in enumerate(items2[1:]):
+        assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
+        assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"
     for bad in ("4@1," * 300, "x" * 5000):
         try:
