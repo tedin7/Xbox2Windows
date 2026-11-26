@@ -7367,12 +7367,16 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
+        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        if cube:
+            kinds[dim] = 'texcube'
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
-        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
+        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') or cube
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7546,6 +7550,14 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
+            elif cube:
+                # The address is S, T and the face index (RDNA 2 ISA, image_sample on a cube map; S and T come from
+                # v_cubesc / v_cubetc divided by |v_cubema| and offset by 1.5, v_cubeid is the face). The sample is
+                # taken from the TextureCube view at the direction those registers stand for (x2w_cube_dir).
+                if len(cs) != 3:
+                    raise Unsupported('image_sample on a cube map with %d address registers' % len(cs))
+                self.pipe.uses_cube_dir = True
+                uv = 'x2w_cube_dir(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             elif three:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
@@ -10529,6 +10541,7 @@ class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
     uses_gather_2d_lod = False
+    uses_cube_dir = False
     uses_store_d16_x = False
     uses_sad = ()
     uses_store_format_xyzw = False
@@ -10807,7 +10820,7 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
@@ -10849,6 +10862,20 @@ class Pipeline:
                 '    return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);',
                 '}',
             ))
+        if getattr(self, 'uses_cube_dir', False):
+            # The inverse of v_cubeid / v_cubesc / v_cubetc / v_cubema (LLVM ConstantFoldAMDGCNCubeIntrinsic, the same table
+            # as Stage.cube): the face index and S = sc / (2 |major|) + 1.5, T = tc / (2 |major|) + 1.5 give the direction.
+            out.extend((
+                'float3 x2w_cube_dir(float s, float t, float face) {',
+                '    float sc = 2.0f * s - 3.0f, tc = 2.0f * t - 3.0f;',
+                '    uint f = (uint)clamp(floor(face + 0.5f), 0.0f, 5.0f);',
+                '    if (f == 0u) return float3(1.0f, -tc, -sc);',
+                '    if (f == 1u) return float3(-1.0f, -tc, sc);',
+                '    if (f == 2u) return float3(sc, 1.0f, tc);',
+                '    if (f == 3u) return float3(sc, -1.0f, -tc);',
+                '    if (f == 4u) return float3(sc, -tc, 1.0f);',
+                '    return float3(-sc, -tc, -1.0f);',
+                '}'))
         if self.uses_gather_2d_lod:
             out.extend((
                 'float4 gather_2d_lod(Texture2D<float4> tex, float2 uv, float lod, uint component, float max_lod) {',
