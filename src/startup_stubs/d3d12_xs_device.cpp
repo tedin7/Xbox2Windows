@@ -7032,6 +7032,17 @@ void report_budget(ID3D12CommandQueue* queue)
             std::snprintf(text, sizeof(text), "%llu/%llu", info.CurrentUsage, info.Budget);
     };
     sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
+    if (residency_observe()) {
+        // Observation only (X2W_D3D12_RESIDENCY=1): how often the local group is over its budget at a heartbeat.
+        static LONG samples, over;
+        unsigned long long used_now = 0, budget_now = 0;
+        const bool have = std::sscanf(local, "%llu/%llu", &used_now, &budget_now) == 2 && budget_now;
+        if (have) {
+            InterlockedIncrement(&samples);
+            if (used_now > budget_now) InterlockedIncrement(&over);
+            log("x2w-residency pressure samples %ld, over budget %ld", samples, over);
+        }
+    }
     sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
     const auto counts = x2w_budget::snapshot();
     char text[640]{};
@@ -7238,6 +7249,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "

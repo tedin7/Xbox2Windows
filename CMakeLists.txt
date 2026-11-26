@@ -1428,6 +1428,17 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# Texture residency decision rules (src/startup_stubs/texture_residency.h, X2W_D3D12_RESIDENCY=1): pure logic, no GPU.
+# Each mutant switches one rule off and its case must then report the failure.
+add_executable(startup_texture_residency tests/startup_texture_residency.cpp)
+target_include_directories(startup_texture_residency PRIVATE src)
+target_compile_features(startup_texture_residency PRIVATE cxx_std_17)
+add_test(NAME startup_texture_residency COMMAND startup_texture_residency)
+foreach(mutant IN ITEMS ignore-in-flight ignore-unsafe no-pin early-complete)
+    add_test(NAME startup_texture_residency_mutant_${mutant} COMMAND startup_texture_residency ${mutant})
+    set_tests_properties(startup_texture_residency_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+
 # X2W_D3D12_RELEASE_RETIRED=1 frees the desktop object of a committed 2D texture only when no recorded list, no submission
 # and no release-time fence still refers to it (docs/startup-runtime.md#d3d12-resource-budget). The `off` case runs
 # without the switch and expects the lifetime of the budget fixture: every released resource stays retained.
