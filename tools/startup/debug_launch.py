@@ -28,6 +28,9 @@ nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
+
+CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run ends without it
+SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
 from window_capture import FILE_CAP, Series, pick_window, png_bytes  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
@@ -177,7 +180,8 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
     stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at the timeout
-    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file):  # a reused run directory starts clean
+    dump_request = os.path.join(logdir, "dump_request")  # created from outside (stall watchdog): write threads_stall.txt now
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file, dump_request):  # a reused run directory starts clean
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -221,6 +225,8 @@ def main():
                               ctypes.create_unicode_buffer(block), cwd, ctypes.byref(startup), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
+    with open(os.path.join(logdir, "title.pid"), "w", encoding="ascii") as handle:  # for the stall watchdog (CPU, hard end)
+        handle.write(str(pi.dwProcessId))
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
     k32.DebugSetProcessKillOnExit(True)
     k32.ResumeThread(wt.HANDLE(pi.hThread))
@@ -378,6 +384,10 @@ def main():
         return (f"[root {root:#x}]" if root else "") + text
 
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
+    # files.txt lists every file open (one flushed line each, a hit and a held-thread step per open: slow on a hard disk)
+    # only with --trace-files 1; without it the hooks stay for offline mode and files.txt keeps what is rare (DENIED,
+    # REDIRECT, VALLOC, LOG_AT) but not the plain opens.
+    log_files = opts.get("--trace-files") == "1"
     # --trace-calls 1: also break on gaming-runtime and movie-player calls. Every hit stops the whole
     # process, so these hooks are off by default; the movie-player report (bink_report) needs them.
     # The call hooks are armed with the file hooks, so without file tracing (--trace-files 1, or offline
@@ -626,6 +636,8 @@ def main():
                     struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
                     set_ctx(thread)
                     return True
+                if not log_files:
+                    desc = None   # a plain open: nothing to log, and no return breakpoint to arm
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -703,6 +715,25 @@ def main():
             handle.write("\n".join(lines) + "\n")
         return lines
 
+    def limited(step, *step_args, seconds=SHUTDOWN_STEP_SECONDS):
+        """Runs a step that can wait for ever (a thread dump on a thread that does not stop) on a thread of its own and
+        waits at most `seconds`. Returns its result, or None when it failed or did not finish (the summary says which)."""
+        box = []
+
+        def work():
+            try:
+                box.append(step(*step_args))
+            except Exception as error:  # diagnostics only
+                print(f"  {step.__name__} failed: {error}")
+                box.append(None)
+        worker = threading.Thread(target=work, name="limited-" + step.__name__, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        if worker.is_alive():
+            print(f"  {step.__name__} did not finish in {seconds:g} s: skipped")
+            return None
+        return box[0] if box else None
+
     watches = [(int(r, 16), int(n or "8", 16)) for r, _, n in
                (item.partition(":") for item in filter(None, os.environ.get("X2W_WATCH", "").split(",")))]
     watch_values, watch_next = {}, 0.0
@@ -720,6 +751,18 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
+    def window_text(user32, hwnd):
+        """WM_GETTEXT sent with a bound: a window thread held on a debug event cannot make the caller wait for ever."""
+        text = ctypes.create_unicode_buffer(128)
+        copied = ctypes.c_size_t(0)
+        user32.SendMessageTimeoutW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, ctypes.c_void_p, wt.UINT, wt.UINT,
+                                               ctypes.c_void_p]
+        user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+        if user32.SendMessageTimeoutW(wt.HWND(hwnd), 0x000D, 128, ctypes.addressof(text), 0x2, 1000,
+                                      ctypes.addressof(copied)):  # WM_GETTEXT, SMTO_ABORTIFHUNG
+            return text.value
+        return None
+
     def grab_window():
         """The title's window as (width, height, BGRA bytes, title text length), or the reason there is none.
 
@@ -732,9 +775,7 @@ def main():
             owner = wt.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
             if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
-                text = ctypes.create_unicode_buffer(128)
-                user32.GetWindowTextW(wt.HWND(hwnd), text, 128)
-                found.append((hwnd, text.value))
+                found.append((hwnd, window_text(user32, hwnd) or ""))
             return True
 
         user32.EnumWindows(proto(visit), 0)
@@ -768,20 +809,25 @@ def main():
             gdi32.DeleteObject(wt.HGDIOBJ(bitmap))
             gdi32.DeleteDC(wt.HDC(memory))
             user32.ReleaseDC(wt.HWND(hwnd), wt.HDC(source))
-        title = ctypes.create_unicode_buffer(128)
-        user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
-        return width, height, raw, len(title.value)
+        title = window_text(user32, hwnd)
+        return width, height, raw, len(title) if title is not None else "unavailable"
 
     def capture_window():
         """Saves what the title's window currently shows on screen (client area) as window.png."""
         frame = grab_window()
         if isinstance(frame, str):
-            print(f"  window capture: {frame}")
-            return
+            return f"  window capture: {frame}"
         width, height, raw, title_length = frame
         with open(os.path.join(logdir, "window.png"), "wb") as handle:
             handle.write(png_bytes(width, height, raw))
-        print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {title_length})")
+        return f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {title_length})"
+
+    def run_capture(result):
+        """Thread body: capture_window's report line goes to `result`, a failure too."""
+        try:
+            result.append(capture_window())
+        except Exception as error:  # diagnostics only
+            result.append(f"  window capture failed: {error}")
 
     # --capture-every: a thread of its own grabs the window, so a slow capture never delays the debug events.
     series = Series(logdir) if capture_every else None
@@ -816,13 +862,26 @@ def main():
         return status.page_free >> 20 if k32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
 
     headroom = HeadroomGuard(headroom_mib, free_commit_mib, warn_mib)
-    while not timeout or time.time() - start < timeout:
-        if time.time() >= stop_next:
-            stop_next = time.time() + 0.5
+    # The loop ends in two steps. At the timeout, the stop file, a commit-headroom stop or a debugger stop it
+    # enters the ending phase: the final window capture runs on a worker thread while this thread, the only one
+    # that may call WaitForDebugEvent, keeps serving events with the same handlers (breakpoints, offline
+    # refusals). Without that, a child thread held on an unserved event leaves the capture waiting for ever.
+    ending, end_time, final_thread, final_result = False, None, None, []
+    final_deadline = 0.0
+    while True:
+        now = time.time()
+        if not ending and timeout and now - start >= timeout:
+            ending = True
+        if not ending and now >= stop_next:
+            stop_next = now + 0.5
             if os.path.exists(stop_file):
                 stop_requested = True
-                log(f"{time.time() - start:7.3f} stop file found: ending the run")
-                break
+                log(f"{now - start:7.3f} stop file found: ending the run")
+                ending = True
+            if os.path.exists(dump_request):
+                os.remove(dump_request)
+                limited(dump_threads, os.path.join(logdir, "threads_stall.txt"))
+                log(f"{now - start:7.3f} threads dump requested from outside: threads_stall.txt")
             low = headroom.check(time.time())
             warning = headroom.take_warning()
             if warning:
@@ -830,6 +889,15 @@ def main():
             if low:
                 stop_requested, stop_reason = True, "commit headroom: " + low
                 log(f"{time.time() - start:7.3f} {stop_reason}: ending the run")
+                ending = True
+        if ending:
+            if end_time is None:
+                end_time = now
+                if exit_code is None:
+                    final_thread = threading.Thread(target=run_capture, args=(final_result,), daemon=True)
+                    final_thread.start()
+                    final_deadline = now + CAPTURE_LIMIT
+            if final_thread is None or not final_thread.is_alive() or now >= final_deadline:
                 break
         if dump_at and time.time() - start >= dump_at[0]:
             dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
@@ -978,11 +1046,12 @@ def main():
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
                 status = DBG_CONTINUE  # rip is already past the int3
-            elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
-                                                  main_base <= ex_addr < main_base + 0x10000000):
+            elif not ending and ((not first) or stop_first or (ex_code == 0x80000003 and main_base and
+                                                                main_base <= ex_addr < main_base + 0x10000000)):
                 stop = (ex_code, ex_addr, tid, first, params)
                 log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
-                break
+                ending = True  # this event stays unserved, so the stopped thread keeps its context
+                continue
             elif ex_code in (0x406D1388, 0x40010006):
                 status = DBG_CONTINUE
             else:
@@ -990,7 +1059,7 @@ def main():
         k32.ContinueDebugEvent(pid, tid, status)
 
     window.abandon()
-    elapsed = time.time() - start
+    elapsed = (end_time or time.time()) - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
     if stop:
@@ -1072,7 +1141,7 @@ def main():
     else:
         print(f"stopped by request after {elapsed:.2f} s ({stop_reason})" if stop_requested
               else f"timeout after {elapsed:.2f} s")
-        dumped = dump_threads(os.path.join(logdir, "threads.txt"))
+        dumped = limited(dump_threads, os.path.join(logdir, "threads.txt")) or []
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
             rva, _, size = item.partition(":")
             blob = read(main_base + int(rva, 16), int(size or "64", 16)) or b""
@@ -1119,14 +1188,19 @@ def main():
         print("  " + headroom.summary())
     if capture_thread:
         capture_done.set()
-        capture_thread.join(30)
+        capture_thread.join(SHUTDOWN_STEP_SECONDS)
         print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
-    if exit_code is None:
-        try:
-            capture_window()
-        except Exception as error:  # diagnostics only
-            print(f"  window capture failed: {error}")
+    if final_thread is not None and exit_code is None:
+        if final_result:
+            print(final_result[0])
+        elif final_thread.is_alive():
+            print(f"  window capture: timed out after {CAPTURE_LIMIT:g} s")
+    # The title ends here, whatever state its threads and window are in: the job, then the process itself, and check.
     k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0002)
+    if k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000) != 0:
+        k32.TerminateProcess(wt.HANDLE(pi.hProcess), 0xDEAD0003)
+        if k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 5000) != 0:
+            print("  the title process did not end after TerminateProcess")
     for h in (out, err, pi.hThread, pi.hProcess):
         k32.CloseHandle(wt.HANDLE(h))
     events.close()

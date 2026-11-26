@@ -168,6 +168,32 @@ struct Layout {
     UINT columns(UINT mip) const { return ((std::max)(1u, width >> mip) + texels - 1) / texels; }
     UINT rows(UINT mip) const { return ((std::max)(1u, height >> mip) + texels - 1) / texels; }
     std::uint64_t bytes() const { return slice_size * slices; }
+    // Bytes from the start of the texture to the end of the last element any mip of the last slice holds. A texture
+    // smaller than its block (a 16x4 texture in a 4 KiB block) is read only up to here; the block's padding past it is
+    // never addressed, so it does not have to be mapped. Never more than bytes().
+    std::uint64_t used_bytes() const
+    {
+        std::uint64_t extent = 0;
+        for (UINT mip = 0; mip < mips; ++mip) {
+            const UINT w = columns(mip), h = rows(mip);
+            std::uint64_t end = 0;
+            if (mip >= first_tail) {
+                for (UINT y = 0; y < h; ++y)
+                    for (UINT x = 0; x < w; ++x) end = (std::max)(end, address(mip, x, y, 0));
+            } else {
+                // The last block in row-major order holds the highest address; inside it the x and y bits are disjoint,
+                // so the highest address is the highest x contribution plus the highest y contribution.
+                const UINT last_x = (w - 1) % block_width, last_y = (h - 1) % block_height;
+                std::uint64_t most_x = 0, most_y = 0;
+                for (UINT x = 0; x <= last_x; ++x) most_x = (std::max)(most_x, std::uint64_t{x_bits[x]});
+                for (UINT y = 0; y <= last_y; ++y) most_y = (std::max)(most_y, std::uint64_t{y_bits[y]});
+                const std::uint64_t block = std::uint64_t{(h - 1) / block_height} * blocks_wide[mip] + (w - 1) / block_width;
+                end = start[mip] + block * block_bytes + most_x + most_y;
+            }
+            extent = (std::max)(extent, end + bytes_per_element);
+        }
+        return (std::min)(slice_size, extent) + slice_size * (slices - 1);
+    }
 
     // Byte offset of element (x, y) of a mip of a slice from the start of the texture.
     std::uint64_t address(UINT mip, UINT x, UINT y, UINT slice) const

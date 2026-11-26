@@ -271,6 +271,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME xmem_lazy_commit_off COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_commit_check.py" "$<TARGET_FILE:xmem_shim>" off)
     set_tests_properties(xmem_lazy_commit_off PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=0")
+    # probe_readable on untouched lazy pages commits ahead instead of faulting once per 64 KiB slot.
+    add_executable(probe_readable_lazy_check tests/probe_readable_lazy_check.cpp)
+    target_include_directories(probe_readable_lazy_check PRIVATE src)
+    target_compile_features(probe_readable_lazy_check PRIVATE cxx_std_17)
+    add_dependencies(probe_readable_lazy_check xmem_shim)
+    add_test(NAME probe_readable_lazy COMMAND probe_readable_lazy_check "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(probe_readable_lazy PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     add_test(NAME xmem_lazy_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_startup_check.py" "$<TARGET_FILE:xmem_shim>")
     set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE
@@ -567,6 +574,8 @@ target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_build_rev)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
+# Linker map of our own DLL beside it: tester_run packs its function table so a thread-snapshot frame d3d12_xs.dll+0xNNNN gets a name.
+target_link_options(d3d12_xs_shim PRIVATE "/MAP:$<TARGET_FILE_DIR:d3d12_xs_shim>/d3d12_xs.map")
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Exactly what tools/startup/run.ps1 copies next to the title (xmem, d3d12_xs, AcpHal, XCRDAPI, chad, xapu, xg_xs and
@@ -842,6 +851,20 @@ add_test(NAME startup_storage_failure_counts COMMAND startup_storage_failure_cou
 add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_storage_failure_counts --mutate one-bucket)
 set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
+# HDD mode of the stand-in (X2W_STORAGE_HDD=1): the read plan (order, merging, limits) as pure logic, and the real
+# queue with the mode on (merged prefetch reads serve 47 of 48 shuffled requests) and off (48 reads), bytes identical.
+add_executable(startup_dstorage_read_plan tests/startup_dstorage_read_plan_check.cpp)
+target_compile_features(startup_dstorage_read_plan PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_read_plan PRIVATE src)
+add_test(NAME startup_dstorage_read_plan COMMAND startup_dstorage_read_plan)
+add_executable(startup_dstorage_hdd_queue tests/startup_dstorage_hdd_queue.cpp)
+target_compile_features(startup_dstorage_hdd_queue PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_hdd_queue PRIVATE src)
+target_link_libraries(startup_dstorage_hdd_queue PRIVATE psapi)
+add_test(NAME startup_dstorage_hdd_queue_on COMMAND startup_dstorage_hdd_queue on)
+add_test(NAME startup_dstorage_hdd_queue_off COMMAND startup_dstorage_hdd_queue off)
+add_test(NAME startup_dstorage_hdd_forget COMMAND startup_dstorage_hdd_queue forget)
+set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off startup_dstorage_hdd_forget PROPERTIES TIMEOUT 60)
 # Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
 # page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
 # compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
@@ -1288,6 +1311,17 @@ set_tests_properties(startup_dump_fence_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DR
 add_test(NAME startup_dump_fence_removed_control_warp COMMAND startup_dump_fence_check --mutate removed)
 set_tests_properties(startup_dump_fence_removed_control_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45
     WILL_FAIL TRUE)
+
+# Per-draw texel history: three source-built draws where only the second covers the watched texel,
+# then a control without that draw. The report must name draw 2 and leave the texel black in the control.
+add_executable(startup_pixel_history tests/startup_pixel_history.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_pixel_history PRIVATE cxx_std_17)
+target_include_directories(startup_pixel_history PRIVATE src)
+target_link_libraries(startup_pixel_history PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_pixel_history_warp COMMAND startup_pixel_history)
+set_tests_properties(startup_pixel_history_warp PROPERTIES TIMEOUT 60)
+add_test(NAME startup_pixel_history_hardware COMMAND startup_pixel_history hardware)
+set_tests_properties(startup_pixel_history_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
 add_executable(startup_typed_buffer_view tests/startup_typed_buffer_view.cpp)
 target_compile_features(startup_typed_buffer_view PRIVATE cxx_std_17)
@@ -2204,6 +2238,16 @@ set_tests_properties(startup_present_view_identity_control startup_present_view_
 set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Buffer memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_buffer.h); the mutated
 # runs are negative controls.
+# Translation manifests are read by a background thread, never with draw_lock held (src/startup_stubs/manifest_prefetch.h);
+# the mutated run opens the file inside the draw-path call and must fail the lock-hold measurement.
+add_executable(startup_manifest_prefetch_check tests/startup_manifest_prefetch_check.cpp)
+target_include_directories(startup_manifest_prefetch_check PRIVATE src)
+target_compile_features(startup_manifest_prefetch_check PRIVATE cxx_std_17)
+add_test(NAME startup_manifest_prefetch COMMAND startup_manifest_prefetch_check)
+add_test(NAME startup_manifest_prefetch_open_under_lock_control COMMAND startup_manifest_prefetch_check --mutate open-under-lock)
+set_tests_properties(startup_manifest_prefetch_open_under_lock_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_manifest_prefetch_retry_under_lock_control COMMAND startup_manifest_prefetch_check --mutate retry-under-lock)
+set_tests_properties(startup_manifest_prefetch_retry_under_lock_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
@@ -4179,6 +4223,17 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_dpp_quad_flow_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # A DPP16 quad min inside an if (EXEC narrowed by s_and_saveexec): the contract of a lane-exact EXEC model (a disabled
+    # source lane is invalid, BOUND_CTRL decides), drawn by hand-written HLSL against a CPU reference; reading the disabled
+    # neighbour and the other BOUND_CTRL rule must fail; the translator's lowering is drawn once it produces one.
+    add_test(NAME startup_gfx2hlsl_dpp_quad_inactive COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_inactive_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_quad_inactive_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_inactive_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_dpp_quad_inactive_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lowers DPP16 quad swaps (quad_perm [1,0,3,2], [2,3,0,1], [3,2,1,0]) in a pixel stage to QuadReadAcross*.
     add_test(NAME startup_gfx2hlsl_dpp_quad_swap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_check.py")
@@ -4712,6 +4767,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_commit_headroom_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_commit_headroom_check.py")
     set_tests_properties(startup_commit_headroom_check PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_stall_watchdog_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stall_watchdog_check.py")
+    set_tests_properties(startup_stall_watchdog_check PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -11647,3 +11705,10 @@ foreach(i RANGE 0 ${X2W_SLOW_TEST_COSTS_LAST} 2)
         set_tests_properties(${slow_name} PROPERTIES COST ${slow_cost})
     endif()
 endforeach()
+
+# GPU time probe (src/startup_stubs/gpu_time_probe.h): per-frame arithmetic, and the timestamp stamps on WARP.
+add_executable(gpu_time_probe_check tests/gpu_time_probe_check.cpp)
+target_include_directories(gpu_time_probe_check PRIVATE src)
+target_compile_features(gpu_time_probe_check PRIVATE cxx_std_17)
+target_link_libraries(gpu_time_probe_check PRIVATE d3d12 dxgi)
+add_test(NAME gpu_time_probe COMMAND gpu_time_probe_check)

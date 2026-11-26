@@ -1,0 +1,1 @@
+tests/startup_gfx2hlsl_wave_reduce_check.py binary llvm-mc-15
