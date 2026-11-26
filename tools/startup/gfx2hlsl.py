@@ -3496,7 +3496,7 @@ class Stage:
         self.uses_quad_vote = False
         # A pixel program with a wave-wide read (a whole-wave reduction) and only forward branches decides every EXEC / VCC
         # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
-        # pilot active-lane model, C1..C5). Programs without such a read keep their per-thread branches.
+        # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or self.skipped_scalar_read_later(branches)))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
