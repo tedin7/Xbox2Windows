@@ -4661,6 +4661,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    # The stall watchdog ends a run hosted by debug_launch.py through its stop file (a hand kill of a debugged title can fail).
+    add_test(NAME startup_stall_watchdog_debug_launch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stall_watchdog_debug_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_stall_watchdog_debug_launch PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     # The debugger's function hooks and concurrent calls (#1281): the step window's bookkeeping, then two
     # threads through one hooked function with the other thread held for each step, and without.
     add_test(NAME startup_hook_window COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py")
