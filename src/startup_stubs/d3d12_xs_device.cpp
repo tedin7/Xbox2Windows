@@ -4867,6 +4867,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
                                      tail ? tail->GetCPUDescriptorHandleForHeapStart().ptr : 0});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
+    if (supplied_memory) replay_record::remember_heap_pages(supplied_memory, bytes);
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;
     note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
               title_memory, desktop,

@@ -1904,7 +1904,20 @@ Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 *
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 15. Version 3: `CALL` holds eleven
 argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
-Float argument values, title memory pages the GPU reads and the device creation are not recorded yet.
+Float argument values and the device creation are not recorded yet.
+
+`X2W_REPLAY_TITLE_RANGES=1` adds committed private title memory named by root CBV, SRV and UAV addresses
+(up to 64 KiB from each address) and by CBV descriptors (using `SizeInBytes`). It also adds the CPU backing of
+descriptor heaps, including supplied memory and stand-in allocations whose CPU start the title has queried.
+The recorder scans before root setters, draws, dispatch, indirect execution, resource and descriptor copies, and queue
+submission. Each snapshot uses the preceding sequence number, so the player applies it before the call that
+can read the bytes. In this mode call-time scans also collect placed ranges within the window. Prefix descriptor
+copies can capture named ranges before the window opens. The regular page and scan budgets still apply, and
+`X2W_REPLAY_PAGES=0` disables page recording. The switch reuses format 3 `PAGE` and `MAP` chunks.
+
+`startup_replay_title_ranges_warp` uses an 8 KiB constant buffer in a plain allocation and alternates the colour
+at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
+must match the original pictures with the switch enabled and differ when the switch is off.
 
 `X2W_PRESENT_PICTURES=<dir>` writes plane 0's surface at every present to `<dir>\present_<nnnn>.png` (n: the
 present's number; RGBA8, BGRA8/X8 and RGB10A2 surfaces). The copy is waited for on the presenting queue, so it costs a

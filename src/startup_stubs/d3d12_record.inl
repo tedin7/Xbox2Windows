@@ -6,8 +6,8 @@
 //
 // Each thread appends to its own buffer (no lock shared between title threads per call: a shared lock would serialise
 // them and hide the cost being recorded); full buffers are written under the file lock. Calls are ordered by a global
-// sequence number taken before the call; nothing else runs before the real slot, so float arguments in xmm registers
-// reach it unchanged (their values are not recorded yet).
+// sequence number taken before the call. The opt-in page scan only runs before slots without float arguments.
+// Float arguments in xmm registers reach the real slot unchanged (their values are not recorded yet).
 //
 // File: the capture chunk framing (tag, header bytes, data bytes). XREC (version, timer frequency), CALL, ARGM (argument
 // memory: seq, arg, address, bytes, blob hash), BLOB (hash, bytes; once per content), OUTP (seq, arg, the pointer an
@@ -235,7 +235,10 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
 }
 
 void stop(bool at_exit);
-inline void pages_at_submit(ThreadBuffer& b, u64 seq);  // d3d12_record_pages.inl
+bool extra_title_pages;  // set before installing the recording thunks
+void remember_heap_start(u64 object, u64 second);
+u64 pages_before_call(bool root, u64 address);
+void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
 __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6,
@@ -247,20 +250,22 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
     if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
-    // Nothing but the sequence number (an interlocked instruction) before the real call.
-    const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
-    // ExecuteCommandLists takes no float arguments, so the page scan may run before it.
-    if constexpr (K == queue_kind && N == 10) {
-        if (window_open) {
-            ThreadBuffer& b = my_buffer();
-            AcquireSRWLockExclusive(&b.lock);
-            pages_at_submit(b, seq - 1);
-            ReleaseSRWLockExclusive(&b.lock);
-        }
-    }
+    // These slots have no floating-point arguments. The opt-in snapshot precedes any title-memory reads.
+    constexpr bool root = K == list_kind && N >= 41 && N <= 46;
+    constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
+                                    (K == device_kind && (N == 23 || N == 24)) || (K == queue_kind && N == 10);
+    u64 seq;
+    if constexpr (consumes_pages)
+        seq = extra_title_pages ? pages_before_call(root, r8) : static_cast<u64>(InterlockedIncrement64(&next_seq));
+    else
+        seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    if constexpr (K == device_kind && N == 17)
+        if (extra_title_pages) remember_cbv_pages(rdx);
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     const u64 args[call_args] = {rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7};
     record_call(K, N, seq, rcx, args, ret);
+    if constexpr (K == descriptor_heap_kind && N == 9)
+        if (extra_title_pages) remember_heap_start(rcx, rdx);
     if (stop_requested) stop(false);  // after the window's last present: that Present call is in the file
     return ret;
 }
@@ -400,8 +405,10 @@ void present()
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (window_open && !was_open) pages_at_window_open(b, seq, present);
-        else if (window_open) pages_at_present(b, seq, present);
+        if (!extra_title_pages) {
+            if (window_open && !was_open) pages_at_window_open(b, seq, present);
+            else if (window_open) pages_at_present(b, seq, present);
+        }
         ReleaseSRWLockExclusive(&b.lock);
     }
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
@@ -490,6 +497,9 @@ void install()
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
     write_raw(head.data(), head.size());
+    char ranges[8]{}, pages[8]{};
+    extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
+        !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
     armed = true;
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
