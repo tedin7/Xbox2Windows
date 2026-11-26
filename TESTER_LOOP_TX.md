@@ -33,6 +33,14 @@ Gate = the independent check recorded before the PR was closed.
 | #2793 buffer_store_format index bound without a division | `3f1f05bd6` | merged | clean | none (stopped) |
 | #2796 mesh parameter exports and pixel reads up to param31 | `ca2881a4e` | merged | clean | none (stopped) |
 
+## Stage branches (other PRs closed on 2026-11-24 to 26)
+
+| Branch | Head | What it brings here |
+|---|---|---|
+| `tx-stage-26` | `96e51beaf` | #2786 (slot 57 mesh buffer reads). Its #1951 duplicates #1408, already on `tester-loop`: `debug_launch.py` keeps #1408's hold-and-step; #1951's `step_gate.py`, its check and CI line are dropped |
+| `tx-stage-25` | `365b33319` | #2067, #2048, #1726 (merged clean) |
+| `tx-stage-24` | `0435d6c8b` | nothing new: #1801 is the older copy of #1939 (kept as on `tester-loop`); #1170's concurrency block is already in main's `windows.yml` |
+
 ## Checks
 
 - Linux: every `tests/startup_gfx2hlsl_*_check.py` (136) on the branch head; the two that need Windows arguments
