@@ -2539,8 +2539,8 @@ These are measured on one executable; treat them as hypotheses for others.
   cache of at most 64 MiB (`dstorage_read_cache.h`, unused entries dropped after 20 s) and the worker's own file read takes the bytes from
   the cache first. Entries still run in order, so a cache miss only costs speed. A third line, `x2w-dstorage hdd <n> s: cache hits ... misses ...;
   prefetch groups ..., disk reads saved by merging ...`, shows what it did. `startup_dstorage_read_plan` tests the plan;
-  `startup_dstorage_hdd_queue_on` / `_off` run 48 shuffled requests through the real queue and compare every byte (on: 47 cache hits, one
-  merged read; off: 48 reads).
+  `startup_dstorage_hdd_queue_on` / `_off` run 48 shuffled requests through the real queue and compare every byte (on: 47 cache hits, a few
+  merged reads; off: 48 reads).
 - **DirectStorage page-request ends (#1198).** After the failure causes, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: page requests by end against the first 64 KiB page` with
   `inside-completed`, `inside-failed`, `at-page-end-completed`, `at-page-end-failed`,

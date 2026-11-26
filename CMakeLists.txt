@@ -843,7 +843,7 @@ add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_
 set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
 # HDD mode of the stand-in (X2W_STORAGE_HDD=1): the read plan (order, merging, limits) as pure logic, and the real
-# queue with the mode on (one merged prefetch read serves 47 of 48 shuffled requests) and off (48 reads), bytes identical.
+# queue with the mode on (merged prefetch reads serve 47 of 48 shuffled requests) and off (48 reads), bytes identical.
 add_executable(startup_dstorage_read_plan tests/startup_dstorage_read_plan_check.cpp)
 target_compile_features(startup_dstorage_read_plan PRIVATE cxx_std_17)
 target_include_directories(startup_dstorage_read_plan PRIVATE src)
