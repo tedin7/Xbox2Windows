@@ -5,7 +5,8 @@ startup_replay_quad draws 300 presents with X2W_REPLAY_RECORD=all and a 1 MiB ca
   - the scene still runs to the end (recording never stops the title);
   - the file is well formed and ends with its XEND, holding fewer presents than were drawn;
   - the file stays near the cap (cap + one thread buffer + the shader cache files);
-  - the log says the cap was reached.
+  - the log says the cap was reached;
+  - "slow" opens its window at the first present after a pause, and that file ends with its XEND too.
 Also printed, not checked (timing on a shared machine): the same 300 presents plain, with the window closed
 (X2W_REPLAY_RECORD=f100000,1: every slot wrapped, nothing recorded) and recorded without a cap.
 
@@ -79,6 +80,16 @@ def main(scene, backend):
         assert presents < PRESENTS, "the capped file holds every present (%d): the cap did not stop it" % presents
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
+
+        # "slow": the window opens at the first present after a gap of 300 ms or more (a 400 ms pause before frame 15:
+        # present 16), lasts 0.15 s, and the file ends with its XEND.
+        slow = directory / "slow.x2wr"
+        code, text, _ = timed(args + [30], dict(env, X2W_REPLAY_RECORD="slow,0,300,0.15,60", X2W_REPLAY_RECORD_FILE=str(slow),
+                                               X2W_TEST_REPLAY_PAUSE="15,400"))
+        assert code == 0, text[-3000:]
+        opened = [line for line in text.splitlines() if "x2w-replay record: window opens at" in line]
+        assert len(opened) == 1 and "present 16 (first slowdown" in opened[0], opened or text[-3000:]
+        end_presents(slow)
 
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),

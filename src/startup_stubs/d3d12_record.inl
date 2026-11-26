@@ -39,6 +39,13 @@ u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with
 // Read by every wrapped slot before it calls the real one: a plain load, so nothing touches the xmm registers that carry
 // float arguments. present() keeps it current (the window is checked per present).
 bool volatile window_open;
+// Before the window (a timed window, not "all"): the calls that make the state the window's calls name are recorded
+// too, so a replay of a mid-game window knows every object: see prefix_slot. Cleared when the window opens.
+bool volatile prefix_open;
+// "slow": the window opens at the first present after slow_after_s whose gap to the previous present is at least
+// slow_gap_s, or at slow_fallback_s; it lasts slow_seconds.
+bool slow_mode;
+double slow_after_s = 120, slow_gap_s = 0.5, slow_seconds = 10, slow_fallback_s = 180, last_present_s = -1;
 
 struct ThreadBuffer {
     SRWLOCK lock = SRWLOCK_INIT;
@@ -107,6 +114,16 @@ bool in_window()
 void update_window()
 {
     window_open = in_window();
+    if (window_open) prefix_open = false;
+}
+
+// The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
+// GPU addresses, fence and queue signals, and every object's QueryInterface/AddRef/Release.
+constexpr bool prefix_slot(int kind, int slot)
+{
+    return kind == device_kind || slot <= 2 || (kind == descriptor_heap_kind && (slot == 9 || slot == 10)) ||
+           (kind == resource_kind && (slot == 8 || slot == 9 || slot == 11)) || (kind == fence_kind && slot == 10) ||
+           (kind == queue_kind && slot == 14);
 }
 
 u64 content_hash(const unsigned char* data, std::size_t bytes)
@@ -212,7 +229,7 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     // the home area; a slot reads only what it declares). The first seven are recorded.
     using Slot = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     const auto call = reinterpret_cast<Slot>(original[K][N]);
-    if (!window_open) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
+    if (!window_open && !(prefix_slot(K, N) && prefix_open)) return call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
     // Nothing but the sequence number (an interlocked instruction) before the real call.
     const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
     const u64 ret = call(rcx, rdx, r8, r9, s0, s1, s2, s3, s4, s5, s6, s7);
@@ -264,7 +281,8 @@ void flush_all(bool at_exit)
 
 // SHDR chunks: every file directly in X2W_SHADER_CACHE (requests and translations), header = its name (UTF-8), data =
 // its bytes, so a replay on another machine has the translations this run had. Files over 16 MiB, and the files after
-// 512 MiB in total, are left out (counted in the log). file_lock held.
+// 512 MiB in total, are left out (counted in the log). At process exit (DllMain, loader lock held) it stops after 5 s
+// so a large cache cannot hold the exit up. file_lock held.
 void write_shader_cache(bool at_exit)
 {
     wchar_t dir[MAX_PATH];
@@ -277,11 +295,12 @@ void write_shader_cache(bool at_exit)
     if (find == INVALID_HANDLE_VALUE) return;
     constexpr u64 file_max = 16ull << 20, total_max = 512ull << 20;
     u64 files = 0, total = 0, left_out = 0;
+    const ULONGLONG deadline = GetTickCount64() + (at_exit ? 5000 : 120000);
     std::vector<unsigned char> chunk;
     do {
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         const u64 size = (static_cast<u64>(found.nFileSizeHigh) << 32) | found.nFileSizeLow;
-        if (size > file_max || total + size > total_max) {
+        if (size > file_max || total + size > total_max || GetTickCount64() > deadline) {
             ++left_out;
             continue;
         }
@@ -316,7 +335,7 @@ void stop(bool at_exit)
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
-    if (!at_exit) write_shader_cache(false);  // never inside DllMain: thousands of file reads under the loader lock
+    write_shader_cache(at_exit);
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
@@ -338,6 +357,16 @@ void present()
     if (!armed || stopped) return;
     const LONG present = InterlockedIncrement(&presents);
     const bool was_open = window_open;
+    if (slow_mode && end_s >= 1e300) {
+        const double t = seconds_now(), gap = last_present_s < 0 ? 0 : t - last_present_s;
+        last_present_s = t;
+        if (t >= slow_after_s && (gap >= slow_gap_s || t >= slow_fallback_s)) {
+            start_s = t;
+            end_s = t + slow_seconds;
+            log("x2w-replay record: window opens at %.1f s, present %ld (%s, gap %.0f ms) for %.0f s", t, present,
+                gap >= slow_gap_s ? "first slowdown" : "fallback time", gap * 1000, slow_seconds);
+        }
+    }
     update_window();
     if (window_open || present == first_present) {
         ThreadBuffer& b = my_buffer();
@@ -352,14 +381,25 @@ void present()
     if (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)) InterlockedExchange(&stop_requested, 1);
 }
 
-// X2W_REPLAY_RECORD: all | <start s>,<seconds> | f<first present>,<presents>. Reads it, opens the file and wraps the
-// slots; build_tables calls it last. Unset: nothing changes.
+// X2W_REPLAY_RECORD: all | <start s>,<seconds> | f<first present>,<presents> | slow[,<after s>,<gap ms>,<seconds>,
+// <fallback s>] (default slow,120,500,10,180). Reads it, opens the file and wraps the slots; build_tables calls it
+// last. Unset: nothing changes.
 void install()
 {
     char value[64]{};
     const DWORD n = GetEnvironmentVariableA("X2W_REPLAY_RECORD", value, sizeof(value));
     if (!n || n >= sizeof(value)) return;
-    if (value[0] == 'f') {
+    if (std::strncmp(value, "slow", 4) == 0) {
+        double after = slow_after_s, gap_ms = slow_gap_s * 1000, seconds = slow_seconds, fallback = slow_fallback_s;
+        if (value[4] && (value[4] != ',' || std::sscanf(value + 5, "%lf,%lf,%lf,%lf", &after, &gap_ms, &seconds, &fallback) != 4 ||
+                         after < 0 || gap_ms <= 0 || seconds <= 0 || fallback < after)) {
+            log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (slow | slow,<after s>,<gap ms>,<seconds>,<fallback s>)", value);
+            return;
+        }
+        slow_mode = true;
+        slow_after_s = after, slow_gap_s = gap_ms / 1000, slow_seconds = seconds, slow_fallback_s = fallback;
+        start_s = 1e300;  // closed until the trigger sets it
+    } else if (value[0] == 'f') {
         long first = 0, count = 0;
         if (std::sscanf(value + 1, "%ld,%ld", &first, &count) != 2 || first < 0 || count <= 0) {
             log("x2w-replay record: X2W_REPLAY_RECORD=%s not understood (all | <start s>,<seconds> | f<present>,<presents>)", value);
@@ -425,6 +465,7 @@ void install()
     }
     write_raw(head.data(), head.size());
     armed = true;
+    prefix_open = std::strcmp(value, "all") != 0;
     update_window();
     wrap_all(std::make_index_sequence<kind_count>{});
     log("x2w-replay record: on (%s) -> %s", value, path);
