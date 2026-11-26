@@ -2592,11 +2592,60 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'descnum' and len(s) == 3:
+                return self.descriptor_number(self.descriptor_number_node(s))
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
+
+    @staticmethod
+    def descriptor_number_node(symbol):
+        kind, node = symbol[1:]
+        if kind in ('stride', 'stride_min1'):
+            stride = ('alu', '({0} >> 16) & 0x3fffu', (node[:4],))
+            return ('alu', 'max({0}, 1u)', (stride,)) if kind == 'stride_min1' else stride
+        return node
+
+    def descriptor_number(self, node, budget=None):
+        """Materialize an immutable descriptor expression only when a numeric consumer needs it."""
+        if budget is None:
+            budget = [128]
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise Unsupported('descriptor numeric expression exceeds 128 operations and operands')
+        kind, *args = node
+        if kind == 'alu':
+            template, operands = args
+            return '(' + template.format(*(self.descriptor_number(word, budget) for word in operands)) + ')'
+        if kind == 'value':
+            return args[0]
+        if kind == 'desc':
+            source, offset, word = args
+            if (getattr(self, 'kind', None) in ('ps', 'vs') and source[0] == 'table' and 0 <= source[1] < 16
+                    and offset is not None and offset % 4 == 0 and 0 <= offset + 4 * word <= 0x7ffffffc):
+                return 'ud%d' % self.pipe.ud(('descword', source[1], offset + 4 * word))
+            if getattr(self, 'kind', None) == 'cs' and source[0] == 'table' and offset is not None and word % 4 == 3:
+                key = source, offset + 4 * (word - 3)
+                self.pipe.resource(key, 'buf')
+                return 'ud%d' % self.pipe.ud(('descword3', self.srv_index(key)))
+            raise Unsupported('cannot materialize descriptor word %d from %s at %s' % (word, source, offset))
+        raise Unsupported('cannot materialize descriptor number from %s' % args[0])
+
+    def descriptor_alu(self, template, sources, symbols):
+        operands = []
+        for token, symbol in zip(sources, symbols):
+            if symbol and symbol[0] == 'desc' and names_one_value(symbol):
+                node = symbol[:4]
+            elif symbol and symbol[0] == 'descnum' and len(symbol) == 3:
+                node = self.descriptor_number_node(symbol)
+            elif (symbol and symbol[0] in ('const', 'ud')) or self.const_u32(token) is not None:
+                node = ('value', self.u(token))
+            else:
+                node = ('unavailable', '%s holding %s' % (token, symbol))
+            operands.append(node)
+        return ('descnum', 'alu', ('alu', template, tuple(operands)))
 
     def note_whole_read(self, reg):
         if reg in self.low16_only_v:
@@ -2798,8 +2847,10 @@ class Stage:
         elif getattr(self, 'vcc_lost', False):
             raise Unsupported('vcc read after a descriptor load into s106/s107')
 
-    def mark_vcc_descriptor(self):
+    def mark_vcc_descriptor(self, extended=False):
         self.vcc_lost = True
+        self.vcc_constant_pair = False
+        self.vcc_descriptor_extended = extended
         self.vcc_descriptor_overwritten = False
         if getattr(self, 'has_branches', False):
             value = tuple(self.sym[i] for i in (106, 107))
@@ -2814,6 +2865,11 @@ class Stage:
             if assignment:
                 if getattr(self, 'has_branches', False):
                     self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
+                if getattr(self, 'vcc_constant_pair', False):
+                    self.vcc_constant_pair = False
+                    if not getattr(self, 'has_branches', False):
+                        self.sym.pop(106, None)
+                        self.sym.pop(107, None)
                 if getattr(self, 'vcc_lost', False):
                     # The scalar symbols are provisional across branches, checked after translation.
                     self.vcc_lost = False
@@ -2853,7 +2909,8 @@ class Stage:
 
     def check_vcc_paths(self):
         """An overlapping descriptor must reach its use on every path, and VCC must be numeric at a mask read."""
-        if not self.has_branches or not any(event == 'load_descriptor' for events in self.vcc_events.values()
+        if not self.has_branches or not any(event in ('load_descriptor', 'read_null_descriptor')
+                                           for events in self.vcc_events.values()
                                            for event, _ in events):
             return
         offsets = [off for off, _, _ in self.blocks]
@@ -2872,13 +2929,13 @@ class Stage:
                 continue
             seen.add((block, state))
             for event, value in by_block[block]:
-                if event == 'read_vcc' and state is not None:
+                if event == 'read_vcc' and state is not None and state[0] == 'load_descriptor':
                     raise Unsupported('vcc read after a descriptor load into s106/s107')
-                if event == 'read_descriptor':
-                    if state is None or any(state[reg] != symbol for reg, symbol in value):
+                if event in ('read_descriptor', 'read_null_descriptor'):
+                    if state is None or any(state[1][reg] != symbol for reg, symbol in value):
                         raise Unsupported('descriptor operand overlaps s106/s107 without a matching load on every path')
-                if event == 'load_descriptor':
-                    state = value
+                if event in ('load_descriptor', 'load_constant_descriptor'):
+                    state = (event, value)
                 elif event == 'write_vcc':
                     state = None
             term = self.blocks[block][2]
@@ -3014,20 +3071,31 @@ class Stage:
         if scc:
             self.set_scc(scc.replace('$', 's%d' % n))
 
-    def descriptor(self, tok):
-        """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
+    def descriptor(self, tok, *, allow_null=True):
+        """Return (source, byte offset) for a resource operand, or None for a proven null resource."""
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
         if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
             if getattr(self, 'has_branches', False):
                 expected = tuple((i - 106, self.sym.get(i)) for i in range(max(106, r[1]), min(107, r[2]) + 1))
-                self.vcc_events.setdefault(self.pc, []).append(('read_descriptor', expected))
+                event = 'read_null_descriptor' if allow_null and self.null_descriptor(tok) else 'read_descriptor'
+                self.vcc_events.setdefault(self.pc, []).append((event, expected))
             elif getattr(self, 'vcc_descriptor_overwritten', False):
                 raise Unsupported('descriptor operand %s overlaps a redefined vcc' % tok)
         if r == ('s', 104, 107) and s and s[0] == 'desc' and (
                 s[3] % 4 or
                 any(self.sym.get(104 + i) != desc_word(s, s[3] + i) for i in range(1, 4))):
             raise Unsupported('descriptor operand %s needs four consecutive words of the same descriptor' % tok)
+        if r == ('s', 100, 107) and getattr(self, 'vcc_descriptor_extended', False) and s and s[0] == 'desc':
+            for i in (6, 7):
+                word = self.sym.get(100 + i)
+                if not word or (word[0] != 'const' and word != desc_word(s, s[3] + i)):
+                    raise Unsupported('descriptor operand %s needs matching descriptor words in vcc' % tok)
+        if s and s[0] == 'const' and r and r[0] == 's':
+            if allow_null and self.null_descriptor(tok):
+                return None
+            value = next((self.is_const(i) for i in range(r[1], r[2] + 1) if self.is_const(i)), s[1])
+            raise Unsupported("descriptor operand %s holds ('const', %#x)" % (tok, value & 0xffffffff))
         if s and s[0] == 'desc':
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
@@ -3037,6 +3105,11 @@ class Stage:
                 raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
+
+    def null_descriptor(self, tok):
+        r = reg_range(tok)
+        return (r and r[0] == 's' and r[2] - r[1] in (3, 7)
+                and all(self.is_const(i) == 0 for i in range(r[1], r[2] + 1)))
 
     def heap_sampler(self, tok):
         """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
@@ -3891,7 +3964,8 @@ class Stage:
             self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
             self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform, proven, mask) for constant-lane SGPR spills
             self.vcc_events = {}
-            self.vcc_lost = self.vcc_descriptor_overwritten = False
+            self.vcc_lost = self.vcc_descriptor_overwritten = self.vcc_descriptor_extended = False
+            self.vcc_constant_pair = False
             self.entry_table_pointers = {
                 reg: sym[1] for reg, sym in init_sym.items()
                 if isinstance(reg, int) and sym[0] == 'ptr' and sym[1][0] == 'table'
@@ -5875,17 +5949,25 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         mask_dest = dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo', 'exec_hi', 'vcc_hi')
+        constant_pair = None
         if base == 's_mov_b64' and ops[0] == 'vcc' and len(ops) == 2:
             source = reg_range(ops[1])
             if source and source[0] == 's':
-                words = (syms[0], self.sym.get(source[2]))
+                # The decoder prints odd scalar operands as single registers.
+                high = source[2]
+                if high == source[1] and high % 2 and high < 105:
+                    high += 1
+                words = (syms[0], self.sym.get(high))
+                tracked_pair = high == source[1] + 1 and high <= 107 and all(
+                    word and word[0] in ('desc', 'const') for word in words)
                 if any(word and word[0] == 'desc' for word in words):
-                    if (source[1] % 2 or source[2] != source[1] + 1 or
-                            any(not word or word[0] != 'desc' for word in words)):
-                        raise Unsupported('mask from descriptor data: vcc needs an even pair of descriptor words')
+                    if not tracked_pair:
+                        raise Unsupported('mask from descriptor data: vcc needs a pair of tracked descriptor words or constants')
                     self.sym[106], self.sym[107] = words
-                    self.mark_vcc_descriptor()
+                    self.mark_vcc_descriptor(extended=bool(source[1] % 2 or any(w[0] == 'const' for w in words)))
                     return None
+                if tracked_pair:
+                    constant_pair = words
         tg_srcs = [
             reg for tok in ops[1:] for r in (reg_range(tok),) if r and r[0] == 's'
             for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
@@ -5978,7 +6060,10 @@ class Stage:
                 else:
                     self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
-                self.sym[d] = ('descnum',)
+                arity = max(int(i) for i in re.findall(r'\{(\d+)\}', text)) + 1
+                self.sym[d] = (self.descriptor_alu(text, srcs, syms)
+                               if not pair and not mods and arity == len(srcs)
+                               else ('descnum', 'alu', ('unavailable', '%s in %s' % (', '.join(srcs), base))))
             return None
         # The table templates name their sources as {0}, {1}, ...; a short operand list would make
         # str.format raise IndexError, which the single-shader path records as a translator crash
@@ -6055,6 +6140,13 @@ class Stage:
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
                     self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             self.emit('%s = (%s) & 1;' % (var, expr))
+            if constant_pair is not None:
+                # Keep the numeric mask assignment and also make the literal words available to a resource read.
+                self.sym[106], self.sym[107] = constant_pair
+                self.vcc_constant_pair = True
+                self.vcc_descriptor_overwritten = False
+                if getattr(self, 'has_branches', False):
+                    self.vcc_events.setdefault(self.pc, []).append(('load_constant_descriptor', constant_pair))
             if scc:
                 self.set_scc(scc.replace('$', var))
             return None
@@ -6785,7 +6877,7 @@ class Stage:
         waterfall = getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
         if waterfall and key in self.pipe.rw_keys:
             raise Unsupported('compute readfirstlane waterfall: scalar buffer load requires a read-only descriptor')
-        buf = self.pipe.resource(key, 'buf')
+        buf = self.pipe.resource(key, 'buf') if key is not None else None
         is_lit = bool(re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token))
         if is_lit:
             val = int(token, 0)
@@ -6806,7 +6898,7 @@ class Stage:
         # plus a literal is the same for the whole dispatch: heap_record names it by (table parameter, table byte,
         # root constant parameter and word or None, scale, byte offset). Any other buffer word is only marked.
         where = ()
-        if hasattr(self, 'heap_index'):
+        if hasattr(self, 'heap_index') and key is not None:
             key, r, sreg = self.descriptor(ops[1]), reg_range(ops[1]), reg_range(token)
             first = self.sym.get(r[1])
             at = (None, None, 0, val) if is_lit else self.heap_word_offset(
@@ -6823,7 +6915,8 @@ class Stage:
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i) if buf else '0u',
+                       uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
             if hasattr(self, 'heap_index'):
@@ -6855,7 +6948,7 @@ class Stage:
         if len(ops) != 4:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         key = self.descriptor(ops[2])
-        buf = self.pipe.resource(key, 'buf')
+        buf = self.pipe.resource(key, 'buf') if key is not None else None
         soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -6872,8 +6965,8 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = self.pipe.ud(('stride', self.srv_index(key)))
-            terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
+            terms.append('%s * %s' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
             if key in self.pipe.modified:
@@ -6881,8 +6974,8 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.srv_index(key)))
-            terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
+            terms.append('%s * %s' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
@@ -6905,7 +6998,7 @@ class Stage:
         buf, address = self.buffer_address(ops, mods)
         self.emit('a = %s;' % address)
         for i in range(count):
-            self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i))
+            self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i) if buf else '0u')
 
     def op_buffer_load_dwordx2(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 2)
@@ -7002,6 +7095,8 @@ class Stage:
         if not src or src[0] != 'v' or src[2] - src[1] != count - 1 or src[2] > 255:
             raise Unsupported('buffer store data %s' % ops[0])
         key = self.descriptor(ops[2])
+        if key is None:
+            return
         if key[0][0] != 'table' or key[1] is None:
             raise Unsupported('buffer store through %s' % (key,))
         if key in self.pipe.modified:
@@ -7068,6 +7163,9 @@ class Stage:
             vaddr = reg_range(ops[1])
             if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
                 raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
+        if kind_label == 'buffer store' and self.null_descriptor(ops[2]):
+            self.descriptor(ops[2])  # verify any overlapping VCC words on all paths
+            return None, None, None, glc
         key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
@@ -7095,6 +7193,8 @@ class Stage:
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
         src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
                                                         uniform_off=True)
+        if uav is None:
+            return
         # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
         # lanes race; with one proven value in all of them any order stores the same words.
         if ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1)):
@@ -7259,6 +7359,10 @@ class Stage:
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
         buf, address = self.buffer_address(ops, [m for m in mods if not m.startswith('format:')])
+        if buf is None:
+            for i in range(count):
+                self.set_v(dst[1] + i, '0u')
+            return
         self.emit('a = %s;' % address)
         self.load_format(fmt, buf, dst[1], count)
 
@@ -7477,6 +7581,10 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
+        if buf is None:
+            for i in range(count):
+                self.set_v(dst[1] + i, '0u')
+            return
         # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
@@ -7596,6 +7704,9 @@ class Stage:
         rsrc = reg_range(ops[2])
         if not rsrc or rsrc[0] != 's' or rsrc[2] - rsrc[1] != 3 or rsrc[2] > 105:
             raise Unsupported('%s descriptor %s' % (name, ops[2]))
+        if self.null_descriptor(ops[2]):
+            self.descriptor(ops[2])
+            return
         key = self.store_descriptor(ops[2], 4, name, stride0_ok=False)
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
@@ -7655,6 +7766,9 @@ class Stage:
         rsrc = reg_range(ops[2])
         if not rsrc or rsrc[0] != 's' or rsrc[2] - rsrc[1] != 3 or rsrc[2] > 105:
             raise Unsupported('%s descriptor %s' % (name, ops[2]))
+        if self.null_descriptor(ops[2]):
+            self.descriptor(ops[2])
+            return
         key = self.store_descriptor(ops[2], 4, name, stride0_ok=False)
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
@@ -7799,8 +7913,8 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
-        tex = self.pipe.resource(desc_key, kinds[dim])
-        if hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+        tex = self.pipe.resource(desc_key, kinds[dim]) if desc_key is not None else None
+        if tex is not None and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
@@ -7849,6 +7963,9 @@ class Stage:
                 expected = 1 if packed_2d else (3 if three else 2)
                 if len(cs) != expected:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
+            if tex is None:
+                self.null_image_read(dst, dmask)
+                return
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
@@ -7876,7 +7993,7 @@ class Stage:
                 self.lod_sampler_words(name, words, mip_filter_none_ok=True)
                 smp = self.pipe.sampler(tuple(words), lod_limits=bool((words[2] >> 26) & 3))
             else:
-                smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
+                smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3], allow_null=False))
             if packed_2d:
                 packed = self.u(cs[0])
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
@@ -7925,6 +8042,9 @@ class Stage:
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
+        if tex is None:
+            self.null_image_read(dst, dmask, packed='d16' in mods)
+            return
         self.emit('t = %s;' % call)
         if how in ('load', 'load_mip') and 'd16' in mods:
             res = self.pipe.resources[desc_key]
@@ -7942,6 +8062,17 @@ class Stage:
                 if dmask & (1 << bit):
                     self.set_v(n, 'U(t.%s)' % comp)
                     n += 1
+
+    def null_image_read(self, dst, dmask, packed=False):
+        if not 0 < dmask <= 15:
+            raise Unsupported('invalid null image dmask')
+        count = dmask.bit_count()
+        if packed:
+            count = (count + 1) // 2
+        if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
+            raise Unsupported('null image destination does not match dmask')
+        for i in range(count):
+            self.set_v(dst[1] + i, '0u', low16_only=packed and i == count - 1 and bool(dmask.bit_count() % 2))
 
     def image_compare(self, ops, mods, how):
         """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
@@ -7990,7 +8121,10 @@ class Stage:
             pixel_aot.comparison_sampler_state(tuple(words), level_zero=how == 'c_lz', allow_border=True)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
+        key = self.descriptor(ops[2])
+        if key is None:
+            return self.null_image_read(reg_range(ops[0]), dmask)
+        tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type.
         location = ('float3(%s, %s, %s)' % (self.f(cs[1]), self.f(cs[2]), self.f(cs[3])) if array
@@ -8160,6 +8294,9 @@ class Stage:
             raise Unsupported('%s with %d address registers: %s expected' % (
                 name, len(cs), 'one packed register' if packed_2d else address_text))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
+        if self.null_descriptor(ops[2]):
+            self.descriptor(ops[2])  # verify any overlapping VCC words on all paths
+            return
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
                 raise Unsupported('compute image_store requires full-width VGPR coordinates')
@@ -8225,8 +8362,11 @@ class Stage:
             check_gather_sampler(profiled, 1, comparison=False)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
-        key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
-        tex = self.pipe.resource(key, 'tex2d')
+        if self.kind == 'cs' and not self.null_descriptor(ops[2]):
+            key = self.fixed_table_image(ops[2], name)
+        else:
+            key = self.descriptor(ops[2])
+        tex = self.pipe.resource(key, 'tex2d') if key is not None else None
         return dst, addr, words, channels[masks[0]], tex
 
     def op_image_gather4(self, ops, mods):
@@ -8235,6 +8375,8 @@ class Stage:
     def op_image_gather4_lz(self, ops, mods):
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
             'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
+        if tex is None:
+            return self.null_image_read(dst, 15)
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
@@ -8279,6 +8421,8 @@ class Stage:
         regs = []
         dst, addr, words, (channel_name, channel_index), tex = self.gather_2d_setup(
             name, ops, mods, 3, 'three address registers', mip_preclamp=True, regs_out=regs)
+        if tex is None:
+            return self.null_image_read(dst, 15)
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in regs[1:])
         fields = None
@@ -8315,6 +8459,8 @@ class Stage:
         """image_gather4_l on a 2D texture with explicit LOD and a validated constant sampler."""
         dst, addr, words, (_, channel_index), tex = self.gather_2d_setup(
             'image_gather4_l', ops, mods, 3, 'three contiguous address registers', mip_preclamp=False)
+        if tex is None:
+            return self.null_image_read(dst, 15)
         self.pipe.uses_gather_2d_lod = True
         max_lod = ((words[1] >> 12) & 0xfff) / 256.0
         u, v, lod = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
@@ -8360,7 +8506,10 @@ class Stage:
             check_gather_sampler(words, 1, comparison=True)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        key = self.descriptor(ops[2])
+        if key is None:
+            return self.null_image_read(dst, 15)
+        tex = self.pipe.resource(key, 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         reference, u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         # The gather is read before any destination register is written, so an alias between the address
@@ -11742,8 +11891,11 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def manifest(self):
-        # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
-        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
+        # A manifest that needs a new runtime binding must be rejected by older runtimes.
+        version = 2 if self.stored_images() else 1
+        if any(source[0] == 'descword' for source in self.uds):
+            version = 3
+        lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
