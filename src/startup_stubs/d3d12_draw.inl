@@ -3114,16 +3114,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         }
         ID3D12Resource* chunk = nullptr;
+        // A raw view reads zero past its end and memory the title has not written is zero: copy only the part that can hold data.
+        // Pages that are only reserved (lazy commit) are zero and are left out without being touched; a write commits them, which
+        // the next draw sees. Of the committed part, the trailing zero bytes are left out too. (A 16 MiB binding copied whole on
+        // every draw emptied the 256 MiB upload ring.)
+        const std::size_t full_bytes = bytes;
+        if (address && bytes >= (64u << 10) && !formatted.entry) {
+            bool extent_ok = false;
+            const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
+            if (extent_ok) bytes = extent ? extent : 256;
+        }
         const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
-        if (readable_range && !formatted.entry && bytes >= (64u << 10)) {
-            // A raw view reads zero past its end and unwritten title memory is zero: copy only up to the last non-zero byte.
-            // (A 16 MiB binding copied whole on every draw emptied the 256 MiB upload ring.)
-            static x2w_local::ZeroTailCache zero_tails;
-            const std::size_t used = zero_tails.length(static_cast<std::uint64_t>(frame_number), reinterpret_cast<const void*>(address), bytes);
-            if (used < bytes) {
-                InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(bytes - used));
-                bytes = used;
-            }
+        if (readable_range && !formatted.entry && full_bytes >= (64u << 10)) {
+            bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes);
+            if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
         }
         bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
