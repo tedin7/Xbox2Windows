@@ -40,9 +40,22 @@ Gate = the independent check recorded before the PR was closed.
 | `tx-stage-26` | `96e51beaf` | #2786 (slot 57 mesh buffer reads). Its #1951 duplicates #1408, already on `tester-loop`: `debug_launch.py` keeps #1408's hold-and-step; #1951's `step_gate.py`, its check and CI line are dropped |
 | `tx-stage-25` | `365b33319` | #2067, #2048, #1726 (merged clean) |
 | `tx-stage-24` | `0435d6c8b` | nothing new: #1801 is the older copy of #1939 (kept as on `tester-loop`); #1170's concurrency block is already in main's `windows.yml` |
+| `w7-mesh-rfl-marker` | `90b0b747b` | the opt-in engine (`tools/startup/gfx2hlsl_engine.py`, `X2W_ENGINE=1`, default off; see `docs/startup-engine.md`) and its single-block mesh marker fix. The engine's copies of the WaveSync and slot 57 buffer-read checks are `tests/startup_engine_wavesync_check.py` and `tests/startup_engine_mesh57_buffer_read_check.py` (CTest `startup_engine_*`); the default checks keep their names. Engine keys use revision 29 like the runtime here |
+
+## Other fixes on this branch
+
+- Since #2815 the runtime writes `revision.txt` into the shader cache: the draw checks that expect one `.txt` there
+  (logical view, address SRV, joined table pointer, d16 SRV, MUBUF descriptor, pixel UAV, pixel heap SRV) skip it.
 
 ## Checks
 
 - Linux: every `tests/startup_gfx2hlsl_*_check.py` (136) on the branch head; the two that need Windows arguments
   (`export_null_draw`, `mul24_align_draw`) exit 1 the same way on `tester-loop`.
-- Each merged PR's own tests after its merge.
+- Each merged PR's own tests after its merge; the engine and default checks touched by the `w7` merge.
+- Windows Server 2025, D3D12 WARP, dev, on `a27cddc31` (the translator PRs only), CTest regex
+  `^(startup_gfx2hlsl_|startup_image_(sample_b|get_lod|gather_lz)|startup_pixel_(image_store|heap_srv)|startup_compute_(readfirstlane|request|store_d16_x|store_format_xyzw)|mesh_param_link|startup_shader_cache_|startup_indirect_draw_indexed|startup_resource_retire_title)`:
+  410 of 424 passed. Failed: `startup_pixel_heap_srv_*` (8, the `revision.txt` count, fixed above),
+  `startup_image_gather_lz_{warp,hardware}` (the draw helper has no `--check-pixel-gather`, see #2760 above),
+  `startup_gfx2hlsl_f16_alu_draw_warp` and `startup_gfx2hlsl_cvt_pk_int16_hardware` (`PermissionError` replacing an
+  entry of the shared DXC cache that another test held open), `startup_resource_retire_title_{warp,hardware}_debug0`
+  (the warp one passed when run again alone). Release was not reached in that run.
