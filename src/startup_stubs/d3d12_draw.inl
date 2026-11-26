@@ -2832,6 +2832,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
+            if (have && red_producers().enabled()) {
+                // Log-only, with the red-producer diagnostic: the first 64 words of the bound buffer as floats next to their raw
+                // value, to see which constant a pass reads (a pointer or stale struct shows as huge or denormal values).
+                const uint32_t* raw = reinterpret_cast<const uint32_t*>(address);
+                const size_t shown = bytes / 4 < 64 ? bytes / 4 : 64;
+                char text[64 * 28 + 1];
+                size_t used = 0;
+                for (size_t k = 0; k < shown && used + 28 < sizeof(text); ++k) {
+                    float f;
+                    std::memcpy(&f, &raw[k], sizeof(f));
+                    used += static_cast<size_t>(std::snprintf(text + used, sizeof(text) - used, "%s%u:%08x=%g", k ? " " : "", static_cast<unsigned>(k), raw[k], static_cast<double>(f)));
+                }
+                text[used] = 0;
+                log("x2w-draw   %016llx srv %u buffer floats (%zu of %zu words): %s", tr->key, i, shown, bytes / 4, text);
+            }
         }
     }
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
