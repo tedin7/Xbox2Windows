@@ -16,6 +16,7 @@ Files in the staging/drive folder for one recording <id>:
 Recordings are PRIVATE game data: local and Drive only, never GitHub.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -84,9 +85,10 @@ def pack(record_dir, staging_dir, record_id=None, chunk_bytes=CHUNK_BYTES):
                 files.append((os.path.relpath(path, record_dir).replace(os.sep, "/"), os.path.getsize(path)))
     files.sort()
     writer = ChunkWriter(staging_dir, record_id, chunk_bytes)
-    with tarfile.open(fileobj=writer, mode="w|gz", compresslevel=3) as tar:
-        for relative, _ in files:
-            tar.add(os.path.join(record_dir, relative), arcname=relative, recursive=False)
+    with gzip.GzipFile(fileobj=writer, mode="wb", compresslevel=3, mtime=0) as zipped:   # level 3: GBs of capture data, speed over size
+        with tarfile.open(fileobj=zipped, mode="w|") as tar:
+            for relative, _ in files:
+                tar.add(os.path.join(record_dir, relative), arcname=relative, recursive=False)
     writer.finish()
     manifest = {"id": record_id, "chunk_bytes": chunk_bytes, "chunks": writer.chunks, "packed_bytes": sum(c["bytes"] for c in writer.chunks),
                 "source_bytes": sum(size for _, size in files), "files": [{"name": n, "bytes": b} for n, b in files]}
