@@ -4124,6 +4124,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # the repair tool withdraws exactly those and nothing else.
     add_test(NAME startup_shader_cache_repair_packed COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_shader_cache_repair_packed_check.py")
+    add_test(NAME startup_shader_cache_retry_keys COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_shader_cache_retry_keys_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
