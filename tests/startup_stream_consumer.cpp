@@ -402,16 +402,18 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8;
-    const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
-    const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
-    const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
+    const bool one_d = mode == "texture-1d", volume = mode == "texture-3d";   // 1D and 3D output views (tex1d, tex3d manifests)
+    const bool fp32 = mode == "texture-array" || mode == "texture-array-2d" || one_d || volume;
+    const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1, depth = volume ? 6 : 1, rows = one_d ? 1 : height;
+    const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * rows, slices = layers * depth, bytes = slice_bytes * slices;
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
     const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
+    const D3D12_RESOURCE_DESC texture_desc{one_d ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0,
+        width, rows, static_cast<UINT16>(volume ? depth : layers), 1, format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -422,7 +424,7 @@ static int texture_slot67(void* device, const std::string& mode)
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
     if (fp32) {
-        for (UINT layer = 0; layer < layers; ++layer)
+        for (UINT layer = 0; layer < slices; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;
     } else {
@@ -448,6 +450,11 @@ static int texture_slot67(void* device, const std::string& mode)
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray = {0, 1, 4, 0}; // four selected slices, with untouched neighbors on both sides
     }
+    if (one_d) view = {format, D3D12_UAV_DIMENSION_TEXTURE1D};   // Texture1D.MipSlice 0
+    if (volume) {
+        view = {format, D3D12_UAV_DIMENSION_TEXTURE3D};
+        view.Texture3D = {0, 1, 4};   // FirstWSlice 1, WSize 4: physical slices 1..4, the HLSL W coordinate is relative to it
+    }
     if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
     if (mode == "texture-store-copied") {
         // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a
@@ -472,7 +479,7 @@ static int texture_slot67(void* device, const std::string& mode)
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
     D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
+    source.PlacedFootprint = {0, {format, width, rows, depth, pitch}};
     D3D12_TEXTURE_COPY_LOCATION result = source;
     result.pResource = static_cast<ID3D12Resource*>(readback);
     const UINT constants[3] = {1, 2, 3};
