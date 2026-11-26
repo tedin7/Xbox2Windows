@@ -58,7 +58,7 @@ void page_gather_ranges()
     page_ranges.clear();
     for (const PageRange& r : raw) {
         if (!page_ranges.empty() && r.address <= page_ranges.back().address + page_ranges.back().bytes) {
-            const u64 end = std::max(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
+            const u64 end = (std::max)(page_ranges.back().address + page_ranges.back().bytes, r.address + r.bytes);
             page_ranges.back().bytes = end - page_ranges.back().address;
         } else {
             page_ranges.push_back(r);
@@ -88,7 +88,7 @@ void page_scan(bool everything, u64 stamp)
                 break;
             }
             const u64 at = range.address + page_cursor_offset;
-            const std::size_t want = static_cast<std::size_t>(std::min<u64>(page_slab_bytes, range.bytes - page_cursor_offset));
+            const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset));
             page_cursor_offset += want;
             const std::size_t readable = readable_window(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
             SIZE_T got = 0;
