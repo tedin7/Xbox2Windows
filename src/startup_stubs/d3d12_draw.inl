@@ -2651,6 +2651,10 @@ void log_not_drawn_causes()
     for (int i = 0; i < not_drawn_sites && used > 0 && used < static_cast<int>(sizeof(text)) - 80; ++i)
         if (not_drawn_counts[i]) used += snprintf(text + used, sizeof(text) - used, " %s %ld,", not_drawn_names[i], not_drawn_counts[i]);
     log("%s", text);
+    // Passes whose depth view has one plane read-only (list_targets binds them with per-plane states; they were refused before).
+    if (render_target_mixed_dsv[1] || render_target_mixed_dsv[2])
+        log("x2w-render OMSetRenderTargets with a depth view with one read-only plane: depth read-only %ld, stencil read-only %ld",
+            render_target_mixed_dsv[1], render_target_mixed_dsv[2]);
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
