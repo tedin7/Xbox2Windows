@@ -466,15 +466,15 @@ int main(int argc, char** argv)
             // The progress line: 10 enqueued, 7 completed, the request numbered 7 waited 1234 ms, 2 s window.
             enqueue_ring_tick[7 & (enqueue_ring_size - 1)] = static_cast<LONG>(100000 - 1234);
             char progress[256];
-            format_progress(progress, sizeof progress, 20, 10, 7, 2 << 20, 4 << 20, 5 << 20, 9 << 20, 2.0, 100000);
+            format_progress(progress, sizeof progress, 20, 10, 6, 1, 2 << 20, 4 << 20, 5 << 20, 9 << 20, 2.0, 100000);
             const char* const want_progress =
                 "x2w-dstorage progress 20 s: pending 3 (oldest 1234 ms), read 1.0 MB/s, inflated 2.0 MB/s, "
-                "enqueued 10 completed 7, total read 5120 KiB inflated 9216 KiB";
+                "enqueued 10 retired 7 (written 6, failed 1), total read 5120 KiB inflated 9216 KiB";
             if (!expect(std::strcmp(progress, want_progress) == 0, "progress line differs")) {
                 std::fprintf(stderr, "  got:  %s\n  want: %s\n", progress, want_progress);
                 ok = false;
             }
-            format_progress(progress, sizeof progress, 30, 10, 10, 0, 0, 5 << 20, 9 << 20, 10.0, 100000);
+            format_progress(progress, sizeof progress, 30, 10, 10, 0, 0, 0, 5 << 20, 9 << 20, 10.0, 100000);
             ok = expect(std::strstr(progress, "pending 0 (oldest none), read 0.0 MB/s, inflated 0.0 MB/s") != nullptr,
                         "an idle queue must read pending 0, oldest none") && ok;
         }

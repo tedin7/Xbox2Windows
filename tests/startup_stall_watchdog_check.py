@@ -138,7 +138,7 @@ class Process(unittest.TestCase):
             (logdir / "events.txt").write_text("start\n")
             (logdir / "stderr.txt").write_text("x2w-d3d12 heartbeat: 7 frames presented in 3.0 s (2.3 fps overall)\n"
                                                "x2w-dstorage progress 3 s: pending 0 (oldest none), read 0.0 MB/s, inflated 0.0 MB/s, "
-                                               "enqueued 5 completed 5, total read 64 KiB inflated 64 KiB\n")
+                                               "enqueued 5 retired 5 (written 5, failed 0), total read 64 KiB inflated 64 KiB\n")
             result = self.run_watchdog(logdir, "--min-seconds", "0", "--stall-seconds", "2", "--memory-percent", "0")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertRegex(result.stdout, r"^tester_run: STALL STOP at \d+ s: frozen: ")

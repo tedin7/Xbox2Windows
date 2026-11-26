@@ -532,10 +532,13 @@ void note_enqueued() noexcept
     enqueue_ring_tick[static_cast<unsigned>(number) & (enqueue_ring_size - 1)] = static_cast<LONG>(GetTickCount());
 }
 // The progress line: queue depth, the oldest pending request's age, and MB/s read and inflated over the last
-// `seconds`. `completed` is the sum of every request outcome; `now` is GetTickCount().
-int format_progress(char* out, std::size_t size, int second, LONG enqueued, LONG completed, LONG64 read_delta,
+// `seconds`. `retired` is the sum of every request outcome (written + failed): the queue depth is enqueued - retired.
+// `written` is the requests that really wrote their destination (raw + inflated + bcpack-blank) and `failed` the ones
+// that did not, so the line tells a run that retires fast by failing from one that loads. `now` is GetTickCount().
+int format_progress(char* out, std::size_t size, int second, LONG enqueued, LONG written, LONG failed, LONG64 read_delta,
                     LONG64 inflated_delta, LONG64 read_total, LONG64 inflated_total, double seconds, DWORD now) noexcept
 {
+    const LONG completed = written + failed;   // retired
     const LONG pending = enqueued > completed ? enqueued - completed : 0;
     char oldest[48] = "none";
     if (pending > 0 && pending <= static_cast<LONG>(enqueue_ring_size))
@@ -546,9 +549,9 @@ int format_progress(char* out, std::size_t size, int second, LONG enqueued, LONG
         std::snprintf(oldest, sizeof(oldest), "unknown, more than %u pending", enqueue_ring_size);
     return std::snprintf(out, size,
                          "x2w-dstorage progress %d s: pending %ld (oldest %s), read %.1f MB/s, inflated %.1f MB/s, "
-                         "enqueued %ld completed %ld, total read %lld KiB inflated %lld KiB", second, pending, oldest,
+                         "enqueued %ld retired %ld (written %ld, failed %ld), total read %lld KiB inflated %lld KiB", second, pending, oldest,
                          static_cast<double>(read_delta) / 1048576.0 / seconds,
-                         static_cast<double>(inflated_delta) / 1048576.0 / seconds, enqueued, completed,
+                         static_cast<double>(inflated_delta) / 1048576.0 / seconds, enqueued, completed, written, failed,
                          static_cast<long long>(read_total >> 10), static_cast<long long>(inflated_total >> 10));
 }
 // The disk side of loading (the title package can sit on a hard disk, where seeks, not bandwidth, set the speed):
@@ -1980,7 +1983,7 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // (pending flat, oldest age growing, 0 MB/s).
                 const LONG64 read_now = bytes_read_total, inflated_now = bytes_inflated_total;
                 char progress[256];
-                format_progress(progress, sizeof progress, second, requests_enqueued, total2, read_now - last_read,
+                format_progress(progress, sizeof progress, second, requests_enqueued, total2 - failed, failed, read_now - last_read,
                                 inflated_now - last_inflated, read_now, inflated_now, interval_ms / 1000.0, GetTickCount());
                 log("%s", progress);
                 const DiskStats disk_now = disk_snapshot();
