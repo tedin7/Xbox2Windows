@@ -102,13 +102,26 @@ void on_warp()
     require(r.frames == 2, "two frames of three submissions each");
     require(r.busy_ms > 0 && r.max_ms >= r.avg_ms && r.avg_ms > 0, "the copies took measurable GPU time");
     require(!probe.skipped && !probe.failed, "no stamp skipped or failed");
-    // The ring is free again after the read back: a full ring of submissions still gets its slots.
+    // The queue is held on a fence the CPU signals later, so no slot can complete while the ring fills. All slots
+    // are free again after the read back above; the next one past the ring is skipped and counted.
+    ComPtr<ID3D12Fence> gate;
+    require(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))) && SUCCEEDED(queue->Wait(gate.Get(), 1)), "hold the queue");
     for (UINT i = 0; i < x2w_gpu_time::Probe::slots; ++i) {
         const int slot = probe.before(queue.Get(), 200);
         require(slot >= 0, "slots are reusable after harvest");
         probe.after(queue.Get(), slot);
     }
     require(probe.before(queue.Get(), 200) == -1 && probe.skipped == 1, "a full ring skips the stamp and counts it");
+    // Released: every held slot is read back, and the ring takes stamps again.
+    require(SUCCEEDED(gate->Signal(1)), "release the queue");
+    require(SUCCEEDED(queue->Signal(done.Get(), 2)), "signal after the ring");
+    event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    require(SUCCEEDED(done->SetEventOnCompletion(2, event)) && WaitForSingleObject(event, 60000) == WAIT_OBJECT_0, "queue finished again");
+    CloseHandle(event);
+    probe.harvest(300);
+    const int again = probe.before(queue.Get(), 300);
+    require(again >= 0, "the ring takes stamps again after it drained");
+    probe.after(queue.Get(), again);
 }
 
 }  // namespace
