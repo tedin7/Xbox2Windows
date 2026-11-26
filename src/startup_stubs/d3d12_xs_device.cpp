@@ -7620,6 +7620,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                                           static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
             }
             log("x2w-d3d12 time inside the stand-in since the last report (ms/calls):%s", text);
+            log("x2w-d3d12 list copies: buffer %ld, resource %ld, resolves %ld, refused %ld, buffer copies made in title memory %ld",
+                InterlockedCompareExchange(&list_buffer_copies, 0, 0), InterlockedCompareExchange(&list_resource_copies, 0, 0),
+                InterlockedCompareExchange(&list_resolves, 0, 0), InterlockedCompareExchange(&list_copies_refused, 0, 0),
+                InterlockedCompareExchange(&list_title_memory_copies, 0, 0));
             used = 0;
             text[0] = 0;
             for (int i = 0; i < 256; ++i) {
