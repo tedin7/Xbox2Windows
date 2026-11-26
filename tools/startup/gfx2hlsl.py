@@ -1011,6 +1011,7 @@ QUAD_ANY_HLSL = [
     '    return row + abs(ddy_fine(row)) != 0.0;',
     '}',
 ]
+ROW_ROR8 = 'RowRotate8'  # not an intrinsic: the compute exchange partner is lane ^ 8
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
@@ -4881,15 +4882,25 @@ class Stage:
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
             return self.dpp_broadcast(base, ops, mods)
         perm = None
+        row_ror8 = False
         for m in mods:
             match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
-            if match and perm is None:
+            if match and perm is None and not row_ror8:
                 perm = tuple(int(x) for x in match.groups())
+            elif m == 'row_ror:8' and perm is None and not row_ror8:
+                row_ror8 = True
             elif m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
                 raise Unsupported('%s_dpp with %s' % (base, m))
-        if perm in DPP_PAIR:
+        if row_ror8:
+            # DPP16 row_ror:8 (RDNA 2 ISA, "Data-Parallel Primitives"): a row is 16 lanes and lane i reads the lane 8 places
+            # round the row, which is lane i ^ 8 whichever way the rotation runs. Only compute, through groupshared memory.
+            if getattr(self, 'kind', None) != 'cs':
+                raise Unsupported('%s_dpp with row_ror:8 outside a compute program' % base)
+            intrinsic = ROW_ROR8
+        elif perm in DPP_PAIR:
             return self.dpp_pair(base, '%s %s' % (base, ', '.join(ops)), ops, mods)
-        intrinsic = QUAD_SWAPS.get(perm)
+        else:
+            intrinsic = QUAD_SWAPS.get(perm)
         if not intrinsic:
             raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
                               % (base, perm))
@@ -4920,7 +4931,7 @@ class Stage:
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         compute = getattr(self, 'kind', None) == 'cs'
         if compute:
-            self.compute_quad_gate(base)
+            self.compute_quad_gate(base, row_ror8)
         else:
             if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
                 raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
@@ -4947,7 +4958,7 @@ class Stage:
         if compute:
             self.emit('GroupMemoryBarrierWithGroupSync();')  # the next exchange may rewrite the array
 
-    def compute_quad_gate(self, base):
+    def compute_quad_gate(self, base, row_ror8=False):
         """A DPP quad swap in a compute program is exchanged through groupshared memory (no quad intrinsic: SM 6 leaves the
         quad of a compute thread to the implementation). Lane i of an aligned group of four reads lane perm[i] (RDNA 2 ISA,
         DPP16 quad_perm); a wave holds 32 or 64 consecutive threads in x-major order, so lane bits 1:0 are the bits 1:0
@@ -4957,6 +4968,8 @@ class Stage:
         x, y, z = self.pipe.group
         if x * y * z % 4:
             raise Unsupported('%s_dpp in a compute program requires a group of whole quads (a multiple of 4 threads)' % base)
+        if row_ror8 and x * y * z % 16:
+            raise Unsupported('%s_dpp row_ror:8 in a compute program requires a group of whole rows (a multiple of 16 threads)' % base)
         if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
             raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
 
@@ -4970,7 +4983,7 @@ class Stage:
         self.uses_quad_shared = True
         self.emit('x2w_quad[%s] = %s;' % (flat, source))
         self.emit('GroupMemoryBarrierWithGroupSync();')
-        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3}[intrinsic])
+        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3, ROW_ROR8: 8}[intrinsic])
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
