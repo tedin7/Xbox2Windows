@@ -155,10 +155,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
+        else {
+            // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
+            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
+            log("x2w-draw compute pipeline %016llx manifest line %u rejected (%s; %zu inputs and %zu outputs read so far): %.120s", tr.key,
+                line_number, why, tr.srvs.size(), tr.uavs.size(), line.c_str());
+            return why;
+        }
     }
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
