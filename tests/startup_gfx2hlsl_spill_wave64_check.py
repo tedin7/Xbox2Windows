@@ -22,6 +22,7 @@ Fixtures:
 The reference is the last value written to (VGPR, lane), computed here by replaying the lane writes on a dictionary.
 Mutations of the translated text (lane 63 read as lane 40, the overwrite ignored, another VGPR's slot) must fail.
 """
+import os
 import re
 import struct
 import subprocess
@@ -70,6 +71,19 @@ PS_WORDS = bytes.fromhex(
     'ff0380be00002040ff0381be00004040f60382be0a0061d7005001000a0061d7017e01000b0061d702400100000108880c0061d708420100'
     '800380be800381be800382be800388be030060d70a510100040060d70a7f0100050060d70b4101000a0061d705500100060060d70a510100'
     '090060d70c430100030002380400043806000638090008380f1800f801020304000081bf')
+
+
+def _vop3(op, vdst, src0, lane):
+    return struct.pack('<2I', 0xd7000000 | op << 16 | vdst, src0 | (128 + lane) << 9)
+
+
+# The same program with the derived word spilled to v10 lane 8 (v_writelane_b32 v10, s8, 8 / v_readlane_b32 s9, v10, 8)
+# instead of v12 lane 33: v10 then holds lanes 8 and 40, one slot in wave32 and two in wave64.
+PAIR_PS_TEXT = (PS_TEXT.replace('v_writelane_b32 v12, s8, 33', 'v_writelane_b32 v10, s8, 8')
+                .replace('v_readlane_b32 s9, v12, 33', 'v_readlane_b32 s9, v10, 8'))
+PAIR_PS_WORDS = (PS_WORDS.replace(_vop3(0x361, 12, 8, 33), _vop3(0x361, 10, 8, 8))
+                 .replace(_vop3(0x360, 9, 256 + 12, 33), _vop3(0x360, 9, 256 + 10, 8)))
+OPT_IN = 'X2W_SPILL_WAVE64_PAIR'
 VS_TEXT = '''v_mov_b32_e32 v3, 0x40400000
 v_mov_b32_e32 v10, 0xc0400000
 v_cmp_eq_u32_e32 vcc_lo, 1, v0
@@ -137,6 +151,7 @@ def replay(text, outputs):
 
 
 PS_SLOTS = replay(PS_TEXT, ('s3', 's4', 's6', 's9'))
+assert replay(PAIR_PS_TEXT, ('s3', 's4', 's6', 's9')) == PS_SLOTS
 VS_SLOTS = replay(VS_TEXT, ('s22', 's23', 's24', 's25'))
 
 
@@ -146,6 +161,19 @@ def ps_image():
 
 def ps_text():
     return G.Pipeline(VS_WORDS, PS_WORDS, root_blob(), ps_hw_inputs=PACKED).hlsl_ps()
+
+
+def pair_text(opt_in):
+    """The translated pair program; opt_in sets X2W_SPILL_WAVE64_PAIR for this call only."""
+    saved = os.environ.pop(OPT_IN, None)
+    if opt_in:
+        os.environ[OPT_IN] = '1'
+    try:
+        return G.Pipeline(VS_WORDS, PAIR_PS_WORDS, root_blob(), ps_hw_inputs=PACKED).hlsl_ps()
+    finally:
+        os.environ.pop(OPT_IN, None)
+        if saved is not None:
+            os.environ[OPT_IN] = saved
 
 
 def vs_pipeline():
@@ -164,6 +192,8 @@ PS_MUTATIONS = {
     'the overwritten slot keeps its first value': (r'sp10_40 = s5;', 'sp10_40 = sp10_40;'),
     'v11 lane 32 reads v10 lane 40': (r'= sp11_32;', '= sp10_40;'),
 }
+# The pair program's derived word reads the slot of lane 8; reading lane 40 instead must fail the readback.
+PAIR_MUTATION = (r's9 = sp10_8;', 's9 = sp10_40;')
 VS_MUTATIONS = {
     'lane 48 reads lane 0 of the same VGPR': (r'v12 = 0x9abcdef0u', 'v12 = 0x12345678u'),
     'the overwritten slot keeps its first value': (r'v14 = 0x12345678u', 'v14 = 0x9abcdef0u'),
@@ -211,6 +241,21 @@ def controls():
             check('VS mutation "%s" changes the text' % label, mutate(text, old, new) != text)
     except G.Unsupported as reason:
         check('vertex stage slots translate', False, str(reason))
+    got = [re.sub(r'_e(32|64)\b', '', asm) for _o, _n, _m, asm in G.decode(PAIR_PS_WORDS)]
+    check('pair fixture decodes to its source', got == [re.sub(r'_e(32|64)\b', '', l) for l in PAIR_PS_TEXT.splitlines()], got)
+    try:
+        pair_text(False)
+        check('lanes 8 and 40 of v10 are refused without the opt-in', False, 'translated')
+    except G.Unsupported as reason:
+        check('lanes 8 and 40 of v10 are refused without the opt-in (%s)' % reason,
+              'one slot in wave32 and two in wave64' in str(reason) and OPT_IN in str(reason), reason)
+    try:
+        text = pair_text(True)
+        check('with %s=1 lanes 8 and 40 of v10 are two slots' % OPT_IN,
+              all(re.search(r'\b%s = 0' % v, text) for v in ('sp10_8', 'sp10_40')) and 's9 = sp10_8;' in text, text)
+        check('the pair mutation changes the text', mutate(text, *PAIR_MUTATION) != text)
+    except G.Unsupported as reason:
+        check('with the opt-in the pair translates', False, str(reason))
     for label, program, kind in (
             ('lane 64', ['v_writelane_b32 v10, s0, 64'], 'ps'),
             ('lanes 8 and 40 of one VGPR', ['v_writelane_b32 v10, s0, 8', 'v_writelane_b32 v10, s1, 40'], 'ps'),
@@ -257,6 +302,15 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 run = draw_pixels(renderer, adapter, vs, bad, reference)
                 check('%s %s PS mutation "%s" fails' % (adapter, kind, label),
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+            pair_source = pair_text(True)
+            pair = compile_hlsl(compiler, kind, pair_source, 'ps_pair_' + kind, ps_profile, directory)
+            run = draw_pixels(renderer, adapter, vs, pair, reference)
+            check('%s %s pair PS: all %d pixels equal the slot reference' % (adapter, kind, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout, run.stdout + run.stderr)
+            bad = compile_hlsl(compiler, kind, mutate(pair_source, *PAIR_MUTATION), 'bad_ps_pair_' + kind, ps_profile, directory)
+            run = draw_pixels(renderer, adapter, vs, bad, reference)
+            check('%s %s pair PS mutation (lane 8 reads lane 40) fails' % (adapter, kind),
+                  run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
             vs2 = compile_hlsl(compiler, kind, vs_source, 'vs_spill_' + kind, vs_profile, directory)
             flat = compile_hlsl(compiler, kind, flat_source, 'ps_flat_' + kind, ps_profile, directory)
             run = draw_flat(renderer, adapter, vs2, flat, expected_vs)

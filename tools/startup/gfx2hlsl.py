@@ -8749,8 +8749,13 @@ class Stage:
                     continue  # a register lane is refused where it is read
         for lane in lanes:
             if lane + 32 in lanes:
-                raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64'
-                                  % (name, n, lane, lane + 32))
+                if os.environ.get('X2W_SPILL_WAVE64_PAIR') == '1':
+                    # Opt-in: a compiler spills into lanes below the wave size only, so a program that names both k and
+                    # k + 32 of one VGPR runs as wave64 and the two are two slots. Not proven for a title compiler
+                    # (the wave size is not in the shader), so it stays off until a run shows it right.
+                    continue
+                raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64 '
+                                  '(X2W_SPILL_WAVE64_PAIR=1 reads the pair as wave64)' % (name, n, lane, lane + 32))
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
