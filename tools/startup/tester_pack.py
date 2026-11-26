@@ -530,6 +530,37 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     return sorted(chosen.values(), key=lambda c: (-c[2] if c[1] == "compute" else 0, -c[2], c[0]))
 
 
+PHASES_NAME = "phases.txt"
+PHASE_WINDOW_S = 30
+HEARTBEAT_RE = re.compile(r"^x2w-d3d12 heartbeat: (\d+) frames presented in ([0-9.]+) s", re.M)
+PICTURE_RE = re.compile(r"^\s*([0-9.]+) s\s+picture \S+ mean ([0-9.]+)", re.M)
+
+
+def phase_table(stderr_text, timeline_text, window=PHASE_WINDOW_S):
+    """One row per `window` seconds: frames presented and fps in that window (from the cumulative 'heartbeat' lines of the
+    stand-in) and the mean level of the last window picture inside it, so the phases of a run read in one place instead of
+    being rebuilt from stderr by hand. Windows without a heartbeat show '-'."""
+    beats = sorted({(float(t), int(f)) for f, t in HEARTBEAT_RE.findall(stderr_text)})
+    pictures = sorted((float(t), float(m)) for t, m in PICTURE_RE.findall(timeline_text))
+    end = max([t for t, _ in beats] + [t for t, _ in pictures] + [0])
+    lines = ["# run phases per %d s: presents, fps, picture mean (0 = black, 255 = white); from stderr.txt heartbeats and timeline.txt" % window,
+             "# from_s  to_s  presents  fps  picture_mean"]
+    frames_at = lambda t: max([f for bt, f in beats if bt <= t] + [0])
+    start = 0
+    while start < end:
+        stop = start + window
+        inside = [m for t, m in pictures if start < t <= stop]
+        have = [bt for bt, _ in beats if bt <= stop]
+        if have and any(bt > start for bt in have):
+            presents = frames_at(stop) - frames_at(start)
+            fps = "%.1f" % (presents / float(window))
+        else:
+            presents, fps = "-", "-"
+        lines.append("%5d %5d %9s %5s %7s" % (start, stop, presents, fps, "%.1f" % inside[-1] if inside else "-"))
+        start = stop
+    return "\n".join(lines) + "\n"
+
+
 SYMBOLS_NAME = "d3d12_xs.symbols.txt"
 MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
 MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
@@ -758,6 +789,14 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         manifest["request_files"] = {"folder": REQUESTS_DIR, "keys": len(chosen), "files": sum(len(c[3]) for c in chosen),
                                      "bytes": sum(b for c in chosen for _, b in c[3]),
                                      "ranked": [{"key": k, "kind": kd, "weight": w, "missing_code_files": m} for k, kd, w, _, m in chosen]}
+    texts = {}
+    for name in ("stderr.txt", "timeline.txt"):
+        path = os.path.join(logdir, name)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                texts[name] = handle.read()
+    if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
+        add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
     files = log_files(logdir)
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:

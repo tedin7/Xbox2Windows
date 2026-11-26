@@ -643,6 +643,33 @@ def check_mail_ready_parts():
                     assert "manifest.json" in names
 
 
+def check_phase_table():
+    """phases.txt: presents, fps and picture mean per 30 s window from the stand-in heartbeats and the capture rows."""
+    beats = ("x2w-d3d12 heartbeat: 150 frames presented in 5.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 900 frames presented in 30.0 s (30.0 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1000 frames presented in 60.0 s (16.7 fps overall); x\n"
+             "x2w-d3d12 heartbeat: 1010 frames presented in 90.0 s (11.2 fps overall); x\n")
+    timeline = ("   10.0 s  picture window_010s.png mean 0.0  first\n   40.0 s  picture window_040s.png mean 85.5  changed\n"
+                "   55.0 s  picture window_055s.png mean 36.0  changed\n")
+    rows = T.phase_table(beats, timeline).splitlines()
+    assert rows[2].split() == ["0", "30", "900", "30.0", "0.0"], rows[2]
+    assert rows[3].split() == ["30", "60", "100", "3.3", "36.0"], rows[3]
+    assert rows[4].split() == ["60", "90", "10", "0.3", "-"], rows[4]
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", beats.encode())
+        write(run, "timeline.txt", timeline.encode())
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "p.zip"))
+        with zipfile.ZipFile(Path(tmp) / "p.zip") as z:
+            assert z.read(T.PHASES_NAME).decode().splitlines()[2].split()[:4] == ["0", "30", "900", "30.0"]
+        write(run, "stderr.txt", b"no heartbeats\n")
+        T.pack(str(run), MANIFEST, str(Path(tmp) / "q.zip"))
+        with zipfile.ZipFile(Path(tmp) / "q.zip") as z:
+            assert T.PHASES_NAME not in z.namelist(), "no heartbeat, no phases file"
+
+
 def make_old_cache(folder):
     """Five requests of an older revision (3 graphics, 1 compute, 1 mesh 57) with their results, which must not travel."""
     graphics = ("a", "b", "root")
@@ -785,6 +812,7 @@ if __name__ == "__main__":
     check_request_files()
     check_request_code_files()
     check_mail_ready_parts()
+    check_phase_table()
     check_part_one_has_the_small_files()
     check_preset()
     check_privacy_screen()
