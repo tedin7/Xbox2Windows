@@ -54,6 +54,32 @@ def first_lane_expected(lanes, active, source):
     return [(13 + source[enabled[0] if enabled else 0]) & MASK] * lanes
 
 
+# The lanes that stay enabled are chosen by bit 0 of their own source word, so any set of lanes is possible (the threshold
+# above only makes "every lane from p up"). Same read and add as above.
+BIT0 = (('v_and_b32_e32 v9, 1, v5', '810a1236'), ('v_cmpx_ne_u32_e32 0, v9', '8012aa7d'))
+FIRST_LANE_SETS = {   # name -> enabled lanes of a 32-lane group; the first of each set is where the read must come from
+    'only_lane0': {0}, 'lane0_off': set(range(1, 32)), 'only_last': {31}, 'only_lane13': {13},
+    'odd_lanes': set(range(1, 32, 2)), 'band_9_20': set(range(9, 21)), 'sparse_17_29_31': {17, 29, 31},
+    'upper_half': set(range(16, 32)), 'none': set(),
+}
+
+
+def first_lane_set_program():
+    return (*PREFIX[:-1], *BIT0, FIRST_READ, RESTORE, ADD_FIRST, STORE, END)
+
+
+def first_lane_set_source(enabled, lanes=32):
+    """Source words with a hash payload and bit 0 set for the enabled lanes only; the rest of the buffer is plain data."""
+    source = [((0x9e3779b1 * (i + 1) + 7) & MASK) & ~1 for i in range(WORDS)]
+    for lane in enabled:
+        source[lane] |= 1
+    return source
+
+
+def first_lane_set_expected(lanes, enabled, source):
+    return [(13 + source[min(enabled) if enabled else 0]) & MASK] * lanes
+
+
 def translate(rows, group=(4, 1, 1)):
     code = bytes.fromhex(''.join(word for _, word in rows))
     return G.ComputePipeline(code, root_blob(), USER7, group).hlsl_cs()
@@ -109,6 +135,13 @@ def controls(llvm_mc=None):
         assert 'if (exec & 1) InterlockedMin(x2w_rfl_min,' in text and text.count('GroupMemoryBarrierWithGroupSync();') == 3, text
     refused('requires a proven uniform source', lambda: translate(first_lane_program(), (33, 1, 1)))
     refused('requires a proven uniform source', lambda: translate(first_lane_program(), (64, 1, 1)))
+    if llvm_mc:
+        rows = first_lane_set_program()
+        assert assemble(llvm_mc, '\n'.join(asm for asm, _ in rows) + '\n') == bytes.fromhex(''.join(word for _, word in rows))
+    for lanes in (8, 32):
+        assert 'if (exec & 1) InterlockedMin(x2w_rfl_min,' in translate(first_lane_set_program(), (lanes, 1, 1))
+    for lanes in (33, 64, 128):
+        refused('requires a proven uniform source', lambda lanes=lanes: translate(first_lane_set_program(), (lanes, 1, 1)))
 
 
 def first_lane_dispatch(directory, dxc, runner, adapter):
@@ -137,8 +170,40 @@ def first_lane_dispatch(directory, dxc, runner, adapter):
     return check_references('first-lane readfirstlane', runner, adapter, shader, cases)
 
 
+def first_lane_set_dispatch(directory, dxc, runner, adapter):
+    """The enabled lanes are any set, not only 'all lanes from p up': lane 0 off, only the last lane, only lane 13, a band,
+    a sparse set, no lane. Hosts split the 32 guest lanes differently (WARP 4 lanes per wave), so a first-lane choice that
+    depended on the host wave would pick a wrong lane for some set. Controls: a read fixed at lane 0, and one fixed at the
+    lowest lane of the host-sized chunk (lane // 4 * 4) must differ."""
+    lanes = 32
+    src, shader = directory / 'first_lane_set.hlsl', directory / 'first_lane_set.cso'
+    src.write_text(translate(first_lane_set_program(), (lanes, 1, 1)), encoding='ascii')
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+    cases = []
+    for name, enabled in FIRST_LANE_SETS.items():
+        source = first_lane_set_source(enabled)
+        output = first_lane_set_expected(lanes, enabled, source)
+        words = [1, *output, *([SENTINEL] * (WORDS - lanes)), 0, *([0] * 15), *source]
+        case = directory / ('first-lane-set-%s.case' % name)
+        case.write_bytes(struct.pack('<%dI' % len(words), *words))
+        cases.append((case, 'enabled lanes: %s' % name, None))
+        if name in ('only_lane13', 'sparse_17_29_31'):
+            for label, wrong_lane in (('lane 0', 0), ('the host chunk start', min(enabled) // 4 * 4)):
+                if wrong_lane == min(enabled):
+                    continue
+                wrong = [(13 + source[wrong_lane]) & MASK] * lanes
+                words = [1, *wrong, *([SENTINEL] * (WORDS - lanes)), 0, *([0] * 15), *source]
+                case = directory / ('first-lane-set-%s-wrong-%d.case' % (name, wrong_lane))
+                case.write_bytes(struct.pack('<%dI' % len(words), *words))
+                cases.append((case, '%s: %s instead of the first enabled lane' % (name, label),
+                              'word=0 expected=%08x actual=%08x' % (wrong[0], output[0])))
+    return check_references('first-lane readfirstlane, lane sets', runner, adapter, shader, cases)
+
+
 def dispatch(directory, dxc, runner, adapter):
     if first_lane_dispatch(directory, dxc, runner, adapter):
+        return 77
+    if first_lane_set_dispatch(directory, dxc, runner, adapter):
         return 77
     for label, body in (('arithmetic', (ADD, XOR)), ('fixed-buffer', FIXED_LOAD), ('invariant', (CONST, XOR))):
         src, shader = directory / 'waterfall.hlsl', directory / 'waterfall.cso'
