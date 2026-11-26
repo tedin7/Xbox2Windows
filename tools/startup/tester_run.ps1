@@ -273,7 +273,15 @@ $manifestFile = Join-Path ([System.IO.Path]::GetTempPath()) "tester_manifest_${s
 [System.IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 
 $zip = Join-Path $outRoot ("report_{0}_{1}.zip" -f $source.Commit, $stamp)
-$parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache })
+# The linker map of our d3d12_xs.dll names its functions in the zip; only a map written with this DLL (within a minute of it).
+$mapArgs = @()
+$dllFile = Join-Path $buildRoot "d3d12_xs.dll"
+$mapFile = Join-Path $buildRoot "d3d12_xs.map"
+if ((Test-Path -LiteralPath $dllFile) -and (Test-Path -LiteralPath $mapFile) -and
+    ([math]::Abs(((Get-Item -LiteralPath $mapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $dllFile).LastWriteTimeUtc).TotalSeconds) -lt 60)) {
+    $mapArgs = @("--map", $mapFile)
+}
+$parts = @(Invoke-Native { & $python -B $pack pack $logDir $manifestFile $zip --limit-mb $LimitMB --cache $cache @mapArgs })
 if ($LASTEXITCODE -ne 0) { throw "tester_run: packing the logs failed (see above); the logs stay in $logDir" }
 Remove-Item -LiteralPath $manifestFile -Force
 foreach ($line in $parts) {

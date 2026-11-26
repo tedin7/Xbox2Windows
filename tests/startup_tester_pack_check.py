@@ -390,7 +390,57 @@ def check_seed_cache():
         assert json.loads((root / "seed.json").read_text())["seeded"] == 5
 
 
+MSVC_MAP = """ d3d12_xs
+
+ Timestamp is 6563a1f2 (Wed Nov 26 15:00:02 2026)
+
+ Preferred load address is 0000000180000000
+
+ Start         Length     Name                   Class
+ 0001:00000000 00a00000H .text$mn                CODE
+
+  Address         Publics by Value              Rva+Base               Lib:Object
+
+ 0001:00001000       DllMain                    0000000180001000 f   dllmain.obj
+ 0001:00001400       ?Draw@Queue@@QEAAXXZ       0000000180001400 f   d3d12_draw.obj
+ 0001:00001800       g_table                    0000000180001800     d3d12_draw.obj
+ 0001:00002000       ?Present@Queue@@QEAAXXZ    0000000180002000 f i present.obj
+"""
+
+
+def check_symbols():
+    import subprocess
+    rows = T.parse_symbols(MSVC_MAP)  # functions only (flag f), RVA = address - preferred load address
+    assert rows == [(0x1000, "DllMain"), (0x1400, "?Draw@Queue@@QEAAXXZ"), (0x2000, "?Present@Queue@@QEAAXXZ")], rows
+    nm = "0000000000001000 T alpha\n0000000000001200 t beta\n0000000000001300 D data\n0000000000001000 T alias\n"
+    assert T.parse_symbols(nm) == [(0x1000, "alpha"), (0x1200, "beta")]
+    assert T.load_symbols(T.format_symbols(rows)) == rows
+    try:
+        T.parse_symbols("not a map\n")
+        raise AssertionError("a text without function symbols must be refused")
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        (tmp / "d3d12_xs.map").write_text(MSVC_MAP)
+        (tmp / "m.json").write_text(json.dumps(MANIFEST))
+        out = subprocess.run([sys.executable, "-B", T.__file__, "pack", str(run),
+                              str(tmp / "m.json"), str(tmp / "r.zip"), "--map", str(tmp / "d3d12_xs.map")],
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        with zipfile.ZipFile(tmp / "r.zip") as z:
+            assert z.read(T.SYMBOLS_NAME).decode() == "1000 DllMain\n1400 ?Draw@Queue@@QEAAXXZ\n2000 ?Present@Queue@@QEAAXXZ\n"
+            assert json.loads(z.read("manifest.json"))["symbols"] == 3
+        T.pack(str(run), MANIFEST, str(tmp / "plain.zip"))
+        with zipfile.ZipFile(tmp / "plain.zip") as z:
+            assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
+
+
 if __name__ == "__main__":
+    check_symbols()
     check_seed_cache()
     check_cache_results()
     check_preset()

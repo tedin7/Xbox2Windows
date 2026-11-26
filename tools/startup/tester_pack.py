@@ -14,7 +14,9 @@ translate, translate_err, window*.png, bink_luma.png ...), the debugger summary 
 Not in it: sub-folders such as a shader cache, memory dumps and game files; with --cache the zip also holds
 `shader_results.txt`: for every request key of the cache its kind, ok / refused / pending and, for a refusal, the first line
 of its `.fail` text (the translator's own message; a compiler message is cut to its error codes), ranked by reason. Never
-shader code or binaries. Nothing is dropped: past the size limit
+shader code or binaries. With --map (the linker map of our own d3d12_xs.dll) it also holds
+`d3d12_xs.symbols.txt`: one `RVA function` line per function of that DLL (never a game file), so a stack frame
+d3d12_xs.dll+0xNNNN reads as a name. Nothing is dropped: past the size limit
 the zip is split into numbered parts (<name>_part01of03.zip, ...) and a very large file into numbered pieces.
 """
 import argparse
@@ -353,6 +355,49 @@ def format_results(rows):
     return "\n".join(lines) + "\n"
 
 
+SYMBOLS_NAME = "d3d12_xs.symbols.txt"
+MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
+MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
+NM_SYMBOL = re.compile(r"^([0-9a-fA-F]{8,16})\s+[TtWw]\s+(\S+)\s*$")
+
+
+def parse_symbols(text):
+    """RVA and name of every function in a linker map of OUR OWN DLL: the MSVC /MAP file (the tester's build; only entries
+    flagged `f`, RVA = address - preferred load address) or `nm -n` text (address, type T/t/W/w, name; addresses taken as RVAs).
+    Sorted by RVA, one name per RVA. Raises ValueError on text of neither kind."""
+    base = MSVC_BASE.search(text)
+    rows = {}
+    if base:
+        base = int(base.group(1), 16)
+        for line in text.splitlines():
+            m = MSVC_SYMBOL.match(line)
+            if m and m.group(3) == "f":
+                rows.setdefault(int(m.group(2), 16) - base, m.group(1))
+    else:
+        for line in text.splitlines():
+            m = NM_SYMBOL.match(line)
+            if m:
+                rows.setdefault(int(m.group(1), 16), m.group(2))
+    if not rows:
+        raise ValueError("no function symbols in the map (expected an MSVC /MAP file or nm -n text)")
+    return sorted(rows.items())
+
+
+def format_symbols(rows):
+    """Compact table, one `RVA name` line per function (hex RVA, no 0x): symbols of our DLL, never game files."""
+    return "".join("%x %s\n" % row for row in rows)
+
+
+def load_symbols(text):
+    """Reads a table written by format_symbols back into sorted (rva, name) rows."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            rows.append((int(parts[0], 16), parts[1].strip()))
+    return sorted(rows)
+
+
 def log_files(logdir):
     """(archive name, path) of every file the run wrote: the run folder's own files and the debugger summary
     `<logdir>.out` beside it. Sub-folders (a shader cache), memory dumps and anything that is not a regular file stay out."""
@@ -400,7 +445,7 @@ def first_poll(logdir):
     return None
 
 
-def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None):
+def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 1024, chunk_bytes=CHUNK_BYTES, cache_dir=None, map_file=None):
     """Writes every log of the run into numbered zip parts, each under limit_bytes; nothing is dropped.
     One part keeps the plain name; several become <stem>_partNNofMM.zip. Returns the list of (path, size)."""
     manifest = validate_manifest(dict(manifest_in))
@@ -425,6 +470,11 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
         add(RESULTS_NAME, format_results(rows).encode("utf-8"))
+    if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
+        with open(map_file, encoding="utf-8", errors="replace") as handle:
+            rows = parse_symbols(handle.read())
+        manifest["symbols"] = len(rows)
+        add(SYMBOLS_NAME, format_symbols(rows).encode("utf-8"))
     stem, ext = os.path.splitext(zip_path)
     count = len(members)
     for index, group in enumerate(members, 1):
@@ -467,6 +517,7 @@ def main(argv):
     q.add_argument("zip")
     q.add_argument("--limit-mb", type=float, default=DEFAULT_LIMIT_MB)
     q.add_argument("--cache", default=None, help="shader cache folder: add shader_results.txt (the result text of every key)")
+    q.add_argument("--map", default=None, help="linker map of our d3d12_xs.dll: add d3d12_xs.symbols.txt (RVA and function name only)")
     r = sub.add_parser("cache-results")
     r.add_argument("cache")
     args = parser.parse_args(argv)
@@ -499,7 +550,7 @@ def main(argv):
         return 0
     with open(args.manifest, encoding="utf-8-sig") as handle:
         manifest_in = json.load(handle)
-    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache):
+    for path, size in pack(args.logdir, manifest_in, args.zip, int(args.limit_mb * 1024 * 1024), cache_dir=args.cache, map_file=args.map):
         print("%s %d" % (path, size))
     return 0
 
