@@ -53,6 +53,32 @@ STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
 
 
+# d16: the data is four binary16 values packed in two VGPRs (R, G in the first, B, A in the second, low half first), stored
+# with image_store v[4:5] ... d16. v4 = 0xc0003c00 (1.0, -2.0), v5 = 0x7bff3800 (0.5, 65504.0). Every half is exact in
+# binary32 and the four values differ, so a swapped half, a binary32 reading of the words or a missing conversion all change
+# the texel.
+D16_SOURCE = """\
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+v_mov_b32 v0, 1
+v_mov_b32 v1, 2
+v_mov_b32 v4, 0xc0003c00
+v_mov_b32 v5, 0x7bff3800
+s_waitcnt lgkmcnt(0)
+image_store v[4:5], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D d16
+s_waitcnt vmcnt(0)
+exp mrt0 v4, v5, v4, v5 done vm
+s_endpgm
+"""
+D16_PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'ff02087e003c00c0' 'ff020a7e0038ff7b' '7fc08cbf')
+D16_STORE = bytes.fromhex('080f20f000040480')
+D16_SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050405' '000081bf')
+D16_WORDS = D16_PREFIX + D16_STORE + D16_SUFFIX
+D16_VALUES = (1.0, -2.0, 0.5, 65504.0)
+D16_BITS = ['%08x' % struct.unpack('<I', struct.pack('<f', v))[0] for v in D16_VALUES]
+D16_LINE = ('w0[uint2(v0, v1)] = float4(f16tof32(v4 & 0xffffu), f16tof32(v4 >> 16), '
+            'f16tof32(v5 & 0xffffu), f16tof32(v5 >> 16));')
+
+
 def cmpx_eq(constant):
     """v_cmpx_eq_u32_e32 <constant>, v0: VOPC (bits 31:25 = 0x3e), opcode 0xd2, VSRC1 v0, SRC0 an inline
     integer 1..64 (0x80 + n). In gfx10 the VOPC v_cmpx form writes only exec."""
@@ -106,9 +132,34 @@ def controls():
         assert STORE_LINE in translate(with_store(store)).hlsl_ps(), name
     print('glc, slc, dlc and unorm accepted')
 
-    # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
+    # d16: the two data registers hold four binary16 values, widened to binary32 for the float UAV.
+    decoded = D.decode_instruction(D16_STORE, 0)[2]
+    assert decoded == 'image_store v[4:5], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D d16', decoded
+    pipe16 = translate(D16_WORDS)
+    ps16 = pipe16.hlsl_ps()
+    assert '    ' + D16_LINE in ps16 and STORE_LINE not in ps16, ps16
+    assert 'uav 0 tex2d table 0 0' in pipe16.manifest(), pipe16.manifest()
+    print('d16 store: %s' % D16_LINE)
+    # d16 needs exactly two data registers (a binary32 store needs four), and the other flags stay refused with it.
+    for data, needle in (('v[4:7]', 'two VGPRs expected'), ('v4', 'two VGPRs expected')):
+        try:
+            pipe16.ps.op_image_store([data, 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'd16'])
+        except G.Unsupported as error:
+            assert needle in str(error), error
+        else:
+            raise AssertionError('d16 with data %s was accepted' % data)
+    try:
+        pipe.ps.op_image_store(['v[4:5]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D'])
+    except G.Unsupported as error:
+        assert 'four VGPRs expected' in str(error), error
+    else:
+        raise AssertionError('two data registers without d16 were accepted')
+    refused(D16_PREFIX + D16_STORE[:7] + bytes([D16_STORE[7] | 0x40]) + D16_SUFFIX, 'image_store')
+    print('d16 needs two data registers; d16 with a16 refused')
+
+    # Refusals, each by name: packed addresses, fault-status returns, a 128-bit descriptor,
     # a partial channel mask and other image dimensions.
-    cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
+    cases = (('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
              ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
@@ -193,6 +244,9 @@ def check_binary(llvm_mc):
     built = assemble(llvm_mc, SOURCE)
     if built != WORDS:
         raise AssertionError('assembled %s, recorded %s' % (built.hex(), WORDS.hex()))
+    built16 = assemble(llvm_mc, D16_SOURCE)
+    if built16 != D16_WORDS:
+        raise AssertionError('d16: assembled %s, recorded %s' % (built16.hex(), D16_WORDS.hex()))
     print('fixture words match llvm-mc')
 
 
@@ -227,6 +281,26 @@ def check_draw(dxc, renderer, adapter):
             assert text != source, label
             run = draw(text, label.replace(' ', '_'))
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
+                raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
+            print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
+
+        # d16: four binary16 values from two VGPRs reach the float texel; controls with a wrong half order, a binary32
+        # reading of the words and the store deleted must fail.
+        d16 = translate(D16_WORDS).hlsl_ps()
+        d16_expected = ','.join(D16_BITS)
+        run = draw(d16, 'd16_store', d16_expected)
+        sys.stdout.write(run.stdout)
+        if run.returncode:
+            raise AssertionError('d16 store draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw d16: texel (1, 2) = %s, all other texels untouched' % d16_expected)
+        swapped = ('w0[uint2(v0, v1)] = float4(f16tof32(v4 >> 16), f16tof32(v4 & 0xffffu), '
+                   'f16tof32(v5 >> 16), f16tof32(v5 & 0xffffu));')
+        for label, text in (('d16 halves swapped', d16.replace(D16_LINE, swapped)),
+                            ('d16 read as binary32', d16.replace(D16_LINE, 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v4, v5));')),
+                            ('d16 store deleted', d16.replace(D16_LINE, ''))):
+            assert text != d16, label
+            run = draw(text, label.replace(' ', '_'), d16_expected)
+            if run.returncode == 0 or 'texel_mismatch x=1 y=2' not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
 

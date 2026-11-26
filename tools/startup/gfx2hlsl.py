@@ -7404,7 +7404,7 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute, a full 2D-array texel.
+        """Write a full 2D texel (FP32, or with d16 packed FP16, in pixel and compute stages) or, for compute FP32, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
@@ -7418,7 +7418,7 @@ class Stage:
         name = 'image_store'
         if self.kind not in ('ps', 'cs'):
             raise Unsupported('%s outside a pixel stage' % name)
-        d16 = self.kind == 'cs' and mods.count('d16') == 1
+        d16 = mods.count('d16') == 1
         if len(ops) != 3:
             raise Unsupported('%s with %d operands' % (name, len(ops)))
         for m in mods:
