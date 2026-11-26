@@ -3767,6 +3767,75 @@ class Stage:
         return {self.ins[i][0]: self.ins[lo][0] for b in always[0] for lo, hi in (bounds[b],)
                 for i in range(lo, hi) if self.ins[i][0] in entry}
 
+    def whole_quad_exec_sites(self, cfg):
+        """Must-analysis of lane-exact whole-quad EXEC before each instruction.
+
+        The entry WQM no-op matches the guest on each host quad. From there, full-width saves, restores and
+        narrowing by a whole-quad mask stay lane-exact. A write outside this model drops the
+        proof. At joins and back edges intersect the facts from every incoming path.
+        """
+        bounds, _, succ, _ = cfg
+        wave32 = wave32_exec_proof(self.ins)
+        width = 'b32' if wave32 else 'b64'
+        full_exec = {'exec', 'exec_lo'} if wave32 else {'exec'}
+        constants = {'0', '-1'}
+        move, narrow, save = ('s_%s_%s' % (op, width) for op in ('mov', 'and', 'and_saveexec'))
+        operations = []
+        for off, _, name, asm in self.ins:
+            _, ops, mods = parse(asm)
+            _, _, writes = scalar_effects(name, asm)
+            operations.append((off, name, ops, mods, writes, writes_exec(name, ops) or bool(writes & EXEC_KEYS),
+                               name.startswith('exp') and 'vm' in asm.split()))
+
+        before = {0: {'entry'}}
+        pending = {0}
+        known = set()
+        while pending:
+            block = pending.pop()
+            facts = before[block].copy()
+            lo, hi = bounds[block]
+            for off, name, ops, mods, writes, exec_write, discard in operations[lo:hi]:
+                if 'exec' in facts:
+                    known.add(off)
+                else:
+                    known.discard(off)
+                if discard:
+                    # An EXEC-guarded export can discard host lanes before a later restore.
+                    facts.clear()
+                    continue
+                previous = facts
+                facts = {fact for fact in previous if not isinstance(fact, frozenset) or writes.isdisjoint(fact)}
+                if not exec_write:
+                    continue
+                facts.discard('entry')
+                facts.discard('exec')
+                if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1]:
+                    if previous & {'entry', 'exec'}:
+                        facts.add('exec')
+                    continue
+                if not mods and 'exec' in previous:
+                    if name == narrow and ops[0] in full_exec and (
+                            set(ops[1:]) <= full_exec | constants and set(ops[1:]) & full_exec):
+                        facts.add('exec')
+                        continue
+                    if name == save and ops[1] in full_exec | constants:
+                        dst = reg_range(ops[0])
+                        if dst and dst[0] == 's' and dst[2] <= 105 and dst[2] - dst[1] == (0 if wave32 else 1):
+                            facts.update(('exec', frozenset(scalar_tokens(ops[0]))))
+                            continue
+                    if name == move and ops[0] in full_exec and (
+                            ops[1] in full_exec or frozenset(scalar_tokens(ops[1])) in previous):
+                        facts.add('exec')
+                        continue
+                # A later restore cannot repair values produced by an inexact EXEC write.
+                facts.clear()
+            for target in succ[block]:
+                merged = before.get(target, facts) & facts
+                if before.get(target) != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return known
+
     def uniform_entry_exec(self):
         sites = getattr(self, 'entry_exec_proof', None)
         return self.exec_known if sites is None else self.pc in sites
@@ -3831,6 +3900,14 @@ class Stage:
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.whole_quad_sites = set()
+        if (getattr(self, 'kind', None) == 'ps' and not self.fetched and
+                any(name == 'v_add_f32_dpp' for _, _, name, _ in self.ins)):
+            self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
+        self.entry_wqm_sites = (self.entry_wqm_exec_sites()
+                                if branches and getattr(self, 'kind', None) == 'ps' and
+                                any(name == 'v_subrev_f32_dpp' for _, _, name, _ in self.ins)
+                                else set())
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
@@ -3936,6 +4013,8 @@ class Stage:
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
             self.compute_dpp_blocks = set()
+
+            self.whole_quad_reads = set()
             self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
             self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
             self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
@@ -4780,6 +4859,56 @@ class Stage:
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
             self.quad_flow_reads.append((self.pc, base))
 
+    def entry_wqm_exec_sites(self):
+        """Track the entry WQM mask through reachable blocks, intersecting facts at joins and back edges."""
+        bounds, _, succ, _ = self.spill_cfg
+        if not bounds:
+            return set()
+        # Only the entry block can establish WQM. Later s_wqm instructions cannot
+        # recover an EXEC write that this translator does not model on helper lanes.
+        entry_end = bounds[0][1]
+        entry_wqm = None
+        clobbers = set()
+        wave32 = wave32_exec_proof(self.ins)
+        for i, (_off, _n, name, asm) in enumerate(self.ins):
+            _, ops, _ = parse(asm)
+            full_wqm = (name == 's_wqm_b64' and ops == ['exec', 'exec'] or
+                        wave32 and name == 's_wqm_b32' and ops in (['exec', 'exec'], ['exec_lo', 'exec_lo']))
+            if full_wqm:
+                if i < entry_end and entry_wqm is None and not clobbers:
+                    entry_wqm = i
+            elif writes_exec(name, ops) or name == 'exp' or name.startswith(('s_swappc', 's_call')):
+                clobbers.add(i)
+        if entry_wqm is None or any(0 in targets for targets in succ):
+            return set()
+
+        incoming, pending, sites = {0: False}, {0}, set()
+        while pending:
+            block = pending.pop()
+            whole = incoming[block]
+            lo, hi = bounds[block]
+            for i in range(lo, hi):
+                off = self.ins[i][0]
+                if whole:
+                    sites.add(off)
+                else:
+                    sites.discard(off)
+                if i == entry_wqm:
+                    whole = True
+                elif i in clobbers:
+                    whole = False
+            for target in succ[block]:
+                merged = incoming.get(target, True) and whole
+                if incoming.get(target) != merged:
+                    incoming[target] = merged
+                    pending.add(target)
+        return sites
+
+    def quad_subrev_block_proof(self, base):
+        return (base == 'v_subrev_f32' and self.quad_flow_allowed()
+                and not getattr(self, 'fetched', False)
+                and self.pc in getattr(self, 'entry_wqm_sites', ()))
+
     def quad_flow_refusals(self, branches, targets):
         """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
 
@@ -4823,6 +4952,12 @@ class Stage:
                             and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
         out = []
         for at, base in reads:
+            if at in self.whole_quad_reads:
+                split = next((b for b in sorted(self.divergent_branches) if reaches(b, at)), None)
+                if split is not None:
+                    out.append((at, '%s_dpp quad read at +0x%x: %s at +0x%x is not proven wave-uniform'
+                                % (base, at, self.divergent_branches[split], split)))
+                continue
             if self.wqm_set_at is None or self.wqm_set_at >= first:
                 out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the s_wqm exec, exec does not '
                                 'run before every branch' % (base, at)))
@@ -4862,8 +4997,9 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
-        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
-                not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
+        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or getattr(self, 'fetched', False) or
+                (not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
+                 and not self.quad_subrev_block_proof(base))):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
         if len(ops) < 2:
@@ -5353,7 +5489,7 @@ class Stage:
         if not getattr(self, 'exec_known', False):
             if self.narrowing_proof():
                 narrowed = True
-            else:
+            elif not self.quad_subrev_block_proof(base):
                 raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
                                   % (base, self.quad_exec_cause()))
         elif not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))):
@@ -5361,7 +5497,7 @@ class Stage:
                               % (base, self.quad_exec_cause()))
         if not narrowed and fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        if not getattr(self, 'wqm_exec', False):
+        if not getattr(self, 'wqm_exec', False) and not self.quad_subrev_block_proof(base):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
             raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
@@ -5518,16 +5654,23 @@ class Stage:
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         compute = getattr(self, 'kind', None) == 'cs'
+        after_exec_write = (base == 'v_add_f32' and not self.exec_known and
+                            getattr(self, 'pc', None) in getattr(self, 'whole_quad_sites', ()))
         if compute:
             self.compute_quad_gate(base, row_ror8, allow_flow=compute_float)
             if row is not None and math.prod(self.pipe.group) % 16:
                 raise Unsupported('%s_dpp %s requires a group of whole rows (a multiple of 16 threads)' % (base, row))
         else:
-            if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
-            if not getattr(self, 'wqm_exec', False):
-                raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
-                                  'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+            block_proof = self.quad_subrev_block_proof(base)
+            if not after_exec_write:
+                if (getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed())
+                        or not (getattr(self, 'exec_known', False) or block_proof)):
+                    raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
+                if not (getattr(self, 'wqm_exec', False) or block_proof):
+                    raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
+                                      'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+            else:
+                self.whole_quad_reads.add(self.pc)
             self.note_quad_flow(base)
             self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
@@ -5541,6 +5684,11 @@ class Stage:
                     valid = None
             else:
                 swapped = self.quad_source(intrinsic, self.u(base0), compute)
+            if after_exec_write:
+                # All host threads of the quad execute the read, including when the guest quad is off.
+                self.used_v.add(self.DPP_TEMP)
+                self.emit('v%d = %s;' % (self.DPP_TEMP, swapped))
+                swapped = 'v%d' % self.DPP_TEMP
             first = 'F(%s)' % swapped
             if abs0:
                 first = 'abs(%s)' % first
