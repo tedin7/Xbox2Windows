@@ -1457,12 +1457,15 @@ def check_lds_exchange(ins, group, words):
     published = False
     read = False
     prev = (None, [], [])
-    for i, (_, _, _, asm) in enumerate(ins):
+    for i, (offset, _, _, asm) in enumerate(ins):
         name, ops, mods = parse(asm)
         base = name.removesuffix('_e32').removesuffix('_e64')
         if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc')) or writes_exec(base, ops)
                 or base == 's_endpgm' and i + 1 < len(ins)):
-            raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
+            # Name the first instruction that breaks the shape, so a refusal count says which one to lift.
+            cause = ('branch' if base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc'))
+                     else 'EXEC written by' if writes_exec(base, ops) else 'code after')
+            raise Unsupported('LDS exchange needs straight-line code and entry EXEC: %s %s at +0x%x' % (cause, base, offset))
         if base == 's_barrier':
             if (not fill_spans or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
                     or mods or ops not in ([], ['0'], ['0x0'])):

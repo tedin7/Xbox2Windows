@@ -221,6 +221,16 @@ def check_controls():
     refused('straight-line', lambda: translate_case('P', code=patch(WORDS_P, store, '020084bf' + store)))
     refused('1D group', lambda: translate_case('P', group=(32, 2, 1)))
 
+    # The straight-line refusal names the first instruction that breaks the shape (kind, mnemonic, byte offset), so a
+    # tester report says which one to lift.
+    for what, decoded in (
+            ('branch s_cbranch_scc0 at +0x4', [(0, 4, 'v_mov_b32', 'v_mov_b32 v8, 0'), (4, 4, 's_cbranch_scc0', 's_cbranch_scc0 1'),
+                                               (8, 4, 's_endpgm', 's_endpgm')]),
+            ('EXEC written by s_mov_b64 at +0x4', [(0, 4, 'v_mov_b32', 'v_mov_b32 v8, 0'), (4, 4, 's_mov_b64', 's_mov_b64 exec, -1'),
+                                                   (8, 4, 's_endpgm', 's_endpgm')]),
+            ('code after s_endpgm at +0x0', [(0, 4, 's_endpgm', 's_endpgm'), (4, 4, 'v_mov_b32', 'v_mov_b32 v8, 0')])):
+        refused('straight-line code and entry EXEC: ' + what, lambda d=decoded: G.check_lds_exchange(d, (4, 1, 1), 128))
+
     # Mixed-width interoperability: in-span b32 after b64 succeeds, while out-of-span b32/read2_b32/b64 stay refused.
     mixed_b32 = translate_case('P', code=patch(WORDS_P, read_p, '1000d8d808000008')).hlsl_cs()
     assert 'v8 = lds[(v8 + 16u) >> 2];' in mixed_b32, mixed_b32
