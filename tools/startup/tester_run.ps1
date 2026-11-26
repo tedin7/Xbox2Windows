@@ -254,10 +254,12 @@ if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send
 # pending or -FinishTranslateSeconds is over, so the next run starts with every request already translated.
 if ($FinishTranslateSeconds -gt 0) {
     $before = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0])
+    # Pending = no result at all. A refusal is a result (c25: a refusal of this translator build is final): counting it as pending
+    # printed "2616 pending" for requests that were all refused.
+    $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0] - [int]$before[2])
     $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
     $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
-    Write-Host ("tester_run: finishing the translation: {0} request(s) pending, one pass, at most {1} s (the report above is already packed; do not close this window)" -f $pendingBefore, $FinishTranslateSeconds)
+    Write-Host ("tester_run: finishing the translation: {0} request(s) pending ({1} refused earlier, retried only if the translator changed), one pass, at most {2} s (the report above is already packed; do not close this window)" -f $pendingBefore, [int]$before[2], $FinishTranslateSeconds)
     $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
         -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
@@ -265,7 +267,7 @@ if ($FinishTranslateSeconds -gt 0) {
     $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
     if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
     $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
-    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0])
+    $pendingAfter = [math]::Max(0, [int]$after[1] - [int]$after[0] - [int]$after[2])
     $note = if ($capped) { ", stopped at the cap" } elseif ($translator.ExitCode -ne 0) { ", translator exit code $($translator.ExitCode) (see $finishErr)" } else { "" }
     Write-Host ("tester_run: finish translation done in {0:N0} s: pending before {1}, after {2}; ok {3}, refused {4} in total ({5} new){6}" -f `
         $finishClock.Elapsed.TotalSeconds, $pendingBefore, $pendingAfter, [int]$after[0], [int]$after[2], ([int]$after[2] - [int]$before[2]), $note)
