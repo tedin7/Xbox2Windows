@@ -223,6 +223,23 @@ of only 64 bytes, and an unproven overlapping write all leave the target clear.
 Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
 `ctest --preset release -j1 --no-tests=error -R '^startup_indirect_copy_provenance_' -V`.
 
+### Title-memory tables in translated indirect draws
+
+With the same title-input switch, compute can also snapshot a readable range
+outside any placed buffer. Translated indirect draws additionally require
+`X2W_INDIRECT_TABLE_SNAPSHOT=1`, which defaults off, and
+`X2W_TRANSLATED_INDIRECT_DRAW=1`. The table range is capped at 16 MiB when the
+draw snapshot switch is on. Refusal logs identify the table lookup failure,
+and typed-view format failures report the DXGI format number.
+
+The WARP cases use a three-vertex draw with an unplaced title-memory table.
+They compare every target pixel to a CPU raster reference, check the named
+switch-off refusal, and require a one-record shift to disagree with the original
+reference while matching the shifted triangle. A typed-view control checks
+the numeric format in the refusal and the clear target.
+
+Run `ctest --preset dev --no-tests=error -R '^startup_indirect_table_snapshot(_off|_shifted|_format)?_warp$' -V`.
+
 ### Packed pixel position in a source-built shader
 
 Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.

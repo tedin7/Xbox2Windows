@@ -2457,21 +2457,22 @@ bool unfilled_heap_slot(const std::uint32_t* words)
     return words[0] && !words[1] && !words[2] && !words[3];
 }
 
-// X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
-// (a committed default buffer that holds zeros) is read from title memory, snapshotted into the upload ring.
+// X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1 permits snapshots of translated inputs from title memory.
 bool title_input_snapshot_enabled()
 {
     static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT");
     return enabled;
 }
 
-// For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
-// fallback to copying an unrelated or stale title allocation into the draw upload ring.
+constexpr u64 title_input_snapshot_limit = u64{16} << 20;
+constexpr u64 raw_buffer_limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+
+// Bind the complete descriptor range, with a recording-time snapshot when enabled.
 // why, when given, receives the condition an empty result failed on.
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
-                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool compute_input = false)
+                                         u64 limit = raw_buffer_limit,
+                                         bool compute_input = false, bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2551,12 +2552,23 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             log("x2w-draw an input buffer descriptor has %llu bytes (stride %u, limit %llu)", static_cast<unsigned long long>(bytes), stride,
                 static_cast<unsigned long long>(limit));
         if (bytes % 4) return refuse("an input buffer range is not a whole number of dwords");
-        return refuse(limit == (16u << 20) ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
+        return refuse(limit == title_input_snapshot_limit ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
     }
     ID3D12Resource* native = nullptr;
     bool upload = false;
     int input_source = 0;
     Wrapper* device = self->own().list_device;
+    const bool can_snapshot = (compute_input || allow_title_snapshot) && title_input_snapshot_enabled() &&
+        bytes <= title_input_snapshot_limit;
+    const auto snapshot = [&]() -> IndirectBufferView {
+        if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
+            return refuse("an input range in title memory is not readable");
+        u64 ring_offset = 0;
+        ID3D12Resource* ring = nullptr;
+        if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
+            return refuse("an input range could not be copied from title memory");
+        return {ring, ring_offset, bytes, stride, true, 2};
+    };
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
             if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
@@ -2568,10 +2580,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
             const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
-            if (!alias.resource)
-                return refuse(in_upload ? "an input range crosses the end of its upload allocation"
-                                        : "an input is in title memory outside any placed buffer");
-            return {alias.resource, alias.offset, bytes, stride};
+            if (alias.resource) return {alias.resource, alias.offset, bytes, stride};
+            if (in_upload) return refuse("an input range crosses the end of its upload allocation");
+            if (can_snapshot) return snapshot();
+            return refuse("an input is in title memory outside any placed buffer");
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
@@ -2579,17 +2591,11 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (!placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
-            } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
-                // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
-                // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
-                // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
-                u64 ring_offset = 0;
-                ID3D12Resource* ring = nullptr;
-                if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
-                    return refuse("an input range in title memory is not readable");
-                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
-                    return refuse("an input range could not be copied from title memory");
-                return {ring, ring_offset, bytes, stride, true, 2};
+            } else if (can_snapshot) {
+                if (!compute_input && offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                    return refuse("an input buffer range is not 16-byte aligned in its resource");
+                // The committed buffer has no title backing. Capture the CPU writes visible during recording.
+                return snapshot();
             } else {
                 return refuse("an input is in a placed buffer that does not alias title memory");
             }
@@ -2639,6 +2645,7 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
         D3D12_SHADER_RESOURCE_VIEW_DESC view;
         std::memcpy(&view, record.desc, 40);
+        format = view.Format;
         return x2w_startup::view_word3(view, words[3]);
     }
     if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
@@ -3212,24 +3219,31 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (indirect) {
             IndirectBufferView view{};
-            if (srv.source == 1 && indexed) {
+            const bool vertex_stream = srv.source == 1 && indexed;
+            const char* why = vertex_stream ? "an indexed vertex stream has an invalid descriptor"
+                                            : "an input buffer descriptor is missing or unreadable";
+            if (vertex_stream) {
                 const auto& vb = pass.vb[0];
                 if (vb.StrideInBytes && vb.StrideInBytes <= 0x3fff && vb.SizeInBytes % vb.StrideInBytes == 0 &&
                     vb.BufferLocation <= 0xffffffffffffull) {
                     const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
                         static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
-                    view = indirect_table_buffer(self, stream, true);
+                    view = indirect_table_buffer(self, stream, true, &why);
                     indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
                 }
             } else if (entry_ok) {
-                view = indirect_table_buffer(self, words);
+                static const bool snapshot_enabled = x2w_local::env_on("X2W_INDIRECT_TABLE_SNAPSHOT");
+                const u64 limit = snapshot_enabled ? title_input_snapshot_limit : raw_buffer_limit;
+                view = indirect_table_buffer(self, words, false, &why, limit, false, snapshot_enabled);
             }
-            if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
-                indirect->set_refusal(
-                    srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
-                                    : "translated draw requires a complete GPU-backed table buffer range",
-                    srv.source == 1 ? indirect_refusal_code::incomplete_vertex_stream
-                                    : indirect_refusal_code::incomplete_table_buffer);
+            if (view.resource && view.resource == indirect->argument)
+                why = "an input buffer uses the indirect argument resource";
+            else if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                why = "an input buffer offset is not 16-byte aligned";
+            if (!view.resource || why) {
+                indirect->set_refusal(why ? why : "an input buffer has no GPU backing",
+                    vertex_stream ? indirect_refusal_code::incomplete_vertex_stream
+                                  : indirect_refusal_code::incomplete_table_buffer);
                 draw_lock_release_exclusive();
                 return not_drawn(11);
             }

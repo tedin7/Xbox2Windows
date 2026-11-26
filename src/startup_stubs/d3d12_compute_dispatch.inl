@@ -448,7 +448,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, title_input_snapshot_limit, true);
             if (unfilled_heap_slot(words) && !tr->unfilled_heap_slot_logged) {
                 tr->unfilled_heap_slot_logged = true;
                 log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);

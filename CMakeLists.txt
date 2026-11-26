@@ -1797,6 +1797,12 @@ add_test(NAME startup_indirect_other_refusal_census_control_warp
 set_tests_properties(startup_indirect_other_refusal_census_control_warp PROPERTIES TIMEOUT 60
     PASS_REGULAR_EXPRESSION "got +'x2w-d3d12 indirect-other refusals: total 3. distinct keys 2, distinct pairs 2 \\(overflow calls 0\\)'")
 
+foreach(mode IN ITEMS table-snapshot table-snapshot-off table-snapshot-shifted table-snapshot-format)
+    string(REPLACE "-" "_" test_suffix "${mode}")
+    add_test(NAME startup_indirect_${test_suffix}_warp COMMAND startup_indirect_draw_indexed warp ${mode})
+    set_tests_properties(startup_indirect_${test_suffix}_warp PROPERTIES TIMEOUT 60)
+endforeach()
+
 # Teardown of the four per-device caches that keep desktop D3D12 objects (#2572): the built d3d12_xs.dll is
 # loaded by explicit path, warmed through its own probe, then unloaded -- the caches must release what they
 # own and the module must go -- and a second load is run in a child process that leaves the module loaded to
