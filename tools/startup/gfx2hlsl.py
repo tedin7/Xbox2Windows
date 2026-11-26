@@ -9412,12 +9412,12 @@ class Stage:
         self.mix(ops, mods, 'hi')
 
     def packed_half(self, base, arity, text, ops, mods):
-        """v_pk_{mul,add,fma}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
+        """v_pk_{mul,add,fma,min,max}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR
-        (an inline constant or a literal reaches the high lane in a way that is not proven; hold it in a VGPR first).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR or a literal read
+        through its low half in both lanes (an inline constant, or a literal's high half, reaches a lane in a way that is not proven).
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -9430,14 +9430,27 @@ class Stage:
             if len(bits) != arity or any(b not in ('0', '1') for b in bits):
                 raise Unsupported('%s with %s' % (base, m))
             sel[key] = [int(b) for b in bits]
-        for tok in ops:
+        literal = {}   # source index -> its 32-bit literal, read through its LOW half only (see below)
+        for i, tok in enumerate(ops):
             r = reg_range(tok)
-            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
-                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
+            if r and r[0] == 'v' and r[1] == r[2] and tok == 'v%d' % r[1]:
+                continue
+            if i >= 1 and re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                # A literal is one dword and each lane picks a half of it by op_sel / op_sel_hi. Only a source whose two lanes both
+                # read the low half is accepted: that is the plain binary16 constant (LLVM prints `0x7bef op_sel_hi:[1,0]`); a read of
+                # the high half of a literal, and an inline constant (how it reaches each half is not proven), stay refused.
+                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                    raise Unsupported('%s literal source %s read through its high half' % (base, tok))
+                literal[i - 1] = int(tok, 16) & 0xffff
+                continue
+            raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
         lanes = []
         for picks in (sel['op_sel'], sel['op_sel_hi']):
             args = []
-            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
+            for n, (tok, hi, both) in enumerate(zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi']))):
+                if n in literal:
+                    args.append('f16tof32(0x%xu)' % literal[n])
+                    continue
                 word = self.u(tok, low16_only=not any(both))
                 args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
             lanes.append('f16rn(%s)' % text.format(*args))
@@ -9452,6 +9465,14 @@ class Stage:
 
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
+    # v_pk_{min,max}_f16: the lane values are exact binary32 images of binary16, so the binary32 helper that orders -0 below +0 and passes a
+    # NaN to D3D min/max (the one v_min_f32 and v_max_f32 use) is exact, and f16rn gives the result back its binary16 word.
+    def op_v_pk_min_f16(self, ops, mods):
+        self.packed_half('v_pk_min_f16', 2, 'minmax_zero32({0}, {1}, false)', ops, mods)
+
+    def op_v_pk_max_f16(self, ops, mods):
+        self.packed_half('v_pk_max_f16', 2, 'minmax_zero32({0}, {1}, true)', ops, mods)
 
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
