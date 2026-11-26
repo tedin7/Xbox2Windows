@@ -11,7 +11,7 @@ The scene is an existing in-repo fixture, run unchanged. Checked:
   - control (--control): one byte of the first creation call's description memory is changed in the recording; the replay must
     then NOT log the same creations.
 
-usage: startup_replay_family_check.py <x2w_replay> <warp|hardware> [--control] -- <scene exe> [scene args]
+usage: startup_replay_creations_check.py <x2w_replay> <warp|hardware> [--control] -- <scene exe> [scene args]
 """
 import json
 import os
@@ -111,7 +111,7 @@ def main(argv):
             assert damage_first_creation(recording, damaged), "no argument memory to damage"
             code, text, log, _t = play(damaged, "damaged")
             assert code != 0 or creations(log) != recorded, "a damaged creation replayed to the same creations"
-        print("replay family: %d creation lines equal; calls %s" % (len(recorded), summary.get("calls")))
+        print("replay creations: %d creation lines equal; calls %s" % (len(recorded), summary.get("calls")))
     return 0
 
 
