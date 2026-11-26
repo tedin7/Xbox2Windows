@@ -13,6 +13,7 @@
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
+#include "startup_stubs/dstorage_read_cache.h"
 #include "startup_stubs/bcpack_decoder.h"
 
 #include <psapi.h>
@@ -142,6 +143,7 @@ struct QueueWork {
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
+    u64 prefetch_next = 0;            // HDD mode: the first entry (by finished_total + 1 + position) not yet planned, guarded by mutex
     bool worker_started = false;  // guarded by the setup mutex
     u64 next_entry_id = 0;
     u64 next_submission_id = 0;
@@ -581,6 +583,54 @@ DiskStats disk_snapshot()
     const std::lock_guard guard(disk_mutex);
     return disk_stats;
 }
+
+// HDD mode (X2W_STORAGE_HDD=1, off by default): the worker plans the file reads of its next 256 queue entries, a prefetch thread reads
+// them sorted and merged (dstorage_read_plan.h) into a bounded cache, and the worker's own file read asks the cache first. The
+// worker still runs its entries in order, so a miss only costs speed. Look-ahead: the next 256 entries; reads within 64 KiB of
+// each other merge up to 4 MiB; at most 64 MiB cached, unused entries dropped after 20 s.
+bool hdd_mode() noexcept
+{
+    static const bool on = [] {
+        char text[8];
+        const DWORD length = GetEnvironmentVariableA("X2W_STORAGE_HDD", text, sizeof(text));
+        return length == 1 && text[0] == '1';
+    }();
+    return on;
+}
+constexpr std::size_t hdd_look_ahead_entries = 256;  // queue entries (requests, status entries and fences) planned ahead
+x2w_startup::ReadCache& hdd_cache()
+{
+    // Never destroyed: the prefetch thread can outlive the static destructors at process exit.
+    static x2w_startup::ReadCache* const cache = new x2w_startup::ReadCache(&note_disk_read, 64 << 10, 4 << 20, 64 << 20, 20000);
+    return *cache;
+}
+// Called with the queue mutex held, right after the worker took an entry: plan the file reads of the entries still waiting.
+void hdd_look_ahead(QueueWork& work)
+{
+    // The entry the worker just took has sequence number finished_total; the entry at position i of `submitted` has
+    // finished_total + 1 + i. Plan the window's entries that earlier calls did not plan.
+    const u64 first = work.finished_total + 1;
+    const std::size_t window = work.submitted.size() < hdd_look_ahead_entries ? work.submitted.size() : hdd_look_ahead_entries;
+    const std::size_t begin = work.prefetch_next > first ? static_cast<std::size_t>(work.prefetch_next - first) : 0;
+    // Plan again only when less than half a window is planned ahead (or nothing is left to plan), so that each plan
+    // covers many new entries and merges well, instead of one new request per worker step.
+    if (begin >= window || begin >= hdd_look_ahead_entries / 2) return;
+    work.prefetch_next = first + window;
+    std::vector<x2w_startup::PlannedRead> reads;
+    for (std::size_t i = begin; i < window; ++i) {
+        const Entry& e = work.submitted[i];
+        if (e.type != Entry::request || !e.source || e.source->kind != file || e.source->handle == INVALID_HANDLE_VALUE) continue;
+        const u64 options = *reinterpret_cast<const u64*>(e.bytes);
+        if (options & memory_source_option) continue;
+        x2w_startup::PlannedRead r;
+        r.file = reinterpret_cast<std::uintptr_t>(e.source->handle);
+        r.offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
+        r.size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
+        r.index = i;
+        reads.push_back(r);
+    }
+    if (!reads.empty()) hdd_cache().submit(reads);
+}
 // The disk line: MB/s while reading and the share of the window spent in reads (high share and low MB/s = seek-bound),
 // read sizes (<=4K <=16K <=64K <=256K <=1M >1M) and the offset order of the reads, all since the start.
 int format_disk(char* out, std::size_t size, int second, const DiskStats& now, const DiskStats& before, double seconds,
@@ -887,11 +937,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         auto* file_object = reinterpret_cast<Object*>(source);
         bool file_read = false;
         if (file_object && file_object->kind == file) {
-            LARGE_INTEGER began, ended;
-            QueryPerformanceCounter(&began);
-            file_read = x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed);
-            QueryPerformanceCounter(&ended);
-            note_disk_read(file_object->handle, offset, source_size, ended.QuadPart - began.QuadPart, file_read);
+            // HDD mode: the prefetch may already hold these bytes (counted as read by the prefetch thread's own read).
+            if (hdd_mode()) file_read = hdd_cache().take(reinterpret_cast<std::uintptr_t>(file_object->handle), offset, source_size, packed, 3000);
+            if (!file_read) {
+                LARGE_INTEGER began, ended;
+                QueryPerformanceCounter(&began);
+                file_read = x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed);
+                QueryPerformanceCounter(&ended);
+                note_disk_read(file_object->handle, offset, source_size, ended.QuadPart - began.QuadPart, file_read);
+            }
         }
         if (file_read)
             input = packed.data();
@@ -1188,6 +1242,7 @@ DWORD WINAPI queue_worker(void* parameter)
             if (work.stopping) break;
             entry = std::move(work.submitted.front());
             work.submitted.pop_front();
+            if (hdd_mode()) hdd_look_ahead(work);
         }
         // Buffers are sized from request fields; a failed allocation fails that request instead of
         // ending the process (an exception leaving a thread calls terminate). The handlers only note
@@ -1916,6 +1971,12 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 format_disk(disk_line, sizeof disk_line, second, disk_now, last_disk, interval_ms / 1000.0,
                             frequency.QuadPart > 0 ? static_cast<double>(frequency.QuadPart) : 1.0);
                 log("%s", disk_line);
+                if (hdd_mode()) {
+                    const x2w_startup::ReadCache::Counters c = hdd_cache().counters();
+                    log("x2w-dstorage hdd %d s: cache hits %ld misses %ld (waited for a read in progress %ld); prefetch groups %ld, disk reads saved by "
+                        "merging %ld, prefetched %lld KiB, unused entries dropped %ld, failed group reads %ld", second, c.hits, c.misses,
+                        c.waited, c.groups, c.reads_saved, static_cast<long long>(c.prefetched_bytes >> 10), c.evicted_unused, c.failed);
+                }
                 last_disk = disk_now;
                 last_read = read_now;
                 last_inflated = inflated_now;

@@ -842,6 +842,19 @@ add_test(NAME startup_storage_failure_counts COMMAND startup_storage_failure_cou
 add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_storage_failure_counts --mutate one-bucket)
 set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
+# HDD mode of the stand-in (X2W_STORAGE_HDD=1): the read plan (order, merging, limits) as pure logic, and the real
+# queue with the mode on (one merged prefetch read serves 47 of 48 shuffled requests) and off (48 reads), bytes identical.
+add_executable(startup_dstorage_read_plan tests/startup_dstorage_read_plan_check.cpp)
+target_compile_features(startup_dstorage_read_plan PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_read_plan PRIVATE src)
+add_test(NAME startup_dstorage_read_plan COMMAND startup_dstorage_read_plan)
+add_executable(startup_dstorage_hdd_queue tests/startup_dstorage_hdd_queue.cpp)
+target_compile_features(startup_dstorage_hdd_queue PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_hdd_queue PRIVATE src)
+target_link_libraries(startup_dstorage_hdd_queue PRIVATE psapi)
+add_test(NAME startup_dstorage_hdd_queue_on COMMAND startup_dstorage_hdd_queue on)
+add_test(NAME startup_dstorage_hdd_queue_off COMMAND startup_dstorage_hdd_queue off)
+set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off PROPERTIES TIMEOUT 60)
 # Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
 # page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
 # compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
