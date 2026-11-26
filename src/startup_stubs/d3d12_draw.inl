@@ -2179,6 +2179,8 @@ void log_not_drawn_causes()
         if (not_drawn_counts[i]) used += snprintf(text + used, sizeof(text) - used, " %s %ld,", not_drawn_names[i], not_drawn_counts[i]);
     log("%s", text);
 }
+// Fixtures: the cause line without waiting for the frame that logs it.
+extern "C" __declspec(dllexport) void x2w_d3d12_not_drawn_census() { log_not_drawn_causes(); }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)

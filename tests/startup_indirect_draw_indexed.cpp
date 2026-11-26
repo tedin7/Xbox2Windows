@@ -32,6 +32,7 @@
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity);
+extern "C" __declspec(dllimport) void x2w_d3d12_not_drawn_census();
 
 #if defined(OFFSCREEN_AGILITY_620)
 extern "C" {
@@ -1333,8 +1334,9 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         for (const auto& line : entries) std::fprintf(stderr, "  %s\n", line.c_str());
         return false;
     }
+    x2w_d3d12_not_drawn_census();
     std::ifstream file(log_path, std::ios::binary);
-    std::string log_line;
+    std::string log_line, causes_line, first_site_line;
     bool saw_root_log = false, saw_tex_log = false;
     const std::string want_root = "x2w-render translated ExecuteIndirect Draw refused, shader " + parsed[0].key +
         ": translated draw requires the guest pipeline's root signature";
@@ -1344,6 +1346,19 @@ bool check_translated_refusal_census(const std::wstring& log_path)
         if (!log_line.empty() && log_line.back() == '\r') log_line.pop_back();
         if (log_line == want_root) saw_root_log = true;
         if (log_line == want_tex) saw_tex_log = true;
+        if (log_line.rfind("x2w-render not drawn by cause:", 0) == 0) causes_line = log_line;
+        if (log_line == "x2w-draw not drawn: sampled_texture_mismatch (call 1 at this site)") first_site_line = log_line;
+    }
+    // Every refused draw of this fixture is counted at its own site: 2 missing guest roots, 1 texture mismatch,
+    // 1 draw-dependent entry value, 2 incomplete table buffers; the valid draw adds none.
+    const bool causes_ok = causes_line.find(" missing_guest_root 2,") != std::string::npos &&
+        causes_line.find(" sampled_texture_mismatch 1,") != std::string::npos &&
+        causes_line.find(" unsupported_resource_or_entry 1,") != std::string::npos &&
+        causes_line.find(" incomplete_vertex_or_table_buffer 2,") != std::string::npos && !first_site_line.empty();
+    if (!causes_ok) {
+        std::fprintf(stderr, "not-drawn cause line wrong or missing: '%s' (site log line %s)\n", causes_line.c_str(),
+                     first_site_line.empty() ? "missing" : "seen");
+        return false;
     }
     if (!saw_root_log || !saw_tex_log) {
         std::fprintf(stderr, "indirect-draw refusal log lines missing for key %s (root=%d, texture=%d)\n",
