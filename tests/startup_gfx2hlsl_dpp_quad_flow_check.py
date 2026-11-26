@@ -75,6 +75,28 @@ exp mrt0 v2, v3, v5, v1 done vm
 s_endpgm
 ''', '7e0484be7e0afebeff0002165d9b00008002047e8002067e80020a7e800380befa04044a01b100fffa06064a01aa00ff008206bf030085bf'
          'fa02087e01a000ff040b0a3aff02024a010100000081008000850abff2ff85bf7e04fe870f1800f802030501000081bf'),
+    # The fall-through clears and restores EXEC, then joins a path that kept the WQM mask.
+    'ADD_AFTER_EXEC': ('''s_wqm_b64 exec, exec
+v_and_b32_e32 v1, 15, v0
+v_lshrrev_b32_e32 v2, 16, v0
+v_lshlrev_b32_e32 v2, 4, v2
+v_or_b32_e32 v1, v1, v2
+v_cvt_f32_u32_e32 v1, v1
+v_add_f32_e32 v2, 0.5, v1
+s_mov_b32 s0, 0
+s_cmp_eq_u32 s0, 1
+s_cbranch_scc1 5
+s_and_saveexec_b64 s[4:5], 0
+v_add_f32_dpp v1, v2, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+s_mov_b64 exec, s[4:5]
+s_nop 0
+v_add_f32_dpp v3, v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_add_f32_dpp v4, -v1, v2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+v_add_f32_dpp v5, v1, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+exp mrt0 v3, v4, v5, v2 done vm
+s_endpgm
+''', '7e0afebe8f0002369000042c8404043401050238010d027ef0020406800380be008106bf050085bf802484be'
+         'fa04020602b100ff0404febe000080bffa04060601b100fffa040806014e10fffa040a06011b00ff0f1800f803040502000081bf'),
     'VCC_LOOP': ('''s_wqm_b64 exec, exec
 v_mul_u32_u24_e32 v1, 0x9b5d, v0
 v_mov_b32_e32 v2, 0
@@ -153,11 +175,65 @@ def words(name):
     return bytes.fromhex(FIXTURES[name][1])
 
 
-def translate(name):
+def translate_code(code):
     try:
-        return G.Pipeline(VS_WORDS, words(name), root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
+        return G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
     except G.Unsupported as reason:
         return None, str(reason)
+
+
+def translate(name):
+    return translate_code(words(name))
+
+
+def add_reference(local_read=None):
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            local = 16 * y + x + 0.5
+            for channel, (dx, dy, sign) in enumerate(((1, 0, 1), (0, 1, -1), (1, 1, 1))):
+                neighbour = 16 * (y ^ dy) + (x ^ dx) if channel != local_read else 16 * y + x
+                out.append(local + sign * neighbour)
+            out.append(local)
+    return struct.unpack('<%dI' % len(out), struct.pack('<%df' % len(out), *out))
+
+
+ADD_INTRINSICS = ('QuadReadAcrossX', 'QuadReadAcrossY', 'QuadReadAcrossDiagonal')
+
+
+def add_bypass():
+    # Take the other CFG edge by comparing s0 with zero.
+    code = words('ADD_AFTER_EXEC')
+    return bytes.fromhex(replace_once(code.hex(), '008106bf', '008006bf'))
+
+
+def check_add_controls():
+    for edge, code in (('restore', words('ADD_AFTER_EXEC')), ('bypass', add_bypass())):
+        text, reason = translate_code(code)
+        check('DPP add with the %s edge translates' % edge, text is not None, str(reason))
+        if text is not None:
+            for index, intrinsic in enumerate(ADD_INTRINSICS):
+                check('%s is outside the EXEC guard' % intrinsic,
+                      ('v256 = %s(v1);\n        if (exec & 1) v%d =' % (intrinsic, index + 3)) in text)
+            check('the add in the disabled quad leaves v1 unchanged',
+                  'v256 = QuadReadAcrossX(v2);\n        if (exec & 1) v1 =' in text)
+    reference = add_reference()
+    for index, intrinsic in enumerate(ADD_INTRINSICS):
+        check('%s CPU reference detects a lane-local read' % intrinsic, reference != add_reference(local_read=index))
+    original = words('ADD_AFTER_EXEC').hex()
+    controls = (
+        # Restore a literal selecting only lane 0.
+        ('0404febe', '8104febe', 'EXEC written at +0x34 by s_mov_b64'),
+        # Overwrite the saved mask before restoring it.
+        ('0404febe000080bf', '800384be0404febe', 'EXEC written at +0x38 by s_mov_b64'),
+        # Replace the scalar compare that drives the branch with a vector compare.
+        ('008106bf', '0000827d', 'is not proven wave-uniform'),
+        ('01b100ff', '01b100ef', 'with row_mask:0xe'),
+    )
+    for old, new, reason in controls:
+        mutated = bytes.fromhex(replace_once(original, old, new))
+        text, actual = translate_code(mutated)
+        check('DPP add control refused: %s' % reason, text is None and reason in str(actual), str(actual))
 
 
 # ---- CPU reference ----------------------------------------------------------------------------------------------------
@@ -205,6 +281,7 @@ MUTATIONS = {'swap reads its own lane': swap_own, 'broadcast reads lane 1': broa
 
 # ---- controls ---------------------------------------------------------------------------------------------------------
 def controls():
+    check_add_controls()
     text, reason = translate('LOOP')
     check('LOOP translates (uniform scalar loop and if, quad reads inside)', text is not None, str(reason))
     if text is not None:
@@ -279,6 +356,36 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                   run.returncode != 0 and bool(lines) and lines[0].startswith('pixel mismatch'), run.stdout + run.stderr)
 
 
+
+def check_add_draw(dxc, renderer, adapter):
+    reference_words = add_reference()
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_dxc', 'vs_6_0', directory)
+        reference = words_file(directory, 'add_reference', reference_words)
+        for edge, code in (('restore', words('ADD_AFTER_EXEC')), ('bypass', add_bypass())):
+            text, reason = translate_code(code)
+            if text is None:
+                check('DPP add translates for the draw', False, str(reason))
+                continue
+            ps = compile_hlsl(dxc, 'dxc', text, 'ps_add_' + edge, 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, ps, reference)
+            print('  ' + ' '.join(ln for ln in run.stdout.splitlines()
+                                  if ln.startswith(('backend=', 'adapter=', 'driver=', 'debug_errors='))))
+            check('dxc %s DPP add %s: all %d pixels match' % (adapter, edge, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                  run.stdout + run.stderr)
+            if edge == 'restore':
+                mutants = [(intrinsic, intrinsic + '(v1)', 'v1') for intrinsic in ADD_INTRINSICS]
+                mutants.append(('inactive_write', 'if (exec & 1) v1 = U(F(v256)', 'v1 = U(F(v256)'))
+                for name, old, new in mutants:
+                    mutant = replace_once(text, old, new)
+                    ps = compile_hlsl(dxc, 'dxc', mutant, 'ps_add_' + name, 'ps_6_0', directory)
+                    run = draw(renderer, adapter, vs, ps, reference)
+                    check('dxc %s DPP add %s mutant mismatches' % (adapter, name),
+                          run.returncode != 0 and any(ln.startswith('pixel mismatch') for ln in run.stderr.splitlines()),
+                          run.stdout + run.stderr)
+
 def check_binary(llvm_mc):
     for name, (source, hexwords) in FIXTURES.items():
         check('llvm-mc assembles the %s fixture to the same words' % name,
@@ -295,6 +402,7 @@ def main():
         elif mode == 'draw':
             controls()
             check_draw(*args)
+            check_add_draw(*args)
         else:
             raise SystemExit(__doc__)
     if failures:
