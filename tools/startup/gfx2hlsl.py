@@ -1441,6 +1441,8 @@ LDS_EXCHANGE_OPS = {
     'ds_read2_b32': (False, 4, None, 'dword'),
     'ds_write_b64': (True, 8, '3', 'qword'),
     'ds_read_b64': (False, 8, None, 'qword'),
+    'ds_write_b96': (True, 12, None, 'triple-dword'),
+    'ds_read_b96': (False, 12, None, 'triple-dword'),
     'ds_write_b128': (True, 16, '4', 'quad-dword'),
     'ds_read_b128': (False, 16, None, 'quad-dword'),
 }
@@ -1450,7 +1452,8 @@ def check_lds_exchange(ins, group, words):
     """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
 
     RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
-    ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4), and
+    ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4),
+    ds_write_b96 / ds_read_b96 access three contiguous little-endian dwords, and
     ds_write_b128 / ds_read_b128 access four contiguous little-endian dwords (v[n]..v[n+3] at addr+offset..addr+offset+12).
     All widths share the dword-indexed groupshared uint lds[N] array and require 4-byte alignment (natural 8/16-byte alignment is not required on GFX10/RDNA2 LDS).
     LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
@@ -1488,7 +1491,7 @@ def check_lds_exchange(ins, group, words):
             elif (len(ops) != 2 or _lds_single(addr_op) is None
                   or (_lds_single(val_op) is None if dwords == 1 else _lds_vgpr_span(val_op, dwords) is None)):
                 need_val = ('a matching data VGPR' if dwords == 1
-                            else 'an aligned %d-VGPR %s' % (dwords, 'pair' if dwords == 2 else 'quad'))
+                            else 'an aligned %d-VGPR %s' % (dwords, {2: 'pair', 3: 'triple', 4: 'quad'}[dwords]))
                 raise Unsupported('LDS exchange needs %s, %s and an optional byte offset'
                                   % ('two VGPRs' if dwords == 1 else 'a VGPR address', need_val))
             offsets = lds_byte_offsets(base, mods)
@@ -1510,8 +1513,14 @@ def check_lds_exchange(ins, group, words):
                     start0, end0 = fill_spans[0]
                     if offset < end0 and start0 < end:
                         raise Unsupported('LDS dword fills must be disjoint')
-                elif producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0'] or modifiers:
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
+                else:
+                    if width == 12:
+                        strided = (producer in ('v_mul_lo_u32', 'v_mul_u32_u24')
+                                   and args in ([addr_op, '12', 'v0'], [addr_op, 'v0', '12']))
+                    else:
+                        strided = producer == 'v_lshlrev_b32' and args == [addr_op, shift, 'v0']
+                    if not strided or modifiers:
+                        raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
                 fill_spans.append((offset, end))
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
@@ -5124,7 +5133,7 @@ class Stage:
                         for index, offset in enumerate(offsets):
                             self.set_v(start + index, 'lds[(%s + %du) >> 2]' % (address, offset))
                 else:
-                    dwords = 4 if base.endswith('_b128') else 2
+                    dwords = LDS_EXCHANGE_OPS[base][1] // 4
                     lo = _lds_vgpr_span(ops[1 if write else 0], dwords)
                     if write:
                         vals = [self.u('v%d' % (lo + k)) for k in range(dwords)]
@@ -8095,9 +8104,8 @@ class Stage:
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. HLSL's typed UAV store writes every channel of the view, so only DMASK 0xf is exact here;
-        a partial mask would need a read-modify-write and is refused. The data is stored as float4, so the
-        bound view must be of a float or normalized format (the runtime side is not part of this lowering).
+        registers. A partial mask uses a typed UAV load to preserve untouched channels. Compute accepts
+        DMASK 0xf and full-width DMASK 0x7. The float4 view requires a float or normalized format.
         The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
         from helper lanes as the hardware drops them for lanes outside exec.
         """
@@ -8139,8 +8147,7 @@ class Stage:
         # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
         # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
         channels = [i for i in range(4) if mask >> i & 1]
-        if self.kind != 'ps' and mask != 0xf:
-            # Proven by readback in the pixel stage only; a compute store keeps the refusal.
+        if self.kind != 'ps' and mask != 0xf and (mask != 0x7 or d16):
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
         if not channels or mask > 0xf or (d16 and mask != 0xf):
             raise Unsupported('%s with dmask %s: %s' % (
@@ -10708,7 +10715,8 @@ MUBUF_ATOMIC_OPS = {
 
 # Legacy straight-line LDS exchange ops checked by check_lds_exchange().
 LEGACY_LDS_EXCHANGE_OPS = frozenset((
-    'ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64', 'ds_write_b128', 'ds_read_b128',
+    'ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64',
+    'ds_write_b96', 'ds_read_b96', 'ds_write_b128', 'ds_read_b128',
 ))
 
 # Dual-offset & stride-64 32-bit LDS ops: name -> (is_write, offset_stride_bytes)
@@ -11961,6 +11969,8 @@ class ComputePipeline(Pipeline):
                 lines.append('uav %d %s' % (r['index'], where))
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
+                if r.get('load'):
+                    lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))

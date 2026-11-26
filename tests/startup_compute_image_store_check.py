@@ -155,7 +155,62 @@ def array_reference(layer):
     return initial, expected
 
 
+# One row of RGB writes. The other row is suppressed by EXEC.
+RGB_SOURCE = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+s_waitcnt lgkmcnt(0)
+v_lshl_add_u32 v8, s10, 2, v0
+v_mov_b32 v9, v1
+v_mov_b32 v14, 0x3f400000
+v_mov_b32 v15, 0x3ea00000
+v_mov_b32 v16, 0xbf200000
+v_cmpx_eq_u32 0, v1
+image_store v[14:16], v[8:9], s[24:31] dmask:0x7 dim:SQ_RSRC_IMG_2D
+s_endpgm
+"""
+RGB_WORDS = bytes.fromhex(
+    '07038cbe80038dbe06060cf4400000fa7fc08cbf080046d70a0401040103127e'
+    'ff021c7e0000403fff021e7e0000a03eff02207e000020bf8002a47d080720f0080e0600000081bf'
+)
+RGB_LINE = ('if (exec & 1) { t = w0[uint2(v8, v9)]; t.x = asfloat(v14); t.y = asfloat(v15); '
+            't.z = asfloat(v16); w0[uint2(v8, v9)] = t; }')
+
+
+def rgb_pipeline():
+    return G.ComputePipeline(RGB_WORDS, root_blob(3), RSRC2, fixture.GROUP)
+
+
+def rgb_dispatch(directory, compiler, renderer, adapter):
+    initial, expected = [], []
+    for mip in range(3):
+        for y in range(8 >> mip):
+            for x in range(32 >> mip):
+                texel = [sentinel(mip, 0, y, x, c) for c in range(4)]
+                initial.extend(texel)
+                if mip == y == 0 and x < 4 * fixture.GROUPS:
+                    texel[:3] = [0x3f400000, 0x3ea00000, 0xbf200000]
+                expected.extend(texel)
+    source = rgb_pipeline().hlsl_cs()
+    assert source.count(RGB_LINE) == 1
+    cases = (
+        ('RGB preserves alpha', source, 0, None),
+        ('clobber alpha', source.replace(RGB_LINE, RGB_LINE.replace('t = w0[uint2(v8, v9)];', 't = 0;')),
+         8, 'mip=0 word=3 expected=bf000003 actual=00000000'),
+    )
+    # texture_uav_load_flag selects an RGBA32 FLOAT view with typed load and store support.
+    return draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                      selector=fixture.GROUPS | (1 << 21))
+
+
 def controls(llvm_mc):
+    rgb = rgb_pipeline()
+    assert rgb.hlsl_cs().count(RGB_LINE) == 1
+    assert 'uav 0 tex2d float table 1 64 channels 4\nuavload 0\n' in rgb.manifest()
+    if llvm_mc:
+        assert assemble(llvm_mc, RGB_SOURCE) == RGB_WORDS
+
     def encoded(line, hex_words):
         words = bytes.fromhex(hex_words)
         if llvm_mc:
@@ -392,10 +447,13 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--llvm-mc')
     mode.add_argument('--dispatch', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
+    mode.add_argument('--dispatch-rgb', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
     args = parser.parse_args()
-    if args.dispatch:
+    if args.dispatch or args.dispatch_rgb:
         out = Path(__file__).resolve().parents[1] / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
+            if args.dispatch_rgb:
+                raise SystemExit(rgb_dispatch(Path(tmp), *args.dispatch_rgb))
             raise SystemExit(dispatch(Path(tmp), *args.dispatch))
     controls(args.llvm_mc)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify bounded 128-bit LDS exchanges (ds_write_b128, ds_read_b128) and mixed 32/64/128-bit ops across s_barrier.
+"""Verify bounded 96/128-bit LDS exchanges and mixed-width operations across s_barrier.
 
 With no arguments, checks offline RSRC2 sizing, 4-VGPR quad validation, dword alignment/bounds, mixed 32/64/128-bit
 LDS interoperability, and barrier/waitcnt/branch/EXEC/1D-group/gds/non-compute refusals.
@@ -166,7 +166,38 @@ WORDS_R = bytes.fromhex(
     '7fc08cbf0785158f15001a4a841a1a34001078e00d090480000081bf'
 )
 
+# A nonzero dword offset, 12-byte lane stride and an address/destination alias.
+# Each half of the group reads lane 0 or 32 from the opposite half.
+SOURCE_T = PREAMBLE + """\
+v_xor_b32 v5, 0x11220000, v0
+v_xor_b32 v6, 0x33440000, v0
+v_xor_b32 v7, 0x55660000, v0
+v_mul_u32_u24 v4, 12, v0
+ds_write_b96 v4, v[5:7] offset:4
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_lshrrev_b32 v9, 5, v0
+v_xor_b32 v9, 1, v9
+v_mul_u32_u24 v9, 0x180, v9
+v_and_b32 v9, 0x180, v9
+ds_read_b96 v[9:11], v9 offset:4
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v12, 0
+v_lshlrev_b32 v13, 4, v0
+buffer_store_dwordx4 v[9:12], v13, s[16:19], 0 offen
+s_endpgm
+"""
+
+WORDS_T = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf'
+    'ff000a3a00002211ff000c3a00004433ff000e3a000066558c000816'
+    '040078db040500007fc08cbf00008abf8500122c8112123aff12121680010000'
+    'ff121236800100000400f8db090000097fc08cbf8002187e84001a34001078e00d090480000081bf'
+)
+
+
 CASES = {
+    'T': (SOURCE_T, WORDS_T, USER7 | (2 << 15), (64, 1, 1), (1, 1, 1)),
     'Q': (SOURCE_Q, WORDS_Q, USER7 | TGID_X | (2 << 15), (32, 1, 1), (2, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | (2 << 15), (64, 1, 1), (1, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | (1 << 15), (32, 1, 1), (1, 1, 1)),
@@ -188,7 +219,11 @@ SENTINEL = 0xc5c5c5c5
 
 def expected_words(name):
     out = [SENTINEL] * WORDS
-    if name == 'Q':
+    if name == 'T':
+        for lane in range(64):
+            peer = 32 if lane < 32 else 0
+            out[lane * 4:lane * 4 + 4] = [0x11220000 ^ peer, 0x33440000 ^ peer, 0x55660000 ^ peer, 0]
+    elif name == 'Q':
         for g in range(2):
             for l in range(32):
                 peer = (g << 8) + (l ^ 17)
@@ -242,6 +277,14 @@ def translate_case(name, code=None, rsrc2=None, group=None):
 
 
 def check_controls():
+    triple = translate_case('T').hlsl_cs()
+    assert '    a = (v4 + 4u) >> 2;\n    lds[a] = v5;\n    lds[a + 1u] = v6;\n    lds[a + 2u] = v7;' in triple
+    assert '    a = (v9 + 4u) >> 2;\n    v9 = lds[a];\n    v10 = lds[a + 1u];\n    v11 = lds[a + 2u];' in triple
+    for control in ('t-wrong-store', 't-wrong-read'):
+        assert mutate(triple, control) != triple
+    refused('one bounded triple-dword', lambda: translate_case('T', rsrc2=USER7 | (1 << 15)))
+    wrong_stride = patch(WORDS_T, '8c000816', '88000816')  # change multiplication by 12 to 8
+    refused('one bounded triple-dword', lambda: translate_case('T', code=wrong_stride))
     # Positive HLSL lowering: declarations, single-eval alias-safe index, barrier, and all 4 dwords.
     hlsl_q = translate_case('Q').hlsl_cs()
     assert 'groupshared uint lds[256];' in hlsl_q, hlsl_q
@@ -373,7 +416,7 @@ def check_controls():
     refused('straight-line', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
     refused('1D group', lambda: translate_case('Q', group=(16, 2, 1)))
     refused('completed read', lambda: G.check_lds_exchange(b64_to_b128[:4] + [b64_to_b128[-1]], (4, 1, 1), 128))
-    refused('does not cover', lambda: G.check_lds_exchange([
+    refused('one bounded triple-dword', lambda: G.check_lds_exchange([
         (0, 4, 'v_lshlrev_b32', 'v_lshlrev_b32 v4, 4, v0'),
         (4, 8, 'ds_write_b96', 'ds_write_b96 v4, v[5:7]'),
         (12, 4, 's_endpgm', 's_endpgm'),
@@ -435,10 +478,12 @@ def check_binary(llvm_mc):
     for line, hex_words in VERIFIED_SNIPPETS.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == hex_words, '%s: assembled %s, recorded %s' % (line, built, hex_words)
-    print('128-bit LDS fixture words match llvm-mc (%d programs, %d snippets)' % (len(CASES), len(VERIFIED_SNIPPETS)))
+    print('Wide LDS fixture words match llvm-mc (%d programs, %d snippets)' % (len(CASES), len(VERIFIED_SNIPPETS)))
 
 
 CONTROLS = {
+    't-wrong-store': ('T', '    lds[a + 2u] = v7;\n', '    lds[a + 2u] = v6;\n'),
+    't-wrong-read': ('T', '    v11 = lds[a + 2u];\n', '    v11 = lds[a + 1u];\n'),
     'q-same-lane': ('Q', '    v9 = 0x00000110u ^ v4;\n', '    v9 = v4;\n'),
     'q-swap-dwords': ('Q', '    v11 = lds[a + 2u];\n    v12 = lds[a + 3u];\n',
                       '    v11 = lds[a + 3u];\n    v12 = lds[a + 2u];\n'),
@@ -489,6 +534,9 @@ def check_dispatch(dxc, runner, adapter, control=None):
                 else:
                     diagnostics.append(line)
             if control:
+                if name == 'T':
+                    assert 'compared_words=320 mismatches=64' in run.stdout, run.stdout
+                    assert 'word=2 expected=55660020 actual=33440020' in diagnostics, diagnostics
                 if run.returncode != 1 or not any('expected=' in line for line in diagnostics):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (control, run.returncode, run.stderr))
                 print('control %s: rejected at %s' % (control, diagnostics[0]))

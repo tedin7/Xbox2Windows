@@ -3,7 +3,8 @@
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
-// by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
+// by the token of a view the title created (device slots 18 and 19). `uavload <i>` requires typed UAV loads
+// for a texture output. `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
 // count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
@@ -26,6 +27,7 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool load = false; // an output texture read back through its typed UAV
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
@@ -168,6 +170,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u rootconst %d %d times %u%n", &i, &a, &b, &x,
                      &c, &d, &y, &used) == 7 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
+        else if (std::sscanf(line.c_str(), "uavload %u%n", &i, &used) == 1 && whole() &&
+                 !tr.uavs.empty() && i == tr.uavs.size() - 1 && tr.uavs.back().texture && !tr.uavs.back().load)
+            tr.uavs.back().load = true;
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
@@ -437,6 +442,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && slot.load) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+                constexpr auto required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+                if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                    (support.Support2 & required) != required)
+                    reason = "an output texture format does not support typed UAV load and store";
+            }
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
