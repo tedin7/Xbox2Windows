@@ -2391,7 +2391,31 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
                 if (!own_memory) address = base + offset;
             }
+        } else if (record.slot == 19 && record.desc_bytes >= 40) {
+            // A buffer the title wrote through an unordered access view and reads through the same descriptor: the view's own
+            // range, with the element size from the view as for a shader resource view.
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            std::memcpy(&view, record.desc, 40);
+            owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+            if (!owner || owner->own().kind != resource_kind || !owner->own().real || view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+                return refuse("an input view token is not a buffer view of a desktop resource");
+            const bool raw = view.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW;
+            const UINT element = raw ? 4 : view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                                       : x2w_startup::typed_buffer_format_bytes(view.Format);
+            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return refuse("an input buffer view has no element size or overflows");
+            offset = view.Buffer.FirstElement * element;
+            bytes = u64{view.Buffer.NumElements} * element;
+            stride = raw ? 0 : element;
+            if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
+                if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
+                address = base + offset;
+            }
         } else {
+            static LONG shapes;
+            if (first_calls(shapes, 12))
+                log("x2w-draw an input view token is not a buffer view: record slot %u, %u description bytes, resource %p, token generation %u",
+                    static_cast<unsigned>(record.slot), static_cast<unsigned>(record.desc_bytes), reinterpret_cast<const void*>(record.resource),
+                    words[3]);
             return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {

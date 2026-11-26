@@ -120,6 +120,12 @@ def main(consumer, dxc, adapter):
             result.stderr[-3000:]
         # The output descriptor is the token of a view the title made over the placed output buffer: the dispatch makes the
         # desktop UAV on that buffer, so every word still matches and the log says where the output came from.
+        # An input that is the token of an unordered access view of a buffer is read through that view's own range.
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-uav-token')
+        wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+        assert not wrong, 'input uav token: word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
+            wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
+        assert not lines(result, 'refused'), result.stderr[-3000:]
         got, result = dispatch(directory, consumer, env, 'dispatch-output-token')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
         assert not wrong, 'output token: word=%d got=%08x expected=%08x (%d words differ)\n%s' % (

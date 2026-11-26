@@ -211,6 +211,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
+// dispatch-input-uav-token writes the token of an unordered access view of the input buffer where the input descriptor was.
 // dispatch-output-token writes the token of an unordered access view of the output buffer where the output descriptor was.
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
@@ -242,7 +243,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     UINT descriptors[2][4]{};
     for (int i = 0; i < 2; ++i) {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i || mode == "dispatch-input-uav-token" ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
         const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
@@ -350,6 +351,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // The token is wider than a table descriptor: the output descriptor after it is written again.
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
+    }
+    if (mode == "dispatch-input-uav-token") {
+        // The input is a buffer the title also writes through an unordered access view: the token of that view replaces the
+        // input descriptor (it is wider than a table descriptor, so the output descriptor after it is written again).
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+        uav.Buffer = {0, words, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        invoke(device, 19, word(placed[0]), 0, word(&uav), cpu);
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
     }
     if (mode == "dispatch-output-token") {
         // The output is a view the title created (device slot 19) over the placed output buffer: its token replaces the output
