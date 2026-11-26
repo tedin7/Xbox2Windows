@@ -316,6 +316,22 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
     }
 
+    // Lazily committed memory (X2W_XMEM_LAZY_COMMIT) is not committed until the title touches it, and the commit-state
+    // measurements below do not touch it: commit the viewed page the way the fault handler would, then measure.
+    {
+        x2w_startup::PlacedBufferRange before{};
+        if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, before) || !before.covered) {
+            x2w_local::commit_lazy(reinterpret_cast<void*>(page_start), static_cast<std::size_t>(page_span));
+            x2w_startup::PlacedBufferRange after{};
+            if (x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, after) && after.covered) {
+                static volatile LONG lazy_view_commits;
+                const LONG total = InterlockedIncrement(&lazy_view_commits);
+                if (total <= 8 || (total & (total - 1)) == 0)
+                    log("x2w-d3d12 lazy pages committed for buffer views: %ld (this one: %llu bytes at 0x%llx)", total, page_span, page_start);
+            }
+        }
+    }
+
     // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
     // a multiple of the element size past it, no FirstElement can name the address; likewise when the surrounding page is not
     // fully committed or shares its page with a placed resource. In those cases the view is backed by an upload copy that
