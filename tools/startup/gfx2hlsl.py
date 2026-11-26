@@ -7946,9 +7946,6 @@ class Stage:
         # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
         # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
         channels = [i for i in range(4) if mask >> i & 1]
-        if self.kind != 'ps' and mask != 0xf:
-            # Proven by readback in the pixel stage only; a compute store keeps the refusal.
-            raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
         if not channels or mask > 0xf or (d16 and mask != 0xf):
             raise Unsupported('%s with dmask %s: %s' % (
                 name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
@@ -11713,6 +11710,8 @@ class ComputePipeline(Pipeline):
                 lines.append('uav %d %s' % (r['index'], where))
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
+                if r.get('load'):  # a partial-dmask store reads the texel back: the view needs typed UAV load
+                    lines.append('uavload %d' % r['index'])
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
