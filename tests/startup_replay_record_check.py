@@ -88,8 +88,9 @@ def main(consumer, backend):
         if plain is None:
             print("No D3D12 feature-level 12 hardware adapter")
             return 77
-        recording = directory / "run.x2wr"
-        recorded = draw(args, dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording)), backend, output)
+        # X2W_REPLAY_DIR (tester_run -Record): the recording is replay.x2wr in that folder, made if missing.
+        recording = directory / "record" / "replay.x2wr"
+        recorded = draw(args, dict(env, X2W_REPLAY_RECORD="all", X2W_REPLAY_DIR=str(recording.parent)), backend, output)
         assert recorded == plain, "recording changed the picture"
         tags, calls, blobs, argm, outputs, kinds, end_calls = summarize(recording)
         assert tags[0] == "XREC" and tags[-1] == "XEND", (tags[:3], tags[-3:])

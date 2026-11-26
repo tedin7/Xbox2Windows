@@ -34,7 +34,8 @@ HANDLE file = INVALID_HANDLE_VALUE;
 SRWLOCK file_lock = SRWLOCK_INIT, blob_lock = SRWLOCK_INIT, buffers_lock = SRWLOCK_INIT;
 LONG64 volatile calls_written, blobs_stored;
 u64 bytes_written;
-LONG volatile stopped, stop_requested;
+LONG volatile stopped, stop_requested, cap_reached;
+u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the file is this large
 // Read by every wrapped slot before it calls the real one: a plain load, so nothing touches the xmm registers that carry
 // float arguments. present() keeps it current (the window is checked per present).
 bool volatile window_open;
@@ -194,6 +195,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[7], 
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
         drain(b);
+        if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
         ReleaseSRWLockExclusive(&file_lock);
     }
     ReleaseSRWLockExclusive(&b.lock);
@@ -320,8 +322,8 @@ void stop(bool at_exit)
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
     if (!at_exit)
-        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents", end.calls, end.blobs,
-            end.bytes, presents);
+        log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
+            end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
 }
 
 // A present ends a frame: noted in the recording, and the recording stops after the window's last present.
@@ -367,7 +369,21 @@ void install()
     }
     char path[MAX_PATH]{};
     const DWORD p = GetEnvironmentVariableA("X2W_REPLAY_RECORD_FILE", path, sizeof(path));
-    if (!p || p >= sizeof(path)) std::snprintf(path, sizeof(path), "%s", "replay.x2wr");
+    if (!p || p >= sizeof(path)) {
+        // X2W_REPLAY_DIR (tester_run -Record): the file goes into that folder.
+        char dir[MAX_PATH - 16]{};
+        const DWORD d = GetEnvironmentVariableA("X2W_REPLAY_DIR", dir, sizeof(dir));
+        if (d && d < sizeof(dir)) {
+            CreateDirectoryA(dir, nullptr);
+            std::snprintf(path, sizeof(path), "%s\\replay.x2wr", dir);
+        } else {
+            std::snprintf(path, sizeof(path), "%s", "replay.x2wr");
+        }
+    }
+    char cap[24]{};
+    const DWORD c = GetEnvironmentVariableA("X2W_REPLAY_MAX_MIB", cap, sizeof(cap));
+    const unsigned long long cap_mib = c && c < sizeof(cap) ? std::strtoull(cap, nullptr, 10) : 0;
+    if (cap_mib) max_bytes = cap_mib << 20;
     file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         log("x2w-replay record: cannot create %s (error %lu)", path, GetLastError());
