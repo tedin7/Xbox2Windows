@@ -1409,25 +1409,6 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
-# List upload pages stay flat over 10,000 record/execute cycles on an allocator that is never reset, are not reused
-# while the GPU has not passed them, and are never reused when no submit can be tracked.
-add_executable(startup_upload_page_reuse tests/startup_upload_page_reuse.cpp)
-target_compile_features(startup_upload_page_reuse PRIVATE cxx_std_17)
-target_link_libraries(startup_upload_page_reuse PRIVATE d3d12_xs_shim d3d12 dxgi)
-foreach(backend IN ITEMS warp hardware)
-    add_test(NAME startup_upload_page_reuse_${backend} COMMAND startup_upload_page_reuse ${backend})
-    set_tests_properties(startup_upload_page_reuse_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
-    add_test(NAME startup_upload_page_reuse_untracked_${backend} COMMAND startup_upload_page_reuse ${backend} untracked)
-    set_tests_properties(startup_upload_page_reuse_untracked_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_SUBMIT_FENCE_FAIL=1")
-    # Control: without the reuse the pages grow (exit 12).
-    add_test(NAME startup_upload_page_reuse_mutant_${backend} COMMAND startup_upload_page_reuse ${backend})
-    set_tests_properties(startup_upload_page_reuse_mutant_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
-        PASS_REGULAR_EXPRESSION "1 growing: "
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0;X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse")
-endforeach()
-
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
 target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
 target_include_directories(startup_upload_arena PRIVATE src)

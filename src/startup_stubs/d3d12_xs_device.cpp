@@ -1571,69 +1571,13 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
-// Pages of finished list arenas, handed to the next arenas (allocator_lock).
-x2w_upload::FreePages free_upload_pages;
 
 LONG allocator_swaps, allocator_creates;
-LONG64 arenas_recycled_early;  // arenas recycled before their allocator's Reset (reclaim_finished_arenas)
-
-// X2W_TEST_UPLOAD_PAGES_MUTANT=never-reuse (fixtures only): the list upload pages are not reused before their
-// allocator's Reset, as before the reuse; startup_upload_page_reuse must then fail.
-bool upload_reuse_mutant()
-{
-    static const bool on = [] {
-        char value[16]{};
-        const DWORD n = GetEnvironmentVariableA("X2W_TEST_UPLOAD_PAGES_MUTANT", value, sizeof(value));
-        return n && n < sizeof(value) && std::strcmp(value, "never-reuse") == 0;
-    }();
-    return on;
-}
-
-// allocator_lock held. The list's current recording can never be submitted again (the list was Reset or destroyed):
-// its upload arena may be recycled once the GPU passes the recording's submits.
-void retire_list_arena(Wrapper* list)
-{
-    auto& state = list->own();
-    if (state.list_uploads) state.list_uploads->retired = true;
-    state.list_uploads = nullptr;
-}
-
-// allocator_lock held. Every arena of an idle allocator (no list holds a recording on it and the GPU passed its
-// submits) goes back to the free pages.
-void recycle_arenas(DesktopAllocator& allocator)
-{
-    for (auto& arena : allocator.uploads) arena->recycle(free_upload_pages);
-    allocator.uploads.clear();
-}
-
-// allocator_lock held. A list recorded again and again on one allocator that the title rarely resets would otherwise
-// keep one arena (at least one 64 KB page) per recording until that Reset: the arenas whose recording is retired and
-// finished on the GPU are recycled now.
-void reclaim_finished_arenas(DesktopAllocator& allocator)
-{
-    if (upload_reuse_mutant()) return;
-    auto& arenas = allocator.uploads;
-    for (auto it = arenas.begin(); it != arenas.end();) {
-        if (!(*it)->finished()) {
-            ++it;
-            continue;
-        }
-        (*it)->recycle(free_upload_pages);
-        it = arenas.erase(it);
-        ++arenas_recycled_early;
-    }
-}
 
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
-    retire_list_arena(list);
-    // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
-        if (found->second) --found->second->lists;
-        list_recordings.erase(found);
-    }
     ReleaseSRWLockExclusive(&allocator_lock);
 }
 
@@ -1669,13 +1613,11 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
     if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
         try {
             if (!state.list_uploads) {
-                reclaim_finished_arenas(*found->second);
                 auto arena = std::make_unique<x2w_upload::Arena>();
                 found->second->uploads.push_back(std::move(arena));
                 state.list_uploads = found->second->uploads.back().get();
             }
-            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment,
-                                                          upload_reuse_mutant() ? nullptr : &free_upload_pages);
+            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment);
         } catch (const std::bad_alloc&) {
             // Refuse the allocation without invalidating any range already recorded.
         }
@@ -1802,7 +1744,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
     if (next) {
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
-            recycle_arenas(*next);
+            next->uploads.clear();
             next->indexed_validation.clear();
             next->scratches.clear();
             next->submits.clear();
@@ -1849,7 +1791,6 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     submit.submitted(chunks, signaled);
     if (signaled) {
         for (Wrapper* list : lists) {
-            if (auto* arena = list->own().list_uploads) arena->submitted(fence, value);
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
             auto& submits = found->second->submits;
@@ -1858,10 +1799,8 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             else same->second = value;
         }
     } else {
-        for (Wrapper* list : lists) {
-            if (auto* arena = list->own().list_uploads) arena->untracked = true;
+        for (Wrapper* list : lists)
             if (const auto found = list_recordings.find(list); found != list_recordings.end()) found->second->untracked = true;
-        }
         static LONG failures;
         if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
     }
@@ -1909,47 +1848,6 @@ extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_internal_queue(voi
     return *queue != nullptr;
 }
 
-// The list upload arenas and the allocators behind them, for the x2w-upload-pages heartbeat line and fixtures.
-struct UploadPageStats {
-    unsigned long long title_allocators, desktop_allocators, creates, swaps, arenas, recycled_early;
-    unsigned long long live_pages, live_bytes, free_pages, created, reused;
-};
-UploadPageStats upload_page_stats()
-{
-    UploadPageStats stats{};
-    AcquireSRWLockShared(&allocator_lock);
-    stats.title_allocators = title_allocators.size();
-    for (const auto& entry : title_allocators) {
-        stats.desktop_allocators += entry.second.pool.size();
-        for (const DesktopAllocator* allocator : entry.second.pool) stats.arenas += allocator->uploads.size();
-    }
-    stats.recycled_early = static_cast<unsigned long long>(arenas_recycled_early);
-    ReleaseSRWLockShared(&allocator_lock);
-    stats.creates = static_cast<unsigned long long>(InterlockedCompareExchange(&allocator_creates, 0, 0));
-    stats.swaps = static_cast<unsigned long long>(InterlockedCompareExchange(&allocator_swaps, 0, 0));
-    const auto& pages = x2w_upload::page_counters;
-    stats.live_pages = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.live), 0, 0));
-    stats.live_bytes = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.live_bytes), 0, 0));
-    stats.free_pages = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.free), 0, 0));
-    stats.created = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.created), 0, 0));
-    stats.reused = static_cast<unsigned long long>(InterlockedCompareExchange64(const_cast<LONG64*>(&pages.reused), 0, 0));
-    return stats;
-}
-
-// Fixtures: list upload pages alive (in an arena or the free pool), in the free pool, ever created, and handed out
-// again from the pool; and the arenas recycled before their allocator's Reset.
-extern "C" __declspec(dllexport) void x2w_d3d12_upload_page_stats(unsigned long long* live, unsigned long long* free,
-                                                                   unsigned long long* created, unsigned long long* reused,
-                                                                   unsigned long long* recycled_early)
-{
-    const UploadPageStats stats = upload_page_stats();
-    if (live) *live = stats.live_pages;
-    if (free) *free = stats.free_pages;
-    if (created) *created = stats.created;
-    if (reused) *reused = stats.reused;
-    if (recycled_early) *recycled_early = stats.recycled_early;
-}
-
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
 extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
 {
@@ -1979,7 +1877,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             target = nullptr;
             for (DesktopAllocator* spare : title.pool) {
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
-                    recycle_arenas(*spare);
+                    spare->uploads.clear();
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
                     spare->submits.clear();
@@ -2025,7 +1923,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             discard_upload_chunks(state.upload_chunks, upload_chunks.data());
-            retire_list_arena(self);
+            state.list_uploads = nullptr;
             state.list_scratch = nullptr;
             state.list_ready = false;
             state.list_open = true;
@@ -7471,18 +7369,6 @@ void report_budget(ID3D12CommandQueue* queue)
     }
     log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s sysmem-fallback=%llu bytes=%llu", local, nonlocal, text, counts.unmeasured,
         commit, pool, job, counts.sysmem_fallbacks, counts.sysmem_fallback_bytes);
-    // Who holds the upload memory: the list arenas (their pages and the free pool), the allocators behind the title's
-    // allocators, and the linear-buffer staging pool (Run N: +3,000 upload objects of about 90 KB after loading).
-    const UploadPageStats uploads = upload_page_stats();
-    X2wLinearBufferTotals linear{};
-    const bool linear_on = x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off;
-    if (linear_on) linear_buffers().totals(&linear);
-    char staging[48] = "staging=off";
-    if (linear_on) std::snprintf(staging, sizeof(staging), "staging=%llu", static_cast<unsigned long long>(linear.staging_created));
-    log("x2w-upload-pages list pages=%llu (%llu MiB) free=%llu created=%llu reused=%llu arenas=%llu recycled_early=%llu "
-        "allocators=%llu desktop=%llu creates=%llu swaps=%llu %s", uploads.live_pages, uploads.live_bytes >> 20,
-        uploads.free_pages, uploads.created, uploads.reused, uploads.arenas, uploads.recycled_early, uploads.title_allocators,
-        uploads.desktop_allocators, uploads.creates, uploads.swaps, staging);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
