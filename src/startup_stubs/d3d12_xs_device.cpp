@@ -51,6 +51,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/gpu_time_probe.h"
+#include "startup_stubs/dsv_planes.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -2847,6 +2848,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
+    std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
@@ -2987,6 +2989,18 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
+        if (it->resource != resource) continue;
+        // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
+        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
+            x2w_dsv::move_plane(list, *it, 0, state);
+            return;
+        }
+        // Anything else wants one state for the whole resource: bring both planes back to COMMON first.
+        x2w_dsv::release(list, *it);
+        pass.mixed.erase(it);
+        break;
+    }
     for (auto& known : pass.states) {
         if (known.first != resource) continue;
         if (known.second != state) {
@@ -3001,6 +3015,9 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
 // State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
 D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 {
+    for (const auto& planes : pass_of(self).mixed)
+        if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
+            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     for (const auto& known : pass_of(self).states)
         if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -3017,6 +3034,7 @@ void release_targets(Wrapper* self)
     Pass& pass = pass_of(self);
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
     pass = Pass{};
 }
 
@@ -3027,7 +3045,10 @@ void retire_drop_recording(Wrapper* list)
 {
     residency_discard_list(list);
     if (!release_retired_enabled()) return;
-    if (list->own().pass) pass_of(list).states.clear();
+    if (list->own().pass) {
+        pass_of(list).states.clear();
+        pass_of(list).mixed.clear();
+    }
     retire_discard_holds(list);
 }
 
@@ -4091,6 +4112,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bool mixed_planes = false;  // a view with one read-only plane: dsv_state is the depth plane's, the stencil plane gets the other
+    D3D12_RESOURCE_STATES stencil_plane_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
         if (!resolved) {
@@ -4114,9 +4137,11 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             // A format without a stencil plane has no second plane to disagree with.
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
+                // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
+                mixed_planes = true;
                 InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
-                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
-                return;
+                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets: depth stencil view with one read-only plane (flags 0x%x) bound with per-plane states", view.dsv_flags);
+                stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
@@ -4133,7 +4158,24 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         pass.target_formats[i] = formats[i];
         if (i == 0) pass.target0 = targets[i];
     }
-    if (dsv_target) require_state(self, dsv_target, dsv_state);
+    if (dsv_target && mixed_planes) {
+        // A whole-resource state it was in is dropped to COMMON first; then each plane moves to its own state.
+        for (auto it = pass.states.begin(); it != pass.states.end(); ++it)
+            if (it->first == dsv_target) {
+                transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), dsv_target, it->second, D3D12_RESOURCE_STATE_COMMON);
+                pass.states.erase(it);
+                break;
+            }
+        auto found = std::find_if(pass.mixed.begin(), pass.mixed.end(), [&](const x2w_dsv::Planes& p) { return p.resource == dsv_target; });
+        if (found == pass.mixed.end()) {
+            pass.mixed.push_back(x2w_dsv::planes_of(dsv_target));
+            found = pass.mixed.end() - 1;
+        }
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
+        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
+    } else if (dsv_target) {
+        require_state(self, dsv_target, dsv_state);
+    }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
     pass.bound_depth = dsv_target;
