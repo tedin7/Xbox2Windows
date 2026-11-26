@@ -83,6 +83,11 @@ once more in system memory instead of returning an error, and the `x2w-budget` l
 GPU time per frame is on too (`X2W_GPU_TIME=1`): every 300 frames an `x2w-gpu-time` line gives the average and longest
 GPU time of a frame and how long the GPU sat idle. `-NoGpuTime` turns it off; the manifest records it as `gpu_time`.
 
+HDD mode is on (`X2W_STORAGE_HDD=1`, because the title package is read from a hard disk, Run M: about 125 reads per second at 3 MB/s): the
+DirectStorage stand-in plans the file reads of its next queue entries, merges neighbours and reads them ahead in file order on a second
+thread. `-NoHddMode` turns it off; the manifest records it as `hdd_mode`. Its effect shows on the `x2w-dstorage disk` and
+`x2w-dstorage hdd` lines (reads per second, MB/s while reading, cache hits).
+
 Lazy memory commit is on as well (`run.ps1 -LazyMemory`: `X2W_XMEM_LAZY_COMMIT`, `_LAZY_STARTUP`, `_SHARED_VIEWS`), which cuts the section commit; `-NoLazyMemory` turns it off and the manifest records it.
 
 `-Deep` also turns on `-TraceCalls` and `-TraceApi`: slower, more detail in the logs.
