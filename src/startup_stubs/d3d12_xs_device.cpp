@@ -19,6 +19,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/committed_range.h"
 #include "startup_stubs/zero_tail.h"
+#include "startup_stubs/copy_cache_trim.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
@@ -2710,9 +2711,22 @@ UploadRingStats upload_ring_stats()
     return stats;
 }
 
+// X2W_TEST_UPLOAD_RING_MAX_KIB=<n> (fixtures only): the whole ring is at most n KiB, so one reservation can be at most a quarter of that.
+u64 upload_ring_max_bytes()
+{
+    static const u64 bytes = [] {
+        char value[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_UPLOAD_RING_MAX_KIB", value, sizeof(value));
+        const u64 kib = n && n < sizeof(value) ? std::strtoull(value, nullptr, 10) : 0;
+        return kib ? kib << 10 : max_upload_ring_bytes;
+    }();
+    return bytes;
+}
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
-    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
+    const u64 ring_max_bytes = upload_ring_max_bytes();
+    const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
@@ -2735,7 +2749,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < max_upload_ring_bytes ? max_upload_ring_bytes - total_bytes : 0;
+    const u64 remaining = total_bytes < ring_max_bytes ? ring_max_bytes - total_bytes : 0;
     if (rounded <= remaining) {
         u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
@@ -2792,7 +2806,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+        log("x2w-draw upload ring reservation refused: no unused capacity (asked %zu bytes, ring %llu MiB in %zu chunks, %ld reservations, %ld recycled so far)",
+            bytes, static_cast<unsigned long long>(total_bytes >> 20), chunks.size(), static_cast<long>(upload_ring_reservations),
+            static_cast<long>(upload_ring_recycled));
     return reservation;
 }
 
@@ -4982,8 +4998,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         }
     }
     const bool has_resource = args[0] != 0 || is_unmaterialized_lazy;
+    // args[0] is a resource only for the resource views (slots 18 to 21). For the constant buffer view (17) and the
+    // sampler (22) it is the address of a description: it must not be called as a resource.
     const D3D12_RESOURCE_DESC resource_desc_for_check = is_unmaterialized_lazy ? lazy_rec.desc
-        : (args[0] ? reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc() : D3D12_RESOURCE_DESC{});
+        : (N >= 18 && N <= 21 && args[0] ? reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc() : D3D12_RESOURCE_DESC{});
     const char* skip = nullptr;
     bool default_view = false;
     bool uav_denied = false;  // a UAV of a resource without unordered access: recorded as not created, as before #2649
@@ -7771,6 +7789,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
+        log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
+        for (int size_class = 0; size_class < 2; ++size_class) {
+            const auto& step = buffer_step_stats[size_class];
+            log("x2w-render buffer binding steps (%s): %lld bindings, %lld MiB copied; trim %lld ms, frame_copy %lld ms (%lld over 1 ms, max %lld ms)",
+                size_class ? "64 KiB and larger" : "under 64 KiB", step.calls, step.bytes >> 20, step.trim_us / 1000, step.copy_us / 1000,
+                step.copy_over_1ms, step.copy_max_us / 1000);
+        }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",

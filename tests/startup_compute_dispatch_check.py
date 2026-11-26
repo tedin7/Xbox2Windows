@@ -118,6 +118,13 @@ def main(consumer, dxc, adapter):
             and '[00000000 00000000 ' not in census[2], census
         assert len(refused) == 1 and 'an output buffer was created without unordered access' in refused[0], \
             result.stderr[-3000:]
+        # The output descriptor is the token of a view the title made over the placed output buffer: the dispatch makes the
+        # desktop UAV on that buffer, so every word still matches and the log says where the output came from.
+        got, result = dispatch(directory, consumer, env, 'dispatch-output-token')
+        wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+        assert not wrong, 'output token: word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
+            wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
+        assert not lines(result, 'refused') and len(lines(result, 'from a view token')) == 1, result.stderr[-3000:]
         got, result = dispatch(directory, consumer, env, 'dispatch-same-root')
         assert got == expected and not lines(result, 'refused'), 'setting the same compute root again lost the constants'
 

@@ -330,6 +330,19 @@ std::unordered_map<u64, Translation*>& translation_by_key() { static std::unorde
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
+// Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
+// trim = committed extent + readable probe + zero-tail scan; copy = frame_copy (compare with the cached snapshot, ring copy).
+struct BufferStepStats {
+    LONG64 calls, trim_us, copy_us, copy_over_1ms, copy_max_us, bytes;
+};
+BufferStepStats buffer_step_stats[2];
+inline LONG64 step_now_us()
+{
+    static const double per_us = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return static_cast<double>(f.QuadPart) / 1e6; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<LONG64>(static_cast<double>(t.QuadPart) / per_us);
+}
 LONG64 zero_tail_bytes_saved;  // bytes of buffer bindings not copied because they were zero to the end (zero_tail.h)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
@@ -411,7 +424,7 @@ x2w_startup::ManifestSource& manifest_source()
 bool lookup_manifest(u64 key, bool retry, std::string& out, bool may_unlock)
 {
     x2w_startup::ManifestSource& source = manifest_source();
-    if (retry || !source.claim_first(key)) return source.load_retry(key, out);
+    if (retry || !source.claim_first(key)) return source.load_retry(key, out, GetTickCount64());
     if (!may_unlock) return source.read_first(key, out);
     draw_lock_release_exclusive();
     const bool read = source.read_first(key, out);
@@ -1480,18 +1493,38 @@ struct FrameCopy {
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
+LONG64 big_copies_reused, big_copies_made;
+
+// X2W_BIG_COPY_REUSE=0 turns the cross-frame reuse of large copies off (every copy ends with its frame, as before).
+bool big_copy_reuse_enabled()
+{
+    static const bool on = [] {
+        char value[8]{};
+        return !GetEnvironmentVariableA("X2W_BIG_COPY_REUSE", value, sizeof(value)) || value[0] != '0';
+    }();
+    return on;
+}
+// X2W_TEST_FRAME_COPY_STALE=1 (fixtures only): a large copy is reused without comparing it with the title's memory (the control of
+// startup_frame_copy: a title write between two frames must then be missed).
+bool stale_large_copy_mutant()
+{
+    static const bool on = GetEnvironmentVariableA("X2W_TEST_FRAME_COPY_STALE", nullptr, 0) != 0;
+    return on;
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
-        frame_copies().clear();
         frame_copies_frame = frame_number;
+        if (big_copy_reuse_enabled()) x2w_local::trim_frame_copies(frame_copies());
+        else frame_copies().clear();
     }
     const u64 key = address * 1099511628211ull ^ bytes;
     const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+    if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
         const auto& slice = found->second.slice;
         AcquireSRWLockExclusive(&allocator_lock);
         for (unsigned i = 0; i < upload_chunks.size(); ++i) {
@@ -1501,6 +1534,7 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
                 ReleaseSRWLockExclusive(&allocator_lock);
                 *offset = slice.offset;
                 if (resource) *resource = slice.resource;
+                if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
                 return true;
             }
         }
@@ -1519,6 +1553,7 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
     std::memcpy(slice.mapped, source, bytes);
+    if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_made);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
@@ -1716,9 +1751,14 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     x2w_upload::Page owned;
     // The plain (row-major, not compact) CPU upload of a large texture gets its own buffer as well.
     const bool own_buffer = !console && !tiled && !is_compact && !address_uploads_from_ring() && total >= own_upload_buffer_bytes;
-    if (dedicated || own_buffer) {
+    // A tiled block-compressed chain or surface is written to a zeroed buffer of its own as a console layout is: these are the
+    // large world textures, and sharing the ring with the draws' constants let a streaming burst fill it (draws then lost their
+    // buffers). X2W_TEST_ADDRESS_UPLOAD_RING=1 keeps the ring, for the existing fixtures.
+    const bool own_tiled = (tiled_chain || (tiled && !single)) && !console && !address_uploads_from_ring();
+    if (dedicated || own_buffer || own_tiled) {
         u64 bytes = 0;
-        for (UINT i = 0; i < (console ? mips : plan.count); ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        for (UINT i = 0; i < (console || tiled_chain ? mips : tiled ? 1 : plan.count); ++i)
+            bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
@@ -1728,7 +1768,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             return false;
         }
         // Console layouts detile into a zeroed buffer; a plain upload overwrites every byte it names.
-        if (dedicated) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+        if (dedicated || own_tiled) std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1762,30 +1802,48 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
-                u64 offset = 0;
+                u64 offset = owned.cursor;
                 ID3D12Resource* chunk = nullptr;
-                auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-                if (!rows || !chunk) {
-                    state.done = false;
-                    return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+                if (owned.cpu) {
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                } else {
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    if (!rows || !chunk) {
+                        state.done = false;
+                        return false;  // staging failed: not uploaded, so report it and retry at the next bind
+                    }
+                    std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
-                std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else if (tiled && !single) {
-        u64 offset = 0;
+        u64 offset = owned.cursor;
         const auto bytes = plan.bytes(0);
         ID3D12Resource* chunk = nullptr;
-        auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
-        if (!rows || !chunk) {
-            state.done = false;
-            return false;  // staging failed: not uploaded, so report it and retry at the next bind
+        unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+        if (owned.cpu) {
+            owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+        } else {
+            rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+            if (!rows || !chunk) {
+                state.done = false;
+                return false;  // staging failed: not uploaded, so report it and retry at the next bind
+            }
+            std::memset(rows, 0, static_cast<std::size_t>(bytes));
         }
-        std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
-        plan.upload(list, texture, chunk, 1, 1, 0, 0, offset);
+        plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, 1, 1, 0, 0, offset);
+        if (own_tiled) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
@@ -3145,6 +3203,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // the next draw sees. Of the committed part, the trailing zero bytes are left out too. (A 16 MiB binding copied whole on
         // every draw emptied the 256 MiB upload ring.)
         const std::size_t full_bytes = bytes;
+        const LONG64 step_t0 = step_now_us();
         if (address && bytes >= (64u << 10) && !formatted.entry) {
             bool extent_ok = false;
             const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
@@ -3155,7 +3214,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
             if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
         }
+        const LONG64 step_t1 = step_now_us();
         bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
+        {
+            const LONG64 step_t2 = step_now_us();
+            auto& step = buffer_step_stats[full_bytes >= (64u << 10) ? 1 : 0];
+            InterlockedIncrement64(&step.calls);
+            InterlockedAdd64(&step.trim_us, step_t1 - step_t0);
+            InterlockedAdd64(&step.copy_us, step_t2 - step_t1);
+            InterlockedAdd64(&step.bytes, static_cast<LONG64>(bytes));
+            if (step_t2 - step_t1 > 1000) InterlockedIncrement64(&step.copy_over_1ms);
+            if (step_t2 - step_t1 > step.copy_max_us) step.copy_max_us = step_t2 - step_t1;
+        }
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.

@@ -1,4 +1,4 @@
-"""Independent CPU model of v_pk_mul_f16 / v_pk_add_f16 / v_pk_fma_f16 (Part of #1723). Pure Python, no GPU.
+"""Independent CPU model of v_pk_mul_f16 / v_pk_add_f16 / v_pk_fma_f16 / v_pk_min_f16 / v_pk_max_f16 (Part of #1723). Pure Python, no GPU.
 
 Per RDNA 2 VOP3P: result low half = op(source i half op_sel[i], ...), result high half = op(source i half
 op_sel_hi[i], ...); absent modifiers mean op_sel [0,..] and op_sel_hi [1,..]. Each half is an IEEE binary16
@@ -55,8 +55,25 @@ def round_exact(x):
     return neg | (n if e == -14 and n < 0x400 else ((e + 15) << 10) | (n & 0x3ff))
 
 
+def minmax(op, a, b):
+    """v_pk_min_f16 / v_pk_max_f16 lane: IEEE minNum / maxNum on binary16 words. A quiet NaN operand yields the other operand, two NaNs
+    a quiet NaN, and the zeros are ordered (-0 below +0). Signalling NaN operands are not modelled (the callers leave them out)."""
+    if is_nan(a) and is_nan(b):
+        return 0x7e00
+    if is_nan(a):
+        return b
+    if is_nan(b):
+        return a
+    x, y = h2f(a), h2f(b)
+    if x == y:  # equal values: only the two zeros differ by their encoding
+        return (a | b) if op == 'min' else (a & b)
+    return a if (x < y) == (op == 'min') else b
+
+
 def half_op(op, a, b, c=0):
-    """One binary16 lane: op is 'mul', 'add' or 'fma' (a * b + c)."""
+    """One binary16 lane: op is 'mul', 'add', 'fma' (a * b + c), 'min' or 'max'."""
+    if op in ('min', 'max'):
+        return minmax(op, a, b)
     words = (a, b, c) if op == 'fma' else (a, b)
     if any(is_nan(w) for w in words):
         return 0x7e00

@@ -19,6 +19,8 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
@@ -1922,6 +1924,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
+    nested_saves, nested_restores = {}, {}  # nested if of a wave block: save index -> restore index, and back
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
     def live_at_join(reg, join):
@@ -1976,7 +1979,28 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     inner = [i for i in range(source + 1, target) if i in edges
                              and ins[i][2] in ('s_cbranch_scc0', 's_cbranch_scc1', 's_branch')
                              and i < edges[i] <= target]
-                    scalar = [i for i in range(source + 1, target) if i not in inner and not (no_effect(i) or lane_only(i))]
+                    # A nested if of the block: s_and_saveexec_b64 sK:sK+1, vcc / s_cbranch_execz over a body / the restore
+                    # s_or_b64 exec, exec, sK:sK+1. Every thread holds its own EXEC bit and the saved mask is one bit per
+                    # thread, so narrowing and restoring is per lane in the one-lane model; the per-lane skip of the
+                    # branch is the generic execz rule, checked on its own edge below. The save, the branch and the
+                    # restore are not scalar instructions the wave block would run once per wave.
+                    nested = set()
+                    for i in range(source + 2, target):
+                        if ins[i][2] != 's_cbranch_execz' or i not in edges or not i < edges[i] < target:
+                            continue
+                        save = re.fullmatch(r's_and_saveexec_b64 s\[(\d+):(\d+)\], vcc', ins[i - 1][3])
+                        done = ins[edges[i]][3]
+                        if (not save or int(save[2]) != int(save[1]) + 1 or done != 's_or_b64 exec, exec, s[%s:%s]' % save.groups()
+                                or not ins[i - 2][2].startswith('v_cmp_')
+                                or any(writes_exec(ins[k][2], parse(ins[k][3])[1]) or re.search(r'\bs\[?%s\b|\bs%s\b' % (save[1], save[2]), ins[k][3])
+                                       for k in range(i + 1, edges[i]))
+                                or any(live_at_join(reg, edges[i] + 1) for reg in ('s' + save[1], 's' + save[2]))):
+                            continue
+                        nested |= {i - 1, i, edges[i]}
+                        nested_saves[i - 1], nested_restores[edges[i]] = edges[i], i - 1
+                    inner = inner + sorted(i for i in nested if ins[i][2] == 's_cbranch_execz')
+                    scalar = [i for i in range(source + 1, target)
+                              if i not in inner and i not in nested and not (no_effect(i) or lane_only(i))]
                     # The guest runs every scalar instruction of the block once per wave that has an active lane.
                     # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
                     # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
@@ -1998,6 +2022,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     # land between the compare and the execz branch, and the block itself is straight-line code.
                     entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
                                or compare < d <= source]
+                    def branch_kinds():
+                        """Mnemonic and direction of each inner branch the block cannot take (names only, for the triage)."""
+                        kinds = set()
+                        for k in range(source + 1, target):
+                            if k in edges and k not in inner:
+                                where = ('backward' if edges[k] <= k else 'past the block' if edges[k] > target
+                                         else 'forward in the block')
+                                kinds.add('%s %s' % (ins[k][2], where))
+                        return ', '.join(sorted(kinds))
                     causes = [name for name, failed in (
                         ('no compare before the branch', compare <= a_end),
                         ('no full-EXEC reset before the compare', ins[reset][3] != 's_mov_b64 exec, -1'),
@@ -2005,7 +2038,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                         ('a branch lands between the reset and the branch', bool(entries)),
                         ('a branch from outside lands inside the block',
                          any(source < d < target and not source < s < target for s, d in edges.items())),
-                        ('a branch inside the block other than a forward SCC branch',
+                        ('a branch inside the block other than a forward SCC branch (%s)' % branch_kinds(),
                          any(s in edges and s not in inner for s in range(source + 1, target))),
                         ('VCC or SCC live at the join', any(live_at_join(reg, target) for reg in masks)),
                         ('a scalar instruction the wave block cannot run once per wave',
@@ -2115,7 +2148,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         base_name = re.sub(r'_e(32|64)$', '', name)
         complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
                       and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
-        if name != 's_and_saveexec_b64' and not complement and scalar_registers(asm) & saved_masks:
+        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores
+                and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
             if scc_stale and reads_scc(name, asm):
@@ -2185,6 +2219,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             mask = None
             stale |= pending
             pending.clear()
+        elif index in nested_saves and mask == 'wave_load':
+            mask, scc_stale = ('nest', index), True
+        elif index in nested_restores and mask == ('nest', nested_restores[index]):
+            mask = 'wave_load'
         elif (name == 's_and_saveexec_b64' and mask is None and index > 0 and index not in targets
               and re.fullmatch(r's_and_saveexec_b64 s\[\d+:\d+\], vcc', asm)
               and ins[index - 1][2].startswith('v_cmp_')
@@ -2322,6 +2360,9 @@ def mrtz_covers_every_path(ins, at):
     return True
 
 
+
+# Inline float constants of a packed binary16 operation and their binary16 words.
+PK_INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00, '2.0': 0x4000, '-2.0': 0xc000, '4.0': 0x4400, '-4.0': 0xc400}
 
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
@@ -3621,6 +3662,11 @@ class Stage:
         self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
             name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
         self.uses_quad_vote = False
+        # A pixel program with a wave-wide read (a whole-wave reduction) and only forward branches decides every EXEC / VCC
+        # branch by a vote over the host wave, so that every thread of the wave reaches the read together (see
+        # the active-lane model, rules C1..C5). Programs without such a read keep their per-thread branches.
+        self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
+                          and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
@@ -3682,6 +3728,8 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
+            self.wave_unsound = None
+            self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
@@ -3914,6 +3962,11 @@ class Stage:
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
+                        elif self.wave_exec and cond in ('execz', 'execnz', 'vccz', 'vccnz'):
+                            # Decided over the host wave (WaveActiveAnyTrue): every thread takes it together.
+                            self.wave_voted_branches.add(off)
+                            self.uniform_branches.add(off)
+                            cond_uniform = True
                         elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
                                 and self.uniform_cf and not self.lane_exec_breaks
                                 and self.skipped_block_vector_only(off, int(parse(asm)[1][0].split('_')[1], 16))):
@@ -3923,6 +3976,12 @@ class Stage:
                             # still follows the guest's.
                             self.voted_branches.add(off)
                             cond_uniform = True
+                        if self.wave_exec and not cond_uniform and self.wave_unsound is None:
+                            # A branch that is neither wave-uniform nor a vote parts the host wave, so no wave intrinsic
+                            # can be trusted to see every lane. Refused at the end of the pass, so that an earlier
+                            # refusal of the program keeps its own reason.
+                            self.wave_unsound = Unsupported('wave-wide read in a program with a branch (%s) that is '
+                                                            'neither wave-uniform nor an EXEC / VCC vote' % name)
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -3988,6 +4047,10 @@ class Stage:
                 if refusals is not None:
                     del refusals[first_refusal:]
                 continue
+            if raised_unsupported is None and self.wave_unsound is not None:
+                if refusals is None:
+                    raise self.wave_unsound
+                refusals.append((str(self.wave_unsound), self.kind))
             if raised_unsupported is not None:
                 raise raised_unsupported
             break
@@ -4864,7 +4927,14 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
-            if base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
+            if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
+                # The guest skips the block when no lane of the wave has the bit; here every thread of the host wave
+                # takes the same decision (convergence rule C2).
+                self.needs_sm6 = True
+                word = 'exec' if base[10:].startswith('exec') else 'vcc'
+                bit = LE.EXEC_BIT if word == 'exec' else '(vcc & 1u) != 0u'
+                cond = ('!' if base[10:].endswith('z') else '') + 'WaveActiveAnyTrue(%s)' % bit
+            elif base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
                 # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
                 # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
                 self.uses_quad_vote = True
@@ -8430,6 +8500,60 @@ class Stage:
         self.set_s(dst[1] + 1, '0u', ('const', 0))
         return None
 
+    def op_s_bitreplicate_b64_b32(self, ops, mods):
+        """Write each bit of a 32-bit source twice: D.u64 bit 2i and 2i+1 = S0 bit i; SCC unchanged (Run R, 3c50f16a).
+
+        RDNA 2 ISA SOP1 S_BITREPLICATE_B64_B32 (the same result as pixel_aot's s_bitreplicate_b64_b32). The low
+        destination dword holds the replicated source bits 15:0, the high dword bits 31:16. An integer inline
+        constant or a 32-bit literal is the 32-bit source and folds. Lane masks and a source that is also a
+        destination register are refused (the pair would be written before the second half reads the source).
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_bitreplicate_b64_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105 or dst[1] % 2:
+            raise Unsupported('s_bitreplicate_b64_b32 destination %s' % ops[0])
+        if any(r in self.masks for r in range(dst[1], dst[2] + 1)) or self.is_lane_mask(ops[0]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+
+        def replicate(word, shift):
+            folded = 0
+            for bit in range(16):
+                if (word >> (shift + bit)) & 1:
+                    folded |= 3 << (2 * bit)
+            return folded
+
+        def fold(word):
+            lo, hi = replicate(word, 0), replicate(word, 16)
+            self.set_s(dst[1], '0x%08xu' % lo, ('const', lo))
+            self.set_s(dst[1] + 1, '0x%08xu' % hi, ('const', hi))
+
+        if re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1]):
+            fold(int(ops[1], 0) & 0xffffffff)
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s' % ops[1])
+        if src[1] in self.masks or self.is_lane_mask(ops[1]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_bitreplicate_b64_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            fold(sym[1] & 0xffffffff)
+            return None
+        if dst[1] <= src[1] <= dst[2]:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s is a destination register' % ops[1])
+        value = self.S(src[1])
+
+        def expr(shift):
+            return '(%s)' % ' | '.join('((%s & 0x%xu) != 0u ? 0x%xu : 0u)' % (value, 1 << (shift + bit), 3 << (2 * bit))
+                                       for bit in range(16))
+
+        self.set_s(dst[1], expr(0))
+        self.set_s(dst[1] + 1, expr(16))
+        return None
+
     def op_s_quadmask_b32(self, ops, mods):
         """Collapse each nibble of S0 to one bit of D; SCC = result != 0 (#1723).
 
@@ -9291,12 +9415,12 @@ class Stage:
         self.mix(ops, mods, 'hi')
 
     def packed_half(self, base, arity, text, ops, mods):
-        """v_pk_{mul,add,fma}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
+        """v_pk_{mul,add,fma,min,max}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR
-        (an inline constant or a literal reaches the high lane in a way that is not proven; hold it in a VGPR first).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR, or a literal or
+        inline float constant read through its low half in both lanes (a high-half read and inline integers are not proven).
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -9309,14 +9433,34 @@ class Stage:
             if len(bits) != arity or any(b not in ('0', '1') for b in bits):
                 raise Unsupported('%s with %s' % (base, m))
             sel[key] = [int(b) for b in bits]
-        for tok in ops:
+        literal = {}   # source index -> its 32-bit literal, read through its LOW half only (see below)
+        for i, tok in enumerate(ops):
             r = reg_range(tok)
-            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
-                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
+            if r and r[0] == 'v' and r[1] == r[2] and tok == 'v%d' % r[1]:
+                continue
+            if i >= 1 and re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                # A literal is one dword and each lane picks a half of it by op_sel / op_sel_hi. Only a source whose two lanes both
+                # read the low half is accepted: that is the plain binary16 constant (LLVM prints `0x7bef op_sel_hi:[1,0]`); a read of
+                # the high half of a literal, and an inline constant (how it reaches each half is not proven), stay refused.
+                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                    raise Unsupported('%s literal source %s read through its high half' % (base, tok))
+                literal[i - 1] = int(tok, 16) & 0xffff
+                continue
+            if i >= 1 and tok in PK_INLINE_F16:
+                # Inline float constants (0.5, 1.0, 2.0, 4.0 and negatives) are the binary16 value in the low half; accepted on the same
+                # terms as a literal: both lanes read the low half. Inline integers and a high-half read stay refused.
+                if sel['op_sel'][i - 1] or sel['op_sel_hi'][i - 1]:
+                    raise Unsupported('%s inline constant %s read through its high half' % (base, tok))
+                literal[i - 1] = PK_INLINE_F16[tok]
+                continue
+            raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
         lanes = []
         for picks in (sel['op_sel'], sel['op_sel_hi']):
             args = []
-            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
+            for n, (tok, hi, both) in enumerate(zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi']))):
+                if n in literal:
+                    args.append('f16tof32(0x%xu)' % literal[n])
+                    continue
                 word = self.u(tok, low16_only=not any(both))
                 args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
             lanes.append('f16rn(%s)' % text.format(*args))
@@ -9331,6 +9475,14 @@ class Stage:
 
     def op_v_pk_fma_f16(self, ops, mods):
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
+    # v_pk_{min,max}_f16: the lane values are exact binary32 images of binary16, so the binary32 helper that orders -0 below +0 and passes a
+    # NaN to D3D min/max (the one v_min_f32 and v_max_f32 use) is exact, and f16rn gives the result back its binary16 word.
+    def op_v_pk_min_f16(self, ops, mods):
+        self.packed_half('v_pk_min_f16', 2, 'minmax_zero32({0}, {1}, false)', ops, mods)
+
+    def op_v_pk_max_f16(self, ops, mods):
+        self.packed_half('v_pk_max_f16', 2, 'minmax_zero32({0}, {1}, true)', ops, mods)
 
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
@@ -10020,8 +10172,31 @@ class Stage:
     # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
     # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
     WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
-                   'v_max_u32': ('WaveActiveMax({0})', 0)}
+                   'v_max_u32': ('WaveActiveMax({0})', 0), 'v_and_b32': ('WaveActiveBitAnd({0})', 0xffffffff),
+                   'v_xor_b32': ('WaveActiveBitXor({0})', 0), 'v_add_nc_u32': ('WaveActiveSum({0})', 0)}
     WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
+    WAVE_REDUCE_CONTROL = re.compile(r'quad_perm:\[[0-3],[0-3],[0-3],[0-3]\]|row_half_mirror|row_mirror')
+
+    @staticmethod
+    def wave_steps_reduce(controls, op):
+        """Whether four DPP16 steps (each a quad_perm, row_half_mirror or row_mirror, every lane valid) followed by
+        v_permlanex16_b32 with lane selects 0, 0 and the combine leave lane 31 with every lane's input exactly once
+        (ISA, DPP16 and V_PERMLANEX16_B32). Each lane holds, per source lane, how often that input went into its value:
+        a step adds the permuted lane's counts to the lane's own. An idempotent operation (or, and, min, max) only needs
+        every count at least once; xor and sum need exactly once."""
+        def source(control, lane):
+            if control == 'row_half_mirror':
+                return (lane & ~7) | (7 - (lane & 7))
+            if control == 'row_mirror':
+                return (lane & ~15) | (15 - (lane & 15))
+            sel = [int(x) for x in control[len('quad_perm:['):-1].split(',')]
+            return (lane & ~3) | sel[lane & 3]
+        held = [[int(i == lane) for i in range(32)] for lane in range(32)]
+        for control in controls:
+            held = [[a + b for a, b in zip(held[source(control, lane)], held[lane])] for lane in range(32)]
+        held = [[a + b for a, b in zip(held[(lane & ~15 ^ 16)], held[lane])] for lane in range(32)]
+        counts = held[31]
+        return all(c == 1 for c in counts) if op in ('v_xor_b32', 'v_add_nc_u32') else all(c >= 1 for c in counts)
 
     @staticmethod
     def wave_reduce_cndmask_fill(stretch, ss):
@@ -10041,6 +10216,45 @@ class Stage:
     WAVE_REDUCE_FILLS = (wave_reduce_cndmask_fill,)
     # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
     WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
+
+    def skipped_scalar_read_later(self, branches):
+        """Rule C5 of the active-lane model: a scalar register written inside a block that an EXEC / VCC branch can skip
+        and read after the join. The guest runs the block for the whole wave when any lane is active, so every lane sees the
+        new value (also a lane that is inactive in the block and reads it after EXEC is restored); a thread that skips
+        the block on its own keeps the old one. Only a wave-wide decision of the branch keeps them equal."""
+        ins = getattr(self, 'ins', None)
+        if not isinstance(ins, list):
+            return False
+        wave_branch = {off: name for off, _n, name, _a in ins
+                       if name.startswith('s_cbranch_') and name[10:] in ('execz', 'execnz', 'vccz', 'vccnz')}
+        for pc, target in branches:
+            if pc not in wave_branch:
+                continue
+            written = set()
+            for off, _n, name, asm in ins:
+                if pc < off < target:
+                    reads, writes, _may = scalar_effects(name, asm)
+                    if reads & {'exec', 'vcc'} or name.startswith('v_cmp'):
+                        continue   # mask arithmetic: one bit per thread already, no wave-wide value
+                    written |= {w for w in writes if re.fullmatch(r's\d+', w)}
+            if written and any(off >= target and written & scalar_effects(name, asm)[0] for off, _n, name, asm in ins):
+                return True
+        return False
+
+    def holds_wave_reduction(self):
+        """Whether the program starts a whole-wave reduction chain: s_or_saveexec_b32 sS, -1 and, within the chain's
+        length, a row_mirror / row_half_mirror DPP step or a v_permlanex16_b32 (the test wave_reduction itself uses)."""
+        ins = getattr(self, 'ins', None)
+        if not isinstance(ins, list):
+            return False
+        for index, (_off, _n, name, asm) in enumerate(ins):
+            _name, ops, _mods = parse(asm)
+            if name in ('s_or_saveexec_b32', 's_or_saveexec_b64') and len(ops) == 2 and ops[1] == '-1':
+                for nxt, nops, nmods in (parse(item[3]) for item in ins[index + 1:index + 17]):
+                    if nxt == 'v_permlanex16_b32' or nxt.endswith('_dpp') and ('row_mirror' in nmods or
+                                                                               'row_half_mirror' in nmods):
+                        return True
+        return False
 
     def wave_reduction(self, base, ops):
         """True when this instruction belongs to a recognised wave reduction (its result is lowered at the restore of
@@ -10071,7 +10285,7 @@ class Stage:
             raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
         ss = ss[1]
         first = next((k for k, (name, _o, m) in enumerate(steps)
-                      if name.endswith('_dpp') and set(m) & set(self.WAVE_REDUCE_STEPS)), len(steps))
+                      if name.endswith('_dpp') and any(self.WAVE_REDUCE_CONTROL.fullmatch(x) for x in m)), len(steps))
         items = self.ins[index:index + first + 10]
 
         def at(k, what):
@@ -10092,25 +10306,29 @@ class Stage:
                               'form' % (ss, ' / '.join(t[3] for t in stretch) or 'no instruction'))
         vt, source, identity = fill
         op = None
-        for k, want in enumerate(self.WAVE_REDUCE_STEPS):
-            b, o, m, text = at(first + k, want)
+        seen = []
+        for k in range(len(self.WAVE_REDUCE_STEPS)):
+            b, o, m, text = at(first + k, 'the DPP step %d of 4' % (k + 1))
             if not b.endswith('_dpp'):
-                raise Unsupported('wave reduction: missing step %s (found %s)' % (want, text))
+                raise Unsupported('wave reduction: missing step %d of 4 (found %s)' % (k + 1, text))
             controls = [x for x in m if not x.startswith(('row_mask:', 'bank_mask:', 'bound_ctrl:', 'fi:'))]
-            if controls != [want]:
-                order = ' (steps out of order or missing)' if controls and controls[0] in self.WAVE_REDUCE_STEPS else ''
-                raise Unsupported('wave reduction: %s in place of %s%s' % (' '.join(controls) or 'no DPP control', want,
-                                                                         order))
+            if len(controls) != 1 or not self.WAVE_REDUCE_CONTROL.fullmatch(controls[0]):
+                raise Unsupported('wave reduction: %s in place of a quad_perm, row_half_mirror or row_mirror step'
+                                  % (' '.join(controls) or 'no DPP control'))
+            seen.append(controls[0])
             if 'row_mask:0xf' not in m or 'bank_mask:0xf' not in m:
                 raise Unsupported('wave reduction: %s with a partial row or bank mask' % text)
             this = b[:-len('_dpp')]
             if this not in self.WAVE_REDUCE:
-                raise Unsupported('wave reduction of %s: only v_or_b32, v_min_u32 and v_max_u32 are lowered' % this)
+                raise Unsupported('wave reduction of %s: only v_or_b32, v_and_b32, v_xor_b32, v_add_nc_u32, v_min_u32 and v_max_u32 are lowered' % this)
             if op not in (None, this):
                 raise Unsupported('wave reduction mixes %s and %s' % (op, this))
             op = this
             if o != ['v%d' % vt] * 3:
                 raise Unsupported('wave reduction: %s does not combine v%d with itself' % (text, vt))
+        if not self.wave_steps_reduce(seen, op):
+            raise Unsupported('wave reduction: the steps %s do not bring every lane\'s input into lane 31%s' % (
+                ', '.join(seen), ' exactly once' if op in ('v_xor_b32', 'v_add_nc_u32') else ''))
         if identity != self.WAVE_REDUCE[op][1]:
             raise Unsupported('wave reduction of %s: the inactive lanes get 0x%08x, the identity is 0x%08x'
                               % (op, identity, self.WAVE_REDUCE[op][1]))
@@ -10172,10 +10390,13 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
-            raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
-        if not getattr(self, 'exec_known', False):
-            raise Unsupported('wave reduction: EXEC is not the entry mask')
+        if not getattr(self, 'wave_exec', False):
+            # Straight-line only: every lane of the host wave runs the chain with the entry EXEC.
+            if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+                raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are '
+                                  'lowered')
+            if not getattr(self, 'exec_known', False):
+                raise Unsupported('wave reduction: EXEC is not the entry mask')
         if getattr(self, 'wqm_exec', False):
             raise Unsupported('wave reduction after s_wqm exec, exec: helper lanes are in EXEC and would be counted')
         for _off, _n, name, asm in self.ins[index + first + 7:]:   # everything after the restore
@@ -10208,12 +10429,22 @@ class Stage:
         return True
 
     def lower_wave_reduction(self, op, vt, vp, ss, source):
-        value = self.WAVE_REDUCE[op][0].format(self.u(source))
+        operand = self.u(source)
+        if not self.exec_known:
+            # Past an EXEC write the lanes outside the old EXEC take the identity (the v_cndmask of the chain).
+            operand = '((%s) ? %s : %du)' % (LE.EXEC_BIT, operand, self.WAVE_REDUCE[op][1] & 0xffffffff)
+        value = self.WAVE_REDUCE[op][0].format(operand)
         self.needs_sm6 = True
         self.set_s(ss, 'exec')
         self.sym[ss] = ('execcopy',)
         self.masks.add(ss)
-        self.set_v(vt, value)
+        # The guest runs the chain with every lane enabled, so vT is written in every lane and every thread of the host
+        # wave takes part in the intrinsic: no `if (exec & 1)` around it (an inactive lane's readlane source must be set).
+        was_known, self.exec_known = self.exec_known, True
+        try:
+            self.set_v(vt, value)
+        finally:
+            self.exec_known = was_known
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(vp)
         self.set_scc('true')   # s_or_saveexec_b32 set SCC from the all-lanes EXEC
@@ -12336,10 +12567,15 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
-        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
-        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        # --retry-lifted <dir> [seconds] [--jobs N] [--weights <last run's stderr.txt>]: before the title starts, the
+        # old refusals (lifted families first, then what the last run used most)
+        given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
+        seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
+        at = sys.argv.index('--weights') if '--weights' in sys.argv[3:] else None
+        weights = run_weights(sys.argv[at + 1]) if at is not None and at + 1 < len(sys.argv) else None
+        print(retry_lifted(out_dir, seconds, jobs=jobs, weights=weights).line(), flush=True)
         return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
@@ -12356,7 +12592,19 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp())
+    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+
+
+def jobs_argument(args):
+    """--jobs N among `args`: at most N workers, and never more than translation_jobs(); None when absent."""
+    if '--jobs' not in args:
+        return None
+    at = args.index('--jobs')
+    try:
+        wanted = int(args[at + 1])
+    except (IndexError, ValueError):
+        raise SystemExit('gfx2hlsl: --jobs needs a whole number')
+    return max(1, min(wanted, translation_jobs()))
 
 
 
@@ -12424,6 +12672,13 @@ LIFTED_REASONS = (
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
 )
 PRE_RUN_RETRY_SECONDS = 180.0
+# In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
+# what this build writes for the cases its lift does not cover (Run R: TG_SIZE_EN groups the wave32 lift does not prove,
+# compute image_store dmask), so a newer .fail of a lifted family is retried once per build, not at the head of every run.
+RETRIED_NAME = 'pre_run_retried.txt'
+# The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
+NOT_DRAWN_LINE = re.compile(r'x2w-render not drawn key ([0-9a-f]{16}): (\d+)')
+CENSUS_LINE = re.compile(r'x2w-render compute census key ([0-9a-f]{16}): (\d+) dispatches, (\d+) translated')
 
 
 def lifted_family(reason, families=LIFTED_REASONS):
@@ -12437,44 +12692,97 @@ def lifted_failures(out_dir, since_translator, families=LIFTED_REASONS):
     return [key for key, lifted in old_failures(out_dir, since_translator, families) if lifted]
 
 
-def old_failures(out_dir, since_translator, families=LIFTED_REASONS):
-    """(key, in a lifted family) for every request an older build refused (a .fail older than since_translator, still
-    pending), in retry order: the lifted families first, then graphics and mesh requests (what a title draws) before
-    compute, each oldest request first. A refusal this build wrote is final and not listed."""
+def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=frozenset(), weights=None):
+    """(key, in a lifted family) for every refused request worth a retry, in retry order: the lifted families first,
+    then the requests the last run used most (`weights`: draws not drawn or dispatches without a translation), then
+    graphics and mesh requests (what a title draws) before compute, each oldest request first. A .fail older than
+    since_translator was written by another build and is listed; a newer one is final, unless its reason is in a lifted
+    family and this build has not retried it yet (`final`): a .fail's time does not prove which build wrote it (Run P
+    kept a pixel MRTZ request refused by a stale .fail although that build translates it)."""
+    weights = weights or {}
     rows = []
-    for order, key in enumerate(pending_keys(out_dir, False, since_translator)):
+    for order, key in enumerate(pending_keys(out_dir, False, None)):
         fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
-            if since_translator is not None and os.path.getmtime(fail) >= since_translator:
-                continue
+            newer = since_translator is not None and os.path.getmtime(fail) >= since_translator
             with open(fail, encoding='utf-8', errors='replace') as handle:
                 reason = handle.readline()
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
+        if newer and (not lifted or key in final):
+            continue
         compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
-        rows.append((not lifted, compute, order, key, lifted))
-    return [(key, lifted) for _l, _c, _o, key, lifted in sorted(rows)]
+        rows.append((not lifted, -weights.get(key, 0), compute, order, key, lifted))
+    return [(key, lifted) for _l, _w, _c, _o, key, lifted in sorted(rows)]
+
+
+def retried_by_build(out_dir, stamp):
+    """The keys this translator build (stamp) already retried before a run and left refused (RETRIED_NAME); an empty
+    set when another build wrote the file, or there is none."""
+    try:
+        with open(os.path.join(out_dir, RETRIED_NAME), encoding='ascii') as handle:
+            words = handle.read().split()
+    except (OSError, UnicodeDecodeError):
+        return frozenset()
+    if stamp is None or not words or words[0] != 'build-%r' % stamp:
+        return frozenset()
+    return frozenset(int(word, 16) for word in words[1:] if re.fullmatch(r'[0-9a-f]{16}', word))
+
+
+def note_retried(out_dir, stamp, keys):
+    """Record that this build retried `keys` and left them refused (replaces the record of another build)."""
+    if stamp is None:
+        return
+    path = os.path.join(out_dir, RETRIED_NAME)
+    with suppress(OSError):
+        with open(path + '.tmp', 'w', encoding='ascii') as handle:
+            handle.write('build-%r\n' % stamp + ''.join('%016x\n' % key for key in sorted(keys)))
+        os.replace(path + '.tmp', path)
+
+
+def run_weights(path):
+    """{key: draws not drawn (graphics) or dispatches without a translation (compute)} from a run's stderr.txt, each
+    key's newest cumulative line; {} when the file cannot be read."""
+    weights = {}
+    try:
+        with open(path, encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if not line.startswith('x2w-render '):
+                    continue
+                drawn, census = NOT_DRAWN_LINE.match(line), CENSUS_LINE.match(line)
+                if drawn:
+                    weights[int(drawn.group(1), 16)] = int(drawn.group(2))
+                elif census:
+                    weights[int(census.group(1), 16)] = max(0, int(census.group(2)) - int(census.group(3)))
+    except OSError:
+        return {}
+    return weights
 
 
 class RetryReport:
-    def __init__(self, keys, ok, refused, left, seconds, lifted=0):
+    def __init__(self, keys, ok, refused, left, seconds, lifted=0, used=0):
         self.keys, self.ok, self.refused, self.left, self.seconds = keys, ok, refused, left, seconds
-        self.lifted = lifted
+        self.lifted, self.used = lifted, used
 
     def line(self):
         """tester_run's log line: old refusals (of them in lifted families), translated now, still refused, left for
         the pass after the run."""
         left = ', %d left for the pass after the run (time cap)' % self.left if self.left else ''
-        return 'pre-run retry: %d keys (%d in lifted families), ok %d, still refused %d%s, %.0f s' % (
-            self.keys, self.lifted, self.ok, self.refused, left, self.seconds)
+        used = ', %d used in the last run' % self.used if self.used else ''
+        return 'pre-run retry: %d keys (%d in lifted families%s), ok %d, still refused %d%s, %.0f s' % (
+            self.keys, self.lifted, used, self.ok, self.refused, left, self.seconds)
 
 
-def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic):
-    """Translate again, on every core, the old refusals (old_failures: lifted families first) before the title starts.
-    No new request is started after `seconds`; what is left keeps its .fail for the pass after the run."""
+def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIFTED_REASONS, clock=time.monotonic,
+                 weights=None):
+    """Translate again the old refusals (old_failures: lifted families first, then by the last run's use `weights`)
+    before the title starts. No new request is started after `seconds`; what is left keeps its .fail for the pass after
+    the run. What this build retried and still refuses is recorded (RETRIED_NAME) and not retried again by it."""
     start = clock()
-    rows = old_failures(out_dir, translator_stamp(), families)
+    stamp = translator_stamp()
+    already = retried_by_build(out_dir, stamp)
+    rows = old_failures(out_dir, stamp, families, already, weights)
     keys = [key for key, _lifted in rows]
     results = {}
     if keys:
@@ -12497,9 +12805,15 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
                     done, _ = wait(running, return_when=FIRST_COMPLETED)
                     for future in done:
                         results[running.pop(future)] = future.result()
+    for key, result in results.items():
+        if result == 'ok':  # the stale refusal would still count as one in the cache's totals
+            with suppress(OSError):
+                os.remove(os.path.join(out_dir, '%016x.fail' % key))
+    if results:
+        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
     ok = sum(1 for result in results.values() if result == 'ok')
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
-                       sum(1 for _key, lifted in rows if lifted))
+                       sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
 
 
 def translate_one(out_dir, key):

@@ -41,15 +41,17 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LogDir "args.json")
 foreach ($name in "finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log", "threads.txt",
                   "translate.txt", "translate_err.txt") {
+    # a real debugger writes finished.txt last: in stall mode the stub writes it only after it was told to stop (written
+    # and removed again, a busy host let the watchdog see it and stop watching)
+    if ($env:STUB_STALL -and $name -eq "finished.txt") { continue }
     Set-Content -LiteralPath (Join-Path $LogDir $name) -Value "stub $name"
 }
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window.png"), [byte[]](1, 2, 3))
 [System.IO.File]::WriteAllBytes((Join-Path $LogDir "window_015s.png"), [byte[]](4, 5, 6))
 Add-Content -LiteralPath (Join-Path $LogDir "stderr.txt") -Value "x2w-input script time base first-poll: first poll at 151.9 s, first entry at 156.9 s since process start"
 Set-Content -LiteralPath "$LogDir.out" -Value "stub summary"
+if ($env:STUB_KILL_SELF) { Stop-Process -Id $PID -Force }   # the tester pressed Ctrl-C / closed the window: nothing after this runs
 if ($env:STUB_STALL) {
-    # a real debugger writes finished.txt last: the stub does the same, after it was told to stop
-    Remove-Item -LiteralPath (Join-Path $LogDir "finished.txt") -Force
     $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 120 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
@@ -66,6 +68,13 @@ def fnv(blob): return 0
 key = fnv(b'x2w-startup-shader-%d')
 ckey = fnv(b'x2w-startup-shader-%dcs')
 mkey = fnv(b'x2w-startup-mesh-57-7')
+# --retry-lifted <cache> <s> --jobs N: count the .fail files and print the line gfx2hlsl.py prints, record the arguments
+if len(sys.argv) > 2 and sys.argv[1] == '--retry-lifted':
+    fails = [n for n in os.listdir(sys.argv[2]) if n.endswith('.fail')]
+    if os.environ.get('STUB_RETRY_ARGS'):  # outside the cache: the next run lists the cache's entries
+        open(os.environ['STUB_RETRY_ARGS'], 'w').write(chr(10).join(sys.argv[3:]))
+    print('pre-run retry: %%d keys (%%d in lifted families), ok 0, still refused %%d, 0 s' %% (len(fails), len(fails), len(fails)))
+    sys.exit(0)
 # one pass (argv: --once <cache>): publish a ready marker for every request that has none; STUB_HANG never ends (the cap)
 if len(sys.argv) > 2 and sys.argv[1] == '--once':
     if os.environ.get('STUB_HANG'):
@@ -93,7 +102,7 @@ def git(tree, *args):
 def make_tree(root):
     tree = Path(root) / "tree"
     (tree / "tools" / "startup").mkdir(parents=True)
-    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py"):
+    for name in ("tester_run.ps1", "tester_pack.py", "shader_cache_revision.py", "runtime_sources.py", "memory_top.py", "stall_watchdog.py", "tester_janitor.py"):
         shutil.copy(STARTUP / name, tree / "tools" / "startup" / name)
     (tree / "src").mkdir()
     (tree / "src" / "device.cpp").write_text("int device;\n", encoding="ascii")
@@ -171,7 +180,7 @@ def check_shell(shell):
         assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
-                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt"]), names
+                                "args.json", "debugger_summary.out", "manifest.json", "shader_results.txt", "memory.txt", "janitor.txt"]), names
         assert args["Render"] and args["Translate"] and args["FakeUser"] and args["GpuMirror"], args
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
@@ -233,6 +242,14 @@ def check_shell(shell):
         assert mem_manifest["end_cause"].startswith("unknown: the debugger wrote no summary"), mem_manifest["end_cause"]  # the stub writes no summary
         # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
         # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
+        # The folders a run started this minute or the next would take already hold a finished run (as after a run
+        # moments ago): the stalled run must get its own folder, or the watchdog sees that finished.txt and stops.
+        now = time.time()
+        for at in (now, now + 60):
+            taken = tree / "out" / "tester" / ("run_" + time.strftime("%Y%m%d-%H%M", time.localtime(at)))
+            taken.mkdir(parents=True, exist_ok=True)
+            for name in ("finished.txt", "events.txt", "taken_marker.txt"):
+                (taken / name).write_text("an earlier run\n", encoding="ascii")
         stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
                              "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
         assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
@@ -241,11 +258,42 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_stall) as z:
             stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             assert "stall_stop.json" in z.namelist(), z.namelist()
+            assert "taken_marker.txt" not in z.namelist(), "the stalled run reused an earlier run's folder"
             # Not a wall-clock limit (a loaded VM with a release build running beside took 130 s for the whole test): the stub says
             # whether the stop file or its own deadline ended its wait.
             assert z.read("wait_ended.txt").decode("utf-8-sig").strip() == "stop file", "the run did not end through the stop file"
         assert stall_manifest["end_cause"].startswith("watchdog at ") and "frozen:" in stall_manifest["end_cause"], stall_manifest
         assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
+        # The tester stops the script (the stub ends the whole PowerShell process, as a closed window does) before it packed anything:
+        # the janitor, in a window of its own, still packs the report from the early manifest.
+        killed = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
+                            "-MemoryStopPercent", "0", extra_env={"STUB_KILL_SELF": "1"})
+        assert killed.returncode != 0, ("the stub did not end the script", killed.stdout, killed.stderr)
+
+        def interrupted_report():
+            # An earlier case of the same minute wrote a zip of the same name (the name has the minute only): look inside, not at names.
+            for path in sorted((tree / "out" / "tester").glob("report_*.zip")):
+                try:
+                    with zipfile.ZipFile(path) as z:
+                        found = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+                except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+                    continue
+                if found.get("interrupted"):
+                    return found
+            return None
+
+        waited = time.monotonic()
+        cut = None
+        while time.monotonic() - waited < 120 and cut is None:
+            cut = interrupted_report()
+            if cut is None:
+                time.sleep(1)
+        if cut is None:
+            notes = {str(f.relative_to(tree)): f.read_text(errors="replace")[-1500:] for f in (tree / "out" / "tester").glob("run_*/janitor*.txt")}
+            for f in Path(tempfile.gettempdir()).glob("tester_janitor_*.json.*"):   # the janitor's own stdout/stderr
+                notes[f.name] = f.read_text(errors="replace")[-1500:]
+            raise AssertionError("the janitor did not pack the report of an interrupted run: %r" % notes)
+        assert cut["interrupted"] is True and cut["end_cause"].startswith("interrupted by the tester"), cut
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
                          "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1", "STUB_STALL_WAIT": "5"})
         assert "STALL STOP" not in off.stdout, off.stdout
@@ -256,8 +304,8 @@ def check_shell(shell):
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
         # No -Input given: the default is accept, only A (never Start)
-        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
-        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept)", "press A #2 (accept)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
+        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+1.5,4@65+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
+        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept, tap)", "press A #2 (accept, tap)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
@@ -362,20 +410,38 @@ def check_shell(shell):
         finished = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "60")
         assert finished.returncode == 0, (finished.stdout, finished.stderr)
         assert "finishing the translation: 1 request(s) pending" in finished.stdout, finished.stdout
+        assert "safe to stop now, results kept" in finished.stdout, finished.stdout
         assert "pending before 1, after 0; ok 2, refused 0 in total (0 new)" in finished.stdout, finished.stdout
         assert (fresh_cache / "aaaaaaaaaaaaaaaa.txt").exists(), "the finish pass did not translate the pending request"
         assert finished.stdout.index("Send this file") < finished.stdout.index("finish translation done"), "zip first"
         # a pass that never ends is stopped at the cap, the exit code and the zip are unaffected
         (fresh_cache / "req_cccccccccccccccc.a").write_bytes(b"x")
+        # A cache that holds requests AND an old refusal (Run R: the re-keying said 'the new cache already holds
+        # requests' and nothing retried the stale MRTZ .fail): the pre-run retry runs, on 4 workers, before the title.
+        (fresh_cache / "req_dddddddddddddddd.a").write_bytes(b"x")
+        (fresh_cache / "dddddddddddddddd.fail").write_text("unsupported: MRTZ requires one uncompressed depth export\n")
         capped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-FinishTranslateSeconds", "3",
-                            extra_env={"STUB_HANG": "1"})
+                            extra_env={"STUB_HANG": "1", "STUB_RETRY_ARGS": str(tree.parent / "retry_args.txt")})
         assert capped.returncode == 0, (capped.stdout, capped.stderr)
         assert "pending before 1, after 1" in capped.stdout and "stopped at the cap" in capped.stdout, capped.stdout
+        assert "tester_run: pre-run retry: 1 keys (1 in lifted families)" in capped.stdout, capped.stdout
+        # the earlier runs left their stderr.txt: the newest ranks the retry by draws/dispatches
+        retry_args = (tree.parent / "retry_args.txt").read_text().splitlines()
+        assert retry_args[:4] == ["180", "--jobs", "4", "--weights"] and len(retry_args) == 5, retry_args
+        weights_file = Path(retry_args[4])
+        assert weights_file.name == "stderr.txt" and weights_file.parent.name.startswith("run_") and weights_file.is_file(), \
+            retry_args
+        assert capped.stdout.index("pre-run retry: 1 keys") < capped.stdout.index("Send this file"), "before the run"
         assert not (fresh_cache / "cccccccccccccccc.txt").exists()
         assert capped.stdout.index("Send this file") < capped.stdout.index("finish translation done"), "the zip comes first"
-        assert list((tree / "out" / "tester").glob("report_*.zip"))
+        newest = max((tree / "out" / "tester").glob("report_*.zip"), key=lambda p: p.stat().st_mtime)
+        with zipfile.ZipFile(newest) as z:
+            retried = json.loads(z.read("manifest.json").decode("utf-8-sig"))["pre_run_retry"]
+        assert retried.startswith("pre-run retry: 1 keys (1 in lifted families)"), retried
+        (fresh_cache / "dddddddddddddddd.fail").unlink()
         skipped = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0")
         assert "finishing the translation" not in skipped.stdout, "-FinishTranslateSeconds 0 must skip the pass"
+        assert "tester_run: pre-run retry skipped: no refusal in the cache" in skipped.stdout, skipped.stdout
     print("tester_run.ps1 under %s: stale build refused, per-revision shader cache, run arguments, -Deep, zip and manifest pass"
           % Path(shell).name)
 

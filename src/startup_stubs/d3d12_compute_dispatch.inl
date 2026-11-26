@@ -226,6 +226,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
+        bool token_output;  // an output taken from a view token: its words are made up, word 3 is unknown
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
@@ -414,6 +415,58 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
         // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        if (words[0] == view_token_magic) {
+            // The title wrote this output through a view it created (CreateUnorderedAccessView): the token names the real resource,
+            // so the desktop UAV is made on it. Its bytes are the GPU's, as an aliased output's are; a copied placement keeps them
+            // in its desktop copy and the later draws bind that (note_placed_gpu_write).
+            ViewRecord record{};
+            note_lock_acquire(false);
+            if (words[1] < view_records().size()) record = view_records()[words[1]];
+            ReleaseSRWLockShared(&note_lock);
+            Wrapper* const owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            if (record.slot == 19 && record.desc_bytes >= sizeof(uav)) std::memcpy(&uav, record.desc, sizeof(uav));
+            if (record.slot != 19 || record.desc_bytes < sizeof(uav) || uav.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+                reason = "an output view token is not an unordered access view of a buffer";
+            else if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
+                     !InterlockedCompareExchange(&owner->own().refs, 0, 0))
+                reason = "an output view token names no live desktop resource";
+            if (!reason) {
+                auto* const real = static_cast<ID3D12Resource*>(owner->own().real);
+                const bool raw = uav.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW;
+                const UINT element = raw ? 4 : uav.Buffer.StructureByteStride ? uav.Buffer.StructureByteStride
+                    : x2w_startup::typed_buffer_format_bytes(uav.Format);
+                const D3D12_RESOURCE_DESC target = real->GetDesc();
+                const u64 offset = element ? uav.Buffer.FirstElement * element : 0;
+                const u64 bytes = u64{uav.Buffer.NumElements} * element;
+                if (target.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !(target.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                    reason = "an output view token's resource is not a buffer with unordered access";
+                else if (!element || uav.Buffer.FirstElement > UINT64_MAX / element) reason = "an output view token has no element size";
+                else if (!bytes) reason = "an output range has zero bytes";
+                else if (bytes % 4) reason = "an output range is not a whole number of dwords";
+                else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
+                else if (offset > target.Width || bytes > target.Width - offset) reason = "an output view token is outside its resource";
+                else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
+                else if (const auto* info = resource_info(owner);
+                         owner->own().title_memory && (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON))
+                    reason = "an output buffer was not created in the common state";
+                for (std::size_t input = 0; input < inputs && !reason; ++input)
+                    if (views[input].resource == real) reason = "an output buffer is also an input";
+                if (!reason) {
+                    views[i] = {real, offset, bytes, true};
+                    views[i].token_output = true;
+                    views[i].stride = raw ? 0 : element;
+                    views[i].words[1] = (raw ? 0u : element) << 16;
+                    views[i].words[2] = raw ? static_cast<std::uint32_t>(bytes) : uav.Buffer.NumElements;
+                    note_placed_gpu_write(owner, offset, bytes);
+                    static LONG token_logged;
+                    if (first_calls(token_logged, 8))
+                        log("x2w-draw compute %016llx output %zu from a view token: resource %p offset 0x%llx, %llu bytes, %s", key, i,
+                            static_cast<void*>(real), offset, bytes, raw ? "raw" : "structured or typed");
+                }
+            }
+            continue;
+        }
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
@@ -462,7 +515,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             }
             values[i] = word[3];
             break;
-        case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
+        case ComputeTranslation::output_word3:
+            if (view.token_output) reason = "an output taken from a view token has no descriptor word 3 the program reads";
+            values[i] = view.words[3];
+            break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
         }
