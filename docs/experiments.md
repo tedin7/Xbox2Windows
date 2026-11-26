@@ -53,12 +53,21 @@ paths using source-built allocations.
 
 ## Present color producer trace
 
-Set `X2W_RED_PRODUCER_AUTO=3700,12` and `X2W_PRESENT_SIGNATURE_EVERY=1` to sample the
-title-selected RGBA8 presentation texture. `X2W_RED_PRODUCER_RGB=255,0,255` selects a
+Set `X2W_RED_PRODUCER_AUTO=3700,12` to sample the title-selected RGBA8 presentation
+texture every four presents. `X2W_PRESENT_SIGNATURE_EVERY=1` samples every present. `X2W_RED_PRODUCER_RGB=255,0,255` selects a
 specific RGB triplet. The default match is `255,0,0`. A transition to the match at or
 after present 3700 arms the next 12 frames after the sample is published. The log also
 reports up to 64 earlier recording identities for the known presentation targets.
 Use `X2W_RED_PRODUCER_FRAMES=4100,4110` for an explicit frame window.
+
+Set `X2W_RED_PRODUCER_ONSET=1` to arm when a nonmatching sample is followed by a
+flat sample near the selected color. The center RGB must be within four 8-bit
+levels per channel of the selected color, and each pixel on the sampled rows
+must be within four levels per channel of the center. This mode samples every
+present by default and logs the preceding completed sample. It also follows one
+hop through resolved texture SRVs of translated draws to known present targets.
+Once discovered, up to 32 such textures are eligible for producer history and
+readback under the same format and operation limits.
 
 The producer rows report one RGBA8 texel before and after a clear or supported
 graphics draw to a known present target. They include the submitting queue and
@@ -66,8 +75,8 @@ operation order. Present samples use the same texel, and attachment rows identif
 the bound render targets and depth view. A queue fence guards the readbacks.
 Recording history gives candidate commands. Attribution requires a completed
 producer read and a matching presentation resource. The trace covers direct-list
-graphics writes to previously seen single-sample present targets. Compute writes,
-alias writes and resources upstream of those targets require separate evidence.
+graphics writes to previously seen single-sample present targets and eligible
+inputs in onset mode. Compute writes and alias writes require separate evidence.
 The diagnostic retains up to eight present resources and 512 paired readbacks in
 an opted-in process.
 
@@ -75,7 +84,10 @@ an opted-in process.
 checks exact colors on both sides of each clear, compared to subsequent presents,
 then resubmits the closed recording and reverses the writes. The automatic cases
 check red and magenta, ignore an early exact match and a later near match, and
-refuse an out-of-range RGB component. Run the WARP and hardware checks separately
+refuse an out-of-range RGB component. The default-cadence case omits the signature
+override. The onset case compares a near-red center in a nonuniform picture with
+a uniform near-red picture, then checks the producer readbacks with onset on and
+automatic capture with onset off. Run the WARP and hardware checks separately
 when reporting adapter results.
 
 ```powershell
