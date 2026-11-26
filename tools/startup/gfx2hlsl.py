@@ -7367,8 +7367,9 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
-        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        # Cube maps: the level-zero and explicit-level samples of any stage and the implicit-LOD sample of a pixel stage
+        # (the runtime binds a TextureCube view for them).
+        cube = dim == 'SQ_RSRC_IMG_CUBE' and (how in ('lz', 'l') or (how == 'sample' and getattr(self, 'kind', None) == 'ps'))
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:

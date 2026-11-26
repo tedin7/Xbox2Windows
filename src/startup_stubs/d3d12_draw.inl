@@ -397,7 +397,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
+                                     !std::strcmp(kind, "texcube") ? 5 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (std::sscanf(line.c_str(), "srvuse %d %15s", &i, kind) == 2) {
@@ -1865,11 +1866,12 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
     for (UINT i = 0; i < tr.srvs.size(); ++i) {
         if (!tr.d16_srvs.requires_exact(i)) continue;
         const Translation::Srv& srv = tr.srvs[i];
-        if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
+        if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(i, "non-table texture binding", srv.kind);
         const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D :
+                               srv.kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE3D;
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
@@ -1904,6 +1906,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
                 (srv.kind == 1 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && tex_desc.DepthOrArraySize == 1) ||
                 (srv.kind == 2 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
                 (srv.kind == 3 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
+                (srv.kind == 5 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && tex_desc.DepthOrArraySize == 6) ||
                 (srv.kind == 4 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && tex_desc.DepthOrArraySize == 1);
             if (!dim_ok) return refuse(i, "default view dimension", static_cast<int>(tex_desc.Dimension));
         } else {
@@ -2407,7 +2410,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             return refuse(i, "the texture is also a render or depth target of this draw", reinterpret_cast<u64>(texture));
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
-            if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
+            if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
             const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
@@ -2723,10 +2726,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
         if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
-        if (srv.kind >= 1 && srv.kind <= 4) {
+        if (srv.kind >= 1 && srv.kind <= 5) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D :
+                               srv.kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE3D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -2804,8 +2808,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
-            const bool wrong_1d_resource = texture && srv.kind == 4 &&
-                (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
+            const bool wrong_1d_resource = texture && ((srv.kind == 4 &&
+                (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1)) ||
+                (srv.kind == 5 && (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || texture->GetDesc().DepthOrArraySize != 6)));
             if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);

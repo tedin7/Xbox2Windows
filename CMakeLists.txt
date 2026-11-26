@@ -3994,7 +3994,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_image_3d_check.py")
     add_test(NAME startup_image_load_mip_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_load_mip_check.py")
+    add_test(NAME startup_image_cube_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_cube_check.py")
     foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_cube_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_cube_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_image_cube_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_image_3d_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_3d_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

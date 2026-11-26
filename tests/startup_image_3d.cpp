@@ -68,8 +68,12 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, bool cube)
 {
+    // cube: six 2x2 faces as the six slices of a 2D array, sampled through a TextureCube view (levels 1).
+    if (cube && (!array || levels != 1 || one_dimensional || two_dimensional))
+        throw std::runtime_error("A cube fixture is one level of six faces");
+    const UINT slices = cube ? 6u : side;
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
     if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
@@ -105,15 +109,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                  : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = base;
     td.Height = one_dimensional ? 1 : base;
-    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : side;
+    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : slices;
     td.MipLevels = levels;
     td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
     // The subresource of slice s and mip m is m + s * levels.
-    const UINT subresources = (array ? side : 1) * levels;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
+    const UINT subresources = (array ? slices : 1) * levels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6 * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];
@@ -166,7 +170,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         view.Texture2D.MostDetailedMip = first_mip;
         view.Texture2D.MipLevels = view_levels;
     }
-    device->CreateShaderResourceView(texture.Get(), view_levels ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    if (cube) {
+        view.Format = td.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.TextureCube.MostDetailedMip = 0;
+        view.TextureCube.MipLevels = 1;
+    }
+    device->CreateShaderResourceView(texture.Get(), view_levels || cube ? &view : nullptr,
+                                     views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -211,7 +223,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
     readback->Unmap(0, &none);
     std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
-                one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
+                one_dimensional ? "1d" : two_dimensional ? "2d" : cube ? "cube" : array ? "2d_array" : "3d",
                 z, color[0], color[1], color[2], color[3]);
 }
 
