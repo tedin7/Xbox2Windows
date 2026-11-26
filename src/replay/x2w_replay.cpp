@@ -394,6 +394,7 @@ using Microseconds = std::chrono::duration<double, std::micro>;
 
 struct SlotTiming {
     ReplayClock::duration total{}, interval{};
+    u64 calls = 0;
 };
 
 struct ReplayTiming {
@@ -405,6 +406,7 @@ struct ReplayTiming {
     {
         auto& slot = slots[{call.kind, call.slot}];
         slot.total += duration;
+        ++slot.calls;
         slot.interval += duration;
     }
 
@@ -441,8 +443,8 @@ struct ReplayTiming {
         std::fprintf(f, ", \"slot_times\": [");
         const char* separator = "";
         for (const auto& [key, timing] : slots) {
-            std::fprintf(f, "%s{\"kind\": %u, \"slot\": %u, \"total_us\": %.3f}", separator,
-                         static_cast<unsigned>(key.first), static_cast<unsigned>(key.second),
+            std::fprintf(f, "%s{\"kind\": %u, \"slot\": %u, \"calls\": %llu, \"total_us\": %.3f}", separator,
+                         static_cast<unsigned>(key.first), static_cast<unsigned>(key.second), timing.calls,
                          Microseconds(timing.total).count());
             separator = ", ";
         }

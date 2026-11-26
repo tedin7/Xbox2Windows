@@ -111,6 +111,13 @@ def check_timing(summary, recording, progress):
     keys = [(entry["kind"], entry["slot"]) for entry in slots]
     assert len(keys) == len(expected) and set(keys) == expected, keys
     assert all(entry["total_us"] >= 0 for entry in slots), slots
+    # Per-call cost needs the call count: every recorded call is counted once, under its own slot.
+    counts = {}
+    for tag, header, *_ in chunks(data):
+        if tag == b"CALL":
+            key = struct.unpack_from("<QIHH", data, header)[2:]
+            counts[key] = counts.get(key, 0) + 1
+    assert {(e["kind"], e["slot"]): e["calls"] for e in slots} == counts, (slots, counts)
     slot_us = sum(entry["total_us"] for entry in slots)
     wall_us = summary["wall_s"] * 1_000_000
     assert wall_us > 0 and abs(slot_us - wall_us) <= 0.10 * wall_us, (slot_us, wall_us)
