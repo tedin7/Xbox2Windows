@@ -117,6 +117,8 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
     env.update(extra_env or {})
     for key in [k for k in env if k.startswith("X2W_")]:
         del env[key]
+    if "-ScanRoots" not in args:
+        args = (*args, "-ScanRoots", str(tree / "scan_none"))  # no search of the real AppData during the checks
     if "-FinishTranslateSeconds" not in args:
         args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
     script = str(tree / "tools" / "startup" / "tester_run.ps1")
@@ -292,6 +294,25 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_fresh) as z:
             fresh_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert fresh_manifest["fresh_save"] is True and fresh_manifest["saves_at_end"] == 0 and fresh_manifest["saves_at_start"] == 0, fresh_manifest
+
+        # Files written during the run under a search folder are listed in the manifest (where the title keeps its choices);
+        # a file older than the run start is not.
+        scan = tree / "scan_here"
+        (scan / "Vendor" / "Game").mkdir(parents=True, exist_ok=True)
+        written = scan / "Vendor" / "Game" / "privacy.dat"
+        written.write_bytes(b"1")
+        later = time.time() + 3600  # modified after the run starts
+        os.utime(written, (later, later))
+        stale = scan / "Vendor" / "Game" / "old.dat"
+        stale.write_bytes(b"1")
+        os.utime(stale, (1000000000, 1000000000))
+        scanned = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-ScanRoots", str(scan))
+        assert scanned.returncode == 0, (scanned.stdout, scanned.stderr)
+        newest_scan = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
+        with zipfile.ZipFile(newest_scan) as z:
+            scan_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
+        listed = scan_manifest["files_written"]
+        assert len(listed) == 1 and listed[0].endswith("privacy.dat (1 bytes)"), scan_manifest["files_written"]
 
         # A tracked change in the runtime sources makes the checkout dirty: the build revision must carry -dirty to match.
         device = tree / "src" / "device.cpp"
