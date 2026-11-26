@@ -1769,6 +1769,10 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_mesh_request_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1")
 endforeach()
+add_test(NAME startup_indirect_mesh_request_control_warp COMMAND startup_indirect_draw_indexed warp mesh)
+set_tests_properties(startup_indirect_mesh_request_control_warp PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1;X2W_MESH_REQUEST_CONTROL=1"
+    PASS_REGULAR_EXPRESSION "mesh request census mismatch for [0-9a-f]+ .expected 2 uses and refusals.")
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
