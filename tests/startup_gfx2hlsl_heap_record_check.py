@@ -14,7 +14,7 @@ dispatch reads the 32-byte heap record that root constant word 2 indexes. The HL
 compared whole. Every other form keeps a refusal: another shift, another index, an index register written
 again, a branch target between the shift and the load, a high word that is not a constant zero, an offset
 modifier, eight dwords, an index read from a buffer at an offset that differs between groups (named as such;
-startup_gfx2hlsl_heap_word_check.py covers the buffer forms that are accepted), a formatted load or a store through
+startup_gfx2hlsl_heap_word_check.py covers the buffer forms that are accepted), a store through
 the record, and the graphics stages. --llvm-mc reassembles every instruction used here and compares the words.
 """
 import argparse
@@ -179,8 +179,6 @@ def check_refusals():
         ('high word left as the group ID', {CLEAR: ()}, high),
         ('offset modifier', {LOAD: ('s_load_dwordx4 s[16:19], s[8:9], s6 offset:0x20',)}, 'with offset:0x20'),
         ('eight dwords', {LOAD: ('s_load_dwordx8 s[16:23], s[8:9], s6',)}, 's_load of a resource heap record of 8 dwords'),
-        ('formatted load', {READ: ('buffer_load_format_xyzw v[5:8], v4, s[16:19], 0 offen',)},
-         'formatted buffer load requires a hardware table descriptor'),
         ('store through the record', {WRITE: ('buffer_store_dword v5, v4, s[16:19], 0 offen',)}, "('resheap', 0, 2)"),
     )
     for name, edits, reason in controls:

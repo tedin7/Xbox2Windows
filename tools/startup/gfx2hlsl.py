@@ -7465,7 +7465,8 @@ class Stage:
     def mubuf_format(self, ops, mods, count):
         """buffer_load_format_x/xy/xyz/xyzw: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
 
-        The caller supplies that word as an entry constant. Each supported format becomes one case of a switch
+        The caller supplies that word as an entry constant for table and heap descriptors. Compute can also
+        supply it from an SGPR while keeping the bound buffer. Each supported format becomes one case of a switch
         on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
         each destination register, a component or the constant 0 or 1. The draw builds the word from a hardware
         descriptor or from the title's typed buffer view (src/startup_stubs/buffer_format_word3.h) and refuses the
@@ -7477,18 +7478,29 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
-        # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
+        # Buffer binding still requires a proven resource; the format word can be supplied separately.
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
         if (not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc'
-                or not names_one_value(first) or any(
-                    self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
+                or not names_one_value(first)):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
-        if first[1][0] != 'table':
-            raise Unsupported('formatted buffer load requires a hardware table descriptor')
-        if self.past_entry and not self.formatted_descriptor_from_block(r, first):
-            raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
+        intact = all(self.sym.get(r[1] + i) == desc_word(first, first[3] + i) for i in range(4))
+        if not intact:
+            # Keep the original buffer binding and address fields. Only the format/select word can
+            # come from scalar ALU or memory. Entry-block provenance prevents path-dependent rebinding.
+            if (self.kind != 'cs' or self.past_entry or not all(
+                    self.sym.get(r[1] + i) == desc_word(first, first[3] + i) for i in range(3))):
+                raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
+            known = self.is_const(r[2])
+            if known is not None and ((known >> DESC_FORMAT_SHIFT) & DESC_FORMAT_MASK) not in DESC_FORMAT_CODES.values():
+                raise Unsupported('formatted buffer load through a descriptor whose words were rewritten with an unsupported FORMAT')
+            word3 = self.S(r[2])
+        else:
+            if first[1][0] != 'table' and (self.kind != 'cs' or first[1][0] != 'resheap'):
+                raise Unsupported('formatted buffer load requires a hardware table descriptor')
+            if self.past_entry and not self.formatted_descriptor_from_block(r, first):
+                raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
+            word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
@@ -7518,8 +7530,11 @@ class Stage:
     def op_buffer_load_format_xyzw(self, ops, mods):
         self.mubuf_format(ops, mods, 4)
 
-    def op_buffer_store_format_d16_x(self, ops, mods):
-        """Lower compute MUBUF buffer_store_format_d16_x (opcode 0x84) using V# word 3, stride and num_records.
+    def op_buffer_store_format_d16_x(self, ops, mods, *, xyzw=False):
+        """Lower compute MUBUF D16 stores using V# word 3, stride and num_records.
+
+        XYZW takes two packed VGPRs and writes four binary16, UNORM16 or SNORM16 components.
+        X handles the scalar formats below.
 
         Writes one converted 16-bit component from the low 16 bits of vdata into a raw UAV buffer:
         - BUF_FMT_32_FLOAT (22): binary16 -> binary32, 4-byte aligned Store.
@@ -7533,7 +7548,7 @@ class Stage:
         mismatched stride/OOB_SELECT, nonzero DW1[31:30] swizzle flags (uav_stride carries DW1 >> 16),
         unsupported formats/flags, misaligned addresses and out-of-bounds lanes are no-ops.
         """
-        name = 'buffer_store_format_d16_x'
+        name = 'buffer_store_format_d16_xyzw' if xyzw else 'buffer_store_format_d16_x'
         if self.kind != 'cs':
             raise Unsupported(name)
         raw = getattr(self, 'raw_code', b'')
@@ -7560,7 +7575,7 @@ class Stage:
                 raise Unsupported('%s modifier %s' % (name, m))
         imm_offset = 0 if imm_offset is None else imm_offset
         src = reg_range(ops[0])
-        if not src or src[0] != 'v' or src[1] != src[2] or src[1] > 255:
+        if not src or src[0] != 'v' or src[2] - src[1] != int(xyzw) or src[2] > 255:
             raise Unsupported('%s data %s' % (name, ops[0]))
         if idxen and offen:
             vaddr = reg_range(ops[1])
@@ -7605,11 +7620,18 @@ class Stage:
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
         num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
-        val_expr = self.u(ops[0], low16_only=True)
-        self.pipe.uses_store_d16_x = True
-        call = 'store_format_d16_x(%s, %s, %s, %s, %s, %s, %s, %du, %s);' % (
-            uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
+        if xyzw:
+            self.pipe.uses_store_d16_xyzw = True
+            val_expr = 'uint2(%s, %s)' % tuple(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        else:
+            self.pipe.uses_store_d16_x = True
+            val_expr = self.u(ops[0], low16_only=True)
+        call = '%s(%s, %s, %s, %s, %s, %s, %s, %du, %s);' % (
+            name.removeprefix('buffer_'), uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+
+    def op_buffer_store_format_d16_xyzw(self, ops, mods):
+        self.op_buffer_store_format_d16_x(ops, mods, xyzw=True)
 
     def op_buffer_store_format_xyzw(self, ops, mods):
         """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
@@ -11103,6 +11125,7 @@ class Pipeline:
     uses_gather_2d_lod = False
     uses_cube_dir = False
     uses_store_d16_x = False
+    uses_store_d16_xyzw = False
     uses_sad = ()
     uses_store_format_xyzw = False
     srv_formats = ()
@@ -11461,7 +11484,7 @@ class Pipeline:
                 '    return result;',
                 '}',
             ))
-        if self.uses_store_d16_x:
+        if self.uses_store_d16_x or self.uses_store_d16_xyzw:
             out.extend((
                 'uint d16_to_unorm16(uint h) {',
                 '    float x = f16tof32(h);',
@@ -11478,6 +11501,29 @@ class Pipeline:
                 '    precise float rounded = scaled >= 0.0f ? floor(scaled + 0.5f) : ceil(scaled - 0.5f);',
                 '    return ((uint)(int)rounded) & 0xffffu;',
                 '}',
+            ))
+            d16_bounds = (
+                '    if (voff > 0xffffffffu - imm_off) return;',
+                '    uint rec_off = voff + imm_off;',
+                '    uint addr = 0u;',
+                '    if (oob_sel == 3u) {',
+                '        if (stride != 0u) return;',
+                '        if (soff > 0xffffffffu - rec_off) return;',
+                '        addr = soff + rec_off;',
+                '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
+                '    } else {',
+                '        if (stride == 0u) return;',
+                '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
+                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                '        uint elem_addr = idx * stride + rec_off;',
+                '        if (soff > 0xffffffffu - elem_addr) return;',
+                '        addr = elem_addr + soff;',
+                '    }',
+                '    uint uav_bytes = 0u;',
+                '    buf.GetDimensions(uav_bytes);',
+            )
+        if self.uses_store_d16_x:
+            out.extend((
                 'void store_format_d16_x(RWByteAddressBuffer buf, uint word3, uint stride, uint num_records, '
                 'uint idx, uint voff, uint soff, uint imm_off, uint val) {',
                 '    if ((word3 & 0xcef80000u) != 0u || (word3 & 7u) != 4u) return;',
@@ -11497,24 +11543,7 @@ class Pipeline:
                 '    }',
                 '    uint elem_bytes = fmt == 22u ? 4u : (fmt == 7u || fmt == 8u || fmt == 11u || fmt == 12u || fmt == 13u ? 2u : 0u);',
                 '    if (elem_bytes == 0u) return;',
-                '    if (voff > 0xffffffffu - imm_off) return;',
-                '    uint rec_off = voff + imm_off;',
-                '    uint addr = 0u;',
-                '    if (oob_sel == 3u) {',
-                '        if (stride != 0u) return;',
-                '        if (soff > 0xffffffffu - rec_off) return;',
-                '        addr = soff + rec_off;',
-                '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
-                '    } else {',
-                '        if (stride == 0u) return;',
-                '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
-                '        uint elem_addr = idx * stride + rec_off;',
-                '        if (soff > 0xffffffffu - elem_addr) return;',
-                '        addr = elem_addr + soff;',
-                '    }',
-                '    uint uav_bytes = 0u;',
-                '    buf.GetDimensions(uav_bytes);',
+                *d16_bounds,
                 '    uint h = val & 0xffffu;',
                 '    if (fmt == 22u) {',
                 '        if ((addr & 3u) != 0u || uav_bytes < 4u || addr > uav_bytes - 4u) return;',
@@ -11537,6 +11566,45 @@ class Pipeline:
                 '        buf.InterlockedCompareExchange(base, cur, next, prev);',
                 '        if (prev == cur) break;',
                 '        cur = prev;',
+                '    }',
+                '}',
+            ))
+        if self.uses_store_d16_xyzw:
+            out.extend((
+                'uint store_d16_pair(uint packed, uint fmt) {',
+                '    if (fmt == 71u) return packed;',
+                '    uint lo = packed & 0xffffu, hi = packed >> 16u;',
+                '    if (fmt == 65u) return d16_to_unorm16(lo) | (d16_to_unorm16(hi) << 16u);',
+                '    return d16_to_snorm16(lo) | (d16_to_snorm16(hi) << 16u);',
+                '}',
+                'void store_d16_half(RWByteAddressBuffer buf, uint addr, uint keep, uint insert) {',
+                '    uint cur = buf.Load(addr);',
+                '    for (;;) {',
+                '        uint prev;',
+                '        buf.InterlockedCompareExchange(addr, cur, (cur & keep) | insert, prev);',
+                '        if (prev == cur) break;',
+                '        cur = prev;',
+                '    }',
+                '}',
+                'void store_format_d16_xyzw(RWByteAddressBuffer buf, uint word3, uint stride, uint num_records, '
+                'uint idx, uint voff, uint soff, uint imm_off, uint2 val) {',
+                '    if ((word3 & 0xcef80000u) != 0u || (word3 & 0xfffu) != 0xfacu) return;',
+                '    uint oob_sel = (word3 >> 28u) & 3u;',
+                '    if ((oob_sel != 0u && oob_sel != 3u) || stride > 0x3fffu) return;',
+                '    uint field = (word3 >> 12u) & 127u;',
+                '    uint fmt = (word3 & 0x1000000u) != 0u ? field :',
+                '        field == 96u ? 65u : field == 97u ? 66u : field == 103u ? 71u : 0u;',
+                '    if (fmt != 65u && fmt != 66u && fmt != 71u) return;',
+                '    const uint elem_bytes = 8u;',
+                *d16_bounds,
+                '    if ((addr & 1u) != 0u || uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;',
+                '    uint2 packed = uint2(store_d16_pair(val.x, fmt), store_d16_pair(val.y, fmt));',
+                '    if ((addr & 2u) == 0u) {',
+                '        buf.Store2(addr, packed);',
+                '    } else {',
+                '        store_d16_half(buf, addr - 2u, 0xffffu, packed.x << 16u);',
+                '        buf.Store(addr + 2u, (packed.x >> 16u) | (packed.y << 16u));',
+                '        store_d16_half(buf, addr + 6u, 0xffff0000u, packed.y >> 16u);',
                 '    }',
                 '}',
             ))
@@ -11876,6 +11944,7 @@ class ComputePipeline(Pipeline):
     def _reset_stage(self):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
+        self.uses_store_d16_xyzw = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
