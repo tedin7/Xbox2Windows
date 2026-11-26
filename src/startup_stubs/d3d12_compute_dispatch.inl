@@ -37,6 +37,7 @@ struct ComputeTranslation {
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
+    KeyUse use;                            // when a Dispatch first and last had this key bound
     const char* first_refusal = nullptr;   // reason of the first refused call
     bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
@@ -77,7 +78,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt") || !fetch_manifest(tr.key, tr.retry_manifest_at != 0, manifest)) {
+    if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }
@@ -160,10 +161,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
+        else {
+            // The first line no pattern took (the whole line, not only its kind), so the next run names the form.
+            const char* const why = line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer, a 2D texture or a cube map"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D, 2D, 2D-array or 3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
+            log("x2w-draw compute pipeline %016llx manifest line %u rejected (%s; %zu inputs and %zu outputs read so far): %.120s", tr.key,
+                line_number, why, tr.srvs.size(), tr.uavs.size(), line.c_str());
+            return why;
+        }
     }
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
@@ -191,6 +198,18 @@ const char* load_compute_translation(ComputeTranslation& tr)
 }
 
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
+x2w_phase::Totals dispatch_phase_totals;
+
+// Every 300 frames with the render totals: where translated dispatches spent their time since the last line.
+void log_dispatch_phases()
+{
+    const auto window = dispatch_phase_totals.take();
+    if (!window.calls[x2w_phase::direct] && !window.calls[x2w_phase::indirect] && !window.calls[x2w_phase::refused]) return;
+    char line[1024];
+    x2w_phase::format_window(window, line, sizeof(line));
+    log("%s", line);
+}
+
 const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
@@ -210,10 +229,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
-    AcquireSRWLockExclusive(&draw_lock);
+    x2w_phase::Timer timer;
+    timer.start(dispatch_phase_totals);
+    draw_lock_acquire_exclusive();
+    timer.got_lock();
+    DispatchPhases phases;
     ComputeTranslation* const tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
+    tr->use.note(process_ms());
     std::uint32_t words[8] = {};
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
     else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
@@ -237,6 +261,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    phases.to(1);
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
@@ -398,20 +423,28 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
         // One reason per condition, so a census says which one an output failed on.
         if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
-        else if (!bytes || bytes % 4 || bytes > (16u << 20)) reason = "an output range is empty, over 16 MiB or not whole dwords";
+        else if (!bytes) reason = "an output range has zero bytes";
+        else if (bytes % 4) reason = "an output range is not a whole number of dwords";
+        else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
         else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer was created without unordered access";
+        static LONG size_logged;
+        if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
+            log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
+                stride, words[2], reason);
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
+    timer.resolved();
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
             if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
+    phases.to(2);
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
@@ -434,6 +467,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
         }
     }
+    phases.to(3);
     // A texture the title filled in memory is brought up to date first. An upload recorded before a later one
     // fails only syncs content, as a draw sampling that texture would.
     for (std::size_t i = 0; i < inputs && !reason; ++i)
@@ -441,12 +475,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
             tr->first_refusal = reason;
             std::memcpy(tr->refusal_words, words, sizeof(tr->refusal_words));
         }
-        ReleaseSRWLockExclusive(&draw_lock);
+        phases.end();
+        timer.finish(x2w_phase::refused);
+        draw_lock_release_exclusive();
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
@@ -461,6 +498,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
+    phases.to(4);
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
         if (i < inputs && view.texture) {
@@ -519,7 +557,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (const auto address = pass.desktop_compute_upload_srvs[parameter]) list->SetComputeRootShaderResourceView(parameter, address);
     }
     ++tr->translated;
-    ReleaseSRWLockExclusive(&draw_lock);
+    phases.end();
+    timer.finish(dispatch.signature ? x2w_phase::indirect : x2w_phase::direct);
+    draw_lock_release_exclusive();
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
     InterlockedIncrement(&compute_dispatches_translated);
@@ -566,5 +606,32 @@ void log_compute_census()
             keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
 }
 
+// One line per pipeline key (graphics and compute) whose use count changed since the last line: first and last use in
+// seconds since the process started. The report script keeps the earliest first and the latest last per key.
+void log_key_use_census()
+{
+    struct Row { const char* kind; u64 key; KeyUse use; };
+    std::vector<Row> rows;
+    AcquireSRWLockExclusive(&draw_lock);
+    for (auto& item : compute_translations())
+        if (item.second.use.uses != item.second.use.reported_uses) {
+            rows.push_back({"compute", item.second.key, item.second.use});
+            item.second.use.reported_uses = item.second.use.uses;
+        }
+    for (auto& item : translation_by_key())
+        if (item.second && item.second->use.uses != item.second->use.reported_uses) {
+            rows.push_back({"graphics", item.second->key, item.second->use});
+            item.second->use.reported_uses = item.second->use.uses;
+        }
+    ReleaseSRWLockExclusive(&draw_lock);
+    for (const Row& row : rows)
+        log("x2w-render key use %s %016llx first %.1f s last %.1f s uses %llu", row.kind, row.key, row.use.first_ms / 1000.0,
+            row.use.last_ms / 1000.0, row.use.uses);
+}
+
 // Fixtures: the census without waiting for the frame that logs it.
-extern "C" __declspec(dllexport) void x2w_d3d12_compute_census() { log_compute_census(); }
+extern "C" __declspec(dllexport) void x2w_d3d12_compute_census()
+{
+    log_compute_census();
+    log_key_use_census();
+}

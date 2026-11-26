@@ -84,40 +84,46 @@ private:
     std::unordered_map<std::uint64_t, std::string> ready_;
 };
 
-// What the draw and dispatch paths use, with draw_lock held. The FIRST lookup of a key is one synchronous open, as it always
-// was, so a translation that is already published draws on its first use. RETRIES of a key that was absent never open
-// the file: they take what the background thread has read. The two kinds of open done under the lock are counted
-// separately; `retry_opens_under_lock` must stay 0 (it is what made the lock busy: every absent key re-opened its
-// file once a second).
+// What the draw and dispatch paths use. The first lookup of a key is claimed by exactly one caller (claim_first), who reads the
+// manifest with draw_lock RELEASED (read_first) and holds nothing while the disk answers; every other lookup, and every retry
+// of a key that was absent, takes what the background thread has read (load_retry) and opens nothing. Reads are counted: a key
+// read twice means some retry opened the file again (retry_opens must stay 0).
 class ManifestSource {
 public:
     explicit ManifestSource(ManifestPrefetch::Io io) : io_(io), prefetch_(std::move(io)) {}
 
-    // Under draw_lock. retry: the key was looked up before and was absent.
-    bool load(std::uint64_t key, bool retry, std::string& out)
+    // True for the first caller that asks about this key (it must then call read_first, outside any lock).
+    bool claim_first(std::uint64_t key)
     {
-        if (retry) return prefetch_.fetch(key, out);
+        std::lock_guard<std::mutex> lock(opened_mutex_);
+        return claimed_.insert(key).second;
+    }
+
+    // One file read for a claimed key, to be made without draw_lock. A second read of the same key counts as a retry open.
+    bool read_first(std::uint64_t key, std::string& out)
+    {
         {
-            // An open of a key that was already opened once is a retry that opened the file under the lock.
             std::lock_guard<std::mutex> lock(opened_mutex_);
-            if (opened_.insert(key).second) ++first_opens_under_lock_;
-            else ++retry_opens_under_lock_;
+            if (read_.insert(key).second) ++first_opens_;
+            else ++retry_opens_;
         }
         return io_.read(key, out);
     }
 
+    // Retries and lookups that lost the claim: in-memory only.
+    bool load_retry(std::uint64_t key, std::string& out) { return prefetch_.fetch(key, out); }
+
     ManifestPrefetch& prefetch() { return prefetch_; }
-    long long first_opens_under_lock() const { return first_opens_under_lock_; }
-    long long retry_opens_under_lock() const { return retry_opens_under_lock_; }
+    long long first_opens() const { return first_opens_; }
+    long long retry_opens() const { return retry_opens_; }
     long long background_reads() const { return prefetch_.background_reads(); }
 
-protected:
+private:
     ManifestPrefetch::Io io_;
     ManifestPrefetch prefetch_;
-    std::atomic<long long> first_opens_under_lock_{0};
-    std::atomic<long long> retry_opens_under_lock_{0};
     std::mutex opened_mutex_;
-    std::unordered_set<std::uint64_t> opened_;
+    std::unordered_set<std::uint64_t> claimed_, read_;
+    long long first_opens_ = 0, retry_opens_ = 0;
 };
 
 }  // namespace x2w_startup

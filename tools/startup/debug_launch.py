@@ -993,12 +993,14 @@ def main():
             addr, unicode, length = struct.unpack_from("<QHH", event, 16)
             raw = read(addr, length * (2 if unicode else 1))
             text = raw.decode("utf-16-le" if unicode else "latin-1", errors="replace").rstrip("\0\r\n")
-            log(f"{time.time() - start:7.3f} debug-output {text[:300]}")
+            # One record per message, whole: line breaks are escaped (a CRLF used to split the record in two) and nothing is cut.
+            log(f"{time.time() - start:7.3f} debug-output {text.replace(chr(13), chr(92) + 'r').replace(chr(10), chr(92) + 'n')}")
         elif code == EXCEPTION:
             ex_code, ex_flags, _, ex_addr, nparams = struct.unpack_from("<IIQQI", event, 16)
             params = struct.unpack_from("<" + "Q" * min(nparams, 15), event, 16 + 32) if nparams else ()
             first = struct.unpack_from("<I", event, 16 + 152)[0]
             label = NAMES.get(ex_code, "")
+            disposition = ""   # how the exception was answered, written with the exception's own log line
             if ex_code == 0x80000003 and ex_addr in breakpoints:
                 handle_breakpoint(tid, ex_addr)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -1041,9 +1043,11 @@ def main():
                         log(f"{time.time() - start:7.3f} host-cpu {name} at {where(ex_addr)} rewritten")
                     k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                     continue
-            log(f"{time.time() - start:7.3f} exception {ex_code:#010x} {label} at {where(ex_addr)} "
-                f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]}")
+            def log_exception(how):
+                log(f"{time.time() - start:7.3f} exception {ex_code:#010x} {label} at {where(ex_addr)} "
+                    f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]} thread {tid}: {how}")
             if ex_code == 0x80000003 and not loader_break_seen:
+                disposition = "continued (the loader's initial breakpoint; hooks armed)"
                 loader_break_seen = True  # the loader's initial breakpoint
                 for addr in hooks:
                     arm(addr)
@@ -1060,19 +1064,30 @@ def main():
                   and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
+                patched = False
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
+                    patched = True
+                disposition = ("continued (soft assert, %d of %s skipped%s)" % (
+                    sum(asserts_seen.values()), "all" if skip_asserts == -1 else skip_asserts,
+                    ", int3 patched to a nop" if patched else ""))
                 status = DBG_CONTINUE  # rip is already past the int3
             elif not ending and ((not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                                 main_base <= ex_addr < main_base + 0x10000000)):
                 stop = (ex_code, ex_addr, tid, first, params)
+                log_exception("stopped (not continued: the debugger ends the run here)")
                 log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
                 ending = True  # this event stays unserved, so the stopped thread keeps its context
                 continue
             elif ex_code in (0x406D1388, 0x40010006):
+                disposition = "continued (thread name or debug print)"
                 status = DBG_CONTINUE
             else:
+                disposition = "not handled (passed on to the title)"
                 status = DBG_EXCEPTION_NOT_HANDLED
+            if not disposition:
+                disposition = "continued" if status == DBG_CONTINUE else "not handled (passed on to the title)"
+            log_exception(disposition)
         k32.ContinueDebugEvent(pid, tid, status)
 
     window.abandon()

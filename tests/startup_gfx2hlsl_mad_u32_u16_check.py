@@ -6,12 +6,13 @@
                                        compile the translated pair with FXC ps_5_1 when given and with DXC ps_6_0,
                                        draw one pixel per four input sets and compare the four result words
 
-RDNA 2 ISA semantics for v_mad_u32_u16 (when op_sel:[0,0,0] and no clamp/omod/abs/neg):
-  D.u32 = (S0.u32 & 0xffffu) * (S1.u32 & 0xffffu) + S2.u32  (32-bit unsigned wraparound).
+RDNA 2 ISA semantics for v_mad_u32_u16 (no clamp/omod/abs/neg):
+  D.u32 = S0.u16 * S1.u16 + S2.u32  (32-bit unsigned wraparound), where op_sel bit 0 / bit 1 takes the high halfword
+  [31:16] of S0 / S1 instead of the low one. op_sel bit 2 (S2, a full dword) and bit 3 (the destination) stay refused.
 
 S0 and S1 read only bits [15:0] (allowed on low16-only odd-dmask d16 image_load results), while S2 reads all
-32 bits (refused on low16-only registers). Any modifier (op_sel, clamp, omod, abs, neg) or wrong operand count
-is refused.
+32 bits (refused on low16-only registers). Any other modifier (op_sel bits 2 and 3, clamp, omod, abs, neg) or
+wrong operand count is refused.
 """
 import re
 import struct
@@ -31,8 +32,10 @@ MASK = 0xffffffff
 VOP3_MAD_U32_U16 = 0x373
 
 
-def ref_mad_u32_u16(s0, s1, s2):
-    return ((s0 & 0xffff) * (s1 & 0xffff) + s2) & MASK
+def ref_mad_u32_u16(s0, s1, s2, sel=(0, 0)):
+    a = (s0 >> 16 if sel[0] else s0) & 0xffff
+    b = (s1 >> 16 if sel[1] else s1) & 0xffff
+    return (a * b + s2) & MASK
 
 
 def encode_mad_u32_u16(vdst, src0, src1, src2, *, literal=None, op_sel=(0, 0, 0, 0),
@@ -55,8 +58,16 @@ def encode_mad_u32_u16(vdst, src0, src1, src2, *, literal=None, op_sel=(0, 0, 0,
 BODY_WORDS = b''.join(encode_mad_u32_u16(12 + lane, 256 + lane, 256 + 4 + lane, 256 + 8 + lane)
                       for lane in range(4))
 PS_WORDS = PRE_WORDS + BODY_WORDS + POST_WORDS
+SELECTS = ((1, 0), (0, 1), (1, 1))  # op_sel:[1,0,0], [0,1,0] (the shape the title uses), [1,1,0]
+SEL_WORDS = {sel: b''.join(encode_mad_u32_u16(12 + lane, 256 + lane, 256 + 4 + lane, 256 + 8 + lane,
+                                              op_sel=(sel[0], sel[1], 0, 0)) for lane in range(4))
+             for sel in SELECTS}
+SEL_PS_WORDS = {sel: PRE_WORDS + words + POST_WORDS for sel, words in SEL_WORDS.items()}
 BODY_SOURCE = ''.join('v_mad_u32_u16 v%d, v%d, v%d, v%d\n' % (12 + lane, lane, 4 + lane, 8 + lane)
                       for lane in range(4))
+SEL_SOURCE = {sel: ''.join('v_mad_u32_u16 v%d, v%d, v%d, v%d op_sel:[%d,%d,0]\n'
+                           % (12 + lane, lane, 4 + lane, 8 + lane, sel[0], sel[1]) for lane in range(4))
+              for sel in SELECTS}
 
 # Synthetic non-register forms decoded through G.decode() and translated via Stage.
 SYNTHETIC_CASES = [
@@ -147,8 +158,8 @@ def check(label, ok, detail=''):
         raise AssertionError(label)
 
 
-def translate_ps(mutate=None):
-    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PS_WORDS, root_blob())
+def translate_ps(mutate=None, sel=None):
+    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PS_WORDS if sel is None else SEL_PS_WORDS[sel], root_blob())
     text = pipe.hlsl_ps()
     if mutate is not None:
         pattern, replacement, _ = MUTATIONS[mutate]
@@ -156,6 +167,13 @@ def translate_ps(mutate=None):
         assert count == 4 and mutated != text, (mutate, count, text)
         text = mutated
     return pipe, text
+
+
+def ignore_op_sel(text):
+    """A broken lowering that drops the halfword select: every `(vN >> 16u)` operand reads the low half instead."""
+    mutated, count = re.subn(r'\((v[0-7]) >> 16u\) & 0xffffu', r'\1 & 0xffffu', text)
+    assert count >= 4 and mutated != text, count
+    return mutated
 
 
 def decode_one(word_bytes):
@@ -212,6 +230,27 @@ def controls():
             break
     check('pixel lowering: %d 32-bit inputs match reference' % len(GRID), mismatch is None, repr(mismatch))
 
+    # 2b. op_sel: the selected halfword of S0 / S1 reaches the multiply (different high and low halves, a nonzero
+    #     32-bit addend), and the unselected operand still reads its low half.
+    for sel in SELECTS:
+        _, sel_text = translate_ps(sel=sel)
+        sel_exprs = lane_expressions(sel_text)
+        bad = None
+        for index, (s0, s1, s2) in enumerate(GRID):
+            lane = index % 4
+            env = {'v%d' % lane: s0, 'v%d' % (4 + lane): s1, 'v%d' % (8 + lane): s2}
+            if sel_exprs[lane].run(env)[0] != ref_mad_u32_u16(s0, s1, s2, sel):
+                bad = (lane, (s0, s1, s2))
+                break
+        check('op_sel:[%d,%d,0] lowering: %d 32-bit inputs match reference' % (sel[0], sel[1], len(GRID)), bad is None,
+              repr(bad))
+        broken = lane_expressions(ignore_op_sel(sel_text))
+        differs = any(broken[i % 4].run({'v%d' % (i % 4): a, 'v%d' % (4 + i % 4): b, 'v%d' % (8 + i % 4): c})[0]
+                      != ref_mad_u32_u16(a, b, c, sel) for i, (a, b, c) in enumerate(GRID))
+        check('op_sel:[%d,%d,0]: ignoring the select is caught by the grid' % sel, differs)
+        check('op_sel:[%d,%d,0]: the draw chunk 0 separates the halves' % sel,
+              [ref_mad_u32_u16(*row, sel) for row in DRAW_SETS[:4]] != [ref_mad_u32_u16(*row) for row in DRAW_SETS[:4]])
+
     # 3. Synthetic non-register forms: literal, inline integer, SGPR.
     sample_vals = {
         'v5': 0xdead0011, 'v9': 0x87654321, 'v15': 0xbeef0005, 's4': 0xcafe0009,
@@ -255,8 +294,6 @@ def controls():
 
     # 5. Refusal controls from synthetic VOP3A bytes and malformed operand counts.
     byte_refusals = [
-        ('op_sel:[1,0,0]', encode_mad_u32_u16(1, 256 + 2, 256 + 3, 256 + 4, op_sel=(1, 0, 0, 0)), 'v_mad_u32_u16 with'),
-        ('op_sel:[0,1,0]', encode_mad_u32_u16(1, 256 + 2, 256 + 3, 256 + 4, op_sel=(0, 1, 0, 0)), 'v_mad_u32_u16 with'),
         ('op_sel:[0,0,1]', encode_mad_u32_u16(1, 256 + 2, 256 + 3, 256 + 4, op_sel=(0, 0, 1, 0)), 'v_mad_u32_u16 with'),
         ('op_sel:[0,0,0,1]', encode_mad_u32_u16(1, 256 + 2, 256 + 3, 256 + 4, op_sel=(0, 0, 0, 1)), 'v_mad_u32_u16 with'),
         ('clamp', encode_mad_u32_u16(1, 256 + 2, 256 + 3, 256 + 4, clamp=1), 'v_mad_u32_u16 with'),
@@ -312,6 +349,9 @@ def check_binary(llvm_mc):
     built = assemble(llvm_mc, BODY_SOURCE)
     if built != BODY_WORDS:
         raise AssertionError('body: assembled %s, recorded %s' % (built.hex(), BODY_WORDS.hex()))
+    for sel in SELECTS:
+        if assemble(llvm_mc, SEL_SOURCE[sel]) != SEL_WORDS[sel]:
+            raise AssertionError('op_sel %s body differs from llvm-mc' % (sel,))
     for name, source, words in (('prologue', PRE_SOURCE, PRE_WORDS), ('export', POST_SOURCE, POST_WORDS)):
         if assemble(llvm_mc, source) != words:
             raise AssertionError('%s fixture differs from llvm-mc' % name)
@@ -355,6 +395,28 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                         raise AssertionError('%s mutation %s did not read %s\n%s\n%s'
                                              % (kind, mut_name, wrong, run.stdout, run.stderr))
                     print('%s mutation %s: fails as expected, reads %s' % (kind, mut_name, wrong), flush=True)
+        check_draw_sel(dxc, renderer, adapter, directory)
+
+
+def check_draw_sel(dxc, renderer, adapter, directory):
+    """op_sel draws on DXC ps_6_0: every select reproduces the reference; ignoring the select must fail."""
+    for sel in SELECTS:
+        good_ps = compile_hlsl(dxc, 'dxc', translate_ps(sel=sel)[1], 'ps_sel_%d%d' % sel, 'ps_6_0', directory)
+        bad_ps = compile_hlsl(dxc, 'dxc', ignore_op_sel(translate_ps(sel=sel)[1]), 'bad_sel_%d%d' % sel, 'ps_6_0',
+                              directory)
+        for index in range(0, len(DRAW_SETS), 4):
+            chunk = DRAW_SETS[index:index + 4]
+            vs = compile_hlsl(dxc, 'dxc', G.Pipeline(vs_words(chunk), SEL_PS_WORDS[sel], root_blob()).hlsl_vs(),
+                              'vs_sel_%d%d_%d' % (sel + (index,)), 'vs_6_0', directory)
+            expected = words_text(ref_mad_u32_u16(*x, sel) for x in chunk)
+            run = draw(renderer, adapter, vs, good_ps, expected)
+            if run.returncode:
+                raise AssertionError('op_sel %s chunk %d\n%s\n%s' % (sel, index // 4, run.stdout, run.stderr))
+            if index == 0:
+                run = draw(renderer, adapter, vs, bad_ps, expected)
+                if run.returncode == 0:
+                    raise AssertionError('op_sel %s ignored by the lowering was not caught\n%s' % (sel, run.stdout))
+        print('op_sel:[%d,%d,0] draws match the reference; the select-ignoring lowering fails' % sel, flush=True)
 
 
 def main():

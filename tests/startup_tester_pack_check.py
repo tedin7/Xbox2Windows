@@ -65,6 +65,14 @@ def check_preset():
     for n, item in enumerate(items2[1:]):
         assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
+    accept = T.input_preset("accept", 600)
+    presses = accept.split(",")
+    assert presses[:3] == ["4@35+0.3", "4@45+0.3", "4@55+0.3"] and presses[-1] == "4@595+0.3" and len(presses) == 57, (presses[:3], presses[-1], len(presses))
+    assert {p.split("@")[0] for p in presses} == {"4"}, "only A (mask 4): never Start (1), D-pad or the other buttons"
+    assert T.input_preset("accept", 35) == "" and T.input_preset("accept", 36) == "4@35+0.3", "presses stop with the run"
+    assert len(T.input_preset("accept", 100000).split(",")) == T.MAX_ENTRIES and len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
+    assert T.input_labels("accept", 600) == ["press A #%d (accept)" % n for n in range(1, 58)], "one label per press"
+    assert T.input_labels("accept", 20) == []
     for none in ("none", "off", "OFF", ""):
         assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"
@@ -377,6 +385,41 @@ def make_cache(folder):
     write(folder, "req_5000000000000001.fail", b"unsupported: " + b"x" * 500 + b"\n")
 
 
+def check_key_use():
+    """The runtime's 'x2w-render key use' lines give each key its first and last use in shader_results.txt."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        run = tmp / "run"
+        run.mkdir()
+        (run / "stderr.txt").write_text(
+            "x2w-render key use compute 2000000000000001 first 12.5 s last 30.0 s uses 4\n"
+            "x2w-render key use compute 2000000000000001 first 12.5 s last 250.5 s uses 900\n"  # printed again: the count grew
+            "x2w-render key use graphics 1000000000000002 first 241.0 s last 242.0 s uses 3\n"
+            "x2w-render key use graphics 0000000000000001 first 1.0 s last 2.0 s uses 7\n"  # ok key: only on its own line
+            "x2w-render key use compute zzzz first 1 s last 2 s uses 1\n"  # malformed: ignored
+            "x2w-render compute census: 3 keys dispatched\n", encoding="utf-8")
+        use = T.key_use(str(run))
+        assert use == {"2000000000000001": (12.5, 250.5, 900), "1000000000000002": (241.0, 242.0, 3), "0000000000000001": (1.0, 2.0, 7)}, use
+        assert T.key_use(str(tmp / "missing")) == {} and T.key_use(None) == {}
+        text = T.format_results(T.cache_results(str(cache)), use)
+        assert "2000000000000001 compute refused image_store on SQ_RSRC_IMG_3D: only 2D images are lowered first=12.5s last=250.5s uses=900\n" in text, text
+        assert "0000000000000001 graphics ok first=1.0s last=2.0s uses=7\n" in text
+        assert not [l for l in text.splitlines() if l.startswith("1000000000000003 ") and "first=" in l], "a key never used has no use"
+        # the refused keys used latest come first, latest last use on top; an ok key is not listed there
+        section = text.split("## refused keys used latest")[1].split("## keys")[0].splitlines()[1:]
+        keys = [line.split()[3] for line in section if line.strip()]
+        assert keys == ["2000000000000001", "1000000000000002"], keys
+        assert T.format_results(T.cache_results(str(cache))) == T.format_results(T.cache_results(str(cache)), {}), "no use lines: unchanged"
+        assert "refused keys used latest" not in T.format_results(T.cache_results(str(cache))) and "first=1" not in T.format_results(T.cache_results(str(cache)))
+        # packed with the cache, the zip's shader_results.txt carries the use
+        T.pack(str(run), MANIFEST, str(tmp / "use.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "use.zip") as z:
+            assert "uses=900" in z.read(T.RESULTS_NAME).decode()
+
+
 def check_cache_results():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -419,6 +462,56 @@ def check_cache_results():
             assert z.read(T.RESULTS_NAME).decode() == text
             manifest = json.loads(z.read("manifest.json"))
             assert manifest["cache_keys"] == 12 and manifest["files"][T.RESULTS_NAME]["bytes"] == len(text.encode())
+
+
+def check_request_files():
+    """The request files of the worst refused keys travel in their own zip folder: ranked by draws not drawn / dispatches
+    without a translation, refused keys only, whole keys within the byte cap, listed in the manifest."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        make_cache(cache)
+        write(cache, "req_1000000000000003.root", b"R" * 1000)
+        write(cache, "req_2000000000000001.root", b"S" * 2000)
+        write(cache, "req_2000000000000001.sa", b"T" * 500)
+        write(cache, "req_2000000000000001.txt", b"not a request file")
+        stderr = (b"x2w-render not drawn key 1000000000000002: 500 (translation_not_ready)\n"
+                  b"x2w-render not drawn key 1000000000000003: 900 (translation_not_ready)\n"
+                  b"x2w-render not drawn key 0000000000000001: 99999 (an ok key is never picked)\n"
+                  b"x2w-render compute census key 2000000000000001: 1000 dispatches, 100 translated, first refusal: x\n"
+                  b"x2w-render compute census key 2000000000000001: 7000 dispatches, 100 translated, first refusal: x\n"
+                  b"x2w-render compute census key 2000000000000003: 50 dispatches, 50 translated, first refusal: none\n"
+                  b"x2w-render compute census key 3000000000000002: 0 dispatches, 0 translated, first refusal: none\n")
+        weights = T.key_weights(stderr.decode())
+        assert weights["2000000000000001"] == 6900 and weights["1000000000000003"] == 900, weights
+        rows = T.cache_results(str(cache))
+        chosen = T.select_requests(str(cache), rows, weights)
+        assert [c[0] for c in chosen] == ["2000000000000001", "1000000000000003", "1000000000000002"], [c[0] for c in chosen]
+        assert [n for n, _ in chosen[0][3]] == ["req_2000000000000001.c67", "req_2000000000000001.root", "req_2000000000000001.sa"]
+        assert len(T.select_requests(str(cache), rows, weights, top=2)) == 2, "top N keys"
+        assert [c[0] for c in T.select_requests(str(cache), rows, weights, cap=1500)] == ["1000000000000003", "1000000000000002"], \
+            "a key that does not fit whole is skipped, the next one still goes in"
+        run = tmp / "run"
+        run.mkdir()
+        make_run(run, 1)
+        write(run, "stderr.txt", stderr)
+        T.pack(str(run), MANIFEST, str(tmp / "with.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "with.zip") as z:
+            names = z.namelist()
+            folder = sorted(n for n in names if n.startswith(T.REQUESTS_DIR + "/"))
+            assert folder == sorted(T.REQUESTS_DIR + "/" + n for c in chosen for n, _ in c[3]), folder
+            assert not [n for n in names if n.startswith("req_")] and T.RESULTS_NAME in names
+            assert z.read(T.REQUESTS_DIR + "/req_1000000000000003.root") == b"R" * 1000
+            listed = json.loads(z.read("manifest.json"))["request_files"]
+            assert listed["keys"] == 3 and listed["files"] == len(folder) and listed["folder"] == T.REQUESTS_DIR
+            assert listed["bytes"] == sum(b for c in chosen for _, b in c[3]) <= T.REQUESTS_CAP_BYTES
+            assert [r["key"] for r in listed["ranked"]] == [c[0] for c in chosen] and listed["ranked"][0]["weight"] == 6900
+        # no stderr or no counters: no request files, still a valid zip
+        write(run, "stderr.txt", b"err\n")
+        T.pack(str(run), MANIFEST, str(tmp / "none.zip"), cache_dir=str(cache))
+        with zipfile.ZipFile(tmp / "none.zip") as z:
+            assert not [n for n in z.namelist() if n.startswith(T.REQUESTS_DIR)] and json.loads(z.read("manifest.json"))["request_files"]["keys"] == 0
 
 
 def make_old_cache(folder):
@@ -559,6 +652,8 @@ if __name__ == "__main__":
     check_symbols()
     check_seed_cache()
     check_cache_results()
+    check_key_use()
+    check_request_files()
     check_preset()
     check_privacy_screen()
     check_manifest()

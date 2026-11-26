@@ -59,6 +59,20 @@ def translator_cases(directory):
     assert "U(i.param1.x)" in hlsl, hlsl                    # the body is translated as in the one-exit shader
     print("translate: a pixel shader with a kill block after its first s_endpgm translates")
     decode = gfx2hlsl.native_instructions
+    # A literal equal to s_endpgm (0xbf810000, also the float -1.0078125) is not an exit: the end-program words are counted
+    # over decoded instructions, so a one-exit shader holding it is the ordinary program and a kill shader holding it is
+    # still the two-exit one.
+    literal = [S.vop1(1, 5, 255), 0xbf810000]
+    one_exit = two_exit_pixel(words=[*literal, *S.pixel_words(0)])
+    refused("Unverified multi-exit program", one_exit, None)
+    status, hlsl = S.translate(directory / "literal_one_exit", S.vertex(), one_exit)
+    assert status == "ok" and "U(i.param1.x)" in hlsl, (status, hlsl)
+    status, hlsl = S.translate(directory / "literal_two_exits", S.vertex(), two_exit_pixel(entry=0xbf880009, body=[*literal, *S.pixel_words(0)]))
+    assert status == "ok" and "U(i.param1.x)" in hlsl, (status, hlsl)
+    print("translate: a literal equal to s_endpgm is not counted as an exit (one-exit and kill shaders)")
+    refused("(3 end-program words, 3 decoded exits)",
+            two_exit_pixel(words=[EXECZ_TO_KILL, *S.pixel_words(0), *NULL_EXPORT, END, *NULL_EXPORT, END]), decode)
+    print("control: three decoded exits are refused, with their count")
     refused("Unverified multi-exit program", pixel, None)
     print("control: without the translator's decoder the two exits are still unverified")
     refused("Unverified multi-exit control flow: s_sendmsg",

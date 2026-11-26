@@ -53,6 +53,9 @@ if ($env:STUB_STALL) {
     $wait = if ($env:STUB_STALL_WAIT) { [int]$env:STUB_STALL_WAIT } else { 120 }
     $deadline = (Get-Date).AddSeconds($wait)
     while (-not (Test-Path -LiteralPath (Join-Path $LogDir "stop")) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    # what ended the wait: the stop file (the watchdog worked) or the stub's own deadline (it did not)
+    $ended = if (Test-Path -LiteralPath (Join-Path $LogDir "stop")) { "stop file" } else { "deadline" }
+    Set-Content -LiteralPath (Join-Path $LogDir "wait_ended.txt") -Value $ended
     Set-Content -LiteralPath (Join-Path $LogDir "finished.txt") -Value "stub finished.txt"
 }
 exit 0
@@ -230,16 +233,17 @@ def check_shell(shell):
         assert mem_manifest["end_cause"].startswith("unknown: the debugger wrote no summary"), mem_manifest["end_cause"]  # the stub writes no summary
         # Stall watchdog: a title that stops moving (the stub waits for the `stop` file) ends the run early, the zip is
         # still packed and the manifest says why. Memory rule off here: the host's own commit is not under test.
-        started = time.monotonic()
         stalled = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "3",
                              "-StallMinSeconds", "0", "-MemoryStopPercent", "0", extra_env={"STUB_STALL": "1"})
         assert stalled.returncode == 0, (shell, stalled.stdout, stalled.stderr)
-        assert time.monotonic() - started < 90, "the run did not end through the stop file"
         assert "tester_run: STALL STOP at " in stalled.stdout and "frozen:" in stalled.stdout, stalled.stdout
         newest_stall = sorted((tree / "out" / "tester").glob("report_*.zip"), key=os.path.getmtime)[-1]
         with zipfile.ZipFile(newest_stall) as z:
             stall_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             assert "stall_stop.json" in z.namelist(), z.namelist()
+            # Not a wall-clock limit (a loaded VM with a release build running beside took 130 s for the whole test): the stub says
+            # whether the stop file or its own deadline ended its wait.
+            assert z.read("wait_ended.txt").decode("utf-8-sig").strip() == "stop file", "the run did not end through the stop file"
         assert stall_manifest["end_cause"].startswith("watchdog at ") and "frozen:" in stall_manifest["end_cause"], stall_manifest
         assert stall_manifest["stop_reason"].startswith("stall watchdog at ") and "frozen:" in stall_manifest["stop_reason"], stall_manifest
         off = run_script(shell, tree, "-NoBuild", "-Seconds", "200", "-CaptureEvery", "0", "-StallSeconds", "0",
@@ -251,8 +255,9 @@ def check_shell(shell):
         with zipfile.ZipFile(newest_snap) as z:
             snap_manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
         assert snap_manifest["title_input_snapshot"] is False
-        # No -Input given: the default is no automatic presses (an empty script, no labels), so the tester's own clicks are not fought
-        assert snap_manifest["input_script"] in ("", None) and not snap_manifest["input_labels"], snap_manifest["input_script"]
+        # No -Input given: the default is accept, only A (never Start)
+        assert snap_manifest["input_script"].startswith("4@35+0.3,4@45+0.3,4@55+0.3") and set(m.split("@")[0] for m in snap_manifest["input_script"].split(",")) == {"4"}, snap_manifest["input_script"]
+        assert snap_manifest["input_labels"][:2] == ["press A #1 (accept)", "press A #2 (accept)"] and len(snap_manifest["input_labels"]) == len(snap_manifest["input_script"].split(","))
         assert not {"X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT", "X2W_TRANSLATED_INDIRECT_COPY_RANGES"} & set(snap_manifest["env"]), snap_manifest["env"]
         big = run_script(shell, tree, "-NoBuild", "-CaptureEvery", "0", "-MemoryGiB", "33")
         assert big.returncode == 0, (big.stdout, big.stderr)
