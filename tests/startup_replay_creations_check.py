@@ -35,7 +35,7 @@ def creations(text):
     """The stand-in's creation lines, addresses and pointers blanked, in order."""
     lines = []
     for line in text.splitlines():
-        if line.startswith("x2w-d3d12 ") and CREATION.match(line) and ("Create" in line or "Place" in line or "Heap" in line):
+        if line.startswith("x2w-d3d12 ") and CREATION.match(line) and re.search(r"create|place|heap", line, re.I):
             lines.append(HEX.sub("#", line))
     return lines
 
