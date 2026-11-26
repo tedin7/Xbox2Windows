@@ -50,6 +50,7 @@ def record(consumer, directory, backend, name, green, mode, base_env):
     if code == 77:
         return 77, None
     assert code == 0 and "-> drawn;" in text, "%s: recorded run failed (%d)\n%s" % (name, code, text[-2500:])
+    (work / "recorded.txt").write_text(text)
     return recording, shots
 
 
@@ -67,7 +68,8 @@ def main(consumer, player, backend):
                 print("No D3D12 feature-level 12 hardware adapter")
                 return 77
             recorded = pictures(shots)
-            assert sorted(recorded) == ["present_0001.png", "present_0002.png"], (name, sorted(recorded))
+            log = [l for l in (directory / name / "recorded.txt").read_text().splitlines() if "present" in l]
+            assert sorted(recorded) == ["present_0001.png", "present_0002.png"], (name, sorted(recorded), log[:8])
             _score, replayed = replay(player, recording, directory / name / "replayed", backend, base_env, presents=2)
             assert sorted(replayed) == sorted(recorded), (name, sorted(replayed))
             differ = [n for n in recorded if replayed[n] != recorded[n]]
