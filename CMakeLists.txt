@@ -1370,6 +1370,17 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
 
+# Replay (docs/startup-runtime.md#d3d12-replay-record): the player, next to the stand-in it loads, and the scene the
+# replay test records (tests/cmake/startup_replay.cmake).
+add_executable(x2w_replay src/replay/x2w_replay.cpp)
+target_compile_features(x2w_replay PRIVATE cxx_std_17)
+# Delay-loaded: the recording's settings (XENV) are in the environment before the stand-in reads any.
+target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp)
+target_link_options(x2w_replay PRIVATE /DELAYLOAD:d3d12_xs.dll)
+add_executable(startup_replay_quad tests/startup_replay_quad.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_replay_quad PRIVATE cxx_std_17)
+target_link_libraries(startup_replay_quad PRIVATE d3d12_xs_shim d3d12 dxgi)
+
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -5051,6 +5062,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        add_test(NAME startup_present_source_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_present_source_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_present_source_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -5353,6 +5368,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
     add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")
+    # recordings leave the tester's PC through the shared Drive folder (tools/startup/record_transfer.py)
+    add_test(NAME startup_record_transfer COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_record_transfer_check.py")
     # memory.txt of a tester run: the processes holding the most committed memory (tools/startup/memory_top.py).
     add_test(NAME startup_memory_top COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_top_check.py")
