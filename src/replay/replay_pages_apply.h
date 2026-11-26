@@ -53,7 +53,7 @@ inline void merge_spans(std::vector<ReservedSpan>& spans)
 // Reserves and commits MAP and descriptor backing ranges at their recorded addresses.
 inline bool reserve_page_ranges(const Recording& r, std::string& problem)
 {
-    constexpr u64 granule = 0x10000;
+    static constexpr u64 granule = 0x10000;
     const auto aligned = [](u64 address, u64 bytes) -> ReservedSpan {
         return {address & ~(granule - 1), (address + bytes + granule - 1) & ~(granule - 1)};
     };
