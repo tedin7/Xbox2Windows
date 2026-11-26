@@ -5,7 +5,7 @@ tools/startup/gfx2hlsl.py must meet, read back from a real D3D12 draw.
   binary <llvm-mc>                     assemble the fixture sources with LLVM (gfx1013) and compare with the words here
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        draw 16 x 16 pixels with (a) hand-written HLSL that follows the contract, which
-                                       must match the CPU reference, (b) two wrong lowerings, which must not, and (c) the
+                                       must match the CPU reference, (b) wrong lowerings, which must not, and (c) the
                                        translator's own lowering once it produces one; DXC ps_6_0 (quad reads need SM 6.0;
                                        the optional fxc argument is accepted and ignored)
 
@@ -17,16 +17,19 @@ The pixel stage (both fixtures):
   }                                                    s_or_b64 exec, exec, s[4:5]
   exp mrt0 v2, v1, v0, v0
 
-The contract (AMD RDNA 2 ISA, DPP16: FI = 0, the source lane must be enabled, else BOUND_CTRL decides): a lane whose
-quad_perm source lane is disabled by EXEC reads an invalid source. With BOUND_CTRL = 0 (MIN_IN_IF) the instruction
-does not write that lane, so v2 keeps 0x5a5a; with BOUND_CTRL = 1 (MIN_IN_IF_BC) src0 reads 0, so v2 = min(0, v1) = 0.
-A lane disabled by EXEC is not written either way. The bit-7 condition gives 40 partly covered quads, 8 whole ones and
+The contract (AMD RDNA 2 ISA reference, DPP16 instruction fields FI and BOUND_CTRL, decoded from the instruction's own
+bits: FI is bit 18 and BOUND_CTRL bit 19 of the DPP word): per lane src_valid = in range (a quad swap always is) and
+(FI = 1 or the source lane is enabled by EXEC). An invalid source reads 0 with BOUND_CTRL = 1, and with BOUND_CTRL = 0
+the destination lane is not written (v2 keeps 0x5a5a). A lane disabled by EXEC is not written either way. The four
+fixtures cover FI x BOUND_CTRL: MIN_IN_IF (0, 0), MIN_IN_IF_BC (0, 1), MIN_IN_IF_FI (1, 0), MIN_IN_IF_FI_BC (1, 1);
+with FI = 1 the disabled neighbour's v1 is read, so BOUND_CTRL does not matter there. The bit-7 condition gives 40 partly covered quads, 8 whole ones and
 16 empty ones over 16 x 16 pixels, and 160 pixels whose x ^ 1 neighbour is on the other side of the if.
 
 Today the translator refuses both fixtures (the read meets the narrowed EXEC); the controls accept that refusal or a
 translation. Once the lane-exact EXEC model lowers them, the draw checks the translation against the same reference,
-and the model's owner then makes the controls require it (REQUIRE_TRANSLATION). The two wrong lowerings are the ones a
-model can fall into: reading the disabled neighbour as if FI = 1 (min with its v1), and the other BOUND_CTRL rule.
+and the model's owner then makes the controls require it (REQUIRE_TRANSLATION). The wrong lowerings are the ones a
+model can fall into: ignoring FI (each fixture drawn with the opposite FI rule), and, where it matters (FI = 0), the
+other BOUND_CTRL rule.
 """
 import re
 import struct
@@ -63,10 +66,12 @@ s_endpgm
 '''
 PREFIX = '7e0afebeff0002165d9b0000ff02047e5a5a0000ff0206368000000080068a7d6a2484befa02042601b1'
 SUFFIX = 'ff7e04fe880f1800f802010000000081bf'
-# name -> (source, words assembled by llvm-mc 19 for gfx1013, BOUND_CTRL)
+# name -> (source, words assembled by llvm-mc 19 for gfx1013, (FI, BOUND_CTRL)); FI is DPP16 bit 18, BOUND_CTRL bit 19
 FIXTURES = {
-    'MIN_IN_IF': (SOURCE % '', PREFIX + '00' + SUFFIX, 0),
-    'MIN_IN_IF_BC': (SOURCE % ' bound_ctrl:1', PREFIX + '08' + SUFFIX, 1),
+    'MIN_IN_IF': (SOURCE % '', PREFIX + '00' + SUFFIX, (0, 0)),
+    'MIN_IN_IF_BC': (SOURCE % ' bound_ctrl:1', PREFIX + '08' + SUFFIX, (0, 1)),
+    'MIN_IN_IF_FI': (SOURCE % ' fi:1', PREFIX + '04' + SUFFIX, (1, 0)),
+    'MIN_IN_IF_FI_BC': (SOURCE % ' bound_ctrl:1 fi:1', PREFIX + '0c' + SUFFIX, (1, 1)),
 }
 REFUSAL = 'v_min_u32_dpp requires a straight-line pixel shader with entry EXEC: EXEC written at +0x20 by s_and_saveexec_b64'
 
@@ -93,8 +98,11 @@ def active(x, y):
     return bool(word(x, y) & CONDITION_BIT)
 
 
-def image(bound_ctrl, fetch_inactive=False):
-    """Words per pixel: v2, v1, v0, v0. fetch_inactive=True is the wrong FI = 1 reading, for the controls."""
+def image(bits):
+    """Words per pixel: v2, v1, v0, v0, for the instruction's (FI, BOUND_CTRL): per lane src_valid = in range (always,
+    a quad swap) and (FI or the source lane enabled); an invalid source reads 0 with BOUND_CTRL = 1, else the lane is
+    not written. A disabled lane is not written either way."""
+    fetch_inactive, bound_ctrl = bits
     out = []
     for y in range(HEIGHT):
         for x in range(WIDTH):
@@ -108,7 +116,7 @@ def image(bound_ctrl, fetch_inactive=False):
     return out
 
 
-# ---- hand-written lowerings: the contract and two wrong ones ----------------------------------------------------------
+# ---- hand-written lowerings: the contract and the wrong ones ----------------------------------------------------------
 HAND = '''struct PSIn { float4 pos : SV_Position; };
 float4 main(PSIn i) : SV_Target0 {
     uint v0 = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);
@@ -124,24 +132,35 @@ float4 main(PSIn i) : SV_Target0 {
     return float4(asfloat(v2), asfloat(v1), asfloat(v0), asfloat(v0));
 }
 '''
-CONTRACT = {0: 'if (other_lane) v2 = min(other, v1);', 1: 'v2 = other_lane ? min(other, v1) : min(0u, v1);'}
-WRONG = {'reads the disabled neighbour (FI = 1)': 'v2 = min(other, v1);'}
+CONTRACT = {(0, 0): 'if (other_lane) v2 = min(other, v1);', (0, 1): 'v2 = other_lane ? min(other, v1) : min(0u, v1);',
+            (1, 0): 'v2 = min(other, v1);', (1, 1): 'v2 = min(other, v1);'}
+
+
+def wrong_lowerings(bits):
+    """{what it gets wrong: body} for the fixture's bits: ignoring FI (the mutant c13's model must not be), and the
+    other BOUND_CTRL rule where BOUND_CTRL matters (FI = 0)."""
+    fi, bc = bits
+    out = {'ignores FI': CONTRACT[(1 - fi, bc)]}
+    if not fi:
+        out['takes the other BOUND_CTRL rule'] = CONTRACT[(fi, 1 - bc)]
+    return out
 
 
 def controls():
-    for name, (_source, _words, bound_ctrl) in FIXTURES.items():
+    for name, (_source, _words, bits) in FIXTURES.items():
         text, reason = translate(name)
         if REQUIRE_TRANSLATION:
             check('%s translates' % name, text is not None, str(reason))
         else:
             check('%s translates or is refused for its narrowed EXEC' % name,
                   text is not None or (reason is not None and REFUSAL in reason), str(reason))
-    reference, other = image(0), image(1)
+    reference, other = image((0, 0)), image((0, 1))
     pixels = WIDTH * HEIGHT
     split = sum(active(x, y) and not active(x ^ 1, y) for y in range(HEIGHT) for x in range(WIDTH))
     check('the condition leaves %d enabled pixels with a disabled x ^ 1 neighbour' % split, split > pixels // 8)
     check('the two BOUND_CTRL rules give different images', reference[0::4] != other[0::4])
-    check('reading the disabled neighbour gives another image', image(0, True)[0::4] != reference[0::4])
+    check('FI = 1 (read the disabled neighbour) gives another image', image((1, 0))[0::4] != reference[0::4])
+    check('with FI = 1 BOUND_CTRL does not matter', image((1, 0)) == image((1, 1)))
 
 
 # ---- draw -------------------------------------------------------------------------------------------------------------
@@ -173,17 +192,17 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_dxc', 'vs_6_0', directory)
-        for name, (_source, _words, bound_ctrl) in FIXTURES.items():
-            reference = words_file(directory, 'reference_%s' % name, image(bound_ctrl))
-            good = compile_hlsl(dxc, 'dxc', HAND % CONTRACT[bound_ctrl], 'ps_contract_%d' % bound_ctrl, 'ps_6_0', directory)
+        for name, (_source, _words, bits) in FIXTURES.items():
+            tag = '%d%d' % bits
+            reference = words_file(directory, 'reference_%s' % name, image(bits))
+            good = compile_hlsl(dxc, 'dxc', HAND % CONTRACT[bits], 'ps_contract_%s' % tag, 'ps_6_0', directory)
             run = draw(renderer, adapter, vs, good, reference)
             print('  ' + ' '.join(ln for ln in run.stdout.splitlines()
                                   if ln.startswith(('backend=', 'adapter=', 'driver=', 'debug_errors='))))
             check('dxc %s %s: the contract lowering matches all %d pixels' % (adapter, name, WIDTH * HEIGHT),
                   matched(run), run.stdout + run.stderr)
-            wrong = dict(WRONG, **{'takes the other BOUND_CTRL rule': CONTRACT[1 - bound_ctrl]})
-            for how, body in wrong.items():
-                bad = compile_hlsl(dxc, 'dxc', HAND % body, 'ps_wrong_%d_%d' % (bound_ctrl, len(how)), 'ps_6_0', directory)
+            for how, body in wrong_lowerings(bits).items():
+                bad = compile_hlsl(dxc, 'dxc', HAND % body, 'ps_wrong_%s_%d' % (tag, len(how)), 'ps_6_0', directory)
                 run = draw(renderer, adapter, vs, bad, reference)
                 check('dxc %s %s: a lowering that %s fails' % (adapter, name, how), mismatched(run),
                       run.stdout + run.stderr)
@@ -198,7 +217,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
 
 
 def check_binary(llvm_mc):
-    for name, (source, hexwords, _bc) in FIXTURES.items():
+    for name, (source, hexwords, _bits) in FIXTURES.items():
         check('llvm-mc assembles the %s fixture to the same words' % name,
               assemble(llvm_mc, source) == bytes.fromhex(hexwords))
 
