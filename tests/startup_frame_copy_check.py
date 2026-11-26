@@ -50,11 +50,13 @@ def check(directory, consumer, backend):
         ("big-changed, never-refill mutant", {"X2W_TEST_FRAME_COPY_STALE": "1"}, RED * 8 * 4),
         # The shared-lock reuse path must show the same pixels as the default path, changed bytes included.
         ("big-changed with fast reuse", {"X2W_FAST_FRAME_COPY": "1"}, (RED * 4 + BLUE * 4) * 4),
+        ("changed with fast reuse", {"X2W_FAST_FRAME_COPY": "1", "X2W_TEST_FRAME_COPY_MODE": "changed"}, (RED * 4 + BLUE * 4) * 4),
+        ("same with fast reuse", {"X2W_FAST_FRAME_COPY": "1", "X2W_TEST_FRAME_COPY_MODE": "same"}, RED * 8 * 4),
         ("big-same with fast reuse", {"X2W_FAST_FRAME_COPY": "1", "X2W_TEST_FRAME_COPY_LABEL": "same"}, RED * 8 * 4),
     ):
         folder = directory / name.replace(" ", "_").replace(",", "")
         folder.mkdir()
-        pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": "big-same" if extra.get("X2W_TEST_FRAME_COPY_LABEL") else "big-changed", **extra},
+        pixels = draw_texture(folder, consumer, backend, HLSL, {"X2W_TEST_FRAME_COPY": extra.get("X2W_TEST_FRAME_COPY_MODE") or ("big-same" if extra.get("X2W_TEST_FRAME_COPY_LABEL") else "big-changed"), **extra},
                               binding="srv 0 buf table 0 0")
         if pixels is None:
             return 77

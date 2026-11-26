@@ -1540,19 +1540,24 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
         // there), nothing is written: a shared lock finds the chunk and confirms it is the same generation, the common case of
         // many draws of one list; only a first hold takes the exclusive lock.
         if (fast_frame_copy_enabled()) {
-            AcquireSRWLockShared(&allocator_lock);
+            // The chunk list, the recording's hold mask and the answer are all read and written inside the shared section: a
+            // hold is only ever added or dropped under the exclusive lock (a Reset or release of this list, a ring grow), so
+            // while the shared lock is held the chunk named by the answer cannot be recycled or replaced.
             bool held = false;
+            AcquireSRWLockShared(&allocator_lock);
             for (unsigned i = 0; i < upload_chunks.size(); ++i) {
                 const auto& chunk = upload_chunks[i];
                 if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
                     held = (self->own().upload_chunks >> i) & 1;
+                    if (held) {
+                        *offset = slice.offset;
+                        if (resource) *resource = slice.resource;
+                    }
                     break;
                 }
             }
             ReleaseSRWLockShared(&allocator_lock);
             if (held) {
-                *offset = slice.offset;
-                if (resource) *resource = slice.resource;
                 if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_reused);
                 return true;
             }
