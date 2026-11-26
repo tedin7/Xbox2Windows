@@ -176,6 +176,10 @@ void record_memory(ThreadBuffer& b, u64 seq, std::uint32_t arg, u64 address, std
 
 constexpr int call_args = 11;      // argument words after rcx, all recorded (format 3)
 constexpr std::uint32_t rcx_arg = 15;  // ARGM argument index of rcx when it is not an object
+// Argument words followed in full: memory sized by the next word, and the pointers inside it. The words after them are
+// mostly the caller's stack (few slots take more than seven arguments): a short look each, so a stale pointer and size
+// pair there cannot pull megabytes into the file. A late real argument (an output, an interface id) fits in it.
+constexpr std::uint32_t followed_args = 7;
 
 struct Call {
     u64 seq;
@@ -201,8 +205,8 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     // rcx that is not an object: a struct-return buffer passed first (the object is then the next argument). Its
     // memory after the call is the returned value; ARGM argument 15 (rcx_arg).
     if (!as_wrapper(reinterpret_cast<const void*>(object))) record_memory(b, seq, rcx_arg, object, 0, 0);
-    // Words past a slot's own arguments are the caller's stack: recorded and followed like the others (a replay passes
-    // them on, the slot ignores them).
+    // Words past a slot's own arguments are the caller's stack: recorded too (a replay passes them on, the slot ignores
+    // them), the ones after followed_args with a short look only.
     for (std::uint32_t i = 0; i < call_args; ++i) {
         const u64 value = args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
@@ -213,7 +217,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
                 append_chunk(b.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
             }
         }
-        const u64 next = i + 1 < call_args ? args[i + 1] : 0;
+        if (i >= followed_args) {
+            record_memory(b, seq, i, value, 0, 0);
+            continue;
+        }
+        const u64 next = i + 1 < followed_args ? args[i + 1] : 0;
         record_memory(b, seq, i, value, next <= blob_max_bytes ? static_cast<std::size_t>(next) : 0, record_depth);
     }
     InterlockedIncrement64(&calls_written);

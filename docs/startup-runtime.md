@@ -1889,7 +1889,7 @@ the real slot first (nothing else runs before it, so float arguments in xmm regi
 to its thread's own buffer: the call (sequence, thread, kind, slot, object, eleven argument words, return value, time,
 present count), each pointer argument's memory (two levels of pointers followed, so a pipeline stream and its shaders
 are in it; the window is the larger of 256 bytes and the word after the pointer when that word is a plausible size, as a
-shader's is), and the wrapper an argument's memory holds after the call (a creation's
+shader's is; argument words 8 to 11, mostly the caller's stack, get 256 bytes each and are not followed), and the wrapper an argument's memory holds after the call (a creation's
 result, or an input such as a command-list array). Memory contents are stored once per content. Full buffers are
 written under one file lock; the window opens and closes at presents, and the file ends with the totals when the window
 closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits.
@@ -1921,7 +1921,8 @@ itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the 
 recording, 3 a page range could not be reserved at its address, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are
 accepted and ignored in this version.
 
-Per call: recorded wrappers become the replay's (learned from `OUTP`), argument memory is copied into the replayer's
+Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack
+word past the slot's own arguments may point at the same variable), argument memory is copied into the replayer's
 memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a
 heap's recorded CPU/GPU start maps to the replay's over the heap's descriptor count times the increment), and a fence's
 completed value is waited for until it reaches the recorded one (10 s at most). A buffer's mapped address and GPU address
