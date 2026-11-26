@@ -3220,8 +3220,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (indirect) {
             IndirectBufferView view{};
             const bool vertex_stream = srv.source == 1 && indexed;
-            const char* why = vertex_stream ? "an indexed vertex stream has an invalid descriptor"
-                                            : "an input buffer descriptor is missing or unreadable";
+            // why stays null on success: only a refusal reason from the lookup (or a check below) sets it.
+            const char* why = nullptr;
             if (vertex_stream) {
                 const auto& vb = pass.vb[0];
                 if (vb.StrideInBytes && vb.StrideInBytes <= 0x3fff && vb.SizeInBytes % vb.StrideInBytes == 0 &&
@@ -3241,7 +3241,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             else if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
                 why = "an input buffer offset is not 16-byte aligned";
             if (!view.resource || why) {
-                indirect->set_refusal(why ? why : "an input buffer has no GPU backing",
+                indirect->set_refusal(why ? why
+                                          : vertex_stream ? "an indexed vertex stream has an invalid descriptor"
+                                                          : "an input buffer descriptor is missing or unreadable",
                     vertex_stream ? indirect_refusal_code::incomplete_vertex_stream
                                   : indirect_refusal_code::incomplete_table_buffer);
                 draw_lock_release_exclusive();
