@@ -4706,6 +4706,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
     set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
+    # tester_pack.py end-cause names why a run hosted by debug_launch.py ended (one run per way a run can end).
+    add_test(NAME startup_end_cause_debug_launch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_end_cause_debug_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_end_cause_debug_launch PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
