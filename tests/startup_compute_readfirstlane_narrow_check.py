@@ -50,8 +50,8 @@ def translate(rows, group=(4, 1, 1)):
 def controls(llvm_mc=None):
     cases = (
         (program(), None),
-        # Any other EXEC write (here a restore of the saved copy) ends the proof: nothing says the lanes are a subset again.
-        (program(after_cmpx=(waterfall.RESTORE,)), REFUSAL),
+        # Replacing EXEC with a literal can enable lanes outside the known subset.
+        (program(after_cmpx=(('s_mov_b32 exec_lo, 1', '8103febe'),)), REFUSAL),
         # An address that differs between lanes is not one value for the first active lane.
         (program(address=VARYING_ADDRESS), REFUSAL),
     )

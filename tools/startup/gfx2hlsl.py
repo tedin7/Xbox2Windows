@@ -24,6 +24,9 @@ import lane_exec as LE  # noqa: E402
 from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
+READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
+
+
 class Unsupported(Exception):
     pass
 
@@ -3112,6 +3115,7 @@ class Stage:
                 if value != live_in[i]:
                     live_in[i], changed = value, True
         self.waterfall_reads = {}
+        self.waterfall_scalar_loads = {}
         for close, target in jumps:
             head = index.get(target)
             if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
@@ -3293,6 +3297,7 @@ class Stage:
         body_writes = {key, 'scc'}  # WREXEC supplies SCC for the next iteration.
         numeric_writes = {key}
         descriptor_inputs, buffer_descriptors = set(), set()
+        scalar_loads = set()
         reads_before_write = set()
         defined = {key}
         keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
@@ -3300,28 +3305,32 @@ class Stage:
             base, ops, mods = parse(ins[j][3])
             base = re.sub(r'_e(32|64)$', '', base)
             if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
-                            'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32', 's_load_dwordx4', 'buffer_load_dword'):
+                            's_bfe_u32', 's_max_u32', 's_mul_i32', 'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32',
+                            's_load_dwordx4', 's_load_dwordx8', 's_buffer_load_dwordx2', 'buffer_load_dword'):
                 return 'body instruction %s is not proven lane-local' % base
             if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
                 return 'body instruction %s has unproved modifiers' % base
             reads, writes, may_write = effects[j]
             if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
                 return 'body reads or changes a lane mask or special register'
-            if base == 's_load_dwordx4':
+            if base in ('s_load_dwordx8', 's_buffer_load_dwordx2'):
+                scalar_loads.add(ins[j][0])
+            if base in ('s_load_dwordx4', 's_load_dwordx8'):
                 dst = reg_range(ops[0]) if len(ops) == 3 else None
                 if not dst or dst[0] != 's' or dst[2] > 105:
                     return 'descriptor load overlaps a special register'
                 descriptor_inputs.update(reads)
             else:
                 numeric_writes.update(may_write)
-            if base == 'buffer_load_dword':
-                if len(ops) < 3:
+            if base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
+                descriptor_index = 1 if base.startswith('s_buffer') else 2
+                if len(ops) <= descriptor_index:
                     return 'buffer load has no descriptor'
-                buffer_descriptors.update(scalar_tokens(ops[2]))
+                buffer_descriptors.update(scalar_tokens(ops[descriptor_index]))
             reads_before_write.update(reads - defined)
             defined.update(writes)
             body_writes.update(may_write)
-            if (reads & keyed) or base == 'buffer_load_dword':
+            if (reads & keyed) or base in ('buffer_load_dword', 's_buffer_load_dwordx2'):
                 keyed.update(may_write)
             else:
                 keyed -= writes
@@ -3340,6 +3349,7 @@ class Stage:
             return 'body scalar is live at the loop exit'
         if any(name.startswith('s_movrel') for _, _, name, _ in ins):
             return 'relative scalar indexing can observe a loop register'
+        self.waterfall_scalar_loads[ins[head][0]] = scalar_loads
         return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
@@ -3650,6 +3660,71 @@ class Stage:
                 out.add(reg)
         return out
 
+    def entry_exec_sites(self, cfg):
+        """Prove entry EXEC and its saved copies on every incoming CFG edge."""
+        bounds, _, succ, _ = cfg
+        if not bounds or any(name.startswith(('s_wqm', 's_swappc', 's_call', 's_rfe'))
+                             for _, _, name, _ in self.ins):
+            return set()
+        wave = self.pipe.wave_size
+        wave32 = wave == 32 or wave is None and wave32_exec_proof(self.ins)
+        width = 1 if wave32 else 2
+        mask = ('exec_lo', 'exec') if wave32 else ('exec',)
+        copy_op = 's_mov_b32' if wave32 else 's_mov_b64'
+
+        operations = []
+        for _, _, name, asm in self.ins:
+            _, ops, mods = parse(asm)
+            _, _, writes = scalar_effects(name, asm)
+            if 'any' in scalar_destinations(name, asm):
+                writes |= {'s%d' % i for i in range(106)}
+            move = None
+            if name == copy_op and len(ops) == 2 and not mods:
+                dst, src = ops
+                reg = reg_range(src if dst in mask else dst)
+                if reg and reg[0] == 's' and reg[2] <= 105 and reg[2] - reg[1] + 1 == width:
+                    words = ('s%d' % reg[1],) if wave32 else ('s%d' % reg[1], 's%d' % reg[2])
+                    if src in mask:
+                        move = ('save', words)
+                    elif dst in mask:
+                        move = ('restore', words)
+            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move))
+
+        # Missing blocks are unreachable so far. At a join or back edge keep only facts common to all paths.
+        before = {0: {()}}  # () is current EXEC; other facts name the SGPRs of an entry mask copy.
+        pending = {0}
+        known = set()
+        while pending:
+            b = pending.pop()
+            facts = before[b].copy()
+            lo, hi = bounds[b]
+            for i in range(lo, hi):
+                off = self.ins[i][0]
+                if () in facts:
+                    known.add(off)
+                else:
+                    known.discard(off)
+                exec_write, writes, move = operations[i]
+                entry = () in facts
+                restore = move is not None and move[0] == 'restore' and move[1] in facts
+                facts = {copy for copy in facts if writes.isdisjoint(copy)}
+                if exec_write:
+                    facts.discard(())
+                if restore:
+                    facts.add(())
+                if entry and move is not None and move[0] == 'save':
+                    facts.add(move[1])
+            for target in succ[b]:
+                merged = before.get(target, facts) & facts
+                if before.get(target) != merged:
+                    before[target] = merged
+                    pending.add(target)
+        return known
+
+    def uniform_entry_exec(self):
+        sites = getattr(self, 'entry_exec_proof', None)
+        return self.exec_known if sites is None else self.pc in sites
+
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
@@ -3733,6 +3808,8 @@ class Stage:
                         lo, hi = bounds[block]
                         reached.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
                         pending.extend(succ[block])
+        self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
+                                 if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
@@ -3775,6 +3852,7 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
             self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
+            self.active_waterfall_loads = set()
             self.wave_unsound = None
             self.wave_voted_branches = set()  # EXEC / VCC branches decided by a vote over the host wave (wave_exec)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
@@ -3792,6 +3870,7 @@ class Stage:
             self.uses_pos = False
             self.fetched = False
             self.uniform_v = set()
+            self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
             self.varying_s = set()
             self.align4_v = set()
             self.align4_s = set()
@@ -3920,6 +3999,7 @@ class Stage:
                     }
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
+                    self.entry_written_v.clear()
                     self.since_join, self.scc_uniform = kept_u, False
                     self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
@@ -4505,7 +4585,7 @@ class Stage:
         # proof no longer needs a known exec (see op_v_readfirstlane_b32).
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
                 (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
-                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)) and
+                 not getattr(self, 'past_entry', True) and self.uniform_entry_exec()) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -4522,7 +4602,7 @@ class Stage:
                      all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
                      not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
                      (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
-        loaded = load_form and not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)
+        loaded = load_form and not getattr(self, 'past_entry', True) and self.uniform_entry_exec()
         # With empty EXEC, READFIRSTLANE uses the old VGPR in lane zero. An unguarded reload
         # cannot reproduce it. Require the entry mask until the path proves a nonempty wave.
         vaddr = reg_range(ops[1]) if load_form and ops[1] != 'off' else None
@@ -4530,7 +4610,8 @@ class Stage:
         # A uniform address gives every active lane the same words, so the first active lane's value is the recomputed
         # temporary whatever lanes a v_cmpx removed (an empty wave observes nothing); any other EXEC write ends the proof.
         recomputed = (load_form and getattr(self, 'past_entry', False) and exprs is not None
-                      and (getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
+                      and (getattr(self, 'entry_exec_proof', None) is not None and self.uniform_entry_exec()
+                           or getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
                            or getattr(self, 'exec_narrow_only', False) and self.pc not in self.loads_after_wide_exec_write))
         loaded_regs = ()
         if loaded or recomputed:
@@ -4573,6 +4654,13 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if getattr(self, 'entry_exec_proof', None) is not None:
+            for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
+                reg = reg_range(token)
+                if reg and reg[0] == 'v':
+                    self.entry_written_v.difference_update(range(reg[1], reg[2] + 1))
+            if dst is not None and self.uniform_entry_exec() and (base in UNIFORM_VALU or base in UNIFORM_LOADS):
+                self.entry_written_v.update(loaded_regs or (dst,))
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
             self.since_join -= (wrote_s - uniform_written)
@@ -4754,6 +4842,8 @@ class Stage:
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
         if writes_exec(name, ops):
             self.uniform_expr.clear()
+            if getattr(self, 'entry_exec_proof', None) is not None:
+                self.uniform_v.clear()
         regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
         for tok in destinations(name, ops):
             r = reg_range(tok)
@@ -6374,6 +6464,9 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
+        waterfall = count == 8 and getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
+        if waterfall and p[1][0] != 'table':
+            raise Unsupported('compute readfirstlane waterfall: s_load_dwordx8 requires a fixed descriptor table')
         if len(p) > 2 and not isinstance(p[2], int):
             # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
             raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
@@ -6417,6 +6510,8 @@ class Stage:
                 load = (-1 - hi[1],)
             else:
                 load = (self.pc,)
+            if waterfall and (base_off | off) & 3:
+                raise Unsupported('compute readfirstlane waterfall: descriptor table address requires dword alignment')
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
             if into_vcc:
@@ -6683,8 +6778,12 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
-        buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
+        key = self.descriptor(ops[1])
         token = smem_offset(ops[2])
+        waterfall = getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
+        if waterfall and key in self.pipe.rw_keys:
+            raise Unsupported('compute readfirstlane waterfall: scalar buffer load requires a read-only descriptor')
+        buf = self.pipe.resource(key, 'buf')
         is_lit = bool(re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token))
         if is_lit:
             val = int(token, 0)
@@ -6714,6 +6813,11 @@ class Stage:
                     and first[0] == 'desc' and key[0][0] == 'table' and key not in getattr(self.pipe, 'modified', ())  # probes build a bare pipe
                     and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
                 where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
+        # RDNA 2 scalar buffer addressing clears the low two bits of the final address.
+        # The raw view starts at the aligned descriptor base. Align once before loading either word.
+        if waterfall and (extra % 4 or not self.operand_align4(token)):
+            self.emit('a = (%s + %du) & ~3u;' % (offset, extra))
+            offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
@@ -8804,22 +8908,26 @@ class Stage:
         # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
         if getattr(self, 'past_entry', True):
             return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
-        return getattr(self, 'exec_known', False)
+        return self.uniform_entry_exec()
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
         waterfalls = getattr(self, 'waterfall_reads', {})
-        if getattr(self, 'pc', None) in waterfalls and not (src and self.proven_uniform_v(src[1])):
+        # A value defined with entry EXEC is still in the VGPR if no path since then could overwrite it.
+        direct = src and src[1] in getattr(self, 'entry_written_v', ()) and self.uniform_entry_exec()
+        uniform = src and (direct or self.proven_uniform_v(src[1]))
+        if getattr(self, 'pc', None) in waterfalls and not uniform:
             reason = waterfalls[self.pc]
             if reason:
                 raise Unsupported('compute readfirstlane waterfall: ' + reason)
+            self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
-            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
-        if past_entry:
+                not src or src[0] != 'v' or src[1] != src[2] or not uniform):
+            raise Unsupported(READFIRSTLANE_UNIFORM)
+        if past_entry and not direct:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
             # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
             # so the read recomputes the definition from the scalars instead of reading this lane's copy.
@@ -11732,18 +11840,31 @@ class ComputePipeline(Pipeline):
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
+        self.retry_entry_exec = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
 
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
-        part-way: translate again with that descriptor as one RW view, once per such descriptor."""
+        part-way: translate again with that descriptor as one RW view, once per such descriptor.
+        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
         while True:
             try:
-                return self._reset_stage()
+                self._reset_stage()
+                refusals = self._stage_args[1]
+                if (not self.retry_entry_exec and refusals is not None
+                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
+                    self.retry_entry_exec = True
+                    continue
+                return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
+            except Unsupported as reason:
+                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                    raise
+                # Keep the original lowering for every shader that already translates.
+                self.retry_entry_exec = True
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
