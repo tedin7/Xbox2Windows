@@ -3860,6 +3860,10 @@ class Stage:
         if (getattr(self, 'kind', None) == 'ps' and not self.fetched and
                 any(name == 'v_add_f32_dpp' for _, _, name, _ in self.ins)):
             self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
+        self.entry_wqm_sites = (self.entry_wqm_exec_sites()
+                                if branches and getattr(self, 'kind', None) == 'ps' and
+                                any(name == 'v_subrev_f32_dpp' for _, _, name, _ in self.ins)
+                                else set())
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
@@ -4804,6 +4808,56 @@ class Stage:
         if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
             self.quad_flow_reads.append((self.pc, base))
 
+    def entry_wqm_exec_sites(self):
+        """Track the entry WQM mask through reachable blocks, intersecting facts at joins and back edges."""
+        bounds, _, succ, _ = self.spill_cfg
+        if not bounds:
+            return set()
+        # Only the entry block can establish WQM. Later s_wqm instructions cannot
+        # recover an EXEC write that this translator does not model on helper lanes.
+        entry_end = bounds[0][1]
+        entry_wqm = None
+        clobbers = set()
+        wave32 = wave32_exec_proof(self.ins)
+        for i, (_off, _n, name, asm) in enumerate(self.ins):
+            _, ops, _ = parse(asm)
+            full_wqm = (name == 's_wqm_b64' and ops == ['exec', 'exec'] or
+                        wave32 and name == 's_wqm_b32' and ops in (['exec', 'exec'], ['exec_lo', 'exec_lo']))
+            if full_wqm:
+                if i < entry_end and entry_wqm is None and not clobbers:
+                    entry_wqm = i
+            elif writes_exec(name, ops) or name == 'exp' or name.startswith(('s_swappc', 's_call')):
+                clobbers.add(i)
+        if entry_wqm is None or any(0 in targets for targets in succ):
+            return set()
+
+        incoming, pending, sites = {0: False}, {0}, set()
+        while pending:
+            block = pending.pop()
+            whole = incoming[block]
+            lo, hi = bounds[block]
+            for i in range(lo, hi):
+                off = self.ins[i][0]
+                if whole:
+                    sites.add(off)
+                else:
+                    sites.discard(off)
+                if i == entry_wqm:
+                    whole = True
+                elif i in clobbers:
+                    whole = False
+            for target in succ[block]:
+                merged = incoming.get(target, True) and whole
+                if incoming.get(target) != merged:
+                    incoming[target] = merged
+                    pending.add(target)
+        return sites
+
+    def quad_subrev_block_proof(self, base):
+        return (base == 'v_subrev_f32' and self.quad_flow_allowed()
+                and not getattr(self, 'fetched', False)
+                and self.pc in getattr(self, 'entry_wqm_sites', ()))
+
     def quad_flow_refusals(self, branches, targets):
         """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
 
@@ -4892,8 +4946,9 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
-        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
-                not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
+        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or getattr(self, 'fetched', False) or
+                (not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
+                 and not self.quad_subrev_block_proof(base))):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
         if len(ops) < 2:
@@ -5383,7 +5438,7 @@ class Stage:
         if not getattr(self, 'exec_known', False):
             if self.narrowing_proof():
                 narrowed = True
-            else:
+            elif not self.quad_subrev_block_proof(base):
                 raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask%s'
                                   % (base, self.quad_exec_cause()))
         elif not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))):
@@ -5391,7 +5446,7 @@ class Stage:
                               % (base, self.quad_exec_cause()))
         if not narrowed and fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        if not getattr(self, 'wqm_exec', False):
+        if not getattr(self, 'wqm_exec', False) and not self.quad_subrev_block_proof(base):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
             raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
@@ -5547,10 +5602,12 @@ class Stage:
         if compute:
             self.compute_quad_gate(base, row_ror8)
         else:
+            block_proof = self.quad_subrev_block_proof(base)
             if not after_exec_write:
-                if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
+                if (getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed())
+                        or not (getattr(self, 'exec_known', False) or block_proof)):
                     raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC%s' % (base, self.quad_exec_cause()))
-                if not getattr(self, 'wqm_exec', False):
+                if not (getattr(self, 'wqm_exec', False) or block_proof):
                     raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                                       'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
             else:
