@@ -1572,21 +1572,37 @@ bool bigbind_once_enabled()
     return on;
 }
 
+bool bigbind_pool_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_BIGBIND_POOL");
+    return on;
+}
+
 struct BigBinding {
     std::size_t bytes = 0;
     bool readable = false;
     UploadReservation slice;
 };
 
-// Protected by draw_lock. Each chunk has a separate frame hold in addition to the holds
-// taken by command lists, so the ring cannot recycle a cached slice before Present.
+// Protected by draw_lock. Frame holds keep cached slices alive until Present
+// even when every recording that references them has already been discarded.
 std::map<std::pair<u64, std::size_t>, BigBinding> big_bindings;
-UploadChunkMask big_binding_chunks;
+UploadChunkMask big_binding_chunks, big_binding_buffers;
 struct BigBindingCounts {
-    unsigned trims = 0, copies = 0, hits = 0;
-    std::size_t copied_bytes = 0;
+    unsigned long long trims = 0, copies = 0, hits = 0, copied_bytes = 0, failed_reservations = 0;
 };
-BigBindingCounts big_binding_counts;
+BigBindingCounts big_binding_counts, big_binding_totals;
+
+bool bigbind_drop_failed_mutant()
+{
+    static const bool on = [] {
+        char mode[16]{};
+        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+        return std::strcmp(mode, "once-ring-full") == 0 &&
+               x2w_local::env_on("X2W_TEST_BIGBIND_DROP_FAILED");
+    }();
+    return on;
+}
 
 // X2W_TEST_BIGBIND_NO_RESET=1 (fixtures only): the cache is not dropped at Present, so a later frame reads the first frame's
 // bytes. The control of startup_frame_copy_once: the second frame must then show the old colour.
@@ -1610,31 +1626,45 @@ std::pair<u64, std::size_t> bigbind_key(u64 address, std::size_t full_bytes)
 
 void finish_bigbind_frame(LONG frame)
 {
-    if (!bigbind_no_reset_mutant()) big_bindings.clear();
-    if (big_binding_chunks && !bigbind_no_reset_mutant()) {
-        AcquireSRWLockExclusive(&allocator_lock);
-        discard_upload_chunks(big_binding_chunks, upload_chunks.data());
-        big_binding_chunks = 0;
-        ReleaseSRWLockExclusive(&allocator_lock);
+    if (!bigbind_no_reset_mutant()) {
+        big_bindings.clear();
+        if (big_binding_chunks || big_binding_buffers) {
+            AcquireSRWLockExclusive(&allocator_lock);
+            discard_upload_chunks(big_binding_chunks, upload_chunks.data());
+            discard_upload_chunks(big_binding_buffers, large_upload_buffers.data());
+            ReleaseSRWLockExclusive(&allocator_lock);
+        }
     }
     static const bool report = [] {
         char mode[16]{};
         GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
         return std::strncmp(mode, "once", 4) == 0;
     }();
-    if (report && big_binding_counts.trims)
-        log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
-            big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    const auto& counts = big_binding_counts;
+    if (report && counts.trims)
+        log("x2w-draw large bindings frame %ld: %llu trims, %llu copies, %llu hits, %llu bytes, %llu failed reservations",
+            frame, counts.trims, counts.copies, counts.hits, counts.copied_bytes, counts.failed_reservations);
+    auto& totals = big_binding_totals;
+    totals.trims += counts.trims;
+    totals.copies += counts.copies;
+    totals.hits += counts.hits;
+    totals.copied_bytes += counts.copied_bytes;
+    totals.failed_reservations += counts.failed_reservations;
+    if (render_mode() && frame % 300 == 0)
+        log("x2w-draw large bindings totals (frame %ld): %llu trims, %llu copies, %llu hits, %llu bytes, %llu failed reservations",
+            frame, totals.trims, totals.copies, totals.hits, totals.copied_bytes, totals.failed_reservations);
     big_binding_counts = {};
 }
 
 bool bind_upload_slice(Wrapper* self, const UploadReservation& slice)
 {
     AcquireSRWLockExclusive(&allocator_lock);
-    for (unsigned i = 0; i < upload_chunks.size(); ++i) {
-        auto& chunk = upload_chunks[i];
+    auto& buffers = slice.dedicated ? large_upload_buffers : upload_chunks;
+    auto& recording = slice.dedicated ? self->own().large_upload_buffers : self->own().upload_chunks;
+    for (unsigned i = 0; i < buffers.size(); ++i) {
+        auto& chunk = buffers[i];
         if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
-            chunk.hold(self->own().upload_chunks, i);
+            chunk.hold(recording, i);
             ReleaseSRWLockExclusive(&allocator_lock);
             return true;
         }
@@ -3406,7 +3436,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 have = bind_upload_slice(self, slice);
                 if (have) InterlockedIncrement64(&big_copies_reused);
             } else {
-                slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
+                if (bigbind_pool_enabled()) slice = reserve_large_upload(self, bytes, big_binding_buffers);
+                if (!slice.mapped) slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
                 if (slice.mapped) {
                     std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
                     ++big_binding_counts.copies;
@@ -3419,8 +3450,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 offset = slice.offset;
                 chunk = slice.resource;
             } else {
-                // A retry needs a fresh readability check before it can read title memory.
-                big_bindings.erase(bigbind_key(address, full_bytes));
+                ++big_binding_counts.failed_reservations;
+                if (bigbind_drop_failed_mutant()) big_bindings.erase(bigbind_key(address, full_bytes));
             }
         } else if (readable_range) {
             have = frame_copy(self, address, bytes, &offset, &chunk);

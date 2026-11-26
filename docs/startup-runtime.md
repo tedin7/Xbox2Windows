@@ -517,6 +517,27 @@ one address between two draws of a frame, such as a dynamic constant buffer, gav
 data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
 `startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
 
+With `X2W_BIGBIND_ONCE=1`, translated large raw descriptor bindings keep their
+validated length and readable verdict until Present, including when an upload
+reservation fails. The next draw retries the reservation. The memory range must
+remain valid through the frame. The first successful copy supplies the snapshot
+for later draws in that frame.
+
+`X2W_BIGBIND_POOL=1` enables dedicated upload buffers for those snapshots.
+Each new buffer is sized to the trimmed length rounded up to 1 MiB. The pool
+holds up to 32 buffers and defaults to a 512 MiB cap, set by
+`X2W_BIGBIND_POOL_MIB`. A buffer can be reused after Present, after every
+referencing command-list recording is discarded, and after the last-use fence
+on every submitting queue completes. If the pool cannot supply a buffer, the
+draw tries the upload ring. The render totals at every 300th Present include
+cumulative trims, copies, hits, copied bytes, and failed reservations for this
+cache.
+
+`startup_frame_copy_once_{warp,hardware}` exercises the pool with four draws
+per frame and a rewritten range in the second frame. Its readback checks the
+pool, ring fallback, saturation, and pool-off paths. A fixture-only mutant drops
+the failed cache entry and must report four trims per frame instead of one.
+
 ## Root signature changes and dropped root constants
 
 Command-list slot 34 (`SetGraphicsRootSignature`) clears the translated draw's cached descriptor tables, root

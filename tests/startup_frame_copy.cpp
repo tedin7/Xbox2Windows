@@ -26,6 +26,7 @@ static void* create_present_queue(void* guest)
 //   big-changed / big-same  as above with a 64 KiB buffer (a "large" copy, kept across frames), and a present between the draws, so
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
+//   once-ring-full  four draws per frame from a binding with a zero tail, using a restricted upload ring
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
 //            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
@@ -36,7 +37,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
-    const bool once = keys || !std::strcmp(mode, "once");
+    const bool ring_full = !std::strcmp(mode, "once-ring-full");
+    const bool once = keys || ring_full || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
     if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
@@ -62,11 +64,18 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     constexpr UINT large_bytes = 16u << 20;
     float* large = nullptr;
     constexpr UINT large_words = large_bytes / sizeof(float);
+    constexpr UINT head_word = 9;
+    constexpr UINT tail_word = (large_bytes - 4352) / sizeof(float) - 1;
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;
-        if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
-        std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
+        if (ring_full) {
+            large[head_word] = 0.0f;
+            large[tail_word] = 1.0f;
+        } else {
+            if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
+            std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
+        }
     }
     const auto* memory = once ? large : constants;
     const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(memory),
@@ -111,9 +120,18 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
             }
             invoke(queue, 32, 0, 0, 0);
             if (frame == 0) {
-                large[0] = large[large_words - 4] = 0.0f;
-                large[2] = large[large_words - 2] = 1.0f;
+                if (ring_full) {
+                    large[head_word] = 1.0f;
+                    large[tail_word] = -1.0f;
+                } else {
+                    large[0] = large[large_words - 4] = 0.0f;
+                    large[2] = large[large_words - 2] = 1.0f;
+                }
             }
+        }
+        if (ring_full) {
+            // Advance to the normal render totals report with empty frames.
+            for (UINT frame = 2; frame < 300; ++frame) invoke(queue, 32, 0, 0, 0);
         }
         VirtualFree(large, 0, MEM_RELEASE);
         return 0;
