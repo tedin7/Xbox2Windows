@@ -3,10 +3,12 @@
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
-// by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
+// by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers.
+// `smprecord` resolves a sampler from the same view heap at Dispatch. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
-// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
+// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). `desc_word` and `desc_null` read
+// metadata independently of the bound SRV/UAV slots. Any other manifest line makes the translation
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
@@ -16,7 +18,7 @@ struct ComputeTranslation {
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
     // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
-    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records, descriptor_word, descriptor_null };
     struct Slot {
         int a, b;
         bool texture, heap;
@@ -26,12 +28,14 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        unsigned heap_offset = 0;
+        unsigned descriptor_index = 0;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
-    std::vector<Slot> uds, srvs, uavs;
+    std::vector<Slot> uds, srvs, uavs, record_samplers;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -150,6 +154,63 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
+        ComputeTranslation::Slot binding{};
+        unsigned descriptor_index = 0;
+        const auto location = [&](const char* where, bool metadata = false) {
+            int end = 0;
+            if (std::sscanf(where, "table %d %d%n", &binding.a, &binding.b, &end) != 2 || !end) {
+                end = 0;
+                if (std::sscanf(where, "heap record %d %d %d %d %u %u %u%n", &binding.a, &binding.b,
+                                &binding.word_param, &binding.word_byte, &binding.at, &binding.times,
+                                &binding.heap_offset, &end) != 7 || !end)
+                    return false;
+                binding.heap = true;
+                if (binding.heap_offset > 60 || binding.heap_offset % 4 ||
+                    (binding.word_param >= 0 ? binding.word_byte < 0 : binding.a < 0))
+                    return false;
+            } else if (binding.a < 0) {
+                return false;
+            }
+            if (binding.b < 0) return false;
+            if (!metadata) return !where[end];
+            int tail = 0;
+            return where[end] == ' ' && std::sscanf(where + end, " %u%n", &descriptor_index, &tail) == 1 &&
+                tail && !where[end + tail];
+        };
+        char kind[16] = "";
+        if (std::sscanf(line.c_str(), "udsrc %u %15s %n", &i, kind, &used) == 2 && used &&
+            i == tr.uds.size() && (!std::strcmp(kind, "desc_word") || !std::strcmp(kind, "desc_null")) &&
+            location(line.c_str() + used, true)) {
+            binding.source = !std::strcmp(kind, "desc_word") ? ComputeTranslation::descriptor_word : ComputeTranslation::descriptor_null;
+            if (binding.source == ComputeTranslation::descriptor_word && (descriptor_index < 2 || descriptor_index > 5))
+                return "an entry value names an invalid descriptor word";
+            if (binding.source == ComputeTranslation::descriptor_null && descriptor_index)
+                return "an entry value names an invalid descriptor null test";
+            binding.descriptor_index = descriptor_index;
+            tr.uds.push_back(binding);
+            continue;
+        }
+        binding = {};
+        used = 0;
+        if (std::sscanf(line.c_str(), "srv %u %15s %n", &i, kind, &used) == 2 && used &&
+            i == tr.srvs.size() && !std::strncmp(line.c_str() + used, "heap record ", 12) &&
+            location(line.c_str() + used)) {
+            binding.texture = !std::strcmp(kind, "tex2d") || !std::strcmp(kind, "texcube");
+            binding.cube = !std::strcmp(kind, "texcube");
+            if (!binding.texture && std::strcmp(kind, "buf")) return "an unsupported heap resource kind";
+            tr.srvs.push_back(binding);
+            continue;
+        }
+        used = 0;
+        binding = {};
+        if (std::sscanf(line.c_str(), "smprecord %u %n", &i, &used) == 1 && used &&
+            i == tr.record_samplers.size() && i < x2w_startup::translated_sampler_count &&
+            location(line.c_str() + used) && binding.heap) {
+            tr.record_samplers.push_back(binding);
+            tr.samplers.heap = true;
+            continue;
+        }
+        used = 0;
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
@@ -216,6 +277,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     for (const ComputeTranslation::Slot& ud : tr.uds) {
+        if (ud.source >= ComputeTranslation::descriptor_word) continue;
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
@@ -225,7 +287,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()),
+            static_cast<UINT>(tr.record_samplers.size()))))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -311,10 +374,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    std::uint32_t values[32] = {};
+    std::vector<D3D12_SAMPLER_DESC> sampler_views;
     phases.to(1);
-    for (std::size_t i = 0; i < count && !reason; ++i) {
-        const bool output = i >= inputs;
-        const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
+    for (std::size_t i = 0; i < count + tr->uds.size() + tr->record_samplers.size() && !reason; ++i) {
+        const bool sampler = i >= count + tr->uds.size();
+        const bool metadata = i >= count && !sampler;
+        const bool output = i >= inputs && i < count;
+        const ComputeTranslation::Slot slot = sampler ? tr->record_samplers[i - count - tr->uds.size()]
+            : metadata ? tr->uds[i - count] : output ? tr->uavs[i - inputs] : tr->srvs[i];
+        if (metadata && slot.source < ComputeTranslation::descriptor_word) continue;
+        if (slot.heap && slot.a >= 0 && (metadata || sampler || slot.heap_offset || slot.texture) &&
+            !pass.compute_constants.is_bound(slot.a, slot.b, 1)) {
+            reason = "a descriptor heap index was not set since the compute root";
+            break;
+        }
         if (dispatch.signature && (slot.heap || slot.texture)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
@@ -351,14 +425,92 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
-            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
-        const std::size_t entry_bytes = slot.texture ? 32 : 16;
+        const std::size_t entry_bytes = metadata ? (slot.descriptor_index >= 4 ? 32 : 16) : slot.texture ? 32 : 16;
+        const u64 heap_offset = u64{std::uint32_t{index << 5}} + slot.heap_offset;
+        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(heap_offset, entry_bytes) : 0)
+            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), entry_bytes);
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
             break;
         }
         std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
+        if (sampler) {
+            D3D12_SAMPLER_DESC desc{};
+            if (!resolve_draw_sampler({words[0], words[1], words[2], words[3]}, desc)) {
+                reason = "a sampler record cannot be represented as a desktop sampler";
+                break;
+            }
+            sampler_views.push_back(desc);
+            continue;
+        }
+        if (metadata) {
+            std::uint32_t& value = values[i - count];
+            if (words[0] != view_token_magic) {
+                if (slot.descriptor_index >= 4 && (words[3] >> 28) < 8) {
+                    reason = "a descriptor entry word is outside the bound buffer descriptor";
+                    break;
+                }
+                // The guest compares the two encoded words with zero. DW1 can also carry descriptor flags.
+                value = slot.source == ComputeTranslation::descriptor_null
+                    ? (words[0] == 0 && words[1] == 0) : words[slot.descriptor_index];
+                continue;
+            }
+            ViewRecord record{};
+            note_lock_acquire(false);
+            const bool known = words[1] < view_records().size();
+            if (known) record = view_records()[words[1]];
+            ReleaseSRWLockShared(&note_lock);
+            if (!known) {
+                reason = "a descriptor entry value names an unknown view token";
+            } else if (record.slot == 17 && record.desc_bytes >= 12) {
+                if (slot.source == ComputeTranslation::descriptor_null) {
+                    u64 address = 0;
+                    std::memcpy(&address, record.desc, sizeof(address));
+                    value = address == 0;
+                } else if (slot.descriptor_index == 2) {
+                    std::memcpy(&value, record.desc + 8, sizeof(value));
+                } else {
+                    reason = "descriptor word has no defined encoding for this desktop view";
+                }
+            } else if (slot.source == ComputeTranslation::descriptor_null && (record.slot == 18 || record.slot == 19)) {
+                value = !record.resource;
+            } else if (slot.descriptor_index == 2 && record.slot == 18 &&
+                       record.desc_bytes >= sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                std::memcpy(&desc, record.desc, sizeof(desc));
+                if (desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+                    const Wrapper* const owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+                    auto* const resource = owner && owner->own().kind == resource_kind
+                        ? static_cast<ID3D12Resource*>(owner->own().real) : nullptr;
+                    const auto shape = resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+                    if (shape.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        !shape.Width || shape.Width > 16384 || !shape.Height || shape.Height > 16384) {
+                        reason = "a descriptor word needs a desktop texture with representable dimensions";
+                    } else {
+                        // RDNA 2 image resource DW2: WIDTH[15:2], HEIGHT[15:0], reserved zero and RESOURCE_LEVEL.
+                        value = 0x80000000u | ((shape.Height - 1) << 14) | (static_cast<UINT>(shape.Width - 1) >> 2);
+                    }
+                } else if (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && desc.Buffer.StructureByteStride) {
+                    value = desc.Buffer.NumElements;
+                } else if (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && desc.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW &&
+                           desc.Buffer.NumElements <= UINT32_MAX / 4) {
+                    value = desc.Buffer.NumElements * 4;
+                } else {
+                    reason = "descriptor word has no defined encoding for this desktop view";
+                }
+            } else if (slot.descriptor_index == 2 && record.slot == 19 &&
+                       record.desc_bytes >= sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC)) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+                std::memcpy(&desc, record.desc, sizeof(desc));
+                if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER && desc.Buffer.StructureByteStride)
+                    value = desc.Buffer.NumElements;
+                else if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER && desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW &&
+                         desc.Buffer.NumElements <= UINT32_MAX / 4)
+                    value = desc.Buffer.NumElements * 4;
+                else reason = "descriptor word has no defined encoding for this desktop view";
+            } else reason = "descriptor word has no defined encoding for this desktop view";
+            continue;
+        }
         if (slot.texture) {
             // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
             // a null view would read zeros or drop the program's stores without a trace.
@@ -507,9 +659,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
     phases.to(2);
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
-    std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
         const ComputeTranslation::Slot& ud = tr->uds[i];
+        if (ud.source >= ComputeTranslation::descriptor_word) continue;
         const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
         std::uint32_t format = 0, word[4];
         switch (ud.source) {
@@ -526,6 +678,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
         case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
         case ComputeTranslation::output_records: values[i] = view.words[2]; break;
+        case ComputeTranslation::descriptor_word:
+        case ComputeTranslation::descriptor_null: break;
         }
     }
     phases.to(3);
@@ -536,6 +690,23 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    DrawSamplerHeap sampler_heap;
+    if (!reason && !sampler_views.empty()) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, static_cast<UINT>(sampler_views.size()),
+                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        auto* const device = device_of(the_device);
+        if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(sampler_heap.GetAddressOf())))) {
+            reason = "a descriptor record sampler heap could not be allocated";
+        } else {
+            auto dest = sampler_heap->GetCPUDescriptorHandleForHeapStart();
+            const UINT stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+            for (const auto& sampler : sampler_views) {
+                device->CreateSampler(&sampler, dest);
+                dest.ptr += stride;
+            }
+            recorded_draw_sampler_heaps[list].push_back(sampler_heap);
+        }
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -590,15 +761,17 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (!pass.heap_set) {
-        x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
+    if (!pass.heap_set || (sampler_heap && pass.bound_sampler_heap != sampler_heap.Get())) {
+        x2w_startup::bind_translated_heaps(list, draw_heap, sampler_heap.Get());
         pass.heap_set = true;
-        pass.bound_sampler_heap = nullptr;
+        pass.bound_sampler_heap = sampler_heap.Get();
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (sampler_heap)
+        list->SetComputeRootDescriptorTable(x2w_startup::sampler_root_parameter(n), sampler_heap->GetGPUDescriptorHandleForHeapStart());
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);

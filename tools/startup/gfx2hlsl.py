@@ -2592,11 +2592,56 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'desc' and getattr(self.pipe, 'raw_descriptor_values', False):
+                return self.descriptor_value(s)
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
+
+    def descriptor_value(self, sym, null_test=False):
+        source, offset, word = sym[1:4]
+        if sym[4:] not in ((), (-1,)) or source[0] not in ('table', 'resheap', 'resheap_span') or offset is None:
+            raise Unsupported('numeric use of an unproved descriptor word')
+        # A use as a texture identifies an eight-word resource when the second half is inspected.
+        # Without a resource use, do not reinterpret an ambiguous half of a wide SMEM load.
+        key = desc_key(sym)
+        previous = (source, key[1] - 16)
+        current = self.pipe.resources.get(key) or self.pipe.uavs.get(key)
+        prior = self.pipe.resources.get(previous) or self.pipe.uavs.get(previous)
+        half = word % 8 >= 4
+        word %= 4
+        if half and not current and prior and prior['kind'].startswith('tex'):
+            word += 4
+            key = previous
+        elif half and not current and not prior:
+            raise Unsupported('numeric use of an unproved descriptor word')
+        if null_test and word != 0:
+            raise Unsupported('scalar 64-bit compare outside a descriptor address null test')
+        if not null_test and (word < 2 or word >= 6):
+            raise Unsupported('numeric use of a descriptor address word')
+        return 'ud%d' % self.pipe.ud(('desc_null' if null_test else 'desc_word', key, word))
+
+    def descriptor_null_compare(self, ops, mods, equal):
+        if not getattr(self.pipe, 'raw_descriptor_values', False) or mods or len(ops) != 2:
+            raise Unsupported('scalar 64-bit compare')
+        for pair, zero in (ops, ops[::-1]):
+            r = reg_range(pair)
+            if self.const_u32(zero) != 0 or not r or r[0] != 's' or r[2] != r[1] + 1:
+                continue
+            lo, hi = (self.sym.get(i) for i in r[1:3])
+            if lo and lo[0] == 'desc' and lo[3] % 4 == 0 and hi == desc_word(lo, lo[3] + 1):
+                value = self.descriptor_value(lo, null_test=True)
+                self.set_scc('%s %s 0u' % (value, '!=' if equal else '=='))
+                return
+        raise Unsupported('scalar 64-bit compare outside a descriptor address null test')
+
+    def op_s_cmp_eq_u64(self, ops, mods):
+        self.descriptor_null_compare(ops, mods, True)
+
+    def op_s_cmp_lg_u64(self, ops, mods):
+        self.descriptor_null_compare(ops, mods, False)
 
     def note_whole_read(self, reg):
         if reg in self.low16_only_v:
@@ -2628,6 +2673,9 @@ class Stage:
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'operand read'))
             return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
+            numeric_vcc = getattr(self, 'numeric_vcc', None)
+            if numeric_vcc and tok == 'vcc_lo':
+                return numeric_vcc
             self.read_vcc()
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
@@ -2657,6 +2705,8 @@ class Stage:
 
     def is_lane_mask(self, tok):
         reg = reg_range(tok)
+        if tok == 'vcc_lo' and getattr(self, 'numeric_vcc', None):
+            return False
         return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
                 or bool(reg and reg[0] == 's' and reg[1] in getattr(self, 'masks', ())))
 
@@ -2793,12 +2843,15 @@ class Stage:
         return False
 
     def read_vcc(self):
+        if getattr(self, 'numeric_vcc', None):
+            raise Unsupported('lane-mask operation on a uniform descriptor word in vcc_lo')
         if getattr(self, 'has_branches', False):
             self.vcc_events.setdefault(self.pc, []).append(('read_vcc', None))
         elif getattr(self, 'vcc_lost', False):
             raise Unsupported('vcc read after a descriptor load into s106/s107')
 
     def mark_vcc_descriptor(self):
+        self.numeric_vcc = None
         self.vcc_lost = True
         self.vcc_descriptor_overwritten = False
         if getattr(self, 'has_branches', False):
@@ -2812,6 +2865,7 @@ class Stage:
             if re.search(r'\bvcc\b', rhs):
                 self.read_vcc()
             if assignment:
+                self.numeric_vcc = None
                 if getattr(self, 'has_branches', False):
                     self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
                 if getattr(self, 'vcc_lost', False):
@@ -3029,6 +3083,9 @@ class Stage:
                 any(self.sym.get(104 + i) != desc_word(s, s[3] + i) for i in range(1, 4))):
             raise Unsupported('descriptor operand %s needs four consecutive words of the same descriptor' % tok)
         if s and s[0] == 'desc':
+            if s[1][0] == 'resheap_span' and (s[3] % 4 or any(
+                    self.sym.get(i) != desc_word(s, s[3] + i - r[1]) for i in range(r[1] + 1, r[2] + 1))):
+                raise Unsupported('resource heap descriptor needs consecutive dwords from one load')
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
@@ -3044,6 +3101,8 @@ class Stage:
         if not r or r[2] - r[1] != 3:
             return None
         first = self.sym.get(r[1])
+        if first and first[0] == 'desc' and first[1][0] == 'resheap_span' and self.kind == 'cs':
+            return self.pipe.record_sampler(self.descriptor(tok))
         if not first or first[0] != 'smpheap':
             return None
         if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
@@ -4968,6 +5027,9 @@ class Stage:
             skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
             high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
             masks = [high] if high else []
+        if (getattr(self, 'numeric_vcc', None) and 'vcc_lo' in ops[1:] and base != 'v_cndmask_b32'
+                and (base in MASK_AWARE_VALU or MASK_AWARE_VALU_RE.search(base))):
+            raise Unsupported('lane-mask operation on a uniform descriptor word in vcc_lo')
         tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
         for tok in destinations(base, ops):   # an overwritten register no longer holds a mask's high word
@@ -5908,7 +5970,19 @@ class Stage:
                     self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
-        if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+        raw_values = getattr(self.pipe, 'raw_descriptor_values', False)
+        raw_words = any(s and s[0] == 'desc' for s in syms) and all(
+            not s or s[0] not in ('descnum', 'ptr', 'ptrhi') for s in syms)
+        if raw_values and raw_words and base == 's_mov_b32' and dname == 'vcc_lo' and len(syms) == 1 and not mods:
+            value = self.descriptor_value(syms[0])
+            x, y, z = self.pipe.group
+            if x * y * z > 32 or getattr(self, 'has_branches', False):
+                raise Unsupported('descriptor word into vcc_lo requires a straight-line group of at most 32 threads')
+            self.emit('vcc = 0u;')
+            self.numeric_vcc = value
+            return
+        numeric_alu = raw_values and raw_words and not pair and not mask_dest and dname != 'm0' and base != 's_mov_b32'
+        if not numeric_alu and any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
             if scc or base in SCC_UNMODELLED:
@@ -6564,13 +6638,15 @@ class Stage:
                               'offset' % what)
         if not index or index[0] not in ('rootconst', 'buffer'):
             raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
-        if count != 4:
+        if count % 4:
             raise Unsupported('%s of %d dwords' % (what, count))
         if imm is not None:
             raise Unsupported('%s with offset:%#x' % (what, imm))
         if self.sym.get(base[2]) != ('const', 0):
             raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
         source = ('resheap',) + index[1:] if index[0] == 'rootconst' else ('resheap', 'word') + index[1:]
+        if count > 4:
+            source = ('resheap_span',) + source[1:]
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', source, 0, i)
 
@@ -9333,7 +9409,21 @@ class Stage:
             raise Unsupported('v_cndmask_b32 with %d operands, expected 3 or 4' % len(ops))
         for source in ops[1:3]:
             self.reject_lane_mask_data('v_cndmask_b32', source)
-        mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
+        token = ops[3] if len(ops) > 3 else 'vcc_lo'
+        numeric = getattr(self, 'numeric_vcc', None) if token in ('vcc', 'vcc_lo') else None
+        if getattr(self.pipe, 'raw_descriptor_values', False) and not numeric:
+            reg = reg_range(token)
+            sym = self.sym.get(reg[1]) if reg and reg[0] == 's' else None
+            if sym and sym[0] == 'desc':
+                numeric = self.descriptor_value(sym)
+        if numeric:
+            x, y, z = self.pipe.group
+            if x * y * z > 32:
+                raise Unsupported('a descriptor word as a lane mask requires a group of at most 32 threads')
+            lane = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+            mask = '(%s >> %s)' % (numeric, lane)
+        else:
+            mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
         align4 = self.operand_align4(ops[1]) and self.operand_align4(ops[2])
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])), align4=align4)
@@ -11843,6 +11933,7 @@ class ComputePipeline(Pipeline):
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.rw_keys = set()
         self.retry_entry_exec = False
+        self.raw_descriptor_values = False
         self._stage_args = (cs_code, refusals, decoded)
         self._refusals_before = len(refusals) if refusals is not None else 0
         self._build_stage()
@@ -11850,23 +11941,33 @@ class ComputePipeline(Pipeline):
     def _build_stage(self):
         """Translates the program (the Stage does it on construction). A buffer both loaded and stored is found
         part-way: translate again with that descriptor as one RW view, once per such descriptor.
-        A uniform-source refusal can also retry with the CFG proof, leaving successful legacy HLSL intact."""
+        A refusal can also retry with a stronger entry proof or raw descriptor reads. The first successful
+        lowering is retained unchanged."""
         while True:
             try:
                 self._reset_stage()
                 refusals = self._stage_args[1]
-                if (not self.retry_entry_exec and refusals is not None
-                        and (READFIRSTLANE_UNIFORM, 'cs') in refusals[self._refusals_before:]):
-                    self.retry_entry_exec = True
+                if refusals is not None and any(
+                        self.retry_reason(reason) for reason, _ in refusals[self._refusals_before:]):
                     continue
                 return
             except ReadWriteBuffer as conflict:
                 self._lower_read_write(conflict)
             except Unsupported as reason:
-                if self.retry_entry_exec or str(reason) != READFIRSTLANE_UNIFORM:
+                if not self.retry_reason(str(reason)):
                     raise
-                # Keep the original lowering for every shader that already translates.
-                self.retry_entry_exec = True
+
+    def retry_reason(self, reason):
+        if not self.retry_entry_exec and reason == READFIRSTLANE_UNIFORM:
+            self.retry_entry_exec = True
+            return True
+        if not self.raw_descriptor_values and (
+                re.fullmatch(r'numeric use of s\d+ holding (desc|descnum)', reason)
+                or reason in ('mask from descriptor data', 'scalar 64-bit compare')
+                or reason.startswith('src_scc with unverified SCC') and 'descriptor' in reason):
+            self.raw_descriptor_values = True
+            return True
+        return False
 
     def _lower_read_write(self, conflict):
         if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
@@ -11877,6 +11978,7 @@ class ComputePipeline(Pipeline):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
         cs_code, refusals, decoded = self._stage_args
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
+        self.record_samplers = {}
         self.plain_stored = set()  # raw buffer descriptors a plain buffer store went through
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
@@ -11903,8 +12005,13 @@ class ComputePipeline(Pipeline):
     def stored_images(self):
         return {key: r for key, r in self.uavs.items() if r['kind'] != 'raw'}
 
+    def record_sampler(self, key):
+        return 'qr[%d]' % self.record_samplers.setdefault(key, len(self.record_samplers))
+
     def common(self):
         out = [line for line in super().common() if self.uds or not line.startswith('cbuffer entry')]
+        if self.record_samplers:
+            out.append('SamplerState qr[%d] : register(s0, space%d);' % (len(self.record_samplers), SAMPLER_HEAP_SPACE))
         for r in self.uavs.values():
             if r['kind'] == 'raw':
                 out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
@@ -11934,15 +12041,35 @@ class ComputePipeline(Pipeline):
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
+    @staticmethod
+    def descriptor_location(source, offset):
+        if source[0] == 'table':
+            return 'table %d %d' % (source[1], offset)
+        if len(source) == 3:
+            param, word = source[1:]
+            table, byte, at, scale = -1, 0, 0, 0
+        else:
+            table, byte, param, word, scale, at = source[2:]
+        return 'heap record %d %d %d %d %d %d %d' % (
+            -1 if param is None else param, 0 if word is None else word,
+            table, byte, at, scale, offset)
+
     def manifest(self):
         # Version 2: `stage cs`, `group` and `uav` lines, which a graphics-only reader must not take for a draw.
         lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
-        lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
+        for i, source in enumerate(self.uds):
+            if source[0] in ('desc_word', 'desc_null'):
+                kind, (binding, offset), word = source
+                lines.append('udsrc %d %s %s %d' % (i, kind, self.descriptor_location(binding, offset), word))
+            else:
+                lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             if source[0] == 'table':
                 where = 'table %d %d' % (source[1], off or 0)
             elif source[0] == 'root':
                 where = 'root %d' % source[1]
+            elif source[0] == 'resheap_span':
+                where = self.descriptor_location(source, off)
             elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
                 where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
             elif source[0] == 'resheap' and source[1] == 'word' and r['kind'] == 'buf':
@@ -11962,6 +12089,10 @@ class ComputePipeline(Pipeline):
             else:
                 lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
         lines += self.sampler_lines()
+        if self.record_samplers and self.uses_sampler_heap:
+            raise Unsupported('samplers from both the resource heap and the sampler heap')
+        for (binding, offset), index in self.record_samplers.items():
+            lines.append('smprecord %d %s' % (index, self.descriptor_location(binding, offset)))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         return '\n'.join(lines) + '\n'

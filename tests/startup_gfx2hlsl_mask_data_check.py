@@ -24,7 +24,27 @@ def stage():
     return s
 
 
+MASK_WORDS = bytes.fromhex(
+    '800387be '  # s_mov_b32 s7, 0
+    '030308f4000000fa '  # s_load_dwordx4 s[12:15], s[6:7], 0
+    '030608f4100000fa '  # s_load_dwordx4 s[24:27], s[6:7], 16
+    '7fc08cbf '  # s_waitcnt lgkmcnt(0)
+    '0e03eabe '  # s_mov_b32 vcc_lo, s14
+    '9702147e '  # v_mov_b32 v10, 23
+    '91141202 '  # v_cndmask_b32_e32 v9, 17, v10, vcc_lo
+    '82000c34 '  # v_lshlrev_b32 v6, 2, v0
+    '001070e006090680 '  # buffer_store_dword v9, v6, s[24:27], 0 offen
+    '000081bf '  # s_endpgm
+)
+
+
 def main():
+    from startup_gfx2hlsl_compute_check import root_blob
+
+    pipe = G.ComputePipeline(MASK_WORDS, root_blob(), 7 << 1, (8, 1, 1))
+    assert 'udsrc 2 desc_word table 1 0 2' in pipe.manifest()
+    assert 'ud2 >> (tid.x' in pipe.hlsl_cs()
+
     refused = (
         ('v_cndmask_b32_e64 v1, 0, s30, s[30:31]', 's30'),
         ('v_cndmask_b32_e64 v1, -s30, v0, s[30:31]', '-s30'),

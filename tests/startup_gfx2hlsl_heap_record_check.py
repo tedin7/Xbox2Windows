@@ -13,7 +13,7 @@ after s9 is set to zero. gfx2hlsl.py names that input `srv 0 buf heap rootconst 
 dispatch reads the 32-byte heap record that root constant word 2 indexes. The HLSL and the manifest are
 compared whole. Every other form keeps a refusal: another shift, another index, an index register written
 again, a branch target between the shift and the load, a high word that is not a constant zero, an offset
-modifier, eight dwords, an index read from a buffer at an offset that differs between groups (named as such;
+modifier, two dwords, an index read from a buffer at an offset that differs between groups (named as such;
 startup_gfx2hlsl_heap_word_check.py covers the buffer forms that are accepted), a formatted load or a store through
 the record, and the graphics stages. --llvm-mc reassembles every instruction used here and compares the words.
 """
@@ -50,7 +50,7 @@ ENCODED = {
     's_lshl_b32 s6, s6, 4': '0684068f', 's_lshl_b32 s6, s6, 6': '0686068f', 's_lshl_b32 s6, s6, s5': '0605068f',
     's_lshl_b32 s6, s14, 5': '0e85068f', 's_mov_b32 s9, 1': '810389be', 's_mov_b32 s9, s5': '050389be',
     's_load_dwordx4 s[16:19], s[8:9], s6 offset:0x20': '040408f42000000c',
-    's_load_dwordx8 s[16:23], s[8:9], s6': '04040cf40000000c', 's_load_dwordx4 s[16:19], s[8:9], s5': '040408f40000000a',
+    's_load_dwordx2 s[16:17], s[8:9], s6': '040404f40000000c', 's_load_dwordx4 s[16:19], s[8:9], s5': '040408f40000000a',
     's_load_dwordx4 s[16:19], s[8:9], m0': '040408f4000000f8', 's_add_u32 s6, s6, 0': '06800680',
     's_load_dwordx4 s[28:31], s[12:13], 0x20': '060708f4200000fa',
     's_buffer_load_dword s6, s[28:31], 0x0': '8e0120f4000000fa', 's_buffer_load_dword s6, s[28:31], s14': '8e0120f40000001c',
@@ -178,7 +178,7 @@ def check_refusals():
         ('high word a root constant', {CLEAR: ('s_mov_b32 s9, s5',)}, high),
         ('high word left as the group ID', {CLEAR: ()}, high),
         ('offset modifier', {LOAD: ('s_load_dwordx4 s[16:19], s[8:9], s6 offset:0x20',)}, 'with offset:0x20'),
-        ('eight dwords', {LOAD: ('s_load_dwordx8 s[16:23], s[8:9], s6',)}, 's_load of a resource heap record of 8 dwords'),
+        ('two dwords', {LOAD: ('s_load_dwordx2 s[16:17], s[8:9], s6',)}, 's_load of a resource heap record of 2 dwords'),
         ('formatted load', {READ: ('buffer_load_format_xyzw v[5:8], v4, s[16:19], 0 offen',)},
          'formatted buffer load requires a hardware table descriptor'),
         ('store through the record', {WRITE: ('buffer_store_dword v5, v4, s[16:19], 0 offen',)}, "('resheap', 0, 2)"),

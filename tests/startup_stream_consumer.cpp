@@ -234,6 +234,9 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool descriptor_pair = mode == "dispatch-descriptor-pair";
+    const bool descriptor_mixed = mode == "dispatch-descriptor-mixed";
+    const bool descriptor_probe = mode.rfind("dispatch-descriptor-", 0) == 0;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -280,7 +283,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (mode == "dispatch-input-empty") {
         const UINT view[4] = {0x32c, 0, 0, 0};
         std::memcpy(descriptors[0], view, sizeof(view));
-    } else if (mode == "dispatch-input-null") {
+    } else if (mode == "dispatch-input-null" || mode == "dispatch-descriptor-null") {
         std::memset(descriptors[0], 0, sizeof(descriptors[0]));  // an unbound buffer: all four words zero
     } else if (mode == "dispatch-input-past") {
         descriptors[0][2] = words + 4;
@@ -327,8 +330,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     Slot67Indirect record;
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
-    if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
-        const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
+    const auto sampled_texture = [&](UINT offset, UINT width, unsigned char red) {
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
         const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
@@ -338,8 +340,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&texel)))) || !texel) return 80;
         // The program reads red: 1.0f. The 2x1 texture's left texel has red 0, so only a linear filter that wraps
         // reads 0.5 at the left edge (point or clamp read 0).
-        unsigned char rgba[8] = {255, 64, 128, 32, 255, 64, 128, 32};
+        unsigned char rgba[8] = {red, 64, 128, 32, 255, 64, 128, 32};
         if (width == 2) rgba[0] = 0;
+        std::memset(texel, 0, 256);
         std::memcpy(texel, rgba, sizeof(rgba));
         invoke(upload, 9, 0, 0);
         D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -348,7 +351,29 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         view.Texture2D.MipLevels = 1;
-        if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
+        if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + offset);
+        return 0;
+    };
+    if (descriptor_pair) {
+        if (const int result = sampled_texture(64, 1, 255)) return result;
+        if (const int result = sampled_texture(96, 1, 0)) return result;
+    } else if (descriptor_mixed) {
+        if (const int result = sampled_texture(64, 1, 255)) return result;
+        const UINT samplers[2][4] = {{6, 0, 0, 0}, {0, 0, 0, 0}};
+        std::memcpy(reinterpret_cast<void*>(cpu + 96), samplers, sizeof(samplers));
+    } else if (mode == "dispatch-descriptor-texture-token") {
+        if (const int result = sampled_texture(0, 6, 255)) return result;
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
+    } else if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
+        if (const int result = sampled_texture(mode == "dispatch-input-token" ? 0 : 64,
+                                               mode == "dispatch-sampled-2x1" ? 2 : 1, 255)) return result;
+    }
+    if (mode == "dispatch-descriptor-buffer-token") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_UNKNOWN, D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        view.Buffer = {0, fields[0][1], sizeof(UINT), D3D12_BUFFER_SRV_FLAG_NONE};
+        invoke(device, 18, word(placed[0]), word(&view), cpu);
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
     }
     if (mode == "dispatch-input-null-token") {
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
@@ -385,7 +410,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind(list);
     }
-    if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (heap_record || descriptor_pair || descriptor_mixed) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     if (mode == "dispatch-heap-word-null")
         std::memset(reinterpret_cast<void*>(cpu + 96), 0, 16);  // the index buffer's descriptor stays null: the word reads as 0
     else if (heap_word) {
@@ -507,7 +532,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(lists[t], 9);
             invoke(queue, 10, 1, word(&lists[t]));
         }
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (descriptor_probe) invoke(list, 14, 1, 1, 1);
+    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));

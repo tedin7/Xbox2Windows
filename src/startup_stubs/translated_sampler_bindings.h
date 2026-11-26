@@ -115,7 +115,8 @@ inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 
 // Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
-                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
+                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0,
+                                      UINT dynamic_samplers = translated_sampler_count)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -127,7 +128,7 @@ inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT
     // A range of no descriptors does not serialize: a program without resources starts the table at its outputs.
     parameters[1].DescriptorTable = {(srvs ? 1u : 0u) + (uavs ? 1u : 0u), srvs ? view_ranges : view_ranges + 1};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
-        D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
+        D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, dynamic_samplers, 0, translated_sampler_space, 0};
     UINT count = sampler_root_parameter(srvs + uavs);
     if (samplers.heap) {
         parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
