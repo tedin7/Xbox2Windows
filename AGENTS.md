@@ -203,6 +203,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_waitcnt_depctr_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_skeleton_check.py
+./out/pe-env/bin/python -B tests/startup_mesh57_buffer_read_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_depth_only_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_loop_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_loop_check.py
