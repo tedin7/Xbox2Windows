@@ -1605,8 +1605,12 @@ def mesh_run(ins, at, what, patterns, env):
         text = ins[at + k][3] if at + k < len(ins) else ''
         m = re.fullmatch(re.sub(r'\{(\w+)\}', lambda ref: re.escape(env[ref[1]]), pattern), text)
         if not m:
-            raise Unsupported('slot 57 mesh %s: instruction %d of the accepted shape (%s) is absent'
-                              % (what, k + 1, pattern.split()[0]))
+            want = pattern.split()[0]
+            seen = ins[at + k][2] if at + k < len(ins) else None
+            # Three causes, three texts: the program ended, another opcode stands there, or the operands differ.
+            how = ('is absent: the program ends first' if seen is None else
+                   'is replaced by %s' % seen if seen != want else 'has other operands')
+            raise Unsupported('slot 57 mesh %s: instruction %d of the accepted shape (%s) %s' % (what, k + 1, want, how))
         env.update(m.groupdict())
     return at + len(patterns)
 
