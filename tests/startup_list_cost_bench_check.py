@@ -33,6 +33,8 @@ def main(consumer, dxc, adapter):
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
         assert f'{key:016x}: ok' in out, out
         env['X2W_TEST_BENCH_THREADS'] = os.environ.get('X2W_TEST_BENCH_THREADS', '2')
+        if os.environ.get('X2W_LOCK_SPLIT'):
+            env['X2W_LOCK_SPLIT'] = os.environ['X2W_LOCK_SPLIT']
         got, result = dispatch(directory, consumer, env, 'dispatch-bench')
         expected = C.expected('A')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
@@ -51,6 +53,10 @@ def main(consumer, dxc, adapter):
         assert len(census) == 1, census
         translated = int(census[0].split(' dispatches, ')[1].split(' translated')[0])
         assert translated >= rounds, f'only {translated} Dispatches were translated, one list alone does {rounds}\n' + census[0]
+        if env.get('X2W_LOCK_SPLIT') == '1':
+            # A list that races the first manifest read waits for it: nothing is refused, every Dispatch of every list is translated.
+            assert translated == threads * rounds and not refused, (
+                f'X2W_LOCK_SPLIT=1: {translated} of {threads * rounds} Dispatches translated, {len(refused)} refusals\n' + census[0])
         refused = lines(result, 'refused')
         assert len(refused) <= threads - 1, refused
         print(bench[0])

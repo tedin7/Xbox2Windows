@@ -1522,6 +1522,16 @@ LONG frame_copies_frame = -1;
 
 LONG64 big_copies_reused, big_copies_made;
 
+// X2W_LOCK_SPLIT=1 turns on the draw_lock split pieces (default off): so far a list that races the first manifest read of a compute key waits
+// for it instead of being refused.
+bool lock_split_enabled()
+{
+    static const bool on = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("X2W_LOCK_SPLIT", value, sizeof(value)) && value[0] == '1';
+    }();
+    return on;
+}
 // X2W_BIG_COPY_REUSE=0 turns the cross-frame reuse of large copies off (every copy ends with its frame, as before).
 bool big_copy_reuse_enabled()
 {

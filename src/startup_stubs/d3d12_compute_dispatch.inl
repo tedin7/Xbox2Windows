@@ -31,6 +31,7 @@ struct ComputeTranslation {
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
+    volatile LONG loading = 0;        // the first read of the manifest is in flight (draw_lock is down around it); X2W_LOCK_SPLIT lists wait for it
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
@@ -75,13 +76,50 @@ x2w_local::RefusalCache& compute_refusals() { static x2w_local::RefusalCache cac
 constexpr int refusal_untranslated = 1, refusal_unmodelled = 2;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
+// A list that finds the first manifest read of its key in flight sleeps here instead of being refused (X2W_LOCK_SPLIT=1). The waker
+// clears `loading` and wakes under compute_load_lock, the sleeper checks it under the same lock, so a wake is never lost. compute_load_lock
+// is taken only with draw_lock released (waiter) or briefly inside it (waker, never waiting for anything), so the orders cannot invert.
+SRWLOCK compute_load_lock = SRWLOCK_INIT;
+CONDITION_VARIABLE compute_load_cv = CONDITION_VARIABLE_INIT;
+LONG compute_load_waits, compute_load_wait_timeouts;
+void compute_load_finished(ComputeTranslation& tr)
+{
+    AcquireSRWLockExclusive(&compute_load_lock);
+    InterlockedExchange(&tr.loading, 0);
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    WakeAllConditionVariable(&compute_load_cv);
+}
+// draw_lock held on entry and on return; down while asleep. At most `max_ms` in total.
+void compute_wait_for_load(ComputeTranslation& tr, ULONGLONG max_ms)
+{
+    draw_lock_release_exclusive();
+    AcquireSRWLockExclusive(&compute_load_lock);
+    const ULONGLONG until = GetTickCount64() + max_ms;
+    bool timed_out = false;
+    while (tr.loading) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= until) {
+            timed_out = true;
+            break;
+        }
+        SleepConditionVariableSRW(&compute_load_cv, &compute_load_lock, static_cast<DWORD>(until - now), 0);
+    }
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    InterlockedIncrement(&compute_load_waits);
+    if (timed_out) InterlockedIncrement(&compute_load_wait_timeouts);
+    draw_lock_acquire_exclusive();
+}
+
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
 const char* load_compute_translation(ComputeTranslation& tr)
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
     std::string manifest;
-    if (!cache_path(path, L"", tr.key, L".txt") || !lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true)) {
+    InterlockedExchange(&tr.loading, 1);
+    const bool manifest_found = cache_path(path, L"", tr.key, L".txt") && lookup_manifest(tr.key, tr.retry_manifest_at != 0, manifest, true);
+    compute_load_finished(tr);
+    if (!manifest_found) {
         tr.retry_manifest_at = GetTickCount64() + manifest_retry_ms;
         return nullptr;
     }
@@ -252,6 +290,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     tr->key = key;
     ++tr->dispatches;
     tr->use.note(process_ms());
+    if (tr->loading && lock_split_enabled()) compute_wait_for_load(*tr, 200);
     std::uint32_t words[8] = {};
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
     else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)

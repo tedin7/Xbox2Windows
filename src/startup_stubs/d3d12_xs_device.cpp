@@ -7802,6 +7802,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log("x2w-render compute refusals answered from the cache without draw_lock: %ld", compute_refusals_cached);
+        log("x2w-render compute first-read waits (X2W_LOCK_SPLIT): %ld lists waited, %ld gave up after 200 ms", compute_load_waits, compute_load_wait_timeouts);
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
