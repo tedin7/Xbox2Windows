@@ -6411,7 +6411,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.srv_index(key)))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
@@ -6420,7 +6420,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = self.pipe.ud(('stride', self.pipe.srv_index(key)))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
@@ -6824,10 +6824,17 @@ class Stage:
                 continue
             key = (('vbtab',), 16 * e['slot'])
             buf = self.pipe.resource(key, 'buf')
-            stride = self.pipe.ud(('stride', self.pipe.srv_index(key)))
+            stride = self.pipe.ud(('stride', self.srv_index(key)))
             self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
+
+    def srv_index(self, key):
+        """The read-only slot of a buffer descriptor, for the stride and word 3 the runtime supplies with it. A compute
+        descriptor the program also stores through has none (it is one RW view)."""
+        if key in getattr(self.pipe, 'rw_keys', ()):
+            raise Unsupported('indexed or formatted load through a read-write descriptor %s' % (key,))
+        return self.pipe.resources[key]['index']
 
     @staticmethod
     def descriptor_scalar_writes(name, ops):
@@ -6990,7 +6997,7 @@ class Stage:
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
         if self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.srv_index(self.descriptor(ops[2]))))
+        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
@@ -10164,13 +10171,6 @@ class Pipeline:
             self.uds.append(source)
         return self.uds.index(source)
 
-    rw_keys = frozenset()  # compute: buffer descriptors the program both loads and stores through (one RW view)
-
-    def srv_index(self, key):
-        """The read-only slot of a buffer descriptor, for the stride and word 3 the runtime supplies with it."""
-        if key in self.rw_keys:
-            raise Unsupported('indexed or formatted load through a read-write descriptor %s' % (key,))
-        return self.resources[key]['index']
 
     def resource(self, key, kind):
         if key in self.stored_images():
