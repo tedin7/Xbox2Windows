@@ -686,7 +686,43 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                 stale ? stale.Get() : current.Get());
 }
 
-void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference)
+// The root signature of the gather draws that bind a translated static sampler: the parameter layout of
+// tests/pixel_aot_vs.hlsl (table t0 at 0, b0..b2 at 1..3) with the translated sampler at s0 in place of its point
+// sampler. The caller owns the result for the length of the draw.
+ComPtr<ID3D12RootSignature> translated_sampler_root(ID3D12Device* device, const x2w_startup::TranslatedSamplers& samplers,
+                                                    const char* what)
+{
+    const auto statics = x2w_startup::decode_statics(samplers);
+    D3D12_DESCRIPTOR_RANGE srv{};
+    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable = {1, &srv};
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    for (UINT i = 1; i < 4; ++i) {
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        parameters[i].Descriptor.ShaderRegister = i - 1;
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 4;
+    signature.pParameters = parameters;
+    signature.NumStaticSamplers = 1;
+    signature.pStaticSamplers = statics.data();
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+          (std::string("Serialize ") + what + " root").c_str());
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          (std::string(what) + " root").c_str());
+    return root;
+}
+
+// sampler_line (an smp manifest line) and vsPath (a vertex shader without an embedded root signature) together bind
+// the translated static sampler instead of the fixed clamp one, so a gather of the guest's own address modes can be drawn.
+void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference, const char* sampler_line,
+                        const char* vsPath)
 {
     constexpr UINT side = 8;
     std::ifstream file(reference, std::ios::binary);
@@ -708,7 +744,16 @@ void check_pixel_gather(ID3D12Device* device, const char* shader, const char* re
     file.read(reinterpret_cast<char*>(expected.data()), side * side * sizeof(Color));
     if (!file || file.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("Invalid pixel gather case data");
-    draw_verified(device, shader, levels, first, 0, nullptr);
+    if (!sampler_line) {
+        draw_verified(device, shader, levels, first, 0, nullptr);
+        return;
+    }
+    x2w_startup::TranslatedSamplers samplers;
+    if (!vsPath || !samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1 ||
+        samplers.comparison[0] || samplers.lod_limits[0])
+        throw std::runtime_error("Expected exactly one smp line and a vertex shader for the gather");
+    const auto root = translated_sampler_root(device, samplers, "Gather");
+    draw_verified(device, shader, levels, first, 0, nullptr, nullptr, nullptr, root.Get(), vsPath);
 }
 
 // Comparison gathers bind a SamplerComparisonState built from the translated smpc line and a
@@ -742,33 +787,7 @@ void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const 
     if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1 ||
         samplers.comparison.size() != 1 || !samplers.comparison[0])
         throw std::runtime_error("Expected exactly one smpc line for the comparison gather");
-    const auto statics = x2w_startup::decode_statics(samplers);
-
-    // Same parameter layout as tests/pixel_aot_vs.hlsl, with the comparison sampler in place of its
-    // ordinary point sampler: table t0 at 0, b0..b2 at 1..3, one static sampler at s0.
-    D3D12_DESCRIPTOR_RANGE srv{};
-    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv.NumDescriptors = 2;
-    D3D12_ROOT_PARAMETER parameters[4]{};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[0].DescriptorTable = {1, &srv};
-    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    for (UINT i = 1; i < 4; ++i) {
-        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        parameters[i].Descriptor.ShaderRegister = i - 1;
-        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    D3D12_ROOT_SIGNATURE_DESC signature{};
-    signature.NumParameters = 4;
-    signature.pParameters = parameters;
-    signature.NumStaticSamplers = 1;
-    signature.pStaticSamplers = statics.data();
-    ComPtr<ID3DBlob> blob;
-    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
-          "Serialize comparison gather root");
-    ComPtr<ID3D12RootSignature> root;
-    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
-          "Comparison gather root");
+    const auto root = translated_sampler_root(device, samplers, "Comparison gather");
     draw_verified(device, shader, levels, first, 0, nullptr, nullptr, nullptr, root.Get(), vsPath);
 }
 

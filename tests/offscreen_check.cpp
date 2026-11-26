@@ -831,7 +831,8 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
 
 OperationResult run_check_pixel_gather(const OperationContext& ctx)
 {
-    check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4]);
+    check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argc >= 6 ? ctx.argv[5] : nullptr,
+                       ctx.argc == 7 ? ctx.argv[6] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1748,7 +1749,7 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
     {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
     {"--check-pixel-compare-grad", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
-    {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-gather", 5, 7, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},

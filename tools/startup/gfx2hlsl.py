@@ -105,6 +105,23 @@ def gather_2d_profile_words(words):
     return (w0 & ~(7 << 6), w1, w2 & ~(1 << 28), w3)
 
 
+def gather_2d_wrap_as_clamp(words):
+    """The profiled gather words with CLAMP_X and CLAMP_Y (WORD0 bits 2:0 and 5:3) of 0 (repeat) read as the
+    clamp-to-last-texel profile, for the forms lowered to the native HLSL Gather.
+
+    The native Gather takes its address modes from the static sampler built from the guest's own words, and
+    translated_sampler_bindings.h maps the field value 0 to D3D12 WRAP, so the four texels of the footprint wrap
+    across the edge exactly as the guest's repeat addressing does (D3D11.3 functional spec 22.4.2: "Only the
+    addressing modes of the sampler are used"). Only the profile check sees the substitution; the words bound
+    as the static sampler stay the guest's. The forms that emulate the gather with texel loads and an explicit
+    clamp (image_gather4_l) do not call this and keep refusing wrap."""
+    w0, w1, w2, w3 = words
+    for shift in (0, 3):
+        if (w0 >> shift) & 7 == 0:
+            w0 |= 2 << shift
+    return (w0, w1, w2, w3)
+
+
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
     # A call (s_swappc_b64) just before the prefetch is the program's first instruction, not header: keep it.
@@ -7472,7 +7489,7 @@ class Stage:
         body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, native_gather=False):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
@@ -7494,6 +7511,8 @@ class Stage:
             raise Unsupported('%s requires a constant sampler' % name)
         from pixel_aot import check_gather_sampler
         profiled = gather_2d_profile_words(words)
+        if native_gather:
+            profiled = gather_2d_wrap_as_clamp(profiled)
         if not mip_preclamp and (words[2] & (1 << 28)):
             profiled = (profiled[0], profiled[1], profiled[2] | (1 << 28), profiled[3])
         try:
@@ -7511,7 +7530,7 @@ class Stage:
 
     def op_image_gather4_lz(self, ops, mods):
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
-            'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
+            'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True, native_gather=True)
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
