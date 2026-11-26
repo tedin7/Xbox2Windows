@@ -2497,6 +2497,12 @@ class Stage:
         if neg:
             expr = '(%s ^ 0x80000000u)' % expr
         return expr
+        # `|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
+        if len(tok) > 2 and tok.startswith('|') and tok.endswith('|'):
+            text = '(%s & 0x7fffffffu)' % self.u(tok[1:-1])
+        else:
+            text = self.u(tok)
+        return '(%s ^ 0x80000000u)' % text if neg else text
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
