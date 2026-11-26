@@ -70,7 +70,7 @@ inline std::vector<std::uint64_t> plan_evictions(const std::vector<Texture>& tex
     for (const Texture* t : candidates) {
         if (!to_free) break;
         out.push_back(t->id);
-        to_free -= std::min(to_free, t->bytes);
+        to_free -= (std::min)(to_free, t->bytes);
     }
     return out;
 }
