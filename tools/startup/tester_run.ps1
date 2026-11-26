@@ -339,7 +339,7 @@ $changedFiles = @()
 foreach ($root in $scanRoots) {
     if (-not $root -or -not (Test-Path -LiteralPath $root) -or $scanClock.Elapsed.TotalSeconds -gt 20) { continue }
     $changedFiles += @(Get-ChildItem -LiteralPath $root -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -ge $runStart -and $_.FullName -notmatch '\\(Temp|CrashDumps|Microsoft\\Windows|Packages|\.git)\\' -and -not $_.FullName.StartsWith($outRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Where-Object { $_.LastWriteTime -ge $runStart -and $_.FullName.Substring($root.Length) -notmatch '\\(Temp|CrashDumps|Microsoft\\Windows|Packages|\.git)\\' -and -not $_.FullName.StartsWith($outRoot, [StringComparison]::OrdinalIgnoreCase) } |
         Select-Object -First 60 | ForEach-Object { "{0} ({1} bytes)" -f $_.FullName, $_.Length })
 }
 $saveAfter = @(Get-ChildItem -LiteralPath $saveDir -Recurse -File -ErrorAction SilentlyContinue)  # what the title's saves and persistent storage hold after this run
