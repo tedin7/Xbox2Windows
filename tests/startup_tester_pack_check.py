@@ -65,6 +65,14 @@ def check_preset():
     for n, item in enumerate(items2[1:]):
         assert (item.startswith("wait")) == (n % 4 == 3), "a wait follows every A, and only an A"
         assert (item.startswith("4@")) == (n % 4 == 2), "A is the third press of each cycle"
+    accept = T.input_preset("accept", 600)
+    presses = accept.split(",")
+    assert presses[:3] == ["4@35+0.3", "4@45+0.3", "4@55+0.3"] and presses[-1] == "4@595+0.3" and len(presses) == 57, (presses[:3], presses[-1], len(presses))
+    assert {p.split("@")[0] for p in presses} == {"4"}, "only A (mask 4): never Start (1), D-pad or the other buttons"
+    assert T.input_preset("accept", 35) == "" and T.input_preset("accept", 36) == "4@35+0.3", "presses stop with the run"
+    assert len(T.input_preset("accept", 100000).split(",")) == T.MAX_ENTRIES and len(T.input_preset("accept", 100000)) <= T.MAX_SCRIPT_CHARS
+    assert T.input_labels("accept", 600) == ["press A #%d (accept)" % n for n in range(1, 58)], "one label per press"
+    assert T.input_labels("accept", 20) == []
     for none in ("none", "off", "OFF", ""):
         assert T.input_preset(none, 300) == "" and T.input_labels(none, 300) == [], "%r presses nothing" % none
     assert T.input_preset("4@60,1@70", 300) == "4@60,1@70", "a raw script is passed through"
