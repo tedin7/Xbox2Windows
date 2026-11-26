@@ -4,6 +4,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import startup_compute_waterfall as waterfall
 from compute_load_format_check import check_references
@@ -165,10 +166,9 @@ def main():
     args = parser.parse_args()
     controls(args.llvm_mc)
     if args.dispatch:
-        output = waterfall.HERE.parent / 'out'
-        output.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=output) as tmp:
-            return dispatch(output / tmp, *args.dispatch)
+        output = Path(__file__).resolve().parent.parent / 'out'
+        with tempfile.TemporaryDirectory(dir=output if output.is_dir() else None) as tmp:
+            return dispatch(Path(tmp), *args.dispatch)
     return 0
 
 
