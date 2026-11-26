@@ -133,6 +133,8 @@ def run_script(shell, tree, *args, extra_path=None, extra_env=None, merge_stderr
         args = (*args, "-ScanRoots", str(tree / "scan_none"))  # no search of the real AppData during the checks
     if "-FinishTranslateSeconds" not in args:
         args = (*args, "-FinishTranslateSeconds", "0")  # the finish pass has its own checks; the others keep a still cache
+    if "-MemoryLeftSeconds" not in args:
+        args = (*args, "-MemoryLeftSeconds", "0")  # measured at once: the stall check times the whole run
     script = str(tree / "tools" / "startup" / "tester_run.ps1")
     if merge_stderr:
         # A caller that merges the script's error stream into its output (`... 2>&1`, as a tester's wrapper or a log pipe
@@ -176,7 +178,8 @@ def check_shell(shell):
             manifest = json.loads(z.read("manifest.json").decode("utf-8-sig"))
             args = json.loads(z.read("args.json").decode("utf-8-sig"))
             memory = z.read("memory.txt").decode("utf-8").splitlines()
-        # The end line after the run: the system commit and the top processes by commit (this shell is one of them).
+        # The end line after the run: the system commit and the top processes by commit (this shell is one of them);
+        # with -MemoryLeftSeconds 0 the memory left after exit is measured on it.
         assert memory and re.match(r"end commit \d+\.\d/\d+\.\d GiB \| \S+\.exe", memory[-1]), memory
         assert names == sorted(["finished.txt", "events.txt", "stdout.txt", "stderr.txt", "files.txt", "trap.log",
                                 "threads.txt", "translate.txt", "translate_err.txt", "window.png", "window_015s.png",
@@ -185,6 +188,8 @@ def check_shell(shell):
         assert args["ContinueAsserts"] == 1000 and args["Seconds"] == 200 and args["CaptureEvery"] == 10, args
         assert args["LazyMemory"] and manifest["lazy_memory"] is True, args
         assert manifest["build_check"] == "same commit", manifest
+        # What the run leaves behind, against the run's first memory.txt line (the real reader on this host).
+        assert str(manifest.get("memory_left_after_exit", "")).startswith("memory left after exit: "), manifest
         assert manifest["title_input_snapshot"] is True and manifest["env"].get("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT") == "1" \
             and manifest["env"].get("X2W_TRANSLATED_INDIRECT_COPY_RANGES") == "1", manifest["env"]
         assert args["MemoryGiB"] == manifest["memory_gib"] >= 14 and manifest["physical_ram_gib"] > 0, (args, manifest)

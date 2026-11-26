@@ -33,6 +33,7 @@ CAPTURE_LIMIT = 10.0  # seconds the final window capture may take before the run
 SHUTDOWN_STEP_SECONDS = 8   # longest wait for the thread dump and for the periodic capture thread at the end of the run
 from window_capture import FILE_CAP, MenuPace, Series, frame_mean, pick_window, png_bytes, shape_note  # noqa: E402
 from commit_headroom import HeadroomGuard  # noqa: E402
+from log_tail import tail_text  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 
@@ -1245,10 +1246,11 @@ def main():
     print(f"modules loaded: {len(modules)}")
     with open(os.path.join(logdir, "finished.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(summary) + "\n")
+    # The end of each log, with the newest complete storage heartbeat kept whole even when draw output follows it.
     for name in ("stderr.txt", "trap.log"):
-        path = os.path.join(logdir, name)
-        if os.path.exists(path) and os.path.getsize(path):
-            print(f"--- {name}\n" + open(path, encoding="utf-8", errors="replace").read()[-3000:])
+        text = tail_text(os.path.join(logdir, name))
+        if text:
+            print(f"--- {name}\n" + text)
     return 0
 
 
