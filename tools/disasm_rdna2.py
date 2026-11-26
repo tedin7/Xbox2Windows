@@ -2277,8 +2277,10 @@ def _decode_interp_f32_e64(op: int, w0: int, w1: int) -> tuple[int, str, str, st
 # VOP3 lane permutes (issue #1298). LLVM 15 defines v_permlane16_b32 and v_permlanex16_b32 for gfx10 at
 # VOP3 0x377 and 0x378 with the operand profile `vdst, src0, src1, src2 op_sel:[fi,bound_ctrl]`: src0 is a
 # VGPR, src1 and src2 are scalar lane selects, and op_sel[0] (w0[11]) and op_sel[1] (w0[12]) carry the
-# fetch-inactive and bound_ctrl flags. The same-row form also accepts a VOP3 literal selector
-# as specified by the RDNA 2 ISA operand rules. Unsupported words keep their record length.
+# fetch-inactive and bound_ctrl flags. Only the forms the LLVM 15 assembler accepts are decoded. Its
+# disassembler also prints words this decoder refuses (an SGPR or immediate src0, a VGPR, literal or other
+# refused lane select) and silently drops abs, neg and op_sel[2:3]; those words keep their record length and are
+# reported as unsupported encodings until their meaning is established.
 PERMLANE_OPS = {
     0x377: ("v_permlane16_b32", "Permute lanes within each row of 16 (VOP3A)"),
     0x378: ("v_permlanex16_b32", "Permute lanes across the two rows of 16 (VOP3A)"),
@@ -2289,29 +2291,20 @@ PERMLANE_OPS = {
 PERMLANE_REFUSED_SELECTS = frozenset([*range(209, 235), 249, 250, 254, 255])
 
 
-def _decode_permlane(op: int, w0: int, w1: int, literal: int | None = None) -> tuple[int, str, str, str]:
+def _decode_permlane(op: int, w0: int, w1: int, length: int) -> tuple[int, str, str, str]:
     """Decode v_permlane16_b32 / v_permlanex16_b32; length is 12 when a source names the literal."""
     name, comment = PERMLANE_OPS[op]
-    length = 12 if literal is not None else 8
     src0, src1, src2 = w1 & 0x1ff, (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff
     # abs (w0[10:8]), op_sel[2:3] (w0[14:13]), clamp (w0[15]), omod (w1[28:27]) and neg (w1[31:29]).
-    def valid_selector(src):
-        if src == 255:
-            return op == 0x377 and literal is not None
-        return src < 255 and src not in PERMLANE_REFUSED_SELECTS
-
     if (w0 & 0xe700 or w1 & 0xf8000000 or not 256 <= src0 <= 511
-            or not valid_selector(src1) or not valid_selector(src2) or src1 == src2 == 255):
+            or src1 > 255 or src2 > 255 or src1 in PERMLANE_REFUSED_SELECTS or src2 in PERMLANE_REFUSED_SELECTS):
         return (length, f"{name}_unsupported", f"{name} <unsupported VOP3A encoding>",
                 f"{name} word outside the forms the gfx1013 LLVM 15 assembler accepts")
-    def selector(src):
-        return f"0x{literal:x}" if src == 255 else decode_s_reg(src)
-
-    asm = f"{name} v{w0 & 0xff}, {decode_v_reg(src0)}, {selector(src1)}, {selector(src2)}"
+    asm = f"{name} v{w0 & 0xff}, {decode_v_reg(src0)}, {decode_s_reg(src1)}, {decode_s_reg(src2)}"
     fi, bound_ctrl = (w0 >> 11) & 1, (w0 >> 12) & 1
     if fi or bound_ctrl:
         asm += f" op_sel:[{fi},{bound_ctrl}]"
-    return (length, name, asm, comment)
+    return (8, name, asm, comment)
 
 
 def _packed_addr_regs(count: int) -> int:
@@ -2985,8 +2978,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 # Keep the twelve-byte record of a literal operand, as the generic VOP3 path does.
                 if offset + 12 > len(data):
                     return (8, "vop3_truncated", f"{PERMLANE_OPS[op][0]} <truncated>", "Incomplete VOP3 literal")
-                return _decode_permlane(op, w0, w1, struct.unpack_from("<I", data, offset + 8)[0])
-            return _decode_permlane(op, w0, w1)
+                return _decode_permlane(op, w0, w1, 12)
+            return _decode_permlane(op, w0, w1, 8)
 
         is_vopc = False
         is_vop3b = False
