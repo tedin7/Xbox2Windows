@@ -23,6 +23,10 @@ constexpr std::size_t argument_memory_limit = 1u << 20;
 
 void* original[kind_count][wide_slots];
 std::atomic<bool> active{false};
+// A recording was installed in this process (set once by install(), never cleared, so it stays set after the recording
+// stops). The submission dump reads it: the recorder writes dump rows only while its window is open; a replay
+// (nothing installed) writes them all.
+bool armed = false;
 static_assert(device_kind == x2w_replay_slots::device && list_kind == x2w_replay_slots::list);
 bool scan_submit_pages;
 LONG64 volatile next_seq;
@@ -762,6 +766,7 @@ void install()
         !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
+    armed = true;
     active.store(true);
     wrap_all(std::make_index_sequence<kind_count>{});
     log("x2w-replay record: on (%s) -> %s", value, path);
