@@ -2399,9 +2399,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
-    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
-    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
-    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+    // A compute input whose record count is zero (all four words zero, or a base with no records) is an empty buffer:
+    // every read of it is out of range and the hardware returns zeros, so the dispatch gets 16 bytes of zeros
+    // instead of being refused. A view token is not a descriptor and keeps its own reasons.
+    if (!bytes && allow_title_snapshot && words[0] != view_token_magic) {
         u64 zero_offset = 0;
         ID3D12Resource* zero_ring = nullptr;
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring);
@@ -2429,7 +2430,19 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         }
         const auto placed = placed_buffer_range(device, address, bytes);
         if (placed.reject) return refuse("an input range crosses the end of a placed buffer");
-        if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
+        if (owner && owner != placed.owner) {
+            // Name both resources so the next run shows whether two placements overlap this range.
+            static LONG mismatch_logged;
+            if (first_calls(mismatch_logged, 8)) {
+                auto* token_real = static_cast<ID3D12Resource*>(owner->own().real);
+                auto* placed_real = placed.owner ? static_cast<ID3D12Resource*>(placed.owner->own().real) : nullptr;
+                log("x2w-draw input token resource title memory=%p width=%llu; placement at the range: title memory=%p width=%llu; range address=0x%llx bytes=%llu offset=%llu",
+                    owner->own().title_memory, token_real ? static_cast<unsigned long long>(token_real->GetDesc().Width) : 0ull,
+                    placed.owner ? placed.owner->own().title_memory : nullptr, placed_real ? static_cast<unsigned long long>(placed_real->GetDesc().Width) : 0ull,
+                    static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(offset));
+            }
+            return refuse("an input buffer view token's resource does not hold its range");
+        }
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
             const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};

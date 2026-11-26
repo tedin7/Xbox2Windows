@@ -7,7 +7,7 @@ gfx2hlsl.py --pending with DXC, the unchanged recording still matches all 320 wo
 time is replaced, and each dispatch is refused with its own reason, logs which input and descriptor once, writes
 no output word and leaves the input as written:
 
-- dispatch-input-empty: zero records with a nonzero base and word 3 zero (synthetic values);
+- dispatch-input-empty: zero records with a nonzero base and word 3 zero (synthetic values): runs on zeros, not refused;
 - dispatch-input-past: 16 bytes past the end of the placed input buffer;
 - dispatch-input-unplaced: memory between the two placed buffers;
 - dispatch-input-copied: a buffer placed at an offset the desktop cannot alias, so it is a separate copy;
@@ -31,7 +31,6 @@ from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
 CONTROLS = (
-    ('dispatch-input-empty', 'an input buffer descriptor has zero records'),
     ('dispatch-input-past', 'an input range crosses the end of a placed buffer'),
     ('dispatch-input-unplaced', 'an input is in title memory outside any placed buffer'),
     ('dispatch-input-copied', 'an input is in a placed buffer that does not alias title memory'),
@@ -102,11 +101,11 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
-        # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty
-        # control above has a nonzero base and stays refused).
+        # A descriptor with zero records (all-zero, or a base only) is an empty buffer: the dispatch runs on zeros instead of
+        # being refused.
         got, result = dispatch(directory, consumer, env, 'dispatch-input-null')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
-        assert len(lines(result, 'comes from zeros for a null descriptor (16 bytes)')) == 1, result.stderr[-3000:]
+        assert len(lines(result, 'comes from zeros for an empty descriptor (16 bytes)')) == 1, result.stderr[-3000:]
         assert got != expected and got != untouched, 'a null input must read zeros, not the expected words'
         # A manifest whose first input is out of order is not bound, and the log names the line: the pipeline key, the
         # line number, the reason and the line itself.
@@ -120,6 +119,15 @@ def main(consumer, dxc, adapter):
         rejected = lines(result, f'x2w-draw compute pipeline {key:016x} manifest line ')
         assert got == untouched and len(rejected) == 1 and ' rejected (a resource that is not a raw table buffer' in rejected[0] \
             and rejected[0].endswith(': ' + first[:120]), result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-empty')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert len(lines(result, 'comes from zeros for an empty descriptor (16 bytes)')) == 1, result.stderr[-3000:]
+        assert got != expected and got != untouched, 'an empty input must read zeros, not the expected words'
+        # An output behind a buffer view token (the token names the placed output buffer and a raw range) is bound as
+        # the descriptor would be: all 320 words are written.
+        got, result = dispatch(directory, consumer, env, 'dispatch-output-token')
+        assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), \
+            result.stderr[-3000:]
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
