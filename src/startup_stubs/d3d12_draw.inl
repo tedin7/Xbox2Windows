@@ -2058,7 +2058,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 ID3D12Resource* ring = nullptr;
                 if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
                     return refuse("an input range in title memory is not readable");
-                if (!ring_copy(address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring) || !ring)
                     return refuse("an input range could not be copied from title memory");
                 return {ring, ring_offset, bytes, stride, true, 2};
             } else {
