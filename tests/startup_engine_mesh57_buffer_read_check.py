@@ -10,10 +10,9 @@ soffset + voffset (offen) + index * stride (idxen) + instruction offset; a read 
 
   soffset      the colour load takes its byte offset from an SGPR (`s_mov_b32 s40, 192`) instead of the instruction offset: same picture.
   structured   position and colour loads use `idxen` (index = the vertex slot) with the stride from the descriptor (16): same picture.
-Every case is first drawn against the picture its own address model gives (zero differing pixels: this verifies the model, including the wrong
-variants), and each wrong variant is then drawn against the picture of the right address and must differ by exactly the pixels the model gives:
-a colour read one vertex too far (soffset 208) and the structured load with stride 0 (every vertex reads slot 0). Stride 8 is not drawn: the position export also takes z and w from the load, so a half-slot shift makes w negative and the picture needs a clip model.
-Reads past the end of the vertex buffer are not drawn: the harness binds it as a root descriptor, which has no view bound to model.
+  out of range the colour load starts past the end of the 512-byte view (`s_mov_b32 s40, 1024`): every colour channel reads 0.
+Each wrong variant is also drawn against the reference of the right address and must fail with exactly the number of pixels the model gives:
+a colour read one vertex too far (soffset 208), a read past the view, and the structured load with stride 0 (every vertex reads slot 0).
 Without arguments only the translation is checked (the variants translate; only the structured one asks the runtime for the stride constant).
 `binary` compares the embedded words with llvm-mc; `draw` compiles the request path's output (ms_6_5, ps_6_0) and draws it.
 """
@@ -54,6 +53,7 @@ def structured_variant():
 
 SOFFSET_COLOUR = soffset_variant(192)
 SOFFSET_WRONG = soffset_variant(208)
+SOFFSET_OUT_OF_RANGE = soffset_variant(1024)
 STRUCTURED = structured_variant()
 
 LOAD = 's_load_dwordx4 s[16:19], s[10:11], 0\n'
@@ -76,6 +76,7 @@ def binary(mc):
     text = (HERE / 'startup_mesh57_skeleton.s').read_text()
     T.expect('soffset words match llvm-mc', T.assemble(mc, soffset_asm(text, 192)), SOFFSET_COLOUR)
     T.expect('wrong soffset words match llvm-mc', T.assemble(mc, soffset_asm(text, 208)), SOFFSET_WRONG)
+    T.expect('out-of-range soffset words match llvm-mc', T.assemble(mc, soffset_asm(text, 1024)), SOFFSET_OUT_OF_RANGE)
     T.expect('structured words match llvm-mc', T.assemble(mc, structured_asm(text)), STRUCTURED)
 
 
@@ -113,6 +114,7 @@ CASES = (
     ('soffset', SOFFSET_COLOUR, None, RIGHT, RIGHT),
     ('soffset one vertex too far', SOFFSET_WRONG, None,
      model_image(lambda slot: 16 * slot, lambda slot: 208 + 16 * slot), RIGHT),
+    ('out of range', SOFFSET_OUT_OF_RANGE, None, model_image(lambda slot: 16 * slot, lambda slot: 1024 + 16 * slot), RIGHT),
     ('structured, stride 16', STRUCTURED, 16, RIGHT, RIGHT),
     ('structured, stride 0', STRUCTURED, 0, model_image(lambda slot: 0, lambda slot: 192), RIGHT),
 )
@@ -124,7 +126,7 @@ def controls():
     T.expect('the right picture is the standard draw of the fixture',
              RIGHT, T.rasterise(POINTS, COLOURS, INDICES, len(POINTS), len(INDICES)))
     for name, words, stride, drawn, compared in CASES:
-        T.expect(name + ': a wrong read draws another picture than the right one', drawn != RIGHT, words is SOFFSET_WRONG or stride == 0)
+        T.expect(name + ': a wrong read draws another picture than the right one', drawn != RIGHT, words in (SOFFSET_WRONG, SOFFSET_OUT_OF_RANGE) or stride == 0)
         with tempfile.TemporaryDirectory() as tmp:
             key, result = T.request(tmp, words)
             T.expect(name + ' translates', result, 'ok')
@@ -151,22 +153,18 @@ def draw(dxc, renderer, adapter):
             struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '1'], len(POINTS))
             if stride is not None:
                 struct.pack_into('<I', constants, 4 * uds['stride', '0'], stride)
+            expected = sum(a != b for a, b in zip(drawn, compared))
             path = Path(tmp) / 'case.bin'
-            args = [renderer, adapter, '--mesh-indexed', base + '.ms57.cso', base + '.ps57.cso', str(path)]
-            # The program is drawn against its own model first (no differing pixel), then against the right picture.
-            for reference, what in ((drawn, 'its own model'), (compared, 'the right picture')):
-                expected = sum(a != b for a, b in zip(drawn, reference))
-                if reference is compared and expected == 0:
-                    continue
-                path.write_bytes(bytes(constants) + VIEW + b'\xcd' * 80 + b''.join(map(bytes, reference)))
-                run = subprocess.run(args, capture_output=True, text=True)
-                if run.returncode == 77:
-                    print(run.stdout + run.stderr)
-                    return 77
-                if (run.returncode != int(bool(expected))
-                        or not re.search(rf'\bpixels={T.SIDE * T.SIDE} mismatches={expected}\b', run.stdout)):
-                    raise AssertionError(f'{name} against {what}: want {expected} differing pixels: {run.stdout}{run.stderr}')
-                print(f'{name} against {what}: {expected} differing pixels')
+            path.write_bytes(bytes(constants) + VIEW + b'\xcd' * 80 + b''.join(map(bytes, compared)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', base + '.ms57.cso', base + '.ps57.cso', str(path)],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(expected))
+                    or not re.search(rf'\bpixels={T.SIDE * T.SIDE} mismatches={expected}\b', run.stdout)):
+                raise AssertionError(f'{name}: want {expected} differing pixels: {run.stdout}{run.stderr}')
+            print(f'{name}: {expected} differing pixels from the right picture')
     return 0
 
 
