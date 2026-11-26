@@ -3060,6 +3060,46 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_arm(self, b, t, block, succ, pred, effects, entry_sites):
+        """Find a forward scalar diamond whose two arms narrow entry EXEC with the same VCC."""
+        second = max(block) + 1
+        scalar = b - 2
+        if not (0 <= scalar < b < second < t - 2):
+            return None
+        ins = self.ins
+        off = ins[scalar][0]
+        if (ins[scalar][2] != 's_cbranch_scc0' or succ[scalar] != [b - 1, second]
+                or off not in entry_sites or ins[second + 1][2] != 's_cbranch_execz'
+                or len(succ[second + 1]) != 2
+                or not second + 1 < succ[second + 1][1] <= t
+                or ins[second - 1][2] != 's_branch' or succ[second - 1] != [t]):
+            return None
+        for opener in (b - 1, second):
+            if parse(ins[opener][3]) != ('s_mov_b64', ['exec', 'vcc'], []):
+                return None
+        for lo, hi in ((b - 1, second), (second, t)):
+            for i in range(lo, hi):
+                if any(p != scalar and not lo <= p < hi for p in pred[i]):
+                    return None
+                if any(not i < j < hi and j != t for j in succ[i]):
+                    return None
+        # Both arms see the same comparison. The straight prefix must also define SCC.
+        needs = {'vcc', 'scc'}
+        i = scalar
+        while i and pred[i] == {i - 1}:
+            i -= 1
+            name = ins[i][2]
+            defined = needs & effects[i][2]
+            if 'scc' in defined and not name.startswith('s_cmp'):
+                return None
+            if 'vcc' in defined and (
+                    not name.startswith('v_cmp_') or 'vcc' not in effects[i][1] or ins[i][0] not in entry_sites):
+                return None
+            needs -= defined
+            if not needs:
+                return off, ins[second][0], ins[t][0]
+        return None
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3072,7 +3112,9 @@ class Stage:
         the block (its branches and loops included), which masks have that lane's bit clear, and the write must
         leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
         so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
-        the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. Follow fall-through
+        successors up to the join to distinguish the body from a separate scalar arm in the same address range.
+        The separate arm may reopen EXEC from VCC only with entry EXEC at the uniform scalar split. A definition live at
         the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
         shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
         or a backward s_cbranch_execz is refused.
@@ -3125,8 +3167,14 @@ class Stage:
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
         refused, into = {}, {}
+        pred = [set() for _ in self.ins]
+        for i, edges in enumerate(succ):
+            for j in edges:
+                pred[j].add(i)
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
+        entry_sites = None
+        other_refusals = set()
         for b, (off, n, name, asm) in enumerate(self.ins):
             if name != 's_cbranch_execz':
                 continue
@@ -3139,6 +3187,21 @@ class Stage:
             entry = frozenset({('exec', 0), ('exec_hi', 1)})
             before = {b + 1: entry} if b + 1 < t else {}
             entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
+            # Follow the actual first arm to its join. Keep the lexical checks below for existing diagnostics,
+            # including external entries and scalar effects outside the shape this proof covers.
+            arm = None
+            if entered and before and hasattr(self, 'spill_cfg') and getattr(self, 'pipe', None):
+                block = set()
+                pending = [b + 1]
+                while pending:
+                    i = pending.pop()
+                    if b < i < t and i not in block:
+                        block.add(i)
+                        pending.extend(succ[i])
+                if any(i not in block and effects[i][2] & EXEC_KEYS for i in range(b + 1, t)):
+                    if entry_sites is None:
+                        entry_sites = self.entry_exec_sites(self.spill_cfg)
+                    arm = self.execz_arm(b, t, block, succ, pred, effects, entry_sites)
             changed = not entered
             while changed:
                 changed = False
@@ -3194,7 +3257,13 @@ class Stage:
                     if named:
                         reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
+                    if reason == 'exec write' and arm and at == arm[1]:
+                        self.execz_arm_candidates[at] = arm
+                    else:
+                        other_refusals.add(at)
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+        for at in other_refusals:
+            getattr(self, 'execz_arm_candidates', {}).pop(at, None)
         return refused
 
     def execz_read_cause(self, j, word, b, t, effects, into):
@@ -3775,7 +3844,6 @@ class Stage:
             # the pc dispatch even when the preceding region took different paths.
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
-        refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
         # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
         self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
@@ -3787,6 +3855,8 @@ class Stage:
         self.wave_exec = (getattr(self, 'kind', None) == 'ps' and bool(branches) and all(t > pc for pc, t in branches)
                           and (self.holds_wave_reduction() or (not self.quad_exec and self.skipped_scalar_read_later(branches))))
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.execz_arm_candidates = {}
+        refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
@@ -3899,6 +3969,7 @@ class Stage:
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
+            self.execz_arms = {}
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
@@ -4057,7 +4128,11 @@ class Stage:
                         self.float_const_s.pop(reg, None)
                 try:
                     if off in refused:
-                        raise Unsupported(refused[off])
+                        arm = self.execz_arm_candidates.get(off)
+                        if not arm or arm[0] not in self.uniform_branches:
+                            raise Unsupported(refused[off])
+                        split, second, join = arm
+                        self.execz_arms[split] = second, join
                     base = re.sub(r'_e(32|64)$', '', name)
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
@@ -10320,7 +10395,10 @@ class Stage:
         wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
-        for i, (off, lines, term) in enumerate(self.blocks):
+
+        def block(i, chained=False, diamond=None):
+            off, lines, term = self.blocks[i]
+            out = []
             if off in getattr(self, 'mesh_collect_reads', {}):
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
@@ -10329,7 +10407,7 @@ class Stage:
                 out.append('    {')
             else:
                 attribute = '[branch] ' if off in wave_load_blocks else ''
-                out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
+                out.append('    %s%sif (pc == %d) {' % ('else ' if chained else '', attribute, i))
             if off in getattr(self, 'mesh_collect_reads', {}):
                 out.append('        uint mesh_first = mesh_first_%d;' % i)
             out += ['        ' + line for line in lines]
@@ -10347,9 +10425,34 @@ class Stage:
                 out.append('        pc = 0xffffu;')
             elif term[0] == 'jump':
                 out.append('        pc = %d;' % goto(term[1]))
+            elif diamond:
+                second, join = diamond
+                out.append('        if (%s) {' % term[1])
+                for begin, end in ((second, join), (nxt, second)):
+                    out.append('            pc = %d;' % begin)
+                    for j in range(begin, end):
+                        out.extend('        ' + line for line in block(j))
+                    if begin == second:
+                        out.append('        } else {')
+                out.append('        }')
             else:
                 out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
             out.append('    }')
+            return out
+
+        # A proven scalar split selects the whole arm. The existing per-lane
+        # PC guards inside each arm still implement EXEC-zero skips.
+        arms = getattr(self, 'execz_arms', {})
+        diamonds = {}
+        if arms:
+            sizes = {off: size for off, size, _, _ in self.ins}
+            for split, (second, join) in arms.items():
+                diamonds[goto(split + sizes[split]) - 1] = goto(second), goto(join)
+        i = 0
+        while i < len(self.blocks):
+            diamond = diamonds.get(i)
+            out.extend(block(i, chained=loops and i != 0, diamond=diamond))
+            i = diamond[1] if diamond else i + 1
         if loops:
             out.append('    }')
         return out
@@ -12936,6 +13039,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('execz-arms', r'inside a block s_cbranch_execz skips per lane: exec write'),
     ('mrtz', r'MRTZ requires one uncompressed depth export'),
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
