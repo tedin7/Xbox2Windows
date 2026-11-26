@@ -26,7 +26,7 @@ def check(directory, consumer, backend):
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
-    manifest, = cache.glob('*.txt')
+    manifest, = (path for path in cache.glob('*.txt') if path.name != 'revision.txt')
     text = manifest.read_text(encoding='ascii')
     assert 'descword3 0' in text and 'srv 0 buf table 0 0' in text, text
     result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
