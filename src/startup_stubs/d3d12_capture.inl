@@ -52,6 +52,52 @@ struct ResourceInfo {
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
+
+// Time spent waiting for note_lock, by kind of acquisition, printed with the heartbeat (print_note_lock_waits). A wait is the
+// time between asking for the lock and holding it; a long one means another thread held it (or was descheduled while it did).
+struct NoteLockWaits {
+    volatile LONG64 calls[2], ticks[2], max_ticks[2], over_5ms[2];  // [0] shared, [1] exclusive
+};
+NoteLockWaits note_lock_waits;
+inline void note_lock_acquire(bool exclusive)
+{
+    LARGE_INTEGER start, end, frequency;
+    QueryPerformanceCounter(&start);
+    if (exclusive) AcquireSRWLockExclusive(&note_lock);
+    else AcquireSRWLockShared(&note_lock);
+    QueryPerformanceCounter(&end);
+    QueryPerformanceFrequency(&frequency);
+    const LONG64 waited = end.QuadPart - start.QuadPart;
+    const int k = exclusive ? 1 : 0;
+    InterlockedIncrement64(&note_lock_waits.calls[k]);
+    InterlockedAdd64(&note_lock_waits.ticks[k], waited);
+    for (LONG64 seen = note_lock_waits.max_ticks[k]; waited > seen;) {
+        const LONG64 before = InterlockedCompareExchange64(&note_lock_waits.max_ticks[k], waited, seen);
+        if (before == seen) break;
+        seen = before;
+    }
+    if (waited * 200 > frequency.QuadPart) InterlockedIncrement64(&note_lock_waits.over_5ms[k]);
+}
+// One line for the heartbeat; resets the counters. Empty when the lock was never taken.
+inline bool note_lock_wait_line(char* out, std::size_t size)
+{
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    const double per_ms = frequency.QuadPart / 1000.0;
+    LONG64 calls[2], ticks[2], max_ticks[2], over[2];
+    for (int k = 0; k < 2; ++k) {
+        calls[k] = InterlockedExchange64(&note_lock_waits.calls[k], 0);
+        ticks[k] = InterlockedExchange64(&note_lock_waits.ticks[k], 0);
+        max_ticks[k] = InterlockedExchange64(&note_lock_waits.max_ticks[k], 0);
+        over[k] = InterlockedExchange64(&note_lock_waits.over_5ms[k], 0);
+    }
+    if (!calls[0] && !calls[1]) return false;
+    std::snprintf(out, size, "x2w-d3d12 note_lock waits since the last report: shared %lld calls, %.1f ms total, max %.1f ms, %lld over 5 ms; "
+                  "exclusive %lld calls, %.1f ms total, max %.1f ms, %lld over 5 ms",
+                  static_cast<long long>(calls[0]), ticks[0] / per_ms, max_ticks[0] / per_ms, static_cast<long long>(over[0]),
+                  static_cast<long long>(calls[1]), ticks[1] / per_ms, max_ticks[1] / per_ms, static_cast<long long>(over[1]));
+    return true;
+}
 std::unordered_map<const Wrapper*, PipelineInfo>& pipeline_infos() { static std::unordered_map<const Wrapper*, PipelineInfo> m; return m; }
 std::unordered_map<const Wrapper*, std::vector<unsigned char>>& root_blobs() { static std::unordered_map<const Wrapper*, std::vector<unsigned char>> m; return m; }
 std::unordered_map<const Wrapper*, ResourceInfo>& resource_infos() { static std::unordered_map<const Wrapper*, ResourceInfo> m; return m; }
@@ -113,7 +159,7 @@ std::uint32_t* shadow_slot(u64 desktop_handle, std::uint32_t* room = nullptr)
 }
 std::uint32_t shadow_id(u64 desktop_handle)
 {
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const std::uint32_t* slot = shadow_slot(desktop_handle);
     const std::uint32_t id = slot ? *slot : 0;
     ReleaseSRWLockShared(&note_lock);
@@ -167,7 +213,7 @@ bool title_backed(u64 title_handle, u64 bytes)
 // materialized token the title copied into title memory with its own memory copy.
 bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
 {
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const std::uint32_t* slot = shadow_slot(desktop_handle);
     std::uint32_t id = slot ? *slot : 0;
     bool live = id && id - 1 < view_records().size() && view_materialized()[id - 1];
@@ -178,7 +224,7 @@ bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
     std::uint32_t words[8];
     std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
     if (words[0] != view_token_magic) return false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     live = words[1] < view_records().size() && view_materialized()[words[1]];
     ReleaseSRWLockShared(&note_lock);
     return live;
@@ -207,23 +253,29 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     info.stream_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
-    const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
-    if (have) info.desc.assign(static_cast<const unsigned char*>(desc), static_cast<const unsigned char*>(desc) + have);
-    if (path == 57 && have >= 0x28) {
-        u64 words[5];
-        std::memcpy(words, desc, sizeof(words));
-        if (words[2] && words[2] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[1]), words[2]))
-            info.state_a.assign(reinterpret_cast<const unsigned char*>(words[1]), reinterpret_cast<const unsigned char*>(words[1]) + words[2]);
-        if (words[4] && words[4] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[3]), words[4]))
-            info.state_b.assign(reinterpret_cast<const unsigned char*>(words[3]), reinterpret_cast<const unsigned char*>(words[3]) + words[4]);
+    {
+        Timed probe_timed(time_pipe_probe);
+        const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
+        if (have) info.desc.assign(static_cast<const unsigned char*>(desc), static_cast<const unsigned char*>(desc) + have);
+        if (path == 57 && have >= 0x28) {
+            u64 words[5];
+            std::memcpy(words, desc, sizeof(words));
+            if (words[2] && words[2] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[1]), words[2]))
+                info.state_a.assign(reinterpret_cast<const unsigned char*>(words[1]), reinterpret_cast<const unsigned char*>(words[1]) + words[2]);
+            if (words[4] && words[4] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[3]), words[4]))
+                info.state_b.assign(reinterpret_cast<const unsigned char*>(words[3]), reinterpret_cast<const unsigned char*>(words[3]) + words[4]);
+        }
     }
-    AcquireSRWLockExclusive(&note_lock);
+    {
+        Timed lock_timed(time_pipe_lock);  // the wait for note_lock: the guard ends once the lock is held
+        note_lock_acquire(true);
+    }
     pipeline_infos()[w] = std::move(info);
     ReleaseSRWLockExclusive(&note_lock);
 }
 const PipelineInfo* pipeline_info(const Wrapper* w)
 {
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto found = pipeline_infos().find(w);
     const PipelineInfo* info = found == pipeline_infos().end() ? nullptr : &found->second;
     ReleaseSRWLockShared(&note_lock);
@@ -250,7 +302,7 @@ void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
             }
         }
     }
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     root_blobs()[w] = std::move(copy);
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -308,7 +360,7 @@ void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 void retire_placement(Wrapper* w)
 {
     // Keep immutable capture data available to resource_info() readers.
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     const auto found = resource_infos().find(w);
     if (found != resource_infos().end() && found->second.placement != Placement::none) {
         auto& group = placement_group(found->second.bytes);
@@ -330,7 +382,7 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
     PlacedVertexView result{};
     if (!start || !bytes) return result;
     if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const u64 end = start + bytes;
     for (const auto& group : placement_index) {
         if (group.by_start.empty()) continue;
@@ -357,7 +409,7 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
 }
 const ResourceInfo* resource_info(const Wrapper* w)
 {
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto found = resource_infos().find(w);
     const ResourceInfo* info = found == resource_infos().end() ? nullptr : &found->second;
     ReleaseSRWLockShared(&note_lock);
@@ -366,7 +418,7 @@ const ResourceInfo* resource_info(const Wrapper* w)
 void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
                u64 title_sampler_cpu)
 {
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
@@ -449,7 +501,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
     };
     mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     ++views_noted;
     const auto found = view_ids().find(hash);
     if (found != view_ids().end()) {
@@ -519,7 +571,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
 }
 void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop, UINT count, UINT increment)
 {
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     descriptors_copied += count;
     std::uint32_t dest_room = 0, src_room = 0;
     std::uint32_t* to = shadow_slot(dest_desktop, &dest_room);
@@ -671,7 +723,7 @@ void object(Wrapper* w)
             if (info->base) object(info->base);
         }
     } else if (w->own().kind == root_signature_kind) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         const auto found = root_blobs().find(w);
         std::vector<unsigned char> blob = found == root_blobs().end() ? std::vector<unsigned char>{} : found->second;
         ReleaseSRWLockShared(&note_lock);
@@ -690,7 +742,7 @@ void object(Wrapper* w)
         chunk("RES ", &header, sizeof(header), nullptr, 0);
     } else if (w->own().kind == descriptor_heap_kind) {
         HeapInfo found{};
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (const HeapInfo& heap : heap_infos())
             if (heap.wrapper == common.wrapper) found = heap;
         ReleaseSRWLockShared(&note_lock);
@@ -724,7 +776,7 @@ void view(std::uint32_t id_plus_one, bool with_data)
 {
     if (!id_plus_one) return;
     ViewRecord record{};
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const bool known = id_plus_one - 1 < view_records().size();
     if (known) record = view_records()[id_plus_one - 1];
     ReleaseSRWLockShared(&note_lock);
@@ -748,7 +800,7 @@ void view(std::uint32_t id_plus_one, bool with_data)
 void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
 {
     HeapInfo heap{};
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     for (const HeapInfo& h : heap_infos())
         if (h.desktop_gpu && gpu_handle >= h.desktop_gpu && gpu_handle < h.desktop_gpu + u64{h.count} * h.increment) heap = h;
     ReleaseSRWLockShared(&note_lock);
@@ -802,7 +854,7 @@ void list_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, const u64* stack, u6
                 Wrapper* heap = as_wrapper(reinterpret_cast<void* const*>(r8)[i]);
                 object(heap);
                 HeapInfo info{};
-                AcquireSRWLockShared(&note_lock);
+                note_lock_acquire(false);
                 for (const HeapInfo& h : heap_infos())
                     if (h.wrapper == reinterpret_cast<u64>(heap)) info = h;
                 ReleaseSRWLockShared(&note_lock);

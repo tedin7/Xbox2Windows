@@ -365,9 +365,12 @@ Wrapper* the_device;
 
 // Time spent inside the stand-in per entry-point family, reported with the heartbeat.
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
-       time_pipeline, time_heap, time_copy, time_count };
+       time_pipeline, time_heap, time_copy,
+       // Parts of the pipeline-creation entry points (inside the "pipeline" total, which they overlap): waiting for note_lock,
+       // probing the title's descriptor memory, publishing a request, dumping.
+       time_pipe_lock, time_pipe_probe, time_pipe_publish, time_pipe_dump, time_count };
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
-                                            "pipeline", "heap", "copy"};
+                                            "pipeline", "heap", "copy", "pipe-lock", "pipe-probe", "pipe-publish", "pipe-dump"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
@@ -2293,7 +2296,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_root_translation_blob(voi
     Wrapper* w = as_wrapper(root);
     if (!w || w->own().kind != root_signature_kind) return 0;
     if (heap_flags) *heap_flags = root_heap_flags(w);
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const auto found = root_blobs().find(w);
     const std::size_t bytes = found == root_blobs().end() ? 0 : found->second.size();
     if (bytes && out) std::memcpy(out, found->second.data(), bytes < capacity ? bytes : capacity);
@@ -3667,7 +3670,7 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 {
     DXGI_FORMAT format = target->GetDesc().Format;
     if (const std::uint32_t id = shadow_id(desktop_handle)) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
         if (id - 1 < view_records().size() && view_records()[id - 1].desc_bytes >= 4)
             std::memcpy(&view_format, view_records()[id - 1].desc, 4);
@@ -3691,7 +3694,7 @@ ResolvedView resolve_view(u64 handle, int slot)
     bool known = false;
     bool materialized = false;
     if (const std::uint32_t id = shadow_id(handle)) {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         known = id - 1 < view_records().size();
         if (known) {
             record = view_records()[id - 1];
@@ -3826,7 +3829,7 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
 ID3D12DescriptorHeap* owning_view_heap(u64 gpu)
 {
     u64 owner = 0;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     for (const HeapInfo& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
         const u64 offset = gpu - heap.desktop_gpu;
@@ -4773,7 +4776,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     if constexpr (N >= 19 && N <= 21) {
         bool tracked = false;
         if (args[D]) {
-            AcquireSRWLockShared(&note_lock);
+            note_lock_acquire(false);
             tracked = shadow_slot(args[D]) != nullptr;
             ReleaseSRWLockShared(&note_lock);
         }
@@ -5064,7 +5067,7 @@ void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT
     };
     std::vector<Candidate> candidates;
     try {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         std::uint32_t room = 0;
         const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
         if (ids && count <= room) {
@@ -5093,7 +5096,7 @@ void refresh_copied_lazy_views(Wrapper* self, u64 dest_desktop, UINT count, UINT
         if (!real) continue;
         const D3D12_RESOURCE_DESC real_desc = real->GetDesc();
         const auto view_mode = view_defaults_mode();
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         std::uint32_t room = 0;
         const std::uint32_t* ids = shadow_slot(dest_desktop, &room);
         // The slot must still name the record, and the record still the texture (the title may have overwritten it).
@@ -5801,7 +5804,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
     std::vector<PendingSrvRefresh> refreshes;
     const u64 target_wrapper = reinterpret_cast<u64>(w);
     try {
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (const HeapInfo& h : heap_infos()) {
             if (!h.shadow || h.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
             for (std::uint32_t i = 0; i < h.count; ++i) {
@@ -5825,7 +5828,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
         const auto view_mode = view_defaults_mode();
         // Hold note_lock shared across revalidation and CreateShaderResourceView so concurrent note_view /
         // note_copy / retire_drop_heap_views (all exclusive) cannot overwrite a slot or retire a heap mid-write.
-        AcquireSRWLockShared(&note_lock);
+        note_lock_acquire(false);
         for (const auto& item : refreshes) {
             const HeapInfo* target_heap = nullptr;
             for (const HeapInfo& h : heap_infos()) {
@@ -5920,7 +5923,7 @@ void retire_release_view_ref(const void* object)
 void retire_drop_heap_views(Wrapper* heap)
 {
     if (!release_retired_enabled() || !heap) return;
-    AcquireSRWLockExclusive(&note_lock);
+    note_lock_acquire(true);
     for (HeapInfo& h : heap_infos()) {
         if (h.wrapper != reinterpret_cast<u64>(heap) || !h.shadow) continue;
         for (std::uint32_t i = 0; i < h.count; ++i) {
@@ -5939,7 +5942,7 @@ void retire_drop_heap_views(Wrapper* heap)
 bool retire_address_has_live_user(u64 address, const Wrapper* skip)
 {
     bool other_live = false;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         if (wrapper == skip || reinterpret_cast<u64>(wrapper->own().title_memory) != address) return false;
         if (InterlockedCompareExchange(const_cast<LONG*>(&wrapper->own().refs), 0, 0) > 0 ||
@@ -6271,7 +6274,7 @@ void retire_reasons_collect(RetireReasonReport& report)
 {
     // 1: which resources a tracked slot-18 descriptor names, and whether one of those lies in a shader-visible heap.
     std::unordered_map<const Wrapper*, bool> viewed;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     try {
         for (const HeapInfo& h : heap_infos()) {
             if (!h.shadow) continue;
@@ -6420,7 +6423,7 @@ std::size_t view_census_line(char* out, std::size_t capacity)
     if (!out || !capacity) return 0;
     out[0] = 0;
     if (!view_census_enabled()) return 0;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const std::size_t used = view_census_format(out, capacity, "distinct by slot");
     ReleaseSRWLockShared(&note_lock);
     return used;
@@ -6448,7 +6451,7 @@ extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long ti
 {
     *out = {};
     out->shadow = shadow_id(desktop_cpu_handle(title_handle));
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     out->records = view_records().size();
     out->materialized = view_materialized().size();
     out->ids = view_ids().size();
@@ -6691,7 +6694,7 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resou
     if (!w || w->own().kind != resource_kind) return FALSE;
     const u64 base = reinterpret_cast<u64>(w->own().title_memory);
     if (!base) return FALSE;
-    AcquireSRWLockShared(&note_lock);
+    note_lock_acquire(false);
     const bool indexed = resource_address_index().contains(base, static_cast<const Wrapper*>(w));
     ReleaseSRWLockShared(&note_lock);
     return indexed ? TRUE : FALSE;
@@ -6968,7 +6971,10 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
-    dump_pipeline("pipeline", N, desc, 0x300);
+    {
+        Timed dump_timed(time_pipe_dump);
+        dump_pipeline("pipeline", N, desc, 0x300);
+    }
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     if constexpr (N == 57) {
         if (x2w_local::env_on("X2W_REFUSE_FIXED_MESH") && is_fixed_mesh57_descriptor(desc)) {
@@ -6988,6 +6994,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (!*out) return E_OUTOFMEMORY;
     if constexpr (N == 67) {
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
+        Timed publish_timed(time_pipe_publish);
         if (const u64 key = publish_compute_request(desc)) {
             static_cast<Wrapper*>(*out)->own().compute_request_key = key;
             static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
@@ -7607,6 +7614,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);
+        }
+        {
+            char line[400];
+            if (note_lock_wait_line(line, sizeof(line))) log("%s", line);
         }
         {
             LARGE_INTEGER frequency;
