@@ -2427,6 +2427,7 @@ class Stage:
     raw_code = b''
     address_carry_pairs = ()
     address_carry_reader = None
+    numeric_mask_words = None
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -2621,6 +2622,8 @@ class Stage:
 
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
+        if self.numeric_mask_words and tok in self.numeric_mask_words:
+            return self.numeric_mask_words[tok]
         if tok == 'src_scc':
             # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
             # Refuse unless a modeled writer set SCC on the reaching path in this block.
@@ -2812,6 +2815,7 @@ class Stage:
             if re.search(r'\bvcc\b', rhs):
                 self.read_vcc()
             if assignment:
+                getattr(self, 'packable_masks', set()).discard('vcc')
                 if getattr(self, 'has_branches', False):
                     self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
                 if getattr(self, 'vcc_lost', False):
@@ -2995,6 +2999,7 @@ class Stage:
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'mask_high', set()).discard(n)
+        getattr(self, 'packable_masks', set()).discard(n)
         getattr(self, 'float_const_s', {}).pop(n, None)
         if isinstance(self.align4_s, set):
             if sym is not None and sym[0] == 'const':
@@ -3860,6 +3865,8 @@ class Stage:
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
+            self.packable_masks = set()  # compare results and copies proven to hold a guest lane's bit
+            self.uses_mask_shared = False
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
@@ -4887,8 +4894,8 @@ class Stage:
         place the tag moves. A compare or carry writes its single-word mask itself (the decoder
         names a wave64 compare destination s0, not s[0:1]); a mask-only scalar op (mov, bitwise, cselect, saveexec)
         copies the tag of its sources to its destination, both words of a b64 pair; any other write cleared the tag
-        already (set_s). self.masks holds the low word, self.mask_high the high word of a wave64 pair: no numeric read of
-        either is lowered (lower())."""
+        already (set_s). self.masks holds the low word, self.mask_high the high word of a wave64 pair.
+        Numeric reads are checked by lower()."""
         low, high = tags
         self.tag_compare_pair(base, ops)
         saveexec = base.startswith('s_') and 'saveexec' in base
@@ -4949,13 +4956,47 @@ class Stage:
                 return t.strip()
         return None
 
-    def lower(self, base, asm, ops, mods):
-        """Lower one instruction; a vector ALU form that reads a lane mask as a number is refused.
+    def packable_mask(self, tok):
+        """Whether tok holds the current lane's bit of a proven low mask word."""
+        if tok in ('exec', 'exec_lo'):
+            return getattr(self, 'exec_known', False)
+        if tok in ('vcc', 'vcc_lo'):
+            return 'vcc' in self.packable_masks
+        r = reg_range(tok)
+        return bool(r and r[0] == 's' and r[1] not in self.mask_high and r[1] in self.packable_masks)
 
-        The model keeps one lane's bit of a wave mask. A vector ALU source that reads the mask as a number (the
-        llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
-        The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
-        The check runs after the form's own refusals, so those keep their messages."""
+    def materialize_mask_words(self, base, sources):
+        """Collect one console wave's low word in guest lane order, independent of the host wave size."""
+        if (base not in ('s_mul_i32', 'v_sub_f32', 'v_mul_f32') or self.kind != 'cs'
+                or not self.quad_flow_straight() or not self.exec_known or self.wqm_exec):
+            return {}
+        x, y, z = self.pipe.group
+        count = x * y * z
+        if count > 32:
+            return {}
+        if base != 's_mul_i32':
+            sources = [self.split_neg(tok)[1].strip('|') for tok in sources]
+        if self.reads_mask_high(sources):
+            return {}
+        masks = [tok for tok in sources if self.is_lane_mask(tok)]
+        if any(not self.packable_mask(tok) or ':' in tok for tok in masks):
+            return {}
+        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        words = {}
+        for i, tok in enumerate(dict.fromkeys(masks)):
+            word = 'x2w_mask_%x_%d' % (self.pc, i)
+            bit = self.u(tok)
+            self.emit('x2w_mask_bits[%s] = (%s & 1u) << %s;' % (flat, bit, flat))
+            self.emit('GroupMemoryBarrierWithGroupSync();')
+            self.emit('uint %s = 0u;' % word)
+            self.emit('for (uint lane = 0u; lane < %du; ++lane) %s |= x2w_mask_bits[lane];' % (count, word))
+            self.emit('GroupMemoryBarrierWithGroupSync();')
+            words[tok] = word
+        self.uses_mask_shared = True
+        return words
+
+    def lower(self, base, asm, ops, mods):
+        """Keep mask operations lane-local and materialize proven low words for supported numeric reads."""
         self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
             return None
@@ -4968,15 +5009,35 @@ class Stage:
             skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
             high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
             masks = [high] if high else []
+        needs_word = bool(masks) and not self.lane_mask_exact()
+        words = (self.materialize_mask_words(base, ops[1:])
+                 if needs_word and len(ops) == 3 and hasattr(self, 'packable_masks') else {})
+        packable = getattr(self, 'packable_masks', None)
+        copied_mask = (packable is not None and self.kind == 'cs' and base in ('s_mov_b32', 's_mov_b64')
+                       and len(ops) == 2 and self.packable_mask(ops[1]))
+        if packable:
+            writes = scalar_destinations(base, asm)
+            if 'any' in writes:
+                packable.clear()
+            else:
+                packable.difference_update(writes)
         tags = self.mask_source_tags(base, ops)
-        result = self._lower(base, asm, ops, mods)
+        self.numeric_mask_words = words
+        try:
+            result = self._lower(base, asm, ops, mods)
+        finally:
+            self.numeric_mask_words = None
         for tok in destinations(base, ops):   # an overwritten register no longer holds a mask's high word
             r = reg_range(tok)
             if r and r[0] == 's':
                 getattr(self, 'mask_high', set()).difference_update(range(r[1], r[2] + 1))
-        if masks and not self.lane_mask_exact():
+        if needs_word and not words:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
+        if copied_mask:
+            dst = reg_range(ops[0])
+            if dst and dst[0] == 's' and dst[1] in self.masks:
+                packable.add(dst[1])
         return result
 
     def _lower(self, base, asm, ops, mods):
@@ -8963,9 +9024,8 @@ class Stage:
     # as that invocation's own bit: `vcc` / `sN` hold bit 0 of the wave mask, and a v_cmp stores `w` (all lanes active)
     # or `exec & w`, so an inactive lane's bit is already 0 in the variable. `v_writelane_b32 vN, M, k` copies the whole
     # wave mask into lane k whatever EXEC is, `v_readlane_b32 D, vN, k` copies it back to every lane, so a mask that is
-    # only ever used as a mask afterwards (reject_lane_mask_data and the mask rules refuse every numeric read of a marked
-    # register, vcc included) has, after the reload, each invocation's bit equal to its bit at the write: the spill is
-    # the identity on the per-invocation bit. The slot variable spN_k is therefore assigned the mask's own variable at
+    # only used as a mask afterwards (checked by require_mask_reads_only) has each invocation's bit equal to its bit
+    # at the write. The spill is the identity on the per-invocation bit, so spN_k is assigned the mask's own variable at
     # the write, in every invocation, and the reload copies it into the destination and marks it a mask again (or
     # assigns vcc for a `vcc_lo` destination). The slot proof of spill_join (written on every path, no loop-carried
     # read, no write in a region the wave runs while the invocation skips it; writes in s_cbranch_execz blocks are
@@ -10209,6 +10269,12 @@ class Stage:
             d = reg[1]
             self.set_s(d, expr)
             self.masks.add(d)
+        if not writes_exec and getattr(self, 'kind', None) == 'cs' and self.exec_known:
+            packable = getattr(self, 'packable_masks', set())
+            if dst in ('vcc', 'vcc_lo'):
+                packable.add('vcc')
+            elif dst not in ('exec', 'exec_lo'):
+                packable.add(d)
 
     def export(self, asm):
         # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
@@ -11928,6 +11994,8 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        if getattr(s, 'uses_mask_shared', False):
+            shared.append('groupshared uint x2w_mask_bits[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         if getattr(s, 'uses_quad_shared', False):
             shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
