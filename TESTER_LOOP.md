@@ -32,6 +32,10 @@ the zip it prints. It is not a release; upstream gets each piece through its own
 | 1D and 3D image_store | fork branch `c22-img-1d3d` | `d17d221a9` |
 | residency slice 1 (update) | fork branch `f4-residency-s1` | `5cc2a859c` |
 | per-reason SRV shape table | fork branch `c22-srv-shapes` | `3a826e171` |
+| tester pack: reasons in the report | fork branch `tester-pack-reasons` | `10a88f822` |
+| image_gather4_lz_o with a constant packed offset | fork branch `x2w-w5-gather-lz-o` | `0c5b82846` |
+| DPP in compute (w6) | fork branch `w6-dpp-cs` | `49bc35454` |
+| execz refusal names its cause (text only) | fork branch `c7-execz-cause` | `dd0d392e3` |
 | `tools/startup/tester_run.ps1`, `tools/startup/tester_pack.py` | this branch | its own tests: `startup_tester_pack`, `startup_tester_run_ps1` |
 
 Each merge into this branch is a merge commit that names the heads it took. Both PRs touch `tools/startup/run.sh`; the merge keeps both flags. Nothing is rebased or force-pushed.
