@@ -101,6 +101,7 @@ jobs:
               (["tests/startup_gfx2hlsl_cvt_pk_int16_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_scalar_null_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_scalar_null_check.py", "decode", "libLLVM-15.so.1"], {}),
+              (["tests/startup_gfx2hlsl_vector_readlane_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_global_load_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_global_load_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_cmp16_check.py", "binary", "llvm-mc-15", "llvm-objcopy-15"], {}),
@@ -283,6 +284,7 @@ jobs:
             tests/startup_gfx2hlsl_cvt_pk_u8_check.py \
             tests/startup_gfx2hlsl_cvt_pk_int16_check.py \
             tests/startup_gfx2hlsl_scalar_null_check.py \
+            tests/startup_gfx2hlsl_vector_readlane_check.py \
             tests/startup_compute_global_load_check.py \
             tests/startup_gfx2hlsl_cvt_off_f32_i4_check.py \
             tests/startup_gfx2hlsl_int_med3_check.py \

@@ -3735,6 +3735,9 @@ class Stage:
                         pending.extend(succ[block])
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
+        if getattr(self, 'kind', None) == 'cs':
+            self.readlane_entry_symbols = init_sym
+            self.__dict__.pop('readlane_uniform_inputs', None)
         init_exec_known = getattr(self, 'exec_known', True)
         init_narrow_only = getattr(self, 'exec_narrow_only', True)
         init_wqm_exec = getattr(self, 'wqm_exec', False)
@@ -3762,6 +3765,7 @@ class Stage:
             self.address_carry_reader = None
             uniform_vcc_compares = set()
             self.lines = []
+            self.uses_vector_readlane = False
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
@@ -9123,12 +9127,117 @@ class Stage:
                 raise Unsupported('%s: v%d is a lane spill written by v_writelane_b32' % (what, src[1]))
         self.set_s(dst[1], 'WaveReadLaneFirst(%s)' % self.u(ops[1]), uniform=False)
 
+    def group_uniform_readlane_inputs(self):
+        """Prove SCC branches and lane selectors independently of host-wave uniformity.
+
+        The shared exchange needs every invocation to follow the same PC, including
+        across loop back edges. Track only scalar operations on already uniform
+        inputs. Vector-derived words, including readlane results, never establish
+        group uniformity.
+        """
+        bounds, _, successors, _ = self.spill_cfg
+        entry = {'s%d' % n for n in self.entry_uniform_s}
+        entry.update('s%d' % n for n, sym in self.readlane_entry_symbols.items()
+                     if sym[0] in ('ud', 'ptr', 'ptrhi'))
+        instructions = []
+        for off, _, name, asm in self.ins:
+            base, ops, _ = parse(asm)
+            base = re.sub(r'_e(32|64)$', '', base)
+            reads, writes, may_write = scalar_effects(name, asm)
+            # A relative destination may clobber any SGPR, and a calculated jump
+            # is outside this proof's control-flow model.
+            if base.startswith(('s_movreld', 's_setpc', 's_swappc')):
+                return {}
+            scalar_load = re.fullmatch(r's_(?:buffer_)?load_dword(?:x(?:2|4|8|16))?', base)
+            compare = re.fullmatch(r's_cmpk?_(?:eq|lg|gt|ge|lt|le)_[iu]32', base)
+            pure = (base in SCA and not base.endswith('_b64')) or scalar_load or compare
+            if pure:
+                # The scalar effects helper conservatively lists SCC as a
+                # possible write for every SALU. Loads and these moves preserve it.
+                if scalar_load or base in ('s_mov_b32', 's_movk_i32'):
+                    may_write.discard('scc')
+                # Only ordinary SGPRs, immediate values and the absent SMEM offset
+                # can supply a proof. In particular exclude implicit mask inputs.
+                sources = ops if compare else ops[1:]
+                pure = all(re.fullmatch(r's(?:\d+|\[\d+:\d+\])|off|-?(?:0x[0-9a-fA-F]+|\d+)', tok)
+                           for tok in sources)
+            instructions.append((off, base, reads, writes, may_write, pure))
+
+        into = [entry] + [None] * (len(bounds) - 1)
+        proven = {}
+        changed = True
+        while changed:
+            changed = False
+            for block, (lo, hi) in enumerate(bounds):
+                if into[block] is None:
+                    continue
+                state = set(into[block])
+                for i in range(lo, hi):
+                    off, base, reads, writes, may_write, pure = instructions[i]
+                    if base.startswith('s_cbranch_') and (
+                            base not in ('s_cbranch_scc0', 's_cbranch_scc1') or 'scc' not in state):
+                        return {}
+                    if base == 'v_readlane_b32':
+                        proven[off] = frozenset(state)
+                    uniform_write = pure and reads <= state
+                    state.difference_update(may_write)
+                    if uniform_write:
+                        state.update(writes)
+                for target in successors[block]:
+                    new = state if into[target] is None else into[target] & state
+                    if new != into[target]:
+                        into[target], changed = new, True
+        return proven
+
+    def read_vector_lane(self, dst, src, select):
+        if not hasattr(self, 'readlane_uniform_inputs'):
+            self.readlane_uniform_inputs = self.group_uniform_readlane_inputs()
+        if select not in self.readlane_uniform_inputs.get(self.pc, ()):
+            raise Unsupported('v_readlane_b32 requires a group-uniform lane select and control flow')
+        if self.pipe.rw_keys:
+            raise Unsupported('v_readlane_b32 group-uniform proof requires read-only scalar load sources')
+        x, y, z = self.pipe.group
+        threads = x * y * z
+        wave = self.pipe.wave_size
+        if wave is None:
+            # For a group of at most 32, the populated lanes have the same
+            # numbering in either mode. Bit 5 selects an unpopulated lane in
+            # wave64 and aliases a low lane in wave32.
+            if threads <= 32 or wave32_exec_proof(self.ins):
+                wave = 32
+            else:
+                raise Unsupported('v_readlane_b32 requires a known guest wave size for groups larger than 32 threads')
+        if wave not in (32, 64):
+            raise Unsupported('v_readlane_b32 requires guest wave32 or wave64')
+        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        index = '((%s & ~%du) | (%s & %du))' % (flat, wave - 1, self.u(select), wave - 1)
+        self.uses_quad_shared = self.uses_vector_readlane = True
+        self.emit('x2w_quad[%s] = %s;' % (flat, self.u(src)))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        # Out-of-group lanes of a partial guest wave have no input value. Keep
+        # even a speculative memory access within the allocated shared array.
+        value = 'x2w_quad[%s]' % index
+        if threads % wave:
+            value = '(%s < %du ? x2w_quad[min(%s, %du)] : 0u)' % (index, threads, index, threads - 1)
+        self.set_s(dst, value, uniform=False)
+        # A subsequent exchange (including this site on the next iteration)
+        # must wait for every invocation to finish reading the previous values.
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+
     def op_v_readlane_b32(self, ops, mods):
         if len(ops) != 3 or reg_range(ops[1]) is None or reg_range(ops[1])[0] != 'v':
             raise Unsupported('v_readlane_b32 requires a VGPR source')
         lane = reg_range(ops[2])
         if lane and lane[0] == 's' and lane[1] == lane[2] and getattr(self, 'sym', {}).get(lane[1]) == ('first_lane',):
             self.read_first_lane(ops, mods)
+            return
+        dst, src = reg_range(ops[0]), reg_range(ops[1])
+        if (getattr(self, 'kind', None) == 'cs' and not mods and hasattr(self, 'readlane_entry_symbols')
+                and dst and dst[0] == 's' and dst[1] == dst[2] <= 103 and src[1] == src[2] <= 255
+                and lane and lane[0] == 's' and lane[1] == lane[2] <= 103
+                and not any(name.startswith('v_writelane_b32') and src == reg_range(next(iter(parse(asm)[1]), ''))
+                            for _, _, name, asm in self.ins)):
+            self.read_vector_lane(dst[1], ops[1], ops[2])
             return
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if getattr(self, 'has_branches', False):
@@ -11806,7 +11915,10 @@ class ComputePipeline(Pipeline):
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         if getattr(s, 'uses_quad_shared', False):
-            shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
+            threads = self.group[0] * self.group[1] * self.group[2]
+            if getattr(s, 'uses_vector_readlane', False) and shared and self.lds_words + threads > 8192:
+                raise Unsupported('v_readlane_b32 exchange and LDS exceed the 32 KiB group-shared limit')
+            shared.append('groupshared uint x2w_quad[%d];' % threads)
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
