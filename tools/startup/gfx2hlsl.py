@@ -8430,6 +8430,60 @@ class Stage:
         self.set_s(dst[1] + 1, '0u', ('const', 0))
         return None
 
+    def op_s_bitreplicate_b64_b32(self, ops, mods):
+        """Write each bit of a 32-bit source twice: D.u64 bit 2i and 2i+1 = S0 bit i; SCC unchanged (Run R, 3c50f16a).
+
+        RDNA 2 ISA SOP1 S_BITREPLICATE_B64_B32 (the same result as pixel_aot's s_bitreplicate_b64_b32). The low
+        destination dword holds the replicated source bits 15:0, the high dword bits 31:16. An integer inline
+        constant or a 32-bit literal is the 32-bit source and folds. Lane masks and a source that is also a
+        destination register are refused (the pair would be written before the second half reads the source).
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_bitreplicate_b64_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105 or dst[1] % 2:
+            raise Unsupported('s_bitreplicate_b64_b32 destination %s' % ops[0])
+        if any(r in self.masks for r in range(dst[1], dst[2] + 1)) or self.is_lane_mask(ops[0]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+
+        def replicate(word, shift):
+            folded = 0
+            for bit in range(16):
+                if (word >> (shift + bit)) & 1:
+                    folded |= 3 << (2 * bit)
+            return folded
+
+        def fold(word):
+            lo, hi = replicate(word, 0), replicate(word, 16)
+            self.set_s(dst[1], '0x%08xu' % lo, ('const', lo))
+            self.set_s(dst[1] + 1, '0x%08xu' % hi, ('const', hi))
+
+        if re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1]):
+            fold(int(ops[1], 0) & 0xffffffff)
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s' % ops[1])
+        if src[1] in self.masks or self.is_lane_mask(ops[1]):
+            raise Unsupported('s_bitreplicate_b64_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_bitreplicate_b64_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            fold(sym[1] & 0xffffffff)
+            return None
+        if dst[1] <= src[1] <= dst[2]:
+            raise Unsupported('s_bitreplicate_b64_b32 source %s is a destination register' % ops[1])
+        value = self.S(src[1])
+
+        def expr(shift):
+            return '(%s)' % ' | '.join('((%s & 0x%xu) != 0u ? 0x%xu : 0u)' % (value, 1 << (shift + bit), 3 << (2 * bit))
+                                       for bit in range(16))
+
+        self.set_s(dst[1], expr(0))
+        self.set_s(dst[1] + 1, expr(16))
+        return None
+
     def op_s_quadmask_b32(self, ops, mods):
         """Collapse each nibble of S0 to one bit of D; SCC = result != 0 (#1723).
 
