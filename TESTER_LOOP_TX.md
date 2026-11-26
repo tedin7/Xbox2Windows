@@ -1,5 +1,7 @@
 # Tester loop branch with the closed translator PRs (`tester-loop-tx`)
 
+Real-hardware testing by @Makto94.
+
 This branch is `tester-loop` plus the translator pull requests that were closed on 2026-11-26 without merging, so a
 tester run can compare the two branches on the same title. It is not a release and nothing here goes upstream from
 this branch. It follows `tester-loop`: each `tester-loop` push is merged in with a merge commit.
