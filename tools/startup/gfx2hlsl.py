@@ -2371,8 +2371,11 @@ class Stage:
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
     exec_known = False        # unit probes without __init__ customize this explicitly when needed
+    # Every EXEC write so far was a v_cmpx, which keeps only lanes the mask already had: EXEC is a subset of the entry mask.
+    exec_narrow_only = False
     has_image_writes = True   # proved False in translate() only when no image write exists in the dispatch
     loads_after_exec_write = ()  # compute loads reached from an EXEC writer through the block graph
+    loads_after_wide_exec_write = ()  # the same for a writer that is not a v_cmpx
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
@@ -2423,6 +2426,7 @@ class Stage:
             self.used_s, self.used_v = set(), set()
             self.used_atomic = set()
             self.exec_known = True    # exec still equals the entry mask (the lane is active)
+            self.exec_narrow_only = True
             self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
             self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
             self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
@@ -3670,27 +3674,31 @@ class Stage:
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
+        self.loads_after_wide_exec_write = set()
         all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
                 any(name in all_uniform_loads for _, _, name, _ in self.ins)):
             # A later block can reach an earlier load through one or more edges. exec_known only sees
             # instructions already translated. Follow the CFG, including paths outside a loop's textual range.
             bounds, _, succ, _ = self.spill_cfg
-            pending = []
-            for block, (lo, hi) in enumerate(bounds):
-                if any(writes_exec(name, parse(asm)[1]) for _, _, name, asm in self.ins[lo:hi]):
-                    pending.extend(succ[block])
-            visited = set()
-            while pending:
-                block = pending.pop()
-                if block not in visited:
-                    visited.add(block)
-                    lo, hi = bounds[block]
-                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
-                    pending.extend(succ[block])
+            for reached, wide_only in ((self.loads_after_exec_write, False), (self.loads_after_wide_exec_write, True)):
+                pending = []
+                for block, (lo, hi) in enumerate(bounds):
+                    if any(writes_exec(name, parse(asm)[1]) and not (wide_only and name.startswith('v_cmpx'))
+                           for _, _, name, asm in self.ins[lo:hi]):
+                        pending.extend(succ[block])
+                visited = set()
+                while pending:
+                    block = pending.pop()
+                    if block not in visited:
+                        visited.add(block)
+                        lo, hi = bounds[block]
+                        reached.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
+                        pending.extend(succ[block])
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
+        init_narrow_only = getattr(self, 'exec_narrow_only', True)
         init_wqm_exec = getattr(self, 'wqm_exec', False)
         init_masks = set(getattr(self, 'masks', ()))
         init_attrs = dict(getattr(self, 'attrs', {}))
@@ -3719,6 +3727,7 @@ class Stage:
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
+            self.exec_narrow_only = init_narrow_only
             self.wqm_exec = init_wqm_exec
             self.wqm_count, self.execcopy_epoch = 0, {}
             self.helper_restore = False
@@ -4473,8 +4482,11 @@ class Stage:
         # cannot reproduce it. Require the entry mask until the path proves a nonempty wave.
         vaddr = reg_range(ops[1]) if load_form and ops[1] != 'off' else None
         exprs = getattr(self, 'uniform_expr', None)
+        # A uniform address gives every active lane the same words, so the first active lane's value is the recomputed
+        # temporary whatever lanes a v_cmpx removed (an empty wave observes nothing); any other EXEC write ends the proof.
         recomputed = (load_form and getattr(self, 'past_entry', False) and exprs is not None
-                      and getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write)
+                      and (getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
+                           or getattr(self, 'exec_narrow_only', False) and self.pc not in self.loads_after_wide_exec_write))
         loaded_regs = ()
         if loaded or recomputed:
             candidate = reg_range(ops[0])
@@ -5900,7 +5912,7 @@ class Stage:
                     if isinstance(self.align4_v, set):
                         self.align4_v.clear()
                     return None
-                self.exec_known = False
+                self.exec_known = self.exec_narrow_only = False
                 if hasattr(self, 'lane_exec_breaks') and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms)):
                     # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
@@ -6033,7 +6045,7 @@ class Stage:
                     break
 
     def set_exec_scc(self, expr):
-        self.exec_known = False
+        self.exec_known = self.exec_narrow_only = False
         self.scc_effect = 'emitted'
         self.scc_verified = True
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
@@ -6257,7 +6269,7 @@ class Stage:
             # In wave32, exec_lo and vcc_lo hold the whole lane mask, as the generic scalar path reads them.
             mask = 'exec' if low[0].startswith('exec') else 'vcc'
             if mask == 'exec':
-                self.exec_known = False
+                self.exec_known = self.exec_narrow_only = False
             self.emit('%s = (%s) & 1;' % (mask, expr))
             return
         r = reg_range(low[0])
@@ -8634,7 +8646,7 @@ class Stage:
         for n in range(r[1], r[2] + 1):
             self.sym[n] = ('the saved mesh lane-0 mask',)
         self.emit('exec = (tid & 63u) == 0u ? 1u : 0u;')
-        self.exec_known = False
+        self.exec_known = self.exec_narrow_only = False
 
     def op_x2w_mesh_group(self, ops, mods):
         # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
