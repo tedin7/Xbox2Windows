@@ -331,6 +331,18 @@ void install()
     std::vector<unsigned char> head;
     struct { std::uint32_t version, call_bytes; u64 frequency; } header{2, sizeof(Call), static_cast<u64>(frequency.QuadPart)};
     append_chunk(head, "XREC", &header, sizeof(header), nullptr, 0);
+    // XENV: the process's X2W_ settings (name=value, NUL-separated), so a replay runs the stand-in as it ran here.
+    if (wchar_t* block = GetEnvironmentStringsW()) {
+        std::string settings;
+        for (const wchar_t* entry = block; *entry; entry += std::wcslen(entry) + 1) {
+            if (std::wcsncmp(entry, L"X2W_", 4) != 0 || std::wcsncmp(entry, L"X2W_REPLAY_RECORD", 17) == 0) continue;
+            char narrow[2048];
+            const int n = WideCharToMultiByte(CP_UTF8, 0, entry, -1, narrow, sizeof(narrow), nullptr, nullptr);
+            if (n > 0) settings.append(narrow, static_cast<std::size_t>(n));  // n counts the NUL
+        }
+        FreeEnvironmentStringsW(block);
+        append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
+    }
     write_raw(head.data(), head.size());
     armed = true;
     update_window();

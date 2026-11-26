@@ -332,6 +332,32 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     std::fflush(stdout);
 }
 
+// The recorded process's X2W_ settings (XENV), for every one this process does not set itself. Paths of the recording
+// machine (the shader cache, files and folders) are left out: the replay has its own.
+void apply_settings(const std::vector<std::string>& settings)
+{
+    int applied = 0, kept = 0;
+    for (const std::string& entry : settings) {
+        const std::size_t equals = entry.find('=');
+        if (equals == std::string::npos || equals == 0) continue;
+        const std::string name = entry.substr(0, equals), value = entry.substr(equals + 1);
+        const auto ends = [&](const char* tail) {
+            const std::size_t n = std::strlen(tail);
+            return name.size() >= n && name.compare(name.size() - n, n, tail) == 0;
+        };
+        if (name == "X2W_SHADER_CACHE" || name == "X2W_PRESENT_PICTURES" || ends("_DIR") || ends("_FILE") || ends("_PATH") ||
+            ends("_LOG"))
+            continue;
+        if (GetEnvironmentVariableA(name.c_str(), nullptr, 0)) {
+            ++kept;
+            continue;
+        }
+        SetEnvironmentVariableA(name.c_str(), value.c_str());
+        ++applied;
+    }
+    say("x2w-replay: %d recorded settings applied, %d already set here", applied, kept);
+}
+
 int run(const Options& o)
 {
     CreateDirectoryW(o.out.c_str(), nullptr);
@@ -342,15 +368,16 @@ int run(const Options& o)
         return 2;
     }
     SetStdHandle(STD_ERROR_HANDLE, log);
-    if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
-    if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
-        SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     Recording r;
     if (const std::string problem = read_recording(o.recording.c_str(), r); !problem.empty()) {
         say("x2w-replay: %s", problem.c_str());
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 2;
     }
+    apply_settings(r.settings);
+    if (!GetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", nullptr, 0)) SetEnvironmentVariableW(L"X2W_PRESENT_PICTURES", o.out.c_str());
+    if (!GetEnvironmentVariableW(L"X2W_SHADER_CACHE", nullptr, 0))
+        SetEnvironmentVariableW(L"X2W_SHADER_CACHE", (o.out + L"\\shader_cache").c_str());
     say("x2w-replay: %zu calls, %zu blobs, %llu presents marked, %s", r.steps.size(), r.blobs.size(), r.presents_marked,
         r.ended ? "ended" : "no end chunk (the recorded process stopped early)");
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;

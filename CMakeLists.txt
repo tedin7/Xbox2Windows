@@ -1374,7 +1374,9 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp
 # replay test records (tests/cmake/startup_replay.cmake).
 add_executable(x2w_replay src/replay/x2w_replay.cpp)
 target_compile_features(x2w_replay PRIVATE cxx_std_17)
-target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi)
+# Delay-loaded: the recording's settings (XENV) are in the environment before the stand-in reads any.
+target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp)
+target_link_options(x2w_replay PRIVATE /DELAYLOAD:d3d12_xs.dll)
 add_executable(startup_replay_quad tests/startup_replay_quad.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_replay_quad PRIVATE cxx_std_17)
 target_link_libraries(startup_replay_quad PRIVATE d3d12_xs_shim d3d12 dxgi)

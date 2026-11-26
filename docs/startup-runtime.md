@@ -1895,7 +1895,8 @@ closes, when `x2w_d3d12_replay_record_stop` is called, or when the process exits
 
 File: the capture chunk framing (tag, header bytes, data bytes): `XREC` (version, call record size, timer frequency),
 `CALL`, `ARGM` (seq, argument, depth, address, bytes, content hash), `BLOB` (hash, bytes, then the bytes),
-`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents).
+`OUTP` (seq, argument, wrapper), `PRES` (seq, present, seconds), `XEND` (calls, blobs, bytes, presents), and after
+`XREC` one `XENV`: the process's `X2W_` settings (`name=value`, NUL-separated, `X2W_REPLAY_RECORD*` left out).
 Version 2: a followed pointer's `ARGM` argument is the call's argument | 0x100 * (word index in its parent + 1), and its
 parent is the last `ARGM` of the same call with a depth one higher. When rcx is not an object (a struct-return buffer
 passed first, the object second), its memory after the call is `ARGM` argument 7.
@@ -1908,7 +1909,8 @@ GPU round trip per present. A recorded run and its replay write the same names.
 ### Replayer
 
 `x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--max-seconds S]` (built next to the stand-in) makes a
-device through the stand-in and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
+device through the stand-in (loaded late, after it has set every recorded `XENV` setting this process does not set
+itself, except paths: names ending in `_DIR`, `_FILE`, `_PATH`, `_LOG`, and the shader cache) and plays the recorded calls in sequence order on one thread. It writes `<out dir>\stderr.txt`
 (the stand-in's log), the present pictures (it sets `X2W_PRESENT_PICTURES` to the out dir unless it is set),
 `replay_summary.json` and one `x2w-replay score` line on stdout. Exit codes: 0 played to the end, 2 bad arguments or
 recording, 4 no device, 5 stopped at `--max-seconds`, 77 no adapter. `--mode`, `--threads` and `--from-present` are

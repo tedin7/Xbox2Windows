@@ -4,7 +4,8 @@
 
 startup_replay_quad draws an animated scene only through the stand-in and presents it every frame. Checked:
   - recorded run: X2W_PRESENT_PICTURES writes present_<nnnn>.png per present, and the pictures change over time;
-  - replay: x2w_replay writes the same picture names, every one equal to the recorded run's, every call played on an
+  - replay: with no X2W_ setting but the shader cache (the stand-in's settings travel in the recording), x2w_replay
+    writes the same picture names, every one equal to the recorded run's, every call played on an
     object it knows, and one "x2w-replay score" line;
   - control: the same recording with the last frame's clear colour changed in its memory replays to a different last
     picture, and the other pictures stay equal (the replay draws from the recording, and the comparison sees it).
@@ -99,6 +100,8 @@ def run(args, env):
 
 
 def replay(player, recording, out, backend, env):
+    # Only the shader cache from here: the stand-in's settings come from the recording (XENV).
+    env = {k: v for k, v in env.items() if not k.startswith("X2W_") or k == "X2W_SHADER_CACHE"}
     code, text = run([player, recording, out, "--adapter", backend], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""

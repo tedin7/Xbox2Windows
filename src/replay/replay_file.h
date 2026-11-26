@@ -58,6 +58,7 @@ struct Recording {
     u64 frequency = 0;
     std::vector<Step> steps;  // sorted by seq
     std::unordered_map<u64, Blob> blobs;
+    std::vector<std::string> settings;  // XENV: the recorded process's X2W_ settings, "name=value"
     u64 presents_marked = 0, end_calls = 0;
     bool ended = false;
 
@@ -134,6 +135,13 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&bytes, h + 8, 8);
             if (bytes != data_bytes) return "BLOB size mismatch at " + std::to_string(at);
             out.blobs[hash] = Blob{out.base + data_at, bytes};
+        } else if (name == "XENV") {
+            const char* text = reinterpret_cast<const char*>(out.base + data_at);
+            for (u64 i = 0; i < data_bytes;) {
+                const u64 length = strnlen(text + i, static_cast<std::size_t>(data_bytes - i));
+                if (length) out.settings.emplace_back(text + i, static_cast<std::size_t>(length));
+                i += length + 1;
+            }
         } else if (name == "PRES") {
             ++out.presents_marked;
         } else if (name == "XEND" && header_bytes >= 8) {
