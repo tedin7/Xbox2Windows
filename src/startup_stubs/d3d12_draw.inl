@@ -156,7 +156,7 @@ std::uint64_t process_ms()
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, desc_word };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     KeyUse use;                              // when a draw first and last used this pipeline key
@@ -605,15 +605,15 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
-        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2") {
-            // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
-            // so a translation whose stores would be silently skipped is never drawn (#1723).
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 &&
+                   line != "x2w-manifest 1" && line != "x2w-manifest 2" && line != "x2w-manifest 3") {
+            // Version 2 adds UAV bindings. Version 3 adds scalar descriptor entry words.
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (line == "dynamic_heap" || line == "dynamic_heap texture2d") {
             tr.dynamic_heap = true;
             tr.dynamic_texture_heap = line == "dynamic_heap texture2d";
-        } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
+        } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
             else if (!std::strcmp(source, "basevertex")) ud.kind = Translation::base_vertex;
@@ -622,6 +622,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
             else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
             else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
+            else if (!std::strcmp(source, "descword")) {
+                if (fields != 4 || x < 0 || x >= 16 || y < 0 || y % 4 != 0 ||
+                    static_cast<std::size_t>(i) != tr.uds.size()) {
+                    log("x2w-draw invalid descriptor word entry for %016llx", tr.key);
+                    return;
+                }
+                ud.kind = Translation::desc_word;
+            }
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
@@ -2610,7 +2618,8 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation, bool 
             if (ud.kind == Translation::stride && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
                 (translation.srvs[ud.a].source == 0 || (indexed && translation.srvs[ud.a].source == 1)) &&
                 translation.srvs[ud.a].kind == 0) continue;
-            if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16)
+            if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16 &&
+                ud.kind != Translation::desc_word)
                 return false;
         }
     }
@@ -2622,6 +2631,7 @@ constexpr const char* pipeline_or_target_unavailable = "pipeline_or_target_unava
 constexpr const char* translation_not_ready = "translation_not_ready";
 constexpr const char* d16_srv_not_ready = "d16_srv_not_ready";
 constexpr const char* formatted_buffer_not_ready = "formatted_buffer_not_ready";
+constexpr const char* descriptor_word_not_ready = "descriptor_word_not_ready";
 constexpr const char* missing_guest_root = "missing_guest_root";
 constexpr const char* live_compute_pipeline = "live_compute_pipeline";
 constexpr const char* unsupported_resource_or_entry = "unsupported_resource_or_entry";
@@ -3219,6 +3229,23 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
     return true;
 }
 
+// Numeric scalar descriptor expressions read the original table words as entry constants.
+bool read_descriptor_entry_words(const Translation& tr, const Pass& pass, std::uint32_t (&values)[32])
+{
+    for (std::size_t i = 0; i < tr.uds.size(); ++i) {
+        const auto& ud = tr.uds[i];
+        if (ud.kind != Translation::desc_word) continue;
+        const auto& table = pass.view_tables[ud.a];
+        const u64 entry = table.record(static_cast<u64>(ud.b), sizeof(values[i]));
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(values[i]))) {
+            log("x2w-draw %016llx: descriptor word unavailable at table %d byte %d", tr.key, ud.a, ud.b);
+            return false;
+        }
+        std::memcpy(&values[i], reinterpret_cast<const void*>(entry), sizeof(values[i]));
+    }
+    return true;
+}
+
 struct PixelUavBinding {
     ID3D12Resource* resource = nullptr;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
@@ -3495,6 +3522,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
         draw_lock_release_exclusive();
         return not_drawn(pass, list, not_drawn_key, 1);
+    }
+    std::uint32_t descriptor_words[32] = {};
+    if (!read_descriptor_entry_words(*tr, pass, descriptor_words)) {
+        if (indirect) indirect->set_refusal("descriptor entry word unavailable", indirect_refusal_code::descriptor_word_not_ready);
+        draw_lock_release_exclusive();
+        return not_drawn(1);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
@@ -4178,7 +4211,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
-            : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
+            : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3]
+            : ud.kind == Translation::desc_word ? descriptor_words[i] : 0;
     }
     phases.to(4);
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
