@@ -271,6 +271,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME xmem_lazy_commit_off COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_commit_check.py" "$<TARGET_FILE:xmem_shim>" off)
     set_tests_properties(xmem_lazy_commit_off PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=0")
+    # probe_readable on untouched lazy pages commits ahead instead of faulting once per 64 KiB slot.
+    add_executable(probe_readable_lazy_check tests/probe_readable_lazy_check.cpp)
+    target_include_directories(probe_readable_lazy_check PRIVATE src)
+    target_compile_features(probe_readable_lazy_check PRIVATE cxx_std_17)
+    add_dependencies(probe_readable_lazy_check xmem_shim)
+    add_test(NAME probe_readable_lazy COMMAND probe_readable_lazy_check "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(probe_readable_lazy PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     add_test(NAME xmem_lazy_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_startup_check.py" "$<TARGET_FILE:xmem_shim>")
     set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE
