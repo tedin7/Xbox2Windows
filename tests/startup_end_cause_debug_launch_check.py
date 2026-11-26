@@ -9,7 +9,7 @@ The source-built probe is hosted by the real debugger, once per way out; the log
   stop file       a `stop` file is written from outside            -> "stopped by request"
   exited          the title returns 0 by itself                    -> "title exited by itself"
   killed          the title process is killed from outside         -> "title killed externally"
-  crashed         the title raises an access violation             -> "title crashed (exit code 0xC0000005"
+  crashed         the title raises an access violation             -> "access violation (0xc0000005)"
   watchdog        stall_watchdog.py writes the stop file           -> "watchdog at"
 
 Every line ends with the last present milestone ("last present"), which a probe without a heartbeat reports as none.
@@ -97,7 +97,7 @@ def main(probe):
 
         process, logdir = host(probe, work, "crashed", "crash", 30)
         output = finish(process)
-        got["crashed"] = (cause(logdir), "title crashed (exit code 0xC0000005")
+        got["crashed"] = (cause(logdir), "access violation (0xc0000005)")
 
         process, logdir = host(probe, work, "watchdog", "sleep", 60)
         watchdog = subprocess.Popen([sys.executable, "-B", str(TOOLS / "stall_watchdog.py"), str(logdir), "--parent", str(process.pid),
