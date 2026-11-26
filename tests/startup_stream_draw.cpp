@@ -449,6 +449,10 @@ int draw_walk_threads(ID3D12Device* desktop, void* guest, void* pso, const char*
         invoke(frames[i].list, 36, 0, table);
     }
 
+    // Start the lock-report interval without presenting a surface.
+    if (FAILED(static_cast<HRESULT>(invoke(frames[0].queue, 32, 0, 0, 0)))) return 49;
+    const auto report_at = GetTickCount64() + 5100;
+
     // Warm the translation and PSO before entering the measured draws.
     invoke(frames[0].list, 12, 3, 1);
     const float clear[] = {0, 0, 1, 1};
@@ -471,6 +475,10 @@ int draw_walk_threads(ID3D12Device* desktop, void* guest, void* pso, const char*
         });
     }
     for (unsigned i = 0; i < threads; ++i) workers[i].join();
+
+    // Present prints the lock report after a five-second interval.
+    while (GetTickCount64() < report_at) Sleep(10);
+    if (FAILED(static_cast<HRESULT>(invoke(frames[0].queue, 32, 0, 0, 0)))) return 50;
 
     for (unsigned i = 0; i < target_count; ++i) {
         auto& frame = frames[i];

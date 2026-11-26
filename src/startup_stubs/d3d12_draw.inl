@@ -225,6 +225,7 @@ SRWLOCK draw_lock = SRWLOCK_INIT;
 // wait with short holds a queue of threads.
 struct DrawLockStats {
     volatile LONG64 wait_calls, wait_ticks, wait_max, wait_over_5ms, hold_calls, hold_ticks, hold_max, hold_over_5ms;
+    volatile LONG64 shared_walk_holds;
 };
 DrawLockStats draw_lock_stats;
 LONG64 draw_lock_held_since;  // QPC tick of the current exclusive holder; written only by that holder
@@ -262,6 +263,16 @@ inline void draw_lock_release_exclusive()
     if (held * 200 > frequency.QuadPart) InterlockedIncrement64(&draw_lock_stats.hold_over_5ms);
     ReleaseSRWLockExclusive(&draw_lock);
 }
+// The shared graphics binding walk has its own hold count so the heartbeat can
+// show how often recording uses this lock path alongside the exclusive timings.
+struct SharedDrawWalkLock {
+    SharedDrawWalkLock() { AcquireSRWLockShared(&draw_lock); }
+    ~SharedDrawWalkLock()
+    {
+        InterlockedIncrement64(&draw_lock_stats.shared_walk_holds);
+        ReleaseSRWLockShared(&draw_lock);
+    }
+};
 // Where a translated Dispatch spends its time under draw_lock: 0 translation lookup and checks, 1 the descriptor walk, 2 entry values,
 // 3 texture sync, 4 descriptor writes and recording. Started after the lock is held, ended when it is released.
 volatile LONG64 dispatch_phase_ticks[5], dispatch_phase_max[5];
@@ -362,11 +373,14 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
                  wm = InterlockedExchange64(&draw_lock_stats.wait_max, 0), wo = InterlockedExchange64(&draw_lock_stats.wait_over_5ms, 0),
                  hc = InterlockedExchange64(&draw_lock_stats.hold_calls, 0), ht = InterlockedExchange64(&draw_lock_stats.hold_ticks, 0),
                  hm = InterlockedExchange64(&draw_lock_stats.hold_max, 0), ho = InterlockedExchange64(&draw_lock_stats.hold_over_5ms, 0);
-    if (!wc && !hc) return false;
-    std::snprintf(out, size, "x2w-render draw_lock since the last report (exclusive): waits %lld calls, %.1f ms total, max %.1f ms, %lld over 5 ms; "
+    const LONG64 shared = InterlockedExchange64(&draw_lock_stats.shared_walk_holds, 0);
+    if (!wc && !hc && !shared) return false;
+    const int used = std::snprintf(out, size, "x2w-render draw_lock since the last report (exclusive): waits %lld calls, %.1f ms total, max %.1f ms, %lld over 5 ms; "
                   "holds %lld, %.1f ms total, max %.1f ms, %lld over 5 ms",
                   static_cast<long long>(wc), wt / per_ms, wm / per_ms, static_cast<long long>(wo),
                   static_cast<long long>(hc), ht / per_ms, hm / per_ms, static_cast<long long>(ho));
+    if (shared && used >= 0 && static_cast<std::size_t>(used) < size)
+        std::snprintf(out + used, size - used, "; shared draw walk holds %lld", static_cast<long long>(shared));
     return true;
 }
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
@@ -2934,10 +2948,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     std::optional<std::array<DrawTableRead, pixel_uav_limit>> uav_reads;
     const Translation* walked = nullptr;
     if (walk_shared_enabled()) {
-        struct SharedDrawLock {
-            SharedDrawLock() { AcquireSRWLockShared(&draw_lock); }
-            ~SharedDrawLock() { ReleaseSRWLockShared(&draw_lock); }
-        } shared;
+        SharedDrawWalkLock shared;
         walked = ready_draw_walk_translation(pass);
         if (walked) {
             auto& reads = table_reads.emplace();
@@ -3112,8 +3123,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
-    static const bool measure_walk = GetEnvironmentVariableA("X2W_TEST_WALK_THREADS", nullptr, 0) != 0;
-    UINT shared_table_reads = 0, exclusive_table_reads = 0;
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
@@ -3143,10 +3152,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         DrawTableRead local_read{};
         const bool use_shared_read = shared_tables != nullptr;
         if (!use_shared_read && !formatted.entry) read_draw_table(pass, srv, local_read);
-        if (measure_walk && srv.source == 0) {
-            if (use_shared_read) ++shared_table_reads;
-            else ++exclusive_table_reads;
-        }
         const auto& table = use_shared_read ? shared_tables[i] : local_read;
         const u64 entry = formatted.entry ? formatted.entry : table.entry;
         const auto& words = formatted.entry ? formatted.words : table.words;
@@ -3684,8 +3689,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
-    if (measure_walk)
-        log("x2w-draw table reads: %u shared, %u exclusive", shared_table_reads, exclusive_table_reads);
     if (indirect) return drawn;
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";

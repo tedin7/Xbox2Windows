@@ -12,7 +12,7 @@ same ready translation before consuming the snapshot.
 | Title-owned descriptor bytes | The title keeps the table backing alive and synchronizes writes to the entries it binds. The shim bounds-checks the entry and probes readability before copying it. Neither lock synchronizes external writes to title memory. |
 | `view_records()` and its backing storage | Shared `note_lock` while copying the indexed record, nested inside `draw_lock` in the existing order. The capture path publishes records under exclusive `note_lock`. |
 | `note_lock` wait counters | The existing interlocked counters record each acquisition. |
-| Descriptor and view snapshots and fixture counts | Local to the recording call. Resource identities copied from records are resolved during the exclusive phase. |
+| Descriptor and view snapshots | Local to the recording call. Resource identities copied from records are resolved during the exclusive phase. |
 
 The exclusive phase also performs texture materialization, resource state and
 lifetime bookkeeping, PSO creation, binding cache inserts, descriptor writes,
@@ -22,17 +22,19 @@ resolution retain their existing synchronization.
 The fixture in `startup_stream_consumer` records the same 16 draws on one, two
 and four recording threads. Four targets carry distinct CBVs and every measured
 draw covers its own column. The check compares all 128 pixels to the single
-thread reference and to the expected colors. With the switch off it expects one
-SRV table binding per measured draw to go through the exclusive walk. With the
-switch on it expects zero. Each successful draw still takes the exclusive lock
-for mutation and emission. The check measures where the table walk runs and
-does not measure FPS or elapsed lock time.
+thread reference and to the expected colors. Two empty Presents start the
+report interval and emit the existing `draw_lock` heartbeat. The fixture
+expects 17 shared draw walk holds with the switch on, including the warm-up,
+and zero with the switch off. Each successful draw still takes the exclusive
+lock for mutation and emission. The shared hold count includes lookups that
+miss the ready cache.
 
 ```powershell
 ctest --preset dev --no-tests=error -R "^startup_draw_walk_threads_(warp|hardware)$" -V
 ```
 
-The fixture's pre-change control is two or four workers with the switch off:
-the output must match, and the exclusive walk count must remain one. The
-enabled case requires the same output and rejects those exclusive walk counts.
+For the exclusive-walk mutant, replace the `SharedDrawWalkLock` guard at the
+snapshot site with a guard that calls `draw_lock_acquire_exclusive()` and
+`draw_lock_release_exclusive()`. Leave the snapshot and emission code in place.
+The enabled case should still match the pixels and fail at zero shared holds.
 Windows execution is pending.

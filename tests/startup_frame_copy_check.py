@@ -119,6 +119,20 @@ def check_once(directory, consumer, backend):
     return 0
 
 
+def check_walk_report(log, enabled):
+    if "x2w-draw table reads:" in log:
+        raise AssertionError("obsolete per-draw table-read log")
+    reports = re.findall(r"x2w-render draw_lock since the last report \(exclusive\):[^\r\n]*", log)
+    if len(reports) != 1:
+        raise AssertionError(f"expected one draw_lock report, got {reports}")
+    shared = re.search(r"; shared draw walk holds (\d+)$", reports[0])
+    holds = int(shared[1]) if shared else 0
+    expected = 17 if enabled else 0  # One warm-up draw, then four draws on each of four targets.
+    if holds != expected:
+        raise AssertionError(f"switch {enabled}: expected {expected} shared draw walk holds, got {holds}")
+    return holds
+
+
 def check_walk(directory, consumer, backend):
     log = directory / "trap.log"
     env, args, output = prepare_draw_cache(directory, consumer, HLSL, {
@@ -142,13 +156,9 @@ def check_walk(directory, consumer, backend):
         if reference is None:
             reference = actual
         assert actual == expected == reference, f"{threads} threads, switch {enabled}: target pixels differ"
-        reads = re.findall(r"x2w-draw table reads: (\d+) shared, (\d+) exclusive",
-                           log.read_text(errors="replace"))
-        # The first draw warms the cache, then each of four targets is drawn four times.
-        want = (str(enabled), str(1 - enabled))
-        assert len(reads) == 17 and reads[1:] == [want] * 16, (threads, enabled, reads)
+        holds = check_walk_report(log.read_text(errors="replace"), enabled)
         print(f"{backend}: {threads} recording threads, switch {enabled}, "
-              f"128 exact pixels and {1 - enabled} exclusive table reads per measured draw")
+              f"128 exact pixels and {holds} shared draw walk holds")
     return 0
 
 
