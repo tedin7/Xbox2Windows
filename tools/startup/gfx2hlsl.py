@@ -4891,17 +4891,21 @@ class Stage:
                 src_neg_abs.append((neg, absolute, base_tok))
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
-        if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
-            raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
-        if not getattr(self, 'wqm_exec', False):
-            raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
-                              'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
-        self.note_quad_flow(base)
-        self.needs_sm6 = True
+        compute = getattr(self, 'kind', None) == 'cs'
+        if compute:
+            self.compute_quad_gate(base)
+        else:
+            if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
+                raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+            if not getattr(self, 'wqm_exec', False):
+                raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
+                                  'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+            self.note_quad_flow(base)
+            self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
             neg0, abs0, base0 = src_neg_abs[0]
-            swapped = '%s(%s)' % (intrinsic, self.u(base0))
+            swapped = self.quad_source(intrinsic, self.u(base0), compute)
             first = 'F(%s)' % swapped
             if abs0:
                 first = 'abs(%s)' % first
@@ -4909,10 +4913,37 @@ class Stage:
                 first = '(-%s)' % first
             args = [first] + [self.f(o) for o in ops[2:1 + arity]]
         else:
-            swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+            swapped = self.quad_source(intrinsic, self.u(ops[1]), compute)
             args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+        if compute:
+            self.emit('GroupMemoryBarrierWithGroupSync();')  # the next exchange may rewrite the array
+
+    def compute_quad_gate(self, base):
+        """A DPP quad swap in a compute program is exchanged through groupshared memory (no quad intrinsic: SM 6 leaves the
+        quad of a compute thread to the implementation). Lane i of an aligned group of four reads lane perm[i] (RDNA 2 ISA,
+        DPP16 quad_perm); a wave holds 32 or 64 consecutive threads in x-major order, so lane bits 1:0 are the bits 1:0
+        of the flat thread index whatever the wave size. Taken only when every thread reaches the exchange with exec equal
+        to the entry mask (straight-line code, no exec write: the barrier is then uniform and each source lane is active)
+        and the group is made of whole quads."""
+        x, y, z = self.pipe.group
+        if x * y * z % 4:
+            raise Unsupported('%s_dpp in a compute program requires a group of whole quads (a multiple of 4 threads)' % base)
+        if not self.quad_flow_straight() or not getattr(self, 'exec_known', False):
+            raise Unsupported('%s_dpp requires a straight-line compute program with entry EXEC' % base)
+
+    def quad_source(self, intrinsic, source, compute):
+        """Expression for the exchanged lane word. Pixel stage: the SM 6 quad intrinsic. Compute: write this thread's word to
+        a groupshared slot, wait for the group, and read the slot of the lane the swap names."""
+        if not compute:
+            return '%s(%s)' % (intrinsic, source)
+        x, y, _z = self.pipe.group
+        flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+        self.uses_quad_shared = True
+        self.emit('x2w_quad[%s] = %s;' % (flat, source))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        return 'x2w_quad[%s ^ %du]' % (flat, {'QuadReadAcrossX': 1, 'QuadReadAcrossY': 2, 'QuadReadAcrossDiagonal': 3}[intrinsic])
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
@@ -10463,6 +10494,8 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        if getattr(s, 'uses_quad_shared', False):
+            shared.append('groupshared uint x2w_quad[%d];' % (self.group[0] * self.group[1] * self.group[2]))
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
