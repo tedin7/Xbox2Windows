@@ -32,3 +32,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_replay_submit_pages_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+# A synthetic compute dispatch writes to a placed UAV that aliases title memory.
+if(TARGET startup_stream_consumer AND TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}" AND DXC_EXECUTABLE)
+    foreach(backend warp hardware)
+        add_test(NAME startup_replay_compute_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_replay_compute_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "$<TARGET_FILE:x2w_replay>" "${DXC_EXECUTABLE}" "${backend}")
+        set_tests_properties(startup_replay_compute_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

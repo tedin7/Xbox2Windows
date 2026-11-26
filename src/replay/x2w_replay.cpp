@@ -3,7 +3,8 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S]
+//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]
+// --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
 // pages could not be reserved at its address, 4 the stand-in made no device, 5 stopped at --max-seconds, 77 no D3D12 adapter.
@@ -26,6 +27,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -57,6 +59,7 @@ struct Options {
     std::wstring recording, out;
     bool hardware = false;
     double max_seconds = 0;
+    u64 dump_address = 0, dump_bytes = 0;
 };
 
 struct HeapInfo {
@@ -390,6 +393,34 @@ int pick_adapter(bool hardware, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter)
     }
 }
 
+bool parse_dump(const std::wstring& value, Options& o)
+{
+    const auto colon = value.find(L':');
+    if (colon == std::wstring::npos || colon == 0 || colon + 1 == value.size()) return false;
+    const auto address = value.substr(0, colon);
+    const auto digits = address.compare(0, 2, L"0x") == 0 || address.compare(0, 2, L"0X") == 0 ? 2u : 0u;
+    if (digits == address.size() || address.find_first_not_of(L"0123456789abcdefABCDEF", digits) != std::wstring::npos ||
+        value.find_first_not_of(L"0123456789", colon + 1) != std::wstring::npos) return false;
+    errno = 0;
+    o.dump_address = _wcstoui64(address.c_str(), nullptr, 16);
+    if (errno == ERANGE || !o.dump_address) return false;
+    o.dump_bytes = _wcstoui64(value.c_str() + colon + 1, nullptr, 10);
+    return o.dump_bytes && o.dump_bytes <= (u64{64} << 20);
+}
+
+bool dump_title_range(const Options& o)
+{
+    const std::wstring path = o.out + L"\\dump.bin";
+    if (std::FILE* out = _wfopen(path.c_str(), L"wb")) {
+        const auto bytes = static_cast<std::size_t>(o.dump_bytes);
+        const bool wrote = std::fwrite(reinterpret_cast<const void*>(o.dump_address), 1, bytes, out) == bytes;
+        if (std::fclose(out) == 0 && wrote) return true;
+        DeleteFileW(path.c_str());
+    }
+    say("x2w-replay: could not write %ls", path.c_str());
+    return false;
+}
+
 bool parse(int argc, wchar_t** argv, Options& o)
 {
     if (argc < 3) return false;
@@ -400,6 +431,9 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--dump") {
+            if (!parse_dump(value, o)) return false;
+        }
         else if (name == L"--mode" || name == L"--threads" || name == L"--from-present") say("x2w-replay: %ls %ls is not in version 1 (ignored)", name.c_str(), value.c_str());
         else return false;
     }
@@ -516,6 +550,10 @@ int run(const Options& o)
         std::printf("x2w-replay: %s\n", problem.c_str());
         return 3;
     }
+    if (o.dump_bytes && !page_replay().reserved(o.dump_address, o.dump_bytes)) {
+        say("x2w-replay: dump range 0x%llx + %llu is outside the recording's title pages", o.dump_address, o.dump_bytes);
+        return 3;
+    }
     {
         u64 shader_bytes = 0, reserved = 0;
         for (const ShaderFile& f : r.shader_files) shader_bytes += f.content.bytes;
@@ -565,6 +603,16 @@ int run(const Options& o)
         play(p, r, s);
     }
     current_step = nullptr;
+    bool dump_ok = true;
+    if (!stopped && o.dump_bytes) {
+        phase = "dumping title memory";
+        if (p.fence_timeouts) {
+            say("x2w-replay: cannot dump title memory after a fence timeout");
+            dump_ok = false;
+        } else {
+            dump_ok = dump_title_range(o);
+        }
+    }
     phase = "writing the last pages";
     if (!stopped)  // the pages recorded after the last call
         apply_pages_before(r, ~0ull, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
@@ -574,7 +622,7 @@ int run(const Options& o)
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     write_summary(o, p, r, wall, stopped);
-    return stopped ? 5 : 0;
+    return stopped ? 5 : dump_ok ? 0 : 2;
 }
 
 }  // namespace
@@ -585,7 +633,7 @@ int wmain(int argc, wchar_t** argv)
     x2w_replay::Options options;
     if (!x2w_replay::parse(argc, argv, options)) {
         std::fprintf(stderr, "usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] "
-                             "[--threads N|recorded] [--from-present K] [--max-seconds S]\n");
+                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]\n");
         return 2;
     }
     return x2w_replay::run(options);

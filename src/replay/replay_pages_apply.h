@@ -24,11 +24,13 @@ struct PageReplay {
     std::size_t next_map = 0;
     u64 maps_applied = 0, pages_written = 0, zero_pages = 0, missing_pages = 0, bad_maps = 0;
 
-    bool reserved(u64 address) const
+    bool reserved(u64 address, u64 bytes = 1) const
     {
         const auto at = std::upper_bound(spans.begin(), spans.end(), address,
                                          [](u64 a, const ReservedSpan& s) { return a < s.base; });
-        return at != spans.begin() && address < std::prev(at)->end;
+        if (at == spans.begin()) return false;
+        const u64 end = std::prev(at)->end;
+        return address < end && bytes <= end - address;
     }
 };
 
