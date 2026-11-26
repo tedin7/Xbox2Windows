@@ -587,7 +587,8 @@ def check_request_code_files():
         run = tmp / "run"
         run.mkdir()
         make_run(run, 1)
-        write(run, "stderr.txt", "\n".join(stderr).encode() + b"\n" + bytes(random.Random(4).randrange(256) for _ in range(700 * 1024)))
+        noise = random.Random(4)
+        write(run, "stderr.txt", "\n".join(stderr).encode() + b"\n" + bytes(noise.randrange(256) for _ in range(700 * 1024)))
         parts = T.pack(str(run), MANIFEST, str(tmp / "p.zip"), T.MANIFEST_ROOM + 300 * 1024, chunk_bytes=128 * 1024, cache_dir=str(cache))
         assert len(parts) >= 3, len(parts)
         with zipfile.ZipFile(parts[0][0]) as z:
