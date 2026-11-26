@@ -15299,12 +15299,34 @@ It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
 uav N tex2da float table P O channels 4 in the version 2 manifest.
 The [startup runtime array UAV binding](experiments/startup-compute-array-uav.md)
 consumes this manifest for full-mask FP32 and packed D16 compute stores.
-Pixel arrays and the 1D, 3D and cube store forms remain refused.
+Full-mask FP32 compute stores also support 1D and 3D views.
 
 The standalone GPU fixture writes the same four words into mip zero of layer 1
 and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
 64 differences with the store omitted and 128 with the layer changed. Use the
 startup_compute_image_store CTests above to repeat the comparison.
+
+For FP32 stores with DMASK `0x1` through `0xe`, the startup compute translator
+reads the texel through the same UAV, replaces the selected channels in
+consecutive VDATA order, and writes it back under EXEC. This covers 1D, 2D,
+2D-array and 3D output views. The version 2 manifest adds `uavload N` for
+each affected output. Dispatch requires typed UAV load and store support for
+the bound format. [D3D12 typed UAV load support](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads)
+
+The read-modify-write assumes exclusive texel ownership by each active lane,
+including across groups and through aliasing UAV views, for the duration of
+the operation. The translator does not prove ownership. Lanes that write
+different channels of the same texel can lose updates. A partial D16 store
+remains unsupported.
+
+The WARP fixtures dispatch two groups against an RGBA32_FLOAT UAV. They compare
+every channel of every texel, including untouched mips and slices, against a
+CPU reference for each of the 14 masks on all four shapes. Each control
+replaces the typed load with zero and must fail at the first preserved channel.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_image_store_partial_(1d|2d|array|3d)_warp$' -V
+```
 
 ### Explicit-LOD 2D gather
 

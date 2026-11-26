@@ -27,6 +27,7 @@ struct ComputeTranslation {
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
+        bool load = false;  // typed UAV load for a partial image store
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -188,6 +189,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().dimension = 3;
         }
+        else if (std::sscanf(line.c_str(), "uavload %u%n", &i, &used) == 1 && whole() &&
+                 i < tr.uavs.size() && tr.uavs[i].texture && !tr.uavs[i].load)
+            tr.uavs[i].load = true;
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
         else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
@@ -437,8 +441,15 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            // One state per resource here: a texture read and written by the same call is refused. Two outputs
-            // of one texture (two mips) share the unordered access state.
+            if (!reason && slot.load) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+                auto* device = device_of(self->own().list_device);
+                const unsigned bits = FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                                         sizeof(support))) ? 0 : support.Support2;
+                reason = x2w_startup::pixel_uav_support_reason(bits, true);
+            }
+            // A texture bound as both SRV and UAV is refused. A typed load through its own UAV uses the same state.
+            // Two outputs of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
