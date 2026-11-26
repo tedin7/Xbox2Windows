@@ -355,6 +355,15 @@ LONG WINAPI note_crash(EXCEPTION_POINTERS* e)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Only slots wired to the stand-in's struct-return receiver accept an object in RDX.
+// Other calls can leave a live wrapper in that register even when they take no arguments.
+bool accepts_buffer_first(const CallRecord& call)
+{
+    if (call.kind == device_kind) return call.slot == 25 || call.slot == 26 || call.slot == 108;
+    if (call.kind == descriptor_heap_kind) return call.slot == heap_cpu_start || call.slot == heap_gpu_start;
+    return call.kind == resource_kind && call.slot == resource_get_desc;
+}
+
 // Plays one call. false: its object was never seen (skipped).
 bool play(Player& p, const Recording& r, const Step& step)
 {
@@ -363,7 +372,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     Played call{&step};
     if (const auto object = p.objects.find(c.object); object != p.objects.end()) {
         call.self = object->second;
-    } else if (const auto second = p.objects.find(c.args[0]); second != p.objects.end()) {
+    } else if (const auto second = p.objects.find(c.args[0]); accepts_buffer_first(c) && second != p.objects.end()) {
         call.self = second->second;  // (return buffer, object): the struct-return form the stand-in accepts too
         call.buffer_first = true;
     } else {
