@@ -7546,7 +7546,7 @@ class Stage:
                 continue
             # IMAGE_STORE always uses integer texel coordinates, so unorm is a no-op like on image_load.
             if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')
-                    or (m == 'a16' and mods.count('a16') == 1)):
+                    or (m == 'a16' and mods.count('a16') == 1 and self.kind == 'ps')):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
         # a16 packs 16-bit texel coordinates two to a VGPR (x in the low half, y in the high half). Only the 2D form
