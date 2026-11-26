@@ -32,13 +32,16 @@ inline std::size_t used_length(const void* data, std::size_t bytes, std::size_t 
     return rounded < bytes ? rounded : bytes;
 }
 
-// The backwards scan is a pass over the whole range when the tail is zero (about 3 ms for 16 MiB, more than the copy it saves), so
+// The backwards scan is a pass over the whole range when the tail is zero (about 3 ms for 16 MiB, more than the copy it saves).
+// The per-frame cache below is OFF by default: nothing tells the runtime when the title writes into a buffer, so a cached length can
+// miss data written between two draws of a frame (the shader would read zero). It stays as an opt-in for a caller that has a
+// write signal. (original comment:)
 // it is done once per frame per (address, size). Later draws of the frame re-check only where a writer would grow the data: the
 // 64 KiB after the cached length and the last 4 KiB of the range; a non-zero byte there rescans. Data written elsewhere in the
 // tail after the first draw of a frame is picked up on the next frame.
 class ZeroTailCache {
 public:
-    std::size_t length(std::uint64_t frame, const void* data, std::size_t bytes, bool use_cache = true)
+    std::size_t length(std::uint64_t frame, const void* data, std::size_t bytes, bool use_cache = false)
     {
         if (frame != frame_) {
             entries_.clear();
