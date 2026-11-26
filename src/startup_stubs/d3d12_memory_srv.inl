@@ -142,8 +142,9 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
     if (r.Format == v.Format) storage = view;
     else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage)))) return false;
-    const UINT req = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
-                                                                       : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+    const UINT req = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D   ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                     : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
+                                                                         : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
     return (storage.Support1 & req) &&
            (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
 }
