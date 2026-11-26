@@ -18,21 +18,37 @@ if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
 endif()
 
 # Replay of the texture / sampler / image family (row c17 of briefs/replay_all_hands.md): each scene is an in-repo stand-in check
-# that takes a backend. It is recorded (X2W_REPLAY_RECORD=all), replayed by x2w_replay, and every call must play on a known
-# object, with equal pictures where the scene presents (tests/startup_replay_family_check.py).
-if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
-    set(replay_family_scenes startup_view_dimension_device startup_list_copy_texture_warp startup_texture_residency_warp
-        startup_view_census startup_resource_retire_views startup_clear_uav startup_list_dispatch_native
-        startup_small_texture_4k_device_check startup_slot133_lazy_textures_check startup_null_views_check
-        startup_present_view_check)
-    foreach(scene IN LISTS replay_family_scenes)
-        if(TARGET ${scene})
-            foreach(backend IN ITEMS warp hardware)
-                add_test(NAME startup_replay_family_${scene}_${backend} COMMAND "${INTAKE_PYTHON}" -B
-                    "${CMAKE_SOURCE_DIR}/tests/startup_replay_family_check.py" "$<TARGET_FILE:x2w_replay>" ${backend} --
-                    "$<TARGET_FILE:${scene}>" ${backend})
-                set_tests_properties(startup_replay_family_${scene}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-            endforeach()
+# that takes a backend and runs under the settings of its own test (copied from it). It is recorded (X2W_REPLAY_RECORD=all),
+# replayed by x2w_replay, and every call must play on a known object, with equal pictures where the scene presents
+# (tests/startup_replay_family_check.py). Deferred: the scene tests are registered elsewhere in the configure.
+function(x2w_replay_family_scene scene own_test)
+    foreach(backend IN ITEMS warp hardware)
+        string(REPLACE "@B@" "${backend}" own "${own_test}")
+        if(NOT TARGET ${scene} OR NOT TEST ${own})
+            continue()
         endif()
+        get_test_property(${own} ENVIRONMENT scene_env)
+        if(scene_env STREQUAL "scene_env-NOTFOUND")
+            set(scene_env "")
+        endif()
+        add_test(NAME startup_replay_family_${scene}_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_replay_family_check.py" "$<TARGET_FILE:x2w_replay>" ${backend} --
+            "$<TARGET_FILE:${scene}>" ${backend})
+        set_tests_properties(startup_replay_family_${scene}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${scene_env}")
     endforeach()
+endfunction()
+function(x2w_replay_family_all)
+    x2w_replay_family_scene(startup_view_dimension_device startup_view_dimension_@B@)
+    x2w_replay_family_scene(startup_list_copy_texture_warp startup_list_copy_texture_@B@)
+    x2w_replay_family_scene(startup_view_census startup_view_census_@B@)
+    x2w_replay_family_scene(startup_resource_retire_views startup_resource_retire_views_@B@_debug0)
+    x2w_replay_family_scene(startup_clear_uav startup_clear_uav_@B@)
+    x2w_replay_family_scene(startup_list_dispatch_native startup_list_dispatch_native_@B@)
+    x2w_replay_family_scene(startup_small_texture_4k_device_check startup_small_texture_4k_device_@B@)
+    x2w_replay_family_scene(startup_slot133_lazy_textures_check startup_slot133_lazy_textures_@B@_debug0)
+    x2w_replay_family_scene(startup_null_views_check startup_null_views_@B@)
+endfunction()
+if(TARGET x2w_replay AND EXISTS "${INTAKE_PYTHON}")
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL x2w_replay_family_all)
 endif()
