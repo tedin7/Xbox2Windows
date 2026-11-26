@@ -7,6 +7,7 @@ numbered parts instead of dropping a log when it is over the size limit.
 import json
 import os
 import random
+import struct
 import sys
 import tempfile
 import zipfile
@@ -19,6 +20,9 @@ MANIFEST = {"commit": "abcdef12", "build_commit": "abcdef12", "dirty": False, "s
             "input_script": "4@70", "env": {"X2W_D3D12_BUDGET": "1"}, "gpu": "GPU", "gpu_driver": "1.0",
             "windows_build": "26100", "wall_seconds": 305.5, "deep": False, "lazy_textures": True, "lazy_memory": True, "memory_gib": 14, "shader_cache": "shader_cache_abcdef12",
             "translations_at_start": 0}
+
+
+DXBC = b"DXBC" + bytes(20) + struct.pack("<II", 40, 1) + bytes(8)  # a container whose header length matches (4 + 20 + 8 + 8 = 40)
 
 
 def write(folder, name, data):
@@ -146,11 +150,38 @@ def check_cache_stats():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         assert T.cache_stats(str(tmp / "missing")) == (0, 0, 0)
-        for name in ("req_0123456789abcdef.a", "req_0123456789abcdef.txt", "req_0123456789abcdef.cs.cso",
-                     "req_1123456789abcdef.a", "req_1123456789abcdef.fail", "req_2123456789abcdef.m57",
-                     "req_2123456789abcdef.ms57.txt", "req_3123456789abcdef.c67", "revision.txt", "notes.txt"):
-            write(tmp, name, b"x")
-        assert T.cache_stats(str(tmp)) == (2, 4, 1), T.cache_stats(str(tmp))
+        # A shader cache as the translator writes it (gfx2hlsl.py): request req_<key>.<kind>; the finished result is the
+        # manifest <key>.txt (<key>.ms57.txt for a mesh pipeline) plus the bytecode; a refusal is <key>.fail.
+        files = {
+            "req_000000000000000a.a": b"x", "000000000000000a.txt": b"x", "000000000000000a.vs.cso": b"x",
+            "000000000000000a.ps.cso": b"x",                                        # 1 pixel pipeline, ready
+            "req_000000000000000b.c67": b"x", "000000000000000b.txt": b"x", "000000000000000b.cs.cso": b"x",  # compute, ready
+            "req_000000000000000c.m57": b"x", "000000000000000c.ms57.txt": b"x", "000000000000000c.ms57.cso": DXBC,
+            "000000000000000c.ps57.cso": DXBC,                                      # mesh, ready
+            "req_000000000000000d.m57": b"x", "000000000000000d.ms57.txt": b"ps none\n", "000000000000000d.ms57.cso": DXBC,
+            "req_000000000000000e.rtv": b"x", "000000000000000e.txt": b"x", "000000000000000e.vs.cso": b"x",
+            "000000000000000e.ps.cso": b"x",                                        # a variant request, ready
+            "req_0000000000000010.a": b"x", "0000000000000010.fail": b"unsupported\n",   # refused
+            "req_0000000000000011.a": b"x",                                         # pending: nothing yet
+            "req_0000000000000012.a": b"x", "0000000000000012.txt": b"x", "0000000000000012.vs.cso": b"x",
+            "0000000000000012.ps.cso": b"",                                         # pending: empty bytecode
+            "req_0000000000000013.a": b"x", "0000000000000013.txt": b"x",
+            "0000000000000013.vs.cso": b"x", "0000000000000013.ps.cso": b"x", "0000000000000013.fail": b"old\n",  # ready, stale .fail
+            "req_0000000000000014.m57": b"x", "0000000000000014.ms57.txt": b"x",    # pending: mesh without bytecode
+            "revision.txt": b"x", "notes.txt": b"x", "0000000000000099.txt": b"x",  # no request: not counted
+        }
+        for name, data in files.items():
+            write(tmp, name, data)
+        assert T.cache_stats(str(tmp)) == (6, 10, 1), T.cache_stats(str(tmp))
+        # The translator itself calls the same requests finished: nothing it would translate again is counted ready.
+        try:
+            import gfx2hlsl
+        except ImportError:
+            return
+        pending = {"req_%016x" % key for key in gfx2hlsl.pending_keys(str(tmp), False)}
+        stem = {n.split(".")[0] for n in files if n.startswith("req_")}
+        assert stem - pending == {"req_000000000000000a", "req_000000000000000b", "req_000000000000000c",
+                                  "req_000000000000000d", "req_000000000000000e", "req_0000000000000013"}, pending
 
 
 def check_cache_tag():
