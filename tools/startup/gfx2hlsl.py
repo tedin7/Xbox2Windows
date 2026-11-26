@@ -2972,11 +2972,38 @@ class Stage:
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
                     named = [unread[word] for word in words if unread[word] >= 0]
+                    first = min(named) if named else None
+                    word_of = next((w for w in words if unread[w] == first), None)
                     reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
-                        ': read by %s after the join' % self.ins[min(named)][2] if named else '')
+                        ': read by %s after the join' % self.ins[first][2] if named else '')
+                    if named:
+                        reason += ' (%s)' % self.execz_read_cause(first, word_of, b, t, effects, into)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def execz_read_cause(self, j, word, b, t, effects, into):
+        """Why the read at instruction j of `word` after the join t of an execz block is not proven (execz_live_read),
+        as a short phrase for the refusal text: the condition that failed first, in the order the proof checks them."""
+        name, asm = self.ins[j][2:]
+        if not exec_absorbs(name, asm, word):
+            lanes = mask_lanes(name, asm)
+            if not lanes:
+                return 'cause: a data read or a copy, not a lane-mask operation'
+            if lanes[0] not in ('and', 'nand', 'orn2'):
+                return 'cause: lane-mask operation %s, not and/nand/orn2 with exec' % lanes[0]
+            if high_half_of_b32(lanes, word):
+                return 'cause: a 32-bit read of the high half'
+            return 'cause: the word is not paired with the exec word of the same lanes'
+        if j < t:
+            return 'cause: read before the join, reached again through a loop'
+        if not all(b <= k < t for k in into.get(t, ())):
+            return 'cause: another path enters the join'
+        if any(effects[k][2] & EXEC_KEYS for k in range(t, j)):
+            return 'cause: exec is written between the join and the read (restored or changed)'
+        if any(k in into for k in range(t + 1, j + 1)):
+            return 'cause: a branch target (loop or join) lies between the join and the read'
+        return 'cause: other'
 
     def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
