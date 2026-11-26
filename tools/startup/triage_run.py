@@ -50,6 +50,9 @@ SLOT70_REASONS = {
     "as_wrong_state",
     "buffer_unavailable",
     "texture_unavailable",
+    "texture_no_resource",
+    "texture_unreadable",
+    "texture_over_64mib",
     # the partial-tile holds of device_memory_srv
     "partial_tile_xg_rows",
     "partial_tile_beyond_xg_size",
