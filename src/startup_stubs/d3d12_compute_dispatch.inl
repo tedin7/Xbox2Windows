@@ -379,26 +379,69 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             continue;
         }
         // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
-        const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-        const UINT stride = (words[1] >> 16) & 0x3fff;
-        const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
+        // to the title. A buffer view token (slot 19) names its resource and range: the range is the same title
+        // address a descriptor would carry, and the token's resource must be the placement that holds it.
+        // shortcut: copied placements are refused, add them with their first user.
+        u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+        UINT stride = (words[1] >> 16) & 0x3fff;
+        u64 bytes = u64{stride ? stride : 1} * words[2];
+        const Wrapper* token_owner = nullptr;
+        const char* token_reason = nullptr;
+        std::uint32_t view_words[4] = {words[0], words[1], words[2], words[3]};
+        if (words[0] == view_token_magic) {
+            ViewRecord record{};
+            bool known = false;
+            note_lock_acquire(false);
+            if (words[1] < view_records().size()) { record = view_records()[words[1]]; known = true; }
+            ReleaseSRWLockShared(&note_lock);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            token_owner = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+            if (known && record.slot == 19 && record.desc_bytes >= sizeof(uav)) std::memcpy(&uav, record.desc, sizeof(uav));
+            const bool buffer = known && record.slot == 19 && record.desc_bytes >= sizeof(uav) && uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER;
+            const bool raw = buffer && uav.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW && !uav.Buffer.StructureByteStride &&
+                uav.Format == DXGI_FORMAT_R32_TYPELESS;
+            const bool structured = buffer && uav.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && uav.Buffer.StructureByteStride &&
+                uav.Format == DXGI_FORMAT_UNKNOWN;
+            const UINT element = raw ? 4 : structured ? uav.Buffer.StructureByteStride : 0;
+            const u64 base = token_owner && token_owner->own().kind == resource_kind ? reinterpret_cast<u64>(token_owner->own().title_memory) : 0;
+            if (!buffer || !token_owner || token_owner->own().kind != resource_kind || !token_owner->own().real || !base)
+                token_reason = "an output view token is not a buffer view of a desktop resource";
+            else if (!element || uav.Buffer.FirstElement > (UINT64_MAX - base) / element || uav.Buffer.CounterOffsetInBytes)
+                token_reason = "an output buffer view has no element size, overflows or has a counter";
+            else {
+                address = base + uav.Buffer.FirstElement * element;
+                bytes = u64{uav.Buffer.NumElements} * element;
+                stride = raw ? 0 : element;
+                // The words a program's stride and record-count entry values read: as the descriptor would hold them.
+                view_words[0] = static_cast<std::uint32_t>(address);
+                view_words[1] = static_cast<std::uint32_t>(address >> 32) & 0xffff | stride << 16;
+                view_words[2] = raw ? static_cast<std::uint32_t>(bytes) : uav.Buffer.NumElements;
+                view_words[3] = 0;
+            }
+        }
+        const auto placed = token_reason || !bytes || bytes % 4 || bytes > (16u << 20)
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
         // One reason per condition, so a census says which one an output failed on.
-        if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
-        else if (!bytes || bytes % 4 || bytes > (16u << 20)) reason = "an output range is empty, over 16 MiB or not whole dwords";
+        if (token_reason) reason = token_reason;
+        else if (!bytes) reason = "an output range has zero bytes";
+        else if (bytes % 4) reason = "an output range is not a whole number of dwords";
+        else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
         else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
+        else if (token_owner && token_owner != placed.owner) reason = "an output buffer view token's resource does not hold its range";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) reason = "an output buffer was not created in the common state";
         else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer was created without unordered access";
+        static LONG size_logged;
+        if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
+            log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
+                stride, words[2], reason);
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
-        std::memcpy(views[i].words, words, sizeof(views[i].words));
+        std::memcpy(views[i].words, view_words, sizeof(views[i].words));
     }
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
