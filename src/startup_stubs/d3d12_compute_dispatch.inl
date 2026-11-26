@@ -454,7 +454,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 log("x2w-draw unfilled heap slot %u key %016llx", words[0] - 1, key);
             }
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
-            if (view.source == 2) {
+            if (view.source == 2 && !view.snapshot_reused) {
                 InterlockedIncrement(&compute_inputs_snapshot);
                 InterlockedExchangeAdd(&compute_inputs_snapshot_kib, static_cast<LONG>((view.bytes + 1023) / 1024));
             }
@@ -727,6 +727,34 @@ void report_key_use_census(Emit emit, bool only_if_changed)
 void log_key_use_census()
 {
     report_key_use_census([](const char* line) { log("%s", line); }, true);
+}
+
+void log_compute_snapshots(bool fixture)
+{
+    const auto hits = InterlockedCompareExchange64(&compute_snapshot_hits, 0, 0);
+    const auto replacements = InterlockedCompareExchange64(&compute_snapshot_replacements, 0, 0);
+    const auto saved = InterlockedCompareExchange64(&compute_snapshot_saved, 0, 0);
+    log("x2w-render compute snapshots: made %ld, reused %lld, replaced %lld, MiB saved %.3f",
+        InterlockedCompareExchange(&compute_inputs_snapshot, 0, 0), hits, replacements, saved / 1048576.0);
+    if (fixture) {
+        const auto ring = upload_ring_stats();
+        log("x2w-test snapshot ring: reserved %llu bytes, recycled %ld", ring.reserved_bytes, ring.recycled);
+    }
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_compute_snapshots()
+{
+    log_compute_snapshots(true);
+}
+
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_fill_upload_ring(void* guest_list, UINT bytes)
+{
+    auto* list = as_wrapper(guest_list);
+    if (!list || list->own().kind != list_kind) return FALSE;
+    const auto slice = reserve_upload_ring(list, bytes);
+    if (!slice.mapped) return FALSE;
+    std::memset(slice.mapped, 0xa5, bytes);
+    return TRUE;
 }
 
 // Fixtures: the census without waiting for the frame that logs it.

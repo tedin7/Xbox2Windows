@@ -1675,8 +1675,11 @@ void reclaim_finished_arenas(DesktopAllocator& allocator)
     }
 }
 
+void forget_compute_snapshot_recording(Wrapper* list);
+
 void release_upload_recording(Wrapper* list)
 {
+    forget_compute_snapshot_recording(list);
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
     retire_list_arena(list);
@@ -2016,6 +2019,7 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* al
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
 HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
 {
+    forget_compute_snapshot_recording(self);
     Wrapper* a = as_wrapper(allocator);
     HRESULT hr = E_INVALIDARG;
     x2w_startup::ComPtr<ID3D12GraphicsCommandList> replaced;
@@ -2124,6 +2128,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
+        forget_compute_snapshot_recording(self);
         discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
@@ -7759,10 +7764,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
+    const bool reuse_compute_snapshots = compute_snapshot_reuse_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;
+    if (reuse_compute_snapshots) InterlockedIncrement(&compute_snapshot_frame);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
@@ -7910,6 +7917,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
         log_key_use_census();
+        if (reuse_compute_snapshots) log_compute_snapshots(false);
         log_dispatch_phases();
         log_not_drawn_causes();
         static ULONGLONG last_key_report;  // the by-pipeline ranking costs a sort: about once a minute
