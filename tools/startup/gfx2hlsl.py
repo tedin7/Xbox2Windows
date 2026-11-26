@@ -3196,18 +3196,25 @@ class Stage:
         if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
             unread[word] = -1
             return -1
-        seen, work = {t}, [t]
-        for j in work:  # breadth first: the list grows while it is read
+        # A lane whose exec bit is clear where it takes s_cbranch_execz still has it clear at the target, until exec is
+        # written: its model and the wave then differ at most in `word`, and a read W & exec / ~(W & exec) / W | ~exec
+        # (exec_absorbs) gives that lane's bit the same value whatever `word` holds. State per node: `zero` is True on
+        # a path whose last step was a taken s_cbranch_execz with no exec write since (a restore of exec breaks it).
+        seen, work = {(t, False)}, [(t, False)]
+        for j, zero in work:  # breadth first: the list grows while it is read
             name, asm = self.ins[j][2:]
             kept_read = word in effects[j][0] and halves and lane_read(name, asm, word, halves)
-            if word in effects[j][0] and not kept_read and not (exec_absorbs(name, asm, word) and quiet(j)):
+            if word in effects[j][0] and not kept_read and not (exec_absorbs(name, asm, word) and (zero or quiet(j))):
                 unread[word] = j
                 return j
             if kept_read or word not in effects[j][1]:
-                for s in succ[j]:
-                    if s not in seen:
-                        seen.add(s)
-                        work.append(s)
+                writes_exec = bool(effects[j][2] & EXEC_KEYS)
+                for k, s in enumerate(succ[j]):
+                    taken = name == 's_cbranch_execz' and len(succ[j]) == 2 and k == 1 and s != j + 1
+                    state = (s, taken or (zero and not writes_exec))
+                    if state not in seen:
+                        seen.add(state)
+                        work.append(state)
         unread[word] = None
         return None
 

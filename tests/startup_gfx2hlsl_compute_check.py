@@ -50,11 +50,13 @@ All 320 words are compared, so a word outside the written records must keep the 
 and Y group IDs at entry, drop the store, drop case B's immediate offset, drop case C's exec predicate, or drop a
 scalar statement inside case J's block; each must change the readback.
 """
+import inspect
 import itertools
 import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -289,6 +291,86 @@ SOURCE_Q = (SOURCE_P.replace('v_cmp_gt_u32 s23, 4, v0\n', 's_mov_b32 s23, -1\n')
 WORDS_Q = (WORDS_P.replace(bytes.fromhex('1700c4d484000200'), bytes.fromhex('c10397be'))
            .replace(bytes.fromhex('050088bf'), bytes.fromhex('030088bf')).replace(bytes.fromhex('177e178a'), b'')
            .replace(bytes.fromhex('6a7e168717161788'), bytes.fromhex('6a7e178b')))
+# Case R: a taken s_cbranch_execz leaves exec clear, so the join reads s24 & exec as zero (the model skips per lane
+# and keeps s24 as the first block set it for lanes 6 and 7, the wave set it for all). Even groups take the second
+# branch; odd groups store lanes 0-2. SOURCE_R_NEAR restores exec before the read: refused.
+SOURCE_R = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+s_mov_b32 s21, exec_lo
+s_mov_b32 s24, 0
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_and_saveexec_b32 s0, vcc_lo
+s_cbranch_execz 1
+s_mov_b32 s24, -1
+s_mov_b32 exec_lo, s0
+s_and_b32 s22, s7, 1
+s_mul_i32 s22, s22, 3
+v_cmp_gt_u32 vcc_lo, s22, v0
+s_and_saveexec_b32 s1, vcc_lo
+s_cbranch_execz 1
+s_and_b32 s24, vcc_lo, exec_lo
+s_and_b32 s25, s24, exec_lo
+s_mov_b32 exec_lo, s0
+s_and_b32 exec_lo, s25, exec_lo
+s_mul_i32 s26, s7, s5
+s_add_u32 s26, s26, s4
+v_xor_b32 v5, s26, v3
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_R = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4' '000000fa' '7fc08cbf' '0783148f'
+    '1400064a' '82060834' '7e0395be' '800398be' '8600887d' '6a3c80be'
+    '010088bf' 'c10398be' '0003febe' '07811687' '16831693' '1600887d'
+    '6a3c81be' '010088bf' '6a7e1887' '187e1987' '0003febe' '197e7e87'
+    '07051a93' '1a041a80' '1a060a3a' '001070e0' '04050480' '1503febe'
+    '000081bf')
+SOURCE_R_NEAR = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+s_mov_b32 s21, exec_lo
+s_mov_b32 s24, 0
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_and_saveexec_b32 s0, vcc_lo
+s_cbranch_execz 1
+s_mov_b32 s24, -1
+s_mov_b32 exec_lo, s0
+s_and_b32 s22, s7, 1
+s_mul_i32 s22, s22, 3
+v_cmp_gt_u32 vcc_lo, s22, v0
+s_and_saveexec_b32 s1, vcc_lo
+s_cbranch_execz 1
+s_and_b32 s24, vcc_lo, exec_lo
+s_mov_b32 exec_lo, s0
+s_and_b32 s25, s24, exec_lo
+s_and_b32 exec_lo, s25, exec_lo
+s_mul_i32 s26, s7, s5
+s_add_u32 s26, s26, s4
+v_xor_b32 v5, s26, v3
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_R_NEAR = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4' '000000fa' '7fc08cbf' '0783148f'
+    '1400064a' '82060834' '7e0395be' '800398be' '8600887d' '6a3c80be'
+    '010088bf' 'c10398be' '0003febe' '07811687' '16831693' '1600887d'
+    '6a3c81be' '010088bf' '6a7e1887' '0003febe' '187e1987' '197e7e87'
+    '07051a93' '1a041a80' '1a060a3a' '001070e0' '04050480' '1503febe'
+    '000081bf')
+
 
 # Case M is case H with the nested if as an if/else. Each arm has its own s_cbranch_execz; the then arm stores the
 # first word, s_andn2_b32 of the saved mask switches to the else arm, which stores the second, and s_mov_b32
@@ -693,6 +775,7 @@ CASES = {
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'P': (SOURCE_P, WORDS_P, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'Q': (SOURCE_Q, WORDS_Q, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
+    'R': (SOURCE_R, WORDS_R, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
     'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
@@ -1011,6 +1094,10 @@ def expected(name):
                                 old = 1 if name == 'Q' else int(tx < 4)
                                 mask = (tx & 1) if tx < 3 * gx else old  # the block's lanes take the compare, others keep M
                                 out[i] = ~input_word(i) & MASK if mask else input_word(i)
+                            elif name == 'R':
+                                i = gx * 8 + tx
+                                if gx & 1 and tx < 3:  # odd groups: the second compare's lanes; even groups take the branch
+                                    out[i] = ((gx * STRIDE + KEY) & MASK) ^ i
                             elif name == 'K':
                                 i = gx * 8 + tx
                                 if gx == 1:  # only group 1's wave enters the block
@@ -1639,6 +1726,28 @@ def check_execz_mask_exact():
         assert bad == want, (name, sorted(bad))
 
 
+def check_execz_taken_edge():
+    """A lane whose exec bit is clear at a taken s_cbranch_execz still has it clear at the target, until exec is written:
+    case R reads s24 & exec there. The same read after an exec restore is refused; keeping the clear bit across the
+    restore (the mutant) accepts it, and its wave answer differs (all eight lanes store, the model gives none)."""
+    translate('R').hlsl_cs()
+    near = lambda: G.ComputePipeline(WORDS_R_NEAR, root_blob(), CASES['R'][2], CASES['R'][3]).hlsl_cs()
+    refused('read by s_and_b32 after the join', near)
+    source = textwrap.dedent(inspect.getsource(G.Stage.execz_live_read))
+    for old, new in (('(zero and not writes_exec)', 'zero'), ('{(t, False)}, [(t, False)]', '{(t, True)}, [(t, True)]')):
+        assert source.count(old) == 1
+        source = source.replace(old, new)
+    scope = dict(vars(G))
+    exec(compile(source, 'mutant', 'exec'), scope)
+    real = G.Stage.execz_live_read
+    G.Stage.execz_live_read = scope['execz_live_read']
+    try:
+        near()
+    finally:
+        G.Stage.execz_live_read = real
+    refused('read by s_and_b32 after the join', near)
+
+
 def check_controls():
     for name in ('masked-tid', 'extracted-tid'):
         translate(name).hlsl_cs()
@@ -1744,6 +1853,7 @@ def check_controls():
     check_hand_words()
     check_off_stores()
     check_execz_mask_exact()
+    check_execz_taken_edge()
     for name in ('O-dword', 'O-shift'):
         hlsl = translate(name).hlsl_cs().splitlines()
         assert any('u0.Store' in line for line in hlsl), (name, hlsl)
@@ -2325,6 +2435,7 @@ CONTROLS = {
     'p-dropped-or': ('P', 's23 = (s23 | s22) & 1;', 's23 = (s23) & 1;'),  # an entering lane loses its compare bit
     'p-block-entered': ('P', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipping lanes run the block
     'q-block-entered': ('Q', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),
+    'r-taken-edge-unmasked': ('R', 's25 = (s24 & exec) & 1;', 's25 = (s24) & 1;'),  # even groups: lanes 0-5 keep the old bit
     'q-not-all-ones': ('Q', 's23 = 0xffffffffu;', 's23 = 0u;'),  # M not set before the branch: skipped lanes read 0
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
