@@ -129,6 +129,16 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('cli rewrites every refusal it retried', rewritten, {1: True, 2: True, 3: True, 4: True, 5: True, 6: True})
     expect('cli well under the cap', time.time() - started < 120, True)
 
+# --jobs N (tester_run: 4 for the pre-run retry and the pass after the run) caps the workers, never above the cores.
+expect('--jobs 4', G.jobs_argument(['180', '--jobs', '4']), min(4, G.translation_jobs()))
+expect('--jobs 0 is one worker', G.jobs_argument(['--jobs', '0']), 1)
+expect('no --jobs: the caller decides', G.jobs_argument(['180']), None)
+try:
+    G.jobs_argument(['--jobs'])
+    expect('--jobs without a number is refused', False, True)
+except SystemExit:
+    pass
+
 # Real requests (the cases of the stale MRTZ .fail): translatable pixel shaders from the provenance check's helpers.
 sys.path.insert(0, str(ROOT / 'tests'))
 import startup_packed_position_provenance_check as P  # noqa: E402

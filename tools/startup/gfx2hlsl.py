@@ -12242,10 +12242,12 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    jobs = jobs_argument(sys.argv[3:])
     if sys.argv[1] == '--retry-lifted':
-        # --retry-lifted <dir> [seconds]: before the title starts, the old refusals of the families this build lifts
-        seconds = float(sys.argv[3]) if len(sys.argv) > 3 else PRE_RUN_RETRY_SECONDS
-        print(retry_lifted(out_dir, seconds).line(), flush=True)
+        # --retry-lifted <dir> [seconds] [--jobs N]: before the title starts, the old refusals (lifted families first)
+        given = [arg for arg in sys.argv[3:4] if not arg.startswith('--')]
+        seconds = float(given[0]) if given else PRE_RUN_RETRY_SECONDS
+        print(retry_lifted(out_dir, seconds, jobs=jobs).line(), flush=True)
         return
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
@@ -12262,7 +12264,19 @@ def main():
             watch_pass(out_dir, True, started, jobs=jobs, monitor=monitor, recycle=True)
             monitor.tick(None)
             time.sleep(interval)
-    translate_pending(out_dir, since_translator=translator_stamp())
+    translate_pending(out_dir, since_translator=translator_stamp(), jobs=jobs)
+
+
+def jobs_argument(args):
+    """--jobs N among `args`: at most N workers, and never more than translation_jobs(); None when absent."""
+    if '--jobs' not in args:
+        return None
+    at = args.index('--jobs')
+    try:
+        wanted = int(args[at + 1])
+    except (IndexError, ValueError):
+        raise SystemExit('gfx2hlsl: --jobs needs a whole number')
+    return max(1, min(wanted, translation_jobs()))
 
 
 

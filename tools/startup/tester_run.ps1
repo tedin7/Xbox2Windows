@@ -28,7 +28,8 @@ first touch, which cuts the section commit. -NoLazyMemory turns it off. The mani
 The shader cache is repaired once before the run (tools/startup/shader_cache_repair_packed.py: translations made before the packed-position derivation are withdrawn so the translator redoes them, no revision bump); the console says "repaired N packed-position translations" and the manifest records cache_repaired (-1 = skipped). -NoCacheRepair skips it.
 
 When the report is packed the script finishes the translation: one translator pass over the shader cache (no --watch), until
-nothing is pending or -FinishTranslateSeconds (default 900, 0 = skip) is over, then prints "pending before/after, ok, refused".
+nothing is pending or -FinishTranslateSeconds (default 300, 0 = skip) is over, with at most 4 workers at BelowNormal (Run Q:
+16 workers at 100% CPU), then prints "pending before/after, ok, refused". It is safe to stop: what is written is kept.
 The next run then starts with every request the title made already translated. The mail does not wait for this step.
 
 -Deep also sets -TraceCalls and -TraceApi: a slower run with more detail in the logs.
@@ -66,7 +67,7 @@ param(
     [switch]$NoBuild,                           # stop instead of building when the build is not from this commit
     [switch]$Deep,                              # also -TraceCalls and -TraceApi: slower, more detailed
     [int]$MemoryGiB = 0,                        # job memory cap of the launcher; 0 = 75% of physical RAM (at least 14)
-    [int]$FinishTranslateSeconds = 900,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
+    [int]$FinishTranslateSeconds = 300,         # after the report is packed: one translator pass over the cache, at most this long; 0 = skip
     [int]$PrivacyBoxes = 2,                     # -Input menus: the privacy screen has this many checkboxes (2 in Run L/M); the script repeats clock-free passes (up x(N+1), at most one box toggled, down to Conferma, A) until the screen changes; 0 = the plain DOWN,DOWN,A pattern
     [switch]$NoCacheRepair,                     # skip the one-off repair of cached packed-position translations before the run (tools/startup/shader_cache_repair_packed.py)
     [switch]$NoLazyMemory,                      # lazy memory commit is on (run.ps1 -LazyMemory: X2W_XMEM_LAZY_COMMIT, _LAZY_STARTUP, _SHARED_VIEWS); this turns it off
@@ -208,12 +209,15 @@ $cacheAtStart = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-S
 # but one; the --watch pool beside the title keeps to 4 workers and leaves old refusals alone (gfx2hlsl.py watch_jobs),
 # and the finish pass after the run uses every core. X2W_TRANSLATE_JOBS, when the tester sets it, overrides both pools.
 $translateJobs = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+# The pre-run retry and the pass after the run keep to a few workers, so the PC stays usable (Run Q: the pass after the
+# run took 16 workers at 100% CPU and the tester had to kill it).
+$backgroundJobs = 4
 # The --watch pool beside the title leaves old refusals for the pass after the run, so a translator lift would reach
 # only the next run: every old refusal (a .fail an older build wrote) is translated again now, on every core, for at
 # most 180 s: the families recent builds lift first (gfx2hlsl.py LIFTED_REASONS), then graphics before compute.
 # Never blocks the run.
 try {
-    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 } | Out-String).Trim()
+    $retryLine = (Invoke-Native { & $python -B (Join-Path $PSScriptRoot "gfx2hlsl.py") --retry-lifted $cache 180 --jobs $backgroundJobs } | Out-String).Trim()
     if ($retryLine) { Write-Host "tester_run: $retryLine" }
 } catch {
     Write-Warning "tester_run: pre-run retry skipped ($($_.Exception.Message))"
@@ -395,11 +399,13 @@ if ($FinishTranslateSeconds -gt 0) {
     $pendingBefore = [math]::Max(0, [int]$before[1] - [int]$before[0] - [int]$before[2])
     $finishOut = Join-Path $outRoot "finish_translate_$stamp.txt"
     $finishErr = Join-Path $outRoot "finish_translate_$stamp.err.txt"
+    Write-Host "tester_run: safe to stop now, results kept (the report is packed; every translation already written stays in the cache)"
     Write-Host ("tester_run: finishing the translation: {0} request(s) pending ({1} refused earlier, retried only if the translator changed), one pass, at most {2} s (the report above is already packed; do not close this window)" -f $pendingBefore, [int]$before[2], $FinishTranslateSeconds)
     $finishClock = [System.Diagnostics.Stopwatch]::StartNew()
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardOutput $finishOut -RedirectStandardError $finishErr `
-        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"")
+        -ArgumentList @("-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--once", "`"$cache`"", "--jobs", "$backgroundJobs")
     $null = $translator.Handle    # keeps the exit code readable after the process ends
+    try { $translator.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
     $capped = -not $translator.WaitForExit($FinishTranslateSeconds * 1000)
     if ($capped) { $null = Invoke-Native { & taskkill.exe /T /F /PID $translator.Id }; $null = $translator.WaitForExit(10000) }
     $after = (Invoke-Native { & $python -B $pack cache-stats $cache } | Out-String).Trim() -split " "
