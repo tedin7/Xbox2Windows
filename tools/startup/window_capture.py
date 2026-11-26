@@ -53,6 +53,17 @@ def pick_window(windows):
     return windows[0][0]
 
 
+def shape_note(last, width, height, title_length, seconds):
+    """The log line for a capture whose window looks different from the previous one (size or title text length), else None:
+    answers "did we photograph the same window all run?" (Run O: our pictures black while the tester's showed the movie).
+    `last` is the previous (width, height, title_length) or None; the caller keeps the new tuple."""
+    shape = (width, height, title_length)
+    if shape == last:
+        return None
+    return "  window capture: %s at %.0f s: %dx%d window, title text length %s" % (
+        "first picture" if last is None else "the window changed", seconds, width, height, title_length)
+
+
 LOADING_DROP = 0.6   # a loading-like picture is darker than this fraction of the brightest picture seen so far
 LOADING_MIN_PEAK = 20.0  # ... and that brightest picture must be a real screen (mean level of at least 20 of 255)
 
