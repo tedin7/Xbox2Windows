@@ -1089,7 +1089,7 @@ def vcc_hi_scalar_mask_read(ins):
         vcc_hi_whole_word_writer(name, parse(asm)[1]) for _o, _n, name, asm in ins))
 
 
-def wave32_vcc_hi(ins):
+def wave32_vcc_hi(ins, wave32=False):
     """`ins` with every vcc_hi operand renamed to an unused SGPR when vcc_hi is provably an ordinary scalar register,
     else `ins`.
 
@@ -1101,7 +1101,9 @@ def wave32_vcc_hi(ins):
     - no instruction names the 64-bit pair `vcc` (whose high word would then be vcc_hi), and
     - a VALU compare or carry writes vcc_hi or an odd SGPR, or a VOP3 mask source reads one (a misaligned pair in
       wave64, so the program is wave32), or no VALU instruction and no vcc branch uses vcc_lo as a lane mask.
-    Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused."""
+    Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused.
+    wave32=True is the caller's proof that the program is wave32 (RDNA 2 ISA, wave32: VCC is vcc_lo alone, so no VALU
+    instruction ever writes or reads vcc_hi as part of a mask): the two wave64 conditions above are then not needed."""
     if not any(re.search(r'\bvcc_hi\b', asm) for *_, asm in ins):
         return ins
     if any(re.search(r'\bvcc\b', asm) or name.startswith('s_movrel') for _o, _n, name, asm in ins):
@@ -1123,7 +1125,7 @@ def wave32_vcc_hi(ins):
     # see vcc_hi for lanes 32..63: none may be present.
     vcc_mask_use = any((name.startswith('v_') and re.search(r'\bvcc_lo\b', asm)) or name.startswith('v_div_fmas')
                        or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
-    if 'vcc_hi' not in masks and not odd and vcc_mask_use:
+    if not wave32 and 'vcc_hi' not in masks and not odd and vcc_mask_use:
         return ins
     if vcc_hi_scalar_mask_read(ins):
         return ins
@@ -2371,8 +2373,11 @@ class Stage:
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
     exec_known = False        # unit probes without __init__ customize this explicitly when needed
+    # Every EXEC write so far was a v_cmpx, which keeps only lanes the mask already had: EXEC is a subset of the entry mask.
+    exec_narrow_only = False
     has_image_writes = True   # proved False in translate() only when no image write exists in the dispatch
     loads_after_exec_write = ()  # compute loads reached from an EXEC writer through the block graph
+    loads_after_wide_exec_write = ()  # the same for a writer that is not a v_cmpx
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
@@ -2410,6 +2415,12 @@ class Stage:
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
+        elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
+            # A compute program also gets the rename, unless the caller says it is wave64. A program proven wave32 (the
+            # caller says so, or its exec writes are all 32-bit forms) gets it even where a VALU instruction reads vcc_lo
+            # as a lane mask.
+            pipe = getattr(self, 'pipe', None)
+            self.ins = wave32_vcc_hi(self.ins, wave32=getattr(pipe, 'wave_size', None) == 32 or wave32_exec_proof(self.ins))
         if kind == 'ps':
             self.derive_packed_position()
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
@@ -2423,6 +2434,7 @@ class Stage:
             self.used_s, self.used_v = set(), set()
             self.used_atomic = set()
             self.exec_known = True    # exec still equals the entry mask (the lane is active)
+            self.exec_narrow_only = True
             self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
             self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
             self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
@@ -3670,27 +3682,31 @@ class Stage:
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
+        self.loads_after_wide_exec_write = set()
         all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
                 any(name in all_uniform_loads for _, _, name, _ in self.ins)):
             # A later block can reach an earlier load through one or more edges. exec_known only sees
             # instructions already translated. Follow the CFG, including paths outside a loop's textual range.
             bounds, _, succ, _ = self.spill_cfg
-            pending = []
-            for block, (lo, hi) in enumerate(bounds):
-                if any(writes_exec(name, parse(asm)[1]) for _, _, name, asm in self.ins[lo:hi]):
-                    pending.extend(succ[block])
-            visited = set()
-            while pending:
-                block = pending.pop()
-                if block not in visited:
-                    visited.add(block)
-                    lo, hi = bounds[block]
-                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
-                    pending.extend(succ[block])
+            for reached, wide_only in ((self.loads_after_exec_write, False), (self.loads_after_wide_exec_write, True)):
+                pending = []
+                for block, (lo, hi) in enumerate(bounds):
+                    if any(writes_exec(name, parse(asm)[1]) and not (wide_only and name.startswith('v_cmpx'))
+                           for _, _, name, asm in self.ins[lo:hi]):
+                        pending.extend(succ[block])
+                visited = set()
+                while pending:
+                    block = pending.pop()
+                    if block not in visited:
+                        visited.add(block)
+                        lo, hi = bounds[block]
+                        reached.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
+                        pending.extend(succ[block])
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
+        init_narrow_only = getattr(self, 'exec_narrow_only', True)
         init_wqm_exec = getattr(self, 'wqm_exec', False)
         init_masks = set(getattr(self, 'masks', ()))
         init_attrs = dict(getattr(self, 'attrs', {}))
@@ -3719,6 +3735,7 @@ class Stage:
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
+            self.exec_narrow_only = init_narrow_only
             self.wqm_exec = init_wqm_exec
             self.wqm_count, self.execcopy_epoch = 0, {}
             self.helper_restore = False
@@ -4473,8 +4490,11 @@ class Stage:
         # cannot reproduce it. Require the entry mask until the path proves a nonempty wave.
         vaddr = reg_range(ops[1]) if load_form and ops[1] != 'off' else None
         exprs = getattr(self, 'uniform_expr', None)
+        # A uniform address gives every active lane the same words, so the first active lane's value is the recomputed
+        # temporary whatever lanes a v_cmpx removed (an empty wave observes nothing); any other EXEC write ends the proof.
         recomputed = (load_form and getattr(self, 'past_entry', False) and exprs is not None
-                      and getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write)
+                      and (getattr(self, 'exec_known', False) and self.pc not in self.loads_after_exec_write
+                           or getattr(self, 'exec_narrow_only', False) and self.pc not in self.loads_after_wide_exec_write))
         loaded_regs = ()
         if loaded or recomputed:
             candidate = reg_range(ops[0])
@@ -5900,7 +5920,7 @@ class Stage:
                     if isinstance(self.align4_v, set):
                         self.align4_v.clear()
                     return None
-                self.exec_known = False
+                self.exec_known = self.exec_narrow_only = False
                 if hasattr(self, 'lane_exec_breaks') and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms)):
                     # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
                     # source selects, so the lane's EXEC bit may stop following the guest's from here.
@@ -6033,7 +6053,7 @@ class Stage:
                     break
 
     def set_exec_scc(self, expr):
-        self.exec_known = False
+        self.exec_known = self.exec_narrow_only = False
         self.scc_effect = 'emitted'
         self.scc_verified = True
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
@@ -6257,7 +6277,7 @@ class Stage:
             # In wave32, exec_lo and vcc_lo hold the whole lane mask, as the generic scalar path reads them.
             mask = 'exec' if low[0].startswith('exec') else 'vcc'
             if mask == 'exec':
-                self.exec_known = False
+                self.exec_known = self.exec_narrow_only = False
             self.emit('%s = (%s) & 1;' % (mask, expr))
             return
         r = reg_range(low[0])
@@ -7177,13 +7197,13 @@ class Stage:
             pending.extend(self.descriptor_predecessors[earlier])
         return True
 
-    def formatted_pointer_copy(self, pointer, before):
-        """(source register, instruction index) of the one s_mov_b32 that is the last write to this pointer on
-        every path from the entry to this read, or None.
+    def formatted_sole_writer(self, register, before):
+        """Index of the one instruction that is the last write to this SGPR on every path from the entry to
+        instruction `before`, or None.
 
-        One writer found walking back, with no path that reaches the entry without a write, means that the copy is
-        on every path to the read and that no path from the copy to the read writes the pointer again."""
-        self.formatted_pointer_reaches(pointer, before)  # builds the predecessor tables
+        One writer found walking back, with no path that reaches the entry without a write, means that the write is
+        on every path to the read and that no path from it to the read writes the register again."""
+        self.formatted_pointer_reaches(register, before)  # builds the predecessor tables
         writers, seen, expand = set(), set(), [before]
         while expand:
             at = expand.pop()
@@ -7195,13 +7215,21 @@ class Stage:
                 seen.add(earlier)
                 _, _, name, asm = self.ins[earlier]
                 wrote = self.descriptor_writes_by_instruction[earlier] | scalar_destinations(name, asm)
-                if pointer in wrote or 'any' in wrote:
+                if register in wrote or 'any' in wrote:
                     writers.add(earlier)
                 else:
                     expand.append(earlier)
         if len(writers) != 1:
             return None
         index, = writers
+        return None if 'any' in (self.descriptor_writes_by_instruction[index] | scalar_destinations(self.ins[index][2], self.ins[index][3])) else index
+
+    def formatted_pointer_copy(self, pointer, before):
+        """(source register, instruction index) of the one s_mov_b32 that is the last write to this pointer on
+        every path from the entry to this read, or None."""
+        index = self.formatted_sole_writer(pointer, before)
+        if index is None:
+            return None
         _, _, name, asm = self.ins[index]
         _, args, _ = parse(asm)
         source = reg_range(args[1]) if name == 's_mov_b32' and len(args) == 2 else None
@@ -7263,11 +7291,33 @@ class Stage:
                 read = start + previous
                 break
             else:
-                copy = getattr(self, 'kind', None) == 'cs' and self.formatted_pointer_copy(pointer, read)
+                copy = self.formatted_pointer_copy(pointer, read)
                 if copy:
                     pointer, read = copy
             return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
-        return False
+        return self.formatted_descriptor_across_blocks(reg, first)
+
+    def formatted_descriptor_across_blocks(self, reg, first):
+        """The descriptor words were loaded in an earlier block: every word has the same one writer on every path
+        to this read, that writer is one s_load of table memory, and its base pointer is proven as in the block."""
+        end = self.descriptor_instruction_index
+        writers = {self.formatted_sole_writer(w, end) for w in range(reg[1], reg[2] + 1)}
+        if len(writers) != 1 or None in writers:
+            return False
+        at, = writers
+        _, _, name, asm = self.ins[at]
+        _, args, _ = parse(asm)
+        m = re.fullmatch(r's_load_dwordx(4|8|16)', name)
+        load, base = reg_range(args[0]), reg_range(args[1]) if len(args) > 1 else None
+        if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + reg[2] - reg[1] + 1:
+            return False
+        if not base or base[0] != 's':
+            return False
+        pointer, read = base[1], at
+        copy = self.formatted_pointer_copy(pointer, read)
+        if copy:
+            pointer, read = copy
+        return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
 
     def mubuf_format(self, ops, mods, count):
         """buffer_load_format_x/xy/xyz/xyzw: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
@@ -8604,7 +8654,7 @@ class Stage:
         for n in range(r[1], r[2] + 1):
             self.sym[n] = ('the saved mesh lane-0 mask',)
         self.emit('exec = (tid & 63u) == 0u ? 1u : 0u;')
-        self.exec_known = False
+        self.exec_known = self.exec_narrow_only = False
 
     def op_x2w_mesh_group(self, ops, mods):
         # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.

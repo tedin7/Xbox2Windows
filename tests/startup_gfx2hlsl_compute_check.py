@@ -1505,8 +1505,10 @@ def check_formatted_loads():
         assert hlsl.count(' = ((ud3 >> ') == width
     # Word 3 is overwritten in an otherwise intact native descriptor.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
-    # At a branch target, there is no local descriptor load to prove.
-    refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
+    # A descriptor loaded above a branch target (a jump to the next instruction) is the one writer on every path: proven.
+    assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end).hlsl_cs()
+    # A word rewritten after that load, with the target between, is not the loaded descriptor any more.
+    refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe000082bf') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
     check_formatted_pointer_copy()
@@ -2064,10 +2066,14 @@ def check_controls():
         refused('%s: read by %s after the join (cause: %s' % (live, name, cause), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
     # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
-    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
+    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted. The caller's
+    # statement that the program is wave64 keeps that refusal; a program whose exec writes are all 32-bit forms is wave32
+    # (G.wave32_exec_proof), vcc_hi is then an ordinary scalar register and the read is accepted.
+    wave64_read = lambda size: G.ComputePipeline(  # noqa: E731
+        splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo'), root_blob(), CASES['A'][2], CASES['A'][3], wave_size=size)
     refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
-            'joins: read by s_and_b32 after the join',
-            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+            'joins: read by s_and_b32 after the join', lambda: wave64_read(64).hlsl_cs())
+    assert 'vcc_hi' not in wave64_read(None).hlsl_cs() and 'vcc_hi' not in wave64_read(32).hlsl_cs()
     assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
     for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
