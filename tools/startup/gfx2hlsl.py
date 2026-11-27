@@ -1799,6 +1799,11 @@ def mesh_constant_trip(ins, header, latch, offsets):
     return (trips,) if trips is not None else None
 
 
+MESH_MASK_WORDS = {'exec_lo': ('exec', 0), 'exec_hi': ('exec', 32),
+                   'vcc_lo': ('vcc', 0), 'vcc_hi': ('vcc', 32)}
+MESH_MASK_SELECT = 's_cselect_b32_mesh'
+
+
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
@@ -2172,7 +2177,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
         base_name = re.sub(r'_e(32|64)$', '', name)
         complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
                       and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
-        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores
+        mask_select = (name == 's_cselect_b32' and len(ops) == 3
+                       and (any(tok in MESH_MASK_WORDS for tok in ops)
+                            or bool(scalar_registers(', '.join(ops[1:])) & saved_masks))
+                       and not scalar_registers(ops[0]) & (saved_masks | lane))
+        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores and not mask_select
                 and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
@@ -2282,6 +2291,13 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
             mask = count
+        elif mask_select:
+            keep = (off, size, MESH_MASK_SELECT, MESH_MASK_SELECT + ' ' + ', '.join(ops))
+            if ops[0] in ('exec_lo', 'exec_hi'):
+                # No proof of full EXEC until the next recognized restore.
+                stale |= pending
+                pending.clear()
+                mask = ('select', index)
         elif (not lane_spill and (
                 writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
                     name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)))):
@@ -2483,6 +2499,8 @@ class Stage:
             self.mesh_source_ins = list(self.ins)
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
                                      self.mesh_wave_loads, self.mesh_wave_votes)
+            self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
+                                                  for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
@@ -3850,6 +3868,7 @@ class Stage:
         wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values() if bound is not None}
         mesh_votes = getattr(self, 'mesh_wave_votes', {})
         mesh_reads = {off for off, _, name, _ in self.ins if name == 'x2w_mesh_firstlane'}
+        mesh_selects = {off for off, _, name, _ in self.ins if name == MESH_MASK_SELECT}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
@@ -3882,8 +3901,8 @@ class Stage:
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
         self.mesh_allocation_block = None
-        splits = targets | mesh_reads
-        if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads):
+        splits = targets | mesh_reads | mesh_selects
+        if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads or mesh_selects):
             at = next(i for i, item in enumerate(self.ins) if item[2] == 'x2w_mesh_counts')
             self.mesh_allocation_block = self.ins[at][0]
             # The exchange and its EXEC restore always run. Keep the group barrier and allocation outside
@@ -4048,6 +4067,7 @@ class Stage:
             start = 0
             raised_unsupported = None
             self.mesh_collect_reads, self.mesh_collect_votes = {}, {}
+            self.mesh_collect_masks = {}
             self.exec_keep = {}  # registers whose body-arm descriptor symbol is kept after an execz join (rule R1)
 
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
@@ -4351,8 +4371,8 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
-        if mesh_reads or mesh_votes:
-            self.check_mesh_collectives(mesh_reads | mesh_votes.keys(), branches)
+        if mesh_reads or mesh_votes or mesh_selects:
+            self.check_mesh_collectives(mesh_reads | mesh_votes.keys() | mesh_selects, branches)
         if self.lines:
             self.blocks.append((start, self.lines, None))
         for at, reason in self.quad_flow_refusals(branches, targets):
@@ -5209,6 +5229,20 @@ class Stage:
         llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
         The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
         The check runs after the form's own refusals, so those keep their messages."""
+        if base == MESH_MASK_SELECT:
+            return self.mesh_mask_select(ops)
+        ballot_regs = getattr(self, 'mesh_ballot_regs', None)
+        if ballot_regs:
+            # These legacy mask consumers expect a single per-lane bit rather than a scalar mask word.
+            if base.endswith('_b64'):
+                mask_sources = scalar_registers(', '.join(ops[len(destinations(base, ops)):]))
+            elif base == 'v_cndmask_b16' or base.endswith('_co_ci_u32'):
+                low_words = scalar_registers(ops[-1]) if len(ops) >= 4 else set()
+                mask_sources = low_words | {n + 1 for n in low_words}
+            else:
+                mask_sources = set()
+            if mask_sources & ballot_regs:
+                raise Unsupported('slot 57 mesh: %s on a materialized mask word is not covered' % base)
         self.current_asm = asm      # named by scc_refusal
         if self.wave_reduction(base, ops):
             return None
@@ -9142,6 +9176,48 @@ class Stage:
         self.mesh_collect_reads[self.pc] = self.u(ops[1])
         self.set_s(reg_range(ops[0])[1], 'mesh_first', uniform=True)
 
+    def mesh_mask_select(self, ops):
+        if not (self.scc_verified and self.scc_uniform):
+            raise Unsupported('slot 57 mesh: mask select needs a proven wave-uniform SCC')
+
+        def contribution(tok):
+            if tok in MESH_MASK_WORDS:
+                bit, half = MESH_MASK_WORDS[tok]
+                if bit == 'vcc':
+                    self.read_vcc()
+            else:
+                value = pc_word(tok)
+                if value == 0:
+                    return '0u'
+                if value == -1:
+                    return 'tid & 32u ? 0u : 1u'
+                reg = reg_range(tok)
+                if not reg or reg[0] != 's' or reg[1] != reg[2]:
+                    raise Unsupported('slot 57 mesh: unproven mask select source %s' % tok)
+                n = reg[1]
+                half = 32 if n in self.mask_high else 0
+                low = n - 1 if half else n
+                if low not in self.masks or {low, n} & self.join_masks:
+                    raise Unsupported('slot 57 mesh: unproven mask select source %s' % tok)
+                bit = self.S(low)
+            return '((tid & 32u) == %du ? (%s & 1u) : 0u)' % (half, bit)
+
+        yes, no = (contribution(tok) for tok in ops[1:])
+        self.mesh_collect_masks[self.pc] = 'scc ? (%s) : (%s)' % (yes, no)
+        dst = ops[0]
+        if dst in MESH_MASK_WORDS:
+            bit, half = MESH_MASK_WORDS[dst]
+            # SOP2 writes just one half of the guest mask. Keep the other half as it was.
+            self.emit('%s = (tid & 32u) == %du ? ((mesh_mask >> (tid & 31u)) & 1u) : %s;'
+                      % (bit, half, bit))
+            if bit == 'exec':
+                self.exec_known = self.exec_narrow_only = False
+        else:
+            reg = reg_range(dst)
+            if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
+                raise Unsupported('slot 57 mesh: unsupported mask select destination %s' % dst)
+            self.set_s(reg[1], 'mesh_mask', uniform=True)
+
     def check_mesh_collectives(self, sites, branches):
         # A logical wave must reach a collective with all its lanes or none. A lane-only
         # branch is safe before the collective if both paths reconverge there or both miss it.
@@ -9722,6 +9798,14 @@ class Stage:
         for source in ops[1:3]:
             self.reject_lane_mask_data('v_cndmask_b32', source)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
+        if len(ops) == 4 and re.fullmatch(r's\d+', ops[3]):
+            low = int(ops[3][1:])
+            words = {low, low + 1}
+            if words & getattr(self, 'mesh_ballot_regs', set()):
+                if (low % 2 or low >= 105 or words & (self.masks | self.mask_high | self.join_masks)
+                        or not all(self.uniform_source('s%d' % n) for n in words)):
+                    raise Unsupported('slot 57 mesh: unproven scalar pair for v_cndmask_b32')
+                mask = '((tid & 32u ? %s : %s) >> (tid & 31u))' % (self.S(low + 1), mask)
         align4 = self.operand_align4(ops[1]) and self.operand_align4(ops[2])
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])), align4=align4)
@@ -10742,6 +10826,9 @@ class Stage:
                 value = self.mesh_collect_reads[off]
                 out.append('    uint mesh_first_%d = mesh_first_active(tid, pc == %d && (exec & 1u) != 0u, '
                            'pc == %d ? %s : 0u, false);' % (i, i, i, value))
+            if off in getattr(self, 'mesh_collect_masks', {}):
+                selected = self.mesh_collect_masks[off]
+                out.append('    uint mesh_mask_%d = mesh_ballot(tid, pc == %d ? (%s) : 0u);' % (i, i, selected))
             if off == getattr(self, 'mesh_allocation_block', None):
                 out.append('    {')
             else:
@@ -10749,6 +10836,8 @@ class Stage:
                 out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             if off in getattr(self, 'mesh_collect_reads', {}):
                 out.append('        uint mesh_first = mesh_first_%d;' % i)
+            if off in getattr(self, 'mesh_collect_masks', {}):
+                out.append('        uint mesh_mask = mesh_mask_%d;' % i)
             out += ['        ' + line for line in lines]
             if off in getattr(self, 'mesh_collect_votes', {}):
                 word = self.mesh_collect_votes[off]
@@ -12525,6 +12614,21 @@ class MeshPipeline(Pipeline):
             # Nothing reads a parameter without a pixel stage: drop its writes but keep the rest of the export
             # line (its exec guard and mesh_vertex = true), as for unread fparam/hparam fields above.
             lines = [re.sub(r' o\.param\d+ = [^;]*;', '', line) for line in lines]
+        mask_collectives = []
+        if s.mesh_collect_masks:
+            mask_collectives = [
+                'groupshared uint mesh_ballot_word[2];',
+                'uint mesh_ballot(uint tid, uint bit) {',
+                '    uint wave = tid >> 6u;',
+                '    if ((tid & 63u) == 0u) mesh_ballot_word[wave] = 0u;',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    if (bit != 0u) InterlockedOr(mesh_ballot_word[wave], 1u << (tid & 31u));',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    uint word = mesh_ballot_word[wave];',
+                '    GroupMemoryBarrierWithGroupSync();',
+                '    return word;',
+                '}',
+            ]
         collectives = []
         if s.mesh_collect_reads or s.mesh_collect_votes:
             # One logical wave spans 64 guest threads regardless of the desktop wave width.
@@ -12547,7 +12651,7 @@ class MeshPipeline(Pipeline):
                 '}',
             ]
         return '\n'.join(
-            self.common() + collectives + ['struct VSOut {'] + self.interface(False) + [
+            self.common() + collectives + mask_collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
                 % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']

@@ -10451,6 +10451,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(mesh_amplification_refusal PROPERTIES TIMEOUT 30)
     add_test(NAME mesh_entry_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_entry_aot_cli_check.py")
+    add_test(NAME startup_mesh57_cselect_mask_cpu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mesh_cselect_check.py")
+    add_test(NAME startup_mesh57_cselect_mask_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mesh_cselect_check.py" draw "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>")
+    set_tests_properties(startup_mesh57_cselect_mask_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME mesh_bitcmp_clause_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_bitcmp_clause_check.py")
     foreach(adapter IN ITEMS hardware warp)
