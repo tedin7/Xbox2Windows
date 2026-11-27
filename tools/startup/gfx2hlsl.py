@@ -3443,13 +3443,15 @@ class Stage:
 
     def resolve_plain_samples(self):
         """Writes each plain image_sample past a join into the blocks: the implicit-LOD Sample unless a divergent back
-        edge spans it (the same proof as image_sample_b / image_get_lod), else the level-0 call as before. It never
-        refuses: a plain sample that translated before still does."""
+        edge spans it (the same proof as image_sample_b / image_get_lod), else the level-0 call as before.
+        Biased samples require the implicit path."""
         if not self.plain_samples:
             return
         choice = {}
         for at, (level0, implicit) in self.plain_samples.items():
             spanned = any(target <= at <= branch for target, branch in self.divergent_back_edges) or self.divergent_exit_loop(at)
+            if spanned and level0 is None:
+                raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             choice['X2W_PLAIN_SAMPLE<%x>' % at] = level0 if spanned else implicit
 
         def text(line):
@@ -9230,6 +9232,7 @@ class Stage:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
+            implicit_bias = False
             if how == 'b':
                 # The guest clamps the biased LOD to the sampler's MIN_LOD and MAX_LOD. Only a constant descriptor
                 # can be read here, and only its limits are carried to the static sampler (line smpl), so a sampler
@@ -9248,10 +9251,11 @@ class Stage:
                 self.pipe.lod_unvalidated.add(name)
                 smp = heap or self.pipe.sampler(tuple(words))
             elif how in ('sample', 'l', 'lz', 'd') and words:
-                # A constant descriptor carries its LOD limits like image_sample_b, under the same bias and range
-                # validation. A mip filter of 0 (base level only) keeps the ordinary sampler, as before: refusing it
-                # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
-                self.lod_sampler_words(name, words, mip_filter_none_ok=True)
+                # The smpl binding carries the validated LOD state. An unbiased descriptor with mip filter 0
+                # (base level only) keeps the ordinary sampler.
+                allow_bias = how in ('sample', 'lz') and self.kind == 'ps' and dim == 'SQ_RSRC_IMG_2D'
+                words = self.lod_sampler_words(name, words, mip_filter_none_ok=True, allow_bias=allow_bias)
+                implicit_bias = how == 'sample' and bool(words[2] & 0x3fff)
                 smp = self.pipe.sampler(tuple(words), lod_limits=bool((words[2] >> 26) & 3))
             else:
                 smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
@@ -9292,6 +9296,8 @@ class Stage:
                 call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
                     tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
+                if implicit_bias:
+                    raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             elif len(self.blocks) > 0:
                 # Past a join the guest still takes the LOD from the quad's derivatives. Where the rule of image_sample_b
@@ -9299,8 +9305,10 @@ class Stage:
                 # implicit-LOD Sample; otherwise it stays level 0 (resolve_plain_samples).
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
                 if getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
-                    self.plain_samples[self.pc] = (call, '%s.Sample(%s, %s)' % (tex, smp, uv))
+                    self.plain_samples[self.pc] = (None if implicit_bias else call, '%s.Sample(%s, %s)' % (tex, smp, uv))
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
+                elif implicit_bias:
+                    raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
@@ -9411,11 +9419,8 @@ class Stage:
         """The constant sampler words of an image_sample_b, or Unsupported when the guest sampler state is not kept.
 
         SQ_IMG_SAMP_WORD1 bits 11:0 MIN_LOD and 23:12 MAX_LOD are u4.8 and are carried to MinLOD and MaxLOD of the
-        static sampler (translated_sampler_bindings.h, line smpl). SQ_IMG_SAMP_WORD2 bits 13:0 LOD_BIAS (s6.8) and
-        19:14 LOD_BIAS_SEC (s2.4) are not carried: the ISA scales them by T#.perf_modulation, which the D3D12 sampler
-        has no field for, so a nonzero bias is refused. Mip filter 0 disables mipmapping (ISA: "0=none (disable
-        mipmapping, use base-level)"), which a D3D12 sampler cannot express and which would make the bias count, so
-        it is refused too. Field layout: Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json, SQ_IMG_SAMP_WORD1/2."""
+        static sampler (translated_sampler_bindings.h, line smpl). This form still refuses descriptor bias
+        and a mip filter of 0 (RDNA 2 ISA: disable mipmapping and use the base level)."""
         if heap:
             raise Unsupported('image_sample_b through a sampler heap (LOD limits and bias unknown)')
         if not words:
@@ -9428,18 +9433,31 @@ class Stage:
         """True for the four zero words that the default-sampler shortcut of a run-time heap load leaves behind."""
         return list(words) == [0, 0, 0, 0] and 'dynamic sampler index replaced by a default sampler' in self.pipe.notes
 
-    def lod_sampler_words(self, name, words, mip_filter_none_ok=False):
-        """The words of a constant sampler whose LOD limits are carried to the static sampler, or Unsupported.
-
-        Shared by image_sample_b and by image_sample, _l and _lz (#2177). Only the bias form refuses a mip filter of
-        0 (mip_filter_none_ok False): there the bias would count; the other forms leave that sampler as it was."""
-        if words[2] & 0xfffff:
+    def lod_sampler_words(self, name, words, mip_filter_none_ok=False, allow_bias=False):
+        """Validate LOD state for a constant sampler and return the words to bind."""
+        mip_filter = (words[2] >> 26) & 3
+        primary = words[2] & 0x3fff
+        secondary = words[2] & 0xfc000
+        if secondary or (primary and (not allow_bias or mip_filter != 2)):
             raise Unsupported('%s with a sampler LOD bias (word 2 %#x)' % (name, words[2]))
-        if (words[2] >> 26) & 3 == 0 and not mip_filter_none_ok:
+        # AMD RDNA 2 Shader Instruction Set Architecture, sections 8.2.6 and 8.2.7:
+        # T#.perf_modulation scales LOD_BIAS_SEC, which must be zero here. The
+        # primary bias is a signed 14-bit field with eight fractional bits
+        # (also AMD CIK 3D Registers, SQ_IMG_SAMP_WORD2). It maps exactly to
+        # MipLODBias within D3D12_MIP_LOD_BIAS_MIN/MAX.
+        bias = ((primary ^ 0x2000) - 0x2000) / 256
+        if not -16.0 <= bias <= 15.99:
+            raise Unsupported('%s with sampler LOD bias %g outside the D3D12 range' % (name, bias))
+        if mip_filter == 0 and not mip_filter_none_ok:
             raise Unsupported('%s with mipmapping disabled (sampler mip filter 0)' % name)
         if words[1] & 0xfff > (words[1] >> 12) & 0xfff:
             raise Unsupported('%s with sampler MIN_LOD %#x above MAX_LOD %#x'
                               % (name, words[1] & 0xfff, (words[1] >> 12) & 0xfff))
+        if primary and name == 'image_sample_lz':
+            # RDNA 2 ISA §8.2.3, Sample Instruction Suffix Key: _LZ forces mip
+            # level 0. D3D sample_l honors MIPLODBIAS, so bind the zero-bias
+            # words here, separately from any implicit sample with the bias.
+            return (*words[:2], words[2] & ~0x3fff, words[3])
         return words
 
     def op_image_sample_b(self, ops, mods):
@@ -12915,13 +12933,13 @@ class Pipeline:
     def sampler(self, key, comparison=False, lod_limits=False):
         if not isinstance(key[0], int):
             raise Unsupported('sampler from a descriptor')
-        # A comparison sampler, or one that carries the descriptor's LOD limits (image_sample_b), is its own binding
+        # A comparison sampler, or one that carries the descriptor's LOD state, is its own binding
         # even when its words equal an ordinary sampler's.
         key = ('cmp',) + tuple(key) if comparison else ('lod',) + tuple(key) if lod_limits else key
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def sampler_lines(self):
-        """The manifest lines of the static samplers, graphics and compute: smp, smpc or smpl by the key's prefix."""
+        """Emit static sampler words as smp, smpc or smpl. The smpl words carry limits and any validated bias."""
         lines = []
         for key, i in self.samplers.items():
             prefixed = key[0] in ('cmp', 'lod')

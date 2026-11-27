@@ -9,8 +9,9 @@
 
 Semantics. SQ_IMG_SAMP_WORD1 bits 11:0 MIN_LOD and 23:12 MAX_LOD (u4.8, Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json)
 clamp the LOD of every sample form, not only of image_sample_b (#2051). A constant sampler of image_sample, _l and _lz now
-reaches the static sampler through the same smpl manifest line, with the validation of image_sample_b: a descriptor LOD
-bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused. A mip filter of 0 (word 2 bits 27:26) is NOT refused here
+reaches the static sampler through the same smpl manifest line. The 2D pixel sample and level-zero forms accept a
+signed primary bias with linear mip filtering and zero secondary bias. MIN_LOD above MAX_LOD is refused.
+A mip filter of 0 (word 2 bits 27:26) is NOT refused for unbiased sampling here
 (only the bias form needs it: the bias would count): such a sampler keeps its ordinary smp line, as before. A sampler read
 at run time (heap table or the default-sampler shortcut) keeps its ordinary static sampler too, is not validated, and is
 logged once per translated module (#2221).
@@ -46,6 +47,83 @@ from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hl
 from startup_image_sample_b_check import texel_cell  # noqa: E402
 
 POINT_MIP = 0x4000000  # word 2 bits 27:26 = 1
+LINEAR_MIP = 2 << 26
+BIAS_LIMITS = 0x200000  # mip range [0, 2]
+BIAS_VS = """\
+v_mov_b32 v6, 1.0
+exp param0 v6, v6, v6, v6
+exp pos0 v6, v6, v6, v6 done
+s_endpgm
+"""
+BIAS_PS = """\
+s_load_dwordx8 s[32:39], s[8:9], 0x0
+s_mov_b32 s52, 0x92
+s_mov_b32 s53, 0x200000
+s_mov_b32 s54, 0x8003f80
+s_mov_b32 s55, 0
+s_mov_b32 m0, s10
+v_interp_p1_f32_e32 v19, v0, attr0.x
+v_interp_p2_f32_e32 v19, v1, attr0.x
+v_interp_p1_f32_e32 v20, v0, attr0.y
+v_interp_p2_f32_e32 v20, v1, attr0.y
+s_waitcnt lgkmcnt(0)
+image_sample{suffix} v[24:27], v[19:20], s[32:39], s[52:55] dmask:0xf dim:SQ_RSRC_IMG_2D
+s_waitcnt vmcnt(0)
+exp mrt0 v24, v25, v26, v27 done vm
+s_endpgm
+"""
+BIAS_VS_WORDS = bytes.fromhex('f2020c7e0f0200f806060606cf0800f806060606000081bf')
+BIAS_PS_PREFIX = bytes.fromhex(
+    '04080cf4000000faff03b4be92000000ff03b5be00002000ff03b6be803f00088003b7be'
+    '0a03fcbe00004cc801004dc8000150c8010151c87fc08cbf'
+)
+BIAS_SAMPLE = {
+    'sample': bytes.fromhex('080f80f01318a801703f8cbf'),
+    'lz': bytes.fromhex('080f9cf01318a801703f8cbf'),
+}
+BIAS_PS_TAIL = bytes.fromhex('0f1800f818191a1b000081bf')
+
+
+def bias_code(forms, word2=LINEAR_MIP | 0x3f80, word1=BIAS_LIMITS):
+    prefix = BIAS_PS_PREFIX.replace(bytes.fromhex('803f0008'), word2.to_bytes(4, 'little'))
+    prefix = prefix[:20] + word1.to_bytes(4, 'little') + prefix[24:]
+    return prefix + b''.join(BIAS_SAMPLE[form] for form in forms) + BIAS_PS_TAIL
+
+
+def bias_stage(form, word2, word1=BIAS_LIMITS):
+    return G.Pipeline(BIAS_VS_WORDS, bias_code((form,), word2, word1), root_blob())
+
+
+def bias_controls():
+    for form, name, call in (('sample', 'image_sample', '.Sample'), ('lz', 'image_sample_lz', '.SampleLevel')):
+        for bias, field in ((-128, 0x3f80), (128, 0x80), (0, 0), (-4096, 0x3000), (4093, 0xffd)):
+            pipe = bias_stage(form, LINEAR_MIP | field)
+            assert call + '(q0,' in pipe.hlsl_ps()
+            expected_word = LINEAR_MIP | (field if form == 'sample' else 0)
+            assert sampler_line(pipe) == 'smpl 0 0x92 0x200000 0x%x 0x0' % expected_word, (form, bias)
+        for word2, word1, diagnostic in (
+            (LINEAR_MIP | 0x7f80, BIAS_LIMITS, 'with a sampler LOD bias (word 2 0x8007f80)'),
+            (LINEAR_MIP | 0xffe, BIAS_LIMITS, 'outside the D3D12 range'),
+            (LINEAR_MIP | 0x2fff, BIAS_LIMITS, 'outside the D3D12 range'),
+            (POINT_MIP | 0x3f80, BIAS_LIMITS, 'with a sampler LOD bias'),
+            (LINEAR_MIP | 0x3f80, 0x100200, 'with sampler MIN_LOD 0x200 above MAX_LOD 0x100'),
+        ):
+            try:
+                bias_stage(form, word2, word1)
+            except G.Unsupported as error:
+                assert str(error).startswith(name + ' ') and diagnostic in str(error), str(error)
+            else:
+                raise AssertionError((form, word1, word2, 'unexpectedly translated'))
+    shared = G.Pipeline(BIAS_VS_WORDS, bias_code(('sample', 'lz')), root_blob())
+    ps = shared.hlsl_ps()
+    assert '.Sample(q0,' in ps and '.SampleLevel(q1,' in ps
+    assert [line for line in shared.manifest().splitlines() if line.startswith('smpl ')] == [
+        'smpl 0 0x92 0x200000 0x8003f80 0x0',
+        'smpl 1 0x92 0x200000 0x8000000 0x0',
+    ]
+    print('2D inline sampler bias: separate bindings, signed limits, secondary bias, mip filter and LOD clamp controls pass')
+
+
 PROGRAM = """\
 s_load_dwordx8 s[16:23], s[8:9], 0x0
 s_mov_b32 s24, 0
@@ -229,6 +307,8 @@ def refused(name, text):
 
 def controls(only=None):
     assert WORDS, 'no recorded words'
+    if only is None:
+        bias_controls()
     for form, (_, op, w1, mip, plain_mip) in FORMS.items():
         if only and form != only:
             continue
@@ -307,6 +387,9 @@ def check_compute_manifest():
 
 
 def check_binary(llvm_mc):
+    assert assemble(llvm_mc, BIAS_VS) == BIAS_VS_WORDS
+    for name, suffix in (('sample', ''), ('lz', '_lz')):
+        assert assemble(llvm_mc, BIAS_PS.format(suffix=suffix)) == bias_code((name,)), name
     for name, source in fixtures().items():
         built = assemble(llvm_mc, source)
         if built != bytes.fromhex(WORDS[name]):

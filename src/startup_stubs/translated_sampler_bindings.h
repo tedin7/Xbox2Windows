@@ -67,7 +67,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
 struct TranslatedSamplers {
     std::vector<SamplerWords> statics;
     std::vector<bool> comparison;  // parallel to statics: bound as SamplerComparisonState
-    std::vector<bool> lod_limits;  // parallel to statics: MIN_LOD and MAX_LOD carried over (line smpl)
+    std::vector<bool> lod_limits;  // parallel to statics: LOD limits and primary bias carried over (line smpl)
     bool heap = false;
     bool reserved_fallback = false;
 
@@ -105,9 +105,19 @@ struct TranslatedSamplers {
 inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSamplers& samplers)
 {
     std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
-    for (UINT i = 0; i < samplers.statics.size(); ++i)
-        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i],
-                                         i < samplers.lod_limits.size() && samplers.lod_limits[i]));
+    for (UINT i = 0; i < samplers.statics.size(); ++i) {
+        const bool limits = i < samplers.lod_limits.size() && samplers.lod_limits[i];
+        const auto& words = samplers.statics[i];
+        auto sampler = decode_sampler(words, i, i < samplers.comparison.size() && samplers.comparison[i], limits);
+        if (limits) {
+            // RDNA 2 ISA §8.2.7, sampler descriptor: signed primary LOD bias,
+            // bits 13:0 of word 2, with eight fractional bits. The translator
+            // validates the D3D12 range and requires zero secondary bias.
+            const int bias = static_cast<int>(words[2] & 0x3fffu);
+            sampler.MipLODBias = static_cast<float>((bias ^ 0x2000) - 0x2000) / 256.0f;
+        }
+        statics.push_back(sampler);
+    }
     return statics;
 }
 

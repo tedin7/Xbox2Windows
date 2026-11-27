@@ -1314,6 +1314,17 @@ OperationResult run_startup_sampler_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-sampler-bias <ps.cso> <sampler manifest line> <expected red>
+OperationResult run_startup_sampler_bias(const OperationContext& ctx)
+{
+    const auto ps = read_shader(ctx.argv[3]);
+    const int result = check_startup_sampler_lod(ctx.device, false, {ps.data(), ps.size()}, ctx.argv[4],
+                                                std::stof(ctx.argv[5]));
+    if (result == 77) return {OutcomeKind::skip, "skip: R32_FLOAT does not report sampling, mips and render target"};
+    if (result) return {OutcomeKind::fail, "sampler bias readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
 // gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
 OperationResult run_startup_sampler_heap(const OperationContext& ctx)
@@ -1859,6 +1870,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
     {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
+    {"--startup-sampler-bias", 6, 6, nullptr, kNoGate, run_startup_sampler_bias},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},

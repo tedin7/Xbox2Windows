@@ -7,6 +7,7 @@ import sys
 import tempfile
 
 from pixel_aot_check import RAMP, must_reject, translate, write_record
+from startup_image_sample_lod_check import LINEAR_MIP, bias_stage, sampler_line
 
 
 def single(value):
@@ -158,6 +159,51 @@ def compile_ps(compiler, hlsl_text, directory, stem):
     return cso
 
 
+def check_static_sampler_bias(directory, compiler, renderer, backend):
+    def reference(lod):
+        # The three 8x8 texture mips in startup_sampler_lod.cpp hold these solid red values.
+        colors = (0.125, 0.375, 0.625)
+        lod = min(max(lod, 0), len(colors) - 1)
+        mip = int(lod)
+        fraction = lod - mip
+        return colors[mip] * (1 - fraction) + colors[min(mip + 1, len(colors) - 1)] * fraction
+
+    def draw(shader, sampler, lod, *, wrong_lod=None):
+        result = subprocess.run([renderer, backend, "--startup-sampler-bias", shader, sampler, str(reference(lod))],
+                                capture_output=True, text=True)
+        print(result.stdout, end="")
+        if result.returncode == 77:
+            sys.exit(77)
+        if "debug_layer=enabled" in result.stdout:
+            assert "debug_errors=0 debug_warnings=0" in result.stdout, (result.stdout, result.stderr)
+        if wrong_lod is None:
+            assert result.returncode == 0 and "pixels=16 mismatches=0" in result.stdout, (sampler, result.stderr)
+        else:
+            assert result.returncode == 1 and "pixels=16 mismatches=16" in result.stdout, (sampler, result.stderr)
+            actual = f"actual={reference(wrong_lod):g}"
+            lines = [line for line in result.stderr.splitlines() if line.startswith("sampler_bias_mismatch ")]
+            assert len(lines) == 16 and all(line.endswith(actual) for line in lines), result.stderr
+
+    # A 4x4 draw over the full 8x8 base level yields log2(8/4) = 1.
+    implicit = bias_stage("sample", LINEAR_MIP | 0x3f80)
+    sample = compile_ps(compiler, implicit.hlsl_ps(), directory, "static_bias")
+    biased = sampler_line(implicit)
+    draw(sample, biased, 0.5)
+    zero = sampler_line(bias_stage("sample", LINEAR_MIP))
+    draw(sample, zero, 1.0)
+    draw(sample, zero, 0.5, wrong_lod=1.0)
+    doubled = biased.replace("0x8003f80", "0x8003f00")
+    draw(sample, doubled, 0.5, wrong_lod=0.0)
+
+    for field in (0x3f80, 0x80):
+        level_zero = bias_stage("lz", LINEAR_MIP | field)
+        shader = compile_ps(compiler, level_zero.hlsl_ps(), directory, f"static_bias_lz_{field:x}")
+        draw(shader, sampler_line(level_zero), 0.0)
+    # With a positive bias, failing to clear it changes the mip even at explicit LOD zero.
+    leaked = sampler_line(bias_stage("sample", LINEAR_MIP | 0x80))
+    draw(shader, leaked, 0.0, wrong_lod=0.5)
+
+
 def run(directory, compiler, renderer, backend):
     check_rejections()
 
@@ -229,6 +275,7 @@ def run(directory, compiler, renderer, backend):
     lz_const = compile_ps(compiler, translate(lz_constant_uv_program()), directory, "lz_const")
     subprocess.run([renderer, backend, "--check-pixel-case", lz_const, const_case], check=True)
 
+    check_static_sampler_bias(directory, compiler, renderer, backend)
     write_record(os.environ.get("FORM_COVERAGE_RECORD"))
     return 0
 
