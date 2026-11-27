@@ -1553,6 +1553,25 @@ LONG render_target_binds, render_target_unresolved;
 // reverse): nothing is bound, so every later draw of that pass is 'state_not_ready'. Counted by flags (index: DSV flags 0..3).
 LONG render_target_mixed_dsv[4];
 
+constexpr u64 compute_input_chunk_bytes = 16ull << 20;
+constexpr u64 compute_input_snapshot_limit = 256ull << 20;
+
+bool compute_title_inputs_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COMPUTE_TITLE_INPUTS");
+    return enabled;
+}
+
+struct ComputeInputSnapshot {
+    x2w_startup::ComPtr<ID3D12Resource> resource;
+    unsigned char* mapped = nullptr;
+    Wrapper* device = nullptr;
+    u64 address = 0, bytes = 0;
+    UINT last_frame = 0;
+    bool untracked = false;
+    std::vector<std::pair<ID3D12Fence*, UINT64>> submits;
+};
+
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
 // stands for a pool of desktop allocators. A list records on the pool's current one. In render
@@ -1603,6 +1622,10 @@ void detach_gpu_mirror_recording(Wrapper* list)
 }
 
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
+// allocator_lock protects the pool, recording holds, and submission fences.
+std::vector<std::shared_ptr<ComputeInputSnapshot>> compute_input_snapshots;  // allocator_lock
+std::unordered_map<Wrapper*, std::vector<std::shared_ptr<ComputeInputSnapshot>>> compute_input_recordings;
+UINT compute_input_frame;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
 std::vector<UploadRingChunk> large_upload_buffers;
 
@@ -1707,6 +1730,7 @@ void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
     discard_recording_uploads(list->own());
+    if (compute_title_inputs_enabled()) compute_input_recordings.erase(list);
     retire_list_arena(list);
     detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
@@ -1952,6 +1976,28 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     if (signaled) ++value;
     submit.submitted(chunks, signaled);
     submit.submitted(large_buffers, signaled, max_upload_chunks);
+    if (compute_title_inputs_enabled()) {
+        for (Wrapper* list : lists) {
+            const auto recording = compute_input_recordings.find(list);
+            if (recording == compute_input_recordings.end()) continue;
+            for (const auto& entry : recording->second) {
+                if (!signaled) {
+                    entry->untracked = true;
+                    continue;
+                }
+                auto& submits = entry->submits;
+                const auto same = std::find_if(submits.begin(), submits.end(), [fence](const auto& use) {
+                    return use.first == fence;
+                });
+                if (same != submits.end()) {
+                    same->second = value;
+                } else {
+                    try { submits.emplace_back(fence, value); }
+                    catch (const std::bad_alloc&) { entry->untracked = true; }
+                }
+            }
+        }
+    }
     if (signaled) {
         for (Wrapper* list : lists) {
             if (auto* arena = list->own().list_uploads) arena->submitted(fence, value);
@@ -2133,6 +2179,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             discard_recording_uploads(state);
+            if (compute_title_inputs_enabled()) compute_input_recordings.erase(self);
             retire_list_arena(self);
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -2175,6 +2222,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
         discard_recording_uploads(state);
+        if (compute_title_inputs_enabled()) compute_input_recordings.erase(self);
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2923,10 +2971,11 @@ UploadReservation reserve_large_upload(Wrapper* list, std::size_t bytes, UploadC
     return {};
 }
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr)
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadChunkMask* frame_hold = nullptr,
+                                      bool new_compute_chunk = false)
 {
     const u64 ring_max_bytes = upload_ring_max_bytes();
-    const u64 max_alloc_bytes = ring_max_bytes / 4;
+    const u64 max_alloc_bytes = new_compute_chunk ? compute_input_chunk_bytes : ring_max_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
@@ -2945,14 +2994,17 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
-    if (!chunks.empty()) {
+    if (!new_compute_chunk && !chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
         if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < ring_max_bytes ? ring_max_bytes - total_bytes : 0;
-    if (rounded <= remaining) {
+    // A failed compute snapshot may request one additional chunk beyond the ordinary ring cap.
+    const u64 capacity_limit = ring_max_bytes + (new_compute_chunk ? compute_input_chunk_bytes : 0);
+    const u64 remaining = total_bytes < capacity_limit ? capacity_limit - total_bytes : 0;
+    if (rounded <= remaining && chunks.size() < max_upload_chunks) {
         u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
+        if (new_compute_chunk) chunk_bytes = compute_input_chunk_bytes;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         if (append_upload_buffer(chunks, chunk_bytes)) {
@@ -3002,6 +3054,98 @@ bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset,
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
+}
+
+// Fixture: fill the ordinary ring on the recording that will try the snapshot.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_fixture_fill_upload_ring(void* guest_list, UINT bytes, BOOL fill_overflow)
+{
+    auto* list = static_cast<Wrapper*>(guest_list);
+    UINT count = 0;
+    while (reserve_upload_ring(list, bytes).mapped) ++count;
+    if (fill_overflow && compute_title_inputs_enabled() &&
+        reserve_upload_ring(list, compute_input_chunk_bytes, nullptr, true).mapped) ++count;
+    return count;
+}
+
+// Closed lists can be resubmitted. A buffer is idle only after the recording is gone and all its submits completed.
+bool compute_input_snapshot_idle(const std::shared_ptr<ComputeInputSnapshot>& entry)
+{
+    return entry.use_count() == 1 && !entry->untracked &&
+        std::all_of(entry->submits.begin(), entry->submits.end(), [](const auto& use) {
+            const UINT64 done = use.first->GetCompletedValue();
+            return done != UINT64_MAX && done >= use.second;
+        });
+}
+
+ID3D12Resource* large_compute_input_snapshot(Wrapper* list, u64 address, u64 bytes)
+{
+    std::shared_ptr<ComputeInputSnapshot> snapshot;
+    auto* device = list->own().list_device;
+    AcquireSRWLockExclusive(&allocator_lock);
+    if (list->own().list_open && device) {
+        try {
+            for (const auto& entry : compute_input_snapshots) {
+                if (entry->device == device && entry->address == address && entry->bytes == bytes &&
+                    compute_input_snapshot_idle(entry)) {
+                    snapshot = entry;
+                    break;
+                }
+            }
+            if (!snapshot) {
+                auto entry = std::make_shared<ComputeInputSnapshot>();
+                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+                const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
+                    DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+                void* mapped = nullptr;
+                const D3D12_RANGE no_reads{0, 0};
+                if (SUCCEEDED(device_of(device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(entry->resource.GetAddressOf()))) &&
+                    SUCCEEDED(entry->resource->Map(0, &no_reads, &mapped))) {
+                    entry->mapped = static_cast<unsigned char*>(mapped);
+                    entry->device = device;
+                    entry->address = address;
+                    entry->bytes = bytes;
+                    entry->last_frame = compute_input_frame;
+                    compute_input_snapshots.push_back(entry);
+                    snapshot = std::move(entry);
+                }
+            }
+            if (snapshot) {
+                compute_input_recordings[list].push_back(snapshot);
+                snapshot->submits.clear();
+                snapshot->last_frame = compute_input_frame;
+            }
+        } catch (const std::bad_alloc&) {
+            snapshot.reset();
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+
+    if (!snapshot) return nullptr;
+    // Snapshot at record time. Later title writes do not change this dispatch's input.
+    // Fixture mutant deliberately leaves every piece after the first zero.
+    static const bool first_chunk_only = x2w_local::env_on("X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY");
+    for (u64 offset = 0; offset < bytes; offset += compute_input_chunk_bytes) {
+        const auto piece = static_cast<std::size_t>((std::min)(compute_input_chunk_bytes, bytes - offset));
+        if (offset && first_chunk_only) {
+            std::memset(snapshot->mapped + offset, 0, piece);
+        } else if (!x2w_local::guarded_memcpy(snapshot->mapped + offset,
+                       reinterpret_cast<const void*>(address + offset), piece, true)) {
+            return nullptr;
+        }
+    }
+    return snapshot->resource.Get();
+}
+
+void expire_compute_input_snapshots(UINT frame)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    compute_input_frame = frame;
+    auto& snapshots = compute_input_snapshots;
+    snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(), [frame](const auto& snapshot) {
+        return frame - snapshot->last_frame >= 120 && compute_input_snapshot_idle(snapshot);
+    }), snapshots.end());
+    ReleaseSRWLockExclusive(&allocator_lock);
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(Wrapper* list, u64 title_address, std::size_t bytes)
@@ -3127,9 +3271,10 @@ bool indirect_copy_ranges()
     return enabled;
 }
 
-bool list_copied_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes)
+bool list_copied_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes,
+                           bool compute_title_input = false)
 {
-    if (!indirect_copy_ranges()) return false;
+    if (!compute_title_input && !indirect_copy_ranges()) return false;
     const auto& ranges = pass_of(self).copied_gpu_ranges;
     return std::any_of(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
         return range.resource == resource && offset >= range.offset && bytes <= range.bytes &&
@@ -3139,7 +3284,7 @@ bool list_copied_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, 
 
 void note_copy_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes, bool authoritative)
 {
-    if (!indirect_copy_ranges()) return;
+    if (!indirect_copy_ranges() && !compute_title_inputs_enabled()) return;
     auto& ranges = pass_of(self).copied_gpu_ranges;
     ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
         if (range.resource != resource) return false;
@@ -7938,6 +8083,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     InterlockedExchange(&frame_number, frame);
+    if (compute_title_inputs_enabled()) expire_compute_input_snapshots(static_cast<UINT>(frame));
     if (reuse_large_bindings) finish_bigbind_frame(frame);
     if (reuse_indirect_indices) finish_indirect_index_frame();
     if (reuse_large_bindings || reuse_indirect_indices) draw_lock_release_exclusive();
@@ -8088,9 +8234,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("x2w-render manifest lookups: first reads (made with draw_lock released) %lld, repeated reads %lld (must be 0); manifests read by the background thread %lld",
             manifest_source().first_opens(), manifest_source().retry_opens(), manifest_source().background_reads());
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
-            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
-            compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
+        log_compute_dispatch_totals();
         log_compute_census();
         log_key_use_census();
         log_dispatch_phases();
