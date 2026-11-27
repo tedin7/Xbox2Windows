@@ -35,7 +35,8 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
-                              UINT vertices = 3, const std::uint32_t* constants = nullptr);
+                              UINT vertices = 3, const std::uint32_t* constants = nullptr,
+                              DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_FLOAT);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width = 1, UINT height = 1, bool dynamic_heap = false);

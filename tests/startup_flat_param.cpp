@@ -1,10 +1,9 @@
 // Desktop readback for flat parameters in tools/startup/gfx2hlsl.py (v_interp_mov_f32, #1259).
 //
-// Draws one pixel with a translated vertex and pixel stage and returns the four 32-bit words of
-// the colour. The entry constants (cbuffer entry : register(b0)) are visible to both stages, because
-// the translated vertex stage reads ud0, the rectangle-list switch; they are all 0 here (plain
-// triangles) unless the caller passes four words. The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
-// exported.
+// Draws with a translated vertex and pixel stage and returns four words per pixel.
+// The entry constants at b0 are visible to both stages. ud0 is the rectangle-list switch,
+// which defaults to zero for plain triangles. R16_UNORM readback zero-extends each texel
+// into the first word and returns zeros in the other three.
 #include "desktop_gpu.h"
 
 #include <cstdint>
@@ -34,7 +33,7 @@ std::vector<char> read_blob(const char* path)
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width, UINT height,
                               D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
-                              const std::uint32_t* constants)
+                              const std::uint32_t* constants, DXGI_FORMAT format)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -66,7 +65,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    pd.RTVFormats[0] = format;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create flat parameter PSO");
@@ -77,10 +76,11 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    rd.Format = format;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R32G32B32A32_FLOAT, {-1.0f, -1.0f, -1.0f, -1.0f}};
+    const D3D12_CLEAR_VALUE clear{format, {-1.0f, -1.0f, -1.0f, -1.0f}};
+    if (format == DXGI_FORMAT_R16_UNORM) clear.Color[0] = 1.0f;
     const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 readback_size = 0;
@@ -119,8 +119,18 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     check(readback->Map(0, &read, &mapped), "Map flat parameter readback");
     const auto* first = static_cast<const std::uint8_t*>(mapped) + footprint.Offset;
     for (UINT y = 0; y < height; ++y) {
-        std::memcpy(words + size_t(y) * width * 4, first + size_t(y) * footprint.Footprint.RowPitch,
-                    size_t(width) * 4 * sizeof(*words));
+        const auto* row = first + size_t(y) * footprint.Footprint.RowPitch;
+        if (format == DXGI_FORMAT_R16_UNORM) {
+            for (UINT x = 0; x < width; ++x) {
+                std::uint16_t packed;
+                std::memcpy(&packed, row + size_t(x) * sizeof(packed), sizeof(packed));
+                auto* pixel = words + (size_t(y) * width + x) * 4;
+                pixel[0] = packed;
+                pixel[1] = pixel[2] = pixel[3] = 0;
+            }
+        } else {
+            std::memcpy(words + size_t(y) * width * 4, row, size_t(width) * 4 * sizeof(*words));
+        }
     }
     readback->Unmap(0, &none);
     std::printf("startup_flat_param words=%08x,%08x,%08x,%08x\n", words[0], words[1], words[2], words[3]);
