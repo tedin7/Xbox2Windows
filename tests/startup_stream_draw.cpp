@@ -685,7 +685,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         char mode[16]{};
         GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
         const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, mode);
-        if (result || !std::strcmp(mode, "once-mirror")) return result;
+        if (result || !std::strncmp(mode, "once-mirror", 11)) return result;
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
