@@ -69,16 +69,24 @@ hop through resolved texture SRVs of translated draws to known present targets.
 Once discovered, up to 32 such textures are eligible for producer history and
 readback under the same format and operation limits.
 
+With onset enabled, `X2W_RED_PRODUCER_RGB=any` compares each sampled pixel to
+the first sampled pixel. It arms on a flat sample after a nonflat sample or
+after a flat sample whose RGB changes by more than 16 in any channel. Black is
+eligible. `X2W_RED_PRODUCER_AUTO=10s,12` applies the floor 10 seconds after
+process creation. `X2W_RED_PRODUCER_REARM=3` allows three capture windows
+(default one, maximum four), each with its own onset level and ordinal. The
+tester ZIP includes `present_producer.txt` when automatic capture was configured.
+
 The producer rows report one RGBA8 texel before and after a clear or supported
 graphics draw to a known present target. They include the submitting queue and
-operation order. Present samples use the same texel, and attachment rows identify
-the bound render targets and depth view. A queue fence guards the readbacks.
+operation order. Numeric RGB mode uses the same center texel in present
+samples. Attachment rows identify the bound render targets and depth view. A queue fence guards the readbacks.
 Recording history gives candidate commands. Attribution requires a completed
 producer read and a matching presentation resource. The trace covers direct-list
 graphics writes to previously seen single-sample present targets and eligible
 inputs in onset mode. Compute writes and alias writes require separate evidence.
-The diagnostic retains up to eight present resources and 512 paired readbacks in
-an opted-in process.
+The diagnostic retains up to eight present resources and up to 512 paired readbacks per
+armed window. The default single window and explicit frame trace share this limit.
 
 `startup_present_producer` uses a 16×16 source-built texture and known clears. It
 checks exact colors on both sides of each clear, compared to subsequent presents,
@@ -87,12 +95,19 @@ check red and magenta, ignore an early exact match and a later near match, and
 refuse an out-of-range RGB component. The default-cadence case omits the signature
 override. The onset case compares a near-red center in a nonuniform picture with
 a uniform near-red picture, then checks the producer readbacks with onset on and
-automatic capture with onset off. Run the WARP and hardware checks separately
-when reporting adapter results.
+automatic capture with onset off. The level-independent case uses synthetic
+indirect draws to generate nonuniform, white, nonuniform, gray and black
+pictures. It checks the drawn RGB against a CPU reference and the preceding
+green clear, plus the draw identity in history. A present floor excludes white
+and an unreached seconds floor excludes every capture. The numeric black
+control keeps only the final onset. To exercise the matcher mutant, remove
+the any-mode early return in `RedProducers::matches` and rerun the WARP test.
+The white, gray and black sequence must fail its three-capture assertion.
+Run the WARP and hardware checks separately when reporting adapter results.
 
 ```powershell
 cmake --build --preset dev --target startup_present_producer
-ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^startup_(present_producer_warp|tester_pack)$' -V
 ```
 
 ## Per-draw texel history

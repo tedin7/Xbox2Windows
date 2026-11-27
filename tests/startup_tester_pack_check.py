@@ -904,6 +904,33 @@ def check_symbols():
             assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
 
 
+def check_producer_report():
+    config = "x2w-red auto configured floor=40 frames=2 rearm=3\n"
+    waiting = config + "x2w-red auto waiting present=33\n"
+    assert "floor not reached: last present 33, floor 40" in T.producer_report(waiting)
+    assert "floor not reached: last present 33, floor 40s" in T.producer_report(waiting.replace("floor=40", "floor=40s"))
+    reached = waiting + "x2w-red auto floor reached present=40\n"
+    assert "no flat onset seen" in T.producer_report(reached)
+    capture = "x2w-red auto armed sampled_present={} published_at={} target=123 capture={}..{} rgb={} ordinal={}\n"
+    armed = reached + capture.format(45, 46, 47, 48, "255,255,255", 1) + capture.format(55, 56, 57, 58, "0,0,0", 2)
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        log = tmp / "stderr.txt"
+        log.write_text(waiting, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "waiting.zip"))
+        with zipfile.ZipFile(tmp / "waiting.zip") as z:
+            assert "floor not reached: last present 33, floor 40" in z.read(T.PRODUCER_NAME).decode()
+        log.write_text(armed, encoding="utf-8")
+        T.pack(str(tmp), MANIFEST, str(tmp / "report.zip"))
+        with zipfile.ZipFile(tmp / "report.zip") as z:
+            report = z.read(T.PRODUCER_NAME).decode()
+    assert report.splitlines()[1:] == [
+        "capture 1: RGB 255,255,255, onset present 45, frames 47..48",
+        "capture 2: RGB 0,0,0, onset present 55, frames 57..58",
+    ]
+    assert not T.producer_report("unrelated log\n")
+
+
 if __name__ == "__main__":
     check_symbols()
     check_seed_cache()
@@ -922,6 +949,7 @@ if __name__ == "__main__":
     check_manifest()
     check_first_poll()
     check_end_cause()
+    check_producer_report()
     check_cache_stats()
     check_cache_tag()
     check_memory_gib()
