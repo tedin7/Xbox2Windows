@@ -16201,6 +16201,26 @@ a store inside the loop, a live-out scalar that depends on the key (or is comput
 descriptor keeps an instruction-specific refusal. The fixtures include a key-independent live-out read after the loop
 (accepted, checked against a D3D12 WARP readback) and key-dependent live-outs (refused).
 
+### Forward pixel first-lane reads with whole-quad EXEC
+
+The forward pixel retry also accepts an index-free formatted buffer load followed
+by `v_readfirstlane_b32` in the same basic block with no intervening EXEC write.
+At both instructions, every incoming path must prove entry EXEC, its whole-quad
+widening, or a restore from an unmodified saved copy of either mask. The exact
+entry EXEC checks for other instructions retain their existing behavior.
+
+The synthetic pixel fixture writes one channel under a position-dependent mask,
+restores whole-quad EXEC, and picks either a formatted buffer word or a root
+constant on a uniform branch. The WARP check draws both flag values and compares
+all four channels at all 64 pixels against a CPU reference. Swapping the branch
+arms must produce 64 mismatches. Python controls check narrowing, a saved pair
+overwritten on one path, an unknown restore, an indexed load, an intervening
+EXEC or VGPR write, a block boundary, and a mask-changing back edge.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_readfirstlane_uniform|startup_gfx2hlsl_src_scc_join_draw_warp)$' -V
+```
+
 ## Desktop audio render sink
 
 `startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.

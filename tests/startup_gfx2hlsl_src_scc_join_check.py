@@ -385,7 +385,7 @@ def check_pixel_draw(dxc, runner, shaders):
               run.stdout + run.stderr)
 
 
-def check_firstlane_draw(dxc, runner, hlsl, bindings):
+def check_firstlane_draw(dxc, runner, hlsl, bindings, whole_quad):
     def float_word(value):
         return struct.unpack('<I', struct.pack('<f', value))[0]
 
@@ -393,7 +393,7 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings):
         return ','.join(f'{word:08x}' for word in words)
 
     # Include enough backing for the widest format case in the generated switch.
-    values = (97.0, 19.25, 33.0, 41.0, 59.0)
+    values = (97.0, 19.25, 33.0, 41.0, 59.0, 71.0)
     fallback = 5.5
     buffer = hex_words(float_word(value) for value in values)
     word3 = (G.DESC_FORMAT_CODES['BUF_FMT_32_FLOAT'] << G.DESC_FORMAT_SHIFT) | 4
@@ -403,13 +403,10 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings):
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'firstlane_vs', 'vs_6_0', directory)
 
-        def draw(name, shader, flag, mismatch=False):
-            picked = values[1] if flag else fallback
-            scale = 2.0 if flag else 4.0
-            select = scale if flag else 0.5
+        def draw(name, shader, flag, bindings, reference, mismatch=False):
             expected = directory / (name + '.bin')
             expected.write_bytes(b''.join(
-                struct.pack('<4f', (x | (y << 16)) + picked, x | (y << 16), scale, select)
+                struct.pack('<4f', *reference(x | (y << 16), y, flag))
                 for y in range(8) for x in range(8)))
             constants = {('rootconst', 1, 0): flag, ('rootconst', 1, 1): float_word(fallback),
                          ('descword3', 0): word3}
@@ -427,8 +424,19 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings):
             expected_count = '64 differing pixels' if mismatch else '64 matching pixels'
             check(f'{name} WARP readback ({expected_count})', expected_result, run.stdout + run.stderr)
 
+        def entry_reference(pos, _y, flag):
+            picked = values[1] if flag else fallback
+            return pos + picked, pos, 2.0 if flag else 4.0, 2.0 if flag else 0.5
+
+        def whole_quad_reference(pos, y, flag):
+            picked = values[2] if flag else fallback
+            return pos + picked, pos, float(y >= 4), 1.0
+
+        whole_quad_hlsl, swapped, whole_quad_bindings = whole_quad
         for flag in (0, 1):
-            draw(f'firstlane_flag_{flag}', hlsl, flag)
+            draw(f'firstlane_flag_{flag}', hlsl, flag, bindings, entry_reference)
+            draw(f'whole_quad_flag_{flag}', whole_quad_hlsl, flag, whole_quad_bindings, whole_quad_reference)
+        draw('mutant_whole_quad_swapped_arms', swapped, 1, whole_quad_bindings, whole_quad_reference, mismatch=True)
 
         for name, original, mutant in (
             ('mutant_join_scc', 's14 = scc ?', 's14 = !scc ?'),
@@ -436,7 +444,7 @@ def check_firstlane_draw(dxc, runner, hlsl, bindings):
             ('mutant_load_offset', '        a = 4;', '        a = 0;'),
         ):
             assert hlsl.count(original) == 1, (name, original)
-            draw(name, hlsl.replace(original, mutant), 1, mismatch=True)
+            draw(name, hlsl.replace(original, mutant), 1, bindings, entry_reference, mismatch=True)
 
 
 
@@ -607,9 +615,10 @@ elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
     shaders = pixel_controls()
     firstlane_hlsl, bindings = firstlane_pixel.check_translation()
     vertex = vertex_controls()
+    whole_quad = firstlane_pixel.check_whole_quad_translation()
     if not failures:
         check_pixel_draw(*sys.argv[2:], shaders)
-        check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings)
+        check_firstlane_draw(*sys.argv[2:], firstlane_hlsl, bindings, whole_quad)
         check_vertex_draw(*sys.argv[2:], vertex)
 elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     for name, (source, prefix, _) in PIXEL_CASES.items():

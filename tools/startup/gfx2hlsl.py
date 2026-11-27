@@ -4496,10 +4496,15 @@ class Stage:
                 out.add(reg)
         return out
 
-    def entry_exec_sites(self, cfg, reduction_restores=None, *, compute_dpp=False):
-        """Prove entry EXEC and its saved copies on every incoming CFG edge."""
+    def entry_exec_sites(self, cfg, reduction_restores=None, *, compute_dpp=False, pixel_full=False):
+        """Prove entry EXEC and its saved copies on every incoming CFG edge.
+
+        The pixel lane-zero retry also permits the whole-quad widening of a
+        proven mask. Other callers still require exact entry EXEC.
+        """
         bounds, _, succ, _ = cfg
-        if not bounds or any(name.startswith(('s_wqm', 's_swappc', 's_call', 's_rfe'))
+        if not bounds or any(name.startswith(('s_swappc', 's_call', 's_rfe'))
+                             or (not pixel_full and name.startswith('s_wqm'))
                              for _, _, name, _ in self.ins):
             return set()
         wave = getattr(self.pipe, 'wave_size', None)
@@ -4544,11 +4549,14 @@ class Stage:
                 words = mask_words(src1, width)
                 if src0 in mask and words:
                     move = ('restore_or', tuple(words))
-            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move, narrows))
+            widens = pixel_full and not mods and (
+                name == 's_wqm_b64' and ops == ['exec', 'exec'] or
+                wave32 and name == 's_wqm_b32' and ops in (['exec', 'exec'], ['exec_lo', 'exec_lo']))
+            operations.append((writes_exec(name, ops) or bool(writes & EXEC_KEYS), writes, move, narrows, widens))
 
         # Missing blocks are unreachable so far. At a join or back edge keep only facts common to all paths.
-        # () proves exact EXEC. The subset fact allows an OR restore after an AND narrowed it.
-        # Other facts name the SGPRs of an entry mask copy.
+        # () proves EXEC. The subset fact allows an OR restore after an AND narrowed it.
+        # Other facts name the SGPRs of a saved mask copy.
         subset = ('subset',)
         before = {0: {(), subset} if compute_dpp else {()}}
         pending = {0}
@@ -4563,7 +4571,7 @@ class Stage:
                     known.add(off)
                 else:
                     known.discard(off)
-                exec_write, writes, move, narrows = operations[i]
+                exec_write, writes, move, narrows, widens = operations[i]
                 entry = () in facts
                 within_entry = subset in facts
                 restore = (move is not None and move[1] in facts and
@@ -4575,7 +4583,7 @@ class Stage:
                         facts.discard(subset)
                 if reduction_restores is not None:
                     (reduction_restores.add if restore else reduction_restores.discard)(off)
-                if restore:
+                if restore or (entry and widens):
                     facts.add(())
                     if compute_dpp:
                         facts.add(subset)
@@ -4854,10 +4862,10 @@ class Stage:
         # while still selecting the same value for every lane at a join.
         self.firstlane_cfg = (getattr(getattr(self, 'pipe', None), 'retry_firstlane', False)
                               and not back_targets)
-        # The PS retry needs entry EXEC on every incoming path, not just in
-        # instruction order. Keep this proof local to the new lowering.
         self.firstlane_ps_exec = (self.entry_exec_sites(self.spill_cfg)
                                   if self.firstlane_cfg and self.kind == 'ps' else None)
+        self.firstlane_ps_full_exec = (self.entry_exec_sites(self.spill_cfg, pixel_full=True)
+                                       if self.firstlane_ps_exec is not None else set())
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
             self.scc_data_reads = {}
@@ -4901,6 +4909,7 @@ class Stage:
             self.fetched = False
             self.uniform_v = set()
             self.firstlane_v = set()
+            self.firstlane_ps_load_v = set()
             firstlane_edges = {}
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
             self.varying_s = set()
@@ -4967,6 +4976,15 @@ class Stage:
                     self.blocks.append((start, self.lines, None))
                     self.lines, start = [], off
                     self.descriptor_block_first = instruction_index
+                # The relaxed pixel proof tracks a load only within its straight run.
+                if self.firstlane_ps_load_v:
+                    _, operands, _ = parse(asm)
+                    if (instruction_index == self.descriptor_block_first or writes_exec(name, operands)
+                            or scalar_effects(name, asm)[2] & EXEC_KEYS):
+                        self.firstlane_ps_load_v.clear()
+                    else:
+                        base = re.sub(r'_e(32|64)$', '', name)
+                        self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands))
                 self.pc = off
                 if retry_wave:
                     self.exec_known = off in self.reduction_entry_exec
@@ -5812,11 +5830,14 @@ class Stage:
                 shifted = None
         extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
         extra_regs = ()
-        if (extra_proof and self.uniform_entry_exec()
-                and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec)):
+        ps_load_regs = ()
+        entry_proof = (extra_proof and self.uniform_entry_exec()
+                       and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec))
+        pixel_full = extra_proof and self.pc in getattr(self, 'firstlane_ps_full_exec', ())
+        if entry_proof or pixel_full:
             # Table-driven VALU operations use only their explicit operands and, for the
             # accumulator forms, the old destination. No lane selectors or mask operands.
-            if base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU:
+            if entry_proof and (base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU):
                 dst_reg = reg_range(ops[0]) if ops else None
                 inputs = ops if base in ('v_fmac_f32', 'v_mac_f32') else ops[1:]
                 if (dst_reg and dst_reg[0] == 'v' and dst_reg[1] == dst_reg[2] and inputs
@@ -5829,11 +5850,15 @@ class Stage:
                 first = self.sym.get(desc[1]) if desc else None
                 # MUBUF lowering checks the four descriptor words and, outside the entry block,
                 # proves that the table pointer and descriptor load reach this use.
-                if (data and first and first[0] == 'desc' and first[1][0] == 'table'
+                if (data and data[0] == 'v' and first and first[0] == 'desc' and first[1][0] == 'table'
                         and ops[1] == 'off' and self.scalar_const(ops[3]) is not None
                         and self.firstlane_source(ops[3], base)):
-                    extra_regs = range(data[1], data[2] + 1)
-            elif getattr(self, 'kind', None) == 'cs' and base in UNIFORM_LOADS and len(ops) == 4:
+                    regs = range(data[1], data[2] + 1)
+                    if entry_proof:
+                        extra_regs = regs
+                    else:
+                        ps_load_regs = regs
+            elif entry_proof and getattr(self, 'kind', None) == 'cs' and base in UNIFORM_LOADS and len(ops) == 4:
                 data = reg_range(ops[0])
                 if (data and data[0] == 'v' and data[2] - data[1] + 1 == UNIFORM_LOAD_WORDS[base]
                         and (ops[1] == 'off' or self.firstlane_source(ops[1], base))
@@ -5861,6 +5886,7 @@ class Stage:
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
+            self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
             for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
                 reg = reg_range(token)
@@ -10593,6 +10619,10 @@ class Stage:
             if getattr(getattr(self, 'pipe', None), 'retry_firstlane', False):
                 if (self.firstlane_cfg and self.uniform_cf and src[1] in self.firstlane_v
                         and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec)):
+                    self.set_s(dst[1], self.u(ops[1]), uniform=True)
+                    return
+                if (self.firstlane_cfg and self.uniform_cf and src[1] in self.firstlane_ps_load_v
+                        and self.pc in self.firstlane_ps_full_exec):
                     self.set_s(dst[1], self.u(ops[1]), uniform=True)
                     return
                 if getattr(self, 'kind', None) == 'cs' and self.firstlane_wave_allowed(src):
