@@ -7,7 +7,7 @@ gfx2hlsl.py --pending with DXC, the unchanged recording still matches all 320 wo
 time is replaced, and each dispatch is refused with its own reason, logs which input and descriptor once, writes
 no output word and leaves the input as written:
 
-- dispatch-input-empty: an unfilled heap slot, submitted twice to check one diagnostic;
+- dispatch-input-empty: an unfilled heap slot, submitted twice: it reads zeros, with one diagnostic;
 - dispatch-input-past: 16 bytes past the end of the placed input buffer;
 - dispatch-input-unplaced: memory between the two placed buffers;
 - dispatch-input-copied: a buffer placed at an offset the desktop cannot alias, so it is a separate copy;
@@ -26,6 +26,7 @@ Exit 77 when the adapter is not available.
 from math import prod
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,8 +37,8 @@ from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
 
+COPIED_REASON = 'an input is in a placed buffer that does not alias title memory'
 CONTROLS = (
-    ('dispatch-input-empty', 'an input buffer descriptor has zero records'),
     ('dispatch-input-past', 'an input range crosses the end of a placed buffer'),
     ('dispatch-input-unplaced', 'an input is in title memory outside any placed buffer'),
     ('dispatch-input-copied', 'an input is in a placed buffer that does not alias title memory'),
@@ -282,18 +283,35 @@ def main(consumer, dxc, adapter):
             refused = lines(result, 'refused: ')
             census = lines(result, 'x2w-render compute census')
             where = lines(result, f'x2w-draw compute {key:016x} first refused input 0 (table ')
-            calls = 2 if mode == 'dispatch-input-empty' else 1
+            calls = 1
             assert len(refused) == calls and all(line.endswith('refused: ' + reason) for line in refused), (mode, refused)
             assert len(census) == 3 and census[1].endswith(f'reason "{reason}": 1 keys, {calls} dispatches'), (mode, census)
             assert len(where) == 1, (mode, result.stderr[-3000:])
-            slot_lines = lines(result, 'unfilled heap slot ')
-            assert slot_lines == ([f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}']
-                                  if mode == 'dispatch-input-empty' else []), (mode, slot_lines)
+            assert not lines(result, 'unfilled heap slot '), mode
 
         null_env = dict(env, X2W_NULL_TOKEN_ZERO='1')
-        got, result = dispatch(directory, consumer, null_env, 'dispatch-input-empty')
-        assert got == untouched and not lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
-        assert lines(result, 'unfilled heap slot ') == [f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}'], result.stderr[-3000:]
+        # An input that has no records reads zeros, as a D3D12 null descriptor does: an unfilled heap slot (submitted twice,
+        # one diagnostic) and a descriptor with a base and no records both run, and the output equals the zero-input reference.
+        written = prod(group) * prod(groups)
+        zero_expected = [(C.KEY + i * C.STRIDE) & C.MASK for i in range(written)]
+        zero_expected += untouched[written:]
+        assert zero_expected != expected and expected != untouched
+        for settings in (env, null_env):
+            got, result = dispatch(directory, consumer, settings, 'dispatch-input-empty')
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+            assert got == zero_expected, 'an unfilled heap slot must read zeros'
+            assert lines(result, 'unfilled heap slot ') == [f'x2w-draw unfilled heap slot {0x32c - 1} key {key:016x}'], result.stderr[-3000:]
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
+        fields = directory / 'fields.bin'
+        for label, words in (('input without records', (4, 0, 0, 4, C.WORDS, 0)), ('output without records', (4, C.WORDS, 0, 4, 0, 0))):
+            fields.write_bytes(struct.pack('<6I', *words))
+            got, result = dispatch(directory, consumer, dict(env, X2W_TEST_DISPATCH_FIELDS=str(fields)), 'dispatch')
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), (label, result.stderr[-3000:])
+            # Reads of the empty input give zeros; writes to the empty output are dropped.
+            assert got == (zero_expected if label.startswith('input') else untouched), label
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
 
         got, result = dispatch(directory, consumer, dict(env, X2W_COMPUTE_VIEW_TOKENS='1'), 'dispatch-input-token')
         refusal, = lines(result, 'refused: ')
@@ -301,9 +319,6 @@ def main(consumer, dxc, adapter):
             'an input shader resource view token describes a texture, but the shader needs a buffer'), result.stderr[-3000:]
 
         got, result = dispatch(directory, consumer, null_env, 'dispatch-input-null-token')
-        written = prod(group) * prod(groups)
-        zero_expected = [(C.KEY + i * C.STRIDE) & C.MASK for i in range(written)]
-        zero_expected += untouched[written:]
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got == zero_expected, 'null-token output differs from the CPU reference for zero input'
         # The view token switch reads a null buffer view as zeros too, without X2W_NULL_TOKEN_ZERO.
@@ -322,7 +337,7 @@ def main(consumer, dxc, adapter):
         # on zeros: not refused, not the expected words, not untouched.
         snapshot_env = dict(env, X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
         got, result = dispatch(directory, consumer, env, 'dispatch-input-snapshot')
-        assert got == untouched and lines(result, 'refused: ')[0].endswith(CONTROLS[3][1]), result.stderr[-3000:]
+        assert got == untouched and lines(result, 'refused: ')[0].endswith(COPIED_REASON), result.stderr[-3000:]
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-snapshot')
         assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert len(lines(result, 'comes from a snapshot of title memory (1280 bytes)')) == 1, result.stderr[-3000:]

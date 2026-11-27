@@ -234,8 +234,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
 // root; dispatch-same-buffer names the output buffer as the input too.
-// Input descriptors the dispatch refuses, one reason each: dispatch-input-empty has zero records (a nonzero base,
-// word 3 zero), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
+// dispatch-input-empty is an unfilled heap slot (a nonzero base, word 3 zero): it has no records, so it is a null
+// view that reads zeros and is not refused. Input descriptors the dispatch refuses, one reason each: dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.

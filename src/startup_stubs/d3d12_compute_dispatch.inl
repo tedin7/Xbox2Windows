@@ -695,7 +695,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
         // One reason per condition, so a census says which one an output failed on.
         if (words[0] == view_token_magic) reason = "an output is a view token, not a buffer descriptor";
-        else if (!bytes) reason = "an output range has zero bytes";
+        else if (!bytes) {}  // no records: a null view, whose writes are dropped as a D3D12 null descriptor drops them
         else if (bytes % 4) reason = "an output range is not a whole number of dwords";
         else if (bytes > (16u << 20)) reason = "an output range is over 16 MiB";
         else if (!placed.alias) reason = "an output is not in a placed buffer that aliases title memory";
@@ -707,7 +707,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (reason && (!bytes || bytes % 4 || bytes > (16u << 20)) && first_calls(size_logged, 16))
             log("x2w-draw compute %016llx output %zu has %llu bytes (stride %u, records %u): %s", key, i, static_cast<unsigned long long>(bytes),
                 stride, words[2], reason);
-        for (std::size_t input = 0; input < inputs && !reason; ++input)
+        const bool null_output = !bytes && words[0] != view_token_magic;
+        for (std::size_t input = 0; input < inputs && !reason && !null_output; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
@@ -822,7 +823,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
-        require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (view.resource) require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (view.texture) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
                 view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
@@ -833,7 +834,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         desc.Buffer.FirstElement = view.offset / 4;
-        desc.Buffer.NumElements = static_cast<UINT>(view.bytes / 4);
+        desc.Buffer.NumElements = view.resource ? static_cast<UINT>(view.bytes / 4) : 1;  // a null view keeps one element
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
@@ -855,6 +856,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         list->Dispatch(x, y, z);
     }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
+        if (!views[i].resource) continue;  // a null view wrote nothing
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = views[i].resource;

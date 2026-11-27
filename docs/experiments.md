@@ -17728,3 +17728,6 @@ With `X2W_D3D12_LAZY_TEXTURES=1` (Refs #2764, #2379, #1199), device slot 133 (`C
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_slot133_lazy_textures_' -V
 ```
+
+
+A translated compute dispatch no longer refuses an input with no records (`an input buffer descriptor has zero records`, an unfilled heap slot or a zero record count) or an output with no records (`an output range has zero bytes`). The input is bound as a null raw buffer view, whose reads return zero, and the output as a null raw UAV, whose writes are dropped, as D3D12 null descriptors behave. `tests/startup_compute_dispatch_input_check.py` runs the stand-in dispatch with an unfilled slot, a zero-record input (output equals the CPU reference for zero input) and a zero-record output (the output buffer stays untouched), and the debug layer reports no error. Reverting either hunk brings the refusal back and fails the translated-dispatch assertion.
