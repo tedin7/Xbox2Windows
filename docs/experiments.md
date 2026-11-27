@@ -2,6 +2,8 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+[Indexed indirect draws from title memory](experiments/indirect-index-shadow.md) documents the opt-in index staging path and its WARP fixture.
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
@@ -9891,6 +9893,9 @@ pixel comparison. The maintainer separately passed the indexed and compute
 dispatch cases in Release on WARP and an RTX 4060 Laptop, four passes with no skips.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45478647954)
 [Maintainer's adapter results](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7143863805)
+
+See [plain-memory index views](experiments/indirect-index-copy.md) for the
+opt-in staging path and its WARP fixture.
 
 #### GPU-written indirect draw arguments
 
