@@ -1997,7 +1997,7 @@ int check_starved_target(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQu
                   width, height, source_format);
     std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(missing_key));
     std::snprintf(attached, sizeof(attached), " rt0=%p/%d", native_source.Get(), source_format);
-    const std::string cause = "translation_or_d16_or_formatted_not_ready";
+    const std::string cause = "translation_not_ready";
     const std::string candidate = std::string(key) + " x39 (" + cause + ")";
     const std::string window = std::string("x2w-render target ") + target + ": draws " +
         (keep_writing ? "39" : "0") + ", with a null input 0 frames 2..40, not drawn 39 by " + candidate;
