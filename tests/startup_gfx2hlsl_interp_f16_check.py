@@ -1034,13 +1034,14 @@ def check_draw(dxc, renderer, adapter):
 
 
 def varying_vertex_words(near=False):
-    # Fullscreen triangle: attr0.x high varies from 1 to the next binary16 value.
-    # At eight pixel centers the interpolant is exactly (2*x+1)/16 half ULP above 1.
+    # Fullscreen triangle (-1,1), (3,1), (-1,-3): at pixel column x of an 8-wide target the weight of vertex 1
+    # is (x + 0.5) / 16. attr0.x high is 1.0 at vertices 0 and 2 and 3.0 (or, near, 1 + 2^-9) at vertex 1, so the
+    # interpolant is 1 + (x + 0.5) / 8 (near: 1 + (x + 0.5) / 8 binary16 ULPs of 1.0, i.e. 1/16 .. 15/16 ULP).
     def select(dst, original, replacement):
         return words(0x02000000 | dst << 17 | replacement << 9 | (256 + original))  # v_cndmask_b32
 
     return (mov(6, 0x40400000) + mov(7, 0xc0400000) + mov(8, 0xbf800000) + mov(9, 0x3f800000)
-            + mov(15, 0x3c004000) + mov(16, 0x3c014000 if near else 0x42004000) + mov(17, 0x42003800)
+            + mov(15, 0x3c004000) + mov(16, 0x3c024000 if near else 0x42004000) + mov(17, 0x42003800)
             + words(0x7d840081) + select(2, 8, 6) + select(15, 15, 16)  # v_cmp_eq_u32 1, v0
             + words(0x7d840082) + select(3, 9, 7)                       # v_cmp_eq_u32 2, v0
             + mov(4, 0) + mov(5, 0x3f800000)
