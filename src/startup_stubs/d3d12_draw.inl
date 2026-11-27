@@ -454,6 +454,57 @@ bool cache_path(wchar_t* out, const wchar_t* prefix, u64 key, const wchar_t* ext
 
 bool read_text(const wchar_t* path, std::string& out);
 
+constexpr char approx_marker_prefix[] = "x2w-gfx approx: key ";
+
+bool gfx_approx_enabled()
+{
+    static const bool enabled = [] {
+        char flag[2]{};
+        return GetEnvironmentVariableA("X2W_GFX_APPROX", flag, sizeof(flag)) == 1 && flag[0] == '1';
+    }();
+    return enabled;
+}
+
+u64 approx_key(const std::string& marker)
+{
+    constexpr std::size_t prefix = sizeof(approx_marker_prefix) - 1;
+    if (marker.size() < prefix + 23 || marker.compare(0, prefix, approx_marker_prefix) != 0 ||
+        marker.compare(prefix + 16, 7, " stage ") != 0) return 0;
+    const std::string hex = marker.substr(prefix, 16);
+    if (hex.find_first_not_of("0123456789abcdef") != std::string::npos) return 0;
+    return std::strtoull(hex.c_str(), nullptr, 16);
+}
+
+// The prefetcher returns the resolved manifest under the original request key.
+u64 translation_output_key(std::string& manifest, u64 request_key, std::string& marker)
+{
+    if (!gfx_approx_enabled()) return request_key;
+    const auto start = manifest.rfind("\n# x2w-gfx approx: key ");
+    if (start == std::string::npos) return request_key;
+    const auto end = manifest.find_first_of("\r\n", start + 3);
+    marker = manifest.substr(start + 3, end - (start + 3));
+    const u64 key = approx_key(marker);
+    if (key != fnv_bytes("approx1", 7, request_key)) {
+        marker.clear();
+        return request_key;
+    }
+    manifest.resize(start + 1);
+    return key;
+}
+
+LONG approximated_translations;
+
+// Called under draw_lock after a translation is ready.
+void note_approx_translation(u64 output_key, const std::string& marker)
+{
+    if (marker.empty()) return;
+    static auto* reported = new std::unordered_set<u64>();
+    if (reported->insert(output_key).second) {
+        InterlockedIncrement(&approximated_translations);
+        log("%s", marker.c_str());
+    }
+}
+
 // Translation manifests are read by a background thread, never with draw_lock held (see manifest_prefetch.h). A manifest
 // the thread has not read yet counts as absent and is asked for again soon; the thread lists the cache directory about
 // four times a second while any key is waiting.
@@ -471,8 +522,10 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
         HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) return keys;
         do {
-            // <16 hex digits>.txt only; the other manifests (.mesh86.txt, ...) have longer names.
-            if (wcslen(found.cFileName) != 20) continue;
+            // Exact manifests and opt-in aliases wake waiters for the original request key.
+            const auto length = wcslen(found.cFileName);
+            if (length != 20 && !(gfx_approx_enabled() && length == 27 &&
+                                  !wcscmp(found.cFileName + 16, L".approx.txt"))) continue;
             wchar_t* end = nullptr;
             const u64 key = wcstoull(found.cFileName, &end, 16);
             if (end == found.cFileName + 16) keys.push_back(key);
@@ -482,7 +535,21 @@ x2w_startup::ManifestPrefetch::Io manifest_io()
     };
     io.read = [](u64 key, std::string& text) {
         wchar_t path[MAX_PATH];
-        return cache_path(path, L"", key, L".txt") && read_text(path, text);
+        const bool exact = cache_path(path, L"", key, L".txt") && read_text(path, text);
+        if (!gfx_approx_enabled() || (exact && text.find("\nplaceholder rgb ") == std::string::npos))
+            return exact;
+        std::string marker, approximate;
+        if (!cache_path(path, L"", key, L".approx.txt") || !read_text(path, marker)) return exact;
+        const auto end = marker.find_first_of("\r\n");
+        if (end != std::string::npos) marker.resize(end);
+        const u64 derived = approx_key(marker);
+        if (derived && derived == fnv_bytes("approx1", 7, key) && cache_path(path, L"", derived, L".txt") && read_text(path, approximate) &&
+            (approximate.find("\n# " + marker + "\r\n") != std::string::npos ||
+             approximate.find("\n# " + marker + "\n") != std::string::npos)) {
+            text = std::move(approximate);
+            return true;
+        }
+        return exact;
     };
     return io;
 }
@@ -617,6 +684,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     // The writer publishes this marker last. A malformed published result stays rejected.
     const bool previously_missing = tr.retry_manifest_at != 0;
     tr.retry_manifest_at = 0;
+    std::string approx_marker;
+    const u64 output_key = translation_output_key(manifest, tr.key, approx_marker);
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -732,8 +801,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
             return;
     }
-    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
-    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
+    if (!cache_path(path, L"", output_key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
+    if (!cache_path(path, L"", output_key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
     const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u),
         static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
     if (FAILED(hr)) {
@@ -745,6 +814,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw pipeline %016llx placeholder ps: %s", tr.key, tr.placeholder_ps.c_str());
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
+    note_approx_translation(output_key, approx_marker);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }

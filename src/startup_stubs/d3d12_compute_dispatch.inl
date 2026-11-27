@@ -225,6 +225,8 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         return nullptr;
     }
     tr.retry_manifest_at = 0;
+    std::string approx_marker;
+    const u64 output_key = translation_output_key(manifest, tr.key, approx_marker);
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
         std::size_t end = manifest.find('\n', at);
@@ -355,7 +357,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     const UINT twins = static_cast<UINT>(tr.integer_srvs.twins.size());
     const UINT entries = static_cast<UINT>(tr.uds.size()) + twins;
     x2w_startup::ComPtr<ID3DBlob> code;
-    if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
+    if (!cache_path(path, L"", output_key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     const UINT constants = (std::max)(1u, entries + (tr.dynamic_heap ? 1u : 0u));
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants,
@@ -367,6 +369,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (FAILED(device_of(the_device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(&tr.pipeline))))
         return "pipeline creation failed";
     tr.state = 1;
+    note_approx_translation(output_key, approx_marker);
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;

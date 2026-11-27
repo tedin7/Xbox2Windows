@@ -880,8 +880,8 @@ void apply_settings(const std::vector<std::string>& settings)
             const std::size_t n = std::strlen(tail);
             return name.size() >= n && name.compare(name.size() - n, n, tail) == 0;
         };
-        if (name == "X2W_SHADER_CACHE" || name == "X2W_PRESENT_PICTURES" || ends("_DIR") || ends("_FILE") || ends("_PATH") ||
-            ends("_LOG"))
+        if (name == "X2W_SHADER_CACHE" || name == "X2W_PRESENT_PICTURES" || name == "X2W_GFX_APPROX" ||
+            ends("_DIR") || ends("_FILE") || ends("_PATH") || ends("_LOG"))
             continue;
         if (GetEnvironmentVariableA(name.c_str(), nullptr, 0)) {
             ++kept;
