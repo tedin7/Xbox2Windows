@@ -102,6 +102,29 @@ def check_mesh_heap_image_record():
         assert b'dynamic_heap' in output['ms57.txt'].splitlines()
 
 
+def check_stub_cascade():
+    import mesh_waveloop
+
+    program = SERIAL_MESH[:9] + [
+        'be941f00',  # s_getpc_b64 s[20:21]
+        'be9e0314',  # s_mov_b32 s30, s20
+    ] + SERIAL_MESH[9:]
+    status, _ = run(program, 'force')
+    assert 'unsupported s_getpc_b64' in status, status
+    render = mesh_waveloop.render
+    errors = {}
+
+    def capture(pipe, gfx):
+        errors.update({pipe.vs.real[i][2]: str(error) for i, error in pipe.vs.errors.items()})
+        return render(pipe, gfx)
+
+    with patch.object(mesh_waveloop, 'render', side_effect=capture):
+        status, _ = run(program, 'force', stubs=True)
+    assert status == 'ok', status
+    assert 'unsupported s_getpc_b64' in errors['s_getpc_b64'], errors
+    assert 's20 holds a stubbed instruction result' in errors['s_mov_b32'], errors
+
+
 def main():
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
@@ -141,6 +164,7 @@ def main():
     check_scalar_uniformity()
     check_vcc_descriptor_alias()
     check_mesh_heap_image_record()
+    check_stub_cascade()
     print('ok')
 
 

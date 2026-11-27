@@ -18,6 +18,7 @@ MASK_WORDS = {'exec_lo', 'exec_hi', 'vcc_lo', 'vcc_hi'}
 VCC_REGISTERS = {'vcc': 's106', 'vcc_lo': 's106', 'vcc_hi': 's107'}
 UNDEFINED_ENTRY = ('an entry value the mesh model does not define',)
 JOINED = ('a value joined across wave-loop blocks',)
+STUB_RESULT = ('a stubbed instruction result',)
 LANE = '((wb + l) & 127u)'
 LEAK = re.compile(r'\b(?:SV_GroupIndex|Wave\w*|GroupMemoryBarrier\w*|IsHelperLane|'
                   r'QuadRead\w*|dd[xy]\w*|tid|exec|vcc|uint64_t|mesh_(?:first|vote|ballot)\w*)\b')
@@ -235,6 +236,8 @@ def meet(states, exec_zero=()):
             continue
         if first is not None and all(value == first for value in values):
             result[key] = first
+        elif STUB_RESULT in values:
+            result[key] = STUB_RESULT
         elif any(value is not None and (value[0] != 'const' or len(value) != 2) for value in values):
             result[key] = JOINED
     return result
@@ -357,6 +360,9 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             try:
                 reads, writes = self.cfg.effects[index]
                 missing = reads - self.before[index]
+                for reg in sorted(reads):
+                    if re.fullmatch(r's\d+', reg) and self.sym.get(int(reg[1:])) == STUB_RESULT:
+                        raise G.Unsupported('wave loop: %s holds %s' % (reg, STUB_RESULT[0]))
                 if any(op in VCC_REGISTERS for op in ops) or real_name.startswith('s_cbranch_vcc'):
                     for reg in ('s106', 's107'):
                         symbol = self.sym.get(int(reg[1:]))
@@ -405,7 +411,11 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 del self.lines[first:]
                 for reg in self.cfg.effects[index][1]:
                     if re.fullmatch(r's\d+', reg):
-                        self.sym.pop(int(reg[1:]), None)
+                        n = int(reg[1:])
+                        if self.stub_mode:
+                            self.sym[n] = STUB_RESULT
+                        else:
+                            self.sym.pop(n, None)
                 self.emit('// X2W_SERIAL_STUB %s %s' % (real_name, ' '.join(str(reason).split())))
             finally:
                 if 'scc' in self.cfg.effects[index][1] and self.scc_effect != 'emitted':
