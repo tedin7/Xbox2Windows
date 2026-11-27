@@ -666,6 +666,19 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
         if (!output && slot.root) {
+            // A root constant buffer view (dynamic-heap programs): its address was recorded by the list's slot 43/44 calls
+            // and must lie in this list's upload memory. A root SRV goes through the checks below.
+            const auto* root_params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
+            if (root_params && slot.a >= 0 && static_cast<std::size_t>(slot.a) < root_params->size() &&
+                static_cast<std::size_t>(slot.a) < pass.compute_root_addresses.size() &&
+                (*root_params)[slot.a].type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+                const auto range = list_upload_range(self, pass.compute_root_addresses[slot.a], 1, true);
+                if (!range.resource || range.bytes < 4 || range.bytes > (16u << 20) ||
+                    range.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                    reason = "a root input is not an aligned range in this list's upload memory";
+                else views[i] = {range.resource, range.offset, range.bytes & ~u64{3}, false};
+                continue;
+            }
             const IndirectBufferView view = compute_root_srv_buffer(self, pass, slot.a, words, &reason);
             if (reason && !tr->first_refusal)
                 log("x2w-draw compute %016llx first refused input %zu (root %d), address 0x%llx", key, i, slot.a,
