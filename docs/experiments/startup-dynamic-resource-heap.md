@@ -107,3 +107,20 @@ the WARP runtime mirror mutant must change the readback.
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_(resheap_(vertex_image|vertex_loop|descriptor_word|image_dimensions|fma_mix|embedded_scalar)_warp|fma_mix_dispatch_warp)|heap_texture_draw_(warp|hardware))$'
 ```
+
+## Formatted loads
+
+Formatted dynamic buffer loads use the same raw views as ordinary heap loads.
+The snapshot places the record views first, a raw format-information view at
+index `heap_count`, then the translated descriptor tables. Each information
+entry contains the record stride and descriptor word 3. Missing or unsupported
+records have a zero word 3, so every selected component reads as zero.
+The translation reads FORMAT and DST_SEL from that word; see the AMD RDNA 2
+Instruction Set Architecture, sections 8.1.2, 8.1.5 and 8.1.8.
+
+Run the Python translation controls with
+`python3 -B tests/startup_gfx2hlsl_heap_format_check.py` and
+`python3 -B tests/startup_compute_heap_format_check.py`. On Windows, run
+`ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_heap_format|compute_heap_format)_warp$' -V`
+for WARP readback through the offscreen and runtime dispatch fixtures. A capability
+skip is separate from a pass. The Python controls do not exercise the runtime or GPU.
