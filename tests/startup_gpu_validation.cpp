@@ -25,7 +25,8 @@ void WINAPI on_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, 
     if (severity > D3D12_MESSAGE_SEVERITY_ERROR) return;
     auto& messages = *static_cast<DebugMessages*>(context);
     if (++messages.errors <= 12) std::printf("debug layer id=%u: %.500s\n", static_cast<unsigned>(id), text);
-    if (id == D3D12_MESSAGE_ID_GPU_BASED_VALIDATION_INCOMPATIBLE_RESOURCE_STATE) ++messages.state_hazards;
+    // Newer runtimes name the same hazard "Incompatible texture barrier layout" under another message id.
+    if (id == D3D12_MESSAGE_ID_GPU_BASED_VALIDATION_INCOMPATIBLE_RESOURCE_STATE || (text && std::strstr(text, "Incompatible "))) ++messages.state_hazards;
 }
 
 bool ok(HRESULT hr, const char* step)
