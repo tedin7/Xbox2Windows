@@ -1074,9 +1074,11 @@ int main(int argc, char** argv)
         bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
         bc7.dropmips = std::strcmp(argv[9], "dropmips") == 0;
         if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
-                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69) &&
+                          (bc7.width != 512 || bc7.height != 256)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
         else if (bc7.small4k || bc7.dropmips) {}
+        else if (std::strcmp(argv[9], "display64k") == 0) bc7.display64k = true;
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;

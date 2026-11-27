@@ -14,7 +14,7 @@ def write_fixture(upload, width, height):
     pixels = bytearray(width * height * 4)
     for y in range((height + 3) // 4):
         for x in range((width + 3) // 4):
-            block, colors = make_block(x, y)
+            block, colors = make_block(x % 21, y % 19)
             blocks.extend(block)
             for row in range(min(4, height - y * 4)):
                 destination = ((y * 4 + row) * width + x * 4) * 4
@@ -23,6 +23,19 @@ def write_fixture(upload, width, height):
     upload.write_bytes(blocks)
     return pixels
 
+
+def display64k_blocks(linear, width, height):
+    """BC7 block order within one display tile is x0 y0 x1 y1 y2 x2 y3 x3 y4 x4 y5 x5."""
+    tiled = bytearray(len(linear))
+    for y in range(height // 4):
+        for x in range(width // 4):
+            tile = (y // 64) * (width // 256) + x // 64
+            block = sum(((x >> bit) & 1) << shift for bit, shift in enumerate((0, 2, 5, 7, 9, 11)))
+            block |= sum(((y >> bit) & 1) << shift for bit, shift in enumerate((1, 3, 4, 6, 8, 10)))
+            dest = (tile * 4096 + block) * 16
+            src = (y * (width // 4) + x) * 16
+            tiled[dest:dest + 16] = linear[src:src + 16]
+    return tiled
 
 def check(work, consumer, dxc, backend):
     cache = work / "cache"
@@ -57,9 +70,15 @@ def check(work, consumer, dxc, backend):
                         cache / f"{key}.{stage}.cso", shader], check=True)
 
     mismatches = []
-    for width, height in ((64, 64), (81, 69)):
+    for width, height in ((64, 64), (81, 69), (512, 256)):
         reference = write_fixture(upload, width, height)
-        for layout in ("linear", "tiled"):
+        layouts = ("linear", "display64k") if width == 512 else ("linear", "tiled")
+        for layout in layouts:
+            if layout == "display64k":
+                linear = upload.read_bytes()
+                tiled = display64k_blocks(linear, width, height)
+                assert tiled != linear
+                upload.write_bytes(tiled)
             if image.exists():
                 image.unlink()
             result = subprocess.run(base + [str(width), str(height), layout], env=env, capture_output=True, text=True)
