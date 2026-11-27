@@ -42,6 +42,24 @@ std::vector<PageRange> page_ranges;   // pages_lock
 std::size_t page_cursor_range;        // pages_lock
 u64 page_cursor_offset;               // pages_lock
 u64 page_unreadable, page_skipped_no_size, page_scans;
+// The base image written before the window (base_image_holds_window): at most X2W_REPLAY_BASE_SCAN_MS (default 500) per
+// present, and where it has got to: a range by its size and address (the scan order) and the offset in it, so ranges that
+// come or go between two slices do not move it.
+double base_scan_ms = 500.0;
+u64 base_cursor_bytes, base_cursor_address, base_cursor_offset;  // pages_lock
+double base_started_s;      // present thread: when the window's time came
+LONG base_started_present;  // and at which present
+u64 base_slices;            // pages_lock: slices written
+bool page_scan_order(const PageRange& a, const PageRange& b)
+{
+    return a.bytes != b.bytes ? a.bytes < b.bytes : a.address < b.address;
+}
+double page_ms_since(const LARGE_INTEGER& t0)
+{
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    return static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart);
+}
 
 struct NamedPageRange {
     u64 bytes, allocation;
@@ -201,75 +219,95 @@ void page_gather_ranges(bool placed)
             page_ranges.push_back(r);
         }
     }
-    std::sort(page_ranges.begin(), page_ranges.end(), [](const PageRange& a, const PageRange& b) {
-        return a.bytes != b.bytes ? a.bytes < b.bytes : a.address < b.address;
-    });
+    std::sort(page_ranges.begin(), page_ranges.end(), page_scan_order);
     page_skipped_no_size = unsized;
     page_skipped_big = big;
     if (page_cursor_range >= page_ranges.size()) { page_cursor_range = 0; page_cursor_offset = 0; }
+}
+
+// Whether a page pass ends before the next slab of `range` at `offset`: a base image at 3/4 of the page budget (one slab
+// is up to 1 MiB of pages), the budget, or the recording's cap. pages_lock held.
+bool page_pass_ends(const PageRange& range, u64 offset, bool base)
+{
+    const u64 slab = (std::min<u64>)(page_slab_bytes, range.bytes - offset);
+    if (base && page_bytes_out + slab > page_budget_bytes - page_budget_bytes / 4) {
+        page_base_cut = true;
+        page_cut_bytes = range.bytes;
+        page_cut_address = range.address;
+        log("x2w-replay pages: the base image stopped at %llu MiB, 3/4 of the %llu MiB page budget: ranges of %llu "
+            "bytes and more are left out, the rest of the budget keeps the window's changed pages",
+            page_bytes_out >> 20, page_budget_bytes >> 20, range.bytes);
+        return true;
+    }
+    if (page_bytes_out >= page_budget_bytes) {
+        if (!page_budget_reached) {
+            page_budget_reached = true;
+            log("x2w-replay pages: budget of %llu MiB reached, no more pages are written (calls go on)", page_budget_bytes >> 20);
+        }
+        return true;
+    }
+    if (cap_exceeded(page_target->bytes.size())) {  // the same cap as the calls: the recording ends with its XEND
+        if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+        return true;
+    }
+    return false;
+}
+
+// One slab: the committed, readable pages at the start of `want` bytes at `at`, into the page writer.
+void page_capture_slab(u64 at, std::size_t want, std::vector<unsigned char>& buffer, u64 stamp)
+{
+    const std::size_t readable = committed_readable_prefix(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
+    SIZE_T got = 0;
+    if (!readable || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), buffer.data(), readable, &got) ||
+        got != readable) {
+        page_unreadable += want / x2w_replay::page_bytes;
+        return;
+    }
+    if (readable < want) page_unreadable += (want - readable) / x2w_replay::page_bytes;
+    page_writer->capture(at, buffer.data(), readable, stamp);
+}
+
+void page_log_counters(double ms, bool base)
+{
+    const x2w_replay::PageStats& s = page_writer->stats();
+    u64 total = 0;
+    for (const PageRange& r : page_ranges) total += r.bytes;
+    log("x2w-replay pages: ranges %zu (%llu MiB), pages seen %llu, distinct %llu, zero %llu, unchanged %llu, written %llu MiB, "
+        "textures sized %llu, skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
+        page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_sized_textures,
+        page_skipped_no_size, page_range_limit >> 20, page_skipped_big, page_unreadable, page_bytes_out >> 20, ms,
+        base ? " (base image)" : "");
 }
 
 // One pass: all ranges (the base image), or from the cursor until the time budget is used. pages_lock held.
 void page_scan(bool everything, u64 stamp, bool placed = true)
 {
     if (!page_writer) return;
-    LARGE_INTEGER t0, t1;
+    LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     page_gather_ranges(placed);
     if (everything) { page_cursor_range = 0; page_cursor_offset = 0; if (placed) page_base_done = true; }
     std::vector<unsigned char> buffer(page_slab_bytes);
     std::size_t visited = 0;
     bool stopped_early = false;
-    const u64 base_limit = page_budget_bytes - page_budget_bytes / 4;
     while (visited < page_ranges.size() && !stopped_early) {
         const PageRange range = page_ranges[page_cursor_range];
         if (page_after_cut(range)) page_cursor_offset = range.bytes;  // not in the base image: left out
         while (page_cursor_offset < range.bytes) {
-            // The next slab could take the base image past its share (one slab is up to 1 MiB of pages).
-            const u64 slab = (std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset);
-            if (everything && page_bytes_out + slab > base_limit) {
-                page_base_cut = true;
-                page_cut_bytes = range.bytes;
-                page_cut_address = range.address;
-                log("x2w-replay pages: the base image stopped at %llu MiB, 3/4 of the %llu MiB page budget: ranges of %llu "
-                    "bytes and more are left out, the rest of the budget keeps the window's changed pages",
-                    page_bytes_out >> 20, page_budget_bytes >> 20, range.bytes);
-                page_cursor_range = 0;
-                page_cursor_offset = 0;
-                stopped_early = true;
-                break;
-            }
-            if (page_bytes_out >= page_budget_bytes) {
-                if (!page_budget_reached) {
-                    page_budget_reached = true;
-                    log("x2w-replay pages: budget of %llu MiB reached, no more pages are written (calls go on)", page_budget_bytes >> 20);
+            if (page_pass_ends(range, page_cursor_offset, everything)) {
+                if (everything && page_base_cut) {
+                    page_cursor_range = 0;
+                    page_cursor_offset = 0;
                 }
                 stopped_early = true;
                 break;
             }
-            if (cap_exceeded(page_target->bytes.size())) {  // the same cap as the calls: the recording ends with its XEND
-                if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
-                stopped_early = true;
-                break;
-            }
-            const u64 at = range.address + page_cursor_offset;
             const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset));
+            page_capture_slab(range.address + page_cursor_offset, want, buffer, stamp);
             page_cursor_offset += want;
-            const std::size_t readable = committed_readable_prefix(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
-            SIZE_T got = 0;
-            if (!readable || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), buffer.data(), readable, &got) ||
-                got != readable) {
-                page_unreadable += want / x2w_replay::page_bytes;
-                continue;
-            }
-            if (readable < want) page_unreadable += (want - readable) / x2w_replay::page_bytes;
-            page_writer->capture(at, buffer.data(), readable, stamp);
-            if (!everything) {
-                QueryPerformanceCounter(&t1);
-                if (static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart) > page_scan_ms) {
-                    stopped_early = true;
-                    break;
-                }
+            if (!everything && page_ms_since(t0) > page_scan_ms) {
+                stopped_early = true;
+                break;
             }
         }
         if (stopped_early) break;
@@ -279,26 +317,53 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
     }
     page_flush_target();
     ++page_scans;
-    QueryPerformanceCounter(&t1);
-    // The base image can take many seconds (20 s on a tester's title): a window counted in seconds starts counting after
-    // it, or it closes before a second frame is recorded.
+    const double ms = page_ms_since(t0);
+    // A window open from the recording's start writes its base image inside it (no present came before it): a window
+    // counted in seconds starts counting after it, or it closes before a second frame is recorded.
     if (everything && placed && end_s < 1e300) {
-        const double took = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(frequency.QuadPart);
         const double was = end_s;
-        end_s = was + took;
-        log("x2w-replay record: the base image took %.6f s: the window now ends at %.6f s (was %.6f s)", took, end_s, was);
+        end_s = was + ms / 1000.0;
+        log("x2w-replay record: the base image took %.6f s: the window now ends at %.6f s (was %.6f s)", ms / 1000.0, end_s, was);
     }
-    if (everything || page_scans % 20 == 0) {
-        const x2w_replay::PageStats& s = page_writer->stats();
-        u64 total = 0;
-        for (const PageRange& r : page_ranges) total += r.bytes;
-        log("x2w-replay pages: ranges %zu (%llu MiB), pages seen %llu, distinct %llu, zero %llu, unchanged %llu, written %llu MiB, "
-            "textures sized %llu, skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
-            page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_sized_textures,
-            page_skipped_no_size,
-            page_range_limit >> 20, page_skipped_big, page_unreadable, page_bytes_out >> 20, static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart),
-            everything ? " (base image)" : "");
+    if (everything || page_scans % 20 == 0) page_log_counters(ms, everything);
+}
+
+// One slice of the base image written before the window: from its cursor, slab after slab, until base_scan_ms is used
+// (one slab at least). True when the base image is complete: every range written, or its share of the budget used.
+// pages_lock held.
+bool page_base_slice(u64 stamp)
+{
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    page_gather_ranges(true);
+    auto it = std::lower_bound(page_ranges.begin(), page_ranges.end(), PageRange{base_cursor_address, base_cursor_bytes},
+                               page_scan_order);
+    if (it == page_ranges.end() || it->address != base_cursor_address || it->bytes != base_cursor_bytes) base_cursor_offset = 0;
+    std::vector<unsigned char> buffer(page_slab_bytes);
+    bool first = true, ended = false;
+    for (; it != page_ranges.end() && !ended; ++it, base_cursor_offset = 0) {
+        base_cursor_address = it->address;
+        base_cursor_bytes = it->bytes;
+        while (base_cursor_offset < it->bytes) {
+            if (!first && page_ms_since(t0) > base_scan_ms) {
+                page_flush_target();
+                return false;
+            }
+            first = false;
+            if (page_pass_ends(*it, base_cursor_offset, true)) {
+                ended = true;
+                break;
+            }
+            const std::size_t want = static_cast<std::size_t>((std::min<u64>)(page_slab_bytes, it->bytes - base_cursor_offset));
+            page_capture_slab(it->address + base_cursor_offset, want, buffer, stamp);
+            base_cursor_offset += want;
+        }
     }
+    page_flush_target();
+    page_base_done = true;
+    ++page_scans;
+    page_log_counters(page_ms_since(t0), true);
+    return true;
 }
 
 // Either a Present or a submit can be the first scan (pages_lock held).
@@ -311,6 +376,10 @@ void init_page_writer()
         if (GetEnvironmentVariableA("X2W_REPLAY_SCAN_MS", value, sizeof(value))) {
             const double ms = std::atof(value);
             if (ms > 0.0) page_scan_ms = ms;
+        }
+        if (GetEnvironmentVariableA("X2W_REPLAY_BASE_SCAN_MS", value, sizeof(value))) {
+            const double ms = std::atof(value);
+            if (ms > 0.0) base_scan_ms = ms;
         }
         page_budget_bytes = max_bytes / 2;
         if (GetEnvironmentVariableA("X2W_REPLAY_PAGES_MAX_MIB", value, sizeof(value)) && std::atof(value) > 0.0)
@@ -329,7 +398,57 @@ void scan_pages_into(ThreadBuffer& b, bool everything, u64 stamp, bool placed = 
     page_target = nullptr;
 }
 
-// The window has just opened at a Present: take the base image.
+// The window's time has come at a Present (b's lock held). Its base image of title memory is written first, a slice of at
+// most base_scan_ms per Present, while the calls go on into the prefix: the title keeps presenting (one 30 s scan
+// inside a Present ended in a fault in a tester's title). When it is complete the window opens at that Present, and
+// its seconds and Presents count from there. True while the window waits for it.
+bool base_image_holds_window(ThreadBuffer& b, LONG present)
+{
+    if (window_open || page_base_done || extra_title_pages || replay_dump_enabled()) return false;
+    if (!base_warming) {
+        if (!in_window()) return false;
+        base_warming = true;
+        base_started_s = seconds_now();
+        base_started_present = present;
+    }
+    if (!TryAcquireSRWLockExclusive(&pages_lock)) return true;  // a submit scan is running: the next Present goes on
+    init_page_writer();
+    bool complete = true;
+    if (page_writer) {
+        if (!base_slices++)
+            log("x2w-replay record: the window waits for the base image of title memory (at most %.0f ms per present)", base_scan_ms);
+        const u64 before = page_bytes_out;
+        page_target = &b;
+        complete = page_base_slice(static_cast<u64>(InterlockedIncrement64(&next_seq)));
+        page_target = nullptr;
+        base_prefix_bytes += page_bytes_out - before;
+    }
+    ReleaseSRWLockExclusive(&pages_lock);
+    if (!complete) return true;
+    base_warming = false;
+    if (!page_writer) return false;
+    const double took = seconds_now() - base_started_s;
+    const LONG waited = present - base_started_present;
+    if (last_present != 0x7fffffff) {
+        first_present += waited;
+        last_present += waited;
+    }
+    if (end_s < 1e300) {
+        const double was = end_s;
+        start_s += took;
+        end_s = was + took;
+        log("x2w-replay record: the base image took %.6f s and %ld presents before the window: the window now ends at %.6f s "
+            "(was %.6f s)", took, waited, end_s, was);
+    } else {
+        log("x2w-replay record: the base image took %.6f s and %ld presents before the window: the window opens at present %ld",
+            took, waited, present);
+    }
+    return false;
+}
+
+// The window has just opened at a Present. Its base image was written before (base_image_holds_window): the ranges
+// changed since then are rescanned from the smallest (descriptor rings, constants), the same time budget as a Present
+// rescan. With no base image yet it is taken now.
 inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
 {
     (void)present;
@@ -337,7 +456,11 @@ inline void pages_at_window_open(ThreadBuffer& b, u64 seq, LONG present)
     page_prev_mark = seq;
     if (!TryAcquireSRWLockExclusive(&pages_lock)) return;
     init_page_writer();
-    scan_pages_into(b, true, seq);
+    if (page_base_done) {
+        page_cursor_range = 0;
+        page_cursor_offset = 0;
+    }
+    scan_pages_into(b, !page_base_done, seq);
     ReleaseSRWLockExclusive(&pages_lock);
 }
 
