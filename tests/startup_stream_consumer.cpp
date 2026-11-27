@@ -194,7 +194,7 @@ static void* desktop_pipeline(void* device)
 //   data-pointer     valid, with the first data qword pointing at state block A
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
-//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-heap,
+//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-sampled-depth, dispatch-heap,
 //   dispatch-heap-outside, dispatch-heap-word*, dispatch-input-*: one creation, then dispatch_slot67 below
 //   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
@@ -225,6 +225,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // CopyTextureRegion (list slot 16) and a shader resource view of it (device slot 18) whose token the stand-in
 // writes at table byte 64. dispatch-sampled-unbound creates no view, so that entry holds no token.
 // dispatch-sampled-2x1 makes the texture 2x1 with red 0 in its left texel and 1.0 in its right one.
+// dispatch-sampled-depth makes it 2x1 R32_FLOAT, a format a comparison sample reads: 1.0 left, 2.5 right.
 // dispatch-heap runs the program of startup_gfx2hlsl_heap_record_check.py: a third root constant, 2, indexes the
 // 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
 // descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
@@ -451,9 +452,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (!bind_identifier_fixture(device, list, cpu + 64, format, identifier_fixture_dimension())) return 80;
     }
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token" || view_tokens || mode == "dispatch-indirect-texture") {
-        const UINT width = view_tokens || mode == "dispatch-sampled-2x1" ? 2 : 1;
+        const bool depth = mode == "dispatch-sampled-depth";
+        const UINT width = view_tokens || depth || mode == "dispatch-sampled-2x1" ? 2 : 1;
+        const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
         const UINT16 mips = view_tokens ? 2 : 1;
-        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
+        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, mips, format, {1, 0}};
         const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, view_tokens ? 768u : 256u, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
@@ -464,7 +467,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // reads 0.5 at the left edge (point or clamp read 0).
         unsigned char rgba[8] = {255, 64, 128, 32, 255, 64, 128, 32};
         if (width == 2) rgba[0] = 0;
-        std::memcpy(texel, rgba, sizeof(rgba));
+        const float depths[2] = {1.0f, 2.5f};
+        std::memcpy(texel, depth ? static_cast<const void*>(depths) : rgba, sizeof(rgba));
         if (view_tokens) {
             const unsigned char mip[] = {17, 93, 201, 45};
             std::memcpy(static_cast<unsigned char*>(texel) + 512, mip, sizeof(mip));
@@ -472,9 +476,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(upload, 9, 0, 0);
         D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        source.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, width, 1, 1, 256}};
+        source.PlacedFootprint = {0, {format, width, 1, 1, 256}};
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
-        D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         view.Texture2D.MipLevels = 1;
         if (view_tokens) {
             image.SubresourceIndex = 1;
@@ -1171,9 +1175,11 @@ int main(int argc, char** argv)
         bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
         bc7.dropmips = std::strcmp(argv[9], "dropmips") == 0;
         if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
-                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69) &&
+                          (bc7.width != 512 || bc7.height != 256)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
         else if (bc7.small4k || bc7.dropmips) {}
+        else if (std::strcmp(argv[9], "display64k") == 0) bc7.display64k = true;
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;

@@ -1,4 +1,4 @@
-// Included by d3d12_xs_device.cpp after d3d12_draw.inl. Command list slot 16, CopyTextureRegion (#870).
+// Included by d3d12_xs_device.cpp after list_copy.inl. Command list slot 16, CopyTextureRegion (#870).
 // Each location's resource is mapped to its desktop resource, the call is checked by
 // list_copy_texture.h, the two resources move to COPY_SOURCE / COPY_DEST for the call (the list's Close
 // puts them back to COMMON), and a call the desktop would reject is counted and logged, not forwarded.
@@ -177,6 +177,7 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     to.pResource = real_dst;
     from.pResource = real_src;
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyTextureRegion(&to, x, y, z, &from, box ? box : nullptr);
+    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource) mark_gpu_written(self, {real_dst, dst_wrapper});
     retire_hold(self, dst_wrapper);
     retire_hold(self, src_wrapper);
     InterlockedIncrement(&list_copy_texture_forwarded);

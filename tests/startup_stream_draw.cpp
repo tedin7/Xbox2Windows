@@ -308,9 +308,14 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
     const std::vector<unsigned char> blocks{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
     const UINT columns = (input.width + 3) / 4, rows = (input.height + 3) / 4, row_bytes = columns * 16;
     if (blocks.size() != static_cast<std::size_t>(row_bytes) * rows) return false;
-    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
         DXGI_FORMAT_BC7_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
-    if (input.tiled) {
+    if (input.display64k) {
+        // The fixture supplies complete 256x256-texel display tiles in guest memory order.
+        if (input.width % 256 || input.height % 256) return false;
+        desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10a);
+        binding.backing = blocks;
+    } else if (input.tiled) {
         if (!populate_tiled_bc7(input, desc, blocks, row_bytes, binding)) return false;
     } else {
         auto aligned = desc;

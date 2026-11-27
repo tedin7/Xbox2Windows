@@ -3537,6 +3537,7 @@ struct Pass {
     ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
+    u64 sampler_heap_wrapper = 0;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
@@ -5162,7 +5163,6 @@ bool slot70_desktop_arrays_enabled()
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
-#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
@@ -6093,6 +6093,45 @@ void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 des
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%d", count, dest, src, type);
 }
 
+// Slot 61 accepts the extended console sampler description; its destination is a CPU handle.
+void __stdcall device_console_sampler(Wrapper* self, const UINT* words, u64 destination)
+{
+    if (!words || !x2w_local::readable(words, 27 * sizeof(UINT))) return;
+    const auto handle = desktop_cpu_handle(destination);
+    if (!handle) return;
+    D3D12_SAMPLER_DESC sampler{};
+    const auto address_valid = [](UINT value) {
+        return value >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && value <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    if (words[1] > 3 || words[2] > 3 || words[3] > 2 || words[5] > 2 ||
+        words[16] > D3D12_COMPARISON_FUNC_ALWAYS || !std::all_of(words + 6, words + 9, address_valid)) {
+        sampler = x2w_startup::border_sampler();
+        device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+        note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
+        static LONG refused;
+        if (first_calls(refused, 4)) log("x2w-d3d12 unsupported console sampler fields; using border sampler");
+        return;
+    }
+    sampler.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[6]);
+    sampler.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[7]);
+    sampler.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[8]);
+    sampler.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>((std::max)(1u, words[16]));
+    const auto reduction = words[5] == 1 ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM :
+        words[5] == 2 ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM :
+        words[16] > 1 && words[16] < 8 ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const bool anisotropic = words[1] >= 2 || words[2] >= 2;
+    sampler.Filter = anisotropic ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction) :
+        D3D12_ENCODE_BASIC_FILTER(words[2] & 1, words[1] & 1, words[3] == 2 ? 1u : 0u, reduction);
+    sampler.MaxAnisotropy = anisotropic ? std::clamp(words[13], 1u, 16u) : 1u;
+    std::memcpy(&sampler.MinLOD, words + 9, sizeof(float));
+    std::memcpy(&sampler.MaxLOD, words + 10, sizeof(float));
+    if (!words[3]) sampler.MaxLOD = sampler.MinLOD;
+    std::memcpy(&sampler.MipLODBias, words + 11, sizeof(float));
+    std::memcpy(sampler.BorderColor, words + 17, sizeof(sampler.BorderColor));
+    device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+    note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
+}
+
 // Device slot 23, desktop CopyDescriptors(destCount, destStarts, destSizes, srcCount, srcStarts, srcSizes, type).
 void __stdcall device_copy_descriptors(Wrapper* self, UINT dest_count, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
                                        const UINT* dest_sizes, UINT src_count, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
@@ -6614,6 +6653,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
 // member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
@@ -8837,6 +8877,7 @@ void build_tables()
     tables[device_kind][19] = reinterpret_cast<void*>(&view_slot<19, 3>);  // CreateUnorderedAccessView(res, counter, desc, dest)
     tables[device_kind][20] = reinterpret_cast<void*>(&view_slot<20, 2>);  // CreateRenderTargetView(res, desc, dest)
     tables[device_kind][21] = reinterpret_cast<void*>(&view_slot<21, 2>);  // CreateDepthStencilView(res, desc, dest)
+    tables[device_kind][61] = reinterpret_cast<void*>(&device_console_sampler);
     tables[device_kind][22] = reinterpret_cast<void*>(&view_slot<22, 1>);  // CreateSampler(desc, dest)
     tables[device_kind][23] = reinterpret_cast<void*>(&device_copy_descriptors);
     tables[device_kind][24] = reinterpret_cast<void*>(&device_copy_descriptors_simple);
