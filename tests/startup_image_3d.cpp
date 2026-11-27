@@ -67,8 +67,8 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // A nonzero view_levels selects an explicit 2D SRV starting at first_mip. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            float* colors, const char* sampler_line, bool array, UINT levels, bool one_dimensional,
+                            bool two_dimensional, UINT first_mip, UINT view_levels, UINT width, UINT height)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
@@ -141,8 +141,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = 1;
-    rd.Height = 1;
+    rd.Width = width;
+    rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -192,8 +192,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const std::uint32_t constants[entry_constants] = {0, z_bits, 0, 0};
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
+    const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -206,13 +206,17 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     list->CopyTextureRegion(&out, 0, 0, 0, &in, nullptr);
     commands.submit_and_wait(device);
 
-    const D3D12_RANGE read{0, 4 * sizeof(float)};
+    const D3D12_RANGE read{0, SIZE_T(readback_size)};
     check(readback->Map(0, &read, &mapped), "Map image 3D readback");
-    std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
+    const auto* first = static_cast<const std::uint8_t*>(mapped) + target_footprint.Offset;
+    for (UINT y = 0; y < height; ++y)
+        std::memcpy(colors + size_t(y) * width * 4, first + size_t(y) * target_footprint.Footprint.RowPitch,
+                    size_t(width) * 4 * sizeof(float));
     readback->Unmap(0, &none);
-    std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
-                one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
-                z, color[0], color[1], color[2], color[3]);
+    if (width == 1 && height == 1)
+        std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
+                    one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
+                    z, colors[0], colors[1], colors[2], colors[3]);
 }
 
 // Draws an 8x2 R32G32B32A32_UINT target against a two-mip (8x2 mip 0, 4x1 mip 1) 2D or two-slice 2D-array

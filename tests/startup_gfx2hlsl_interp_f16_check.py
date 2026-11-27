@@ -5,6 +5,8 @@
   compile <dxc>                        compile the translated pair with DXC vs_6_0 / ps_6_0 (no rendering)
   draw_exec_halves <dxc> <offscreen_check> <warp|hardware>
                                        draw the EXEC coverage and explicit-LOD sample fixtures and their mutants
+  draw_helper_taint <dxc> <offscreen_check> <warp>
+                                       compare a partial-coverage triangle and its mutants against a CPU reference
   draw_flow <dxc> <offscreen_check> <warp|hardware>
                                        draw the varying, branching pair and mixed-FMA fixture and its mutants
   draw <dxc> <offscreen_check> <warp|hardware>
@@ -380,6 +382,7 @@ def controls():
     monotone_exec_controls()
     cfg_exec_and_memory_controls()
     sample_and_subset_controls()
+    helper_taint_controls()
     assert len(set(flow_reference(8, 4)[::4])) == 8
     loop_controls(expected)
     plain_controls(expected)
@@ -604,9 +607,11 @@ def restored_exec_fixture(*, clobber=b'', wide=False):
             + restore_exec(20) + replace + restore_exec(24) + export + END)
 
 
-def scan_decoded(*instructions):
+def scan_decoded(*instructions, pixel=False):
     """Probe scan effects that do not need descriptor setup or shader lowering."""
     stage = G.Stage.__new__(G.Stage)
+    if pixel:
+        stage.kind = 'ps'
     stage.ins = [(4 * i, 4, G.parse(asm)[0], asm) for i, asm in enumerate(instructions)]
     stage.interp_f16_scan()
     return stage
@@ -935,6 +940,118 @@ def sample_and_subset_controls():
     print('covered samples and EXEC subset controls passed')
 
 
+def helper_taint_fixture(case='lerp'):
+    """Read an omitted partial in WQM after overwriting it in exact EXEC."""
+    live, quad = 32, 36
+    p1, p2 = interp_words(20, 20, 0, high=True)
+    setup = words(0xf40c0404, 0xfa000000)
+    for reg, value in enumerate((0, 0x200000, 0x04000000, 0), 24):
+        setup += words(0xbe8003ff | reg << 16, value)
+    setup += words(0xbf8cc07f)
+
+    def valu(op, dst, src0, src1):
+        return words(op << 25 | dst << 17 | src1 << 9 | (256 + src0))
+
+    def sample(dst, coords, opcode=0x20):
+        return words(0xf0000108 | opcode << 18, 0x00c40000 | dst << 8 | coords, 0xbf8c3f70)
+
+    code = (M0 + setup + copy_exec(live) + wqm() + p1 + p2
+            + words(0x7e001700 | 21 << 17 | 20))  # unpack the full interpolant to v21
+    # An independent implicit sample needs helpers at the triangle edge. Its
+    # U gradient spans four texels per pixel, so the CPU expects mip 2.
+    code += (mov(28, f32_bits(4)) + valu(0x08, 29, 21, 28)
+             + mov(30, f32_bits(3 / 8)) + sample(31, 29))
+    shrink = case in ('lerp', 'lowered_level', 'rewritten')
+    if shrink:
+        code += (mov(28, f32_bits(2.25)) + words(0x7c020000 | 21 << 9 | (256 + 28))
+                 + words(0x8a800000 | live << 16 | 106 << 8 | live) + wqm(live))
+    p1, p2 = interp_words(12, 20, 0, high=True)
+    code += p1 + p2
+    code += copy_exec(quad)
+    if case == 'rewritten':
+        # Rewrite before the overwrite so the new L still reaches masked.
+        code += words(0xbe800480 | live << 16)  # s_mov_b64 L, 0
+    code += (restore_exec(live) + mov(12, f32_bits(5 / 16))
+             + mov(13, f32_bits(3 / 8)) + sample(16, 12 if shrink else 29) + restore_exec(quad))
+    code += (mov(24, f32_bits(3 / 8)) + mov(25, f32_bits(1 / 2))
+             + valu(0x04, 23, 21, 12) + valu(0x2b, 12, 23, 25))  # lerp into v12
+    last = 16
+    if case in ('implicit', 'whole_clear', 'exact_clear', 'explicit', 'lowered_level'):
+        if case == 'exact_clear':
+            code += restore_exec(live)
+        if case in ('whole_clear', 'exact_clear'):
+            code += mov(23, f32_bits(3 / 8))
+        if case == 'exact_clear':
+            code += restore_exec(quad)
+        code += sample(17, 23, opcode=0x27 if case == 'explicit' else 0x20)
+        last = 17
+    elif case == 'compare':
+        nop = words(0xbf800000)
+        code += words(0x7c020000 | 24 << 9 | (256 + 23)) + branch(6, nop) + nop
+    elif case == 'dpp':
+        code += words(0x7e0002fa | 26 << 17, 0xff00b117)  # v_mov_b32_dpp v26, v23 quad_perm:[1,0,3,2]
+    if shrink:
+        code += restore_exec(live)  # export with the shrunken coverage mask
+    return code + export_words(12, 21, 31, last) + END
+
+
+def helper_taint_stage(case):
+    return G.Pipeline(helper_triangle_words(), helper_taint_fixture(case), image_root_blob())
+
+
+def helper_taint_controls():
+    lerp = helper_taint_stage('lerp').hlsl_ps()
+    assert 'F(v21) - F(v12)' in lerp and 'F(v23)' in lerp and '.SampleLevel(' in lerp, lerp
+    whole = helper_taint_stage('whole_clear').hlsl_ps()
+    assert re.search(r'\.Sample\(\w+, float2\(F\(v23\), F\(v24\)\)\)', whole), whole
+    for case in ('explicit', 'lowered_level'):
+        explicit = helper_taint_stage(case).hlsl_ps()
+        assert re.search(r'\.SampleLevel\(\w+, float2\(F\(v23\), F\(v24\)\)', explicit), explicit
+    reason = 'v23 may hold a stale v_interp_p1ll_f16 value in helper lanes: '
+    for case, diagnostic in (
+            ('implicit', reason + 'image_sample reads it across lanes'),
+            ('exact_clear', reason + 'image_sample reads it across lanes'),
+            ('compare', reason + 'v_cmp_lt_f32 uses it to write a lane mask'),
+            ('dpp', reason + 'v_mov_b32_dpp reads it across lanes'),
+            ('rewritten', 'v12 is the v_interp_p1ll_f16 result, which emits nothing: v_sub_f32 reads it after '
+             'a v_interp_p2_f16 that wrote another register')):
+        try:
+            helper_taint_stage(case).hlsl_ps()
+        except G.Unsupported as error:
+            assert str(error) == diagnostic, (case, error)
+        else:
+            raise AssertionError('%s was translated' % case)
+
+    exact = 's_mov_b64 exec, s[32:33]'
+    quad = 's_mov_b64 exec, s[36:37]'
+    prefix = ('s_mov_b64 s[32:33], exec', 's_wqm_b64 exec, exec', 's_mov_b64 s[36:37], exec',
+              'v_interp_p1ll_f16 v12, v0, attr0.x', 'v_interp_p2_f16 v20, v1, attr0.x, v12',
+              exact, 'v_mov_b32 v12, 1.0', quad, 'v_sub_f32 v23, v21, v12')
+    store = 'buffer_store_dword v23, v13, s[16:19], 0 offen'
+    scan_decoded(*prefix, exact, store, pixel=True)
+    for tail, diagnostic in (
+            ((store,), reason + 'buffer_store_dword uses it in a memory write with helper lanes enabled'),
+            (('image_atomic_add v30, v[22:23], s[16:23]',),
+             reason + 'image_atomic_add uses it in a memory write with helper lanes enabled'),
+            (('v_readfirstlane_b32 s20, v23',), reason + 'v_readfirstlane_b32 reads it across lanes'),
+            (('v_cmpx_lt_f32 v23, v24',), reason + 'v_cmpx_lt_f32 uses it to write a lane mask'),
+            (('v_add_co_u32 v20, vcc_lo, v23, v24',), reason + 'v_add_co_u32 uses it to write a lane mask'),
+            (('v_mov_b32_sdwa v23, v30 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD', store),
+             reason + 'buffer_store_dword uses it in a memory write with helper lanes enabled'),
+            (('s_branch label_0024',), 'unmodelled v_interp_p1ll_f16 helper-lane taint across a backward branch')):
+        try:
+            scan_decoded(*prefix, *tail, pixel=True)
+        except G.Unsupported as error:
+            assert str(error) == diagnostic, (tail, error)
+        else:
+            raise AssertionError('%s cleared or observed helper-lane taint' % (tail,))
+    # At the join, the taken edge bypasses a whole overwrite.
+    sample = 'image_sample v30, v[23:24], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D'
+    joined = scan_decoded(*prefix, 's_cbranch_scc0 label_002c', 'v_mov_b32 v23, 0', sample, pixel=True)
+    assert joined.interp_sample_obligations == {44: reason + 'image_sample reads it across lanes'}
+    print('helper-lane interpolation taint controls passed')
+
+
 def f32(x):
     return struct.unpack('<f', struct.pack('<f', x))[0]
 
@@ -1141,18 +1258,24 @@ def check_draw(dxc, renderer, adapter):
             print('plain export, other half: fails as expected', flush=True)
 
 
-def varying_vertex_words():
-    # Fullscreen triangle. Only vertex 1 has x = 3 and attr0.x's high half = 3.
+def varying_vertex_words(right_x=3.0, bottom_y=-3.0):
+    # Only vertex 1 has x = right_x and attr0.x's high half = 3.
     # The other two vertices have x = -1 and attr0.x's high half = 1.
     def select(dst, original, replacement):
         return words(0x02000000 | dst << 17 | replacement << 9 | (256 + original))  # v_cndmask_b32
 
-    return (mov(6, 0x40400000) + mov(7, 0xc0400000) + mov(8, 0xbf800000) + mov(9, 0x3f800000)
+    return (mov(6, f32_bits(right_x)) + mov(7, f32_bits(bottom_y)) + mov(8, 0xbf800000) + mov(9, 0x3f800000)
             + mov(15, 0x3c004000) + mov(16, 0x42004000) + mov(17, 0x42003800)
             + words(0x7d840081) + select(2, 8, 6) + select(15, 15, 16)  # v_cmp_eq_u32 1, v0
             + words(0x7d840082) + select(3, 9, 7)                       # v_cmp_eq_u32 2, v0
             + mov(4, 0) + mov(5, 0x3f800000)
             + words(0xf80008cf, 0x05040302, 0xf800060f, 0x0000110f) + END)
+
+
+def helper_triangle_words():
+    # On the 8x8 target, the triangle has screen vertices (0,0), (8,0), (0,7).
+    # The interpolated high half of attr0.x ranges from 1 on the left to 3 at x=8.
+    return varying_vertex_words(right_x=1.0, bottom_y=-0.75)
 
 
 def flow_reference(width, height):
@@ -1301,6 +1424,54 @@ def check_covered_sample_draw(dxc, renderer, adapter, directory):
             print(name, diagnostic, flush=True)
 
 
+def helper_taint_reference(case):
+    """Evaluate coverage, the two binary16 vertex values, and point mip sampling on the CPU."""
+    reference = []
+    for y in range(8):
+        for x in range(8):
+            interpolated = 1 + (x + 0.5) / 4
+            covered = 7 * (2 * x + 1) + 8 * (2 * y + 1) < 112  # edge through (8,0) and (0,7)
+            if not covered or (case in ('lerp', 'lowered_level') and interpolated > 2.25):
+                reference.extend([f32_bits(-1)] * 4)
+                continue
+            # This interpolant is exactly representable in binary16. v12 starts
+            # the lerp at 5/16 and the texture's level-zero V selects row 1.
+            diff = interpolated - 5 / 16
+            texel_x = int(4 * diff) % 4 if case in ('explicit', 'lowered_level') else 1
+            reference.extend(map(f32_bits, (5 / 16 + diff / 2, interpolated, 65 / 128, (5 + texel_x) / 128)))
+    return reference
+
+
+def check_helper_taint_draw(dxc, renderer, adapter):
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        for case in ('lerp', 'whole_clear', 'explicit', 'lowered_level'):
+            pipe = helper_taint_stage(case)
+            source = pipe.hlsl_ps()
+            sampler, = (line for line in pipe.manifest().splitlines() if line.startswith('smpl '))
+            vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), case + '_vs', 'vs_6_0', directory)
+            expected = directory / (case + '.bin')
+            expected.write_bytes(words(*helper_taint_reference(case)))
+            if case == 'whole_clear':
+                old, new = 'v23 = 0x3ec00000u;', 'v23 = 0x3f200000u;'  # Select the next texel after clearing.
+            else:
+                old, new = 'v25 = 0x3f000000u;', 'v25 = 0x3e800000u;'  # Lerp weight 1/2 becomes 1/4.
+            assert source.count(old) == 1, source
+            for name, text, mismatch in ((case, source, False), (case + '_mutant', source.replace(old, new), True)):
+                ps = compile_hlsl(dxc, 'dxc', text, name, 'ps_6_0', directory)
+                run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-image-words',
+                                                               vs, ps, 8, 8, expected, sampler])
+                diagnostic = run.stdout + run.stderr
+                if run.returncode == 77 and name == 'lerp':
+                    print(diagnostic, flush=True)
+                    raise SystemExit(77)
+                if mismatch:
+                    assert run.returncode == 1 and 'pixel mismatch' in diagnostic, (name, diagnostic)
+                else:
+                    assert run.returncode == 0 and 'all 64 pixels matched' in diagnostic, (name, diagnostic)
+                print(name, diagnostic, flush=True)
+
+
 def main():
     if len(sys.argv) == 1:
         controls()
@@ -1318,6 +1489,8 @@ def main():
         check_flow_draw(*args)
     elif mode == 'draw_exec_halves':
         check_extended_flow_draw(*args)
+    elif mode == 'draw_helper_taint':
+        check_helper_taint_draw(*args)
     else:
         raise SystemExit(__doc__)
 

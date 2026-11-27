@@ -1535,6 +1535,7 @@ OperationResult run_startup_descriptor_limits(const OperationContext& ctx)
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
 // row by row. Reports the first differing pixel and the number of differing pixels.
 // --startup-pixel-buffer-words appends comma-separated hex words for b0 and the raw t0 buffer.
+// --startup-pixel-image-words appends a sampler manifest line for the three-mip 2D fixture.
 OperationResult run_startup_pixel_words(const OperationContext& ctx)
 {
     const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
@@ -1558,7 +1559,12 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
                           mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
                                 cull, winding == "ccw", 6);
-    } else if (std::string_view(ctx.argv[2]) == "--startup-pixel-buffer-words") {
+    } else if (operation == "--startup-pixel-image-words") {
+        std::vector<float> colors(pixels.size());
+        check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, colors.data(), ctx.argv[8],
+                               false, 3, false, true, 0, 3, UINT(width), UINT(height));
+        std::memcpy(pixels.data(), colors.data(), pixels.size() * sizeof(std::uint32_t));
+    } else if (operation == "--startup-pixel-buffer-words") {
         const auto entry = parse_hex_words(ctx.argv[8]);
         const auto buffer = parse_hex_words(ctx.argv[9]);
         if (entry.empty() || entry.size() > 32 || buffer.empty())
@@ -1833,6 +1839,7 @@ const OperationSpec kOperations[] = {
     {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-image-words", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-r16-unorm", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
