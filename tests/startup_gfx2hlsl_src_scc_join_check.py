@@ -17,6 +17,7 @@ for the wave, whichever path each took (a per-lane `s_cbranch_execz` skip includ
 the hardware value.
 
 The pixel draw covers compare and logic writers, both arms of a uniform join, and a counted loop.
+The vertex draw and compute dispatch also exercise the reaching-path fallback with two uniform SCC diamonds.
 Negative controls cover a missing writer, an SCC write skipped by a lane-local EXEC branch, an
 unproved back edge, lane-mask SCC, and an unmodeled writer. One producer polarity mutation
 must fail D3D12 readback.
@@ -39,7 +40,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
 sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
-from startup_flat_param_check import assemble  # noqa: E402
+from startup_flat_param_check import PS_WORDS, assemble  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, compile_hlsl, root_blob  # noqa: E402
 
 failures = []
@@ -320,15 +321,17 @@ def translate_pixel(words):
     return pipe.hlsl_ps()
 
 
+MISSING_WRITER_REASON = ('src_scc with unverified SCC [operand read: s_mov_b32, destination sgpr] at +0xc: '
+                         'entry path has no SCC producer on edge +0x4 -> +0xc')
+
+
 def pixel_controls():
     accepted = {}
     for name, (_, prefix, scale) in PIXEL_CASES.items():
         try:
             hlsl = translate_pixel(pixel_words(prefix))
         except G.Unsupported as error:
-            expected = ('src_scc with unverified SCC [operand read: s_mov_b32, destination sgpr] at +0xc: '
-                        'entry path has no SCC producer on edge +0x4 -> +0xc')
-            check(name, scale is None and str(error) == expected, str(error))
+            check(name, scale is None and str(error) == MISSING_WRITER_REASON, str(error))
         else:
             check(name, scale is not None, 'translated a path without an SCC writer')
             if scale is not None:
@@ -381,17 +384,184 @@ def check_pixel_draw(dxc, runner, shaders):
               run.stdout + run.stderr)
 
 
+
+# The two diamonds run with opposite, wave-uniform compare results. Each false
+# arm has two incoming comparisons, so it needs the reaching-path proof.
+VERTEX_SOURCE = """\
+s_cmp_eq_u32 17, 23
+s_cbranch_scc0 4
+s_cmp_lg_u32 2, 5
+s_cbranch_scc0 2
+s_mov_b32 s20, src_scc
+s_branch 1
+s_mov_b32 s20, src_scc
+s_cmp_eq_u32 17, 17
+s_cbranch_scc0 4
+s_cmp_lg_u32 2, 5
+s_cbranch_scc0 2
+s_mov_b32 s21, src_scc
+s_branch 1
+s_mov_b32 s21, src_scc
+v_mov_b32 v1, 0
+v_cmp_eq_u32 vcc_lo, 0, v0
+v_cndmask_b32 v1, v1, -4.0, vcc_lo
+v_cmp_eq_u32 vcc_lo, 4, v0
+v_cndmask_b32 v1, v1, 4.0, vcc_lo
+v_cmp_eq_u32 vcc_lo, 2, v0
+v_cndmask_b32 v2, -4.0, 4.0, vcc_lo
+v_cmp_eq_u32 vcc_lo, 5, v0
+v_cndmask_b32 v2, v2, 4.0, vcc_lo
+v_cmp_le_u32 vcc_lo, 3, v0
+v_mov_b32 v6, s20
+v_cndmask_b32 v6, v6, s21, vcc_lo
+v_cvt_f32_u32 v6, v6
+v_cvt_f32_u32 v7, s20
+v_mov_b32 v3, 0
+v_mov_b32 v4, 1.0
+exp pos0 v1, v2, v3, v4 done
+exp param0 v6, v7, v3, v4
+s_endpgm
+"""
+SCALAR_WORDS = bytes.fromhex(
+    '919706bf040084bf828507bf020084bffd0394be010082bffd0394be'
+    '919106bf040084bf828507bf020084bffd0395be010082bffd0395be'
+)
+VERTEX_TAIL_WORDS = bytes.fromhex(
+    '8002027e8000847d010001d501efa9018400847d010001d501eda9018200847d'
+    '020001d5f7eca9018500847d020001d502eda9018300867d14020c7e060001d5'
+    '062ba801060d0c7e140c0e7e8002067ef202087ecf0800f8010203040f0200f806070304000081bf'
+)
+MISSING_WRITER_WORDS = bytes.fromhex(PIXEL_CASES['missing_writer'][1])
+FALSE_ARM_SAVE = 's20 = (scc ? 1u : 0u);'
+TRUE_ARM_SAVE = 's21 = (scc ? 1u : 0u);'
+
+
+def check_missing_writer(stage, translate):
+    try:
+        translate(MISSING_WRITER_WORDS)
+    except G.Unsupported as error:
+        check(stage + ' missing writer', str(error) == MISSING_WRITER_REASON, str(error))
+    else:
+        check(stage + ' missing writer', False, 'translated a path without an SCC writer')
+
+
+def check_saves(stage, hlsl):
+    check(stage + ' SCC arms', hlsl.count(FALSE_ARM_SAVE) == 2 and hlsl.count(TRUE_ARM_SAVE) == 2)
+    return hlsl
+
+
+def flip_false_save(hlsl):
+    # The second s20 assignment is the taken false arm of the first diamond.
+    before, save, after = hlsl.rpartition(FALSE_ARM_SAVE)
+    return before + save.replace('1u : 0u', '0u : 1u') + after
+
+
+def translate_compute(prefix):
+    rsrc2 = 6 << 1  # six user SGPRs, including the table pointer at s4:s5
+    pipe = G.ComputePipeline(prefix + sopp(SOPP_ENDPGM), root_blob(), rsrc2, (1, 1, 1))
+    return pipe.hlsl_cs()
+
+
+def compute_controls():
+    check_missing_writer('compute', translate_compute)
+    try:
+        hlsl = translate_compute(SCALAR_WORDS)
+    except G.Unsupported as error:
+        check('compute SCC arms', False, str(error))
+        return None
+    return check_saves('compute', hlsl)
+
+
+def check_compute_join_dispatch(dxc, runner, adapter, hlsl):
+    # Observe the scalar results at the end of the generated compute entry point.
+    body, end = hlsl.rsplit('}', 1)
+    assert end == '\n'
+    shader = 'RWByteAddressBuffer result : register(u0);\n' + body + '    result.Store2(0, uint2(s20, s21));\n}\n'
+    out = Path(here).parent / 'out'
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        for name, source, expected_differences in (
+                ('compute_scc', shader, ()), ('compute_scc_mutant', flip_false_save(shader), (0,))):
+            cso = compile_hlsl(dxc, 'dxc', source, name, 'cs_6_0', directory)
+            dump = directory / (name + '.bin')
+            run = subprocess.run([runner, adapter, '--raw-uav-dump', str(cso), '1', '16', str(dump)],
+                                 capture_output=True, text=True)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                sys.exit(1 if failures else 77)
+            if run.returncode or run.stderr:
+                raise AssertionError(run.stderr or f'raw UAV dump exited with {run.returncode}')
+            got = struct.unpack_from('<2I', dump.read_bytes())
+            want = (int(17 == 23), int(17 == 17))
+            differing = tuple(i for i, (a, b) in enumerate(zip(got, want)) if a != b)
+            check(name + ' GPU readback', differing == expected_differences, f'got {got}, want {want}')
+
+
+def translate_vertex(prefix):
+    pipe = G.Pipeline(prefix + VERTEX_TAIL_WORDS, PS_WORDS, root_blob())
+    return pipe.hlsl_vs(), pipe.hlsl_ps()
+
+
+def vertex_controls():
+    check_missing_writer('vertex', translate_vertex)
+    try:
+        vs, ps = translate_vertex(SCALAR_WORDS)
+    except G.Unsupported as error:
+        check('vertex SCC arms', False, str(error))
+        return None
+    return check_saves('vertex', vs), ps
+
+
+def vertex_reference():
+    # Two oversized triangles cover the left and right halves. Red selects
+    # the corresponding saved bit; green carries the left bit across the target.
+    left, right = int(17 == 23), int(17 == 17)
+    return b''.join(struct.pack('<4f', left if x < 2 else right, left, 0, 1)
+                    for _ in range(4) for x in range(4))
+
+
+def check_vertex_draw(dxc, runner, shaders):
+    vs, ps = shaders
+    # Flipping only the false-arm save changes green at every pixel.
+    mutant = flip_false_save(vs)
+    out = Path(here).parent / 'out'
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        pixel = compile_hlsl(dxc, 'dxc', ps, 'vertex_scc_ps', 'ps_6_0', directory)
+        expected = directory / 'vertex_scc.bin'
+        expected.write_bytes(vertex_reference())
+        for name, source, mismatches in (('vertex_scc', vs, 0), ('vertex_scc_mutant', mutant, 16)):
+            vertex = compile_hlsl(dxc, 'dxc', source, name, 'vs_6_0', directory)
+            run = subprocess.run([runner, 'warp', '--raster-reference', str(vertex), str(pixel),
+                                  '4', '4', str(expected), 'none', 'cw'], capture_output=True, text=True)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                sys.exit(1 if failures else 77)
+            report = run.stdout + run.stderr
+            expected_result = f'{mismatches} of 16 pixels differ' if mismatches else 'all 16 pixels matched'
+            check(name + ' WARP readback', run.returncode == int(bool(mismatches))
+                  and expected_result in report.splitlines(), report)
+
+
 if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
-    check_dispatch(*sys.argv[2:])
+    compute = compute_controls()
+    if not failures:
+        check_dispatch(*sys.argv[2:])
+        check_compute_join_dispatch(*sys.argv[2:], compute)
 elif len(sys.argv) == 4 and sys.argv[1] == 'draw':
     shaders = pixel_controls()
+    vertex = vertex_controls()
     if not failures:
         check_pixel_draw(*sys.argv[2:], shaders)
+        check_vertex_draw(*sys.argv[2:], vertex)
 elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
     for name, (source, prefix, _) in PIXEL_CASES.items():
         check(name + ' encoding', assemble(sys.argv[2], source + PIXEL_TAIL) == pixel_words(prefix))
+    check('vertex encoding', assemble(sys.argv[2], VERTEX_SOURCE) == SCALAR_WORDS + VERTEX_TAIL_WORDS)
 elif len(sys.argv) == 1:
     pixel_controls()
+    vertex_controls()
+    compute_controls()
 else:
     sys.exit(__doc__)
 

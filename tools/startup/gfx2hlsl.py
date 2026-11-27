@@ -3230,7 +3230,7 @@ class Stage:
             if not getattr(self, 'scc_verified', False):
                 reason = self.scc_refusal('src_scc with unverified SCC', 'operand read')
                 pending = getattr(self, 'scc_data_reads', None)
-                if pending is None or self.kind != 'ps':
+                if pending is None or self.kind not in ('ps', 'vs', 'cs'):
                     raise Unsupported(reason)
                 pending[self.pc] = reason
             return '(scc ? 1u : 0u)'
