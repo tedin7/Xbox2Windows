@@ -88,9 +88,9 @@ def pixel_program(proven=False):
                         [('s_branch reduce', wave.sopp(2, -(reduce_words + len(body) + 1)))])[1]
 
 
-def compute_request(directory, code):
-    root = root_blob()
-    state = struct.pack('<7I', 0, 0, 0, (1 << 16) | 8, 1, 0, USER7)
+def compute_request(directory, code, *, root=None, group_x=8, rsrc2=USER7):
+    root = root_blob() if root is None else root
+    state = struct.pack('<7I', 0, 0, 0, (1 << 16) | group_x, 1, 0, rsrc2)
     desc = struct.pack('<12Q', 0, 0, len(state), 0, 0, 0, len(code), 0, 0, 0, 0, 0)
     key = G.compute_key(code, b'', root, desc, state)
     for suffix, blob in zip(('c67', 'data', 'root', 'desc', 'sa', 'sb'), (code, b'', root, desc, state, b'')):
@@ -134,7 +134,8 @@ def check_approx2(directory, key, stage, lifted):
     derived = G.fnv(b'approx2', key)
     marker = f'x2w-gfx approx2: key {derived:016x} stage {stage} lifted {lifted}'
     assert derived != key and G.APPROX2_MARKER.fullmatch(marker)
-    assert artifact(directory, key, 'approx2.txt').read_text().splitlines() == [marker]
+    actual = artifact(directory, key, 'approx2.txt').read_text().splitlines()
+    assert actual == [marker], (actual, marker)
     assert '# ' + marker in artifact(directory, derived, 'txt').read_text().splitlines()
     assert not artifact(directory, key, 'approx.txt').exists()
     return marker, artifact(directory, derived, stage + '.hlsl')
@@ -271,8 +272,12 @@ def permissive_controls(directory):
         derived = G.fnv(b'approx2', key)
         artifact(directory, derived, 'txt').unlink()
         artifact(directory, derived, 'cs.hlsl').unlink()
-        with patch.object(G, 'permissive_translation', side_effect=RuntimeError('injected failure')):
+        stderr = io.StringIO()
+        error = RuntimeError('injected failure ' + 'x' * 200 + '\nsecond line')
+        with patch.object(G, 'permissive_translation', side_effect=error), redirect_stderr(stderr):
             assert G.translate_request(directory, key) == 'unsupported: ' + original
+        assert stderr.getvalue().splitlines() == [
+            f'x2w-gfx approx2 failed: key {key:016x} stage cs: RuntimeError: {str(error)[:200]}']
         assert artifact(directory, key, 'fail').read_text().splitlines() == [original, G.APPROX2_ATTEMPT]
         assert not alias.exists() and not artifact(directory, derived, 'txt').exists()
         assert not artifact(directory, derived, 'cs.hlsl').exists()
@@ -284,10 +289,111 @@ def permissive_controls(directory):
         stdout = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
             G.translate_pending(directory, skip_failed=True, jobs=1)
-        assert stdout.getvalue().splitlines()[-1] == 'approximated (level 2) 1'
+        assert stdout.getvalue().splitlines()[-1] == 'approximated (level 2) 1, failed 0'
+
+        alias.unlink()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(G, 'permissive_translation', side_effect=error), redirect_stdout(stdout), redirect_stderr(stderr):
+            G.translate_pending(directory, skip_failed=True, jobs=1)
+        assert stdout.getvalue().splitlines()[-1] == 'approximated (level 2) 0, failed 1'
+        assert len(stderr.getvalue().splitlines()) == 1
 
     (directory / 'stderr.txt').write_text('\n'.join(markers * 2) + '\n')
     assert set(tester_pack.loaded_approximations(directory).values()) == set(markers)
+
+
+def check_permissive_recovery(directory, key, stage, reason, lifted, expression):
+    for level in ('0', '1', '2'):
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {SWITCH: level, 'X2W_FXC': '', 'X2W_PLACEHOLDER_PS': '0'}), redirect_stderr(stderr):
+            status = G.translate_request(directory, key)
+        if level != '2':
+            assert status == 'unsupported: ' + reason, (level, status)
+            assert artifact(directory, key, 'fail').read_text().splitlines()[0] == reason
+        else:
+            assert status == 'ok', (reason, status, stderr.getvalue())
+            if stage == 'ms':
+                derived = G.fnv(b'approx2', key)
+                marker = f'x2w-gfx approx2: key {derived:016x} stage ms lifted {lifted}'
+                assert '# ' + marker in artifact(directory, derived, 'ms57.txt').read_text().splitlines()
+                source = artifact(directory, derived, 'ms57.hlsl')
+            else:
+                marker, source = check_approx2(directory, key, stage, lifted)
+            assert stderr.getvalue().splitlines() == [marker]
+            assert expression in source.read_text(), (reason, expression)
+
+
+def permissive_recovery_controls(directory):
+    heap_root = bytearray(root_blob())
+    struct.pack_into('<I', heap_root, 64, 0x400)  # RTS0 direct resource heap flag
+    fixtures = (
+        # The execz guard branches past a scalar write. A full EXEC reset makes its result live on every lane.
+        (permissive_program('010088bf 810396be c104febe 1602107e'), {},
+         's_mov_b32 inside a block s_cbranch_execz skips per lane: definition of s22, live where the block joins: '
+         'read by v_mov_b32_e32 after the join (cause: a data read or a copy, not a lane-mask operation)',
+         'execz=1', 's22 = 0x00000001u;'),
+        # The loop has a waterfall-shaped tail, but never selects the matching lanes at its head.
+        (permissive_program('7e0395be 00052c7e 1602107e 000080bf 000080bf 154795be faff85bf'), {},
+         'compute readfirstlane waterfall: the next instruction does not select lanes with the same key',
+         'readfirstlane=1', 's22 = v0;'),
+        # NAND combines the lane's EXEC bit with a plain scalar.
+        (permissive_program('7e83168c 9302107e'), {}, 's_nand_b32 on a lane mask', 'uniform=1',
+         '~(exec & 0x00000003u)'),
+        (permissive_program('7e0398be 180f96be 1602107e'), {}, 's_bcnt1_i32_b32 on a lane mask',
+         'uniform=1', 's22 = countbits(s24);'),
+        # The taken edge carries the first record. The fall-through loads a different descriptor.
+        (permissive_program('048006bf 020085bf 050308f4200000fa 001030e004080380'), {},
+         'descriptor operand s[12:15]: s13 holds a word joined at a branch target',
+         'uniform=1', 'v8 = r0.Load(a + 0);'),
+        (permissive_program('fd02107e'), {},
+         'src_scc with unverified SCC [operand read: v_mov_b32_e32, destination vgpr] at +0x1c: '
+         'entry path has no SCC producer on edge +0x18 -> +0x1c', 'uniform=1', 'v8 = (scc ? 1u : 0u);'),
+        (permissive_program('9202107e')[:-4], {}, 'compute code without s_endpgm', 'other=1', '.Store2('),
+        # A 96-thread group with no EXEC-width evidence has two guest waves at wave64.
+        (permissive_program('07ff1687 3f000000 1602107e'), {'group_x': 96, 'rsrc2': USER7 | (1 << 10)},
+         'COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group '
+         '(more needs whole wave32 waves and a program proved wave32)', 'other=1', 'v8 = 0x00000002u;'),
+        # A wave32 EXEC form wins when both EXEC widths appear and the strict proof cannot decide.
+        (permissive_program('c103febe c104febe 07ff1687 3f000000 1602107e'),
+         {'group_x': 96, 'rsrc2': USER7 | (1 << 10)},
+         'COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group '
+         '(more needs whole wave32 waves and a program proved wave32)', 'other=1', 'v8 = 0x00000003u;'),
+        # One descriptor is read and updated by an atomic, which disqualifies the strict RW buffer retry.
+        (permissive_program('001030e004080480 0010c8e004070480'), {},
+         "descriptor (('table', 1), 16) used for a load and a store", 'other=1', 'u0.InterlockedAdd('),
+        (permissive_program('0000d8d804000008'), {},
+         'LDS exchange needs a nonzero LDS allocation (COMPUTE_PGM_RSRC2 allocates 0 bytes)', 'other=1', 'v8 = 0u;'),
+        # Load a heap record using a root constant byte offset without a preceding shift.
+        (permissive_program('07039cbe 80039dbe 0e0608f400000008 001030e004080680'),
+         {'root': heap_root, 'rsrc2': 8 << 1},
+         's_load of a resource heap record whose offset is not a root constant shifted left by 5 since the last branch target',
+         'resource=1', 'x2w_heap_load(heap_index_'),
+    )
+    for code, options, reason, lifted, expression in fixtures:
+        key = compute_request(directory, code, **options)
+        check_permissive_recovery(directory, key, 'cs', reason, lifted, expression)
+        if reason.startswith('descriptor operand'):
+            manifest = artifact(directory, G.fnv(b'approx2', key), 'txt')
+            assert 'srv 0 buf table 1 0' in manifest.read_text().splitlines()
+        if reason.endswith('used for a load and a store'):
+            source = artifact(directory, G.fnv(b'approx2', key), 'cs.hlsl').read_text()
+            assert source.count('RWByteAddressBuffer u0 : register(u0);') == 1
+            assert 'v8 = u0.Load(a + 0);' in source
+
+    from startup_mesh57_skeleton_check import MESH, code as mesh_bytes, root as mesh_root
+    # Keep the source-built mesh exchange scaffold and insert new scalar consumers in the first result arm.
+    insert = MESH.index('bf8c3f70') + 1
+    for body, reason, expression in (
+        ('7e20021b', 'numeric use of s27 holding an entry value the mesh model does not define', 'v16 = 0u;'),
+        # s27 = 3; execz skips s27 = 9; the position export consumes the scalar.
+        ('be9b0383 bf880001 be9b0389 7e20021b',
+         'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes', 's27 = 0x00000009u;'),
+    ):
+        ms, root = mesh_bytes(MESH[:insert] + body.split() + MESH[insert:]), mesh_root()
+        key = G.mesh57_key(ms, b'', root)
+        for suffix, blob in (('m57', ms), ('ps57', b''), ('root', root)):
+            (directory / f'req_{key:016x}.{suffix}').write_bytes(blob)
+        check_permissive_recovery(directory, key, 'ms', reason, 'mesh=1', expression)
 
 
 def permissive_lifts_and_placeholder(directory):
@@ -407,6 +513,7 @@ if __name__ == '__main__':
         permissive = directory / 'permissive'
         permissive.mkdir()
         permissive_controls(permissive)
+        permissive_recovery_controls(permissive)
         with redirect_stderr(io.StringIO()):
             permissive_lifts_and_placeholder(permissive)
     print('approximate translation, cache keys and strict controls passed')

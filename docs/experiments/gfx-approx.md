@@ -48,7 +48,19 @@ destination. Proof failures can leave code in place under weaker
 assumptions. For example, a recognized reduction can use the HLSL wave
 intrinsic over the active desktop lanes. Shader results can be wrong.
 If a retry cannot produce a complete shader and manifest, the translator
-keeps the strict refusal or the configured placeholder pixel stage.
+keeps the strict refusal or the configured placeholder pixel stage. A failed
+permissive pass logs the request key, stage and first line of the exception
+on stderr. The batch summary counts those failures, including requests that
+fall back to a pixel placeholder.
+
+The permissive pass lowers the instructions in EXEC-zero blocks for the active
+lanes and can take the current lane's value for an unproven first-lane read.
+At an ambiguous scalar join it can use the symbol from the first incoming
+edge. For compute it can append missing termination, infer the wave size for
+`TG_SIZE_EN`, share a raw UAV between loads and writes, and skip LDS operations
+when the exchange proof fails. An unproven resource-heap offset can use the
+shader-side descriptor lookup. Mesh entry scalars that the model cannot define
+read as zero. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The marker records the affected stages and counts the observed sites in
 `readfirstlane`, `reduction`, `uniform` (including lane masks and SCC),
@@ -60,6 +72,8 @@ prefers an exact result and can use the alias when the exact result is
 absent or a placeholder. Slot 57 mesh results are offline only.
 
 The controls above also check level 2 key derivation, cache publication,
-failure fallback and classification on synthetic programs. The WARP test
+failure reporting and recovery on synthetic compute and mesh programs. The
+new recovery cases assert the exact refusal at levels 0 and 1 and inspect
+the level 2 marker and emitted HLSL. The WARP test
 compares all 320 words against a CPU reference, including pairs of a
 supported value and the zero result in each of eight threads.

@@ -41,6 +41,7 @@ READFIRSTLANE_UNIFORM = 'v_readfirstlane_b32 requires a proven uniform source'
 
 _APPROX_RETRY = ContextVar('gfx_approx_retry', default=False)
 _PERMISSIVE = ContextVar('gfx_permissive', default=False)
+_APPROX2_FAILED = ContextVar('gfx_approx2_failed', default=None)
 APPROX_REFUSALS = (READFIRSTLANE_UNIFORM, WAVE_REDUCTION_ENTRY)
 APPROX_ATTEMPT = 'x2w-approx-attempt'
 APPROX_MARKER = re.compile(
@@ -52,7 +53,7 @@ APPROX2_RULES = tuple((kind, re.compile(pattern, re.I)) for kind, pattern in (
     ('readfirstlane', r'^v_readfirstlane_b32 requires|wave-wide read|readfirstlane.*uniform'),
     ('reduction', r'wave reduction'),
     ('uniform', r'exec.*(?:not proven|entry mask)|entry exec|lane[- ]mask|\bs_(?:nand|nor|ff1|bcnt)\w*.*mask'
-                r'|unverified scc|scc.*not proven|joined at a branch target'
+                r'|unverified scc|scc.*not proven|scc from descriptor data|joined at a branch target'
                 r'|is read where it is not defined for every lane'),
     ('execz', r'skips per lane|branch out of (?:the|a) block|execz|loop.*inside.*block'),
     ('resource', r's_load.*(?:heap|register offset)|descriptor words?|formatted load'
@@ -120,6 +121,18 @@ class InstructionRefusal(str):
         return value
 
 
+class PermissiveLift(str):
+    def __new__(cls, category):
+        value = super().__new__(cls, category)
+        value.category = category
+        return value
+
+
+def permissive_lift(refusals, stage, category):
+    if refusals is not None:
+        refusals.append((PermissiveLift(category), stage))
+
+
 def permissive_translation(lower):
     refusals = []
     token = _PERMISSIVE.set(True)
@@ -129,7 +142,7 @@ def permissive_translation(lower):
         _PERMISSIVE.reset(token)
 
 
-def diagnostic_translation(lower):
+def diagnostic_translation(lower, key, kind):
     if approx_level() != 2:
         return approximate_translation(lower)
     try:
@@ -144,18 +157,23 @@ def diagnostic_translation(lower):
     try:
         try:
             result = lower()
-        except Unsupported:
+        except Exception:
             result = None
         refusals = []
         if result is None or isinstance(getattr(result[0], 'ps', None), PlaceholderPixelStage):
             result, refusals = permissive_translation(lower)
         pipe = result[0]
-        if not isinstance(getattr(pipe, 'ps', None), PlaceholderPixelStage):
-            pipe.approx2_refusals = refusals
-            return result
-    except Exception:
-        # Keep the normal diagnostic or placeholder if either retry cannot finish.
-        pass
+        pixel = getattr(pipe, 'ps', None)
+        if isinstance(pixel, PlaceholderPixelStage):
+            raise Unsupported(pixel.reason)
+        pipe.approx2_refusals = refusals
+        return result
+    except Exception as error:
+        if _APPROX2_FAILED.get() is not None:
+            _APPROX2_FAILED.set(True)
+        first_line = (str(error).splitlines() or [''])[0][:200]
+        print('x2w-gfx approx2 failed: key %016x stage %s: %s: %s'
+              % (key, kind, type(error).__name__, first_line), file=sys.stderr, flush=True)
     finally:
         _APPROX_RETRY.reset(token)
     if original is not None:
@@ -166,7 +184,8 @@ def diagnostic_translation(lower):
 def approx2_result(key, pipe):
     counts, stages = Counter(), set()
     for reason, kind in pipe.approx2_refusals:
-        counts[approx2_class(reason, getattr(reason, 'instruction', None))] += 1
+        category = getattr(reason, 'category', None) or approx2_class(reason, getattr(reason, 'instruction', None))
+        counts[category] += 1
         if kind in ('vs', 'ms', 'ps', 'cs'):
             stages.add(kind)
     pipeline_stages = []
@@ -4026,7 +4045,7 @@ def mesh_mbcnt_high(ins, low, base, token, targets):
 
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
                   mask_arm_sites=None, standalone_selects=None, pixel_writes=False, count_rewrites=None,
-                  uniform_bounds=None, coherent_sites=None):
+                  uniform_bounds=None, coherent_sites=None, approx_execz=None):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -4339,6 +4358,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                                 and any(ins[i][2] in MESH_EXEC_BRANCHES + MESH_VCC_BRANCHES
                                         for i in range(source + 1, target)))
                     if coherent and any(source < i < target or source < j < target for i, j in backward):
+                        if approx_execz is not None and target != count_at:
+                            approx_execz.add(source)
+                            continue
                         raise mesh_wave_block_error('a backward branch inside the block')
                     arm_refusal = None
                     if causes and target != count_at and (prefix or vector_limit) and compare > a_end and not entries:
@@ -4398,6 +4420,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                             votes, mask_ops, uniform = mesh_coherent_block(
                                 ins, source, target, edges, backward, live_at_join)
                         except Unsupported as reason:
+                            if approx_execz is not None and target != count_at and str(reason).startswith(MESH_WAVE_BLOCK):
+                                approx_execz.add(source)
+                                continue
                             # Keep the more specific diagnostic for a recognized legacy arm.
                             if arm_refusal and 'an unsupported vector instruction' in str(reason):
                                 raise arm_refusal from None
@@ -4420,6 +4445,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     if causes:
                         if unproven_back_edges:
                             raise Unsupported(MESH_LOOP_REFUSAL)
+                        if approx_execz is not None and target != count_at:
+                            approx_execz.add(source)
+                            continue
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
                     inner_vcc.update(vcc_edges)
@@ -4459,7 +4487,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                 allowed, initializers = skipped_lane_mask_writes(
                     ins, source, target, edges.items(), live_at_join, lane_mask_webs(ins))
                 if not missing <= allowed.keys():
-                    raise Unsupported(execz_effects)
+                    if approx_execz is None:
+                        raise Unsupported(execz_effects)
+                    approx_execz.add(source)
                 mask_instructions.update(allowed.keys() | initializers)
         elif ins[source][2] == 's_cbranch_execnz' and source not in coherent_votes:
             raise Unsupported('slot 57 mesh: s_cbranch_execnz on a wave-wide condition is not covered')
@@ -4901,6 +4931,9 @@ PK_INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00, '
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
+    def lift(self, category):
+        permissive_lift(getattr(self, 'refusals', None), self.kind, category)
+
     # Immutable fallbacks for unit probes that bypass __init__; __init__ and translate() assign fresh
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
@@ -4969,19 +5002,26 @@ class Stage:
             proofs = (self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads,
                       self.mesh_wave_votes, self.mesh_wave_scalars, self.mesh_wave_scalar_joins,
                       self.mesh_mask_arm_sites)
-            passes = ((None, None), (self.mesh_standalone_selects, None),
-                      (self.mesh_standalone_selects, self.mesh_coherent_sites))
-            for selects, coherent in passes:
+            passes = ((None, None, False), (self.mesh_standalone_selects, None, False),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites, False))
+            if _PERMISSIVE.get():
+                passes += ((self.mesh_standalone_selects, self.mesh_coherent_sites, True),)
+            for selects, coherent, relaxed in passes:
+                approx_execz = set() if relaxed else None
                 try:
                     self.ins = mesh_skeleton(
                         self.ins, *proofs, selects, pixel_writes, self.mesh_count_rewrites,
-                        self.mesh_uniform_bounds, coherent)
+                        self.mesh_uniform_bounds, coherent, approx_execz)
+                    for _ in approx_execz or ():
+                        self.lift('mesh')
                     break
                 except Unsupported as reason:
-                    if coherent is not None or not str(reason).startswith('slot 57 mesh:'):
+                    reason = str(reason)
+                    retry_execz = _PERMISSIVE.get() and not relaxed and reason.startswith(MESH_WAVE_BLOCK)
+                    if not reason.startswith('slot 57 mesh:') or (coherent is not None and not retry_execz):
                         raise
                     for proof in proofs + (self.mesh_standalone_selects, self.mesh_count_rewrites,
-                                           self.mesh_uniform_bounds):
+                                           self.mesh_uniform_bounds, self.mesh_coherent_sites):
                         proof.clear()
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
@@ -5209,12 +5249,18 @@ class Stage:
                 elif wave64_exec_proof(self.ins):
                     wave = 64
             if math.prod(self.pipe.group) > 32 and wave not in (32, 64):
-                raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+                wave = self.approx_tg_size_wave()
             self.tg_size_wave = wave
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
             self.entry.append('v%d = tid.%s;' % (i, 'xyz'[i]))
+
+    def approx_tg_size_wave(self):
+        if not _PERMISSIVE.get():
+            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+        self.lift('other')
+        return 32 if wave32_exec_proof(self.ins, allow_mixed=True) else 64
 
     # ---- operand helpers ---------------------------------------------------------------------
     def S(self, n):
@@ -5232,6 +5278,9 @@ class Stage:
                 return self.descriptor_number(self.descriptor_number_node(s))
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
+            if _PERMISSIVE.get() and s[0] == 'an entry value the mesh model does not define':
+                self.lift('mesh')
+                return '0u'
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
@@ -5341,8 +5390,11 @@ class Stage:
                 reason = self.scc_refusal('src_scc with unverified SCC', 'operand read')
                 pending = getattr(self, 'scc_data_reads', None)
                 if pending is None or self.kind not in ('ps', 'vs', 'cs'):
-                    raise Unsupported(reason)
-                pending[self.pc] = reason
+                    if not _PERMISSIVE.get():
+                        raise Unsupported(reason)
+                    self.lift('uniform')
+                else:
+                    pending[self.pc] = reason
             return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
             self.read_vcc()
@@ -7328,6 +7380,7 @@ class Stage:
                     arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
                         incoming.get(off, [])
                     written = (written - here) | set().union(*(w for _, w in arriving))
+                    lifted_join = False
                     for reg in here:
                         paths = [s[reg] for s, w in arriving if reg in w]
                         force = forced.get(off, {}).get(reg)
@@ -7347,14 +7400,24 @@ class Stage:
                             self.used_s.add(reg)
                             continue
                         if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
-                            self.sym[reg] = ('joined at a branch target',)
-                            continue
-                        if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
+                            ambiguous = True
+                        elif force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
                             self.sym[reg] = kept[off][reg] = paths[0]
                             continue
-                        if force == 'refuse' or any(p and not run_time_symbol(p) for p in paths):
-                            self.sym[reg] = ('joined at a branch target',)
-                            continue
+                        else:
+                            ambiguous = force == 'refuse' or any(p and not run_time_symbol(p) for p in paths)
+                        if ambiguous:
+                            if not permissive or not arriving:
+                                self.sym[reg] = ('joined at a branch target',)
+                                continue
+                            # Branch snapshots arrive in source order, before the fall-through edge.
+                            first, _ = (incoming.get(off) or arriving)[0]
+                            if not lifted_join:
+                                self.lift('uniform')
+                                lifted_join = True
+                            if first[reg] is not None:
+                                self.sym[reg] = first[reg]
+                                continue
                         if reg in entry_ud:
                             materialize[reg] = 'ud%d' % entry_ud[reg][1]
                         self.sym.pop(reg, None)
@@ -7480,20 +7543,25 @@ class Stage:
                     line_start = len(self.lines)
                 try:
                     if off in refused:
-                        if not scalar_vote:
+                        if permissive:
+                            self.lift('execz')
+                        elif not scalar_vote:
                             raise Unsupported(refused[off])
-                        operands = parse(asm)[1]
-                        sources = operands[1:] if name in SCA else [smem_offset(operands[2])]
-                        if not all(self.uniform_source(src) for src in sources):
-                            raise Unsupported(refused[off])
-                        if name.startswith('s_buffer_load') and self.descriptor(operands[1]) in self.pipe.rw_keys:
-                            raise Unsupported(refused[off])
+                        else:
+                            operands = parse(asm)[1]
+                            sources = operands[1:] if name in SCA else [smem_offset(operands[2])]
+                            if not all(self.uniform_source(src) for src in sources):
+                                raise Unsupported(refused[off])
+                            if name.startswith('s_buffer_load') and self.descriptor(operands[1]) in self.pipe.rw_keys:
+                                raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
                         if (off not in getattr(self, 'mesh_uniform_bounds', ()) and
                                 (not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s)):
-                            raise Unsupported(execz_effects)
+                            if not permissive:
+                                raise Unsupported(execz_effects)
+                            self.lift('mesh')
                         # Capture the bound at the compare, before any intervening SGPR write.
                         self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
                     if off in getattr(self, 'mesh_standalone_selects', ()) and not (
@@ -7522,7 +7590,9 @@ class Stage:
                         offset = smem_offset(parse(asm)[1][2])
                         if not self.uniform_source(offset) or (
                                 re.fullmatch(r's\d+', offset) and int(offset[1:]) not in self.defined_uniform_s):
-                            raise Unsupported(execz_effects)
+                            if not permissive:
+                                raise Unsupported(execz_effects)
+                            self.lift('mesh')
                     if off in vcc_compares and all(
                         not mesh_vregs([tok]) and self.uniform_source(tok)
                         for tok in parse(asm)[1][1:]
@@ -7537,7 +7607,9 @@ class Stage:
                             if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
                                 if off in mask_arm_sites:
                                     raise mesh_wave_block_error('a scalar live after the arm is undefined or non-uniform on the skip path')
-                                raise Unsupported(execz_effects)
+                                if not permissive:
+                                    raise Unsupported(execz_effects)
+                                self.lift('mesh')
                             self.u(dst)
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
                                         or off in wave_limits or off in wave_loads or off in mesh_votes)
@@ -7604,6 +7676,9 @@ class Stage:
                 except PixelImageConflict:
                     raise
                 except Unsupported as reason:
+                    if (permissive and isinstance(reason, ReadWriteBuffer)
+                            and self.pipe.can_retry_read_write(reason, permissive=True)):
+                        raise
                     if refusals is None:
                         if self.has_branches and ('read_vcc', None) in self.vcc_events.get(off, ()):
                             # Some operand handlers refuse VCC before emitting code. Check whether
@@ -7627,7 +7702,10 @@ class Stage:
                             self.set_s(n, '0u')
                         for n in vgprs:
                             self.set_v(n, '0u')
-                        refusals.append((InstructionRefusal(str(reason), name), self.kind))
+                        if isinstance(reason, ReadWriteBuffer) or str(reason).startswith('LDS exchange needs '):
+                            self.lift('other')
+                        elif off not in refused:
+                            refusals.append((InstructionRefusal(str(reason), name), self.kind))
                     else:
                         refusals.append((str(reason), self.kind))
                     continue
@@ -9143,7 +9221,8 @@ class Stage:
             if r and r[0] == 's':
                 getattr(self, 'mask_high', set()).difference_update(range(r[1], r[2] + 1))
         if masks and not self.lane_mask_exact():
-            raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
+            if not _PERMISSIVE.get() or not base.startswith(('s_ff1_', 's_bcnt')):
+                raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
         return result
 
@@ -9280,7 +9359,9 @@ class Stage:
             if base[10:].startswith('vcc'):
                 self.read_vcc()
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
-                raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
+                if not _PERMISSIVE.get():
+                    raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
+                self.lift('uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             if getattr(self, 'pc', None) in getattr(self, 'wave_voted_branches', ()):
@@ -10192,7 +10273,7 @@ class Stage:
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        lane_complement = False
+        lane_complement = lifted_complement = False
         # s_mul_hi_{u,i}32 need the whole 32-bit word of each source, like the halfword pack.
         word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_mul_hi_i32')
         word_absdiff = base == 's_absdiff_i32'
@@ -10211,10 +10292,17 @@ class Stage:
             lane_complement = (word_complement and bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
                                and all(mask_source(t) for t in srcs))
             if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):
-                raise Unsupported('%s on a lane mask' % base)
+                if not _PERMISSIVE.get() or base not in ('s_nand_b32', 's_nor_b32'):
+                    raise Unsupported('%s on a lane mask' % base)
+                self.lift('uniform')
+                lifted_complement = True
             if lane_complement and any(reg_range(t) and reg_range(t)[1] in getattr(self, 'join_masks', ())
                                        for t in srcs):
-                raise Unsupported('%s on a lane mask joined at a branch target' % base)
+                if not _PERMISSIVE.get() or base not in ('s_nand_b32', 's_nor_b32'):
+                    raise Unsupported('%s on a lane mask joined at a branch target' % base)
+                self.lift('uniform')
+                lane_complement = False
+                lifted_complement = True
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
@@ -10280,7 +10368,7 @@ class Stage:
                     wave = self.tg_size_wave
                     if mask == 0x3f:
                         if wave not in (32, 64):
-                            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+                            wave = self.tg_size_wave = self.approx_tg_size_wave()
                         count = (threads + wave - 1) // wave
                         self.set_s(dst[1], '%du' % count, ('const', count), scc='true')
                         return None
@@ -10295,7 +10383,18 @@ class Stage:
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
-        if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+        descriptor_data = any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms)
+        numeric_descriptor = None
+        if (_PERMISSIVE.get() and descriptor_data and not mods and not pair and not mask_dest
+                and (word_complement or word_absdiff or (dname == 'm0' and scc)
+                     or (dname == 'null' and (scc or base in SCC_UNMODELLED)))):
+            try:
+                numeric_descriptor = [self.descriptor_operand(t) for t in srcs]
+            except Unsupported:
+                pass  # Keep the existing refusal if the selected words have no numeric representation.
+            else:
+                self.lift('uniform')
+        if descriptor_data and numeric_descriptor is None:
             if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
                 result = self.descriptor_alu(text, srcs, syms)
@@ -10306,7 +10405,9 @@ class Stage:
                 self.sym[dst[1]] = result
                 return None
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
-                raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
+                if not _PERMISSIVE.get():
+                    raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
+                self.lift('uniform')
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
                 self.scc_verified = False
@@ -10393,7 +10494,7 @@ class Stage:
         if len(srcs) < needed:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), needed + 1))
         if dname == 'null':
-            if any(self.is_lane_mask(t) for t in srcs):
+            if not lifted_complement and any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s into null on a lane mask' % base)
             if pair:
                 raise Unsupported('%s into null' % base)
@@ -10401,7 +10502,8 @@ class Stage:
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
-        values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
+        values = (numeric_descriptor if numeric_descriptor is not None else
+                  [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)])
         expr = text.format(*values)
         if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
             for tok in srcs:
@@ -11023,19 +11125,22 @@ class Stage:
         if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) == 'ps':
             return self.dynamic_heap_image_record(dst, base, token, imm)
         if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
-            return self.dynamic_heap_record(dst, base, token, imm, count,
-                                            "s_load with a register offset through ('resheap',)")
+            refusal = "s_load with a register offset through ('resheap',)"
+            return self.dynamic_heap_record(dst, base, token, imm, count, refusal)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
-    def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
+    def dynamic_heap_record(self, dst, base, token, imm, count, refusal, *, lifted_offset=False):
         r = reg_range(token)
         # A vertex stage may load the record inside a branch arm: the index lives in a temporary that is declared at
         # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
         # it. Only the vertex stage does this; the pixel and compute stages keep refusing the load in a branch.
         in_branch = self.has_branches
-        if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) != 'vs')
-                or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
+        if (count != 4 or dst[2] > 105
+                or len(self.sym[base[1]]) != 2 or not r or r[0] != 's'
                 or self.sym.get(base[2]) != ('const', 0)):
+            raise Unsupported(refusal)
+        unproven = (in_branch and getattr(self, 'kind', None) != 'vs') or not self.uniform_source(token)
+        if unproven and not _PERMISSIVE.get():
             raise Unsupported(refusal)
         name = 'heap_index_%x' % self.pc
         if in_branch:
@@ -11045,6 +11150,8 @@ class Stage:
             self.emit('uint %s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name), 0, i)
+        if unproven or lifted_offset:
+            self.lift('resource')
 
     def dynamic_heap_image_record(self, dst, base, token, imm):
         """s_load_dwordx8 D, <resource heap pointer>, R in a pixel stage: the whole 32-byte heap record at byte R, the
@@ -11052,14 +11159,20 @@ class Stage:
         shader-model 6.6 heap (see image_texture); the descriptor words themselves are never read. The index lives in a
         function-scope temporary, so a later block (a branch arm, a join) reads the value this load wrote."""
         r = reg_range(token)
+        refusal = "s_load_dwordx8 with a register offset through ('resheap',)"
         if (dst[2] > 105 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or r[1] != r[2]
-                or (imm or 0) % 32 or self.sym.get(base[2]) != ('const', 0) or not self.uniform_source(token)):
-            raise Unsupported("s_load_dwordx8 with a register offset through ('resheap',)")
+                or self.sym.get(base[2]) != ('const', 0)):
+            raise Unsupported(refusal)
+        unproven = (imm or 0) % 32 or not self.uniform_source(token)
+        if unproven and not _PERMISSIVE.get():
+            raise Unsupported(refusal)
         name = 'heap_index_%x' % self.pc
         self.uniform_load_temps.add(name)
         self.emit('%s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
         for i in range(8):
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name, 'image'), 0, i)
+        if unproven:
+            self.lift('resource')
 
     def image_texture(self, key, kind):
         """The HLSL name of the texture an image instruction reads. A key from the dynamic heap becomes a local view
@@ -11104,7 +11217,10 @@ class Stage:
             raise Unsupported(what + ' whose index is read from a buffer other than a table buffer '
                               'at a dispatch-constant offset')
         if not index or index[0] not in ('rootconst', 'buffer'):
-            raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+            refusal = '%s whose offset is not a root constant shifted left by 5 since the last branch target' % what
+            if not _PERMISSIVE.get():
+                raise Unsupported(refusal)
+            return self.dynamic_heap_record(dst, base, token, imm, count, refusal, lifted_offset=True)
         if count != 4:
             raise Unsupported('%s of %d dwords' % (what, count))
         if imm is not None:
@@ -13364,8 +13480,13 @@ class Stage:
             # At dispatch entry even the last partial wave starts at lane zero.
             self.set_s(dst[1], '0u', ('const', 0))
             return None
-        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
-            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        if (self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks
+                or (_PERMISSIVE.get() and self.reads_mask_high(ops[1:]))):
+            if not _PERMISSIVE.get():
+                raise Unsupported('s_ff1_i32_b32 on a lane mask')
+            self.lift('uniform')
+            self.set_s(dst[1], 'firstbitlow(%s)' % self.u(ops[1]))
+            return None
         imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
         if imm:
             value = int(ops[1], 0) & 0xffffffff
@@ -13402,8 +13523,11 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
             raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
-        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
-            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        mask_dest = self.is_lane_mask(ops[0]) or dst[1] in self.masks
+        if mask_dest:
+            if not _PERMISSIVE.get():
+                raise Unsupported('s_ff1_i32_b64 on a lane mask')
+            self.lift('uniform')
         imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
         if imm:
             # Encoding: one 32-bit literal/inline; the ISA zero-extends it (hi = 0).
@@ -13414,8 +13538,12 @@ class Stage:
         src = reg_range(ops[1])
         if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1:
             raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
-        if any(r in self.masks for r in range(src[1], src[2] + 1)):
-            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        read_masks = self.masks | getattr(self, 'mask_high', set()) if _PERMISSIVE.get() else self.masks
+        if any(r in read_masks for r in range(src[1], src[2] + 1)):
+            if not _PERMISSIVE.get():
+                raise Unsupported('s_ff1_i32_b64 on a lane mask')
+            if not mask_dest:
+                self.lift('uniform')
         lo, hi = self.S(src[1]), self.S(src[2])
         self.masks.discard(dst[1])
         self.set_s(dst[1], _ctz64(lo, hi))
@@ -13893,10 +14021,12 @@ class Stage:
         if getattr(self, 'pc', None) in waterfalls and not uniform:
             reason = waterfalls[self.pc]
             if reason:
-                raise Unsupported('compute readfirstlane waterfall: ' + reason)
-            self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
-            self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
-            return
+                if not _PERMISSIVE.get():
+                    raise Unsupported('compute readfirstlane waterfall: ' + reason)
+            else:
+                self.active_waterfall_loads.update(self.waterfall_scalar_loads[self.pc])
+                self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
+                return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2]):
             raise Unsupported(READFIRSTLANE_UNIFORM)
@@ -13922,7 +14052,7 @@ class Stage:
                     self.set_s(dst[1], 'WaveActiveBitOr(value)', uniform=True)
                     self.emit('}')
                     return
-            if _APPROX_RETRY.get() and (self.kind not in ('ps', 'cs') or self.pipe.retry_firstlane):
+            if _PERMISSIVE.get() or (_APPROX_RETRY.get() and (self.kind not in ('ps', 'cs') or self.pipe.retry_firstlane)):
                 self.set_s(dst[1], self.u(ops[1]), uniform=True)
                 self.approx_reads.add(self.pc)
                 return
@@ -16804,7 +16934,9 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                               and any(s and s[0] in ('desc', 'descnum') for s in symbols))
                 if descriptor:
                     if mods or any(self.is_lane_mask(t) or t == 'src_scc' for t in ops):
-                        raise Unsupported('scc from descriptor data in %s with a lane mask, SCC or modifier' % name)
+                        if mods or not _PERMISSIVE.get():
+                            raise Unsupported('scc from descriptor data in %s with a lane mask, SCC or modifier' % name)
+                        self.lift('uniform')
                     self.set_scc((cast % op).format(*(self.descriptor_operand(t) for t in ops)))
                     self.mark_descriptor_scc()
                 else:
@@ -16902,8 +17034,12 @@ for _name, (_pair, _expr, _scc) in SCALAR_BITS.items():
                 raise Unsupported('%s destination %s' % (name, ops[0]))
             if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != (1 if pair else 0):
                 raise Unsupported('%s source %s' % (name, ops[1]))
-            if any(r in self.masks for r in range(src[1], src[2] + 1)):
-                raise Unsupported('%s on a lane mask' % name)
+            approximate_count = _PERMISSIVE.get() and name.startswith('s_bcnt')
+            read_masks = self.masks | getattr(self, 'mask_high', set()) if approximate_count else self.masks
+            if any(r in read_masks for r in range(src[1], src[2] + 1)):
+                if not approximate_count:
+                    raise Unsupported('%s on a lane mask' % name)
+                self.lift('uniform')
             lo, hi = self.S(src[1]), self.S(src[2])
             self.masks.discard(dst[1])
             self.set_s(dst[1], expr(lo, hi), scc=scc)
@@ -18000,7 +18136,7 @@ TG_SIZE_WAVES_REFUSAL = ('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threa
                          '(more needs whole wave32 waves and a program proved wave32)')
 
 
-def wave32_exec_proof(ins):
+def wave32_exec_proof(ins, *, allow_mixed=False):
     """True when the program names a wave32 exec write (a 32-bit scalar op into exec_lo, or s_*saveexec_b32) and no wave64
     exec form (the 64-bit exec pair or a 64-bit scalar op on it). The opcodes differ between the sizes (RDNA 2 ISA, SOP1
     S_AND_SAVEEXEC_B32 / _B64, SOP1 S_MOV_B32 / _B64), so a compiler's exec handling states the wave size; a program that
@@ -18016,7 +18152,7 @@ def wave32_exec_proof(ins):
         elif re.search(r'\bexec_lo\b', asm) and name.endswith('_b32'):
             ops = parse(asm)[1]
             wave32 |= bool(ops) and ops[0] == 'exec_lo'
-    return wave32 and not wave64
+    return wave32 and (allow_mixed or not wave64)
 
 
 def assume_wave64_enabled():
@@ -18058,9 +18194,9 @@ class ReadWriteBuffer(Unsupported):
     """A compute program loads and stores through one descriptor. A raw buffer is lowered as one RWByteAddressBuffer
     (ComputePipeline retries with the key in rw_keys); anything else keeps the refusal."""
 
-    def __init__(self, key, lowerable):
+    def __init__(self, key, lowerable, *, raw_buffer=False):
         super().__init__('descriptor %s used for a load and a store' % (key,))
-        self.key, self.lowerable = key, lowerable
+        self.key, self.lowerable, self.raw_buffer = key, lowerable, raw_buffer
 
 
 class ComputePipeline(Pipeline):
@@ -18092,6 +18228,7 @@ class ComputePipeline(Pipeline):
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.integer_texture_srvs = os.environ.get('X2W_INTEGER_TEXTURE_SRVS') == '1'
         self.rw_keys = set()
+        self.approx_rw_keys = set()
         self.retry_entry_exec = False
         self.retry_firstlane = False
         self._stage_args = (cs_code, refusals, decoded)
@@ -18126,10 +18263,16 @@ class ComputePipeline(Pipeline):
             return False
         return True
 
+    def can_retry_read_write(self, conflict, *, permissive):
+        return (conflict.key not in self.rw_keys and len(self.rw_keys) < 8
+                and (conflict.lowerable or (permissive and conflict.raw_buffer)))
+
     def _lower_read_write(self, conflict):
-        if not conflict.lowerable or conflict.key in self.rw_keys or len(self.rw_keys) >= 8:
+        if not self.can_retry_read_write(conflict, permissive=_PERMISSIVE.get()):
             raise conflict
         self.rw_keys.add(conflict.key)
+        if not conflict.lowerable:
+            self.approx_rw_keys.add(conflict.key)
 
     def _reset_stage(self):
         """A fresh translation state: the descriptors, samplers, entry constants and the program's stage."""
@@ -18141,20 +18284,24 @@ class ComputePipeline(Pipeline):
         self.lod_unvalidated = set()
         if refusals is not None:
             del refusals[self._refusals_before:]
+            for _ in self.approx_rw_keys:
+                permissive_lift(refusals, 'cs', 'other')
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
         if key in self.rw_keys and kind == 'buf':
             return Pipeline.uav(self, key, 'raw')  # the program also stores through it: one RW view, loads read it
         if key in self.uavs:
-            raise ReadWriteBuffer(key, key in self.plain_stored and self.uavs[key]['kind'] == 'raw' and kind == 'buf')
+            raw = self.uavs[key]['kind'] == 'raw' and kind == 'buf'
+            raise ReadWriteBuffer(key, key in self.plain_stored and raw, raw_buffer=raw)
         return super().resource(key, kind)
 
     def uav(self, key, kind='raw', rw=False):
         # rw: a plain buffer store, which a read of the same descriptor may share a view with. Formatted stores and
         # atomics keep the refusal.
         if key in self.resources:
-            raise ReadWriteBuffer(key, rw and self.resources[key]['kind'] == 'buf' and kind == 'raw')
+            raw = self.resources[key]['kind'] == 'buf' and kind == 'raw'
+            raise ReadWriteBuffer(key, rw and raw, raw_buffer=raw)
         if rw:
             self.plain_stored.add(key)
         return super().uav(key, kind)
@@ -18424,9 +18571,16 @@ def load_compute_request(out_dir, key, refusals=None):
     if not code or len(code) % 4:
         raise Unsupported('compute code of %d bytes is not whole dwords' % len(code))
     if S_ENDPGM not in struct.unpack('<%dI' % (len(code) // 4), code):
-        raise Unsupported('compute code without s_endpgm')
+        if not _PERMISSIVE.get():
+            raise Unsupported('compute code without s_endpgm')
+        permissive_lift(refusals, 'cs', 'other')
+        raw = strip_header(code)
+        decoded = decode(raw, refusals, refusal_scope='cs')
+        decoded.append((len(raw), 4, 's_endpgm', 's_endpgm'))
+    else:
+        decoded = None
     rsrc2, group = compute_entry(parts['.sa'])
-    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals)
+    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals, decoded=decoded)
 
 
 def compute_refusals(out_dir, key):
@@ -18463,7 +18617,7 @@ def translate_compute(out_dir, key):
         def lower(refusals=None):
             pipe = load_compute_request(out_dir, key, refusals) if refusals is not None else load_compute_request(out_dir, key)
             return pipe, pipe.hlsl_cs(), pipe.manifest()
-        pipe, hlsl, manifest = diagnostic_translation(lower)
+        pipe, hlsl, manifest = diagnostic_translation(lower, key, 'cs')
     except Unsupported as reason:
         reason = fail_reason(reason)
         write_failure(name + '.fail', reason)
@@ -18624,7 +18778,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch,
                             ps_attr_map=ps_attr_map, ps_hw_inputs=ps_hw_inputs, **collect)
             return pipe, pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
-        pipe, vs, ps, manifest = diagnostic_translation(lower)
+        pipe, vs, ps, manifest = diagnostic_translation(lower, key, 'vs+ps')
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
@@ -18953,7 +19107,7 @@ def translate_mesh57(out_dir, key):
         if ps:
             sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
         return pipe, sources, pipe.manifest()
-    pipe, sources, manifest = diagnostic_translation(lower)
+    pipe, sources, manifest = diagnostic_translation(lower, key, 'ms+ps' if ps else 'ms')
     base = name
     output_key, marker = approx_result(key, pipe)
     name = os.path.join(out_dir, '%016x' % output_key)
@@ -19742,6 +19896,15 @@ def translate_one(out_dir, key):
         return reason
 
 
+def translate_one_level2(out_dir, key):
+    token = _APPROX2_FAILED.set(False)
+    try:
+        result = translate_one(out_dir, key)
+        return result, _APPROX2_FAILED.get()
+    finally:
+        _APPROX2_FAILED.reset(token)
+
+
 WATCH_JOBS = 4          # --watch: workers beside a running title (X2W_TRANSLATE_JOBS overrides)
 RECYCLE_AFTER = 50      # requests per pool worker before it is replaced, so its memory growth is given back
 POOL_LOG_SECONDS = 30.0  # --watch: how often the pool's size and commit are logged
@@ -19886,19 +20049,24 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     rewritten. Results are printed as they finish.
     """
     level2 = approx_level() == 2
-    approximated = 0
+    approximated = failed = 0
     stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
     if not queue:
         if level2:
-            print('approximated (level 2) 0', flush=True)
+            print('approximated (level 2) 0, failed 0', flush=True)
         return
     handled = {}  # key -> marker time it was queued with in this pass
 
+    worker = translate_one_level2 if level2 else translate_one
+
     def report(key, result):
-        nonlocal approximated
-        if level2 and result == 'ok' and os.path.isfile(os.path.join(out_dir, '%016x.approx2.txt' % key)):
-            approximated += 1
+        nonlocal approximated, failed
+        if level2:
+            result, approx_failed = result
+            failed += approx_failed
+            if result == 'ok' and os.path.isfile(os.path.join(out_dir, '%016x.approx2.txt' % key)):
+                approximated += 1
         print('%016x: %s%s' % (key, result, clock() if clock else ''), flush=True)
 
     def refill(queue):
@@ -19923,9 +20091,9 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 key = queue.pop(0)
                 handled[key] = stamps[key]
                 if pool is None:
-                    report(key, translate_one(out_dir, key))
+                    report(key, worker(out_dir, key))
                     break
-                running[pool.submit(translate_one, out_dir, key)] = key
+                running[pool.submit(worker, out_dir, key)] = key
             if running:
                 done, _ = wait(running, timeout=RESCAN_SECONDS if rescan else None, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -19939,7 +20107,7 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
                 idle = not queue and not running
             if idle:
                 if level2:
-                    print('approximated (level 2) %d' % approximated, flush=True)
+                    print('approximated (level 2) %d, failed %d' % (approximated, failed), flush=True)
                 return
     finally:
         if pool is not None:
