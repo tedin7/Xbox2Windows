@@ -5473,6 +5473,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The tester's one-command run and mail-sized zip (tools/startup/tester_run.ps1, tester_pack.py).
     add_test(NAME startup_tester_pack COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_tester_pack_check.py")
+    add_test(NAME startup_null_views_census_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_null_views_check.py" "$<TARGET_FILE:startup_indirect_draw_indexed>" baseline)
+    add_test(NAME startup_null_views_census_omit_index_control_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_null_views_check.py" "$<TARGET_FILE:startup_indirect_draw_indexed>" omit-index)
+    set_tests_properties(startup_null_views_census_warp startup_null_views_census_omit_index_control_warp PROPERTIES TIMEOUT 60)
     # memory.txt of a tester run: the processes holding the most committed memory (tools/startup/memory_top.py).
     add_test(NAME startup_memory_top COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_top_check.py")

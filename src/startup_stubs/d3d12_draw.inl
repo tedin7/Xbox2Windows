@@ -409,6 +409,7 @@ void count_null_binding(x2w_local::NullCause cause)
     InterlockedIncrement(&null_bindings);
     InterlockedIncrement(&null_by_cause[static_cast<int>(cause)]);
 }
+x2w_startup::NullInputCensus null_input_census;
 LONG frame_number;
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
@@ -3460,6 +3461,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (vertex_first < 0) vertex_first = 0;
     phases.to(2);
     UINT indexed_vertices = UINT_MAX;
+    bool has_null_input = false;
+    const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -3489,6 +3492,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
                 pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
         std::uint32_t words[8] = {};
+        const auto note_null = [&](x2w_local::NullCause cause, std::size_t requested = 0,
+                                   const char* why = "range unreadable") {
+            count_null_binding(cause);
+            if (cause == x2w_local::NullCause::none) return;
+            static const bool omit_index = x2w_local::env_on("X2W_TEST_NULL_CENSUS_OMIT_INDEX");
+            null_input_census.note({tr->key, i, cause, static_cast<unsigned>(srv.kind),
+                                    pass.target_count ? static_cast<int>(pass.target_formats[0]) : 0,
+                                    static_cast<int>(pass.dsv_format), {words[0], words[1]}, requested, why,
+                                    binding_frame, binding_frame}, omit_index);
+        };
         const bool entry_ok = formatted.entry ||
             (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
         if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
@@ -3607,7 +3620,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
             const auto cause = x2w_local::classify_null_binding(facts);
-            count_null_binding(cause);
+            note_null(cause);
+            has_null_input |= !texture;
             if (cause == x2w_local::NullCause::unknown_token && token_null_census.note(tr->key)) {
                 char line[256];
                 x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
@@ -3692,6 +3706,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
+        const std::size_t requested_bytes = bytes;
         const bool mirror_candidate = address && !formatted.entry && srv.source != 2 &&
             bytes >= gpu_mirror_min_bytes && bytes <= gpu_mirror_budget &&
             gpu_mirror_enabled() && bigbind_once_enabled();
@@ -3710,18 +3725,19 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
         }
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
-        const auto count_buffer = [&](bool bound) {
+        const auto count_buffer = [&](bool bound, const char* why) {
             x2w_local::BindingFacts buffer_facts;
             buffer_facts.from_table = srv.source == 0;
             buffer_facts.entry_readable = entry_ok;
             buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
             buffer_facts.token_known = buffer_token_known;
             buffer_facts.bound = bound;
-            count_null_binding(x2w_local::classify_null_binding(buffer_facts));
+            note_null(x2w_local::classify_null_binding(buffer_facts), requested_bytes, why);
+            has_null_input |= !bound;
         };
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
             buffer_view(dest, nullptr, 0, 0);
-            count_buffer(false);
+            count_buffer(false, placed.reject ? "ambiguous or invalid placed range" : "placed resource released");
             continue;
         }
         if (placed.owner && bytes % 4 != 0) {
@@ -3736,7 +3752,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 static LONG copy_refused;
                 if (first_calls(copy_refused, 6))
                     log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
-                count_null_binding(x2w_local::NullCause::ring_full);
+                note_null(x2w_local::NullCause::ring_full, padded);
                 draw_lock_release_exclusive();
                 return not_drawn(buffer_copy_failed_site);
             }
@@ -3745,7 +3761,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 std::memset(target + bytes, 0, padded - bytes);
             }
             buffer_view(dest, target ? chunk : nullptr, offset, padded);
-            count_buffer(target != nullptr);
+            count_buffer(target != nullptr, "placed range unreadable");
             continue;
         }
         if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
@@ -3780,7 +3796,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (first_calls(bound_from_copy, 8))
                     log("x2w-draw   %016llx srv %u constants bound from the placed buffer's own copy (a recorded copy wrote it): address 0x%llx, %llu bytes",
                         tr->key, i, address, span);
-                count_buffer(true);
+                count_buffer(true, nullptr);
                 continue;
             }
         }
@@ -3873,7 +3889,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && formatted.entry) {
             // A readable range whose copy failed (upload ring full) is a ring_full refusal, not an unresolved buffer.
-            if (readable_range) count_null_binding(x2w_local::NullCause::ring_full);
+            if (readable_range) note_null(x2w_local::NullCause::ring_full, bytes);
             InterlockedIncrement(&formatted_draws_refused);
             static LONG refused;
             if (first_calls(refused, 6))
@@ -3887,10 +3903,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             static LONG copy_refused;
             if (first_calls(copy_refused, 6))
                 log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
-            count_null_binding(x2w_local::NullCause::ring_full);
+            note_null(x2w_local::NullCause::ring_full, bytes);
             draw_lock_release_exclusive();
             return not_drawn(buffer_copy_failed_site);
         }
+        const char* const buffer_failure = !address ? "address missing" : !requested_bytes ? "size missing" : "range unreadable";
         if (!have && identity_for_null) {
             static float identity[64];
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
@@ -3899,7 +3916,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             have = frame_copy(self, address, bytes, &offset, &chunk);
         }
         buffer_view(dest, have ? chunk : nullptr, offset, bytes);
-        count_buffer(have);
+        count_buffer(have, buffer_failure);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
             if (have && !cache_hit) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
@@ -4066,6 +4083,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn && using_rtv_base) InterlockedIncrement(&rtv_base_draws);
+    if (drawn && pass.target_count && pass.target0) {
+        null_input_census.note_target({reinterpret_cast<std::uintptr_t>(pass.target0), pass.target0_width,
+                                      pass.target0_height, static_cast<int>(pass.target_formats[0]), binding_frame, binding_frame},
+                                     has_null_input);
+    }
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
     if (indirect) return drawn;

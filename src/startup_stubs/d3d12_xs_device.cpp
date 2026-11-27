@@ -52,6 +52,7 @@
 #include "startup_stubs/linear_buffer_backing.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
+#include "startup_stubs/null_input_census.h"
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
 #include "startup_stubs/dsv_planes.h"
@@ -3006,6 +3007,8 @@ struct Pass {
     bool depth_view_writable = false;
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
+    UINT64 target0_width = 0;
+    UINT target0_height = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
@@ -4322,9 +4325,13 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     std::copy_n(targets, 8, pass.bound_targets);
     pass.bound_depth = dsv_target;
     pass.dsv_format = dsv_format;
-    const auto single_sample = [](ID3D12Resource* resource) {
-        const auto samples = resource->GetDesc().SampleDesc;
-        return samples.Count == 1 && !samples.Quality;
+    const auto single_sample = [&pass](ID3D12Resource* resource) {
+        const auto desc = resource->GetDesc();
+        if (resource == pass.target0) {
+            pass.target0_width = desc.Width;
+            pass.target0_height = desc.Height;
+        }
+        return desc.SampleDesc.Count == 1 && !desc.SampleDesc.Quality;
     };
     pass.targets_single_sample = std::all_of(targets, targets + count, single_sample) &&
         (!dsv_target || single_sample(dsv_target));
@@ -7797,12 +7804,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     X2W_ZONE("Present");
     X2W_FRAME_MARK;
     static LONG frames;
-    static ULONGLONG started, last_report, last_copy15_report;
+    static ULONGLONG started, last_report, last_copy15_report, last_null_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
     if (reuse_large_bindings) draw_lock_acquire_exclusive();
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
-    frame_number = frame;
+    InterlockedExchange(&frame_number, frame);
     if (reuse_large_bindings) {
         finish_bigbind_frame(frame);
         draw_lock_release_exclusive();
@@ -7854,7 +7861,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
-    if (frame == 1) started = last_report = last_copy15_report = now;
+    if (frame == 1) started = last_report = last_copy15_report = last_null_report = now;
     if (frame <= 2) {
         char a[3 * 0x50 + 1], b[3 * 0x40 + 1];
         hex_text(plane_parameters, 0x50, a, sizeof(a));
@@ -7892,8 +7899,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
-    if (render_mode() && frame % 300 == 0) {
+    x2w_startup::NullInputCensus::Batch null_report;
+    const bool totals_due = render_mode() && frame % 300 == 0;
+    const bool null_report_due = render_mode() && now - last_null_report >= 10000;
+    if (totals_due || null_report_due) {
+        if (null_report_due) last_null_report = now;
         draw_lock_acquire_exclusive();
+        null_input_census.report(null_report, true);
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         draw_lock_release_exclusive();
@@ -7901,20 +7913,24 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0 && gpu_time_on()) log_gpu_time(frame, now);
     if (render_mode() && frame % 300 == 0 && residency_observe()) residency_report(frame);
     if (render_mode() && frame % 60 == 0) residency_tick(frame);
-    if (render_mode() && frame % 300 == 0)
+    if (totals_due) {
+        char null_totals[200];
+        x2w_startup::format_null_binding_totals(null_totals, sizeof(null_totals), null_total, null_causes);
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals,
+            formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    }
+    null_report.emit([](const char* line) { log("%s", line); });
     if (render_mode() && frame % 300 == 0) {
         log("x2w-render RTV variant totals: requested %ld, ready %ld, draws with base %ld",
             InterlockedCompareExchange(&rtv_variants_requested, 0, 0),
@@ -8075,6 +8091,14 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     };
     memory_srv_census.report(emit, false);
     token_null_census.report(emit, false);
+    x2w_startup::NullInputCensus::Batch null_report;
+    draw_lock_acquire_exclusive();
+    null_input_census.report(null_report, false);
+    char null_totals[200];
+    x2w_startup::format_null_binding_totals(null_totals, sizeof(null_totals), null_bindings, null_by_cause);
+    null_report.add("x2w-render fixture %s", null_totals);
+    draw_lock_release_exclusive();
+    null_report.emit(emit);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);

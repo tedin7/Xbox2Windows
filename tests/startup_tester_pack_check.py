@@ -868,7 +868,30 @@ def check_symbols():
             assert T.SYMBOLS_NAME not in z.namelist()  # no map: no symbol member
 
 
+def check_null_inputs():
+    row = ("x2w-render null input: key 0000000000000123 input 1 (2D) cause token calls {} "
+           "frames 1..{} target format 28 depth format 0 words 56573258 ffffffff")
+    other = row.format(1, 2).replace("input 1", "input 2")
+    target = "x2w-render target abc (4x2 format 28): draws 2, with a null input 1 frames 1..2"
+    clean = "x2w-render target abc (4x2 format 28): draws 3, with a null input 0 frames 3..5"
+    stderr = "\n".join([row.format(1, 1), other, target, row.format(2, 5), clean])
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        run.mkdir()
+        (run / "stderr.txt").write_text(stderr, encoding="utf-8")
+        archive = Path(tmp) / "report.zip"
+        T.pack(str(run), MANIFEST, str(archive))
+        with zipfile.ZipFile(archive) as report:
+            section = report.read(T.NULL_INPUTS_NAME).decode("utf-8")
+    assert section.splitlines()[:3] == ["null inputs", row.format(2, 5), other]
+    assert row.format(1, 1) not in section
+    assert f"{target} (50.0% poisoned)" in section
+    assert f"{clean} (0.0% poisoned)" in section
+    assert not T.null_inputs_section("unrelated log")
+
+
 if __name__ == "__main__":
+    check_null_inputs()
     check_symbols()
     check_seed_cache()
     check_cache_results()
