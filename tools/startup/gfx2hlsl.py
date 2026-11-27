@@ -4141,9 +4141,11 @@ class Stage:
             value = next((self.is_const(i) for i in range(r[1], r[2] + 1) if self.is_const(i)), s[1])
             raise Unsupported("descriptor operand %s holds ('const', %#x)" % (tok, value & 0xffffffff))
         if s and s[0] == 'desc':
-            if s[1][0] == 'dynamic_heap' and (r[0] != 's' or r[2] - r[1] != 3 or s[3] != 0 or
-                    any(self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, 4))):
-                raise Unsupported('dynamic resource heap descriptor requires four intact words')
+            if s[1][0] == 'dynamic_heap':
+                words = 8 if len(s[1]) > 2 else 4  # an image record is the whole 32-byte heap entry
+                if (r[0] != 's' or r[2] - r[1] != words - 1 or s[3] != 0 or
+                        any(self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, words))):
+                    raise Unsupported('dynamic resource heap descriptor requires %s intact words' % ('eight' if words == 8 else 'four'))
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
@@ -8864,6 +8866,8 @@ class Stage:
             return
         if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
+        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) == 'ps':
+            return self.dynamic_heap_image_record(dst, base, token, imm)
         if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
                                             "s_load with a register offset through ('resheap',)")
@@ -8878,6 +8882,37 @@ class Stage:
         self.emit('uint %s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
         for i in range(count):
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name), 0, i)
+
+    def dynamic_heap_image_record(self, dst, base, token, imm):
+        """s_load_dwordx8 D, <resource heap pointer>, R in a pixel stage: the whole 32-byte heap record at byte R, the
+        image descriptor of the view that heap slot (R >> 5) holds. The texture is picked at run time from the bound
+        shader-model 6.6 heap (see image_texture); the descriptor words themselves are never read. The index lives in a
+        function-scope temporary, so a later block (a branch arm, a join) reads the value this load wrote."""
+        r = reg_range(token)
+        if (dst[2] > 105 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or r[1] != r[2]
+                or (imm or 0) % 32 or self.sym.get(base[2]) != ('const', 0) or not self.uniform_source(token)):
+            raise Unsupported("s_load_dwordx8 with a register offset through ('resheap',)")
+        name = 'heap_index_%x' % self.pc
+        self.uniform_load_temps.add(name)
+        self.emit('%s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
+        for i in range(8):
+            self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name, 'image'), 0, i)
+
+    def image_texture(self, key, kind):
+        """The HLSL name of the texture an image instruction reads. A key from the dynamic heap becomes a local view
+        of the bound heap slot; any other key is a normal SRV resource."""
+        if key is None or key[0][0] != 'dynamic_heap':
+            return self.pipe.resource(key, kind) if key is not None else None
+        types = {'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>',
+                 'tex3d': 'Texture3D<float4>'}
+        if self.kind != 'ps' or len(key[0]) != 3 or kind not in types or key[1] != 0 or key in self.pipe.modified:
+            raise Unsupported('dynamic resource heap views require a raw buffer load')
+        self.pipe.uses_dynamic_heap = True
+        name = 'heap_tex_%x' % self.pc
+        # An index past the logical heap reads slot 0 instead of an out-of-range descriptor (a title's index is in range).
+        self.emit('%s %s = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];'
+                  % (types[kind], name, key[0][1], key[0][1]))
+        return name
 
     def dynamic_heap_load(self, key, address):
         if key[1] != 0 or key in self.pipe.modified:
@@ -10203,19 +10238,25 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
-        shared_load = (desc_key is not None and getattr(self, 'kind', None) == 'ps' and how == 'load'
+        dynamic_view = desc_key is not None and desc_key[0][0] == 'dynamic_heap'
+        if dynamic_view and (integer_srvs or sample_d16 or 'd16' in mods):
+            raise Unsupported('dynamic resource heap image with integer or d16 access')
+        shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
+                       and how == 'load'
                        and kinds[dim] in ('tex2d', 'tex2da') and not integer_srvs
                        and 'd16' not in mods
                        and getattr(self.pipe, 'pixel_rw_images', None) is not None
                        and self.is_fixed_table_image(ops[2], desc_key))
         if desc_key is None:
             tex = None
+        elif dynamic_view:
+            tex = self.image_texture(desc_key, kinds[dim])
         elif shared_load:
             tex = self.pipe.pixel_image_load(desc_key, kinds[dim])
         else:
             tex = self.pipe.resource(desc_key, kinds[dim])
         uav_load = shared_load and desc_key in self.pipe.pixel_rw_images
-        if tex is not None and not uav_load and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+        if tex is not None and not uav_load and not dynamic_view and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
