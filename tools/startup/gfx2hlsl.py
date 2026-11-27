@@ -50,6 +50,7 @@ COMPUTE_DPP_FLOAT = frozenset(('v_min_f32', 'v_max_f32', 'v_add_f32'))
 DPP_PAIR = frozenset(((1, 1, 3, 3), (0, 0, 2, 2), (2, 3, 2, 3), (0, 1, 0, 1)))
 # Exchanges projected onto one row (X difference) or one column (Y difference).
 DPP_COARSE = frozenset(((1, 0, 1, 0), (3, 2, 3, 2), (2, 2, 0, 0), (3, 3, 1, 1)))
+WHOLE_QUAD_DPP_OPS = frozenset(('v_add_f32_dpp', 'v_subrev_f32_dpp'))
 DPP_DERIVATIVE_OPS = frozenset(('v_mov_b32', 'v_sub_f32', 'v_subrev_f32'))
 DPP_SCRATCH = 256
 
@@ -5212,7 +5213,7 @@ class Stage:
                 else self.entry_exec_sites(self.spill_cfg, self.reduction_restores))
         self.whole_quad_sites = set()
         if (getattr(self, 'kind', None) == 'ps' and not getattr(self, 'fetched', False) and
-                any(name == 'v_add_f32_dpp' for _, _, name, _ in self.ins)):
+                any(name in WHOLE_QUAD_DPP_OPS for _, _, name, _ in self.ins)):
             self.whole_quad_sites = self.whole_quad_exec_sites(self.spill_cfg)
         self.entry_wqm_sites = (self.entry_wqm_exec_sites()
                                 if branches and getattr(self, 'kind', None) == 'ps' and
@@ -6475,6 +6476,12 @@ class Stage:
                     pending.add(target)
         return sites
 
+    def quad_after_exec_write(self, base):
+        """A float DPP quad read after an EXEC write that whole_quad_exec_sites proved lane-exact whole-quad: EXEC is no
+        longer the entry mask, but every quad is whole, so the four reads are as safe as after the entry s_wqm."""
+        return (base in ('v_add_f32', 'v_subrev_f32') and not getattr(self, 'exec_known', False)
+                and getattr(self, 'pc', None) in getattr(self, 'whole_quad_sites', ()))
+
     def quad_subrev_block_proof(self, base):
         return (base == 'v_subrev_f32' and self.quad_flow_allowed()
                 and not getattr(self, 'fetched', False)
@@ -6592,9 +6599,10 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR and not (perm in DPP_COARSE and base in DPP_DERIVATIVE_OPS):
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
+        after_exec_write = self.quad_after_exec_write(base)
         if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or getattr(self, 'fetched', False) or
                 (not (getattr(self, 'exec_known', False) and getattr(self, 'wqm_exec', False))
-                 and not self.quad_subrev_block_proof(base))):
+                 and not after_exec_write and not self.quad_subrev_block_proof(base))):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
         if len(ops) < 2:
@@ -6605,6 +6613,8 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        if after_exec_write:
+            self.whole_quad_reads.add(self.pc)
         self.note_quad_flow(base, allow_late_wqm=base in DPP_DERIVATIVE_OPS)
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
@@ -7370,8 +7380,7 @@ class Stage:
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         compute = getattr(self, 'kind', None) == 'cs'
-        after_exec_write = (base == 'v_add_f32' and not self.exec_known and
-                            getattr(self, 'pc', None) in getattr(self, 'whole_quad_sites', ()))
+        after_exec_write = self.quad_after_exec_write(base)
         if compute:
             self.compute_quad_gate(base, row_ror8, allow_flow=compute_float)
             if row is not None and math.prod(self.pipe.group) % 16:

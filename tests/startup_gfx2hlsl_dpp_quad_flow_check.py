@@ -495,7 +495,91 @@ def check_subrev_draw(dxc, renderer, adapter, fxc=None):
                   run.stdout + run.stderr)
 
 
+# The ADD_AFTER_EXEC shape with v_subrev_f32: the fall-through clears and restores EXEC, then joins a path that kept the WQM
+# mask. The three reads after the restore are the pair [0,0,2,2] (ddy), the pair [1,1,3,3] with a negated source (ddx) and
+# the diagonal swap [3,2,1,0]. The read inside the cleared EXEC must leave v1 unchanged.
+SUBREV_EXEC_SOURCE = FIXTURES['ADD_AFTER_EXEC'][0].replace('v_add_f32_dpp v1, v2, v2 quad_perm:[1,0,3,2]',
+    'v_subrev_f32_dpp v1, v2, v2 quad_perm:[0,0,2,2]').replace('v_add_f32_dpp v3, v1, v2 quad_perm:[1,0,3,2]',
+    'v_subrev_f32_dpp v3, v1, v2 quad_perm:[0,0,2,2]').replace('v_add_f32_dpp v4, -v1, v2 quad_perm:[2,3,0,1]',
+    'v_subrev_f32_dpp v4, -v1, v2 quad_perm:[1,1,3,3]').replace('v_add_f32_dpp v5, v1, v2 quad_perm:[3,2,1,0]',
+    'v_subrev_f32_dpp v5, v1, v2 quad_perm:[3,2,1,0]')
+SUBREV_EXEC_WORDS = ('7e0afebe8f0002369000042c8404043401050238010d027ef0020406800380be008106bf050085bf802484befa04020a02a000ff0404febe'
+                     '000080bffa04060a01a000fffa04080a01f510fffa040a0a011b00ff0f1800f803040502000081bf')
+
+
+def subrev_exec_reference(local_read=None):
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            local = 16 * y + x + 0.5
+            for channel, (nx, ny, sign) in enumerate(((x & ~1, y, 1), (x | 1, y, -1), (x ^ 1, y ^ 1, 1))):
+                neighbour = 16 * ny + nx if channel != local_read else 16 * y + x
+                out.append(local - sign * neighbour)
+            out.append(local)
+    return struct.unpack('<%dI' % len(out), struct.pack('<%df' % len(out), *out))
+
+
+def subrev_exec_variants():
+    original = bytes.fromhex(SUBREV_EXEC_WORDS)
+    return (('restore', original), ('bypass', bytes.fromhex(replace_once(SUBREV_EXEC_WORDS, '008106bf', '008006bf'))))
+
+
+SUBREV_EXEC_MUTANTS = {
+    'ddy_pair_own': lambda text: replace_once(text, 'v256 = x2w_lane == 0u ? x2w_q0 : x2w_lane == 1u ? x2w_q0 : x2w_lane == 2u ? x2w_q2 : x2w_q2; }\n        if (exec & 1) v3', 'v256 = v1; }\n        if (exec & 1) v3'),
+    'ddx_pair_own': lambda text: replace_once(text, 'v256 = x2w_lane == 0u ? x2w_q1 : x2w_lane == 1u ? x2w_q1 : x2w_lane == 2u ? x2w_q3 : x2w_q3; }\n        if (exec & 1) v4', 'v256 = v1; }\n        if (exec & 1) v4'),
+    'diagonal_own': lambda text: replace_once(text, 'v256 = QuadReadAcrossDiagonal(v1);', 'v256 = v1;'),
+    'inactive_write': lambda text: replace_once(text, 'if (exec & 1) v1 = U(F(v2) - F(v256));', 'v1 = U(F(v2) - F(v256));'),
+}
+
+
+def subrev_exec_controls():
+    check('SUBREV after-exec source matches the fixture words (names only)', SUBREV_EXEC_SOURCE != FIXTURES['ADD_AFTER_EXEC'][0])
+    for edge, code in subrev_exec_variants():
+        text, reason = translate_code(code)
+        check('DPP subrev after an EXEC write with the %s edge translates' % edge, text is not None, str(reason))
+        if text is not None:
+            check('subrev %s: the dpp in the cleared EXEC leaves v1 guarded' % edge, 'if (exec & 1) v1 = U(F(v2) - F(v256));' in text)
+            for name, mutate in SUBREV_EXEC_MUTANTS.items():
+                check('subrev %s: mutant %s changes the HLSL' % (edge, name), mutate(text) != text)
+    reference = subrev_exec_reference()
+    for index in range(3):
+        check('subrev channel %d CPU reference rejects the own lane' % index, reference != subrev_exec_reference(local_read=index))
+    for old, new, why in (
+            ('0404febe', '8104febe', 'with a whole-quad exec mask (restore a lane-0 literal)'),
+            ('0404febe000080bf', '800384be0404febe', 'with a whole-quad exec mask (saved mask overwritten)'),
+            ('008106bf', '0000827d', 'is not proven wave-uniform'),
+            ('01a000ff', '01a000ef', 'with row_mask:0xe')):
+        text, actual = translate_code(bytes.fromhex(replace_once(SUBREV_EXEC_WORDS, old, new)))
+        check('DPP subrev after an EXEC write control refused: %s' % why, text is None and why.split(' (')[0] in str(actual), str(actual))
+
+
+def check_subrev_exec_draw(dxc, renderer, adapter, fxc=None):
+    reference_words = subrev_exec_reference()
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_subrev_exec', 'vs_6_0', directory)
+        reference = words_file(directory, 'subrev_exec_reference', reference_words)
+        for edge, code in subrev_exec_variants():
+            text, reason = translate_code(code)
+            if text is None:
+                check('DPP subrev after an EXEC write translates for the draw', False, str(reason))
+                continue
+            ps = compile_hlsl(dxc, 'dxc', text, 'ps_subrev_exec_' + edge, 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, ps, reference)
+            check('dxc %s DPP subrev after EXEC write %s: all %d pixels match' % (adapter, edge, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout, run.stdout + run.stderr)
+            if edge == 'restore':
+                for name, mutate in SUBREV_EXEC_MUTANTS.items():
+                    ps = compile_hlsl(dxc, 'dxc', mutate(text), 'ps_subrev_exec_' + name, 'ps_6_0', directory)
+                    run = draw(renderer, adapter, vs, ps, reference)
+                    check('dxc %s DPP subrev after EXEC write mutant %s mismatches' % (adapter, name),
+                          run.returncode != 0 and any(ln.startswith('pixel mismatch') for ln in run.stderr.splitlines()),
+                          run.stdout + run.stderr)
+
+
 def check_binary(llvm_mc):
+    check('llvm-mc assembles the SUBREV after-EXEC fixture to the same words',
+          assemble(llvm_mc, SUBREV_EXEC_SOURCE).hex() == SUBREV_EXEC_WORDS)
     for name, (perm, control, _) in SUBREV.items():
         check('llvm-mc assembles the SUBREV %s fixture to the same words' % name,
               assemble(llvm_mc, SUBREV_SOURCE.format(perm=perm)) == subrev_words(control))
@@ -508,6 +592,7 @@ def main():
     if len(sys.argv) == 1:
         controls()
         subrev_controls()
+        subrev_exec_controls()
     else:
         mode, *args = sys.argv[1:]
         if mode == 'binary':
@@ -515,10 +600,12 @@ def main():
         elif mode == 'draw':
             controls()
             subrev_controls()
+            subrev_exec_controls()
             check_draw(*args)
             check_add_draw(*args)
 
             check_subrev_draw(*args)
+            check_subrev_exec_draw(*args)
         else:
             raise SystemExit(__doc__)
     if failures:
