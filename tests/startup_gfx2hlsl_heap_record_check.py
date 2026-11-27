@@ -205,6 +205,34 @@ def check_refusals():
     return len(controls)
 
 
+def check_texture_refusals():
+    from startup_gfx2hlsl_dynamic_heap_check import TEXTURE_L, TEXTURE_U, texture_pipe
+
+    index = "s_load with a register offset through ('resheap',)"
+    waterfall = 'v_readfirstlane_b32 requires a proven uniform source'
+    controls = (
+        (TEXTURE_U, 's_and_b32', 's_and_b32 s14, s7, 7', index),
+        (TEXTURE_U, 's_waitcnt lgkmcnt(0)', 's_mov_b32 s4, s25', 'numeric or unsupported use'),
+        (TEXTURE_U, 's_waitcnt lgkmcnt(0)', 's_mov_b32 s25, 9', 'requires eight intact words'),
+        (TEXTURE_U, 's_waitcnt lgkmcnt(0)', 's_cbranch_scc0 label_0x38', 'joined at a branch target'),
+        (TEXTURE_U, 'image_sample_lz',
+         'image_sample_lz v[12:15], v[5:7], s[24:31], s[36:39] dmask:0xf dim:SQ_RSRC_IMG_3D',
+         'dynamic texture heap requires a 2D'),
+        (TEXTURE_U, 'image_sample_lz',
+         'image_sample_lz v[12:15], v[5:7], s[24:31], s[36:39] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY',
+         'dynamic texture heap requires a 2D'),
+        (TEXTURE_U, 'image_sample_lz',
+         'image_sample_c_lz v12, v[5:7], s[24:31], s[36:39] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+         'comparison sample through a dynamic texture heap descriptor'),
+        (TEXTURE_L, 's_waitcnt vmcnt(0)', 'buffer_store_dword v12, v5, s[40:43], 0 offen', waterfall),
+        (TEXTURE_L, 's_waitcnt vmcnt(0)', 'exp mrt0 v12, v13, v14, v15', waterfall),
+        (TEXTURE_L, 'exp mrt0 v12, v13, v14, v15 done vm', 'v_mov_b32_e32 v12, s14', waterfall),
+    )
+    for code, old, new, reason in controls:
+        refused(reason, lambda: texture_pipe(code, [(old, new)]))
+    return len(controls)
+
+
 def check_mutations():
     """Translator mutation a control above must catch: without the write tracking the refused control translates."""
     again = {SHIFT: (SHIFT, 's_add_u32 s6, s6, 0')}
@@ -231,7 +259,7 @@ if __name__ == '__main__':
     if args.llvm_mc:
         check_binary(args.llvm_mc)
     check_lowering()
-    count = check_refusals()
+    count = check_refusals() + check_texture_refusals()
     check_mutations()
     print('startup_gfx2hlsl_heap_record: PASS (manifest and HLSL exact; %d refused controls; graphics, manifest and '
           'translator-mutation checks)' % count)

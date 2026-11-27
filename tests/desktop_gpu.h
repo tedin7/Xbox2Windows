@@ -41,7 +41,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               UINT constant_count = 4, const std::vector<std::uint32_t>& raw_srv = {}, UINT instances = 1);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width = 1, UINT height = 1, bool dynamic_heap = false);
+                               UINT width = 1, UINT height = 1, bool dynamic_heap = false, bool texture_heap = false);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);

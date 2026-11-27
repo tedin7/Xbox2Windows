@@ -32,7 +32,7 @@ std::vector<char> read_blob(const char* path)
 
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width, UINT height, bool dynamic_heap)
+                               UINT width, UINT height, bool dynamic_heap, bool texture_heap)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -43,6 +43,17 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     if (dynamic_heap) rs.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    if (texture_heap) {
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxAnisotropy = 1;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rs.NumStaticSamplers = 1;
+        rs.pStaticSamplers = &sampler;
+    }
     rs.NumParameters = 1;
     rs.pParameters = &param;
     ComPtr<ID3DBlob> signature, errors;
@@ -96,7 +107,50 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     ComPtr<ID3D12Resource> source;
     ComPtr<ID3D12DescriptorHeap> views;
-    if (dynamic_heap) {
+    std::vector<ComPtr<ID3D12Resource>> textures;
+    if (texture_heap) {
+        constexpr UINT texture_count = 4;
+        constexpr UINT row_pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        constexpr UINT slice_pitch = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        constexpr float colors[texture_count][4] = {
+            {1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {1, 1, 0, 1}
+        };
+        source = make_buffer(device, texture_count * slice_pitch, D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        const D3D12_RANGE none{0, 0};
+        check(source->Map(0, &none, &mapped), "Map texture heap fixture upload");
+        for (UINT i = 0; i < texture_count; ++i)
+            for (UINT y = 0; y < 2; ++y)
+                for (UINT x = 0; x < 2; ++x)
+                    std::memcpy(static_cast<unsigned char*>(mapped) + i * slice_pitch + y * row_pitch +
+                                x * sizeof(colors[i]), colors[i], sizeof(colors[i]));
+        source->Unmap(0, nullptr);
+
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, texture_count + 1,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create texture fixture heap");
+        auto cpu = views->GetCPUDescriptorHandleForHeapStart();
+        const UINT increment = device->GetDescriptorHandleIncrementSize(desc.Type);
+        auto texture_desc = rd;
+        texture_desc.Width = texture_desc.Height = 2;
+        texture_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{rd.Format, D3D12_SRV_DIMENSION_TEXTURE2D,
+                                           D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        srv.Texture2D.MipLevels = 1;
+        for (UINT i = 0; i < texture_count; ++i, cpu.ptr += increment) {
+            textures.push_back(resource(device, texture_desc, D3D12_HEAP_TYPE_DEFAULT,
+                                        D3D12_RESOURCE_STATE_COPY_DEST));
+            auto* texture = textures.back().Get();
+            D3D12_TEXTURE_COPY_LOCATION from{source.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            from.PlacedFootprint = {UINT64{i} * slice_pitch, {rd.Format, 2, 2, 1, row_pitch}};
+            const D3D12_TEXTURE_COPY_LOCATION to{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            transition(list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            device->CreateShaderResourceView(texture, &srv, cpu);
+        }
+        device->CreateShaderResourceView(nullptr, &srv, cpu);
+    } else if (dynamic_heap) {
         constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
         constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
         source = make_buffer(device, 3 * buffer_stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -117,6 +171,8 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
             srv.Buffer = {i * (buffer_stride / 4), 1, 0, D3D12_BUFFER_SRV_FLAG_RAW};
             device->CreateShaderResourceView(source.Get(), &srv, cpu);
         }
+    }
+    if (views) {
         ID3D12DescriptorHeap* binding[]{views.Get()};
         list->SetDescriptorHeaps(1, binding);
     }
