@@ -140,7 +140,7 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
             device->CreateRenderTargetView(images[i].Get(), nullptr, image_rtv);
             list->ClearRenderTargetView(image_rtv, value.Color, 0, nullptr);
             transition(list, images[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
                                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
             view.Texture2D = {0, 1, 0, 0.0f};

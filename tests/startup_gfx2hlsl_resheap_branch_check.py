@@ -79,6 +79,9 @@ COND_ONE = sopc(S_CMP_EQ_U32, S_COND, ONE)
 LOAD = smem(S_LOAD_DWORDX4, S_RECORD, S_HEAP, S_OFFSET)
 READ = mubuf(BUFFER_LOAD_DWORD, 8, 11, S_RECORD)
 SETUP = [sop1(S_MOV_B32, S_HEAP + 1, ZERO), V_MOV_V11_0]
+IMAGE_RECORD = smem(0x03, S_RECORD, S_HEAP, S_OFFSET)
+IMAGE_COORDS = bytes.fromhex('8002187e80021a7e')  # v_mov_b32 v12, 0; v_mov_b32 v13, 0
+IMAGE_READ = bytes.fromhex('080100f00c080400')  # image_load v8, v[12:13], s[16:23] dmask:0x1
 
 
 def vertex(arm):
@@ -132,6 +135,10 @@ def vertex_copy(arm):
     return HEAD + assemble(SETUP + [COND, 'join'] + arm) + COPY_V8 + EXPORTS
 
 
+def vertex_image(record=IMAGE_RECORD, read=IMAGE_READ):
+    return vertex_copy([record, sopp(S_WAITCNT, LGKM0), COND_ONE, 'join', IMAGE_COORDS, read, sopp(S_WAITCNT, VM0)])
+
+
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
 # picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
 # index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
@@ -176,6 +183,7 @@ def expect(label, condition, detail=''):
 
 
 def main(dxc=None):
+    vertex_image_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
     tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
@@ -243,9 +251,9 @@ def else_arm_controls():
     print('heap record in an else arm: controls matched')
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2):
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, heap_count=2):
     """One draw of the vertex stage that reads the heap record named by `offset` (ud1) when ud2 is `cond`."""
-    entry = [0] * count + [2]
+    entry = [0] * count + [heap_count]
     entry[1], entry[2] = offset, cond
     as_hex = lambda words: ','.join('%08x' % word for word in words)
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
@@ -262,6 +270,33 @@ def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2):
 def mutate(source, old, new):
     expect('mutation site ' + old, source.count(old) == 1, source)
     return source.replace(old, new)
+
+
+def vertex_image_control():
+    pipe, vs, ps = translate(vertex_image())
+    assert 'dynamic_heap\n' in pipe.manifest()
+    assert re.search(r'uint [^;]*\bheap_index_\w+\b[^;]*;', vs)
+    assert 'Texture2D<float4> heap_tex_' in vs and '.Load(int3(' in vs
+    bad = vertex_image(record=sop1(S_MOV_B32, 12, VCC_LO) + smem(0x03, S_RECORD, S_HEAP, 12))
+    reason = refusal(bad)
+    assert reason and 'register offset through' in reason, reason
+    sample = bytes.fromhex('080180f00c08040c')  # image_sample with implicit derivatives
+    reason = refusal(vertex_image(read=sample))
+    assert reason and 'dynamic resource heap views require a raw buffer load' in reason, reason
+    return pipe, vs, ps
+
+
+def warp_image(offscreen, dxc):
+    pipe, source, ps_source = vertex_image_control()
+    count = len(pipe.uds)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        draw(offscreen, vs, ps, 96, 0x3fa00000, count, heap_count=5)
+        draw(offscreen, vs, ps, 128, 0x41800000, count, heap_count=5)
+        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, '(ud1 + 0u) >> 5;', '(ud1 + 32u) >> 5;'))
+        draw(offscreen, wrong, ps, 96, 0x3fa00000, count, negative=True, heap_count=5)
 
 
 def warp(offscreen, dxc):
@@ -286,5 +321,7 @@ def warp(offscreen, dxc):
 if __name__ == '__main__':
     if sys.argv[1:2] == ['warp']:
         warp(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-image']:
+        warp_image(*sys.argv[2:4])
     else:
         main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())

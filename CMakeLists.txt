@@ -5158,7 +5158,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_resheap_branch_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp "$<TARGET_FILE:offscreen_check>"
         "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_vertex_image_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
     set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp startup_gfx2hlsl_resheap_branch_warp
+        startup_gfx2hlsl_resheap_vertex_image_warp
         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B
