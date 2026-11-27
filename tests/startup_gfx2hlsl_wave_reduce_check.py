@@ -53,7 +53,7 @@ sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 from startup_flat_param_check import assemble  # noqa: E402
 from startup_image_3d_check import VS_WORDS, compile_hlsl, root_blob  # noqa: E402
-from startup_gfx2hlsl_scalar_null_check import smem, sop2  # noqa: E402
+from startup_gfx2hlsl_scalar_null_check import sop2  # noqa: E402
 
 MASK = 0xffffffff
 SIZE = 32                  # the draw is SIZE x SIZE pixels
@@ -312,7 +312,6 @@ def branch_into_later_readlane():
 
 
 WAVE64 = 'wave64 sum'
-DESCRIPTOR_SHIFT = 'descriptor shift-add SCC'
 
 
 def wave64_sum(high_lane=63, tail=()):
@@ -328,32 +327,8 @@ def wave64_sum(high_lane=63, tail=()):
     ], tail, [move(4, 22)], export('v4', 'v1', 'v4'))[1]
 
 
-def descriptor_shift(shift=3, first=0, second=None, export_result=False):
-    second = (1 << (32 - shift)) if second is None else second
-    words = smem(2, 24, 8, imm=48) + sopp(0x0c, 0xc07f)
-    opcode = 45 + shift
-    for value, d, flag in ((first, 30, 3), (second, 31, 5)):
-        words += sop2(opcode, d, 255, 26, value) + vop1_mov(flag, 253)
-    words += vop2(VOP2_OPS['v_xor_b32'], 6, 261, 0)
-    if export_result:
-        words += vop1_mov(6, 31)
-    return words + program(export('v6', 'v0', 'v3'))[1]
-
-
-def packed_pixel(x, y):
-    return x | (y << 16)
-
-
-def carry(first, descriptor, shift):
-    return int(first * (1 << shift) + descriptor >= 2**32)
-
-
-def descriptor_flag(x, y):
-    return packed_pixel(x, y) ^ carry(0x20000000, MASK, 3)
-
-
 def synthetic_refusal_report(directory):
-    for words in (wave64_sum(), descriptor_shift()):
+    for words in (wave64_sum(),):
         root = root_blob()
         key = G.pipeline_key(VS_WORDS, words, root, b'', PACKED)
         stem = 'req_%016x' % key
@@ -596,18 +571,9 @@ def model_run(label, source, model, default):
 def new_controls():
     with tempfile.TemporaryDirectory() as work:
         report = synthetic_refusal_report(Path(work))['per_request']
-    check('both new synthetic requests have no diagnostic refusal',
-          report['examined'] == report['no_refusal'] == 2, str(report))
-    for shift in range(1, 5):
-        boundary = 1 << (32 - shift)
-        check('descriptor shift %d has the same flag at both descriptor range endpoints' % shift,
-              [carry(a, b, shift) for a in (0, boundary) for b in (0, MASK)] == [0, 0, 1, 1])
-        text, reason = translate(descriptor_shift(shift))
-        check('descriptor shift %d lowers both proven flags' % shift,
-              bool(text and 'scc = false;\n    v3' in text and 'scc = true;\n    v5' in text), str(reason))
+    check('the new synthetic request has no diagnostic refusal',
+          report['examined'] == report['no_refusal'] == 1, str(report))
     for label, words, expected in (
-        ('unknown descriptor carry', descriptor_shift(first=1), 'scc from descriptor data'),
-        ('opaque word used as a number', descriptor_shift(export_result=True), 'numeric use of s31 holding descnum'),
         ('duplicate half', wave64_sum(high_lane=31), 'distinct readlanes'),
         ('live half', wave64_sum(tail=[move(7, 21)]), 'half-wave temporary'),
         ('live vector temporary', wave64_sum(tail=[('v_mov_b32_e32 v7, v8', vop1_mov(7, 264))]),
@@ -854,8 +820,6 @@ DRAWS.append((BRANCH_PAIR_LABEL, BRANCH_PAIR[1], 'v_min_u32',
 DRAWS += [
     (WAVE64, wave64_sum(), WAVE64,
      (('reduce', 'v_add_nc_u32'), ('input', None), ('reduce', 'v_add_nc_u32'))),
-    (DESCRIPTOR_SHIFT, descriptor_shift(), None,
-     (('lane', descriptor_flag), ('lane', packed_pixel), ('lane', lambda x, y: 0))),
 ]
 
 
@@ -942,12 +906,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
             branched = label in BRANCHED or label == BRANCH_PAIR_LABEL
-            tagged = label in (WAVE64, DESCRIPTOR_SHIFT)
+            tagged = label == WAVE64
             if label == WAVE64:
                 hows = [('lane-local input', lambda t: t.replace('WaveActiveSum(v1)', 'v1'))]
-            elif label == DESCRIPTOR_SHIFT:
-                hows = [('lost carry', lambda t: t.replace('scc = true;', 'scc = false;')),
-                        ('spurious carry', lambda t: t.replace('scc = false;\n    v3', 'scc = true;\n    v3'))]
             elif label == BRANCH_PAIR_LABEL:
                 hows = [('min/max swapped', PAIR_MUTATIONS['min and max swapped'])]
             elif label in BRANCHED:

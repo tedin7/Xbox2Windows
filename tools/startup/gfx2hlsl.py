@@ -7661,15 +7661,6 @@ class Stage:
                 return None
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported(self.scc_refusal('src_scc with unverified SCC', 'descriptor source'))
-            if (shift_add and dname != 'm0' and syms[1] and syms[1][0] in ('desc', 'descnum')
-                    and (self.sym.get(dst[1]) or ('',))[0] not in ('desc', 'ptr', 'ptrhi')):
-                # The guest descriptor word is opaque. Its unsigned range is enough to prove carry if
-                # the shifted constant alone overflows, or if it is zero and the addend alone fits.
-                first = self.const_u32(srcs[0])
-                if first is not None and (first == 0 or (first << SHIFT_ADD[base]) > 0xffffffff):
-                    self.set_s(dst[1], None, ('descnum',))
-                    self.set_scc('true' if first else 'false')
-                    return None
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
                 self.scc_verified = False
@@ -15688,7 +15679,6 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
-    ('descriptor-shift-add-scc', r'^scc from descriptor data \[shift-add, complement or absdiff: s_lshl[1-4]_add_u32,'),
     ('wave64-reduction', r'^wave reduction in the wave64 form \(s_or_saveexec_b64 .*only the wave32 chain is lowered'),
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
