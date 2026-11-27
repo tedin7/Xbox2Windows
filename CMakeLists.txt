@@ -5225,7 +5225,28 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_resheap_branch_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp "$<TARGET_FILE:offscreen_check>"
         "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_vertex_image_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_vertex_loop_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image-loop
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_descriptor_word_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-descriptor-word
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_image_dimensions_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-image-dimensions
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_fma_mix_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py" warp-heap
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
+    add_test(NAME startup_gfx2hlsl_resheap_embedded_scalar_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_resheap_branch_check.py" warp-embedded-scalar
+        "$<TARGET_FILE:offscreen_check>" "${DXC_EXECUTABLE}")
     set_tests_properties(startup_gfx2hlsl_dynamic_heap_warp startup_compute_dynamic_heap_warp startup_gfx2hlsl_resheap_branch_warp
+        startup_gfx2hlsl_resheap_vertex_image_warp startup_gfx2hlsl_resheap_vertex_loop_warp
+        startup_gfx2hlsl_resheap_descriptor_word_warp startup_gfx2hlsl_resheap_image_dimensions_warp
+        startup_gfx2hlsl_resheap_fma_mix_warp startup_gfx2hlsl_resheap_embedded_scalar_warp
         PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B
@@ -5368,6 +5389,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_small_texture_4k_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
         set_tests_properties(startup_small_texture_4k_draw_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_heap_texture_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")
+        set_tests_properties(startup_heap_texture_draw_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         # A big sampled texture loses its top mip level (opt-in, src/startup_stubs/texture_drop_mips.h): the draw reads the
         # next level; texel-addressed, hint-less and under-threshold textures keep every level.
         add_test(NAME startup_texture_drop_mips_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B

@@ -741,7 +741,7 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, em
                 saw_getpc |= name == 's_getpc_b64'
                 # A proven table is data, even if its words resemble instructions.
                 if name == 's_endpgm' and saw_getpc:
-                    if embedded_vertex and embedded_buffer_proof(code, out):
+                    if embedded_vertex and (embedded_buffer_proof(code, out) or embedded_scalar_buffer_proof(code, out)):
                         return out
                     if embedded_pixel and embedded_pixel_table(code, out):
                         return out
@@ -1206,6 +1206,10 @@ UNIFORM_IMAGE_LOADS = frozenset(('image_load',))
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
 # Image ops that take implicit derivatives of the pixel quad (see Stage.quad_vote).
 DERIVATIVE_OPS = ('image_sample_b', 'image_get_lod')
+HEAP_IMAGE_TYPES = {'tex1d': ('Texture1D<float4>', 8), 'tex2d': ('Texture2D<float4>', 9),
+                    'tex3d': ('Texture3D<float4>', 10), 'tex2da': ('Texture2DArray<float4>', 13)}
+HEAP_IMAGE_DIMS = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d',
+                   'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
 # "Some lane of the 2x2 quad has bit 0 set": fine derivatives of a 0/1 value read the row neighbour (ddx_fine), then
 # the other row (ddy_fine). Exact for 0/1 and defined only where the quad runs the statement together (SM 5.0 and 6.0).
 # The derivatives are arithmetic operands, not operands of a short-circuit ||: a DXC build for some GPUs moved a derivative
@@ -1363,6 +1367,11 @@ def reads_scc(name, asm):
     return 'src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))
 
 
+def embedded_raw_flags(flags):
+    # RDNA 2 ISA §8.1: raw bounds (OOB_SELECT=3), resource level 1, 32-bit format, no indexing or swizzling.
+    return flags >> 12 in (0x31014, 0x31015, 0x31016)
+
+
 def embedded_buffer_proof(code, ins):
     """Prove a vertex buffer descriptor whose only observable use is reading the shader image."""
     if not ins or ins[-1][2] != 's_endpgm' or classify_decoded(ins) != 'vs':
@@ -1460,14 +1469,155 @@ def embedded_buffer_proof(code, ins):
             continue
         setup[pc] = None
 
-    # RDNA 2 raw bounds (OOB_SELECT=3), resource level 1, a 32-bit format,
-    # and no indexing, swizzling, thread ID, or non-buffer type flags.
-    if (not loads or flags >> 12 not in (0x31014, 0x31015, 0x31016)
+    if (not loads or not embedded_raw_flags(flags)
             or offset % 4 or offset < end or size == 0 or offset + size > len(code)):
         return None
     data = code[offset:offset + size]
     words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-size % 4)))
     return setup, loads, size, words
+
+
+def embedded_scalar_buffer_proof(code, ins):
+    """Prove the scalar-only alternative without changing the legacy MUBUF proof."""
+    if not ins or ins[-1][2] != 's_endpgm' or classify_decoded(ins) != 'vs':
+        return None
+    reads = [i for i, (_, _, name, _) in enumerate(ins) if name == 's_getpc_b64']
+    if len(reads) != 1:
+        return None
+    start = reads[0]
+    getpc, length, _, asm = ins[start]
+    _, ops, mods = parse(asm)
+    low = pc_pair(ops[0]) if len(ops) == 1 and not mods and length == 4 else None
+    if low is None:
+        return None
+
+    offsets = {pc for pc, _, _, _ in ins}
+    branches = {}
+    end = 0
+    for pc, n, name, asm in ins:
+        if (pc != end or name.startswith(('s_setpc', 's_call', 's_rfe', 's_trap', 's_return', 's_endpgm_',
+                                         's_set_gpr_idx')) or 'movrel' in name):
+            return None
+        end = pc + n
+        if name.startswith('s_swappc') and (pc != 0 or parse(asm)[1:] != (['s[4:5]', 's[4:5]'], [])):
+            return None
+        if name == 's_branch' or name.startswith('s_cbranch'):
+            operands = parse(asm)[1]
+            label = re.fullmatch(r'label_0x([0-9a-f]+)', operands[0]) if len(operands) == 1 else None
+            if label is None or int(label[1], 16) not in offsets:
+                return None
+            branches[pc] = int(label[1], 16)
+
+    # One block establishes the advanced pair and each descriptor's literal size and flags before using them.
+    targets = set(branches.values())
+    setup, loads, literals = {getpc: None}, {}, {}
+    pairs = set()
+    offset = None
+    original = {low, low + 1}
+    carry_live = False
+    for pc, _, name, asm in ins[start + 1:]:
+        if pc in targets or pc in branches or name == 's_endpgm':
+            break
+        _, ops, mods = parse(asm)
+        written = scalar_destinations(name, asm)
+        imm = pc_word(ops[-1]) if ops else None
+        pair = None
+        if (offset is None and original == {low, low + 1} and name == 's_add_u32' and not mods
+                and ops[:2] == ['s%d' % low] * 2 and len(ops) == 3 and imm is not None and imm >= 0):
+            # As in the vector table form, an omitted high add assumes the code and table share a 4 GiB window.
+            offset = getpc + length + imm
+            pair, carry_live = low, True
+        elif (carry_live and low in pairs and name == 's_addc_u32' and not mods and len(ops) == 3
+              and ops[:2] == ['s%d' % (low + 1)] * 2 and imm == 0):
+            pair, carry_live = low, False
+        elif name == 's_mov_b64' and len(ops) == 2 and not mods and pc_pair(ops[1]) in pairs:
+            pair = pc_pair(ops[0])
+            carry_live = False
+        elif name.startswith('s_buffer_load_dword') and name in SCALAR_LOADS and len(ops) == 3:
+            dst, desc = map(reg_range, ops[:2])
+            if desc and desc[0] == 's' and desc[1] in pairs and desc[2] == desc[1] + 3 <= 105:
+                if (desc[1] % 4 or not dst or dst[0] != 's' or not dst[1] <= dst[2] <= 105
+                        or dst[1] % min(4, dst[2] - dst[1] + 1)):
+                    return None
+                size, flags = (literals.get(reg) for reg in (desc[1] + 2, desc[1] + 3))
+                if (not size or flags is None or not embedded_raw_flags(flags) or offset % 4
+                        or offset < end or offset + size > len(code)):
+                    return None
+                loads[pc] = size
+                carry_live = False
+        if pair is not None:
+            setup[pc] = None
+        elif carry_live and not name.startswith(('v_', 's_mov_', 's_movk_', 's_waitcnt', 's_nop', 's_load_',
+                                               's_buffer_load_', 'image_', 'buffer_', 'tbuffer_')):
+            carry_live = False
+        if {low, low + 1} & written and pair is None:
+            carry_live = False
+        original -= written
+        pairs = {p for p in pairs if not {p, p + 1} & written}
+        if pair is not None:
+            pairs.add(pair)
+        for reg in written:
+            literals.pop(reg, None)
+        if (name in ('s_mov_b32', 's_movk_i32') and not mods and len(ops) == 2 and imm is not None
+                and len(written) == 1 and ops[0].startswith('s')):
+            value = sopk_imm(ops[1], True) if name == 's_movk_i32' else imm
+            literals[next(iter(written))] = value & 0xffffffff
+
+    if not loads or not embedded_scalar_address_dead(ins, branches, setup, loads):
+        return None
+    data = code[offset:offset + max(loads.values())]
+    words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-len(data) % 4)))
+    return setup, loads, words
+
+
+def embedded_scalar_address_dead(ins, branches, setup, loads):
+    """Check that erased addresses and carry flags never reach an ordinary read, including around a back edge.
+
+    The elided setup instructions assign nothing at run time, so a register they define is 'tainted' until an
+    unconditional write replaces it on that path; a read of a tainted register (or SCC after the elided add) refuses.
+    A possibly predicated write keeps the taint it finds. Forward dataflow over every edge (union at joins)."""
+    tracked = set().union(*(scalar_registers(parse(asm)[1][0]) for pc, _, _, asm in ins if pc in setup))
+    effects = {}
+    for pc, n, name, asm in ins:
+        _, ops, _ = parse(asm)
+        if pc in setup:
+            erased, reads, written = scalar_registers(ops[0]), set(), set()
+            if name in ('s_add_u32', 's_addc_u32'):
+                erased.add('scc')
+        else:
+            erased = set()
+            # Only unconditional SGPR assignments clear the taint; a VOPC/VOP3 SGPR destination, v_writelane or
+            # s_cmov may leave the old value, so it keeps whatever taint it finds.
+            writes = scalar_destinations(name, asm) & tracked
+            written = writes if name in SCA or name.startswith(('s_load_', 's_buffer_load_', 's_cselect_')) else set()
+            # A compare's explicit mask destination is separate from its sources. A conditional move can
+            # preserve the old value, which stays tainted until a later unconditional write.
+            predicated_dest = name.startswith('s_cmov') or (name.startswith('v_cmp_') and name.endswith('_e64'))
+            read_ops = ops[2:] if pc in loads else ops[1:] if written or predicated_dest else ops
+            reads = scalar_registers(' '.join(read_ops)) & tracked
+            if reads_scc(name, asm) or 'scc' in scalar_effects(name, asm)[0]:
+                reads.add('scc')
+            if re.fullmatch(r's_cmpk?_(eq|lg|gt|ge|lt|le)_[iu]32|s_bitcmp[01]_b32', name):
+                written = written | {'scc'}
+        successors = [] if name == 's_endpgm' else ([pc + n] if name != 's_branch' else [])
+        if pc in branches:
+            successors.append(branches[pc])
+        effects[pc] = (reads, erased, written, successors)
+
+    incoming, pending = {0: set()}, [0]
+    while pending:
+        pc = pending.pop()
+        reads, erased, written, successors = effects[pc]
+        if reads & incoming[pc]:
+            return False
+        tainted = (incoming[pc] - written) | erased
+        for target in successors:
+            previous = incoming.get(target)
+            merged = tainted if previous is None else previous | tainted
+            if merged != previous:
+                incoming[target] = merged
+                pending.append(target)
+    return (setup.keys() | loads.keys()) <= incoming.keys()
 
 
 def embedded_pixel_table(code, ins):
@@ -4726,6 +4876,7 @@ class Stage:
     _uniform_written = None
     raw_code = b''
     embedded_buffer = None
+    embedded_scalar_buffer = None
     address_carry_pairs = ()
     address_carry_reader = None
 
@@ -4743,6 +4894,8 @@ class Stage:
                         if refusals is None or decoded is None else decoded)
         if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
             self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
+            if not self.embedded_buffer:
+                self.embedded_scalar_buffer = embedded_scalar_buffer_proof(self.raw_code, self.ins)
         self.pixel_table = embedded_pixel_table(self.raw_code, self.ins) if kind == 'ps' else None
         if kind == 'ms':
             self.mesh_vcc_branches = {}
@@ -4803,12 +4956,15 @@ class Stage:
         # Retry only an existing odd-D16 refusal, leaving successful output untouched.
         self.retry_odd_d16_paths = False
         self.odd_d16_first_refusal = None
+        self.loop_uniform = None  # None until a heap load refuses; then loop header -> assumed uniform SGPRs
+        self.retry_heap_dimensions = False
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
         first_refusal = len(refusals) if refusals is not None else 0
         while True:
             self.lines = []           # body statements (per block)
+            self.uses_dynamic_heap_images = False
             self.sym = {}             # scalar register -> symbolic value
             self.used_s, self.used_v = set(), set()
             self.used_atomic = set()
@@ -4839,7 +4995,8 @@ class Stage:
                     self.odd_d16_first_refusal = reason
                     continue
                 if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
-                        or self.retry_lane_mask_joins(str(reason)) or self.retry_scc_edge_proof(str(reason))):
+                        or self.retry_lane_mask_joins(str(reason)) or self.retry_scc_edge_proof(str(reason))
+                        or self.retry_loop_uniform(str(reason)) or self.retry_heap_image_number(str(reason))):
                     # If another unsupported instruction prevents completing the
                     # proof, retain the refusal that caused this retry.
                     if (self.retry_odd_d16_paths and self.odd_d16_first_refusal is not None and
@@ -4854,10 +5011,11 @@ class Stage:
                 self.retry_odd_d16_paths = True
                 del refusals[first_refusal:]
                 continue
-            if refusals is not None and any(
-                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason)
-                                       or self.retry_lane_mask_joins(reason) or self.retry_scc_edge_proof(reason))
-                    for reason, stage in refusals[first_refusal:]):
+            reasons = [reason for reason, stage in refusals[first_refusal:] if stage == kind] if refusals is not None else []
+            if (any(self.retry_reduction_exec(reason) or self.retry_join(reason)
+                    or self.retry_lane_mask_joins(reason) or self.retry_scc_edge_proof(reason) for reason in reasons)
+                    or any(self.retry_loop_uniform(reason) for reason in reasons)
+                    or any(self.retry_heap_image_number(reason) for reason in reasons)):
                 del refusals[first_refusal:]
                 continue
             if self.retry_join_phi and self.phi_new != self.phi_regs:
@@ -4872,7 +5030,7 @@ class Stage:
                 for reg, kind in regs.items():
                     if have.get(reg) not in (kind, 'refuse'):
                         have[reg], grown = kind, True
-            if not grown:
+            if not grown and not (self.loop_uniform is not None and self.loop_uniform_shrank):
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
@@ -4884,6 +5042,22 @@ class Stage:
         return True
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
+
+    def retry_heap_image_number(self, reason):
+        if (self.retry_heap_dimensions or not re.fullmatch(
+                r"cannot materialize descriptor word \d+ from \('dynamic_heap', 'heap_index_[0-9a-f]+', 'image'\) at 0",
+                reason)):
+            return False
+        self.retry_heap_dimensions = True
+        return True
+
+    def retry_loop_uniform(self, reason):
+        if (self.loop_uniform is not None or self.kind not in ('vs', 'ps') or not getattr(self, 'loop_headers', ())
+                or reason not in ("s_load with a register offset through ('resheap',)",
+                                  "s_load_dwordx8 with a register offset through ('resheap',)")):
+            return False
+        self.loop_uniform = {}
+        return True
 
     def retry_join(self, reason):
         if self.retry_join_phi or not self.JOINED_NUMERIC.fullmatch(reason):
@@ -5050,6 +5224,9 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'desc' and getattr(self, 'kind', None) in ('ps', 'vs') and names_one_value(s):
+                # The runtime supplies the original root-table dword for a numeric use of the descriptor.
+                return self.descriptor_number(s[:4], fixed_only=True)
             if s[0] == 'descnum' and len(s) == 3:
                 return self.descriptor_number(self.descriptor_number_node(s))
             if s[0] == 'tg_size':
@@ -5080,6 +5257,10 @@ class Stage:
             raise Unsupported('descriptor numeric expression exceeds 128 operations and operands')
         kind, *args = node
         if kind == 'alu':
+            if getattr(self, 'retry_heap_dimensions', False) and not fixed_only:
+                dimensions = self.heap_image_number(node, probe)
+                if dimensions is not None:
+                    return dimensions
             template, operands = args
             return '(' + template.format(*(self.descriptor_number(word, budget, fixed_only=fixed_only, probe=probe)
                                            for word in operands)) + ')'
@@ -5111,6 +5292,112 @@ class Stage:
         if symbol and symbol[0] == 'descnum' and len(symbol) == 3:
             return self.descriptor_number(self.descriptor_number_node(symbol), fixed_only=True)
         return self.u(token)
+
+    @staticmethod
+    def heap_image_source(node):
+        pending = [node]
+        for _ in range(128):
+            if not pending:
+                break
+            word = pending.pop()
+            if word[0] == 'desc' and word[1][0] == 'dynamic_heap' and word[1][2:] == ('image',):
+                return word[1]
+            if word[0] == 'alu':
+                pending.extend(reversed(word[2]))
+        return None
+
+    def heap_image_number(self, node, probe):
+        source = self.heap_image_source(node)
+        if source not in self.heap_image_kinds:
+            return None
+        kind = self.heap_image_kinds[source]
+        if kind is None:
+            return None
+
+        def alu(op, a, b):
+            return 'alu', SCA['s_' + op][0], (a, b)
+
+        def literal(value):
+            return 'value', '0x%08xu' % value
+
+        word1, word2, word3 = (('desc', source, 0, word) for word in (1, 2, 3))
+        one = literal(1)
+        base = alu('bfe_u32', word3, literal(0x4000c))
+        last = alu('bfe_u32', word3, literal(0x40010))
+
+        # RDNA 2 ISA §8.2.6, Table 45 stores mip-zero sizes minus one and absolute mip indices.
+        # GetDimensions(0) returns the view's top mip: equivalent to max(mip_zero_size >> base, 1).
+        # The raw size fields agree only at base zero. Match the full calculation before rebasing them.
+        def top_mip(size):
+            return alu('max_u32', alu('lshr_b32', size, base), one)
+
+        width_hi = alu('and_b32', word2, literal(0x3fff))
+        width_shifted = alu('lshl_b32', width_hi, literal(2))
+        for low in (alu('bfe_u32', word1, literal(0x2001e)), alu('lshr_b32', word1, literal(30))):
+            width_lo = alu('add_u32', low, one)
+            if node in (top_mip(alu('lshl2_add_u32', width_hi, width_lo)),
+                        top_mip(alu('add_u32', width_lo, width_shifted)),
+                        top_mip(alu('add_u32', width_shifted, width_lo))):
+                return self.heap_view_dimensions(source, kind, probe)[0]
+        for field in (0xe000e, 0x10000e):
+            height = alu('add_u32', alu('bfe_u32', word2, literal(field)), one)
+            if node == top_mip(height):
+                return self.heap_view_dimensions(source, kind, probe)[1]
+        if node == alu('sub_u32', last, base):
+            return '(%s - 1u)' % self.heap_view_dimensions(source, kind, probe)[2]
+
+        # The resource level, reserved bit and type do not change when the view starts at a later mip.
+        template, (a, b) = node[1:] if len(node[2]) == 2 else ('', (None, None))
+        if template == SCA['s_and_b32'][0] and b in (word2, word3):
+            a, b = b, a
+        if a not in (word2, word3) or b[0] != 'value' or not re.fullmatch(r'0x[0-9a-f]{8}u', b[1]):
+            return None
+        value = int(b[1][2:-1], 16)
+        if template == SCA['s_and_b32'][0]:
+            bits = value
+        elif template == SCA['s_bfe_u32'][0]:
+            shift = value & 31
+            bits = (((1 << min((value >> 16) & 127, 32)) - 1) << shift) & 0xffffffff
+        elif template == SCA['s_lshr_b32'][0]:
+            bits = (0xffffffff << (value & 31)) & 0xffffffff
+        else:
+            return None
+        known, packed = (0xc0000000, 0x80000000) if a == word2 else (0xf0000000, HEAP_IMAGE_TYPES[kind][1] << 28)
+        if not bits & ~known:
+            return '(' + template.format('0x%08xu' % packed, b[1]) + ')'
+        return None
+
+    def heap_image_null_compare(self, name, ops, symbols):
+        """s_cmp_eq/lg of word 1 of an intact heap image record with 0: the guest's test for an unbound descriptor.
+
+        RDNA 2 ISA 8.2.6 Table 45: word 1 holds the format field (bits 60:52), which is never 0 for a texture that can be
+        sampled, and an all-zero resource acts as unbound. The bound view's top-mip width is 0 only for a null view, so
+        word1 == 0 is width == 0. Only under retry_heap_dimensions; any other compare keeps the descriptor path."""
+        if (not getattr(self, 'retry_heap_dimensions', False) or name[6:8] not in ('eq', 'lg')
+                or len(ops) != 2 or 0 not in (self.const_u32(ops[0]), self.const_u32(ops[1]))):
+            return False
+        word = next((s for s in symbols if s and s[0] == 'desc'), None)
+        if (word is None or len(word) != 4 or word[1][0] != 'dynamic_heap' or word[1][2:] != ('image',)
+                or word[2:] != (0, 1) or self.heap_image_kinds.get(word[1]) is None):
+            return False
+        width = self.heap_view_dimensions(word[1], self.heap_image_kinds[word[1]], False)[0]
+        self.set_scc('%s %s 0u' % (width, '==' if name[6:8] == 'eq' else '!='))
+        return True
+
+    def heap_view_dimensions(self, source, kind, probe):
+        suffix = '%x_%s' % (self.pc, source[1])
+        w, h, levels, third = ('heap_%s_%s' % (field, suffix) for field in ('w', 'h', 'levels', 'z'))
+        if kind == 'tex1d':
+            h = '1u'
+            outputs = (w, levels)
+        else:
+            outputs = (w, h, third, levels) if kind in ('tex2da', 'tex3d') else (w, h, levels)
+        if not probe and suffix not in self.heap_dimensions_emitted:
+            self.heap_dimensions_emitted.add(suffix)
+            tex = self.image_texture((source, 0), kind, name='heap_dims_' + suffix)
+            self.emit('uint %s;' % ', '.join(outputs))
+            self.emit('%s.GetDimensions(0u, %s);' % (tex, ', '.join(outputs)))
+        return w, h, levels
 
     def mark_descriptor_scc(self):
         if hasattr(self, 'descriptor_scc_writes'):
@@ -6829,6 +7116,8 @@ class Stage:
             self.calculated_pc = {}
         if self.embedded_buffer:
             self.calculated_pc.update(self.embedded_buffer[0])
+        if self.embedded_scalar_buffer:
+            self.calculated_pc.update(self.embedded_scalar_buffer[0])
         pixel_table = getattr(self, 'pixel_table', None)
         if pixel_table:
             self.calculated_pc[pixel_table[0]] = None
@@ -6853,6 +7142,8 @@ class Stage:
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
+        self.loop_headers = back_targets
+        loop_uniform = getattr(self, 'loop_uniform', None)
         self.mesh_allocation_block = None
         splits = targets | mesh_reads | mesh_selects
         if getattr(self, 'kind', None) == 'ms' and (targets or mesh_reads or mesh_selects):
@@ -7060,6 +7351,7 @@ class Stage:
             self.exec_copies = {}     # SGPR -> (EXEC mask id, offset, may be empty) of the EXEC it copied (until written)
             self.exec_may_be_empty = False  # EXEC was narrowed and no s_cbranch_execz has shown a live lane since
             self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
+            self.heap_image_kinds, self.heap_dimensions_emitted = {}, set()
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             verified_scc_branches = set()
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven, mask)
@@ -7077,6 +7369,7 @@ class Stage:
             incoming_masks = {}
             skipped_marks = (set(), set(), set())  # program-order marks suppressed in the current block
             carried_masks = set()  # edge marks absent from the program-order state
+            loop_heads, loop_ends, loop_branches = {}, {}, set()
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -7214,6 +7507,17 @@ class Stage:
                         r for r in pre_uniform
                         if r not in clobber or (r not in fwd_clobber and r not in blocked)
                     }
+                    if loop_uniform is not None and off in back_targets:
+                        edges = edge_since.get(off, [])
+                        entries = ([pre_uniform] if falls else []) + [edge or set() for edge in edges]
+                        candidates = set.intersection(*entries) if entries else set()
+                        # Distinct forward paths can each bring a uniform but different value.
+                        if len(entries) > 1:
+                            candidates -= forward_splits.get(off, set())
+                        head = candidates & loop_uniform.get(off, candidates)
+                        loop_heads[off] = head
+                        kept_u = (kept_u - clobber) | head
+                        self.varying_s.difference_update(head)
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
@@ -7276,7 +7580,7 @@ class Stage:
                         paths = firstlane_edges.get(off, [])
                         if falls:
                             paths = paths + [(self.firstlane_v, pre_uniform)]
-                        if paths:
+                        if paths and not (loop_uniform is not None and off in back_targets):
                             self.firstlane_v = set.intersection(*(v for v, _ in paths))
                             scalar_phi = set.intersection(*(u for _, u in paths))
                             if self.kind == 'ps' or off in coherent_sites:
@@ -7309,11 +7613,14 @@ class Stage:
                             self.phi_assign(self.phi_regs[b_target])
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
                         # Only what is proven here: a register can be marked varying without leaving since_join.
+                        edge_facts = self.since_join
+                        if loop_uniform is not None and b_target in back_targets and edge_facts is None:
+                            edge_facts = self.defined_uniform_s
                         edge_since.setdefault(b_target, []).append(
                             (self.defined_uniform_s - self.varying_s - self.masks
                              if getattr(self, 'retry_scc_edges', False) else None)
-                            if getattr(self, 'since_join', None) is None
-                            else self.since_join - self.varying_s - self.masks)
+                            if edge_facts is None
+                            else edge_facts - self.varying_s - self.masks)
                         incoming_masks.setdefault(b_target, set()).update(
                             self.masks | self.mask_high | self.join_masks | carried_masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
@@ -7336,6 +7643,11 @@ class Stage:
                             elif sym is not None and back != sym:
                                 self.back_force.setdefault(b_target, {}).setdefault(
                                     reg, 'run' if run_time_symbol(sym) else 'refuse')
+                    if loop_uniform is not None:
+                        if name == 's_branch' or (name in ('s_cbranch_scc0', 's_cbranch_scc1') and self.scc_uniform):
+                            loop_branches.add(off)
+                        if b_target <= off:
+                            loop_ends[off] = self.since_join - self.varying_s - self.masks
                 falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
                 dests = scalar_destinations(name, asm)
                 written |= every_sgpr if 'any' in dests else dests
@@ -7562,6 +7874,21 @@ class Stage:
                 refusals.append((str(self.wave_unsound), self.kind))
             if raised_unsupported is not None:
                 raise raised_unsupported
+            if loop_uniform is not None:
+                # Start with the forward-entry facts and remove any assumption a back edge fails to establish.
+                # Equal scalars at entry and uniform branches preserve equal scalars on each subsequent iteration.
+                # The assumptions only shrink, so the retry terminates, without preserving loop-carried symbols.
+                next_uniform = {head: regs.copy() for head, regs in loop_heads.items()}
+                for end, head in branches:
+                    if head > end:
+                        continue
+                    if (any(head <= branch <= end and branch not in loop_branches for branch, _ in branches)
+                            or any(not head <= branch <= end and head < target <= end for branch, target in branches)):
+                        next_uniform[head].clear()
+                    else:
+                        next_uniform[head].intersection_update(loop_ends[end])
+                self.loop_uniform_shrank = next_uniform != loop_heads
+                self.loop_uniform = next_uniform
             break
         else:
             reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
@@ -10237,6 +10564,12 @@ class Stage:
             if (shift_add and getattr(self, 'kind', None) in ('ps', 'vs') and not mods
                     and dst and dst[0] == 's' and not self.is_lane_mask(dname)):
                 result = self.descriptor_alu(text, srcs, syms)
+                if getattr(self, 'retry_heap_dimensions', False) and self.heap_image_source(result[2]):
+                    # Keep the partial width symbolic until the base mip has been applied. Its carry cannot be used.
+                    self.scc_effect = 'descriptor'
+                    self.scc_uniform = self.scc_verified = False
+                    self.sym[dst[1]] = result
+                    return None
                 expr = self.descriptor_number(self.descriptor_number_node(result), fixed_only=True)
                 values = [self.descriptor_operand(t) for t in srcs]
                 self.set_scc(shift_add_carry(base, values, expr))
@@ -10958,7 +11291,7 @@ class Stage:
             return
         if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
-        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) == 'ps':
+        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) in ('ps', 'vs'):
             return self.dynamic_heap_image_record(dst, base, token, imm)
         if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
@@ -10985,7 +11318,7 @@ class Stage:
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name), 0, i)
 
     def dynamic_heap_image_record(self, dst, base, token, imm):
-        """s_load_dwordx8 D, <resource heap pointer>, R in a pixel stage: the whole 32-byte heap record at byte R, the
+        """s_load_dwordx8 D, <resource heap pointer>, R in a graphics stage: the whole 32-byte heap record at byte R, the
         image descriptor of the view that heap slot (R >> 5) holds. The texture is picked at run time from the bound
         shader-model 6.6 heap (see image_texture); the descriptor words themselves are never read. The index lives in a
         function-scope temporary, so a later block (a branch arm, a join) reads the value this load wrote."""
@@ -10996,23 +11329,44 @@ class Stage:
         name = 'heap_index_%x' % self.pc
         self.uniform_load_temps.add(name)
         self.emit('%s = (%s + %du) >> 5;' % (name, self.smem_soffset(token), imm or 0))
+        source = ('dynamic_heap', name, 'image')
+        if getattr(self, 'retry_heap_dimensions', False):
+            self.heap_image_kinds[source] = self.heap_image_kind(dst)
         for i in range(8):
-            self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name, 'image'), 0, i)
+            self.sym[dst[1] + i] = ('desc', source, 0, i)
 
-    def image_texture(self, key, kind):
+    def heap_image_kind(self, dst):
+        """The first MIMG using the whole record before any write to one of its SGPRs."""
+        regs = set(range(dst[1], dst[2] + 1))
+        for _, _, name, asm in self.ins[self.descriptor_instruction_index + 1:]:
+            writes = scalar_destinations(name, asm)
+            if writes & regs or 'any' in writes:
+                break
+            if name.startswith('image_'):
+                _, ops, mods = parse(asm)
+                if len(ops) >= 3 and reg_range(ops[2]) == dst:
+                    dim = next((part[4:] for part in mods if part.startswith('dim:')), '')
+                    return HEAP_IMAGE_DIMS.get(dim)
+        return None
+
+    def image_texture(self, key, kind, name=None):
         """The HLSL name of the texture an image instruction reads. A key from the dynamic heap becomes a local view
         of the bound heap slot; any other key is a normal SRV resource."""
         if key is None or key[0][0] != 'dynamic_heap':
             return self.pipe.resource(key, kind) if key is not None else None
-        types = {'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>',
-                 'tex3d': 'Texture3D<float4>'}
-        if self.kind != 'ps' or len(key[0]) != 3 or kind not in types or key[1] != 0 or key in self.pipe.modified:
+        if (self.kind not in ('ps', 'vs') or len(key[0]) != 3 or kind not in HEAP_IMAGE_TYPES
+                or key[1] != 0 or key in self.pipe.modified):
             raise Unsupported('dynamic resource heap views require a raw buffer load')
+        assumed = getattr(self, 'heap_image_kinds', {}).get(key[0])
+        if assumed is not None and kind != assumed:
+            raise Unsupported('dynamic resource heap image dimension disagrees with its descriptor use')
         self.pipe.uses_dynamic_heap = True
-        name = 'heap_tex_%x' % self.pc
+        if name is None:
+            name = 'heap_tex_%x' % self.pc
         # An index past the logical heap reads slot 0 instead of an out-of-range descriptor (a title's index is in range).
         self.emit('%s %s = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];'
-                  % (types[kind], name, key[0][1], key[0][1]))
+                  % (HEAP_IMAGE_TYPES[kind][0], name, key[0][1], key[0][1]))
+        self.uses_dynamic_heap_images = True
         return name
 
     def dynamic_heap_load(self, key, address):
@@ -11259,7 +11613,9 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
-        key = self.descriptor(ops[1])
+        embedded = self.embedded_scalar_buffer
+        bound = embedded[1].get(self.pc) if embedded else None
+        key = self.descriptor(ops[1]) if bound is None else None
         token = smem_offset(ops[2])
         waterfall = getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
         if waterfall and key in self.pipe.rw_keys:
@@ -11304,8 +11660,12 @@ class Stage:
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
             address = '%s + %d' % (offset, extra + 4 * i)
-            expr = (self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic
-                    else '%s.Load(%s)' % (buf, address) if buf else '0u')
+            if bound is not None:
+                # RDNA 2 ISA §7.2.1 and Table 27: the SGPR byte offset is wave-wide and its low two address bits are ignored.
+                expr = 'embedded_vs_sload(%s, %du, %du)' % (offset, extra + 4 * i, bound)
+            else:
+                expr = (self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic
+                        else '%s.Load(%s)' % (buf, address) if buf else '0u')
             self.set_s(dst[1] + i, expr, uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
@@ -12239,14 +12599,14 @@ class Stage:
             raise Unsupported('image instruction without %s' % ('dim:' if not dims else 'dmask:'))
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = HEAP_IMAGE_DIMS
         stage = getattr(self, 'kind', None)
         pixel_cube = dim == 'SQ_RSRC_IMG_CUBE' and stage == 'ps' and how in ('sample', 'lz', 'l', 'b')
         cube = pixel_cube or (dim == 'SQ_RSRC_IMG_CUBE' and stage == 'cs' and how in ('lz', 'l'))
         if pixel_cube and ('a16' in mods or 'd16' in mods):
             raise Unsupported('cube sampling with a16 or d16 is unsupported')
         if cube:
-            kinds[dim] = 'texcube'
+            kinds = {**kinds, dim: 'texcube'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
@@ -12347,6 +12707,8 @@ class Stage:
         dynamic_view = desc_key is not None and desc_key[0][0] == 'dynamic_heap'
         if pixel_cube and dynamic_view:
             raise Unsupported('cube sampling requires a table TextureCube view')
+        if dynamic_view and self.kind == 'vs' and how not in ('load', 'load_mip', 'l', 'lz'):
+            raise Unsupported('dynamic resource heap views require a raw buffer load')
         if dynamic_view and (integer_srvs or sample_d16 or 'd16' in mods):
             raise Unsupported('dynamic resource heap image with integer or d16 access')
         shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
@@ -15039,8 +15401,8 @@ class Stage:
             elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
                 word = (int(tok, 16) >> (16 if is_hi else 0)) & 0xffff
                 text = 'f16tof32(0x%04xu)' % word
-            elif tok == '0.5' and not is_hi:
-                text = '0.5'
+            elif tok in PK_INLINE_F16 and not is_hi:  # RDNA 2 ISA inline constants and §6.5 (VOP3P).
+                text = tok
             elif r and r[1] == r[2]:
                 # Only a high-half read needs the upper 16 bits defined.
                 text = 'f16tof32(%s%s)' % (self.u(tok, low16_only=not is_hi), ' >> 16' if is_hi else '')
@@ -16762,7 +17124,9 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 symbols = [self.sym.get(r[1]) if (r := reg_range(t)) and r[0] == 's' else None for t in ops]
                 descriptor = (getattr(self, 'kind', None) in ('ps', 'vs')
                               and any(s and s[0] in ('desc', 'descnum') for s in symbols))
-                if descriptor:
+                if descriptor and not mods and self.heap_image_null_compare(name, ops, symbols):
+                    self.mark_descriptor_scc()
+                elif descriptor:
                     if mods or any(self.is_lane_mask(t) or t == 'src_scc' for t in ops):
                         raise Unsupported('scc from descriptor data in %s with a lane mask, SCC or modifier' % name)
                     self.set_scc((cast % op).format(*(self.descriptor_operand(t) for t in ops)))
@@ -17814,6 +18178,19 @@ class Pipeline:
                 '    uint i = a >> 2u;',
                 '    ' + unaligned_dword_body('embedded_vs[i]', 'embedded_vs[i + 1u]'),
             ]
+        scalar = self.vs.embedded_scalar_buffer if embedded_vertex else None
+        if scalar:
+            _, _, words = scalar
+            out += [
+                'static const uint embedded_vs_scalar[%d] = { %s };' %
+                (len(words), ', '.join('0x%08xu' % word for word in words)),
+                'uint embedded_vs_sload(uint scalar_offset, uint imm, uint bound) {',
+                '    if (scalar_offset > 0xffffffffu - imm) return 0u;',
+                '    uint a = (scalar_offset + imm) & ~3u;',
+                '    if (bound < 4u || a > bound - 4u) return 0u;',
+                '    return embedded_vs_scalar[a >> 2u];',
+                '}',
+            ]
         return out
 
     def interface(self, for_pixel):
@@ -17906,6 +18283,8 @@ class Pipeline:
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+            if any(getattr(stage, 'uses_dynamic_heap_images', False) for stage in (getattr(self, 'vs', None), self.ps)):
+                lines.append('dynamic_heap_images')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())

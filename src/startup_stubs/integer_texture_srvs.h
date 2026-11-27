@@ -66,6 +66,7 @@ inline D3D12_SHADER_RESOURCE_VIEW_DESC null_texture_srv(D3D12_SRV_DIMENSION dime
     // MostDetailedMip and MipLevels occupy the same words in each texture view.
     desc.Texture2D.MipLevels = 1;
     if (dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) desc.Texture2DArray.ArraySize = 1;
+    if (dimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) desc.TextureCubeArray.NumCubes = 1;
     return desc;
 }
 
