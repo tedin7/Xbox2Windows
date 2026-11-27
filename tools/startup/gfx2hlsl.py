@@ -6698,6 +6698,20 @@ class Stage:
             if r[2] == r[1] and high and not (saveexec or pair_select):
                 self.mask_high = getattr(self, 'mask_high', set()) | {r[1]}
 
+    def program_is_wave32(self):
+        """True when the caller says the program runs as wave32, or (when it says nothing) its exec writes are all
+        wave32 forms (wave32_exec_proof)."""
+        wave = getattr(getattr(self, 'pipe', None), 'wave_size', None)
+        if wave is not None:
+            return wave == 32
+        ins = getattr(self, 'ins', None)
+        if not ins:
+            return False
+        cached = self.__dict__.get('_program_wave32')
+        if cached is None:
+            cached = self._program_wave32 = wave32_exec_proof(ins)
+        return cached
+
     def tag_compare_pair(self, base, ops):
         """A compare or carry-out into SGPR sN (the decoder prints a wave64 pair as s[N:N+1] by its low word only). In
         wave64 the destination is an even-aligned pair and s(N+1) holds the other 32 lanes, which no one-lane value
@@ -6710,6 +6724,8 @@ class Stage:
             tok = ops[1]
         else:
             return
+        if self.program_is_wave32():
+            return   # a wave32 compare writes only its own word: s(N+1) is untouched, whatever the compiler keeps there
         r = reg_range(tok.strip())
         if r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks and r[1] % 2 == 0 and r[1] + 1 not in self.masks:
             self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
