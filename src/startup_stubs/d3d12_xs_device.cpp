@@ -2846,12 +2846,20 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     return pipeline;
 }
 
-// Transient guest data is copied into mapped upload chunks. Chunks grow from
-// 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
-// no recording can submit its bytes and every queue that used it has finished.
+// Transient guest data is copied into mapped upload chunks. The regular ring grows
+// from 16 MiB up to 256 MiB. All chunks stay alive for the process. A full chunk can
+// be reused once no recording can submit its bytes and every queue that used it has finished.
 
 volatile LONG64 upload_ring_reserved_bytes;
 volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled;
+volatile LONG upload_ring_pressure_frames;
+extern LONG frame_number;
+
+bool upload_ring_overflow_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_UPLOAD_RING_OVERFLOW");
+    return enabled;
+}
 
 struct UploadRingStats {
     unsigned long long reserved_bytes = 0, capacity = 0;
@@ -2983,11 +2991,14 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
 
     auto& chunks = upload_chunks;
     static unsigned active = 0;
+    static unsigned regular_chunks = 0;
     static u64 total_bytes = 0;
+    static u64 last_regular_capacity = 0;
+    const bool allow_overflow = !new_compute_chunk && upload_ring_overflow_enabled();
 
     AcquireSRWLockExclusive(&allocator_lock);
     const auto finish = [&](unsigned index) {
-        active = index;
+        if (!chunks[index].overflow) active = index;
         InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(rounded));
         InterlockedIncrement(&upload_ring_reservations);
         chunks[index].hold(list->own().upload_chunks, index);
@@ -3003,12 +3014,14 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     // A failed compute snapshot may request one additional chunk beyond the ordinary ring cap.
     const u64 capacity_limit = ring_max_bytes + (new_compute_chunk ? compute_input_chunk_bytes : 0);
     const u64 remaining = total_bytes < capacity_limit ? capacity_limit - total_bytes : 0;
-    if (rounded <= remaining && chunks.size() < max_upload_chunks) {
-        u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
+    if (rounded <= remaining && regular_chunks < max_regular_upload_chunks) {
+        u64 chunk_bytes = regular_chunks ? last_regular_capacity * 2 : initial_upload_chunk_bytes;
         if (new_compute_chunk) chunk_bytes = compute_input_chunk_bytes;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         if (append_upload_buffer(chunks, chunk_bytes)) {
+            ++regular_chunks;
+            last_regular_capacity = chunk_bytes;
             total_bytes += chunk_bytes;
             reservation = reserve_upload_chunk(chunks.back(), rounded);
             return finish(static_cast<unsigned>(chunks.size() - 1));
@@ -3016,11 +3029,13 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     }
     // Allocation failed or the cap was reached. Older unused tails are still safe.
     for (unsigned index = 0; index < chunks.size(); ++index) {
+        if (chunks[index].overflow) continue;
         reservation = reserve_upload_chunk(chunks[index], rounded);
         if (reservation.mapped) return finish(index);
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
+        if (chunks[index].overflow) continue;
         reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
         if (reservation.mapped) {
             InterlockedIncrement(&upload_ring_recycled);
@@ -3028,12 +3043,48 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
         }
     }
 
+    if (allow_overflow) {
+        // Keep regular allocations on the original budget. Overflow chunks may
+        // still be referenced by the open list, so use fresh bytes or a retired chunk.
+        static LONG last_pressure_frame = -1;
+        const LONG frame = InterlockedCompareExchange(&frame_number, 0, 0);
+        if (last_pressure_frame != frame) {
+            last_pressure_frame = frame;
+            InterlockedIncrement(&upload_ring_pressure_frames);
+        }
+        for (unsigned index = 0; index < chunks.size(); ++index) {
+            if (!chunks[index].overflow) continue;
+            reservation = reserve_upload_chunk(chunks[index], rounded);
+            if (reservation.mapped) return finish(index);
+            reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
+            if (reservation.mapped) {
+                InterlockedIncrement(&upload_ring_recycled);
+                return finish(index);
+            }
+        }
+        static u64 overflow_bytes = 0;
+        const u64 overflow_limit = (std::min)(ring_max_bytes, max_upload_ring_bytes);
+        if (chunks.size() - regular_chunks < max_regular_upload_chunks &&
+            rounded <= overflow_limit - overflow_bytes) {
+            const u64 capacity = (std::min)(overflow_limit - overflow_bytes,
+                                            (std::max)(rounded, initial_upload_chunk_bytes));
+            if (append_upload_buffer(chunks, capacity)) {
+                overflow_bytes += capacity;
+                chunks.back().overflow = true;
+                reservation = reserve_upload_chunk(chunks.back(), rounded);
+                return finish(static_cast<unsigned>(chunks.size() - 1));
+            }
+        }
+    }
+
+    const auto chunk_count = chunks.size();
+    const auto capacity_mib = total_bytes >> 20;
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity (asked %zu bytes, ring %llu MiB in %zu chunks, %ld reservations, %ld recycled so far)",
-            bytes, static_cast<unsigned long long>(total_bytes >> 20), chunks.size(), static_cast<long>(upload_ring_reservations),
+            bytes, static_cast<unsigned long long>(capacity_mib), chunk_count, static_cast<long>(upload_ring_reservations),
             static_cast<long>(upload_ring_recycled));
     return reservation;
 }
@@ -8232,6 +8283,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         UploadRingStats ring = upload_ring_stats();
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
             ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        if (upload_ring_overflow_enabled())
+            log("x2w-render upload ring pressure frames: %ld", static_cast<long>(upload_ring_pressure_frames));
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
         log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
         for (int size_class = 0; size_class < 2; ++size_class) {

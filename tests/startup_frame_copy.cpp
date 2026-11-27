@@ -29,6 +29,7 @@ static void* create_present_queue(void* guest)
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
 //   once-mirror  two draws and a readback per frame for three separately submitted 32 MiB snapshots
 //   once-ring-full  four draws per frame from a binding with a zero tail, using a restricted upload ring
+//   ring-pressure  forty submitted frames, each with eight distinct snapshots of a 256-byte binding
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
 //            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
@@ -40,10 +41,11 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool mirror = !std::strcmp(mode, "once-mirror");
+    const bool pressure = !std::strcmp(mode, "ring-pressure");
     const bool ring_full = !std::strcmp(mode, "once-ring-full");
     const bool once = mirror || keys || ring_full || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
-    if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
+    if (!once && !pressure && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
     // 64 KiB: every word after the colour is non-zero, so no zero tail is trimmed and the copy stays a large one.
     alignas(256) static float constants[16384] = {1.0f, 0.0f, 0.0f, 1.0f};
@@ -99,11 +101,13 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
 
     invoke(list, 32, 1, reinterpret_cast<std::uintptr_t>(&heap));  // SetDescriptorHeaps
     invoke(list, 36, 0, table);                                    // SetGraphicsRootDescriptorTable
-    if (mirror) {
+    if (mirror || pressure) {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(target.rtv_heap, 9))};
         const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
         const UINT edits[]{0, (11u << 20) / sizeof(float), large_words - 2};
-        for (UINT frame = 0; frame < 3; ++frame) {
+        const UINT frames = pressure ? 40 : 3;
+        const UINT columns = pressure ? 8 : 2;
+        for (UINT frame = 0; frame < frames; ++frame) {
             if (frame) {
                 if (FAILED(static_cast<HRESULT>(invoke(target.allocator, 8))) ||
                     FAILED(static_cast<HRESULT>(invoke(list, 139, reinterpret_cast<StreamWord>(target.allocator))))) return 46;
@@ -115,11 +119,17 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
                 invoke(list, 32, 1, reinterpret_cast<StreamWord>(&heap));
                 invoke(list, 36, 0, table);
             }
-            large[edits[frame]] = 1.0f;
+            if (mirror) large[edits[frame]] = 1.0f;
             invoke(list, 21, 1, reinterpret_cast<StreamWord>(&viewport));
-            for (UINT half = 0; half < 2; ++half) {
-                const D3D12_RECT rect{static_cast<LONG>(half * width / 2), 0,
-                                      static_cast<LONG>((half + 1) * width / 2), static_cast<LONG>(height)};
+            for (UINT column = 0; column < columns; ++column) {
+                if (pressure) {
+                    const UINT code = frame * columns + column;
+                    constants[0] = static_cast<float>(code & 15) / 15.0f;
+                    constants[1] = static_cast<float>((code >> 4) & 15) / 15.0f;
+                    constants[2] = static_cast<float>(code >> 8) / 3.0f;
+                }
+                const D3D12_RECT rect{static_cast<LONG>(column * width / columns), 0,
+                                      static_cast<LONG>((column + 1) * width / columns), static_cast<LONG>(height)};
                 invoke(list, 22, 1, reinterpret_cast<StreamWord>(&rect));
                 invoke(list, 12, 3, 1);
             }
@@ -131,11 +141,13 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
             const auto deadline = GetTickCount64() + 10000;
             while (invoke(target.fence, 8) < fence_value && GetTickCount64() < deadline) Sleep(1);
             if (invoke(target.fence, 8) != fence_value) return 49;
-            const std::string path = frame == 2 ? pixels : std::string(pixels) + "." + std::to_string(frame);
+            const std::string path = frame + 1 == frames ? pixels : std::string(pixels) + "." + std::to_string(frame);
             if (const int result = read_stream_target(desktop, target, path.c_str())) return result;
             invoke(target.queue, 32, 0, 0, 0);
         }
-        VirtualFree(large, 0, MEM_RELEASE);
+        if (pressure)
+            for (UINT frame = frames; frame < 300; ++frame) invoke(target.queue, 32, 0, 0, 0);
+        if (large) VirtualFree(large, 0, MEM_RELEASE);
         return 0;
     }
     if (keys) {
