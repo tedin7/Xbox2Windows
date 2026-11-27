@@ -194,7 +194,8 @@ Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
 uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
 
 Phase 2 numbers group-uniform values through forward SCC branches and
-read-only loads. The mesh walk tags a register when every lane with
+read-only loads. VGPR bounds and their first-lane copies share a value
+number. The mesh walk tags a register when every lane with
 `thread < B` defines it before the full EXEC reset. After the count exchange
 the tag covers an export under zero or the same published bound. A later
 VGPR write invalidates its tag. A count SGPR can be reused after publication

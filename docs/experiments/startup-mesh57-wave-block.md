@@ -230,6 +230,36 @@ primitive clamping use the published snapshot for each reused count. The
 emitter keeps the original register expressions when the program leaves
 the counts intact.
 
+### VGPR bounds and split thread-index construction
+
+The same value numbering tracks a full-EXEC VGPR bound through ordinary
+per-lane arithmetic, read-only buffer loads and uniform branches. A
+conditional move needs a mask whose two words represent one replicated
+bit, from a constant, an SCC select or a full-EXEC compare of uniform
+operands. A first-lane read of an all-lane uniform VGPR preserves its
+value number. The `thread < vBound` wave-load guard can then supply the
+same tag as an SGPR guard. VGPR bounds retain the existing whole-wave
+EXEC vote. [RDNA 2 Instruction Set Architecture, V_CMP p. 20 and
+V_READFIRSTLANE_B32 p. 137](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+A thread index can start with `v_mbcnt_lo_u32_b32` and finish with
+`v_mbcnt_hi_u32_b32` after intervening scalar work. Both use the mask
+`-1`. The low half adds the count below the lane in lanes 0–31 to
+`wave << 6`, and the high half adds the count below it in lanes 32–63.
+The gap must be straight-line and preserve EXEC, the base and the
+destination. [RDNA 2 Instruction Set Architecture, V_MBCNT p. 184](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The offline fixture accepts SCC-selected, constant and uniform-compare
+lane masks. It refuses thread-derived bounds, bounds written under
+narrowed EXEC, per-lane compare masks and a branch or clobber in the
+thread-index gap. The `lanemask` draw also covers both prefix arms with a
+VGPR bound. The formatted-load arm doubles a loaded count of five,
+the scalar arm loads nine, and the primitive count is one in both.
+On Linux, the no-argument check passed. Against `319e68f77`, the three
+split-pair variants and the adjacent-pair VGPR-bound control changed from
+refused to accepted. All seven negative controls remained refused. The
+VGPR-bound clamp mutant changed 72 and 38 CPU pixels in the two arms.
+
 ### Synthetic controls and draw
 
 `python3 -B tests/startup_mesh57_skeleton_check.py` exercises the scalar

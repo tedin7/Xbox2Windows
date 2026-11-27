@@ -3152,7 +3152,7 @@ def mesh_pixel_memory_writes(code, decoded):
 
 
 def mesh_value(words, token):
-    """Look up a scalar word or an inline/literal constant."""
+    """Look up a register word or an inline/literal constant."""
     if token in FLOATS:
         return ('const', fbits(FLOATS[token]))
     literal = pc_word(token)
@@ -3181,39 +3181,41 @@ def mesh_value_postdominators(ins, first, exchange, edges):
     return postdom
 
 
+def mesh_replicated_mask_word(value, uniform):
+    """A mask word represents one group-uniform bit in every bit position."""
+    return mesh_uniform_value(value, uniform) and (
+        value[0] == 'lane-mask' or value in (('const', 0), ('const', 0xffffffff)))
+
+
 def mesh_value_join(join, paths, uniform, divergent):
     """Apply the PHI uniformity rule in 'Convergence And Uniformity', Uniformity."""
     if len(paths) == 1:
         scalars, vectors, full = paths[0]
         return scalars.copy(), vectors.copy(), full
     merged = []
+    mask_phis = {}
     for bank in (0, 1):
         words = {}
         for word in set().union(*(path[bank] for path in paths)):
-            incoming = {path[bank].get(word) for path in paths}
-            if len(incoming) == 1:
-                words[word] = incoming.pop()
-            else:
-                number = ('phi', join, word)
-                words[word] = number
-                if not divergent and all(mesh_uniform_value(value, uniform) for value in incoming):
-                    uniform.add(number)
+            incoming = tuple(path[bank].get(word) for path in paths)
+            choices = set(incoming)
+            if len(choices) == 1:
+                words[word] = incoming[0]
+                continue
+            number = ('phi', join, word)
+            if not divergent and all(mesh_uniform_value(value, uniform) for value in choices):
+                if bank == 0 and all(mesh_replicated_mask_word(value, uniform) for value in choices):
+                    # Give both halves the same identity only if they agree on every incoming edge.
+                    number = mask_phis.setdefault(incoming, ('lane-mask', join, len(mask_phis)))
+                uniform.add(number)
+            words[word] = number
         merged.append(words)
     return (*merged, all(path[2] for path in paths))
 
 
-def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read_only):
-    """Prove operands of whole-word VALU and buffer loads have the same bits in every lane."""
-    base = re.sub(r'_e(32|64)$', '', name)
-    loads = base.startswith(('buffer_load_', 'tbuffer_load_'))
-    if loads:
-        if not read_only or '_d16' in name or any(
-                mod in ('lds', 'd16', 'tfe', 'lwe') for mod in mods):
-            return False
-    elif mods or base not in VEC_U and base not in VEC_F and base not in VEC_U_TO_F and base != 'v_mov_b32':
-        return False
-    sources = ops if name.startswith(READ_MODIFY_WRITE) else ops[1:]
-    for token in sources:
+def mesh_uniform_operands(operands, scalars, vectors, uniform):
+    """A numeric source is uniform only if every word it reads is uniform."""
+    for token in operands:
         reg = reg_range(token)
         if reg:
             words = vectors if reg[0] == 'v' else scalars
@@ -3223,6 +3225,63 @@ def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read
         elif not mesh_uniform_value(mesh_value(scalars, token), uniform):
             return False
     return True
+
+
+def mesh_uniform_lane_mask(token, scalars, uniform):
+    """Both halves must represent the same bit replicated across their lanes."""
+    if token in ('0', '-1'):
+        return True
+    words = mask_words(token, 2)
+    if words is None:
+        return False
+    low, high = (mesh_value(scalars, word) for word in words)
+    return low == high and mesh_replicated_mask_word(low, uniform)
+
+
+def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read_only):
+    """Prove whole-word VALU and buffer loads have the same inputs in every lane."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base == 'v_cndmask_b32':
+        args = lane_mask_operands(name, ops)
+        return (not mods and len(args) == 4 and mesh_uniform_lane_mask(args[3], scalars, uniform)
+                and mesh_uniform_operands(args[1:3], scalars, vectors, uniform))
+    if base.startswith(('buffer_load_', 'tbuffer_load_')):
+        if not read_only or '_d16' in name or any(
+                mod in ('lds', 'd16', 'tfe', 'lwe') for mod in mods):
+            return False
+        return mesh_uniform_operands([('0' if tok == 'off' else tok) for tok in ops[1:]],
+                                     scalars, vectors, uniform)
+    elif (mods or base.startswith(('v_rcp', 'v_rsq', 'v_exp', 'v_log', 'v_sin', 'v_cos')) or
+          base not in VEC_U and base not in VEC_F and base not in VEC_U_TO_F and base != 'v_mov_b32'):
+        return False
+    sources = ops if name.startswith(READ_MODIFY_WRITE) else ops[1:]
+    return mesh_uniform_operands(sources, scalars, vectors, uniform)
+
+
+def mesh_value_mask(i, name, ops, mods, state, next_s, uniform):
+    """Number full-width masks. RDNA 2 ISA p. 20: V_CMP writes EXEC[n] & result."""
+    ss, vs, full = state
+    if name.startswith('v_cmp_') and len(ops) == 3:
+        words = mask_words(lane_mask_operands(name, ops)[0], 2)
+        if words:
+            if (full and not mods and name.endswith(('_e32', '_e64'))
+                    and mesh_uniform_operands(ops[1:], ss, vs, uniform)):
+                number = ('lane-mask', i)
+                uniform.add(number)
+                next_s.update(dict.fromkeys(words, number))
+            else:
+                next_s.update({word: ('def', i, word) for word in words})
+    elif name == 's_mov_b64' and ops[1] in ('0', '-1'):
+        words = mask_words(ops[0], 2)
+        if words:
+            next_s.update(dict.fromkeys(words, mesh_value(ss, ops[1])))
+    elif (name == 's_cselect_b64' and set(ops[1:]) == {'-1', '0'}
+          and mesh_uniform_value(ss.get('scc'), uniform)):
+        words = mask_words(ops[0], 2)
+        if words:
+            number = ('lane-mask', i)
+            uniform.add(number)
+            next_s.update(dict.fromkeys(words, number))
 
 
 def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
@@ -3255,7 +3314,8 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
             next_s[ops[0]] = ('group-index',)
             uniform.add(('group-index',))
         elif mesh_uniform_value(source, uniform):
-            uniform.add(next_s[ops[0]])
+            next_s[ops[0]] = source
+    mesh_value_mask(i, name, ops, mods, state, next_s, uniform)
     vector_writes = mesh_vector_writes(name, asm)
     if vector_writes:
         vector_uniform = full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only)
@@ -3288,7 +3348,7 @@ def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
         if i not in incoming:
             continue
         state = mesh_value_join(i, incoming.pop(i), uniform, i <= divergent_until)
-        at[i] = state[0]
+        at[i] = state
         if i == exchange:
             break
         name, asm = ins[i][2:]
@@ -3401,9 +3461,19 @@ def mesh_guard_covers(count, tag, thread, selects):
 
 def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform):
     """Prove definitions on all lanes of a prefix guard up to its full EXEC reset."""
-    if compare not in value_at or len(branches) != 1 or ins[compare][2] != 'v_cmpx_gt_u32_e32':
+    if compare not in value_at or len(branches) != 1:
         return None
-    bound = mesh_value(value_at[compare], parse(ins[compare][3])[1][0])
+    name, asm = ins[compare][2:]
+    scalars, vectors, full = value_at[compare]
+    if not full:
+        return None
+    ops = parse(asm)[1]
+    if name == 'v_cmpx_gt_u32_e32':
+        bound = mesh_value(scalars, ops[0])
+    elif name == 'v_cmpx_lt_u32_e32':
+        bound = vectors.get(ops[1])
+    else:
+        return None
     if not mesh_uniform_value(bound, uniform):
         return None
     branch = branches[0]
@@ -3414,7 +3484,26 @@ def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform):
         close += 1
     if close not in value_at:
         return None
-    return close, (bound, thread), mesh_guard_definitions(ins, branch, close, edges), ins[compare][0]
+    scalar_compare = ins[compare][0] if name == 'v_cmpx_gt_u32_e32' else None
+    return close, (bound, thread), mesh_guard_definitions(ins, branch, close, edges), scalar_compare
+
+
+def mesh_mbcnt_high(ins, low, base, token, targets):
+    """Find the matching high half. RDNA 2 ISA p. 184: add the prefix popcount to S1."""
+    high_asm = 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (token, token)
+    for i in range(low + 1, len(ins)):
+        if i in targets:
+            break
+        name, asm = ins[i][2:]
+        if asm == high_asm:
+            return i
+        if (not name.startswith('s_') or name.startswith((
+                's_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_endpgm',
+                's_barrier', 's_sendmsg', 's_trap', 's_movrel'))
+                or writes_exec(name, parse(asm)[1])
+                or scalar_effects(name, asm)[2] & (EXEC_KEYS | {f's{base}'})):
+            break
+    return None
 
 
 def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
@@ -3552,6 +3641,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     targets = set(edges.values())
     if targets & set(constant_trips):
         raise Unsupported(MESH_LOOP_REFUSAL)
+    mbcnt_targets = targets | constant_trips.keys()
     if count_entry is not None and targets.intersection(range(count_entry, count_at)):
         raise Unsupported(exchange_branch_refusal)
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
@@ -3822,7 +3912,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         read_only = not (pixel_writes or mesh_memory_writes(ins[:start] + ins[a_end:count_at] + ins[b_end:]))
         value_at, uniform_values, count_selects = mesh_value_numbers(
             ins, a_end, count_at, edges, constant_trips, read_only)
-    published = {key: value_at.get(count_at, {}).get(env[key]) for key in ('verts', 'prims')}
+    count_words = value_at[count_at][0] if count_at in value_at else {}
+    published = {key: count_words.get(env[key]) for key in ('verts', 'prims')}
     count_regs = {env[key]: key for key in published}
     valid_counts = set(count_regs)
     tags = {}
@@ -4006,7 +4097,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             if guard_block is not None and index == guard_block[0]:
                 _, tag, defined, compare_off = guard_block
                 proved = pending & defined
-                if proved and uniform_bounds is not None:
+                if proved and compare_off is not None and uniform_bounds is not None:
                     uniform_bounds.add(compare_off)
                 for word in pending - proved:
                     tags.pop(word, None)
@@ -4045,7 +4136,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         elif index in load_compares:
             if thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
-            if mask is None and all(wave_loads[ins[source][0]][1] is not None for source in load_branches[index]):
+            if mask is None and (name == 'v_cmpx_lt_u32_e32' or all(
+                    wave_loads[ins[source][0]][1] is not None for source in load_branches[index])):
                 guard_block = mesh_guard_block(
                     ins, index, load_branches[index], edges, thread, value_at, uniform_values)
             for source in load_branches[index]:
@@ -4090,12 +4182,14 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         clobbers_v = mesh_vector_writes(name, asm)
         dest = reg_range(ops[0]) if ops and not base_name.startswith(('v_cmp', 'exp', 'buffer_store')) else None
         writes_v = set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
-        if base_name == 'v_mbcnt_lo_u32_b32' and base is not None and ops[1:] == ['-1', 's%d' % base] and mask is None \
-                and index + 1 not in targets \
-                and index + 1 < len(ins) and ins[index + 1][3] == 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (ops[0], ops[0]):
-            thread = dest[1]
-            thread_high = index + 1
-        elif thread in clobbers_v and index != thread_high:
+        high = (mesh_mbcnt_high(ins, index, base, ops[0], mbcnt_targets)
+                if base_name == 'v_mbcnt_lo_u32_b32' and base is not None
+                and ops[1:] == ['-1', 's%d' % base] and mask is None else None)
+        if high is not None:
+            thread, thread_high = None, high
+        elif index == thread_high:
+            thread, thread_high = dest[1], None
+        elif thread in clobbers_v:
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
         if lane_spill:
             reads_v, writes_v = set(), set()
