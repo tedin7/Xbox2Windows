@@ -4580,7 +4580,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) {
         note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
-        debug_present::note_draw(pass.bound_targets, pass.target_count, pass.bound_depth);  // X2W_DEBUG_PRESENT_TARGET
+        {   // X2W_DEBUG_PRESENT_TARGET: the draw, and what its pipeline does with the depth buffer. A slot 57 pipeline has no desktop
+            // depth-stencil state unless X2W_DEPTH_STATE=1, and then the desktop default (depth off) draws.
+            const bool depth_state = bound->has_depth_stencil && (!bound->depth_from_registers || pass.dsv_format != DXGI_FORMAT_UNKNOWN);
+            const unsigned depth_class = !depth_state ? debug_present::no_depth_state
+                : !bound->depth_stencil.DepthEnable ? debug_present::depth_test_off
+                : !pass.depth_view_writable ? debug_present::depth_view_read_only
+                : bound->depth_stencil.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO ? debug_present::depth_test_only
+                : debug_present::depth_writes;
+            debug_present::note_draw(pass.bound_targets, pass.target_count, pass.bound_depth, depth_class);
+        }
         if (tr->placeholder) note_placeholder_draw(tr->key, pass);
     }
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
