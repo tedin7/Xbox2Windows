@@ -1174,10 +1174,16 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             bound->has_stencil_ref = chosen.has_stencil_ref;
             bound->stencil_ref = chosen.stencil_ref;
         }
-        if (first_calls(chosen.applied ? logged_applied : logged_refused, 24)) {
+        // Pipelines (not draws) counted by the path of the pipeline itself: 55 is derived from a slot 57 base.
+        static LONG seen_by_own[2][2];
+        const LONG seen = InterlockedIncrement(&seen_by_own[chosen.applied ? 1 : 0][own && own->path == 55 ? 1 : 0]);
+        if ((seen & (seen - 1)) == 0)
+            log("x2w-draw depth-stencil registers: %s %ld pipelines with own path %d", chosen.applied ? "applied to" : "not used for",
+                static_cast<long>(seen), own ? own->path : 0);
+        if (first_calls(chosen.applied ? logged_applied : logged_refused, 256)) {
             if (chosen.applied)
-                log("x2w-draw pipeline %p: depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
-                    static_cast<void*>(pipeline), chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
+                log("x2w-draw pipeline %p (own path %d): depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
+                    static_cast<void*>(pipeline), own ? own->path : 0, chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
                     chosen.desc.StencilEnable, chosen.stencil_ref, chosen.depth_bounds ? "; depth bounds not applied" : "",
                     chosen.masks_differ ? "; back-face masks or reference differ, front used" : "");
             else
