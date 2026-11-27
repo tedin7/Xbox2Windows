@@ -14,7 +14,7 @@
 // The size cap is X2W_REPLAY_MAX_MIB as for calls. X2W_REPLAY_PAGES=0 leaves the pages out.
 // One line of counters after the base image and about every 20th scan:
 //   x2w-replay pages: ranges N (M MiB), pages seen S, distinct D, zero Z, unchanged U, written W MiB, skipped (no size) K,
-//   unreadable R, scan T ms
+//   reserved (not committed) H, unreadable R, scan T ms
 constexpr std::size_t page_slab_bytes = 1u << 20;
 
 struct PageRange { u64 address, bytes; };
@@ -27,7 +27,8 @@ std::vector<PageRange> draw_ranges;  // the title ranges by address
 bool draw_ranges_missed;             // gathered again this Present for a span outside them
 LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_outside, draw_over_time, draw_pending_dropped;
-double draw_time_used;
+u64 draw_ranges_gathered;
+double draw_time_used, draw_ranges_ms;
 bool draw_time_logged;
 std::vector<unsigned char> draw_read_buffer;
 x2w_replay::PageWriter* page_writer;  // created lazily by the first page hook; never freed
@@ -55,7 +56,7 @@ bool page_after_cut(const PageRange& r)
 std::vector<PageRange> page_ranges;   // pages_lock
 std::size_t page_cursor_range;        // pages_lock
 u64 page_cursor_offset;               // pages_lock
-u64 page_unreadable, page_skipped_no_size, page_scans;
+u64 page_reserved, page_unreadable, page_skipped_no_size, page_scans;
 // The base image written before the window (base_image_holds_window): at most X2W_REPLAY_BASE_SCAN_MS (default 500) per
 // present, and where it has got to: a range by its size and address (the scan order) and the offset in it, so ranges that
 // come or go between two slices do not move it.
@@ -281,15 +282,37 @@ bool page_pass_ends(const PageRange& range, u64 offset, bool base)
 // One slab: the committed, readable pages at the start of `want` bytes at `at`, into the page writer.
 void page_capture_slab(u64 at, std::size_t want, std::vector<unsigned char>& buffer, u64 stamp)
 {
-    const std::size_t readable = committed_readable_prefix(at, want) & ~std::size_t{x2w_replay::page_bytes - 1};
-    SIZE_T got = 0;
-    if (!readable || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), buffer.data(), readable, &got) ||
-        got != readable) {
-        page_unreadable += want / x2w_replay::page_bytes;
-        return;
+    const u64 end = at + want;
+    u64 run_start = at;
+    const auto capture_run = [&](u64 run_end) {
+        if (run_end == run_start) return;
+        const auto bytes = static_cast<SIZE_T>(run_end - run_start);
+        SIZE_T got = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(run_start), buffer.data(), bytes, &got) &&
+            got == bytes)
+            page_writer->capture(run_start, buffer.data(), bytes, stamp);
+        else
+            page_unreadable += bytes / x2w_replay::page_bytes;
+    };
+    // Adjacent readable regions form one run even if their protections differ.
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) {
+            capture_run(at);
+            page_unreadable += (end - at) / x2w_replay::page_bytes;
+            return;
+        }
+        const u64 next = (std::min)(end, reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize);
+        if (!committed_region_readable(info)) {
+            capture_run(at);
+            const u64 pages = (next - at) / x2w_replay::page_bytes;
+            if (info.State == MEM_RESERVE || info.State == MEM_FREE) page_reserved += pages;
+            else page_unreadable += pages;
+            run_start = next;
+        }
+        at = next;
     }
-    if (readable < want) page_unreadable += (want - readable) / x2w_replay::page_bytes;
-    page_writer->capture(at, buffer.data(), readable, stamp);
+    capture_run(end);
 }
 
 void page_log_counters(double ms, bool base)
@@ -298,9 +321,10 @@ void page_log_counters(double ms, bool base)
     u64 total = 0;
     for (const PageRange& r : page_ranges) total += r.bytes;
     log("x2w-replay pages: ranges %zu (%llu MiB), pages seen %llu, distinct %llu, zero %llu, unchanged %llu, written %llu MiB, "
-        "textures sized %llu, skipped (no size) %llu, over %llu MiB %llu, unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
+        "textures sized %llu, skipped (no size) %llu, over %llu MiB %llu, reserved (not committed) %llu, "
+        "unreadable %llu, written+maps %llu MiB, scan %.0f ms%s",
         page_ranges.size(), total >> 20, s.seen, s.distinct, s.zero, s.unchanged, s.bytes_written >> 20, page_sized_textures,
-        page_skipped_no_size, page_range_limit >> 20, page_skipped_big, page_unreadable, page_bytes_out >> 20, ms,
+        page_skipped_no_size, page_range_limit >> 20, page_skipped_big, page_reserved, page_unreadable, page_bytes_out >> 20, ms,
         base ? " (base image)" : "");
 }
 
@@ -501,8 +525,9 @@ const PageRange* draw_find_range(u64 address)
 void draw_log_counters(LONG present, double used)
 {
     log("x2w-replay draw pages: captures %llu, outside title memory %llu, over the per-present time %llu, "
-        "pending dropped %llu, used %.1f ms of %.0f ms at present %ld",
-        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, used, draw_pages_ms, present);
+        "pending dropped %llu, ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
+        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, draw_ranges_gathered, draw_ranges_ms,
+        used, draw_pages_ms, present);
 }
 
 bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
@@ -513,24 +538,26 @@ bool draw_time_exhausted(const LARGE_INTEGER& start, u64 skipped)
     return true;
 }
 
-void draw_capture_span(const PageRange& span, LONG present, u64 stamp, const LARGE_INTEGER& start)
+void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INTEGER& start)
 {
     if (draw_time_exhausted(start, 1)) return;
-    // The title ranges are gathered again at the first capture of each Present (resources come and go), and once more
-    // in that Present when a span falls outside them (a resource made since).
-    const auto gather = [&] {
-        u64 unsized = 0, big = 0;
-        draw_ranges = page_merge_ranges(true, unsized, big);
-    };
+    // Reuse the ranges across Presents. Refresh on the first miss in a Present.
     if (draw_ranges_present != present) {
-        gather();
         draw_ranges_present = present;
         draw_ranges_missed = false;
     }
     const PageRange* range = draw_find_range(span.address);
     if (!range && !draw_ranges_missed) {
         draw_ranges_missed = true;
-        gather();
+        LARGE_INTEGER before{}, after{};
+        QueryPerformanceCounter(&before);
+        u64 unsized = 0, big = 0;
+        draw_ranges = page_merge_ranges(true, unsized, big);
+        QueryPerformanceCounter(&after);
+        const auto gather_ticks = after.QuadPart - before.QuadPart;
+        start.QuadPart += gather_ticks;
+        ++draw_ranges_gathered;
+        draw_ranges_ms += static_cast<double>(gather_ticks) * 1000.0 / static_cast<double>(frequency.QuadPart);
         range = draw_find_range(span.address);
     }
     if (!range) { ++draw_outside; return; }
@@ -561,7 +588,7 @@ void draw_add_pending(u64 list, u64 address, u64 bytes)
     spans.push_back({address, bytes});
 }
 
-void draw_consume_pending(u64 list, LONG present, u64 stamp, const LARGE_INTEGER& start)
+void draw_consume_pending(u64 list, LONG present, u64 stamp, LARGE_INTEGER& start)
 {
     const auto it = draw_pending.find(list);
     if (it == draw_pending.end()) return;

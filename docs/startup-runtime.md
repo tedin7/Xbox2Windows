@@ -2058,6 +2058,9 @@ ones stay out of the later scans, and the last quarter keeps the window's change
 constants). `pages: budget of N MiB reached` means the later changes were lost too: the window then replays from stale
 memory, and the pictures are wrong.
 
+Page scans skip holes and continue capturing readable pages beyond them.
+The counters report uncommitted pages as `reserved (not committed)` and inaccessible committed pages or failed reads as `unreadable`.
+
 The base image is written before the window opens: when the window's time comes, each present writes at most
 `X2W_REPLAY_BASE_SCAN_MS` (default 500) milliseconds of it while the title keeps presenting and the calls go on into the
 prefix (`x2w-replay record: the window waits for the base image of title memory ...`). A title stopped for the whole base
@@ -2089,6 +2092,7 @@ applies them before the call that reads them. Only spans inside the title ranges
 4 MiB and to its containing title range. `X2W_REPLAY_DRAW_PAGES_MS` sets the time budget per Present (default 100 ms).
 The `x2w-replay draw pages` counters report captures, spans outside title memory, time skips, pending drops and
 time used. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+Draw captures reuse title ranges across Presents and gather them at most once per Present on a lookup miss. The counters report gather count and time outside the capture budget.
 The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
 
 The player applies MAP chunks in stamp order, and a Present rescan is stamped at the previous Present, before the draws

@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -106,6 +107,22 @@ def main(scene, player, backend):
         assert "budget of 2 MiB reached" not in log, log[-3000:]
         compare(replay(player, cut, root / "cut", backend, env), EXPECTED)
         print("With the base image cut at 3/4 of a 2 MiB page budget the late write still replays.")
+
+        hole = root / "hole.x2wr"
+        hole_readback = root / "hole_live.bin"
+        result = run([scene, backend, hole_readback], dict(
+            env, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+            X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(hole), X2W_REPLAY_PAGES="1",
+            X2W_REPLAY_PAGES_AT_SUBMIT="1", X2W_REPLAY_SCAN_MS="250", X2W_REPLAY_MAX_MIB="16",
+            X2W_TEST_SUBMIT_PAGES_HOLE="1"))
+        log = result.stdout + result.stderr
+        assert result.returncode == 0, (result.returncode, log[-3000:])
+        live = hole_readback.read_bytes()
+        compare(live, EXPECTED)
+        compare(replay(player, hole, root / "hole", backend, env), live)
+        reserved = re.findall(r"^.*x2w-replay pages: ranges .*reserved \(not committed\) (\d+),", log, re.MULTILINE)
+        assert any(int(count) > 0 for count in reserved), log[-3000:]
+        print("Both readbacks match across the reserved hole, and the scan counted reserved pages.")
     return 0
 
 
