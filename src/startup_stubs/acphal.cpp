@@ -91,6 +91,7 @@ unsigned char* heap_take(u64 bytes, u64 alignment)
                           PAGE_READWRITE)) {
             break;
         }
+        x2w_local::record_read_span(heap_base + page_begin, static_cast<SIZE_T>(page_end - page_begin));
         std::memmove(&extents[i + 1 + extra], &extents[i + 1], (extent_count - i - 1) * sizeof(Extent));
         std::size_t at = i;
         if (pad) extents[at++] = {e.start, pad, false};
@@ -143,7 +144,9 @@ bool heap_give(const void* virtual_address)
             const u64 decommit_begin = (free_begin + page_size - 1) & ~(page_size - 1);
             const u64 decommit_end = free_end & ~(page_size - 1);
             if (decommit_end > decommit_begin) {
-                VirtualFree(heap_base + decommit_begin, static_cast<SIZE_T>(decommit_end - decommit_begin), MEM_DECOMMIT);
+                const auto length = static_cast<SIZE_T>(decommit_end - decommit_begin);
+                if (VirtualFree(heap_base + decommit_begin, length, MEM_DECOMMIT))
+                    x2w_local::erase_read_span(heap_base + decommit_begin, length);
             }
             done = true;
         }

@@ -2017,7 +2017,12 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && ((bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) || std::memcmp(found->second.content.data(), title, bytes) == 0)) {
+    bool same = false;
+    if (known && !x2w_local::guarded_title_read(title, bytes, [&] {
+        same = (bytes >= x2w_local::big_copy_bytes && stale_large_copy_mutant()) ||
+               std::memcmp(found->second.content.data(), title, bytes) == 0;
+    })) return false;
+    if (same) {
         const auto& slice = found->second.slice;
         if (bind_upload_slice(self, slice)) {
             *offset = slice.offset;
@@ -2031,14 +2036,20 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
-        std::vector<unsigned char> content(title, title + bytes);
+        std::vector<unsigned char> content;
+        if (x2w_local::read_cache_on()) {
+            content.resize(bytes);
+            if (!x2w_local::copy_probed_title(content.data(), title, bytes)) return false;
+        } else {
+            content.assign(title, title + bytes);
+        }
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
         auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, slice, std::move(content)});
         source = entry.first->second.content.data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
-    std::memcpy(slice.mapped, source, bytes);
+    if (!x2w_local::copy_probed_title(slice.mapped, source, bytes)) return false;
     if (bytes >= x2w_local::big_copy_bytes) InterlockedIncrement64(&big_copies_made);
     if (known) {
         static LONG refreshed;
@@ -2355,9 +2366,13 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                         return false;  // staging failed: not uploaded, so report it and retry at the next bind
                     }
                     const auto& level = compact.level[i];
-                    for (u64 y = 0; y < level.rows; ++y)
-                        std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
-                                    static_cast<std::size_t>(level.row_bytes));
+                    for (u64 y = 0; y < level.rows; ++y) {
+                        if (!x2w_local::copy_probed_title(rows + y * fp.Footprint.RowPitch,
+                                memory + level.offset + y * level.row_bytes, static_cast<std::size_t>(level.row_bytes))) {
+                            state.done = false;
+                            return false;
+                        }
+                    }
                 } else if (owned.cpu) {
                     // Own buffer: copy the level's rows from the title's memory and name that buffer in the upload.
                     if (readable_window(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes)) < bytes) {
@@ -2365,7 +2380,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                         return false;  // staging failed: not uploaded, so report it and retry at the next bind
                     }
                     offset = owned.cursor;
-                    std::memcpy(owned.cpu + offset, memory + stride * s + fp.Offset, static_cast<std::size_t>(bytes));
+                    if (!x2w_local::copy_probed_title(owned.cpu + offset, memory + stride * s + fp.Offset,
+                                                     static_cast<std::size_t>(bytes))) {
+                        state.done = false;
+                        return false;
+                    }
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                     chunk = owned.resource.Get();
                 } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
@@ -2563,7 +2582,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
             return refuse(i, "unreadable table entry", srv.a);
-        std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        if (!x2w_local::copy_probed_title(words, reinterpret_cast<const void*>(entry), 32)) return refuse(i, "unreadable table entry", srv.a);
         if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
         ViewRecord record{};
         bool known = false;
@@ -3094,7 +3113,8 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), sizeof(descriptor.words));
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
-        std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
+        if (!x2w_local::copy_probed_title(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
+            return refuse(ud.a, "missing hardware descriptor");
         std::uint32_t format = 0;
         if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
         descriptor.entry = entry;
@@ -3126,7 +3146,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         if (!entry) return refuse(i, "table entry outside the bound table", uav.offset);
         std::uint32_t words[8] = {};
         if (!x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) return refuse(i, "table entry unreadable", entry);
-        std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        if (!x2w_local::copy_probed_title(words, reinterpret_cast<const void*>(entry), 32)) return refuse(i, "table entry unreadable", entry);
         if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
         ViewRecord record{};
         note_lock_acquire(false);
@@ -3170,7 +3190,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
-            std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
+            if (!x2w_local::copy_probed_title(srv_words, reinterpret_cast<const void*>(srv_entry), 32)) continue;
             if (srv_words[0] != view_token_magic) continue;
             note_lock_acquire(false);
             const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
@@ -3454,7 +3474,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const u64 index_start = u64{start} * index_bytes;
     const u64 index_address = pass.ib.BufferLocation + index_start;
     const std::size_t index_total = std::size_t{count} * index_bytes;
-    const bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
+    bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
     D3D12_INDEX_BUFFER_VIEW live_indices{};
     ID3D12Resource* live_index_resource = nullptr;
     const auto stream_needs_slicing = [&](const Translation::Srv& srv) {
@@ -3492,13 +3512,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT vertex_count = indexed ? 0 : count;
     if (indices_ok && !live_index_resource) {
         std::uint32_t low = ~0u, high = 0;
-        for (UINT k = 0; k < count; ++k) {
-            const std::uint32_t value = index_bytes == 2 ? reinterpret_cast<const std::uint16_t*>(index_address)[k]
-                                                         : reinterpret_cast<const std::uint32_t*>(index_address)[k];
-            if (value < low) low = value;
-            if (value > high) high = value;
-        }
-        if (low <= high) {
+        indices_ok = x2w_local::guarded_title_read(reinterpret_cast<const void*>(index_address), index_total, [&] {
+            for (UINT k = 0; k < count; ++k) {
+                const std::uint32_t value = index_bytes == 2 ? reinterpret_cast<const std::uint16_t*>(index_address)[k]
+                                                             : reinterpret_cast<const std::uint32_t*>(index_address)[k];
+                if (value < low) low = value;
+                if (value > high) high = value;
+            }
+        });
+        if (indices_ok && low <= high) {
             vertex_first = base_vertex + static_cast<INT>(low);
             vertex_count = high - low + 1;
         }
@@ -3547,9 +3569,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                     static_cast<int>(pass.dsv_format), {words[0], words[1]}, requested, why,
                                     binding_frame, binding_frame}, omit_index);
         };
-        const bool entry_ok = formatted.entry ||
-            (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
-        if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
+        bool entry_ok = formatted.entry || (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
+        if (entry_ok) {
+            entry_ok = x2w_local::copy_probed_title(words, formatted.entry ? formatted.words :
+                                                   reinterpret_cast<const void*>(entry), 32);
+            if (!entry_ok) std::memset(words, 0, sizeof(words));
+        }
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 6) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
@@ -3822,7 +3847,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return not_drawn(buffer_copy_failed_site);
             }
             if (target) {
-                std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
+                if (!x2w_local::copy_probed_title(target, reinterpret_cast<const void*>(address), bytes)) {
+                    draw_lock_release_exclusive();
+                    return not_drawn(buffer_copy_failed_site);
+                }
                 std::memset(target + bytes, 0, padded - bytes);
             }
             buffer_view(dest, target ? chunk : nullptr, offset, padded);
@@ -3895,7 +3923,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             readable_range = address && bytes && readable_window(address, bytes) >= bytes;
             if (readable_range && large_raw) {
-                bytes = x2w_local::used_length(reinterpret_cast<const void*>(address), bytes, 256, zero_tail_scan_budget);
+                const auto* title = reinterpret_cast<const void*>(address);
+                readable_range = x2w_local::guarded_title_read(title, bytes, [&] {
+                    bytes = x2w_local::used_length(title, bytes, 256, zero_tail_scan_budget);
+                });
                 if (bytes < full_bytes) InterlockedAdd64(&zero_tail_bytes_saved, static_cast<LONG64>(full_bytes - bytes));
             }
             if (cached) {
@@ -3927,8 +3958,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (have) InterlockedIncrement64(&big_copies_reused);
             } else if (!cached->fallback_failed) {
                 slice = reserve_upload_ring(self, bytes, &big_binding_chunks);
-                if (slice.mapped) {
-                    std::memcpy(slice.mapped, reinterpret_cast<const void*>(address), bytes);
+                if (slice.mapped && x2w_local::copy_probed_title(slice.mapped, reinterpret_cast<const void*>(address), bytes)) {
                     ++big_binding_counts.copies;
                     big_binding_counts.copied_bytes += bytes;
                     InterlockedIncrement64(&big_copies_made);
@@ -4008,7 +4038,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                    (first_calls(tr->logged_constants, 3) || ++tr->constants_seen % 300 == 0);
         if (constants_due) {
             const auto* memory_words = reinterpret_cast<const std::uint32_t*>(address);
-            const std::size_t shown = (std::min<std::size_t>)(bytes / 4, 52);
+            std::size_t shown = (std::min<std::size_t>)(bytes / 4, 52);
+            std::uint32_t snapshot[52]{};
+            if (x2w_local::read_cache_on()) {
+                if (!x2w_local::copy_probed_title(snapshot, memory_words, shown * sizeof(*memory_words))) shown = 0;
+                memory_words = snapshot;
+            }
             char text[52 * 14 + 1] = "";
             std::size_t used = 0;
             for (std::size_t k = 0; k < shown && used + 14 < sizeof(text); ++k) {
@@ -4316,7 +4351,10 @@ void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count,
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)
 {
-    pass_of(self).ib = view && x2w_local::readable(view, sizeof(*view)) ? *view : D3D12_INDEX_BUFFER_VIEW{};
+    D3D12_INDEX_BUFFER_VIEW index{};
+    if (view && x2w_local::readable(view, sizeof(*view)) &&
+        !x2w_local::copy_probed_title(&index, view, sizeof(index))) index = {};
+    pass_of(self).ib = index;
 }
 // List slot 48 (desktop 44 + 4), IASetVertexBuffers(start, count, views).
 void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views)

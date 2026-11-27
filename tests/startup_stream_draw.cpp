@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "startup_stream_draw.h"
+#include "startup_stubs/local_log.h"
 #include "../src/startup_stubs/packed_target_format.h"
 #include "startup_stream_setup.h"
 
@@ -534,7 +535,38 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
     void* vertex_resource = nullptr;
-    if (index_probe[0]) {
+    const bool read_cache_clipped = !std::strcmp(index_probe, "read-cache-clipped");
+    const bool read_cache_probe = read_cache_clipped || !std::strcmp(index_probe, "read-cache");
+    static constexpr SIZE_T cache_page = 4096, cache_slots = 96;
+    unsigned char* cache_indices = nullptr;
+    const x2w_local::ReadCacheApi* cache = nullptr;
+    const auto draw_cache_indices = [&] {
+        const D3D12_RECT full{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        invoke(list, 22, 1, arg(&full));
+        for (SIZE_T i = 0; i < cache_slots; ++i) {
+            const D3D12_INDEX_BUFFER_VIEW view{arg(cache_indices + i * 2 * cache_page), 8, DXGI_FORMAT_R16_UINT};
+            invoke(list, 47, arg(&view));
+            invoke(list, 13, 3, 1, 1, 0, 0);
+        }
+    };
+    if (read_cache_probe) {
+        wchar_t path[32768];
+        const auto length = GetEnvironmentVariableW(L"X2W_TEST_READ_CACHE_XMEM", path, static_cast<DWORD>(std::size(path)));
+        if (!length || length >= std::size(path) || !LoadLibraryW(path)) return 75;
+        cache = x2w_local::read_cache();
+        if (!cache) return 76;
+        cache_indices = static_cast<unsigned char*>(VirtualAlloc(nullptr, cache_slots * 2 * cache_page,
+                                                                 MEM_RESERVE, PAGE_NOACCESS));
+        if (!cache_indices) return 71;
+        for (SIZE_T i = 0; i < cache_slots; ++i) {
+            auto* page = cache_indices + i * 2 * cache_page;
+            if (!VirtualAlloc(page, cache_page, MEM_COMMIT, PAGE_READWRITE)) return 71;
+            const std::uint16_t triangle[] = {9, 1, 2, 0};
+            const std::uint16_t clipped[] = {9, 4, 5, 3};
+            std::memcpy(page, read_cache_clipped ? clipped : triangle, sizeof(triangle));
+        }
+        draw_cache_indices();
+    } else if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
         const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;
@@ -791,7 +823,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         frame.attachments[0] = std::move(big);
         frame.count = 1;
     }
-    if (std::wcscmp(viewport_mode, L"reset") == 0) {
+    if (read_cache_probe || std::wcscmp(viewport_mode, L"reset") == 0) {
         if (const int rc = submit(1)) return rc;
         const float clear[] = {0, 0, 1, 1};
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
@@ -801,10 +833,20 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 50, 1, arg(&rtv));
         invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         invoke(list, 25, arg(pso));
-        invoke(list, 12, 3, 1);
+        if (read_cache_probe) {
+            const auto before = cache->stats();
+            draw_cache_indices();
+            const auto after = cache->stats();
+            const auto queries = after.queries - before.queries;
+            std::printf("read cache: %llu queries / %zu indexed draws\n", queries, cache_slots);
+            if (queries >= cache_slots || after.hits - before.hits < cache_slots) return 78;
+        } else {
+            invoke(list, 12, 3, 1);
+        }
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (cache_indices && !VirtualFree(cache_indices, 0, MEM_RELEASE)) return 79;
     if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
     if (vertex_resource) invoke(vertex_resource, 2);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {

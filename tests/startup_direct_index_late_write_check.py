@@ -85,6 +85,36 @@ def check(directory, consumer, backend):
     return 0
 
 
+def check_read_cache(directory, consumer, backend, xmem, mode):
+    vertex = """
+    float4 main(uint index : SV_VertexID) : SV_Position {
+        if (index > 2) return float4(4, 4, 0, 1);
+        return float4(index == 1 ? 3 : -1, index == 2 ? -3 : 1, 0, 1);
+    }
+    """
+    pixel = "float4 main() : SV_Target { return float4(0, 1, 0, 1); }"
+    env, args, output = prepare_draw_cache(directory, consumer, pixel, {}, "", vertex_hlsl=vertex)
+    env.update(X2W_D3D12_DEBUG="1", X2W_TEST_INDEX_PROBE=mode, X2W_READ_CACHE="1",
+               X2W_TEST_READ_CACHE_XMEM=xmem)
+    result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True,
+                            errors="replace", timeout=45)
+    measured = re.search(r"read cache: (\d+) queries / (\d+) indexed draws", result.stdout)
+    if (result.returncode or not measured or int(measured[1]) >= int(measured[2])
+            or re.search(r"x2w-d3d12-debug [^\n]*sev=[01]\b", result.stderr)):
+        raise AssertionError(f"indexed cache ({result.returncode})\n{result.stdout}\n{result.stderr[-4000:]}")
+    expected = bytes((0, 255, 0, 255)) * 32  # Full-screen triangle over the 8 x 4 CPU reference.
+    actual = output.read_bytes()
+    if actual != expected:
+        if mode == "read-cache-clipped" and actual == CLIPPED * 32:
+            print("FAIL: clipped index control differs from the full-screen CPU reference", flush=True)
+            return 1
+        raise AssertionError(f"indexed cache readback differs from the CPU reference: {actual.hex()}")
+    print(result.stdout)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
+        if len(sys.argv) == 5 and sys.argv[3] in ("read-cache", "read-cache-clipped"):
+            sys.exit(check_read_cache(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[4], sys.argv[3]))
+        else:
+            sys.exit(check(Path(temporary), *sys.argv[1:]))

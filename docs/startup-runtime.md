@@ -1514,6 +1514,16 @@ cmake --build --preset dev --target startup_local_log_check startup_local_log_ca
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control|_cache_failure_control)?$' -V
 ```
 
+The opt-in read-cache checks use 96 committed pages separated by reserved pages. The CPU check probes
+10,000 ranges in each switch setting and checks the first probe after a decommit. Its control skips the
+decommit invalidation and must report a stale hit. The WARP check renders a second recording from the
+warmed index pages and compares its pixels with the CPU reference. Its clipped-index control must
+produce the clear color instead. Run these checks on Windows with the development preset and FXC:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_read_cache_(cpu_(on|off)|decommit_control|indexed_warp(_control)?)$' -V
+```
+
 ## Trap-by-default header check
 
 `tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 41 cases, with
@@ -1562,6 +1572,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`; `tester_run.ps1` turns it on, `-NoLowAddresses` off) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
+| `X2W_READ_CACHE=1` | Experimental, off by default. Shares up to 16,384 readable committed spans across the process. Allocator commits and section maps seed the table, and decommit, release and unmap remove the affected range. Uncovered addresses go to `VirtualQuery`. Probes and copies still touch title memory under structured exception handling. The render totals report lookups, hits, system queries, spans and erases. |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |

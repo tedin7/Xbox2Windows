@@ -1,6 +1,6 @@
 #pragma once
 
-#include <windows.h>
+#include "startup_stubs/local_log.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,7 +66,7 @@ inline std::size_t committed_extent_with(std::uintptr_t start, std::size_t bytes
 inline std::size_t committed_extent(const void* start, std::size_t bytes, bool* ok) noexcept
 {
     return committed_extent_with(reinterpret_cast<std::uintptr_t>(start), bytes, [](const void* address, MEMORY_BASIC_INFORMATION* info) {
-        return VirtualQuery(address, info, sizeof(*info)) == sizeof(*info);
+        return query_read_span(address, info);
     }, ok);
 }
 

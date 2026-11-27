@@ -14,6 +14,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/profile_zone.h"
 
+#include <algorithm>
 #include <vector>
 
 #include <iterator>
@@ -32,6 +33,7 @@ struct Backing {
     ULONG64 offset = 0;  // the page is one 64 KiB slot of a shared section (see section_for)
     std::size_t slab = 0;  // index of that section among the slabs
     bool committed = true;  // false while a lazily mapped slot is untouched (X2W_XMEM_LAZY_COMMIT)
+    std::vector<ULONG_PTR> pending_cache_views;  // only populated for lazy slots with the read cache on
 };
 
 using Slot = std::pair<std::size_t, ULONG64>;
@@ -227,7 +229,9 @@ bool commit_block_chunks(ULONG_PTR base, SIZE_T bytes, ULONG_PTR from, ULONG_PTR
     SIZE_T last = to - base < bytes ? to - base : bytes;  // offsets in the block; to is exclusive
     last = (last + lazy_chunk - 1) & ~(lazy_chunk - 1);
     if (last > bytes) last = bytes;
-    return VirtualAlloc(reinterpret_cast<void*>(base + first), last - first, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    void* committed = VirtualAlloc(reinterpret_cast<void*>(base + first), last - first, MEM_COMMIT, PAGE_READWRITE);
+    if (committed) x2w_local::record_read_span(committed, last - first);
+    return committed != nullptr;
 }
 
 // Commits a lazily mapped slot under memory.mutex; false with the system error if the commit fails.
@@ -236,7 +240,25 @@ bool commit_backing(Backing& backing)
     if (backing.committed) return true;
     if (!commit_slot(backing.section, backing.offset, false)) return false;
     backing.committed = true;
+    for (const auto address : backing.pending_cache_views)
+        x2w_local::record_read_span(reinterpret_cast<const void*>(address), page_bytes);
+    std::vector<ULONG_PTR>().swap(backing.pending_cache_views);
     return true;
+}
+
+// Caller holds memory.mutex and has published the OS mapping. If bookkeeping
+// allocation fails, the first read of that view can discover it through VirtualQuery.
+void record_view(ULONG_PTR address, Backing& backing) noexcept
+{
+    if (!x2w_local::read_cache_on()) return;
+    if (backing.committed) {
+        x2w_local::record_read_span(reinterpret_cast<const void*>(address), page_bytes);
+    } else {
+        try {
+            backing.pending_cache_views.push_back(address);
+        } catch (const std::bad_alloc&) {
+        }
+    }
 }
 
 // The backing behind a mapped address (CPU view, or its GPU-view mirror), under memory.mutex.
@@ -412,8 +434,7 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
     failed_address = address;
     if (bytes == page_bytes) return false;
     for (SIZE_T done = 0; done < bytes; done += page_bytes) {
-        Backing one = backing;
-        one.offset += done;
+        const Backing one{backing.section, 0, backing.offset + done};
         if (!map_view(address + done, one)) {
             failed_address = address + done;
             return false;
@@ -426,8 +447,13 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
 
 bool unmap_view(ULONG_PTR address)
 {
-    return UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                           MEM_PRESERVE_PLACEHOLDER) != FALSE;
+    auto* target = reinterpret_cast<void*>(address);
+    if (!UnmapViewOfFile2(GetCurrentProcess(), target, MEM_PRESERVE_PLACEHOLDER)) return false;
+    if (x2w_local::read_cache_on()) {
+        const auto run = memory.runs.find(address);
+        if (run != memory.runs.end()) x2w_local::erase_read_span(target, run->second);
+    }
+    return true;
 }
 
 template <class Pages>
@@ -623,7 +649,13 @@ void forget_page(ULONG_PTR address)
 {
     const auto live = memory.views.find(address);
     if (live == memory.views.end()) return;
-    --memory.backings.at(live->second).views;
+    auto& backing = memory.backings.at(live->second);
+    --backing.views;
+    if (!backing.pending_cache_views.empty()) {
+        auto& aliases = backing.pending_cache_views;
+        const auto found = std::find(aliases.begin(), aliases.end(), address);
+        if (found != aliases.end()) aliases.erase(found);
+    }
     memory.views.erase(live);
 }
 
@@ -661,7 +693,7 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
             at += page_bytes;
             continue;
         }
-        const Backing head = memory.backings.at(live->second);
+        const Backing& head = memory.backings.at(live->second);
         SIZE_T bytes = page_bytes;
         for (; at + bytes < base + size; bytes += page_bytes) {
             const auto next = memory.views.find(at + bytes);
@@ -675,8 +707,7 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
             // map_run may have mapped some pages one at a time before it stopped; keep those.
             for (SIZE_T done = 0; done < bytes; done += page_bytes) {
                 if (memory.runs.count(at + done)) continue;
-                Backing one = head;
-                one.offset += done;
+                const Backing one{head.section, 0, head.offset + done};
                 if (!fail && map_view(at + done, one)) {
                     memory.runs[at + done] = page_bytes;
                 } else {
@@ -685,6 +716,16 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
                                         fail ? ERROR_INVALID_ADDRESS : GetLastError());
                     forget_page(at + done);
                     ++lost;
+                }
+            }
+        }
+        if (x2w_local::read_cache_on()) {
+            for (SIZE_T done = 0; done < bytes; done += page_bytes) {
+                const auto view = memory.views.find(at + done);
+                if (view != memory.views.end()) {
+                    auto& backing = memory.backings.at(view->second);
+                    if (backing.committed)
+                        x2w_local::record_read_span(reinterpret_cast<const void*>(at + done), page_bytes);
                 }
             }
         }
@@ -742,7 +783,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                     const DWORD error = GetLastError();
                     if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {
-                        UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER);
+                        unmap_view(base);
                         memory.runs.erase(base);
                     }
                     coalesce_unused(batch);
@@ -751,8 +792,11 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                 }
                 first = last;
             }
-            for (const auto& [address, page] : batch)
-                ++memory.backings.at(page).views;
+            for (const auto& [address, page] : batch) {
+                auto& backing = memory.backings.at(page);
+                ++backing.views;
+                record_view(address, backing);
+            }
             memory.views.merge(batch);
         } else {
             // Unmap every run that holds a page of the batch, then map the surviving pages of those
@@ -785,10 +829,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             }
             const bool refused = error != ERROR_SUCCESS;
             if (!refused) {
-                for (const auto& [address, page] : batch) {
-                    --memory.backings.at(page).views;
-                    memory.views.erase(address);
-                }
+                for (const auto& entry : batch) forget_page(entry.first);
             }
             if (!refused && !unmapped.empty()) hold_window();
             ULONG_PTR lost = 0;
@@ -878,6 +919,7 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
         how = "placeholder reserve";
     }
+    if (result && (type & MEM_COMMIT)) x2w_local::record_read_span(address ? address : result, bytes, protect);
 #if X2W_TRACY
     if (result && (type & MEM_COMMIT)) {
         // A plot, not a pool: the title releases these ranges with Win32 calls that are not seen here.
@@ -1306,10 +1348,16 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
     }
     // Publish the OS state, including any views left over if Windows refused rollback.
     for (const auto& [address, edit] : plan) {
-        if (edit.old == edit.actual) continue;
+        if (edit.old == edit.actual) {
+            if (x2w_local::read_cache_on() && edit.actual && memory.backings.at(edit.actual).committed)
+                x2w_local::record_read_span(reinterpret_cast<const void*>(address), page_bytes);
+            continue;
+        }
         forget_page(address);
         if (edit.actual) {
-            ++memory.backings.at(edit.actual).views;
+            auto& backing = memory.backings.at(edit.actual);
+            ++backing.views;
+            record_view(address, backing);
             auto node = view_nodes.extract(address);
             node.mapped() = edit.actual;
             memory.views.insert(std::move(node));
@@ -1574,7 +1622,10 @@ extern "C" BOOL WINAPI x2w_xmem_commit_block(const void* address)
     AcquireSRWLockExclusive(&lazy_blocks.lock);
     const bool lazy = lazy_block_at(reinterpret_cast<ULONG_PTR>(address), base, bytes);
     const bool committed = !lazy || VirtualAlloc(reinterpret_cast<void*>(base), bytes, MEM_COMMIT, PAGE_READWRITE);
-    if (lazy && committed) lazy_blocks.blocks.erase(base);
+    if (lazy && committed) {
+        x2w_local::record_read_span(reinterpret_cast<void*>(base), bytes);
+        lazy_blocks.blocks.erase(base);
+    }
     ReleaseSRWLockExclusive(&lazy_blocks.lock);  // keeps the commit's error
     return committed;
 }
@@ -1601,10 +1652,21 @@ VirtualFreeFn real_virtual_free;
 
 BOOL WINAPI virtual_free_lazy(LPVOID address, SIZE_T bytes, DWORD type)
 {
-    if (!(type & MEM_RELEASE)) return real_virtual_free(address, bytes, type);
+    const bool cache = x2w_local::read_cache_on();
+    if (!(type & MEM_RELEASE)) {
+        const BOOL released = real_virtual_free(address, bytes, type);
+        bool erase = cache && released && (type & MEM_DECOMMIT);
+#ifdef X2W_XMEM_TEST_CONTROLS
+        if (erase && x2w_local::env_on("X2W_READ_CACHE_TEST_SKIP_DECOMMIT")) erase = false;
+#endif
+        if (erase) x2w_local::erase_read_span(address, bytes ? bytes : x2w_local::read_span_release_size(address));
+        return released;
+    }
     AcquireSRWLockExclusive(&lazy_blocks.lock);
+    const SIZE_T extent = bytes ? bytes : x2w_local::read_span_release_size(address);
     const BOOL released = real_virtual_free(address, bytes, type);
     const DWORD error = GetLastError();
+    if (cache && released) x2w_local::erase_read_span(address, extent);
     if (released && lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)))
         InterlockedIncrement(&lazy_block_releases);
     ReleaseSRWLockExclusive(&lazy_blocks.lock);
@@ -1662,12 +1724,21 @@ const bool lazy_commit_installed = [] {
     real_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadFile"));
     const int reads = real_read_file ? patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_committed)) : 0;
     x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler on, %d ReadFile import(s) wrapped", reads);
-    if (lazy_startup()) {
+    if (lazy_startup() && !x2w_local::read_cache_on()) {
         real_virtual_free = reinterpret_cast<VirtualFreeFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualFree"));
         const int frees = real_virtual_free ? patch_main_import("VirtualFree", reinterpret_cast<const void*>(&virtual_free_lazy)) : 0;
         x2w_local::logf("x2w-xmem lazy startup blocks (X2W_XMEM_LAZY_STARTUP): %d VirtualFree import(s) wrapped", frees);
     }
     return true;
+}();
+// Installed independently of lazy commit, including runs that commit all pages eagerly.
+const bool read_cache_free_installed = [] {
+    if (!x2w_local::read_cache_on()) return false;
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&virtual_free_lazy), &self)) return false;
+    real_virtual_free = reinterpret_cast<VirtualFreeFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualFree"));
+    return real_virtual_free && patch_main_import("VirtualFree", reinterpret_cast<const void*>(&virtual_free_lazy)) != 0;
 }();
 }  // namespace
 
@@ -1858,6 +1929,9 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
             SetLastError(error);
             return nullptr;
         }
+        if (!listed) x2w_local::record_read_span(block, bytes);
+    } else if (block) {
+        x2w_local::record_read_span(block, bytes);
     }
     return block;
 }
