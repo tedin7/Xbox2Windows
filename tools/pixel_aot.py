@@ -191,6 +191,11 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", d
     if struct.unpack_from("<I", image, 4)[0] == 0x101:
         code = _bounded_code(image, start)
         if decoder is None and llvm is not None:
+            # With only an LLVM library, a program with one end-program word keeps the old fast path (no disassembly, the
+            # library is not even loaded); more words are checked by decoding. A caller-supplied decoder checks every program.
+            if sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code)) == 1 and code.endswith(b"\x00\x00\x81\xbf"):
+                return code
+
             def decoder(span):
                 return disassemble(span, llvm, offsets=True, cpu=cpu, features=features)
         if decoder is not None:
