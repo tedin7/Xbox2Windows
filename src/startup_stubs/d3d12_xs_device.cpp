@@ -8834,6 +8834,7 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     }
     the_device = candidate;
     removal_device = device;
+    x2w_d3d12_replay_record_object(device_kind, candidate);
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
