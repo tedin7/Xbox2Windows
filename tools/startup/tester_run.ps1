@@ -66,6 +66,7 @@ param(
     [string]$Matrix = "",                       # indirect: two runs of -Seconds (default 240), (a) default, (b) X2W_TRANSLATED_INDIRECT_DRAW=1 (translated indirect draws on). gray: three runs of -Seconds (default 240) back to back in one session, (a) default, (b) X2W_TEST_ADDRESS_UPLOAD_RING=1, (c) X2W_BIG_COPY_REUSE=1, one report with run_a/ run_b/ run_c/ + matrix_manifest.json
     [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = "slow": a 10 s window opened by the first slowdown (a present with a >= 500 ms gap after 120 s, fallback 180 s), 400 MiB cap, "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
     [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 400 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
+    [int]$RecordPrefixMaxMiB = 512,             # cap of the part of the recording before the window (X2W_REPLAY_PREFIX_MAX_MIB); the window cap above counts from where the window opens. Raise it (e.g. 1024) when a run starts its window late and the log says "prefix only"
     [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
     [switch]$Upload,                            # (implied by -Record) after a -Record run: cut the recording into 100 MB chunks and copy it into the synced Drive folder x2w-registrazioni, or print the list to upload by hand in the browser
     [int]$LimitMB = 9,
@@ -357,8 +358,8 @@ if ($Record) {
     $recordDir = Join-Path $outRoot ("record_" + $stamp)
     New-Item -ItemType Directory -Force $recordDir | Out-Null
     $freeMiB = [math]::Floor((Get-PSDrive -Name ((Split-Path -Qualifier $recordDir).TrimEnd(":"))).Free / 1MB)
-    if ($freeMiB -lt 2 * $RecordMaxMiB) { throw ("tester_run: -Record needs twice the cap free ({0} MiB), the disk has {1} MiB: free space or lower -RecordMaxMiB" -f (2 * $RecordMaxMiB), $freeMiB) }
-    $env:X2W_REPLAY_RECORD = $recordSpec; $env:X2W_REPLAY_DIR = $recordDir; $env:X2W_REPLAY_MAX_MIB = [string]$RecordMaxMiB; $env:X2W_REPLAY_SHADERS = "0"; $env:X2W_REPLAY_PREFIX_MAX_MIB = "512"
+    if ($freeMiB -lt 2 * ($RecordMaxMiB + $RecordPrefixMaxMiB)) { throw ("tester_run: -Record needs twice the cap free ({0} MiB), the disk has {1} MiB: free space or lower -RecordMaxMiB or -RecordPrefixMaxMiB" -f (2 * ($RecordMaxMiB + $RecordPrefixMaxMiB)), $freeMiB) }
+    $env:X2W_REPLAY_RECORD = $recordSpec; $env:X2W_REPLAY_DIR = $recordDir; $env:X2W_REPLAY_MAX_MIB = [string]$RecordMaxMiB; $env:X2W_REPLAY_SHADERS = "0"; $env:X2W_REPLAY_PREFIX_MAX_MIB = [string]$RecordPrefixMaxMiB
     Write-Host ("tester_run: recording {0} into {1} (cap {2} MiB, {3} MiB free): the run is slower while it records" -f $recordSpec, $recordDir, $RecordMaxMiB, $freeMiB)
 } else {
     Remove-Item Env:X2W_REPLAY_RECORD, Env:X2W_REPLAY_DIR, Env:X2W_REPLAY_MAX_MIB, Env:X2W_REPLAY_SHADERS, Env:X2W_REPLAY_PREFIX_MAX_MIB -ErrorAction SilentlyContinue

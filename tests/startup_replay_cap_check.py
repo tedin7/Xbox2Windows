@@ -149,6 +149,9 @@ def main(scene, backend):
         assert "BEFORE the window opened" not in text, "the prefix hit a cap that is not its own:\n" + text[-3000:]
         _, _, _, window_presents = end_totals(windowed)
         assert window_presents > 0, "the window recorded no present"
+        # The prefix names the slots that took its blob bytes, so a too-big prefix can be traced to a call family.
+        census = re.search(r"x2w-replay record: prefix blob KiB by kind:slot: (\d+):(\d+)=(\d+)", text)
+        assert census and int(census.group(3)) >= 0, "no prefix blob census in the log:\n" + text[-3000:]
 
         # "slow": the window opens at the first present after a gap of 300 ms or more, lasts 0.15 s, and the file ends with
         # its XEND. The 400 ms pause before frame 15 makes present 16 such a present; a loaded machine can stall 300 ms

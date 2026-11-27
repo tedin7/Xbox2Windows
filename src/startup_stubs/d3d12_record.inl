@@ -45,6 +45,12 @@ u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with
 // cap above counts from the size the file had when the window opened, so a large prefix cannot eat the window's room.
 u64 prefix_max_bytes = 0, window_base_bytes = 0;
 bool window_base_set = false;
+// X2W_REPLAY_PREFIX_GENERIC_KIB (default 16, 0 = no limit): before the window, a call without a declared layout copies at
+// most this much memory behind each pointer argument. A size-looking next argument used to ask for up to 4 MiB per pointer,
+// and the unique blobs of ~6000 prefix calls filled a 512 MiB prefix cap by 250 s.
+u64 prefix_generic_bytes = 16u << 10;
+// Unique blob bytes recorded before the window, per call kind and slot: the log at stop names the biggest.
+LONG64 volatile prefix_slot_bytes[kind_count][wide_slots];
 // The thunk checks active before doing any recorder work. Window and prefix
 // selection is published by present(); the prefix ends when the window opens.
 std::atomic<bool> window_open{false}, prefix_open{false};
@@ -244,6 +250,9 @@ struct ArgumentCapture {
             struct { u64 hash, bytes; } blob{hash, bytes};
             append_chunk(buffer.bytes, "BLOB", &blob, sizeof(blob), copy.data(), copy.size());
             InterlockedIncrement64(&blobs_stored);
+            if (prefix_open.load(std::memory_order_relaxed) && !window_open.load(std::memory_order_relaxed) &&
+                static_cast<int>(call.kind) < kind_count && static_cast<int>(call.slot) < wide_slots)
+                InterlockedAdd64(&prefix_slot_bytes[call.kind][call.slot], static_cast<LONG64>(bytes));
         }
         return copy;
     }
@@ -340,8 +349,11 @@ constexpr std::uint32_t generic_followed_args = 7;  // later words are mostly th
 
 void generic_memory(ArgumentCapture& capture, std::uint32_t arg, u64 address, u64 hint, unsigned depth)
 {
-    const std::size_t wanted = hint > generic_window_bytes && hint <= generic_hint_limit
+    std::size_t wanted = hint > generic_window_bytes && hint <= generic_hint_limit
         ? static_cast<std::size_t>(hint) : generic_window_bytes;
+    if (prefix_generic_bytes && wanted > prefix_generic_bytes && prefix_open.load(std::memory_order_relaxed) &&
+        !window_open.load(std::memory_order_relaxed))
+        wanted = static_cast<std::size_t>(prefix_generic_bytes);
     const auto copy = capture.prefix(arg, address, wanted, depth);
     if (!depth || copy.empty()) return;
     const std::size_t scan = (std::min)(copy.size(), generic_scan_bytes) / 8;
@@ -718,6 +730,25 @@ void stop(bool at_exit)
     if (!at_exit && in_prefix && cap_reached)
         log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
             "%ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, presents, max_bytes >> 20);
+    if (!at_exit) {
+        // The five slots that took the most unique blob bytes before the window (kind:slot=KiB), for sizing the prefix.
+        struct { LONG64 bytes; int kind, slot; } top[5]{};
+        for (int k = 0; k < kind_count; ++k)
+            for (int s = 0; s < wide_slots; ++s) {
+                const LONG64 bytes = prefix_slot_bytes[k][s];
+                for (int t = 0; bytes > 0 && t < 5; ++t) {
+                    if (bytes <= top[t].bytes) continue;
+                    for (int u = 4; u > t; --u) top[u] = top[u - 1];
+                    top[t] = {bytes, k, s};
+                    break;
+                }
+            }
+        if (top[0].bytes > 0)
+            log("x2w-replay record: prefix blob KiB by kind:slot: %d:%d=%lld %d:%d=%lld %d:%d=%lld %d:%d=%lld %d:%d=%lld",
+                top[0].kind, top[0].slot, top[0].bytes >> 10, top[1].kind, top[1].slot, top[1].bytes >> 10,
+                top[2].kind, top[2].slot, top[2].bytes >> 10, top[3].kind, top[3].slot, top[3].bytes >> 10,
+                top[4].kind, top[4].slot, top[4].bytes >> 10);
+    }
     if (!at_exit)
         log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
             end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
@@ -827,6 +858,9 @@ void install()
     char prefix_cap[24]{};
     const DWORD pc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_MAX_MIB", prefix_cap, sizeof(prefix_cap));
     if (pc && pc < sizeof(prefix_cap)) prefix_max_bytes = std::strtoull(prefix_cap, nullptr, 10) << 20;
+    char generic_kib[24]{};
+    const DWORD gc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_GENERIC_KIB", generic_kib, sizeof(generic_kib));
+    if (gc && gc < sizeof(generic_kib)) prefix_generic_bytes = std::strtoull(generic_kib, nullptr, 10) << 10;
     file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         log("x2w-replay record: cannot create %s (error %lu)", path, GetLastError());
