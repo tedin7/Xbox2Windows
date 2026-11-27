@@ -3133,6 +3133,7 @@ class Stage:
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):
             self.ins = wave32_vcc_hi(self.ins)
+            self.texture_waterfall_loads = self.flatten_texture_waterfalls()
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
             # A compute program also gets the rename, unless the caller says it is wave64. A program proven wave32 (the
             # caller says so, or its exec writes are all 32-bit forms) gets it even where a VALU instruction reads vcc_lo
@@ -3192,6 +3193,125 @@ class Stage:
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
+
+    def flatten_texture_waterfalls(self):
+        """Flatten a closed readfirstlane/CMPX loop whose body only reads one indexed image record."""
+        loads = {}
+        if not getattr(self.pipe, 'supports_dynamic_texture_heap', False) or not self.pipe.root['flags'] & 0x400 or not any(
+                name == 'v_readfirstlane_b32' for _, _, name, _ in self.ins):
+            return loads
+        heap = 8 + sum(p['count'] if p['type'] == 1 else 1 if p['type'] == 0 else 2
+                       for p in self.pipe.root['params'])
+        ins = self.ins
+        parsed = [parse(asm) for _, _, _, asm in ins]
+        offsets = {off: i for i, (off, _, _, _) in enumerate(ins)}
+        if any(name.startswith(('s_movrel', 's_setpc')) or
+               (name.startswith('s_swappc') and (self.kind != 'vs' or i != 0))
+               for i, (name, _, _) in enumerate(parsed)):
+            return loads
+        jumps = {i: offsets.get(int(ops[0].split('_')[1], 16)) for i, (name, ops, _) in enumerate(parsed)
+                 if name.startswith(('s_branch', 's_cbranch'))}
+        effects = [scalar_effects(name, asm) for _, _, name, asm in ins]
+        wave32 = wave32_exec_proof(ins)
+
+        def dead_after(exit_index, words):
+            pending = [(exit_index, frozenset(words))]
+            visited = set()
+            while pending:
+                i, live = pending.pop()
+                if i is None or i >= len(ins) or not live or (i, live) in visited:
+                    continue
+                visited.add((i, live))
+                reads, writes, _ = effects[i]
+                if live & reads:
+                    return False
+                left = live - writes
+                if parsed[i][0] not in ('s_branch', 's_endpgm'):
+                    pending.append((i + 1, left))
+                if i in jumps:
+                    pending.append((jumps[i], left))
+            return True
+
+        for close, head in jumps.items():
+            if head is None or head < 2 or close < head + 5 or close + 1 >= len(ins):
+                continue
+            if parsed[close][0] != 's_cbranch_scc1' or parsed[head][0] != 'v_readfirstlane_b32':
+                continue
+            _, key_ops, mods = parsed[head]
+            if mods or len(key_ops) != 2 or not re.fullmatch(r's[0-9]+', key_ops[0]) or not re.fullmatch(r'v[0-9]+', key_ops[1]):
+                continue
+            key, lane = key_ops
+            cmp, operands, mods = parsed[head + 1]
+            if re.sub(r'_e(32|64)$', '', cmp) not in ('v_cmpx_eq_i32', 'v_cmpx_eq_u32') or operands not in (key_ops, key_ops[::-1]) or mods:
+                continue
+            close_op, close_args, mods = parsed[close - 1]
+            if close_op not in ('s_andn2_wrexec_b32', 's_andn2_wrexec_b64') or mods or len(close_args) != 2 or close_args[0] != close_args[1]:
+                continue
+            width = close_op[-2:]
+            if width == '32' and not wave32:
+                continue
+            mov = 's_mov_b' + width
+            exec_reg = 'exec_lo' if width == '32' else 'exec'
+            remaining = close_args[0]
+            saved = parsed[close + 1][1][-1] if parsed[close + 1][1] else ''
+            if parsed[close + 1] != (mov, [exec_reg, saved], []):
+                continue
+            mask_words = scalar_tokens(remaining) | scalar_tokens(saved)
+            mask_ranges = [reg_range(mask) for mask in (saved, remaining)]
+            if (any(not r or r[0] != 's' or r[2] > 105 or r[2] - r[1] != (width == '64') for r in mask_ranges)
+                    or mask_words & {key}
+                    or scalar_tokens(remaining) & scalar_tokens(saved)):
+                continue
+            saves = parsed[head - 2:head]
+            saved_exec = (mov, [saved, exec_reg], [])
+            remaining_exec = (mov, [remaining, exec_reg], [])
+            if saves not in ([saved_exec, remaining_exec], [remaining_exec, saved_exec],
+                             [saved_exec, (mov, [remaining, saved], [])]):
+                continue
+            if any(head - 2 < target <= close + 1 for branch, target in jumps.items()
+                   if branch != close and target is not None):
+                continue
+            if any('s%d' % heap in effect[2] for effect in effects[:head]):
+                continue
+            shift = head + 2
+            name, args, mods = parsed[shift]
+            if name != 's_lshl_b32' or len(args) != 3 or args[1:] not in ([key, '5'], [key, '0x5']) or mods:
+                continue
+            load = shift + 1
+            name, args_load, mods = parsed[load]
+            if name != 's_load_dwordx8' or len(args_load) != 3 or mods:
+                continue
+            record, base, offset = args_load
+            if reg_range(base) != ('s', heap, heap + 1) or smem_offset(offset) != args[0]:
+                continue
+            dest = reg_range(record)
+            shift_dst = reg_range(args[0])
+            if (not dest or dest[0] != 's' or dest[2] - dest[1] != 7 or dest[2] > 105
+                    or not shift_dst or shift_dst[0] != 's' or shift_dst[1] != shift_dst[2] or shift_dst[2] > 105
+                    or int(key[1:]) > 105):
+                continue
+            temps = {key, 'scc'} | scalar_tokens(args[0]) | scalar_tokens(record)
+            if (temps & (mask_words | scalar_tokens(base)) or
+                    not dead_after(close + 2, temps | mask_words)):
+                continue
+            images = 0
+            for name, operands, mods in parsed[load + 1:close - 1]:
+                if name in ('s_waitcnt', 's_nop'):
+                    continue
+                image_dst = reg_range(operands[0]) if operands else None
+                if (name not in ('image_sample', 'image_sample_lz', 'image_load') or len(operands) < 3
+                        or operands[2] != record or 'dim:SQ_RSRC_IMG_2D' not in mods
+                        or scalar_tokens(' '.join(operands[3:])) & (temps | mask_words)
+                        or not image_dst or image_dst[0] != 'v' or image_dst[1] <= int(lane[1:]) <= image_dst[2]):
+                    break
+                images += 1
+            else:
+                if 1 <= images <= 4:
+                    loads[ins[load][0]] = lane
+                    for i in (head - 2, head - 1, head, head + 1, shift, close - 1, close, close + 1):
+                        off, size, _, _ = ins[i]
+                        ins[i] = off, size, 's_nop', 's_nop 0'
+        return loads
 
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
@@ -3845,6 +3965,12 @@ class Stage:
             value = next((self.is_const(i) for i in range(r[1], r[2] + 1) if self.is_const(i)), s[1])
             raise Unsupported("descriptor operand %s holds ('const', %#x)" % (tok, value & 0xffffffff))
         if s and s[0] == 'desc':
+            if s[1][0] == 'dynamic_texture':
+                if s[1][2] != self.descriptor_block_first:
+                    raise Unsupported('dynamic texture heap descriptor crosses a branch target')
+                if r[0] != 's' or r[2] - r[1] != 7 or s[3] != 0 or any(
+                        self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, 8)):
+                    raise Unsupported('dynamic texture heap descriptor requires eight intact words')
             if s[1][0] == 'dynamic_heap' and (r[0] != 's' or r[2] - r[1] != 3 or s[3] != 0 or
                     any(self.sym.get(r[1] + i) != desc_word(s, i) for i in range(1, 4))):
                 raise Unsupported('dynamic resource heap descriptor requires four intact words')
@@ -5116,7 +5242,8 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
-                    self.heap_index.clear()  # another path into the join may hold a different word
+                    incoming_heap_indices = self.heap_index if getattr(self, 'kind', None) in ('vs', 'ps') else {}
+                    self.heap_index = {}  # another path into the join may hold a different word
                     self.align4_v.clear()
                     self.align4_s.clear()
                     pre_uniform = {
@@ -5165,6 +5292,11 @@ class Stage:
                         r for r in pre_uniform
                         if r not in clobber or (r not in fwd_clobber and r not in blocked)
                     }
+                    # A wave-wide index word survives when every edge sees its dominating definition.
+                    unchanged = kept_u - clobber - join_writes.get(off, set())
+                    self.heap_index.update(
+                        (r, mark) for r, mark in incoming_heap_indices.items()
+                        if r in unchanged and mark[0] in ('texture_index', 'bufword'))
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.entry_written_v.clear()
@@ -6510,6 +6642,16 @@ class Stage:
             skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
             high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
             masks = [high] if high else []
+        if getattr(self, 'texture_heap_records', False):
+            reads, _, _ = scalar_effects(base, asm)
+            if base in ('image_load', 'image_sample_lz', 'image_sample', 'image_sample_c', 'image_sample_c_lz') and len(ops) >= 3:
+                reads -= scalar_tokens(ops[2])
+                if len(ops) >= 4:
+                    reads |= scalar_tokens(ops[3])
+            for reg in scalar_registers(' '.join(reads)):
+                sym = self.sym.get(reg)
+                if sym and sym[0] == 'desc' and sym[1][0] == 'dynamic_texture':
+                    raise Unsupported('numeric or unsupported use of a dynamic texture heap descriptor')
         tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
         for tok in destinations(base, ops):   # an overwritten register no longer holds a mask's high word
@@ -7852,6 +7994,10 @@ class Stage:
         is named when it is a root constant word (the dispatch knows it) or a word an s_buffer_load wrote (see
         op_s_buffer_load_dword). A root constant word times a literal plus a literal ('rc') is the byte offset such a
         load may read the index word at: the same for every thread of the dispatch."""
+        if getattr(self, 'kind', None) in ('vs', 'ps'):
+            self.mark_texture_heap_index(base, d, srcs, syms)
+            if self.heap_index.get(d, (None,))[0] in ('texture_index', 'texture_byte_offset'):
+                return
         lit = [int(t, 0) & 0xffffffff if re.fullmatch(r'0x[0-9a-f]+|[0-9]+', t) else None for t in srcs]
         r = reg_range(srcs[0])
         if base == 's_lshl_b32' and lit[1:] == [5]:
@@ -7871,6 +8017,28 @@ class Stage:
                     self.heap_index[d] = (('rc', p, w, scale * k & 0xffffffff, add * k & 0xffffffff) if base == 's_mul_i32'
                                           else ('rc', p, w, scale, add + k & 0xffffffff))
                     break
+
+    def mark_texture_heap_index(self, base, dst, srcs, syms):
+        if base not in ('s_lshl_b32', 's_mov_b32', 's_and_b32', 's_add_u32', 's_add_i32'):
+            return
+        if not all(self.uniform_source(src) for src in srcs):
+            return
+        marks = {**self.heap_index, **self.heap_index_was}
+
+        def index_word(src, sym):
+            reg = reg_range(src)
+            return (sym and (sym[0] == 'fixed_buffer_word'
+                             or sym[0] == 'ud' and self.pipe.uds[sym[1]][0] == 'rootconst')
+                    or reg and reg[0] == 's' and marks.get(reg[1], (None,))[0] in ('bufword', 'texture_index'))
+
+        words = [index_word(src, sym) for src, sym in zip(srcs, syms)]
+        if base == 's_lshl_b32':
+            if words[0] and srcs[1] in ('5', '0x5'):
+                self.heap_index[dst] = ('texture_byte_offset',)
+        elif any(words) and all(word or re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', src)
+                                or sym and sym[0] == 'const'
+                                for src, sym, word in zip(srcs, syms, words)):
+            self.heap_index[dst] = ('texture_index',)
 
     def set_exec_scc(self, expr):
         self.exec_known = self.exec_narrow_only = False
@@ -8175,7 +8343,8 @@ class Stage:
                 raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
-        known = self.const_soffset(token) if p[1] != ('smpheap',) else None
+        lane_heap_load = getattr(self, 'pc', None) in getattr(self, 'texture_waterfall_loads', {})
+        known = self.const_soffset(token) if p[1] != ('smpheap',) and not lane_heap_load else None
         if known is not None:
             # A register offset that holds a known constant (s_movk before the load) is that literal byte
             # offset; the modifier adds to it. This reaches descriptors in a bindless heap (#1723).
@@ -8195,8 +8364,11 @@ class Stage:
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
-                    if getattr(self, 'kind', None) == 'cs' and hasattr(self, 'heap_index'):
-                        self.heap_index[dst[1] + i] = ('heap_index_word',)
+                    if hasattr(self, 'heap_index'):
+                        if getattr(self, 'kind', None) == 'cs':
+                            self.heap_index[dst[1] + i] = ('heap_index_word',)
+                        elif getattr(self, 'kind', None) in ('vs', 'ps') and self.pipe.root['params'][p[1][1]]['type'] == 2:
+                            self.heap_index[dst[1] + i] = ('texture_index',)
                 return
             # A compute or vertex raw-store conversion must distinguish loads through different high words
             # even when the source and byte offset match. Keep the load PC for a changed pointer pair.
@@ -8254,6 +8426,20 @@ class Stage:
 
     def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
         r = reg_range(token)
+        if count == 8 and getattr(self, 'kind', None) in ('vs', 'ps') and getattr(self.pipe, 'supports_dynamic_texture_heap', False):
+            mark = self.heap_index.get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+            lane = getattr(self, 'texture_waterfall_loads', {}).get(self.pc)
+            if (dst[2] > 105 or imm or len(self.sym[base[1]]) != 2
+                    or self.sym.get(base[2]) != ('const', 0)
+                    or (lane is None and (mark != ('texture_byte_offset',) or not self.uniform_source(token)))):
+                raise Unsupported(refusal)
+            index = self.u(lane) if lane is not None else '%s >> 5' % self.smem_soffset(token)
+            name = 'heap_index_%x' % self.pc
+            self.emit('uint %s = %s;' % (name, index))
+            self.texture_heap_records = True
+            for i in range(8):
+                self.sym[dst[1] + i] = ('desc', ('dynamic_texture', name, self.descriptor_block_first), 0, i)
+            return
         if (count != 4 or dst[2] > 105 or self.has_branches or len(self.sym[base[1]]) != 2 or not r or r[0] != 's'
                 or not self.uniform_source(token) or self.sym.get(base[2]) != ('const', 0)):
             raise Unsupported(refusal)
@@ -8265,7 +8451,10 @@ class Stage:
     def dynamic_heap_load(self, key, address):
         if key[1] != 0 or key in self.pipe.modified:
             raise Unsupported('dynamic resource heap descriptor was advanced')
+        if getattr(self.pipe, 'uses_dynamic_texture_heap', False):
+            raise Unsupported('mixed dynamic buffer and texture heap views')
         self.pipe.uses_dynamic_heap = True
+        self.pipe.uses_dynamic_buffer_heap = True
         return 'x2w_heap_load(%s, %s)' % (key[0][1], address)
 
     def heap_record(self, dst, base, token, imm, count):
@@ -9581,7 +9770,14 @@ class Stage:
             if hasattr(self, 'derivative_sites'):
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
-        shared_load = (desc_key is not None and getattr(self, 'kind', None) == 'ps' and how == 'load'
+        dynamic_texture = desc_key is not None and desc_key[0][0] == 'dynamic_texture'
+        if dynamic_texture and (dim != 'SQ_RSRC_IMG_2D' or how not in ('sample', 'lz', 'load') or 'd16' in mods):
+            raise Unsupported('dynamic texture heap requires a 2D sample, level-zero sample or texel load')
+        if dynamic_texture and how == 'sample':
+            if getattr(self, 'kind', None) != 'ps' or not self.derivative_exec_ok() or not self.uniform_cf:
+                raise Unsupported('dynamic texture heap sample requires implicit derivatives under wave-uniform control flow')
+            self.derivative_sites.append((self.pc, 'dynamic texture heap sample'))
+        shared_load = (desc_key is not None and not dynamic_texture and getattr(self, 'kind', None) == 'ps' and how == 'load'
                        and kinds[dim] in ('tex2d', 'tex2da') and not integer_srvs
                        and 'a16' not in mods and 'd16' not in mods
                        and getattr(self.pipe, 'pixel_rw_images', None) is not None
@@ -9589,7 +9785,12 @@ class Stage:
         tex = (self.pipe.pixel_image_load(desc_key, kinds[dim]) if shared_load
                else self.pipe.resource(desc_key, kinds[dim]) if desc_key is not None else None)
         uav_load = shared_load and desc_key in self.pipe.pixel_rw_images
-        if tex is not None and not uav_load and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
+        if dynamic_texture:
+            index = desc_key[0][1]
+            tex += '_%x' % self.pc
+            self.emit('Texture2D<float4> %s = ResourceDescriptorHeap[NonUniformResourceIndex(min(%s, heap_count))];' %
+                      (tex, index))
+        if tex is not None and not dynamic_texture and not uav_load and hasattr(self.pipe, 'note_use'):  # the manifest hint `srvuse`; unit-test stubs have none
             self.pipe.note_use(desc_key, 'texel' if how in ('load', 'load_mip') else 'lod' if how == 'get_lod' else 'sample')
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
@@ -9626,7 +9827,7 @@ class Stage:
             location = 'int%d(%s)' % (axes + 1, ', '.join(address + [mip]))
             call = ('%s[uint%d(%s)]' % (tex, axes, ', '.join(address)) if uav_load
                     else '%s.Load(%s)' % (tex, location))
-            if integer_srvs and not packed_d16:
+            if integer_srvs and not packed_d16 and not dynamic_texture:
                 res = self.pipe.resources[desc_key]
                 res['integer_load'] = True
                 call = ('asfloat(%(tex)s_is_integer == 2u ? asuint(%(tex)s_sint.Load(%(loc)s)) : '
@@ -9721,6 +9922,8 @@ class Stage:
                 # each side applies besides the sampler's (the view's mip range) is assumed to agree.
                 call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
                     tex, smp, uv, tex, smp, uv)
+            elif dynamic_texture and how == 'sample':
+                call = '%s.Sample(%s, %s)' % (tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
                 if implicit_bias:
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
@@ -9812,6 +10015,10 @@ class Stage:
         # The reference, u and v; a 2D array adds the slice as the last address register.
         if len(cs) != (4 if array else 3):
             raise Unsupported('%s with %d address registers' % (base, len(cs)))
+        first = reg_range(ops[2])
+        symbol = self.sym.get(first[1]) if first else None
+        if symbol and symbol[0] == 'desc' and symbol[1][0] == 'dynamic_texture':
+            raise Unsupported('comparison sample through a dynamic texture heap descriptor')
         if self.heap_sampler(ops[3]):
             raise Unsupported('%s through a sampler heap' % base)
         words = self.const_words(ops[3])
@@ -13390,6 +13597,7 @@ class PixelImageConflict(Unsupported):
 
 class Pipeline:
     vertex_kind = 'vs'
+    supports_dynamic_texture_heap = True
     uses_dynamic_heap = False
     uses_pack16_rne = False
     uses_gather_2d_lod = False
@@ -13571,6 +13779,13 @@ class Pipeline:
     def resource(self, key, kind):
         if key[0][0] == 'dynamic_heap':
             raise Unsupported('dynamic resource heap views require a raw buffer load')
+        if key[0][0] == 'dynamic_texture':
+            if kind != 'tex2d' or key[1] != 0:
+                raise Unsupported('dynamic texture heap requires an intact 2D image descriptor')
+            if getattr(self, 'uses_dynamic_buffer_heap', False):
+                raise Unsupported('mixed dynamic buffer and texture heap views')
+            self.uses_dynamic_heap = self.uses_dynamic_texture_heap = True
+            return 'texture_' + key[0][1]
         if key in self.stored_images() or key in getattr(self, 'pixel_rw_images', ()):
             raise Unsupported('resource %s is both read and stored to' % (key,))
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
@@ -13758,11 +13973,12 @@ class Pipeline:
             constants = ['uint ud%d;' % i for i in range(len(self.uds) + len(twins))]
             out[-1] = 'cbuffer entry : register(b0) { %s };' % ' '.join(
                 constants + ['uint heap_count;'])
-            out += ['uint x2w_heap_load(uint index, uint address) {',
-                    '    if (index >= heap_count) return 0u;',
-                    '    ByteAddressBuffer buffer = ResourceDescriptorHeap[NonUniformResourceIndex(index)];',
-                    '    return buffer.Load(address);',
-                    '}']
+            if not getattr(self, 'uses_dynamic_texture_heap', False):
+                out += ['uint x2w_heap_load(uint index, uint address) {',
+                        '    if (index >= heap_count) return 0u;',
+                        '    ByteAddressBuffer buffer = ResourceDescriptorHeap[NonUniformResourceIndex(index)];',
+                        '    return buffer.Load(address);',
+                        '}']
         for r, reg, entry in twins:
             kind = {'tex1d': 'Texture1D', 'tex2d': 'Texture2D', 'tex2da': 'Texture2DArray', 'tex3d': 'Texture3D'}[r['kind']]
             out.append('%s<uint4> r%d_uint : register(t%d);' % (kind, r['index'], reg))
@@ -14206,7 +14422,7 @@ class Pipeline:
             version = 3
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
-            lines.append('dynamic_heap')
+            lines.append('dynamic_heap texture2d' if getattr(self, 'uses_dynamic_texture_heap', False) else 'dynamic_heap')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())
@@ -14471,6 +14687,8 @@ class ComputePipeline(Pipeline):
 class MeshPixelStage(Pipeline):
     """Pixel stage paired with a mesh shader exporting param0..param12 (#2413 T4)."""
 
+    supports_dynamic_texture_heap = False
+
     def __init__(self, mesh_params, ps_code, root_blob, *, rtv_formats=(), ps_hw_inputs=None, ps_attr_map=None,
                  sampler_heap=None, srv_formats=(), refusals=None, decoded=None):
         from mesh_param_link import MAX_PARAM, validate_linkage
@@ -14514,6 +14732,7 @@ class MeshPixelStage(Pipeline):
 class MeshPipeline(Pipeline):
     """A slot 57 mesh pipeline with an optional pixel stage. The mesh stage is self.vs."""
     vertex_kind = 'ms'
+    supports_dynamic_texture_heap = False
 
     def hlsl_ms(self):
         s = self.vs
