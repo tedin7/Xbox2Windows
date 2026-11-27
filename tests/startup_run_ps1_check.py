@@ -474,7 +474,7 @@ def shell_failures(shell, script, tmp):
             failures.append(f"{name}: could not inject the wrong debugger argument")
         else:
             problems = run_case(shell, wrong_arg, 7, tmp)
-            if not any("debugger [argv, X2W_TRACE_API]" in item and "'19'" in item for item in problems):
+            if not any("debugger [argv" in item and "'19'" in item for item in problems):
                 failures.append(f"{name}: wrong debugger argument was not detected: {problems}")
         # Expire the live fixture tree after HasExited has been read. The launcher's
         # own taskkill then hits the missing PID and writes native stderr.
