@@ -614,8 +614,9 @@ def native_instructions(code):
     return out
 
 
-def decode(code, refusals=None):
+def decode(code, refusals=None, *, embedded_vertex=False):
     out, off = [], 0
+    saw_getpc = False
     while off + 4 <= len(code):
         try:
             n, name, asm, _ = D.decode_instruction(code, off)
@@ -629,6 +630,11 @@ def decode(code, refusals=None):
             refusals.append((str(reason), 'decode'))
         else:
             out.append((off, n, name, asm))
+            if embedded_vertex:
+                saw_getpc |= name == 's_getpc_b64'
+                # A proven table is data, even if its words resemble instructions.
+                if name == 's_endpgm' and saw_getpc and embedded_buffer_proof(code, out):
+                    return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
     return out[:last + 1]
@@ -1202,6 +1208,90 @@ def reads_scc(name, asm):
     # LLVM AMDGPU SOPInstructions.td lists implicit SCC uses. Cover each supported family here
     # (s_cmov includes s_cmovk_i32) so both the calculated-PC and descriptor checks see new readers.
     return 'src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))
+
+
+def embedded_buffer_proof(code, ins):
+    """Prove a vertex buffer descriptor whose only observable use is reading the shader image."""
+    if not ins or ins[-1][2] != 's_endpgm' or classify_decoded(ins) != 'vs':
+        return None
+    pcs = {off for off, _, _, _ in ins}
+    reads = [item for item in ins if item[2] == 's_getpc_b64']
+    if len(reads) != 1:
+        return None
+    read, length, _, asm = reads[0]
+    _, ops, mods = parse(asm)
+    low = pc_pair(ops[0]) if len(ops) == 1 and not mods and length == 4 else None
+    if low is None or low % 4 or low + 3 > 105:
+        return None
+
+    regs = set(range(low, low + 4))
+    desc = ('s', low, low + 3)
+    setup = {read: None}
+    loads = set()
+    offset = size = flags = None
+    carry_live = False
+    end = 0
+    for pc, n, name, asm in ins:
+        if pc != end:  # No ignored encoding failures or gaps in the executable prefix.
+            return None
+        end = pc + n
+        if name.startswith(('s_setpc', 's_call', 's_rfe', 's_trap', 's_endpgm_')) or 'movrel' in name:
+            return None
+        _, ops, mods = parse(asm)
+        if name.startswith('s_swappc') and (pc != 0 or ops != ['s[4:5]', 's[4:5]'] or mods):
+            return None
+        if name.startswith(('s_branch', 's_cbranch')):
+            # Setup dominates all loads. Forward branches after setup cannot change
+            # any of its words, since every other access to those words is checked below.
+            label = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
+            target = int(label[1], 16) if label else -1
+            if None in (offset, size, flags) or target <= pc or target not in pcs:
+                return None
+            carry_live = False
+        if pc == read:
+            continue
+        refs = scalar_registers(asm) & regs
+        imm = pc_word(ops[-1]) if ops else None
+        if (pc > read and refs and not mods and name in ('s_mov_b32', 's_movk_i32')
+                and len(ops) == 2 and imm is not None):
+            word = sopk_imm(ops[1], True) if name == 's_movk_i32' else imm & 0xffffffff
+            if ops[0] == 's%d' % (low + 2) and size is None:
+                size = word
+            elif ops[0] == 's%d' % (low + 3) and flags is None:
+                flags = word
+            else:
+                return None
+        elif (pc > read and name == 's_add_u32' and not mods and offset is None and len(ops) == 3
+              and ops[:2] == ['s%d' % low] * 2 and imm is not None and imm >= 0):
+            offset = read + length + imm
+            carry_live = True
+        elif (carry_live and name == 's_addc_u32'
+              and not mods and ops[:2] == ['s%d' % (low + 1)] * 2 and len(ops) == 3 and imm == 0):
+            carry_live = False
+        else:
+            # An address-derived SCC cannot escape. Only SCC-preserving
+            # instructions may intervene between the low add and its carry.
+            if offset is not None and reads_scc(name, asm):
+                return None
+            if carry_live and not name.startswith(('v_', 's_mov_', 's_movk_', 's_waitcnt', 's_nop')):
+                carry_live = False
+            if refs:
+                if (name != 'buffer_load_dword' or len(ops) != 4 or reg_range(ops[2]) != desc
+                        or scalar_registers(' '.join(ops[:2] + ops[3:] + mods)) & regs
+                        or 'idxen' in mods or None in (offset, size, flags)):
+                    return None
+                loads.add(pc)
+            continue
+        setup[pc] = None
+
+    # RDNA 2 raw bounds (OOB_SELECT=3), resource level 1, a 32-bit format,
+    # and no indexing, swizzling, thread ID, or non-buffer type flags.
+    if (not loads or flags >> 12 not in (0x31014, 0x31015, 0x31016)
+            or offset % 4 or offset < end or size == 0 or offset + size > len(code)):
+        return None
+    data = code[offset:offset + size]
+    words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-size % 4)))
+    return setup, loads, size, words
 
 
 def calculated_pc_proof(ins, kind):
@@ -3000,6 +3090,7 @@ class Stage:
     bad_sgprs = None
     _uniform_written = None
     raw_code = b''
+    embedded_buffer = None
     address_carry_pairs = ()
     address_carry_reader = None
 
@@ -3012,10 +3103,10 @@ class Stage:
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
         if self.image_proof is None:
-            if refusals is None:
-                self.ins = decode(self.raw_code)
-            else:
-                self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
+            self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs')
+                        if refusals is None or decoded is None else decoded)
+        if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
+            self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
@@ -4610,6 +4701,8 @@ class Stage:
                 raise
             refusals.append((str(reason), self.kind))
             self.calculated_pc = {}
+        if self.embedded_buffer:
+            self.calculated_pc.update(self.embedded_buffer[0])
         targets = set()
         targets.update(target for target in self.calculated_pc.values() if target is not None)
         # (branch, target) of every branch, the proven s_setpc_b64 jumps included
@@ -6514,10 +6607,8 @@ class Stage:
                 return None
             raise Unsupported(base)
         if base == 's_getpc_b64':
-            # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
-            # offset, which is not an integer this model can emit. It is elided only when the program also
-            # calculates a branch target, which calculated_pc_proof() proves and records. Reaching here means no
-            # such proof was found, so name the reason instead of reporting the mnemonic alone.
+            # The calculated branch and program-image proofs elide GETPC before
+            # scalar lowering. Keep the established diagnostic for unproven uses.
             raise Unsupported('%s: the shader load address is only elided for a program that also calculates a branch target' % base)
         raise Unsupported(base)
 
@@ -8200,8 +8291,12 @@ class Stage:
                 raise Unsupported('buffer modifier %s' % m)
         if len(ops) != 4:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
-        key = self.descriptor(ops[2])
-        buf = None if dynamic and key[0][0] == 'dynamic_heap' else self.pipe.resource(key, 'buf')
+        embedded = dynamic and self.embedded_buffer and self.pc in self.embedded_buffer[1]
+        if embedded:
+            key, buf = None, 'embedded_vs_load'
+        else:
+            key = self.descriptor(ops[2])
+            buf = None if dynamic and key[0][0] == 'dynamic_heap' else self.pipe.resource(key, 'buf')
         soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -8240,6 +8335,10 @@ class Stage:
             raise Unsupported('buffer vaddr %s without idxen or offen' % ops[1])
         if soffset is not None:
             terms.append(soffset)
+        if embedded:
+            # Keep the VGPR and scalar terms separate so overflow cannot wrap
+            # a large byte offset back into the table.
+            return buf, '%s, %s, %du' % (terms[0] if offen else '0u', soffset or '0u', offset)
         terms.append('%d' % offset)
         return buf if buf is not None else key, ' + '.join(terms)
 
@@ -8251,6 +8350,9 @@ class Stage:
             raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods, dynamic=True)
+        if buf == 'embedded_vs_load':
+            self.set_v(dst[1], '%s(%s)' % (buf, address))
+            return
         self.emit('a = %s;' % address)
         for i in range(count):
             expr = (self.dynamic_heap_load(buf, 'a + %d' % (4 * i)) if isinstance(buf, tuple)
@@ -12754,6 +12856,12 @@ VERIFIED_UINT_RTVS = frozenset((3, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 
+def unaligned_dword_body(low, high):
+    """Read a little-endian dword spanning two aligned words."""
+    return ('uint k = (a & 3) * 8, lo = %s; if (k == 0) return lo; '
+            'return (lo >> k) | (%s << (32 - k)); }' % (low, high))
+
+
 class Pipeline:
     vertex_kind = 'vs'
     uses_dynamic_heap = False
@@ -12942,7 +13050,7 @@ class Pipeline:
             for res, reg, entry in self.integer_srv_bindings():
                 yield 'srvint %d %d %d' % (res['index'], reg, entry)
 
-    def common(self):
+    def common(self, *, embedded_vertex=False):
         import pixel_aot
         twins = list(self.integer_srv_bindings())
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)', FLOAT_MINMAX,
@@ -13053,8 +13161,8 @@ class Pipeline:
                'uint bfe32(uint x, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 32u - (s1 & 31u));'
                ' uint e = (x >> (s1 & 31u)) & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u));'
                ' uint sh = (32u - w) & 31u; return sg != 0u ? asuint(asint(e << sh) >> sh) : e; }',
-               'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
-               'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
+               'uint ldu(ByteAddressBuffer b, uint a) { ' +
+               unaligned_dword_body('b.Load(a & ~3u)', 'b.Load((a & ~3u) + 4)'),
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds) + len(twins)))]
         if self.uses_dynamic_heap:
             constants = ['uint ud%d;' % i for i in range(len(self.uds) + len(twins))]
@@ -13376,6 +13484,20 @@ class Pipeline:
                 '    }',
                 '}',
             ))
+        embedded = self.vs.embedded_buffer if embedded_vertex else None
+        if embedded:
+            _, _, size, words = embedded
+            out += [
+                'static const uint embedded_vs[%d] = { %s };' %
+                (len(words), ', '.join('0x%08xu' % word for word in words)),
+                'uint embedded_vs_load(uint lane_offset, uint scalar_offset, uint imm) {',
+                '    const uint bound = %du;' % size,
+                '    if (bound < 4u || imm > bound - 4u || scalar_offset > bound - 4u - imm || '
+                'lane_offset > bound - 4u - imm - scalar_offset) return 0u;',
+                '    uint a = lane_offset + scalar_offset + imm;',
+                '    uint i = a >> 2u;',
+                '    ' + unaligned_dword_body('embedded_vs[i]', 'embedded_vs[i + 1u]'),
+            ]
         return out
 
     def interface(self, for_pixel):
@@ -13393,7 +13515,7 @@ class Pipeline:
 
     def hlsl_vs(self):
         s = self.vs
-        out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
+        out = self.common(embedded_vertex=True) + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
         s.used_v.add(0)
         flat = re.compile(r'\s*o\.fparam(\d+) = ')
         half = re.compile(r'\s*o\.hparam(\d+)_(?:lo|hi) = ')
@@ -13639,8 +13761,8 @@ class ComputePipeline(Pipeline):
             if r['kind'] == 'raw':
                 out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
         if self.rw_keys:
-            out.insert(1, 'uint ldu(RWByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
-                          'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }')
+            out.insert(1, 'uint ldu(RWByteAddressBuffer b, uint a) { ' +
+                       unaligned_dword_body('b.Load(a & ~3u)', 'b.Load((a & ~3u) + 4)'))
         return out
 
     def hlsl_cs(self):
@@ -14124,7 +14246,7 @@ def classify_decoded(ins):
 
 
 def classify(blob):
-    return classify_decoded(decode(strip_header(blob)))
+    return classify_decoded(decode(strip_header(blob), embedded_vertex=True))
 
 
 def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
@@ -14134,7 +14256,7 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     def classify_stage(blob):
         if refusals is None:
             return classify(blob)
-        ins = decode(strip_header(blob), refusals)
+        ins = decode(strip_header(blob), refusals, embedded_vertex=True)
         kind = classify_decoded(ins)
         decoded[kind] = ins
         return kind
@@ -14720,6 +14842,8 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
+                              r'for a program that also calculates a branch target'),
     # Includes a plain MRTZ covered by the terminal done+vm export in its block.
     ('f16-unary', r'SDWA form of v_(exp|rcp)_f16|^v_(exp|rcp)_f16'),
     ('writelane-vector', r'^v_writelane_b32: v\d+ is also used as a vector \('),

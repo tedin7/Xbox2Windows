@@ -34,7 +34,7 @@ std::vector<char> read_blob(const char* path)
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width, UINT height,
                               D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
-                              const std::uint32_t* constants)
+                              const std::uint32_t* constants, UINT instances)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -105,7 +105,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(vertices, 1, 0, 0);
+    list->DrawInstanced(vertices, instances, 0, 0);
     transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION out{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     out.PlacedFootprint = footprint;

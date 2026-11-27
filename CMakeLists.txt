@@ -3820,7 +3820,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_gfx2hlsl_retry_lifted PROPERTIES TIMEOUT 300)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
-    # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.
+    # GETPC refusal controls and synthetic embedded vertex table translation.
     add_test(NAME startup_gfx2hlsl_getpc_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py")
     # Image instructions with fewer than three operands (#2360 follow-up): the handler refused
@@ -4524,6 +4524,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_spill_branches_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_getpc_table_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py" "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+    set_tests_properties(startup_gfx2hlsl_getpc_table_warp PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # gfx2hlsl 16-bit vector ALU (#1723): the translated pairs drawn on WARP and hardware (FXC 5_1 and DXC 6_0),
     # four result words per draw against an exact binary16 reference.
     add_test(NAME startup_gfx2hlsl_f16_alu_draw_controls COMMAND "${INTAKE_PYTHON}" -B
