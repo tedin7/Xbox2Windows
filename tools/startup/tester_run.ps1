@@ -359,6 +359,7 @@ $GpuTime = -not $NoGpuTime
 if ($GpuTime) { $env:X2W_GPU_TIME = "1" } else { Remove-Item Env:X2W_GPU_TIME -ErrorAction SilentlyContinue }
 $StartupBelow40 = -not $NoStartupBelow40
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" } else { Remove-Item Env:X2W_XMEM_STARTUP_BELOW_40 -ErrorAction SilentlyContinue }
+$env:X2W_FILE_DIAG = "1"   # log the title's first failing file calls and the package drive's volume info (src/xmem_file_diag.cpp)
 $LowAddresses = -not $NoLowAddresses
 if ($LowAddresses) { $env:X2W_LOW_ADDRESSES = "1" } else { Remove-Item Env:X2W_LOW_ADDRESSES -ErrorAction SilentlyContinue }
 $TitleInputSnapshot = -not $NoTitleInputSnapshot
