@@ -322,6 +322,65 @@ def single_atomic_code(op_name, *, glc=False, offen=True, idxen=False, slc=False
     return prefix + body + insn + bytes.fromhex('000081bf')
 
 
+INDEX_STRIDE = 12
+OBSERVER_BASE = 928
+SCALAR_OFFSET = 8
+# Each result differs from the initial UAV word. Both compare-swap variants match.
+ADDRESS_ATOMICS = (
+    ('swap', 0x24681357, 0x24681357),
+    ('cmpswap', 0x10293847, 0x10293847),
+    ('add', 13, SENTINEL + 13),
+    ('sub', 19, SENTINEL - 19),
+    ('smin', 0x80000018, 0x80000018),
+    ('umin', 0x63000211, 0x63000211),
+    ('smax', 0x23217841, 0x23217841),
+    ('umax', 0xf8761234, 0xf8761234),
+    ('and', 0x10329087, SENTINEL & 0x10329087),
+    ('or', 0x10329087, SENTINEL | 0x10329087),
+    ('xor', 0x10329087, SENTINEL ^ 0x10329087),
+)
+
+
+def address_cases():
+    for op, operand, result in ADDRESS_ATOMICS:
+        for glc in (True, False):
+            # Include pure instruction-immediate addresses as well as inline and register soffset.
+            scalar = 0 if op == 'cmpswap' else SCALAR_OFFSET
+            yield op, operand, result, glc, scalar
+
+
+def address_pipe(indexed):
+    code = bytearray(HEAD)
+    code += s_mov_imm(12, SCALAR_OFFSET)
+    code += vop2(0x25, 1, 0x81, 0)  # v1 = lane + 1
+    code += vop2(0x1a, 2, 0x82, 0)  # v2 = lane * 4
+    for i, (op, operand, _, glc, scalar) in enumerate(address_cases()):
+        code += v_mov_imm(5, operand)
+        if op == 'cmpswap':
+            code += v_mov_imm(6, SENTINEL)
+        soffset = 12 if glc and scalar else 0x80 + scalar
+        code += mubuf(ATOMIC_OPCODES[op][0], 5, int(indexed), 16, soffset,
+                      offen=False, idxen=indexed, offset=4 + 40 * i, glc=glc)
+        code += bytes.fromhex('703f8cbf')  # s_waitcnt vmcnt(0)
+        code += vop2(0x1d, 7, 0x89, 5)   # expose the return even when it equals the initial UAV word
+        code += mubuf(0x1c, 7, 2, 16, 0x80, offset=OBSERVER_BASE + 8 * i)
+    code += bytes.fromhex('000081bf')
+    return cs_pipe(bytes(code), group=(2 if indexed else 1, 1, 1))
+
+
+def address_reference(indexed, *, first_stride=INDEX_STRIDE, first_imm=4, first_scalar=SCALAR_OFFSET,
+                      first_return=True):
+    out = [SENTINEL] * WORDS
+    for i, (_, operand, result, glc, scalar) in enumerate(address_cases()):
+        for lane in range(2 if indexed else 1):
+            stride = (first_stride if i == 0 else INDEX_STRIDE) if indexed else 0
+            immediate = first_imm if i == 0 else 4 + 40 * i
+            soffset = first_scalar if i == 0 else scalar
+            out[((lane + 1) * stride + immediate + soffset) // 4] = result
+            out[OBSERVER_BASE // 4 + 2 * i + lane] = (SENTINEL if glc and (i or first_return) else operand) ^ 9
+    return out
+
+
 def controls(llvm_mc):
     # Verify multi-op reduction and exchange/glc/EXEC/cmpswap fixtures.
     if llvm_mc:
@@ -386,14 +445,27 @@ def controls(llvm_mc):
     refused('unaligned immediate offset', lambda: cs_pipe(single_atomic_code('add', offset=2)))
     refused('unaligned immediate offset', lambda: cs_pipe(single_atomic_code('add', offset=1)))
 
-    # The off variant is limited to add + glc + a scalar register, with the same offset and modifier checks.
-    refused('without the offen address form', lambda: cs_pipe(single_atomic_code('add', offen=False)))
-    refused('without the offen address form', lambda: cs_pipe(single_atomic_code('sub', offen=False, glc=True, soffset_enc=13)))
-    refused('off requires a scalar register soffset', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True)))
+    for indexed in (False, True):
+        pipe = address_pipe(indexed)
+        hlsl = pipe.hlsl_cs()
+        if llvm_mc:
+            # Round-trip both register and inline soffset encodings for each new form.
+            vaddr = 'v1' if indexed else 'off'
+            modifier = ' idxen' if indexed else ''
+            asm = (f'buffer_atomic_swap v5, {vaddr}, s[16:19], s12{modifier} offset:4 glc\n'
+                   f'buffer_atomic_swap v5, {vaddr}, s[16:19], 8{modifier} offset:44\n')
+            expected = b''.join(mubuf(0x30, 5, int(indexed), 16, soffset, offen=False, idxen=indexed,
+                                      offset=offset, glc=glc)
+                                for soffset, offset, glc in ((12, 4, True), (0x88, 44, False)))
+            assert assemble(llvm_mc, asm) == expected
+        index = 'v1 * (ud2 & 0x3fffu) + ' if indexed else ''
+        assert f'a = ({index}0x00000008u + 4) & 0xfffffffcu;' in hlsl
+        assert f'a = ({index}52) & 0xfffffffcu;' in hlsl
+        assert ('udsrc 2 uav_stride 0' in pipe.manifest()) == indexed
+        assert 'u0.InterlockedCompareExchange(a, v6, v5, ao);' in hlsl
+        assert 'u0.InterlockedCompareStore(a, v6, v5);' in hlsl
     refused('unaligned immediate offset', lambda: soffset_pipe(2))
-    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', offen=False, idxen=True, glc=True, soffset_enc=13)))
     refused('buffer soffset vcc_lo', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True, soffset_enc=0x6a)))
-    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True)))
     refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True, offen=True)))
     refused('buffer atomic modifier slc', lambda: cs_pipe(single_atomic_code('add', slc=True)))
     refused('buffer atomic modifier dlc', lambda: cs_pipe(single_atomic_code('add', dlc=True)))
@@ -406,12 +478,15 @@ def controls(llvm_mc):
     refused('buffer atomic data', lambda: stage.buffer_atomic('buffer_atomic_cmpswap', ['v2', 'v0', 's[16:19]', '0'], ['offen']))
     refused('buffer atomic data', lambda: stage.buffer_atomic('buffer_atomic_cmpswap', ['v[2:4]', 'v0', 's[16:19]', '0'], ['offen']))
     refused('buffer soffset -4', lambda: stage.buffer_atomic('buffer_atomic_add', ['v2', 'v0', 's[16:19]', '-4'], ['offen']))
+    refused('vaddr v[0:1] for idxen', lambda: stage.buffer_atomic(
+        'buffer_atomic_add', ['v2', 'v[0:1]', 's[16:19]', '0'], ['idxen']))
     stage.kind = 'ps'
     refused('buffer_atomic_add', lambda: stage.buffer_atomic('buffer_atomic_add', ['v2', 'v0', 's[16:19]', '0'], ['offen']))
 
     # Modified and aliased descriptor refusals.
     mod_prefix = HEAD + bytes.fromhex('11ff118800000400')  # s_or_b32 s17, s17, 0x40000
     refused('modified descriptor', lambda: cs_pipe(single_atomic_code('add', prefix=mod_prefix)))
+    refused('modified descriptor', lambda: cs_pipe(single_atomic_code('add', prefix=mod_prefix, offen=False, idxen=True)))
     refused('holding None', lambda: cs_pipe(single_atomic_code('add', srsrc=20)))
     refused('holding', lambda: cs_pipe(single_atomic_code('add')).cs.buffer_atomic(
         'buffer_atomic_add', ['v2', 'v0', 's[17:20]', '0'], ['offen']))
@@ -426,15 +501,51 @@ def controls(llvm_mc):
     print('buffer_atomic controls (11 ops, scalar byte offset, glc/non-glc, alignment, modifiers, descriptors, refusals) passed')
 
 
-def run_case(directory, compiler, renderer, adapter, name, hlsl, groups, want):
+def run_case(directory, compiler, renderer, adapter, name, hlsl, groups, want, *, stride=None):
     src = directory / f'{name}.hlsl'
     cso = directory / f'{name}.cso'
     case = directory / f'{name}.case'
     src.write_text(hlsl, encoding='ascii')
     subprocess.run([compiler, '-Gis', '-WX', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
-    case.write_bytes(struct.pack('<321I', groups[0] | (groups[1] << 8) | (groups[2] << 16), *want))
-    return subprocess.run([renderer, adapter, '--compute-store-case', str(cso), str(case)],
+    case_bytes = struct.pack('<321I', groups[0] | (groups[1] << 8) | (groups[2] << 16), *want)
+    mode = '--compute-store-case'
+    if stride is not None:
+        case_bytes += struct.pack('<16I', 0, 0, stride, *([0] * 13)) + bytes(4 * WORDS)
+        mode = '--compute-store-sized-case'
+    case.write_bytes(case_bytes)
+    return subprocess.run([renderer, adapter, mode, str(cso), str(case)],
                           capture_output=True, text=True)
+
+
+def check_address_dispatch(directory, compiler, renderer, adapter, indexed):
+    name = 'idxen' if indexed else 'immediate'
+    hlsl = address_pipe(indexed).hlsl_cs()
+    want = address_reference(indexed)
+
+    def run(suffix, shader):
+        return run_case(directory, compiler, renderer, adapter, f'{name}_{suffix}', shader, (1, 1, 1), want,
+                        stride=INDEX_STRIDE if indexed else None)
+
+    result = run('all_atomics', hlsl)
+    assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (
+        name, result.stdout, result.stderr)
+    term = 'v1 * (ud2 & 0x3fffu) + ' if indexed else ''
+    address = f'a = ({term}0x00000008u + 4) & 0xfffffffcu;'
+    mutations = [
+        ('drop_immediate', address, f'a = ({term}0x00000008u) & 0xfffffffcu;', dict(first_imm=0)),
+        ('drop_scalar', address, f'a = ({term}4) & 0xfffffffcu;', dict(first_scalar=0)),
+        ('drop_return', 'v5 = ao;', '', dict(first_return=False)),
+    ]
+    if indexed:
+        mutations.append(('force_dword_stride', address, 'a = (v1 * 4u + 0x00000008u + 4) & 0xfffffffcu;',
+                          dict(first_stride=4)))
+    for suffix, old, new, override in mutations:
+        assert old in hlsl, (name, suffix, old)
+        actual = address_reference(indexed, **override)
+        first = next(i for i, (expected, observed) in enumerate(zip(want, actual)) if expected != observed)
+        result = run(suffix, hlsl.replace(old, new, 1))
+        assert result.returncode == 1 and f'word={first} expected={want[first]:08x} actual={actual[first]:08x}' in result.stderr, (
+            name, suffix, result.returncode, result.stdout, result.stderr)
 
 
 def dispatch(directory, compiler, renderer, adapter):
@@ -445,6 +556,9 @@ def dispatch(directory, compiler, renderer, adapter):
     if res.returncode == 77:
         return 77
     assert res.returncode == 0 and f'compared_words={WORDS} mismatches=0' in res.stdout, (res.stdout, res.stderr)
+
+    for indexed in (False, True):
+        check_address_dispatch(directory, compiler, renderer, adapter, indexed)
 
     exch_pipe = cs_pipe(EXCHANGE_BYTES, group=(8, 1, 1))
     exch_hlsl = exch_pipe.hlsl_cs()

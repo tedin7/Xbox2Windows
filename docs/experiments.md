@@ -15394,23 +15394,28 @@ ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_har
 
 ### Startup compute raw buffer atomics
 
-The startup compute translator lowers 32-bit gfx1013 raw `offen` MUBUF buffer
+The startup compute translator lowers 32-bit gfx1013 MUBUF buffer
 atomics (`buffer_atomic_add`, `sub`, `smin`, `umin`, `smax`, `umax`, `and`,
 `or`, `xor`, `swap`, and `cmpswap`) through fixed-table unmodified `RWByteAddressBuffer`
-descriptors (`u0`). Addresses combine the `vaddr` byte offset, optional `soffset`
-register or aligned immediate, and aligned 12-bit `offset` rounded down by
-`& 0xfffffffcu`, guarded under `(exec & 1)` when `EXEC` is narrowed.
+descriptors (`u0`). The raw UAV view starts at the descriptor base. The byte
+address within it adds the scalar `soffset` and 12-bit `offset` to the
+`offen` VGPR byte offset, the `idxen` VGPR index times the descriptor's
+14-bit stride, or zero for `off`. The summed immediate terms
+must be dword-aligned. The emitted address rounds down to a dword, and
+`(exec & 1)` guards the atomic when `EXEC` is narrowed. Indexed addressing
+assumes a non-swizzled descriptor.
 
 `glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
 `cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
 `(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
 and `smin`/`smax` use signed `asint` overloads.
-Returning `buffer_atomic_add` also accepts `off` with a scalar byte offset
-register. The fixture increments separate counters at scalar offsets 0 and 32
-with immediate offsets 0 and 4, and records the returned old values.
-Each readback compares all 320 words, including the untouched guards.
-Dropping either offset, the old-value return, or the observer store changes
-the expected output. `idxen`, other scalar-only forms, `slc`/`dlc`,
+The synthetic address fixtures exercise all eleven operations with and without
+`glc` for `idxen` and `off`, using instruction immediates and inline or
+register `soffset`. The indexed fixture uses two lanes and a 12-byte stride.
+Each dispatch checks all 320 UAV words against a CPU reference, including the
+observed return values and untouched words. Mutations remove the immediate,
+scalar offset or return, or replace the descriptor stride with four bytes.
+The combined `idxen offen` form, `slc`/`dlc`,
 unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
 and `inc`/`dec`/float/64-bit forms stay refused.
 
