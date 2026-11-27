@@ -43,6 +43,7 @@ struct Scene {
     void* view_heap = nullptr;
     Word view_cpu = 0, view_gpu = 0;
     UINT view_stride = 0;
+    UINT draws_from = ~0u, draws_per_frame = 1;  // X2W_TEST_REPLAY_DRAWS
     alignas(64) unsigned char title_rtvs[512]{};
     void* signature = nullptr;
     void* arguments = nullptr;
@@ -357,7 +358,7 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
                     invoke(s.list, 36, 0, s.view_gpu + s.view_stride);
                 }
             }
-            invoke(s.list, 12, 3, 1);
+            for (UINT draw = frame >= s.draws_from ? s.draws_per_frame : 1; draw; --draw) invoke(s.list, 12, 3, 1);
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
@@ -427,6 +428,12 @@ int main(int argc, char** argv)
     char pause[32]{};
     unsigned pause_frame = ~0u, pause_ms = 0;
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PAUSE", pause, sizeof(pause)) && std::sscanf(pause, "%u,%u", &pause_frame, &pause_ms) != 2)
+        return 2;
+    // X2W_TEST_REPLAY_DRAWS=<frame>,<draws>: that many draws in each frame from that frame on, one before it (a loading
+    // screen, then play, for the recorder's "d" trigger).
+    char draws[32]{};
+    if (GetEnvironmentVariableA("X2W_TEST_REPLAY_DRAWS", draws, sizeof(draws)) &&
+        (std::sscanf(draws, "%u,%u", &scene.draws_from, &scene.draws_per_frame) != 2 || !scene.draws_per_frame))
         return 2;
     char layouts[2]{};
     const bool slot_layouts = GetEnvironmentVariableA("X2W_REPLAY_SLOT_LAYOUTS", layouts, sizeof(layouts)) == 1 && layouts[0] == '1';
