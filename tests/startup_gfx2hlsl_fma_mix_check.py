@@ -197,12 +197,19 @@ expect_refused('high half of a register with undefined upper bits',
 expect_refused('binary32 use of a register with undefined upper bits',
                encode(MIX_F32, 1, (v2, v3, v4)),
                'v_fma_mix_f32 v1, v2, v3, v4', low16_only_v={2})
-expect_refused('op_sel on a binary32 negated inline 0',
-               encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 0, 1), neg=(0, 0, 1)),
-               'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,0,1]')
-expect_refused('op_sel without op_sel_hi (high half of a binary32 source)',
-               encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0)),
-               'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0]')
+expect('op_sel ignored on binary32 negated inline 0',
+       encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 0, 1), neg=(0, 0, 1)),
+       'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,0,1]',
+       'v1 = U(mix32(F(v2), F(v3), (-0.0)));')
+plain_mixed = expect('binary32 and binary16 sources',
+       encode(MIX_F32, 1, (v2, v3, v4), op_sel_hi=(0, 1, 1)),
+       'v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[0,1,1]',
+       'v1 = U(mix32(F(v2), f16tof32(v3), f16tof32(v4)));')
+ignored_mixed = expect('op_sel ignored on binary32 source',
+       encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(0, 1, 1)),
+       'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0] op_sel_hi:[0,1,1]',
+       'v1 = U(mix32(F(v2), f16tof32(v3), f16tof32(v4)));')
+check('ignored binary32 selector emits identical text', plain_mixed == ignored_mixed)
 for src, value in enumerate((0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0), 240):
     expect(f'low-half binary16 inline {value}',
            encode(MIX_F32, 1, (v2, src, v4), op_sel_hi=(0, 1, 0)),

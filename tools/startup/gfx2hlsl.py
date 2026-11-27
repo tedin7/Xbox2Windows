@@ -16528,8 +16528,7 @@ class Stage:
         half, hi, clamp = self.mix_selections(mods)
 
         def operand(tok, is_half, is_hi):
-            if not is_half and is_hi:
-                raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)
+            # AMD RDNA 2 ISA guide, V_FMA_MIX_F32 (p. 173): op_sel is ignored for binary32.
             if tok == '-0':
                 # neg on inline 0 is -0.0 in either format; f() would print +0.0, which changes a -0 product.
                 return '(-0.0)'
