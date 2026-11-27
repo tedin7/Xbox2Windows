@@ -10042,11 +10042,15 @@ class Stage:
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None):
-        if self.kind not in ('ps', 'cs') or len(ops) != 4:
+        level_zero = name == 'image_gather4_lz'
+        if self.kind == 'vs' and level_zero:
+            if len(ops) != 4:
+                raise Unsupported('%s requires four operands' % name)
+        elif self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
-        compute_lz = self.kind == 'cs' and name == 'image_gather4_lz'
+        extended_lz = self.kind in ('cs', 'vs') and level_zero
         for modifier in mods:
-            if compute_lz and modifier == 'unorm':
+            if extended_lz and modifier == 'unorm':
                 continue
             if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
                 raise Unsupported('%s modifier %s' % (name, modifier))
@@ -10075,7 +10079,7 @@ class Stage:
             raise Unsupported('%s requires a constant sampler' % name)
         from pixel_aot import check_gather_sampler
         profiled = gather_2d_profile_words(words)
-        if compute_lz:
+        if extended_lz:
             w0, w1, w2, w3 = profiled
             # The static sampler decoder directly represents these RDNA 2 address modes.
             # Half-border and mirror-once-border have no matching D3D12 address mode.
@@ -10097,7 +10101,7 @@ class Stage:
             # the 2D gather profile and enforces words[1] MAX_LOD plus view mip bounds in HLSL.
             check_gather_sampler(profiled, 1, comparison=False)
         except ValueError as error:
-            if compute_lz:
+            if extended_lz:
                 raise Unsupported('%s sampler: unsupported filter, LOD or descriptor flags' % name) from error
             raise Unsupported('%s sampler: %s' % (name, error)) from error
         if self.kind == 'cs' and not self.null_descriptor(ops[2]):
@@ -10111,7 +10115,7 @@ class Stage:
         raise Unsupported('image_gather4 requires the guest implicit mip level')
 
     def op_image_gather4_lz(self, ops, mods):
-        regs = [] if self.kind == 'cs' else None
+        regs = [] if self.kind in ('cs', 'vs') else None
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
             'image_gather4_lz', ops, mods, 2, 'two VGPR address registers' if regs is not None else
             'two contiguous address registers', mip_preclamp=True, regs_out=regs)
@@ -10120,6 +10124,7 @@ class Stage:
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in (regs if regs is not None else range(addr[1], addr[2] + 1)))
         coords = 'float2(%s, %s)' % (u, v)
+        # Texture2D.Gather* uses view mip zero in every stage, without derivatives.
         if regs is not None and (words[0] & (1 << 15) or 'unorm' in mods):
             # GetDimensions with no mip argument returns the extent at view mip zero.
             self.emit('{ uint gw, gh; %s.GetDimensions(gw, gh); t = %s.Gather%s(%s, %s / float2(gw, gh)); }' %
