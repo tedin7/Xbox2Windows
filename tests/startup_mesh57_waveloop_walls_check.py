@@ -32,6 +32,25 @@ def check_exec_zero_non_rejoining_exit():
         assert 's20 may be read before it is written' in status, status
 
 
+def check_descriptor_pair_moves_through_vcc():
+    prefix = SERIAL_MESH[:8] + [
+        'f4081909', 'fa000000',  # s_load_dwordx4 s[100:103], s[18:19], 0
+        'bee80464',              # s_mov_b64 s[104:105], s[100:101]
+        'beea0466',              # s_mov_b64 vcc, s[102:103]
+    ]
+    for move, descriptor in [
+        ([], '801a0600'),  # use s[104:107] directly
+        (['bee60480', 'bee6046a', 'beea0480'], '80190600'),  # restore s[102:103] from VCC
+    ]:
+        program = prefix + move + ['e0301000', descriptor] + SERIAL_MESH[8:]
+        status, output = run(program, 'force', artifacts=True)
+        assert status == 'ok', status
+        assert b'descword' not in output['ms57.txt'], output['ms57.txt']
+    status, _ = run(prefix + ['bf860000'] + SERIAL_MESH[8:], 'force')  # s_cbranch_vccz
+    assert 'mask word s106 holds desc' in status, status
+
+
 if __name__ == '__main__':
     check_descriptor_shift_add()
     check_exec_zero_non_rejoining_exit()
+    check_descriptor_pair_moves_through_vcc()

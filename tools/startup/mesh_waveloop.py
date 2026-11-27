@@ -379,7 +379,8 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
                 for reg in sorted(reads):
                     if re.fullmatch(r's\d+', reg) and self.sym.get(int(reg[1:])) == STUB_RESULT:
                         raise G.Unsupported('wave loop: %s holds %s' % (reg, STUB_RESULT[0]))
-                if any(op in VCC_REGISTERS for op in ops) or real_name.startswith('s_cbranch_vcc'):
+                if (real_name != 's_mov_b64' and any(op in VCC_REGISTERS for op in ops)
+                        or real_name.startswith('s_cbranch_vcc')):
                     for reg in ('s106', 's107'):
                         symbol = self.sym.get(int(reg[1:]))
                         if reg in reads and symbol and not G.run_time_symbol(symbol):
@@ -607,7 +608,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             raise G.Unsupported('wave loop: unsupported scalar ' + name)
 
         def symbolic_move(self, ops):
-            dst, src = map(G.reg_range, ops)
+            dst, src = (G.reg_range('s[106:107]' if op == 'vcc' else op) for op in ops)
             if not dst or dst[0] != 's' or dst[2] != dst[1] + 1:
                 return False
             if src is None and (re.fullmatch(r'-?(?:0x[0-9a-f]+|[0-9]+)', ops[1]) or ops[1] in G.FLOATS):
@@ -621,7 +622,13 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             if JOINED in symbols:
                 raise G.Unsupported('wave loop: symbolic pair is joined across blocks')
             if any(sym and not G.run_time_symbol(sym) for sym in symbols):
-                super().one('s_mov_b64', 's_mov_b64 ' + ', '.join(ops))
+                # A descriptor word is represented by provenance only. Copy
+                # that provenance through VCC as through any other SGPR pair.
+                values = [self.S(n) if sym is None or G.run_time_symbol(sym) else None
+                          for n, sym in zip(range(src[1], src[2] + 1), symbols)]
+                for n, sym, value in zip(range(dst[1], dst[2] + 1), symbols, values):
+                    kept = sym if value is None or (sym and sym[0] == 'const') else None
+                    self.set_s(n, value, kept)
                 return True
             self.write_pair(ops[0], self.vector_pair(ops[1]))
             for n, sym in zip(range(dst[1], dst[2] + 1), symbols):
