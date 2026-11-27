@@ -18190,9 +18190,56 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
+PIPELINE_KEY_REVISION = b'x2w-startup-shader-28'
+COMPUTE_KEY_REVISION = b'x2w-startup-shader-28cs'
+MESH57_KEY_REVISION = b'x2w-startup-mesh-57-3'
+
+GRAPHICS_KEY_MISMATCH = 'shader request source key mismatch'
+COMPUTE_KEY_MISMATCH = 'compute request files do not match the key in their name'
+MESH57_KEY_MISMATCH = 'slot 57 mesh request key mismatch'
+KEY_MISMATCH_REFUSALS = frozenset((GRAPHICS_KEY_MISMATCH, COMPUTE_KEY_MISMATCH, MESH57_KEY_MISMATCH))
+KEY_SEED_NAME = 'x2w_key_seed.txt'
+
+
+def is_key_mismatch(reason):
+    return str(reason) in KEY_MISMATCH_REFUSALS
+
+
 def shader_cache_seed(revision):
     seed = fnv(revision)
     return fnv(b'extended-buffer-formats1', seed) if extended_buffer_formats() else seed
+
+
+def key_seed_line():
+    return ('x2w-key-seed v1 graphics=%016x compute=%016x mesh57=%016x extended_buffer_formats=%d' % (
+        shader_cache_seed(PIPELINE_KEY_REVISION), shader_cache_seed(COMPUTE_KEY_REVISION),
+        shader_cache_seed(MESH57_KEY_REVISION), extended_buffer_formats()))
+
+
+def read_key_seed(cache_dir):
+    try:
+        with open(os.path.join(cache_dir, KEY_SEED_NAME), encoding='utf-8', errors='replace') as handle:
+            return handle.readline().rstrip('\r\n')
+    except FileNotFoundError:
+        return None
+
+
+def stamp_key_seed(cache_dir):
+    """Stamp an unstamped cache and return the seed found before stamping, if any."""
+    ours = key_seed_line()
+    theirs = read_key_seed(cache_dir)
+    if theirs is None:
+        try:
+            atomic_retry_text(os.path.join(cache_dir, KEY_SEED_NAME), ours + '\n', replace=False)
+            return None
+        except FileExistsError:
+            theirs = read_key_seed(cache_dir)
+    if theirs != ours:
+        print(f"x2w-gfx key seed mismatch: cache has '{theirs}', this translator uses '{ours}'; "
+              'requests written with the other seed are refused as key mismatches '
+              '(re-key with tools/startup/shader_cache_rekey.py or set X2W_EXTENDED_BUFFER_FORMATS=0)',
+              file=sys.stderr)
+    return theirs
 
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
@@ -18202,7 +18249,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, shader_cache_seed(b'x2w-startup-shader-28'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, shader_cache_seed(PIPELINE_KEY_REVISION))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -18212,7 +18259,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs" and the enabled feature tag, then each part preceded by its length
     as a little-endian u64: the code, words 7-8 blob, root signature, 12 description words with their
     pointers zeroed, and two state blocks."""
-    key = shader_cache_seed(b'x2w-startup-shader-28cs')
+    key = shader_cache_seed(COMPUTE_KEY_REVISION)
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
@@ -18246,7 +18293,7 @@ def load_compute_request(out_dir, key, refusals=None):
         if len(parts[ext]) != words[word]:
             raise Unsupported('compute request %s is %d bytes, the description says %d' % (ext, len(parts[ext]), words[word]))
     if compute_key(parts['.c67'], parts['.data'], parts['.root'], desc, parts['.sa'], parts['.sb']) != key:
-        raise Unsupported('compute request files do not match the key in their name')
+        raise Unsupported(COMPUTE_KEY_MISMATCH)
     code = parts['.c67']
     if not code or len(code) % 4:
         raise Unsupported('compute code of %d bytes is not whole dwords' % len(code))
@@ -18578,7 +18625,7 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         if pipeline_key(a, b, root, layout, masks) != base:
             raise Unsupported('RTV variant source key mismatch' if request else
                               'pixel input description names another pipeline' if masks is not None else
-                              'shader request source key mismatch')
+                              GRAPHICS_KEY_MISMATCH)
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -18697,7 +18744,7 @@ def read_ps_inputs(path, key):
 
 
 def mesh57_key(ms, ps, root):
-    value = shader_cache_seed(b'x2w-startup-mesh-57-3')
+    value = shader_cache_seed(MESH57_KEY_REVISION)
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value
@@ -18750,7 +18797,7 @@ def translate_mesh57(out_dir, key):
     source = os.path.join(out_dir, 'req_%016x' % key)
     ms, ps, root = (open(source + ext, 'rb').read() for ext in ('.m57', '.ps57', '.root'))
     if mesh57_key(ms, ps, root) != key:
-        raise Unsupported('slot 57 mesh request key mismatch')
+        raise Unsupported(MESH57_KEY_MISMATCH)
     parse_root(root)
     mesh = decode(strip_header(ms))
     exports = [assembly.split()[1] for _, _, op, assembly in mesh if op == 'exp']
@@ -18862,6 +18909,52 @@ REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped inst
                    'so Only counts at pipeline scope reflect a lower bound on the reasons reached.')
 
 
+# Ready markers are published last. RTV variants use a different key and refer to a base request.
+KEY_REQUEST_KINDS = {'a': 'g', 'c67': 'c', 'm57': 'm57'}
+KEY_REQUEST_PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.a'),
+                     'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
+                     'm57': ('.ps57', '.root', '.m57')}
+
+
+def read_key_request_parts(out_dir, kind, key):
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    parts = {}
+    for ext in KEY_REQUEST_PARTS[kind]:
+        path = name + ext
+        if ext in ('.ia', '.psin') and not os.path.isfile(path):
+            continue
+        with open(path, 'rb') as handle:
+            parts[ext] = handle.read()
+    return parts
+
+
+def recompute_request_key(out_dir, kind, key, parts):
+    if kind == 'g':
+        description = os.path.join(out_dir, 'req_%016x.psin' % key)
+        masks = read_ps_inputs(description, key)
+        return pipeline_key(parts['.a'], parts['.b'], parts['.root'], parts.get('.ia', b''), masks)
+    if kind == 'm57':
+        return mesh57_key(parts['.m57'], parts['.ps57'], parts['.root'])
+    return compute_key(parts['.c67'], parts['.data'], parts['.root'], parts['.desc'], parts['.sa'], parts['.sb'])
+
+
+def key_mismatch_count(cache_dir):
+    """Count ready base requests and how many readable requests hash to a different key."""
+    mismatched = total = 0
+    for name in os.listdir(cache_dir):
+        match = re.fullmatch(r'req_([0-9a-f]{16})\.(a|c67|m57)', name)
+        if not match:
+            continue
+        total += 1
+        key, kind = int(match[1], 16), KEY_REQUEST_KINDS[match[2]]
+        try:
+            parts = read_key_request_parts(cache_dir, kind, key)
+            mismatched += recompute_request_key(cache_dir, kind, key, parts) != key
+        except (OSError, Unsupported):
+            continue
+    return mismatched, total
+
+
 def request_keys(out_dir, compute=False):
     """Graphics request keys (ready marker .a or .rtv), or with compute, slot 67 compute keys (.c67)."""
     pattern = r'req_([0-9a-f]{16})\.c67' if compute else r'req_([0-9a-f]{16})\.(?:a|rtv)'
@@ -18905,7 +18998,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, request, fetch, decoded, attr_map = load_request(
+            out_dir, key, refusals, pair_info, validate_base_key=True)
         ps_inputs = request_ps_inputs(out_dir, key)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
@@ -18999,12 +19093,28 @@ def refusals_main(argv):
                                      epilog=REFUSALS_CAVEAT, allow_abbrev=False)
     parser.add_argument('--refusals', required=True, metavar='CACHE_DIR')
     parser.add_argument('--json', action='store_true', help='emit the report as JSON')
+    parser.add_argument('--replay-sha', metavar='SHA', help='replay revision to include in the report')
+    parser.add_argument('--allow-key-mismatch', action='store_true', help='report despite request-key mismatches')
     args = parser.parse_args(argv)
     if not os.path.isdir(args.refusals):
         parser.error('CACHE_DIR must be an existing directory')
+    header = dict(translator=translator_version()[:12], cache_key_seed=read_key_seed(args.refusals) or 'unstamped',
+                  translator_key_seed=key_seed_line(), replay=args.replay_sha or os.environ.get('X2W_REPLAY_SHA') or 'unknown')
+    if not args.json:
+        print('Translator: %(translator)s\nCache key seed: %(cache_key_seed)s\n'
+              'Translator key seed: %(translator_key_seed)s\nReplay: %(replay)s' % header)
+    if not args.allow_key_mismatch:
+        mismatched, total = key_mismatch_count(args.refusals)
+        if mismatched * 100 > total:
+            print(f'refusals: {mismatched} of {total} requests ({mismatched / total:.1%}) are request-key mismatches: '
+                  f"the cache was written with another key seed (cache: {header['cache_key_seed']}, "
+                  f"translator: {header['translator_key_seed']}). Re-key it with tools/startup/shader_cache_rekey.py "
+                  f'{args.refusals} <new dir> or set X2W_EXTENDED_BUFFER_FORMATS=0; --allow-key-mismatch reports anyway.',
+                  file=sys.stderr)
+            return 3
     report = refusals_report(args.refusals)
     if args.json:
-        print(json.dumps(report))
+        print(json.dumps(dict(header=header, **report)))
         return
     requests = report['per_request']
     print('Per request key')
@@ -19257,14 +19367,17 @@ def write_failure(path, reason, *, version=None, context=None):
     atomic_retry_text(path, '%sx2w-refusal-v1 %s %s\n' % (detail, version, family))
 
 
-def atomic_retry_text(path, content):
+def atomic_retry_text(path, content, *, replace=True):
     handle = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(path) or '.',
                                          prefix='.retry-', delete=False)
     temporary = handle.name
     try:
         with handle:
             handle.write(content)
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)  # Publish atomically without replacing a concurrent writer's file.
     finally:
         with suppress(FileNotFoundError):
             os.remove(temporary)
@@ -19700,6 +19813,16 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     waiting for the next pass; a request already handled in this pass is queued again only when its marker is
     rewritten. Results are printed as they finish.
     """
+    cache_seed = None
+    try:
+        cache_seed = stamp_key_seed(out_dir)
+    except OSError as error:
+        print(f'x2w-gfx cannot stamp key seed: {error}', file=sys.stderr)
+    mismatched, total = key_mismatch_count(out_dir)
+    if mismatched * 100 > total:
+        print(f'x2w-gfx key seed mismatch: {mismatched} of {total} requests ({mismatched / total:.1%}) in '
+              f"{os.path.basename(os.path.normpath(out_dir))} do not match this translator's key seed "
+              f"'{key_seed_line()}' (cache seed: '{cache_seed or 'unstamped'}')", file=sys.stderr)
     stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
     if not queue:
@@ -19836,4 +19959,4 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
     return keys
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -16221,6 +16221,8 @@ The startup shader translator normally stops a pipeline at its first refusal. Fi
 
 `python -B tools/startup/gfx2hlsl.py --refusals <cache-dir> [--json]` surveys an existing cache directory, including requests that already have a `.txt` or `.fail`. The diagnostic writes nothing and translates in memory without invoking fxc. On older translator revisions, `--refusals DIR` is treated as `--pending DIR` and writes into that directory.
 
+Pending translation and re-keying write `x2w_key_seed.txt` when absent. The census reports the cache and translator seeds and exits with status 3 before translation if more than 1% of ready base request keys differ, unless `--allow-key-mismatch` is set.
+
 The text and JSON reports show two views.
 
 - **Per request key** includes RTV variants. Each reason and scope row counts requests containing that refusal, requests where it was the first site reached, and requests where it was the only distinct reason. Repeating the same reason at several sites still counts toward Only. The refusal sites per request histogram counts each site reached. **No refusal recorded (not compiled)** counts requests with zero recorded sites.
