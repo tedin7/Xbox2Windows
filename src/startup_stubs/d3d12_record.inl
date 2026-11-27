@@ -648,10 +648,13 @@ bool hold_srv(u64 seq, u64 object, const u64 (&args)[call_args])
     std::memcpy(e.args, args, sizeof(e.args));
     if (!args[2] || !copy_readable(args[0], e.resource, sizeof(e.resource)) || !copy_readable(args[1], e.view, sizeof(e.view)))
         return false;
+    // window_open is set before emit_held_srvs() takes this lock: an insert that sees it set after the swap must not be
+    // held (nothing would write it), so the caller records it in the file instead.
     AcquireSRWLockExclusive(&held_srv_lock);
-    held_srvs()[args[2]] = e;
+    const bool hold = !window_open.load(std::memory_order_relaxed);
+    if (hold) held_srvs()[args[2]] = e;
     ReleaseSRWLockExclusive(&held_srv_lock);
-    return true;
+    return hold;
 }
 // A prefix copy reads descriptors: the held writes it may read go to the file first (their sequence precedes the copy's).
 void flush_held_srvs(bool all, u64 first, u64 bytes)
