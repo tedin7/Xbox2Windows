@@ -111,6 +111,13 @@ int main(int argc, char** argv)
                                              DXGI_FORMAT_R8G8B8A8_UNORM, false).refusal == CopyRefusal::bad_subresource);
     check("resolve subresource out of range", plan_resolve(&rgba, 1, &msaa, 0, DXGI_FORMAT_R8G8B8A8_UNORM, false).refusal ==
                                                   CopyRefusal::bad_subresource);
+    auto depth = rgba;
+    depth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    auto depth_msaa = depth;
+    depth_msaa.SampleDesc = msaa.SampleDesc;
+    check("legacy planar resolve refused", plan_resolve(&depth, 0, &depth_msaa, 0,
+        DXGI_FORMAT_D24_UNORM_S8_UINT, false).refusal == CopyRefusal::bad_format);
     check("resolve other format", plan_resolve(&rgba, 0, &msaa, 0, DXGI_FORMAT_R32_FLOAT, false).refusal == CopyRefusal::format_mismatch);
     const auto hdr_source = texture(4, 4, DXGI_FORMAT_R16G16B16A16_TYPELESS, 4);
     const auto hdr_target = texture(4, 4, DXGI_FORMAT_R16G16B16A16_TYPELESS);

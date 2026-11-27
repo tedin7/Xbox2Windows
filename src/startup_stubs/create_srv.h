@@ -36,12 +36,12 @@ inline SrvHistory recent_srvs()
     return snapshot;
 }
 
-inline void srv_diagnostic(const char* site, const char* action, unsigned field, UINT from, UINT to, SrvLog log)
+inline void srv_diagnostic(const char* site, const char* action, const char* field, UINT from, UINT to, SrvLog log)
 {
     static LONG lines;
     if (InterlockedIncrement(&lines) > 64) return;
     char line[256];
-    std::snprintf(line, sizeof(line), "x2w-d3d12 SRV %s: site=%s field/reason=%u %u -> %u",
+    std::snprintf(line, sizeof(line), "x2w-d3d12 SRV %s: site=%s field/reason=%s %u -> %u",
                   action, site, field, from, to);
     if (log) log("%s", line);
     else {
@@ -111,7 +111,7 @@ inline view_desc::Refusal validate_srv(ID3D12Device* device, D3D12_SHADER_RESOUR
         device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
     const auto refusal = view ? view_desc::check(*view, resource, dropped_levels,
         [&](view_desc::Field field, UINT from, UINT to) {
-            srv_diagnostic(site, "repaired", static_cast<unsigned>(field), from, to, log);
+            srv_diagnostic(site, "repaired", view_desc::field_name(field), from, to, log);
         }, options.CastingFullyTypedFormatSupported != FALSE) : view_desc::check_default(resource);
     if (refusal != Refusal::none) return refusal;
     const auto dimension = view ? view->ViewDimension : view_desc::default_dimension(resource);
@@ -142,7 +142,7 @@ inline bool x2w_create_srv(ID3D12Device* device, ID3D12Resource* resource,
             checked.RaytracingAccelerationStructure.Location % D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT)
             refusal = Refusal::format;
         if (!view_desc::valid_mapping(checked.Shader4ComponentMapping)) {
-            srv_diagnostic(site, "repaired", static_cast<unsigned>(view_desc::Field::mapping),
+            srv_diagnostic(site, "repaired", view_desc::field_name(view_desc::Field::mapping),
                            checked.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, log);
             checked.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         }
@@ -164,7 +164,7 @@ inline bool x2w_create_srv(ID3D12Device* device, ID3D12Resource* resource,
             if (view_desc::valid_mapping(checked.Shader4ComponentMapping))
                 canonical.Shader4ComponentMapping = checked.Shader4ComponentMapping;
             else
-                srv_diagnostic(site, "repaired", static_cast<unsigned>(view_desc::Field::mapping),
+                srv_diagnostic(site, "repaired", view_desc::field_name(view_desc::Field::mapping),
                                checked.Shader4ComponentMapping, canonical.Shader4ComponentMapping, log);
             checked = canonical;
         }
@@ -173,7 +173,7 @@ inline bool x2w_create_srv(ID3D12Device* device, ID3D12Resource* resource,
     }
 
     if (refusal != Refusal::none) {
-        srv_diagnostic(site, "refused (writing null)", static_cast<unsigned>(refusal), 0, 0, log);
+        srv_diagnostic(site, "refused (writing null)", view_desc::refusal_field_name(refusal), 0, 0, log);
         auto format = desc ? desc->Format : backing.Format;
         if (dimension != D3D12_SRV_DIMENSION_BUFFER &&
             !(dimension >= D3D12_SRV_DIMENSION_TEXTURE1D && dimension <= D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) &&
