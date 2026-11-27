@@ -1239,14 +1239,10 @@ void forget_resource_maps(Wrapper* w)
 
 ULONG __stdcall release(Wrapper* self)
 {
-    const bool resource = self->own().kind == resource_kind;
-    // Serialize the last release with Maps made after the wrapper is referenced again.
-    if (resource) AcquireSRWLockExclusive(&resource_map_lock);
     const auto refs = InterlockedDecrement(&self->own().refs);
-    if (resource) {
-        if (!refs) resource_maps.forget(self);
-        ReleaseSRWLockExclusive(&resource_map_lock);
-    }
+    // A resource may be released while mapped (persistent mapping): its map counts end with it, with no Unmap.
+    // Only the last release takes the lock, so the hot Release path stays lock-free.
+    if (!refs && self->own().kind == resource_kind) forget_resource_maps(self);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
