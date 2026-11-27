@@ -1,4 +1,4 @@
-"""wave32 vcc_hi as an ordinary scalar register in tools/startup/gfx2hlsl.py, read back from a real D3D12 draw.
+"""Wave32 VCC words in the graphics translator, with optional D3D12 readback.
 
   (no arguments)                       translation controls and refusals, pure Python
   binary <llvm-mc>                     assemble the fixture sources with LLVM (gfx1013) and compare with the words here
@@ -22,13 +22,20 @@ The reference below computes the same words with Python integers. The selected w
 integers 1 and 2, and the carry rides on v0 + 0x40000000: with FXC a word that can only be 0 or 1 came back as
 0 on WARP where it was 1 (DXC kept it), a denormal export artifact, not a translation error. Mutations (the compare bit not read, the carry
 lost, vcc_hi read as zero) must fail the draw.
+
+PS_DATA also exports a hardwired low-word comparison and two scalar arithmetic results. A first-lane read at the
+join of a uniform branch exercises both retries. The exports use normal float bit patterns for both compilers.
+PS_DATA2 keeps a pair write in place and reads uniform scalar selects as VOP3 masks.
 """
+import hashlib
+import os
 import re
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -151,6 +158,209 @@ v_add_nc_u32_e32 v5, s1, v0
 exp mrt0 v5, v0, v0, v0 done vm
 s_endpgm
 ''', '0002047e0205d67e6b90018001000a4a0f1800f805000000000081bf', None),
+    'PS_DATA': ('''v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+v_add_co_u32 v6, vcc_hi, v0, 0xfff7fff8
+v_add_co_ci_u32_e64 v3, s3, v0, 0, vcc_hi
+s_movk_i32 vcc_lo, 0x80
+s_mul_i32 vcc_lo, vcc_lo, 2
+s_add_u32 s20, vcc_lo, 0x3f800000
+s_sub_i32 vcc_hi, 0, vcc_lo
+s_mul_hi_u32 vcc_hi, 0x40000000, vcc_hi
+s_mov_b32 s21, 0x10000000
+s_add_u32 s21, s21, vcc_hi
+v_add_nc_u32_e32 v3, s20, v3
+v_add_nc_u32_e32 v4, s21, v0
+v_mov_b32_e32 v7, 1.0
+s_cmp_eq_u32 s20, 0
+s_cbranch_scc1 1
+v_mov_b32_e32 v7, 2.0
+v_readfirstlane_b32 s22, v7
+v_cmp_gt_u32_e32 vcc_lo, 0x90009, v0
+v_mov_b32_e32 v6, s22
+v_cndmask_b32_e32 v5, 1.0, v6, vcc_lo
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+''',
+        '6b00c4d400ff010005000500020001d5f2e8ad01066b0fd700ff0100f8fff7ff030328d50001ad0180006ab06a826a93'
+        '6af21480806aeb81f46beb9aff0395be00000010156b15801406064a1500084af2020e7e148006bf010085bff4020e7e'
+        '07052c7eff00887d0900090016020c7ef20c0a020f1800f802030405000081bf', None),
+    # The extra scalar ranges reserve s8 through s105 and force the retry to use the low SGPRs.
+    'PS_DATA2': ('''s_mov_b64 vcc, 0x14500000
+s_mov_b32 vcc_hi, 0x3f800000
+s_add_u32 s20, vcc_hi, 16
+v_add_nc_u32_e32 v5, s20, v0
+s_cmp_eq_u32 s20, 0x3f800010
+s_cselect_b32 vcc_hi, -1, 0
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+v_add_co_ci_u32_e64 v3, s3, v0, 0, vcc_hi
+v_add_nc_u32_e32 v3, 1.0, v3
+s_cmp_eq_u32 s20, 0
+s_cselect_b32 vcc_lo, -1, 0
+v_cndmask_b32_e64 v4, 1.0, 2.0, vcc_lo
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+''',
+        'ff04eabe00005014f203ebbe6b90148014000a4a14ff06bf1000803fc1806b85020001d5f2e8ad01030328d50001ad01'
+        'f206064a148006bfc1806a85040001d5f2e8a9010f1800f802030405000081bf', None),
+    'PAIR_REACH': ('''s_mov_b32 exec_lo, -1
+s_mov_b32 vcc_hi, 0x40000000
+s_mov_b64 vcc, 0x14500000
+s_add_u32 s20, vcc_hi, 16
+s_mov_b32 vcc_hi, 0x3f800000
+s_add_u32 s21, vcc_hi, s20
+v_mov_b32_e32 v2, s21
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''', 'c103febef403ebbeff04eabe000050146b901480f203ebbe6b1415801502047e0f1800f802020202000081bf', "operand 'vcc_hi'"),
+    'UNIFORM_MOVES': ('''s_movk_i32 vcc_hi, -1
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+s_mov_b32 vcc_lo, 0
+v_cndmask_b32_e64 v3, 1.0, 2.0, vcc_lo
+s_movk_i32 vcc_lo, 0
+v_cndmask_b32_e32 v4, 1.0, v2, vcc_lo
+s_mov_b32 vcc_hi, -1
+v_cndmask_b32_e64 v5, 1.0, 2.0, vcc_hi
+exp mrt0 v2, v3, v4, v5 done vm
+s_endpgm
+''',
+        'ffff6bb0020001d5f2e8ad018003eabe030001d5f2e8a90100006ab0f2040802c103ebbe050001d5f2e8ad010f1800f8'
+        '02030405000081bf', None),
+    'PS_DESCRIPTOR': ('''s_load_dwordx8 s[100:107], s[8:9], 0x0
+s_load_dwordx4 s[12:15], s[8:9], 0x20
+s_mov_b32 s24, 0
+s_mov_b32 s25, 0
+s_mov_b32 s26, 0
+s_mov_b32 s27, 0
+v_mov_b32_e32 v1, 0.5
+v_mov_b32_e32 v2, 0.5
+s_waitcnt lgkmcnt(0)
+image_sample_lz v[8:11], v[1:2], s[100:107], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D
+s_load_dwordx16 s[16:31], s[8:9], 0x30
+s_load_dwordx16 s[32:47], s[8:9], 0x70
+s_load_dwordx16 s[48:63], s[8:9], 0xb0
+s_load_dwordx16 s[64:79], s[8:9], 0xf0
+s_load_dwordx16 s[80:95], s[8:9], 0x130
+s_load_dwordx4 s[96:99], s[8:9], 0x170
+s_mov_b32 s10, 0
+s_mov_b32 s11, 0
+s_mov_b32 exec_lo, -1
+s_buffer_load_dword vcc_lo, s[12:15], 0x10
+s_waitcnt lgkmcnt(0)
+s_mul_i32 vcc_lo, vcc_lo, 3
+s_sub_i32 vcc_hi, 0, vcc_lo
+s_mul_hi_u32 vcc_hi, 0x40000000, vcc_hi
+s_add_u32 s20, vcc_hi, vcc_lo
+v_add_nc_u32_e32 v3, s20, v0
+v_cmp_gt_u32_e32 vcc_lo, 0x90009, v0
+v_mov_b32_e32 v6, 2.0
+v_cndmask_b32_e32 v5, 1.0, v6, vcc_lo
+s_waitcnt vmcnt(0)
+exp mrt0 v8, v9, v3, v5 done vm
+s_endpgm
+''',
+        '04190cf4000000fa040308f4200000fa800398be800399be80039abe80039bbef002027ef002047e7fc08cbf080f9cf0'
+        '0108d900040410f4300000fa040810f4700000fa040c10f4b00000fa041010f4f00000fa041410f4300100fa041808f4'
+        '700100fa80038abe80038bbec103febe861a20f4100000fa7fc08cbf6a836a93806aeb81f46beb9a6b6a14801400064a'
+        'ff00887d09000900f4020c7ef20c0a02703f8cbf0f1800f808090305000081bf', None),
+    'VS_DATA': ('''s_mov_b32 exec_lo, -1
+v_cmp_gt_u32_e32 vcc_lo, 1, v0
+v_mov_b32_e32 v1, 2.0
+v_cndmask_b32_e32 v5, 1.0, v1, vcc_lo
+s_mov_b32 vcc_hi, 0x40000000
+s_mov_b32 vcc_lo, 4
+s_mul_hi_u32 vcc_lo, vcc_hi, vcc_lo
+s_add_u32 s20, vcc_lo, 0x3f800000
+v_mov_b32_e32 v4, s20
+exp pos0 v5, v5, v5, v4 done
+s_endpgm
+''',
+        'c103febe8100887df402027ef2020a02f403ebbe8403eabe6b6aea9a6af214801402087ecf0800f805050504000081bf', None),
+    'MIXED_JOIN': ('''s_cmp_eq_u32 s10, 0
+s_cbranch_scc1 3
+v_cmp_gt_u32_e64 vcc_hi, v0, 1
+s_branch 2
+s_mov_b32 vcc_hi, 0x55555555
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        '0a8006bf030085bf6b00c4d400030100020082bfff03ebbe55555555020001d5f2e8ad010f1800f802020202000081bf', 'v_cmp_gt_u32 into vcc_hi'),
+    'HARDWIRED_MASK': ('''s_mov_b32 exec_lo, -1
+s_load_dwordx4 s[12:15], s[8:9], 0x20
+s_buffer_load_dword vcc_lo, s[12:15], 0x10
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v1, 2.0
+v_cndmask_b32_e32 v2, 1.0, v1, vcc_lo
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        'c103febe040308f4200000fa861a20f4100000fa7fc08cbff402027ef20204020f1800f802020202000081bf', 's_buffer_load destination vcc_lo for 1 dwords'),
+    'HARDWIRED_BRANCH': ('''s_mov_b32 exec_lo, -1
+s_load_dwordx4 s[12:15], s[8:9], 0x20
+s_buffer_load_dword vcc_lo, s[12:15], 0x10
+s_waitcnt lgkmcnt(0)
+s_cbranch_vccz 1
+s_nop 0
+v_mov_b32_e32 v2, 2.0
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        'c103febe040308f4200000fa861a20f4100000fa7fc08cbf010086bf000080bff402047e0f1800f802020202000081bf', 's_buffer_load destination vcc_lo for 1 dwords'),
+    'HARDWIRED_CARRY': ('''s_mov_b32 exec_lo, -1
+s_load_dwordx4 s[12:15], s[8:9], 0x20
+s_buffer_load_dword vcc_lo, s[12:15], 0x10
+s_waitcnt lgkmcnt(0)
+v_add_co_ci_u32_e32 v2, vcc_lo, 1, v0, vcc_lo
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        'c103febe040308f4200000fa861a20f4100000fa7fc08cbf810004500f1800f802020202000081bf', 's_buffer_load destination vcc_lo for 1 dwords'),
+    'HARDWIRED_JOIN': ('''s_mov_b32 exec_lo, -1
+s_load_dwordx4 s[12:15], s[8:9], 0x20
+s_mov_b32 vcc_lo, 0x55555555
+s_cmp_eq_u32 s10, 0
+s_cbranch_scc1 2
+v_cmp_gt_u32_e32 vcc_lo, 1, v0
+s_branch 1
+s_addk_i32 vcc_lo, 0x100
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v1, 2.0
+v_cndmask_b32_e32 v2, 1.0, v1, vcc_lo
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        'c103febe040308f4200000faff03eabe555555550a8006bf020085bf8100887d010082bf0001eab77fc08cbff402027e'
+        'f20204020f1800f802020202000081bf', 's_addk_i32 destination vcc_lo'),
+    'ENTRY': ('''s_mov_b32 exec_lo, -1
+s_add_u32 s20, vcc_hi, 1
+v_cmp_gt_u32_e32 vcc_lo, 1, v0
+v_add_nc_u32_e32 v2, s20, v0
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''',
+        'c103febe6b8114808100887d1400044a0f1800f802020202000081bf', "operand 'vcc_hi'"),
+    'PARTIAL_MIXED': ('''s_mov_b32 exec_lo, -1
+s_mov_b32 vcc_lo, 0x55555555
+s_and_b32 vcc_lo, vcc_lo, -1
+v_mov_b32_e32 v1, 2.0
+v_cndmask_b32_e32 v2, 1.0, v1, vcc_lo
+s_mov_b32 vcc_hi, 0x3f800000
+s_add_u32 s20, vcc_hi, 1
+v_mov_b32_e32 v3, s20
+exp mrt0 v2, v3, v2, v3 done vm
+s_endpgm
+''',
+        'c103febeff03eabe555555556ac16a87f402027ef2020402f203ebbe6b8114801402067e0f1800f802030203000081bf',
+        's_mov_b32 destination vcc_hi'),
+}
+
+
+# SHA-256 of the exact HLSL emitted by 1aeb71894 for the original successful fixtures.
+BASE_HLSL = {
+    'PS': 'a2bd225589782462ee9eba5369cc0f225144de36dece7690401659234b9e35d1',
+    'SCALAR_ONLY': '72f7187feab22d60cb106b1b8a9d83c6cb8cf4f0227ec202c1765e397e0235e2',
+    'READFIRSTLANE_SCALAR': '5f495a754c51a8fb9a143b2520c1d7f11c4ef6f2a331b48548bb0c791d72e6b3',
 }
 
 
@@ -160,9 +370,16 @@ def check(label, ok, detail=''):
         failures.append(label)
 
 
-def translate(name):
+def fixture_code(name):
+    return bytes.fromhex(FIXTURES[name][1])
+
+
+def translate(name, **kwargs):
     try:
-        return G.Pipeline(VS_WORDS, bytes.fromhex(FIXTURES[name][1]), root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
+        code = fixture_code(name)
+        if name == 'VS_DATA':
+            return G.Pipeline(code, None, root_blob(), **kwargs).hlsl_vs(), None
+        return G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED, **kwargs).hlsl_ps(), None
     except G.Unsupported as reason:
         return None, str(reason)
 
@@ -175,6 +392,34 @@ def image():
             total = v0 + 0xfff7fff8
             out += [0x40000000 if v0 > 0x50005 else 0x3f800000, total & MASK, (v0 + 0x40000000 + (total >> 32)) & MASK,
                     (0x1244 + v0) & MASK]
+    return out
+
+
+def data_image():
+    selected_word = {False: 0x3f800000, True: 0x40000000}
+    lo = 0x80 * 2
+    hi = (0x40000000 * (-lo & MASK)) >> 32
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            pos = x | y << 16
+            carry = (pos + 0xfff7fff8) >> 32
+            out += [selected_word[pos > 0x50005], (0x3f800000 + lo + pos + carry) & MASK,
+                    (0x10000000 + hi + pos) & MASK, selected_word[0x90009 > pos]]
+    return out
+
+
+def data2_image():
+    scalar = 0x3f800000 + 16
+    hi = MASK if scalar == 0x3f800010 else 0
+    lo = MASK if scalar == 0 else 0
+    selected_word = (0x3f800000, 0x40000000)
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            pos = x | y << 16
+            out += [selected_word[hi & 1], (0x3f800000 + pos + (hi & 1)) & MASK,
+                    selected_word[lo & 1], (scalar + pos) & MASK]
     return out
 
 
@@ -191,6 +436,18 @@ MUTATIONS = {
     'vcc_hi reads as zero': (r's0 = 0x00001234u \+', 's0 = 0x00000000u +'),
 }
 
+DATA_MUTATIONS = {
+    'vcc_lo data reads as zero': (r's20 = s\d+ \+ 0x3f800000u;', 's20 = 0x3f800000u;'),
+    'vcc_hi data is lost': (r's21 = 0x10000000u \+ s\d+;', 's21 = 0x10000000u;'),
+    'the vcc_hi compare bit is ignored': (r'v2 = \(s\d+ & 1\)', 'v2 = (0u & 1)'),
+    'the hardwired compare bit is ignored': (r'v5 = \(vcc & 1\)', 'v5 = (0u & 1)'),
+}
+DRAW_CASES = (
+    ('PS', image, MUTATIONS),
+    ('PS_DATA', data_image, DATA_MUTATIONS),
+    ('PS_DATA2', data2_image, {'the uniform select is ignored': (r'v2 = \(s\d+ & 1\)', 'v2 = (0u & 1)')}),
+)
+
 
 def controls():
     for name, (_source, _words, refusal) in FIXTURES.items():
@@ -201,6 +458,9 @@ def controls():
             continue
         if refusal is None:
             check('%s translates' % name, text is not None and 'vcc_hi' not in text, str(reason))
+            if name in BASE_HLSL and text is not None:
+                digest = hashlib.sha256(text.encode()).hexdigest()
+                check('%s HLSL matches the base revision byte for byte' % name, digest == BASE_HLSL[name], digest)
         else:
             check('%s refused: %s' % (name, refusal), text is None and reason == refusal, str(reason))
     # A wide operand covering SGPR 107 (s_load_dwordx4 s[104:107]) writes vcc_hi: no free alias exists, so it stays refused.
@@ -217,13 +477,92 @@ def controls():
     if text is not None:
         check('PS keeps the compare and carry in the renamed register',
               re.search(r's(\d+) = \(\(v0 > 0x00050005u\) \? 1u : 0u\);', text) is not None, text)
-        for label, (pattern, replacement) in MUTATIONS.items():
-            check('PS mutation "%s" changes the text' % label, sub(text, pattern, replacement) != text)
+    for name, _, mutations in DRAW_CASES:
+        text, _ = translate(name)
+        if text is not None:
+            for label, (pattern, replacement) in mutations.items():
+                check('%s mutation "%s" changes the text' % (name, label), sub(text, pattern, replacement) != text)
     reference = image()
     check('reference covers both compare outcomes and both carries',
           {reference[i] for i in range(0, len(reference), 4)} == {0x3f800000, 0x40000000}
           and {(reference[i] - 0x40000000 - (i // 4) % WIDTH - ((i // 4 // WIDTH) << 16)) & MASK
                for i in range(2, len(reference), 4)} == {0, 1})
+    reference = data_image()
+    check('PS_DATA covers both outcomes of each comparison',
+          all(set(reference[channel::4]) == {0x3f800000, 0x40000000} for channel in (0, 3)))
+    check_split()
+
+
+def check_split():
+    with patch.object(G, 'wave32_vcc_split', return_value=None):
+        for name, reason in (('PS_DATA', 'v_cmp_gt_u32 into vcc_hi'),
+                             ('PS_DATA2', 's_mov_b32 destination vcc_hi'),
+                             ('PS_DESCRIPTOR', 's_buffer_load destination vcc_lo for 1 dwords'),
+                             ('VS_DATA', 's_mov_b32 destination vcc_hi')):
+            _, refusal = translate(name)
+            check('%s needs the retry' % name, refusal == reason, refusal)
+
+    with patch.object(G, 'wave32_vcc_split', wraps=G.wave32_vcc_split) as split:
+        pipe = G.Pipeline(VS_WORDS, fixture_code('PS_DATA'), root_blob(), ps_hw_inputs=PACKED)
+        check('the first-lane retry keeps the split and builds it once',
+              pipe.retry_firstlane and 's22 = v7;' in pipe.hlsl_ps() and split.call_count == 1)
+
+    for name, kind in (('PS_DATA', 'ps'), ('VS_DATA', 'vs')):
+        refusals = [('prior refusal', 'pipeline')]
+        decoded = {kind: G.decode(fixture_code(name))}
+        text, reason = translate(name, refusals=refusals, decoded=decoded)
+        check('%s retry clears only the new refusals' % name,
+              text is not None and text == translate(name)[0] and refusals == [('prior refusal', 'pipeline')],
+              (reason, refusals))
+
+    pipe = G.Pipeline(VS_WORDS, fixture_code('PS_DESCRIPTOR'), root_blob(), ps_hw_inputs=PACKED)
+    hlsl = pipe.hlsl_ps()
+    check('the texture stays in s[100:107] and the two data words use s7 and s6',
+          [asm for _, _, _, asm in pipe.ps.ins if 's[100:107]' in asm]
+          == [asm for _, _, _, asm in G.decode(fixture_code('PS_DESCRIPTOR')) if 's[100:107]' in asm]
+          and 't = r0.SampleLevel(q0, float2(F(v1), F(v2)), 0);' in hlsl
+          and 's7 = r1.Load(0x00000010u + 0);' in hlsl and 's6 = mul_hi_u32(0x40000000u, s6);' in hlsl
+          and 'v5 = (vcc & 1) ? v6' in hlsl)
+
+    for name in ('MIXED_JOIN', 'HARDWIRED_JOIN', 'HARDWIRED_MASK', 'HARDWIRED_BRANCH', 'HARDWIRED_CARRY',
+                 'ENTRY', 'PAIR'):
+        ins = G.decode(fixture_code(name))
+        check('%s has a resolved CFG and stays pinned' % name, bool(G.lane_mask_cfg(ins)) and G.wave32_vcc_split(ins) is None)
+
+    with patch.object(G, 'vcc_mixed_webs', return_value=set()):
+        text, reason = translate('SCALAR_MASK')
+        check('the mixed-web pin prevents the whole-word mask read', text is not None, reason)
+    with patch.object(G, 'vcc_low_data_reaches', return_value=False):
+        text, reason = translate('PARTIAL_MIXED')
+        check('a separate rename cannot hide the low-word conflict', text is not None, reason)
+
+    with patch.dict(os.environ, {'X2W_GFX_ASSUME_WAVE64': '1'}):
+        text, reason = translate('PS_DATA')
+        check('the wave64 assumption vetoes an odd mask field without a wave32 EXEC form',
+              text is None and reason == 'v_cmp_gt_u32 into vcc_hi', reason)
+
+    check_pair_and_uniform_masks()
+
+
+def check_pair_and_uniform_masks():
+    original = G.decode(fixture_code('PAIR_REACH'))
+    split = G.wave32_vcc_split(original)
+    check('a pair definition pins its high-word reader and leaves the surrounding writes free',
+          split is not None and split[2:4] == original[2:4]
+          and re.fullmatch(r's_mov_b32 s\d+, 2\.0', split[1][3]) is not None
+          and re.fullmatch(r's_mov_b32 s\d+, 1\.0', split[4][3]) is not None
+          and split[5][3] != original[5][3])
+
+    pipe = G.Pipeline(VS_WORDS, fixture_code('PS_DATA2'), root_blob(), ps_hw_inputs=PACKED)
+    check('PS_DATA2 preserves the encoded pair write',
+          pipe.ps.ins[0] == G.decode(fixture_code('PS_DATA2'))[0])
+    hlsl = pipe.hlsl_ps()
+    select = re.search(r'(s\d+) = scc \? 0xffffffffu : 0x00000000u;\s+v2 = \(\1 & 1\)', hlsl)
+    check('PS_DATA2 reads the scalar select bit for both cndmask and carry-in',
+          select is not None and 'a = a + (%s & 1u);' % select[1] in hlsl)
+    with patch.object(G, 'vcc_uniform_mask_def', return_value=False):
+        text, reason = translate('PS_DATA2')
+        check('PS_DATA2 needs the uniform-mask exemption', text is None and reason is not None, reason)
 
 
 def draw(renderer, adapter, vs, ps, expected):
@@ -236,34 +575,44 @@ def draw(renderer, adapter, vs, ps, expected):
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
-    text, reason = translate('PS')
-    if text is None:
-        check('PS translates for the draw', False, reason)
-        return
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        reference = directory / 'reference.bin'
-        reference.write_bytes(struct.pack('<%dI' % (WIDTH * HEIGHT * 4), *image()))
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'vs_' + kind, vs_profile, directory)
-            ps = compile_hlsl(compiler, kind, text, 'ps_' + kind, ps_profile, directory)
-            run = draw(renderer, adapter, vs, ps, reference)
-            check('%s %s PS: all %d pixels match the reference' % (adapter, kind, WIDTH * HEIGHT),
-                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
-                  run.stdout + run.stderr)
-            for n, (label, (pattern, replacement)) in enumerate(MUTATIONS.items()):
-                bad = compile_hlsl(compiler, kind, sub(text, pattern, replacement), 'bad_%s_%d' % (kind, n), ps_profile,
-                                   directory)
-                run = draw(renderer, adapter, vs, bad, reference)
-                check('%s %s PS mutation "%s" fails' % (adapter, kind, label),
-                      run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+            for name, expected, mutations in DRAW_CASES:
+                text, reason = translate(name)
+                if text is None:
+                    check('%s translates for the draw' % name, False, reason)
+                    continue
+                stem = '%s_%s' % (name, kind)
+                reference = directory / (stem + '.bin')
+                reference.write_bytes(struct.pack('<%dI' % (WIDTH * HEIGHT * 4), *expected()))
+                ps = compile_hlsl(compiler, kind, text, stem, ps_profile, directory)
+                run = draw(renderer, adapter, vs, ps, reference)
+                check('%s %s %s: all %d pixels match the reference' % (adapter, kind, name, WIDTH * HEIGHT),
+                      run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                      run.stdout + run.stderr)
+                for n, (label, (pattern, replacement)) in enumerate(mutations.items()):
+                    bad = compile_hlsl(compiler, kind, sub(text, pattern, replacement), '%s_bad_%d' % (stem, n),
+                                       ps_profile, directory)
+                    run = draw(renderer, adapter, vs, bad, reference)
+                    check('%s %s %s mutation "%s" fails' % (adapter, kind, name, label),
+                          run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
 
 
 def check_binary(llvm_mc):
     for name, (source, words, _refusal) in FIXTURES.items():
+        if name == 'PS_DESCRIPTOR':
+            # LLVM 19 rejects the spelling s[100:107]. Assemble the adjacent legal range and advance
+            # SMEM SDST by four and MIMG SRSRC by one four-word slot.
+            binary = assemble(llvm_mc, source.replace('s[100:107]', 's[96:103]'))
+            binary = binary.replace(bytes.fromhex('04180cf4'), bytes.fromhex('04190cf4'), 1)
+            binary = binary.replace(bytes.fromhex('0108d800'), bytes.fromhex('0108d900'), 1)
+        else:
+            binary = assemble(llvm_mc, source)
         check('llvm-mc assembles the %s fixture to the same words' % name,
-              assemble(llvm_mc, source) == bytes.fromhex(words))
+              binary == bytes.fromhex(words))
 
 
 def main():

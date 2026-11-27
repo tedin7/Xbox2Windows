@@ -23,6 +23,7 @@ import sysconfig
 import tempfile
 import time
 import traceback
+from typing import NamedTuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -1299,10 +1300,17 @@ def writes_exec(name, ops, mods=()):
 # In wave32 VCC is vcc_lo alone and vcc_hi is a free scalar register that compilers allocate like any other (RDNA 2
 # ISA, "VCC": in wave32 only VCC_LO is the condition mask). The translator models it as an ordinary SGPR the program
 # never names, taken from the top of the 106 (beyond the user-data and system registers set at entry).
+VCC_WHOLE_WORD_WRITERS = ('s_', 'v_readlane', 'v_readfirstlane')
+
+
 def vcc_hi_whole_word_writer(name, ops):
     """True when the instruction's first operand is vcc_hi and its name is a scalar instruction or an actual lane-read
     writer (v_readlane, v_readfirstlane): the register then holds one whole word, not one bit per lane."""
-    return ops[:1] == ['vcc_hi'] and (name.startswith('s_') or name.startswith(('v_readlane', 'v_readfirstlane')))
+    return ops[:1] == ['vcc_hi'] and name.startswith(VCC_WHOLE_WORD_WRITERS)
+
+
+VCC_VOP3_CARRY_READERS = frozenset(('v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64'))
+VCC_VOP3_MASK_READERS = VCC_VOP3_CARRY_READERS | {'v_cndmask_b32_e64'}
 
 
 def vcc_hi_scalar_mask_read(ins):
@@ -1319,12 +1327,26 @@ def vcc_hi_scalar_mask_read(ins):
             scalar = False
         elif vcc_hi_whole_word_writer(name, ops):
             scalar = True
-        if name in ('v_cndmask_b32_e64', 'v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64') \
-                and ops[-1:] == ['vcc_hi']:
+        if name in VCC_VOP3_MASK_READERS and ops[-1:] == ['vcc_hi']:
             reads = True
             read_after |= scalar
     return read_after or (reads and branchy and any(
         vcc_hi_whole_word_writer(name, parse(asm)[1]) for _o, _n, name, asm in ins))
+
+
+def wave32_mask_operand_proof(ins):
+    """A VALU mask field names an odd SGPR, which cannot start a wave64 mask."""
+    masks = []
+    for _off, _size, name, asm in ins:
+        ops = parse_cached(asm)[1]
+        if name.startswith('v_cmp_') and ops:
+            masks.append(ops[0])
+        elif VOP3B_SDST.match(name) and len(ops) > 1:
+            masks.append(ops[1])
+        if name in VCC_VOP3_MASK_READERS and ops:
+            masks.append(ops[-1])
+    return any(tok == 'vcc_hi' or (reg := reg_range(tok)) and reg[0] == 's' and reg[1] == reg[2] and reg[1] % 2
+               for tok in masks)
 
 
 def wave32_vcc_hi(ins, wave32=False):
@@ -1346,24 +1368,12 @@ def wave32_vcc_hi(ins, wave32=False):
         return ins
     if any(re.search(r'\bvcc\b', asm) or name.startswith('s_movrel') for _o, _n, name, asm in ins):
         return ins
-    masks = []  # lane-mask destinations of VALU compares and carry-outs (VOP3b SDST)
-    for _o, _n, name, asm in ins:
-        ops = parse(asm)[1]
-        if name.startswith('v_cmp_') and ops:
-            masks.append(ops[0])
-        elif VOP3B_SDST.match(name) and len(ops) > 1:
-            masks.append(ops[1])
-        if name in ('v_cndmask_b32_e64', 'v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64') \
-                and ops[-1] != 'vcc_lo':
-            masks.append(ops[-1])  # a lane-mask source is a pair in wave64 too: vcc_hi or an odd SGPR proves wave32
-    odd = any((reg_range(tok) or ('', 0, 1))[0] == 's' and reg_range(tok)[1] == reg_range(tok)[2]
-              and reg_range(tok)[1] % 2 for tok in masks)
     # Without that proof the program may be wave64, where every VALU use of VCC as a lane mask (a write, an
     # implicit or explicit mask source such as v_cndmask_b32_e32, a carry-in, v_div_fmas) and s_cbranch_vccz/vccnz
     # see vcc_hi for lanes 32..63: none may be present.
     vcc_mask_use = any((name.startswith('v_') and re.search(r'\bvcc_lo\b', asm)) or name.startswith('v_div_fmas')
                        or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
-    if not wave32 and 'vcc_hi' not in masks and not odd and vcc_mask_use:
+    if not wave32 and vcc_mask_use and not wave32_mask_operand_proof(ins):
         return ins
     if vcc_hi_scalar_mask_read(ins):
         return ins
@@ -1377,6 +1387,197 @@ def wave32_vcc_hi(ins, wave32=False):
     if free is None:
         return ins
     return [(off, n, name, re.sub(r'\bvcc_hi\b', 's%d' % free, asm)) for off, n, name, asm in ins]
+
+
+VCC_SPLIT_WORDS = {'vcc_lo': 106, 'vcc_hi': 107}
+VCC_SPLIT_TOKEN = re.compile(r'\bvcc_(?:lo|hi)\b')
+VCC_VOP3_FIELDS = frozenset(info[0] for table in (D.VOP3_NATIVE_OPS, D.VOP3P_OPS, D.PERMLANE_OPS)
+                            for info in table.values()) | {'v_readfirstlane_b32'}
+VCC_MASK_SALU = re.compile(r's_(?:mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|cselect|cmov)_b32$')
+VCC_UNIFORM_MASK_LITERALS = frozenset(('0', '0x0', '-1', '0xffffffff'))
+VCC_REFUSAL = re.compile(r'\b(?:vcc(?:_lo|_hi)?|s10[67])\b')
+
+
+class VccAccess(NamedTuple):
+    instruction: int
+    operand: int
+    write: bool
+    read: bool
+    fixed: bool
+    whole_word: bool = False
+    mask_source: bool = False
+
+
+def vcc_mixed_webs(whole_word_defs, mask_sources):
+    """A per-lane mask source cannot read bit 0 of a whole word for every lane."""
+    return whole_word_defs & mask_sources
+
+
+def vcc_uniform_mask_def(name, ops):
+    """Only these scalar forms replicate bit zero across the whole word."""
+    if name == 's_movk_i32' and len(ops) == 2:
+        with suppress(Unsupported):
+            return sopk_imm(ops[1], signed=True) in (0, 0xffffffff)
+    if (name == 's_mov_b32' and len(ops) == 2) or (name == 's_cselect_b32' and len(ops) == 3):
+        return all(t in VCC_UNIFORM_MASK_LITERALS for t in ops[1:])
+    return False
+
+
+def vcc_word_webs(accesses, incoming, word):
+    """Group definitions and operand positions, including read-modify-write positions."""
+    parents = {}
+
+    def root(node):
+        path = []
+        while node in parents:
+            path.append(node)
+            node = parents[node]
+        for prev in path:
+            parents[prev] = node
+        return node
+
+    definitions = {i: (i, j) for i, j, write, *_ in accesses if write}
+    entry = (-1, -1)
+    definitions[-1] = entry
+    for i, j, _write, read, *_ in accesses:
+        if read:
+            for d in incoming[i][word]:
+                left, right = root(definitions[d]), root((i, j))
+                if left != right:
+                    parents[right] = left
+
+    pinned = {root(entry)}
+    whole_words, mask_sources = set(), set()
+    for i, j, _write, _read, fixed, whole, mask in accesses:
+        web = root((i, j))
+        if fixed:
+            pinned.add(web)
+        if whole:
+            whole_words.add(web)
+        if mask:
+            mask_sources.add(web)
+    mixed = vcc_mixed_webs(whole_words, mask_sources)
+    if word == 106 and mixed:
+        return None  # Stage can accept a scalar write to vcc_lo by keeping only its low bit.
+    pinned |= mixed
+    return [(i, j) for i, j, *_ in accesses if root((i, j)) not in pinned]
+
+
+def vcc_low_data_reaches(ins, incoming, hardwired_reads):
+    """Detect whole data words that a retry would leave in the hardwired lane-mask storage."""
+    pending = [d for i in hardwired_reads if incoming[i] is not None for d in incoming[i][106]]
+    seen = {-1}
+    while pending:
+        i = pending.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        _, _, name, asm = ins[i]
+        if not name.startswith(VCC_WHOLE_WORD_WRITERS):
+            continue
+        _, ops, _ = parse_cached(asm)
+        if 'saveexec_b32' in name:
+            continue  # The destination saves the old EXEC mask.
+        if vcc_uniform_mask_def(name, ops):
+            continue
+        if (not VCC_MASK_SALU.fullmatch(name)
+                or any(t not in VCC_UNIFORM_MASK_LITERALS and t not in ('vcc_lo', 'exec_lo')
+                       and not re.fullmatch(r's\d+', t) for t in ops[1:])):
+            return True
+        if 'vcc_lo' in ops[1:] or name == 's_cmov_b32':
+            pending.extend(incoming[i][106])
+    return False
+
+
+def wave32_vcc_split(ins, *, uniform_carries=None):
+    """Rename independent VCC-word webs in a proven wave32 graphics stage.
+
+    When requested, collect the offsets of renamed carry-ins reached by a replicated scalar mask.
+    """
+    if any(name.startswith(('s_setpc', 's_swappc', 's_movrel', 'v_movrel')) for _, _, name, _ in ins):
+        return None
+    try:
+        successors = lane_mask_cfg(ins)
+    except (IndexError, ValueError):
+        return None
+    if not successors:
+        return None
+
+    words = set(VCC_SPLIT_WORDS.values())
+    accesses = {word: [] for word in words}
+    writes = [set() for _ in ins]
+    named, hardwired_reads, uniform_defs = set(), set(), set()
+    for i, (_, _, name, asm) in enumerate(ins):
+        _, ops, _ = parse_cached(asm)
+        named.update(scalar_registers(asm))
+        base = re.sub(r'_e(32|64)$', '', name)
+        no_dest = (base.startswith(NO_SCALAR_DESTINATION) or '_store' in base
+                   or base.startswith(('s_atomic', 's_buffer_atomic')))
+        dest_count = 0 if no_dest else len(effect_destinations(base, ops)[0])
+        explicit_fields = name.endswith('_e64') or name in VCC_VOP3_FIELDS
+        uniform_mask = vcc_uniform_mask_def(name, ops)
+        whole_word = name.startswith(VCC_WHOLE_WORD_WRITERS) and not uniform_mask
+        implicit_read = name.startswith(IMPLICIT_VCC_READ) or name in ('s_cbranch_vccz', 's_cbranch_vccnz')
+        if name.startswith('v_cmp_') and len(ops) == 2 and not explicit_fields:
+            writes[i].add(106)
+            accesses[106].append(VccAccess(i, -2, True, False, True))
+            dest_count = 0
+        if name.startswith('v_cndmask_b32') and len(ops) == 3 and not explicit_fields:
+            implicit_read = True
+        for j, token in enumerate(ops):
+            if name.startswith('v_cmpx') and name.endswith('_e64') and len(ops) == 3 and j == 0:
+                continue  # The decoder prints the unused SDST field.
+            if re.search(r'\bsrc_vccz\b', token):
+                implicit_read = True
+            pair = bool(re.search(r'\bvcc\b', token))
+            ranged = words if pair else scalar_registers(token) & words
+            aliases = {VCC_SPLIT_WORDS[t] for t in VCC_SPLIT_TOKEN.findall(token)}
+            write = j < dest_count
+            read = not write or base.startswith(READ_MODIFY_WRITE)
+            for word in ranged | aliases:
+                hardwired = word == 106 and (pair or word in aliases) and name.startswith('v_') and not explicit_fields
+                fixed = word in ranged or hardwired
+                mask = read and name in VCC_VOP3_MASK_READERS and j == len(ops) - 1
+                accesses[word].append(VccAccess(i, j, write, read, fixed, write and whole_word, mask))
+                if hardwired and read:
+                    hardwired_reads.add(i)
+                if write:
+                    writes[i].add(word)
+                    if uniform_mask:
+                        uniform_defs.add(i)
+        if implicit_read:
+            accesses[106].append(VccAccess(i, -1, False, True, True))
+            hardwired_reads.add(i)
+
+    # In wave32 a compare or carry-out writes only its named destination word.
+    incoming = reaching_mask_words(successors, writes, [set()] * len(ins), words)
+    if vcc_low_data_reaches(ins, incoming, hardwired_reads):
+        return None
+    free = (n for n in range(105, -1, -1) if n not in named)
+    replacements = {}
+    for word in VCC_SPLIT_WORDS.values():
+        reachable = [a for a in accesses[word] if incoming[a.instruction] is not None]
+        rename = vcc_word_webs(reachable, incoming, word)
+        if rename is None:
+            return None
+        target = next(free, None) if rename else None
+        if target is not None:
+            for i, j in rename:
+                replacements.setdefault(i, {})[j] = 's%d' % target
+                off, _, name, asm = ins[i]
+                if (uniform_carries is not None and name in VCC_VOP3_CARRY_READERS
+                        and j == len(parse_cached(asm)[1]) - 1 and incoming[i][word] & uniform_defs):
+                    uniform_carries.add(off)
+    if not replacements:
+        return None
+    result = list(ins)
+    for i, operands in replacements.items():
+        off, size, name, asm = ins[i]
+        mnemonic, ops, mods = parse(asm)
+        for j, target in operands.items():
+            ops[j] = VCC_SPLIT_TOKEN.sub(target, ops[j])
+        result[i] = off, size, name, ' '.join((mnemonic, ', '.join(ops), *mods))
+    return result
 
 
 def pc_pair(token):
@@ -5573,8 +5774,12 @@ class Stage:
         self.vertex_image = vertex_image_plan(self.raw_code) if kind == 'vs' else None
         if kind == 'cs' and decoded is None:
             self.try_image_loads()
+        split = getattr(pipe, '_vcc_split_program', None) if kind in ('vs', 'ps') else None
         if self.vertex_image is not None:
             self.ins = self.vertex_image['ins']
+        elif split is not None:
+            self.ins, self.vcc_split_uniform_carries = split
+            self._program_wave32 = True
         elif self.image_proof is None:
             self.ins = (decode(self.raw_code, refusals, embedded_vertex=kind == 'vs',
                                embedded_pixel=kind == 'ps')
@@ -5619,7 +5824,7 @@ class Stage:
                         proof.clear()
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
-        if kind in ('vs', 'ps'):
+        if kind in ('vs', 'ps') and split is None:
             self.ins = wave32_vcc_hi(self.ins)
         elif kind == 'cs' and getattr(getattr(self, 'pipe', None), 'wave_size', None) != 64:
             # A compute program also gets the rename, unless the caller says it is wave64. A program proven wave32 (the
@@ -16057,14 +16262,16 @@ class Stage:
         With X2W_GFX_ASSUME_WAVE64=1 a vertex or pixel stage that proves neither size counts as wave64 too (3,451 of the
         3,452 stage programs of one recording that name a size were wave64); that is logged once per pipeline. A stage
         whose code shows a wave32 exec form is never assumed, and says so loudly."""
-        pipe = getattr(self, 'pipe', None)
+        return self.wave64_program(getattr(self, 'pipe', None), getattr(self, 'kind', None), getattr(self, 'ins', ()))
+
+    @staticmethod
+    def wave64_program(pipe, kind, ins):
         wave = getattr(pipe, 'wave_size', None)
         if wave is not None:
             return wave == 64
-        ins = getattr(self, 'ins', ())
         if wave64_exec_proof(ins):
             return True
-        if getattr(self, 'kind', None) not in ('vs', 'ps') or not assume_wave64_enabled():
+        if kind not in ('vs', 'ps') or not assume_wave64_enabled():
             return False
         if wave32_exec_proof(ins):
             note_wave_assumption(pipe, 'WAVE32 CODE under X2W_GFX_ASSUME_WAVE64: the stage is not assumed wave64')
@@ -17375,7 +17582,8 @@ class Stage:
         cin_const = self.const_u32(cin_tok)
         if cin_const in (0, 0xffffffff):
             ci = '1u' if cin_const else '0u'
-        elif self.is_lane_mask(cin_tok):
+        elif self.is_lane_mask(cin_tok) or getattr(self, 'pc', None) in getattr(self, 'vcc_split_uniform_carries', ()):
+            # The split proves this source web can supply bit zero, including a scalar select of 0 and -1.
             ci = '(%s & 1u)' % self.u(cin_tok)
         else:
             raise Unsupported('%s carry-in %s' % (name, cin_tok))
@@ -19201,26 +19409,69 @@ class Pipeline:
         self.lod_unvalidated = set()  # image_sample forms read through a heap sampler (LOD fields unchecked, #2221)
         self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
 
-    def _build_pixel_stage(self, code, refusals=None, decoded=None):
+    def _build_pixel_stage(self, code, refusals=None, decoded=None, *, split_vcc=True):
+        return self._build_graphics_stage('ps', code, refusals, decoded, split_vcc=split_vcc)
+
+    def _build_graphics_stage(self, kind, code, refusals=None, decoded=None, *, split_vcc=True):
+        if kind not in ('vs', 'ps'):
+            return Stage(self, kind, code, refusals=refusals, decoded=decoded)
+        split_vcc = split_vcc and self.vertex_kind == 'vs'
         # Translation can allocate bindings before refusing. Restore the state left
-        # by the vertex stage so the retry allocates only the bindings it uses.
-        state = deepcopy(self.__dict__, {id(self.vs): self.vs} if hasattr(self, 'vs') else None)
+        # by the previous stage so each retry allocates only the bindings it uses.
+        memo = {id(self.vs): self.vs} if hasattr(self, 'vs') else {}
+        state = deepcopy(self.__dict__, memo.copy())
         before = len(refusals) if refusals is not None else 0
-        try:
-            stage = Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
-        except Unsupported as reason:
-            if str(reason) not in (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform'):
-                raise
-        else:
-            retry_reasons = (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform')
-            if refusals is None or not any((reason, 'ps') in refusals[before:] for reason in retry_reasons):
-                return stage
-        self.__dict__.clear()
-        self.__dict__.update(state)
-        self.retry_firstlane = True
-        if refusals is not None:
-            del refusals[before:]
-        return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
+        firstlane, split = False, None
+        retry_reasons = (READFIRSTLANE_UNIFORM, 'buffer_store_format_xyzw data not proven wave-uniform')
+        while True:
+            error = None
+            if split is not None:
+                self._vcc_split_program = split
+            try:
+                stage = Stage(self, kind, code, refusals=refusals, decoded=decoded)
+            except Unsupported as reason:
+                error = reason
+                reasons = [str(reason)]
+            else:
+                reasons = [reason for reason, where in refusals[before:] if where == kind] if refusals is not None else []
+            finally:
+                self.__dict__.pop('_vcc_split_program', None)
+
+            if kind == 'ps' and not firstlane and any(reason in retry_reasons for reason in reasons):
+                firstlane = True
+            else:
+                candidate = None
+                if split_vcc and split is None and any(VCC_REFUSAL.search(r) for r in reasons):
+                    candidate = self._split_graphics_vcc(kind, code, refusals, decoded)
+                if candidate is None:
+                    if error is not None:
+                        raise error
+                    return stage
+                split = candidate
+            self.__dict__.clear()
+            self.__dict__.update(deepcopy(state, memo.copy()))
+            if firstlane:
+                self.retry_firstlane = True
+            if refusals is not None:
+                del refusals[before:]
+
+    def _split_graphics_vcc(self, kind, code, refusals, decoded):
+        if refusals is not None and any(where == 'decode' for _, where in refusals):
+            return None  # An omitted instruction can hide an access.
+        ins = decoded if refusals is not None else None
+        if ins is None:
+            try:
+                ins = decode(strip_header(code), embedded_vertex=kind == 'vs', embedded_pixel=kind == 'ps')
+            except Unsupported:
+                return None
+        wave = getattr(self, 'wave_size', None)
+        if wave != 32 and (wave is not None or not (wave32_exec_proof(ins) or wave32_mask_operand_proof(ins))):
+            return None
+        if Stage.wave64_program(self, kind, ins):
+            return None
+        uniform_carries = set()
+        split = wave32_vcc_split(ins, uniform_carries=uniform_carries)
+        return (split, uniform_carries) if split is not None else None
 
     def _graphics_pixel_stage(self, code, pixel_refusal):
         if code is None:
@@ -19250,11 +19501,11 @@ class Pipeline:
             self.mesh_pixel_writes = ps_code is not None and mesh_pixel_memory_writes(
                 ps_code, decoded.get('ps') if decoded else None)
         if refusals is None:
-            self.vs = Stage(self, self.vertex_kind, vs_code)
+            self.vs = self._build_graphics_stage(self.vertex_kind, vs_code)
             self.ps = self._graphics_pixel_stage(ps_code, pixel_refusal)
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.vs = self._build_graphics_stage(self.vertex_kind, vs_code, refusals, decoded.get('vs'))
             self.ps = self._pixel_stage(ps_code, refusals=refusals, decoded=decoded.get('ps'))
         if self.ps is None:
             self.params, self.flat, self.f16_plain = [], [], []
@@ -20315,7 +20566,7 @@ class MeshPixelStage(Pipeline):
             clean_params.append(p)
         self.params = sorted(set(clean_params))
         self.mesh_plain_params = frozenset(self.params)
-        self.ps = self._build_pixel_stage(ps_code, refusals, decoded)
+        self.ps = self._build_pixel_stage(ps_code, refusals, decoded, split_vcc=False)
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         for a, how in self.ps.attrs.items():
             if 'f16' not in how:
