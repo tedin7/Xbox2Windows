@@ -146,6 +146,9 @@ inline void forget_mapped_spans(std::uintptr_t start, std::size_t bytes) noexcep
     else mapped_cache = MappedCache{};
 }
 
+// Forgets every span this thread cached (the shared read cache keeps its own spans; erase them by range above).
+inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
+
 inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes, bool* committed = nullptr) noexcept
 {
     if (bytes == 0 || start + bytes < start) return bytes;
