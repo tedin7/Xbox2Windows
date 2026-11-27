@@ -499,8 +499,22 @@ Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for th
 
 An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
 
+Set `X2W_FORMATTED_BUFFER_DIAGNOSTICS=1` in the runtime to log the DXGI
+format number and component mapping on the first view refusal per pipeline
+and SRV slot. Set `X2W_EXTENDED_BUFFER_FORMATS=1` in both the runtime and the
+translator to enable 25 additional formats for translated draws. The expanded
+graphics cache keys are scoped to that setting. The default uses the
+existing keys and shader source.
+
+`startup_formatted_view_draw_extended_warp` compares the 25 added formats
+against a CPU byte decode, with identity and swizzled mappings. It reads the
+words back from an integer colour target. It also checks the 16 MiB draw
+copy limit and reruns a signed byte with the adjacent unsigned FORMAT case
+to verify that the CPU comparison detects the substitution.
+
+
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3|formatted_view_draw_(warp|hardware)|vertex_fetch_formats_)' -V
+ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3|formatted_view_draw_(warp|extended_warp|hardware)|vertex_fetch_formats_)' -V
 ```
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks

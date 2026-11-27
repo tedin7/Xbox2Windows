@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
 import gfx2hlsl  # noqa: E402
+from disasm_rdna2 import MTBUF_FORMATS  # noqa: E402
 
 # Public DXGI_FORMAT values (dxgiformat.h) for the names the header uses.
 DXGI = {'R32G32B32A32_FLOAT': 2, 'R32G32B32_FLOAT': 6, 'R16G16B16A16_FLOAT': 10, 'R32G32_FLOAT': 16,
@@ -22,20 +23,63 @@ EXPECTED = {**{dxgi: name for dxgi, (name, _) in gfx2hlsl.FETCH_DXGI.items()},
             10: 'BUF_FMT_16_16_16_16_FLOAT', 62: 'BUF_FMT_8_UINT', 36: 'BUF_FMT_16_16_UINT'}
 
 
+# DXGI enumeration and gfx10 unified FORMAT, checked independently of both implementations.
+ADDED = {
+    'R8_SNORM': (63, 2),
+    'R8_SINT': (64, 6),
+    'R16_UNORM': (56, 7),
+    'R16_SNORM': (58, 8),
+    'R16_UINT': (57, 11),
+    'R16_SINT': (59, 12),
+    'R16_FLOAT': (54, 13),
+    'R8G8_SNORM': (51, 15),
+    'R8G8_UINT': (50, 18),
+    'R8G8_SINT': (52, 19),
+    'R32_UINT': (42, 20),
+    'R32_SINT': (43, 21),
+    'R16G16_SINT': (38, 28),
+    'R11G11B10_FLOAT': (26, 36),
+    'R10G10B10A2_UINT': (25, 54),
+    'R8G8B8A8_SNORM': (31, 57),
+    'R8G8B8A8_SINT': (32, 61),
+    'R32G32_UINT': (17, 62),
+    'R32G32_SINT': (18, 63),
+    'R16G16B16A16_UNORM': (11, 65),
+    'R16G16B16A16_SNORM': (13, 66),
+    'R16G16B16A16_UINT': (12, 69),
+    'R16G16B16A16_SINT': (14, 70),
+    'R32G32B32A32_UINT': (3, 75),
+    'R32G32B32A32_SINT': (4, 76)
+}
+DXGI.update({name: value for name, (value, _) in ADDED.items()})
+
+
 def main(header=ROOT / 'src' / 'startup_stubs' / 'buffer_format_word3.h'):
     text = header.read_text()
     code_fn = text[text.index('buffer_format_code('):text.index('view_word3(')]
-    mapped = {DXGI[n]: int(c) for n, c in re.findall(r'case DXGI_FORMAT_(\w+): return (\d+);', code_fn)}
+    legacy, extended = code_fn.split('if (!extended)')
+    pattern = r'case DXGI_FORMAT_(\w+): return (\d+);'
+    mapped = {DXGI[n]: int(c) for n, c in re.findall(pattern, legacy)}
+    added = {n: (DXGI[n], int(c)) for n, c in re.findall(pattern, extended)}
+    assert added == ADDED, (added, ADDED)
     supported = (ROOT / 'src' / 'startup_stubs' / 'formatted_buffer.h').read_text()
-    decoded_fn = supported[supported.index('formatted_buffer_supported('):]
-    decoded = {int(c) for c in re.findall(r'case (\d+):', decoded_fn)}
+    legacy_support, extended_support = supported.split('if (!extended)')
     codes = gfx2hlsl.DESC_FORMAT_CODES
-    assert decoded == set(codes.values()), sorted(decoded ^ set(codes.values()))
+    expected_legacy = {codes[name] for name in gfx2hlsl.DESC_LEGACY_FORMATS}
+    ext_codes = {code for _, code in ADDED.values()}
+    pattern = r'case (\d+):'
+    assert {int(c) for c in re.findall(pattern, legacy_support)} == expected_legacy
+    assert {int(c) for c in re.findall(pattern, extended_support)} == ext_codes
     assert set(mapped) == set(EXPECTED), sorted(set(mapped) ^ set(EXPECTED))
     for dxgi, code in mapped.items():
         assert code == codes[EXPECTED[dxgi]], (dxgi, code, EXPECTED[dxgi])
-    assert set(EXPECTED.values()) == set(codes), 'every decoded format has a DXGI view format'
-    return len(mapped)
+    assert set(EXPECTED.values()) == gfx2hlsl.DESC_LEGACY_FORMATS
+    assert set(codes.values()) == expected_legacy | ext_codes
+    expected_added = {MTBUF_FORMATS[code]: code for code in ext_codes}
+    assert {name: code for name, code in codes.items() if name not in gfx2hlsl.DESC_LEGACY_FORMATS} == expected_added
+    for name in codes:
+        assert (name in gfx2hlsl.DESC_ONE_INTEGER) == name.endswith(('_UINT', '_SINT'))
+    return len(mapped) + len(added)
 
 
 if __name__ == '__main__':

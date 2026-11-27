@@ -5287,6 +5287,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_formatted_view_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}")
         set_tests_properties(startup_formatted_view_draw_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_formatted_view_draw_extended_warp COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_formatted_view_draw_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp "${STARTUP_FXC}" --extended)
+            set_tests_properties(startup_formatted_view_draw_extended_warp PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_packed_target_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_packed_target_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")

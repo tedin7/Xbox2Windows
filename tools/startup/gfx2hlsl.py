@@ -176,7 +176,7 @@ FETCH_FORMATS = {
     'BUF_FMT_32_FLOAT': (None, ['{0}.Load(a)', '0u', '0u', 'U(1.0)'])}
 
 
-# gfx10 buffer-descriptor FORMAT field (word 3, bits 12..18) for each FETCH_FORMATS entry: the same unified
+# gfx10 buffer-descriptor FORMAT field (word 3, bits 12..18): the same unified
 # numbers as the tbuffer `format:` operand (tools/disasm_rdna2.py MTBUF_FORMATS; 1 is the omitted default).
 # A MUBUF buffer_load_format_* has no format operand, so its translation switches on this field at run time.
 # An invalid FORMAT reaches the switch default, which poisons the decoded components with this NaN pattern.
@@ -187,9 +187,92 @@ DESC_FORMAT_CODES = {
     'BUF_FMT_2_10_10_10_UNORM': 50, 'BUF_FMT_16_16_UNORM': 23, 'BUF_FMT_16_16_SNORM': 24, 'BUF_FMT_16_16_UINT': 27, 'BUF_FMT_16_16_FLOAT': 29, 'BUF_FMT_8_8_8_8_UNORM': 56, 'BUF_FMT_8_8_8_8_UINT': 60,
     'BUF_FMT_32_32_FLOAT': 64, 'BUF_FMT_16_16_16_16_FLOAT': 71, 'BUF_FMT_32_32_32_FLOAT': 74,
     'BUF_FMT_32_32_32_32_FLOAT': 77}
+DESC_LEGACY_FORMATS = frozenset(DESC_FORMAT_CODES)
+# The packed names list the most significant field first. DXGI puts R in the low bits.
+DESC_FORMAT_CODES.update({
+    'BUF_FMT_8_SNORM': 2,
+    'BUF_FMT_8_SINT': 6,
+    'BUF_FMT_16_UNORM': 7,
+    'BUF_FMT_16_SNORM': 8,
+    'BUF_FMT_16_UINT': 11,
+    'BUF_FMT_16_SINT': 12,
+    'BUF_FMT_16_FLOAT': 13,
+    'BUF_FMT_8_8_SNORM': 15,
+    'BUF_FMT_8_8_UINT': 18,
+    'BUF_FMT_8_8_SINT': 19,
+    'BUF_FMT_32_UINT': 20,
+    'BUF_FMT_32_SINT': 21,
+    'BUF_FMT_16_16_SINT': 28,
+    'BUF_FMT_10_11_11_FLOAT': 36,
+    'BUF_FMT_2_10_10_10_UINT': 54,
+    'BUF_FMT_8_8_8_8_SNORM': 57,
+    'BUF_FMT_8_8_8_8_SINT': 61,
+    'BUF_FMT_32_32_UINT': 62,
+    'BUF_FMT_32_32_SINT': 63,
+    'BUF_FMT_16_16_16_16_UNORM': 65,
+    'BUF_FMT_16_16_16_16_SNORM': 66,
+    'BUF_FMT_16_16_16_16_UINT': 69,
+    'BUF_FMT_16_16_16_16_SINT': 70,
+    'BUF_FMT_32_32_32_32_UINT': 75,
+    'BUF_FMT_32_32_32_32_SINT': 76,
+})
 DESC_FORMAT_SHIFT, DESC_FORMAT_MASK = 12, 127
 # Integer formats read a DST_SEL constant 1 as the integer 1, every other format as 1.0.
-DESC_ONE_INTEGER = ('BUF_FMT_8_UINT', 'BUF_FMT_16_16_UINT', 'BUF_FMT_8_8_8_8_UINT')
+DESC_ONE_INTEGER = frozenset(fmt for fmt in DESC_FORMAT_CODES if fmt.endswith(('_UINT', '_SINT')))
+
+
+def extended_buffer_formats():
+    return os.environ.get('X2W_EXTENDED_BUFFER_FORMATS') == '1'
+
+
+def extended_format_body(fmt, buf):
+    """Decode one gfx10 FORMAT from raw bytes, retaining each result as a uint word."""
+    *fields, kind = fmt.removeprefix('BUF_FMT_').split('_')
+    widths = [int(field) for field in reversed(fields)]
+    one = '1u' if fmt in DESC_ONE_INTEGER else 'U(1.0)'
+    body = ['{']
+    offset = 0
+    for i, width in enumerate(widths):
+        dword, bit = divmod(offset, 32)
+        address = 'a' if dword == 0 else 'a + %du' % (dword * 4)
+        load = 'ldu(%s, %s)' % (buf, address)
+        mask = (1 << width) - 1
+        raw = load if width == 32 else '((%s >> %du) & %du)' % (load, bit, mask)
+        body.append('{ uint x = %s;' % raw)
+        if kind in ('SINT', 'SNORM') and width < 32:
+            shift = 32 - width
+            body.append('int s = asint(x << %du) >> %du;' % (shift, shift))
+        if kind == 'FLOAT' and width < 32:
+            # Unsigned 10/11-bit floats have the same exponent as binary16. Moving the
+            # exponent and mantissa into the half layout also preserves subnormals.
+            half = 'x' if width == 16 else 'x << %du' % (15 - width)
+            body.append('c%d = U(f16tof32(%s));' % (i, half))
+        elif kind in ('UNORM', 'SNORM'):
+            bits = width - (kind == 'SNORM')
+            denominator = (1 << bits) - 1
+            if kind == 'SNORM':
+                body.append('uint sign = asuint(s) & 0x80000000u; x = min(uint(abs(s)), %du);' % denominator)
+            else:
+                body.append('uint sign = 0u;')
+            # Compute a 24-bit fractional quotient in two chunks so all intermediates
+            # fit in uint. The odd denominator rules out a halfway tie.
+            body.extend([
+                'if (x != 0u) {',
+                'uint top = firstbithigh(x), n = x << (%du - top);' % bits,
+                'uint q = (n << 8u) / %du;' % denominator,
+                'uint r = (n << 8u) - q * %du;' % denominator,
+                'uint fixed24 = (q << 16u) + (r << 16u) / %du;' % denominator,
+                'c%d = sign | (((126u + top - %du) << 23u) + ((fixed24 + 1u) >> 1u)); }' % (i, bits),
+            ])
+        else:
+            body.append('c%d = %s;' % (i, 'asuint(s)' if kind == 'SINT' and width < 32 else 'x'))
+        body.append('}')
+        offset += width
+    if len(widths) < 4:
+        body.append('c3 = %s;' % one)
+    if fmt in DESC_ONE_INTEGER:
+        body.append('one = 1u;')
+    return body + ['}']
 
 # Supported 1-channel formats for compute buffer_store_format_d16_x (RDNA 2 MUBUF 0x84):
 # V# word 3 bits 18:12 carry the 7-bit GFX10 unified FORMAT when RESOURCE_LEVEL (bit 24) is 1,
@@ -9282,7 +9365,12 @@ class Stage:
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
+        extended = self.kind != 'cs' and extended_buffer_formats()
         for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
+            if fmt not in DESC_LEGACY_FORMATS:
+                if extended:
+                    self.emit('case %du: %s break;' % (code, ' '.join(extended_format_body(fmt, buf))))
+                continue
             load, comps = FETCH_FORMATS[fmt]
             body = ['w = %s;' % load.format(buf)] if load else []
             body += ['c%d = %s;' % (i, comps[i].format(buf)) for i in range(4)]
@@ -14685,6 +14773,11 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
+def shader_cache_seed(revision):
+    seed = fnv(revision)
+    return fnv(b'extended-buffer-formats1', seed) if extended_buffer_formats() else seed
+
+
 def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout.
 
@@ -14692,7 +14785,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-28'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, shader_cache_seed(b'x2w-startup-shader-28'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -15164,7 +15257,7 @@ def read_ps_inputs(path, key):
 
 
 def mesh57_key(ms, ps, root):
-    value = fnv(b'x2w-startup-mesh-57-3')
+    value = shader_cache_seed(b'x2w-startup-mesh-57-3')
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value

@@ -569,18 +569,24 @@ void release_placed_vertices(bool done)
     }
 }
 
-// X2W_TEST_FORMATTED_VIEW=<DXGI format>:<component mapping>:<raw 0|1>:<64 hex bytes>: one typed (or raw) buffer view
-// the title creates over a placed buffer holding those bytes, at table entry 0, then one draw. The translated pixel
-// shader in tests/startup_formatted_view_draw_check.py reads element 1 through buffer_load_format_xyzw.
+// X2W_TEST_FORMATTED_VIEW=<DXGI format>:<mapping>:<mode>:<64 hex bytes>. Modes 0, 1 and 2
+// create a typed view, raw view and oversized R32_UINT view respectively. The Python fixture
+// reads the selected element through buffer_load_format_xyzw and checks the target readback.
 int draw_formatted_view(void* guest, void* list)
 {
     char spec[256]{};
     if (!GetEnvironmentVariableA("X2W_TEST_FORMATTED_VIEW", spec, sizeof(spec))) return 48;
-    unsigned format = 0, mapping = 0, raw = 0;
+    unsigned format = 0, mapping = 0, mode = 0;
     char hex[129]{};
-    if (std::sscanf(spec, "%u:%x:%u:%128s", &format, &mapping, &raw, hex) != 4 || std::strlen(hex) != 128) return 48;
+    if (std::sscanf(spec, "%u:%x:%u:%128s", &format, &mapping, &mode, hex) != 4 || std::strlen(hex) != 128 || mode > 2) return 48;
     static std::array<std::uint8_t, 65536 + 256> backing{};
-    auto* const bytes = reinterpret_cast<std::uint8_t*>((ptr(backing.data()) + 0xffff) & ~Word{0xffff});
+    constexpr UINT over_limit = (16u << 20) + 4u;
+    const bool oversized = mode == 2;
+    if (oversized && format != DXGI_FORMAT_R32_UINT) return 48;
+    auto* const bytes = oversized
+        ? static_cast<std::uint8_t*>(VirtualAlloc(nullptr, over_limit + 65536u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+        : reinterpret_cast<std::uint8_t*>((ptr(backing.data()) + 0xffff) & ~Word{0xffff});
+    if (!bytes) return 48;
     for (unsigned i = 0; i < 64; ++i) {
         unsigned value = 0;
         if (std::sscanf(hex + 2 * i, "%2x", &value) != 1) return 48;
@@ -588,7 +594,7 @@ int draw_formatted_view(void* guest, void* list)
     }
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = 256;
+    desc.Width = oversized ? over_limit : 256u;
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     void* placed = nullptr;
@@ -597,10 +603,13 @@ int draw_formatted_view(void* guest, void* list)
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
     D3D12_SHADER_RESOURCE_VIEW_DESC view{static_cast<DXGI_FORMAT>(format), D3D12_SRV_DIMENSION_BUFFER, mapping};
-    view.Buffer.NumElements = 4;
-    view.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    view.Buffer.NumElements = oversized ? over_limit / 4u : 4u;
+    view.Buffer.Flags = mode == 1 ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
     invoke(guest, 18, ptr(placed), ptr(&view), cpu);
     invoke(list, 12, 3, 1);
+    char repeat[2]{};
+    if (GetEnvironmentVariableA("X2W_TEST_FORMATTED_VIEW_REPEAT", repeat, sizeof(repeat)) == 1 && repeat[0] == '1')
+        invoke(list, 12, 3, 1);
     return 0;
 }
 
