@@ -2161,22 +2161,31 @@ LDS_EXCHANGE_OPS = {
 }
 
 
-def lds_unbarriered_b64_pair(ins):
-    """Conservative first general case: one ordered b64 store/load in straight-line entry EXEC."""
-    ds = []
+def lds_general_plan(ins, group, words):
+    """Plan uniform ordering points for a straight-line compute LDS program."""
+    if not 0 < words <= 8192 or any(n < 1 for n in group):
+        return None
+    barriers, pending = set(), set()
     for i, (_, _, _, asm) in enumerate(ins):
         name, ops, mods = parse(asm)
         base = name.removesuffix('_e32').removesuffix('_e64')
         if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_rfe', 's_trap'))
-                or writes_exec(base, ops) or base == 's_barrier'
-                or base == 's_endpgm' and i + 1 < len(ins)):
-            return False
-        if base.startswith('ds_'):
-            ds.append((i, base))
-    if [op for _, op in ds] != ['ds_write_b64', 'ds_read_b64']:
-        return False
-    return all(i + 1 < len(ins) and parse(ins[i + 1][3]) == ('s_waitcnt', ['lgkmcnt(0)'], [])
-               for i, _ in ds)
+                or writes_exec(base, ops) or base == 's_endpgm' and i + 1 < len(ins)):
+            return None
+        if base == 's_barrier':
+            if mods or ops not in ([], ['0'], ['0x0']):
+                return None
+            pending.clear()
+        elif base.startswith('ds_'):
+            if 'gds' in mods or base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS:
+                return None
+            kind = 'a' if base in LDS_ATOMIC_OPS else ('w' if LDS_GENERAL_OPS[base][0] else 'r')
+            if ((kind == 'r' and pending & {'w', 'a'}) or (kind == 'w' and pending)
+                    or (kind == 'a' and pending & {'r', 'w'})):
+                barriers.add(i)
+                pending.clear()
+            pending.add(kind)
+    return barriers
 
 
 def lds_vgpr_writes(base, ops):
@@ -7662,6 +7671,43 @@ class Stage:
             return ('end',)
         if base == 's_branch':
             return ('jump', int(ops[0].split('_')[1], 16))
+        # Prepare the fallback at the first LDS instruction (or barrier), including
+        # programs whose first LDS instruction is dual-offset or atomic.
+        if (getattr(self, 'kind', None) == 'cs' and (base.startswith('ds_') or base == 's_barrier')
+                and getattr(self, 'ins', None)):
+            if not hasattr(self, 'lds_needs_retry'):
+                general_only = LDS_GENERAL_OPS.keys() - LDS_DUAL_OPS.keys()
+                self.lds_needs_retry = any(re.sub(r'_e(32|64)$', '', n) in general_only
+                                           for _, _, n, _ in self.ins)
+            if self.lds_needs_retry and not hasattr(self, 'lds_error'):
+                self.lds_error = None
+                try:
+                    if getattr(self, 'pipe', None) is None:
+                        raise Unsupported('LDS exchange needs pipeline metadata')
+                    self.lds_exchange_words = check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                    self.uses_lds = True
+                except Unsupported as reason:
+                    self.lds_error = str(reason)
+                    if getattr(self, 'pipe', None) is not None:
+                        plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words)
+                        if plan is not None:
+                            self.lds_error = None
+                            self.lds_plan = plan
+            plan = getattr(self, 'lds_plan', None)
+            if plan is not None:
+                if self.descriptor_instruction_index in plan:
+                    self.emit('GroupMemoryBarrierWithGroupSync();')
+                if base == 's_barrier':
+                    self._lds_require_alloc(base)
+                    self.emit('GroupMemoryBarrierWithGroupSync();')
+                    return None
+                if base in LDS_GENERAL_OPS:
+                    return self.lds_general(base, ops, mods)
+                if base in LDS_ATOMIC_OPS:
+                    addr = ops[1 if LDS_ATOMIC_OPS[base][1] else 0]
+                    if not self.operand_align4(addr):
+                        raise Unsupported('%s needs a proven 4-byte aligned address' % base)
+                    return self.lds_atomic(base, ops, mods)
         if base == 's_barrier' and getattr(self, 'kind', None) == 'cs' and self._lds_general_barrier_ok():
             if mods or ops not in ([], ['0'], ['0x0']):
                 raise Unsupported('s_barrier with unexpected operands or modifiers')
@@ -7712,14 +7758,13 @@ class Stage:
                     self.uses_lds = True
                 except Unsupported as reason:
                     self.lds_error = str(reason)
-                    if (getattr(self, 'pipe', None) is not None and
-                            lds_unbarriered_b64_pair(self.ins)):
-                        self.lds_error = None
-                        self.lds_b64_pair = True
+                    if getattr(self, 'pipe', None) is not None:
+                        plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words)
+                        if plan is not None:
+                            self.lds_error = None
+                            self.lds_plan = plan
             if self.lds_error is not None:
                 raise Unsupported(self.lds_error)
-            if getattr(self, 'lds_b64_pair', False):
-                return self.lds_b64_general(base, ops, mods)
             if base == 's_barrier':
                 self.emit('GroupMemoryBarrierWithGroupSync();')
             else:
@@ -10104,41 +10149,99 @@ class Stage:
         if glc:
             self.set_v(data[1], 'asuint(ai)' if signed else 'ao')
 
-    def lds_b64_general(self, name, ops, mods):
-        # AMD RDNA 2 ISA guide, 10.4.3 and 12.13: indexed DS uses a per-lane byte address.
-        # D3D HLSL GroupMemoryBarrierWithGroupSync: all group threads must reach the barrier.
-        write = name == 'ds_write_b64'
-        # Check encoding fields hidden by the disassembler only on this retry path.
+    def lds_general(self, name, ops, mods):
+        """Lower indexed LDS operations on byte addresses (AMD RDNA 2 ISA, 10.4.3 and 12.13)."""
+        write, width, kind = LDS_GENERAL_OPS[name]
+        dual = kind == 'dual'
+        count = (width + 3) // 4
+        slots = 2 if dual else 1
+        span = lambda tok, n: _lds_single(tok) if n == 1 else _lds_vgpr_span(tok, n)
+        if len(ops) != (3 if write and dual else 2):
+            raise Unsupported('%s has invalid LDS operands' % name)
+        addr = ops[0 if write else 1]
+        if _lds_single(addr) is None:
+            raise Unsupported('%s needs an address VGPR' % name)
+        if write:
+            regs = [span(op, count) for op in ops[1:]]
+        else:
+            first = span(ops[0], count * slots)
+            regs = [None if first is None else first + slot * count for slot in range(slots)]
+        if any(reg is None for reg in regs):
+            raise Unsupported('%s has an invalid data VGPR span' % name)
         if self.pc + 8 > len(self.raw_code):
             raise Unsupported('%s needs a complete DS encoding' % name)
         word0, word1 = struct.unpack_from('<2I', self.raw_code, self.pc)
-        unused = 0xffff0000 if write else 0x00ffff00
+        unused = (0xff000000 if dual else 0xffff0000) if write else 0x00ffff00
         if word0 & (1 << 16) or word1 & unused:
             raise Unsupported('%s has reserved or unused DS fields set' % name)
-        if name not in ('ds_write_b64', 'ds_read_b64') or len(ops) != 2:
-            raise Unsupported('LDS b64 pair needs one write followed by one read')
-        addr = ops[0 if write else 1]
-        pair = _lds_pair(ops[1 if write else 0])
-        if _lds_single(addr) is None or pair is None:
-            raise Unsupported('%s needs an address VGPR and a 2-VGPR pair' % name)
-        offset, = lds_byte_offsets(name, mods)
-        if offset % 4 or not self.operand_align4(addr):
-            raise Unsupported('LDS b64 general needs a proven 4-byte aligned address')
+        if dual:
+            fields = {}
+            for mod in mods:
+                match = re.fullmatch(r'offset([01]):(\d+)', mod)
+                if not match or match[1] in fields or int(match[2]) > 255:
+                    raise Unsupported('%s needs two 8-bit LDS offsets' % name)
+                fields[match[1]] = int(match[2])
+            stride = width * (64 if 'st64' in name else 1)
+            offsets = [fields.get(str(i), 0) * stride for i in range(2)]
+        else:
+            offsets = lds_byte_offsets(name, mods)
         limit = self._lds_require_alloc(name)
-        if not write:
-            self.emit('GroupMemoryBarrierWithGroupSync();')
+        aligned = self.operand_align4(addr)
+        guard_exec = '' if self.exec_known else '(exec & 1) && '
         self.emit('a = %s;' % self.u(addr))
-        for index in range(2):
-            off = offset + index * 4
-            if write:
-                value = self.u('v%d' % (pair + index))
-                if off < limit:
-                    self.emit('if (a < %du) lds[(a + %du) >> 2] = %s;' % (limit - off, off, value))
-            else:
-                self.emit('w = 0u;')
-                if off < limit:
-                    self.emit('if (a < %du) w = lds[(a + %du) >> 2];' % (limit - off, off))
-                self.set_v(pair + index, 'w')
+        for slot, off in enumerate(offsets):
+            for word in range(count):
+                start = off + word * 4
+                size = min(4, width - word * 4)
+                direct = size == 4 and aligned and start % 4 == 0
+                if write:
+                    value = self.u('v%d' % (regs[slot] + word))
+                    if direct:
+                        if start < limit:
+                            self.emit('if (%sa < %du) lds[(a + %du) >> 2] = %s;'
+                                      % (guard_exec, limit - start, start, value))
+                    else:
+                        # Sub-dword updates in different lanes may share a uint. Each byte
+                        # uses interlocked masks; a plain read-modify-write loses updates.
+                        for byte in range(size):
+                            pos = start + byte
+                            if pos >= limit:
+                                continue
+                            index = '(a + %du)' % pos
+                            shift = '((%s & 3u) * 8u)' % index
+                            mask = '(0xffu << %s)' % shift
+                            source_shift = byte * 8 + (16 if kind == 'high' else 0)
+                            val = '((%s >> %du) & 0xffu)' % (value, source_shift)
+                            guard = '%sa < %du' % (guard_exec, limit - pos)
+                            self.emit('if (%s) { InterlockedAnd(lds[%s >> 2], ~%s); InterlockedOr(lds[%s >> 2], (%s << %s) & %s); }'
+                                      % (guard, index, mask, index, val, shift, mask))
+                else:
+                    self.emit('w = 0u;')
+                    if direct:
+                        if start < limit:
+                            self.emit('if (%sa < %du) w = lds[(a + %du) >> 2];'
+                                      % (guard_exec, limit - start, start))
+                    else:
+                        for byte in range(size):
+                            pos = start + byte
+                            if pos >= limit:
+                                continue
+                            index = '(a + %du)' % pos
+                            shift = '((%s & 3u) * 8u)' % index
+                            self.emit('if (%sa < %du) w |= ((lds[%s >> 2] >> %s) & 0xffu) << %du;'
+                                      % (guard_exec, limit - pos, index, shift, byte * 8))
+                    if kind == 'i' or kind.startswith('d16') and kind.endswith('_i'):
+                        shift = 32 - width * 8
+                        self.emit('w = asuint(asint(w << %du) >> %du);' % (shift, shift))
+                    dst = regs[slot] + word
+                    if kind.startswith('d16'):
+                        high = kind.startswith('d16_hi')
+                        old = self.u('v%d' % dst, low16_only=high or dst in self.low16_only_v)
+                        expr = ('(%s & 0x0000ffffu) | ((w & 0xffffu) << 16u)' % old if high else
+                                '(%s & 0xffff0000u) | (w & 0xffffu)' % old)
+                        self.set_v(dst, expr, low16_only=not high and dst in self.low16_only_v)
+                    else:
+                        self.set_v(dst, 'w')
 
     def _lds_general_barrier_ok(self):
         """True when a compute stage uses dual/atomic LDS ops in straight-line code without legacy exchange ops."""
@@ -14416,6 +14519,20 @@ LDS_ATOMIC_OPS = {
 }
 
 LDS_DUAL_ATOMIC_OPS = frozenset((*LDS_DUAL_OPS, *LDS_ATOMIC_OPS))
+
+# AMD RDNA 2 ISA guide, 10.4.3 and 12.13: indexed DS byte addresses and element widths.
+LDS_GENERAL_OPS = {
+    **{'ds_%s_b%d' % (op, width * 8): (op == 'write', width, 'plain')
+       for op in ('read', 'write') for width in (4, 8, 12, 16)},
+    **{'ds_read_%s%d' % (sign, bits): (False, bits // 8, sign)
+       for sign in ('u', 'i') for bits in (8, 16)},
+    **{'ds_read_%s%d_d16%s' % (sign, bits, high): (False, bits // 8, 'd16' + high + '_' + sign)
+       for sign, bits in (('u', 8), ('i', 8), ('u', 16)) for high in ('', '_hi')},
+    **{'ds_write_b%d%s' % (bits, high): (True, bits // 8, 'high' if high else 'plain')
+       for bits in (8, 16) for high in ('', '_d16_hi')},
+    'ds_read2_b32': (False, 4, 'dual'),
+    **{name: (write, width, 'dual') for name, (write, width, _) in LDS_DUAL_OPS.items()},
+}
 
 # Unused w1 register field masks in RDNA 2 DS encoding (must be zero):
 # w1[7:0]=ADDR, w1[15:8]=DATA0, w1[23:16]=DATA1, w1[31:24]=VDST.
