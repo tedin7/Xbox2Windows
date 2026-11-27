@@ -5397,6 +5397,8 @@ class Stage:
             self.exec_generation = 0
             self.low16_generation = {}
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
+            self.pixel_rw_loads = {}    # shared pixel image -> [(offset, packed, address registers)] of its loads
+            self.pixel_rw_stores = {}   # shared pixel image -> [(offset, packed, address registers)] of its stores
             self.whole_read_sites = {}  # first upper-half consumer per VGPR
             self.low16_copies = {}      # source VGPR -> copy destinations for the block-boundary guard
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
@@ -10006,7 +10008,7 @@ class Stage:
         desc_key = self.descriptor(ops[2])
         shared_load = (desc_key is not None and getattr(self, 'kind', None) == 'ps' and how == 'load'
                        and kinds[dim] in ('tex2d', 'tex2da') and not integer_srvs
-                       and 'a16' not in mods and 'd16' not in mods
+                       and 'd16' not in mods
                        and getattr(self.pipe, 'pixel_rw_images', None) is not None
                        and self.is_fixed_table_image(ops[2], desc_key))
         if desc_key is None:
@@ -10051,6 +10053,10 @@ class Stage:
                 address = [self.u(c) for c in cs[:axes]]
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
             location = 'int%d(%s)' % (axes + 1, ', '.join(address + [mip]))
+            if uav_load:
+                for earlier in self.pixel_rw_stores.get(desc_key, ()):
+                    self.prove_same_texel(desc_key, earlier, (packed_2d, tuple(cs[:expected_addr])))
+                self.pixel_rw_loads.setdefault(desc_key, []).append((self.pc, packed_2d, tuple(cs[:expected_addr])))
             call = ('%s[uint%d(%s)]' % (tex, axes, ', '.join(address)) if uav_load
                     else '%s.Load(%s)' % (tex, location))
             if integer_srvs and not packed_d16:
@@ -10361,6 +10367,23 @@ class Stage:
                 raise Unsupported('%s through a modified image descriptor' % name)
         return self.descriptor(operand) if known_key is None else known_key
 
+    def prove_same_texel(self, key, earlier, now):
+        """A shared read-write pixel image is read and written through one view only where the access at this offset
+        names the texel of every earlier one: the same address registers, unchanged in between, on a program with no
+        back edge. Another pixel's store to a texel read here would be a race the console does not have."""
+        offset, packed, coords = earlier
+        refusal = 'resource %s is both read and stored to (the load and the store do not name the same texel)' % (key,)
+        if getattr(self, 'has_branches', False) and not getattr(self, 'forward_table_adds', False):
+            raise Unsupported(refusal)
+        if (packed, tuple(coords)) != tuple(now) or not all(re.fullmatch(r'v\d+', c) for c in coords):
+            raise Unsupported(refusal)
+        regs = {int(c[1:]) for c in coords}
+        for off, _n, name, asm in self.ins:
+            if offset <= off < self.pc:
+                base = re.sub(r'_e(32|64)$', '', name)
+                if lds_vgpr_writes(base, parse(asm)[1]) & regs:
+                    raise Unsupported(refusal)
+
     def is_fixed_table_image(self, operand, key):
         if key[0][0] != 'table' or key[1] is None or key[1] % 32 or key in self.pipe.other_modified:
             return False
@@ -10455,7 +10478,10 @@ class Stage:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         if (self.kind == 'ps' and getattr(self.pipe, 'pixel_rw_images', None) is not None
                 and self.is_fixed_table_image(ops[2], key)):
+            for earlier in self.pixel_rw_loads.get(key, ()):
+                self.prove_same_texel(key, earlier, (packed_2d, tuple(cs)))
             image = self.pipe.pixel_image_store(key, image_kind)
+            self.pixel_rw_stores.setdefault(key, []).append((self.pc, packed_2d, tuple(cs)))
         else:
             if key in (getattr(self.pipe, 'pixel_rw_images', None) or ()):
                 raise Unsupported('resource %s is both read and stored to' % (key,))
