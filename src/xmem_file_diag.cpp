@@ -213,7 +213,7 @@ bool wrap_title_file_calls() noexcept
 // Called by the first dstorage Factory::OpenFile: the package archives are being opened, so the diagnostics stop.
 extern "C" void WINAPI x2w_file_diag_opened() noexcept
 {
-    if (InterlockedExchange(&archives_opened, 1)) return;
+    if (!x2w_local::env_on("X2W_FILE_DIAG") || InterlockedExchange(&archives_opened, 1)) return;  // silent without the switch
     x2w_local::logf("x2w-filediag first dstorage OpenFile reached after %ld failing file call(s)",
                     InterlockedCompareExchange(&failing_calls, 0, 0));
 }
