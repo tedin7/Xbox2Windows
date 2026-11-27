@@ -45,6 +45,7 @@ struct Scene {
     alignas(64) unsigned char title_rtvs[512]{};
     void* signature = nullptr;
     void* arguments = nullptr;
+    void* upload = nullptr;  // X2W_TEST_REPLAY_PREFIX_LIVE
 };
 
 LONG volatile access_exceptions;
@@ -199,6 +200,18 @@ int create_scene(void* device, Scene& s)
         s.fallback_rtv = s.rtv;
         s.rtv = destinations[ranges - 1];
     } else {
+        // X2W_TEST_REPLAY_PREFIX_LIVE=1: the target's view is written twice, a null view first, so only the last write to
+        // that destination draws; and an upload buffer is mapped, unmapped and asked for its GPU address every frame.
+        if (GetEnvironmentVariableA("X2W_TEST_REPLAY_PREFIX_LIVE", nullptr, 0)) {
+            invoke(device, 20, 0, arg(&view), s.rtv);
+            const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+            const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&upload_heap), D3D12_HEAP_FLAG_NONE, arg(&buffer),
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, 0, arg(&__uuidof(ID3D12Resource)),
+                                                   arg(&s.upload)))) || !s.upload)
+                return 27;
+        }
         invoke(device, 20, arg(s.target), arg(&view), s.rtv);
     }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -281,6 +294,11 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(s.constants ? width : 4 + (frame * 4) % (width - 4)), static_cast<LONG>(height)};
     if (FAILED(static_cast<HRESULT>(invoke(s.allocator, 8))) || FAILED(static_cast<HRESULT>(invoke(s.list, 139, arg(s.allocator)))))
         return 30;
+    if (s.upload) {
+        void* mapped = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(s.upload, 8, 0, 0, arg(&mapped)))) || !mapped || !invoke(s.upload, 11)) return 37;
+        invoke(s.upload, 9, 0, 0);
+    }
     if (slot_layouts) {
         Word token = ~Word{0};
         if (invoke(device, 80, 0, 0, 0, 0, arg(&token), arg(&token)) != S_OK || token != frame + 1)
