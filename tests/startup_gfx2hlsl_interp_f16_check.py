@@ -4,7 +4,7 @@
   binary <llvm-mc>                     reassemble the fixture sources and compare them with the words below
   compile <dxc>                        compile the translated pair with DXC vs_6_0 / ps_6_0 (no rendering)
   draw_exec_halves <dxc> <offscreen_check> <warp|hardware>
-                                       draw the restored-EXEC, half-write and wide-write fixtures
+                                       draw the EXEC coverage and explicit-LOD sample fixtures and their mutants
   draw_flow <dxc> <offscreen_check> <warp|hardware>
                                        draw the varying, branching pair and mixed-FMA fixture and its mutants
   draw <dxc> <offscreen_check> <warp|hardware>
@@ -50,6 +50,7 @@ sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 import gpu_case_runner  # noqa: E402
 from startup_flat_param_check import VS_WORDS as F32_VS_WORDS, assemble, compile_hlsl, draw, root_blob  # noqa: E402
+from startup_image_3d_check import root_blob as image_root_blob  # noqa: E402
 
 VS_SOURCE = """\
 v_mov_b32 v3, 0x40400000
@@ -378,6 +379,7 @@ def controls():
     extended_flow_controls()
     monotone_exec_controls()
     cfg_exec_and_memory_controls()
+    sample_and_subset_controls()
     assert len(set(flow_reference(8, 4)[::4])) == 8
     loop_controls(expected)
     plain_controls(expected)
@@ -607,6 +609,7 @@ def scan_decoded(*instructions):
     stage = G.Stage.__new__(G.Stage)
     stage.ins = [(4 * i, 4, G.parse(asm)[0], asm) for i, asm in enumerate(instructions)]
     stage.interp_f16_scan()
+    return stage
 
 
 def monotone_exec_controls():
@@ -723,9 +726,9 @@ def cfg_exec_and_memory_controls():
     for asm in instructions:
         name, ops, _ = G.parse(asm)
         effects.append(stage.interp_exec_effects(name, asm, ops, G.writes_exec(name, ops)))
-    effects.append((set(), None, None, False, ()))
+    effects.append(stage.interp_exec_effects('s_nop', 's_nop 0', ['0'], False))
     facts = stage.interp_exec_entry_facts([[1], [2], []], effects, set())
-    assert facts[2] == (frozenset(), {frozenset({20, 21}), frozenset({36, 37})}), 'saveexec must clear EQ'
+    assert facts[2][:2] == (frozenset(), {frozenset({20, 21}), frozenset({36, 37})}), 'saveexec must clear EQ'
 
     masked = ('s_mov_b64 s[36:37], exec', *pair, 's_and_saveexec_b64 s[20:21], vcc', overwrite)
     load = 'image_load v30, [v12, v13], s[32:39]'
@@ -741,9 +744,12 @@ def cfg_exec_and_memory_controls():
             'image_gather4_c_lz_o v[30:33], v[12:16], s[32:39], s[40:43]',
     ):
         scan_decoded(*masked, masked_read)
+    plain = scan_decoded(*masked, 'image_sample v30, v[12:13], s[32:39], s[40:43]')
+    assert set(plain.interp_sample_obligations) == {plain.ins[-1][0]}
     for quad_read in (
-            'image_sample v30, v[12:13], s[32:39], s[40:43]',
             'image_sample_b v30, v[12:14], s[32:39], s[40:43]',
+            'image_sample_d v30, v[12:17], s[32:39], s[40:43]',
+            'image_get_lod v30, v[12:13], s[32:39], s[40:43]',
             'image_gather4 v[30:33], v[12:13], s[32:39], s[40:43]',
             'ds_swizzle_b32 v30, v12',
             'ds_permute_b32 v30, v12, v13',
@@ -820,6 +826,109 @@ def extended_flow_controls():
                  's_mov_b64 exec, s[20:21]', 's_mov_b64 s[36:37], exec', *pair,
                  's_load_dwordx4 s[18:21], s[8:9], 0', 's_mov_b64 exec, s[20:21]', 'v_mov_b32 v12, v20',
                  's_mov_b64 exec, s[36:37]', use)
+
+
+def wqm(src=126):
+    return words(0xbefe0a00 | src)
+
+
+def copy_exec(dst):
+    return words(0xbe80047e | dst << 16)
+
+
+def sample_fixture(form='plain', flow='narrowed'):
+    """Use v12 as U after replacing the omitted partial within the sample's EXEC."""
+    p1, p2 = interp_words(12, 20, 0)  # attr0.x low half is 1.5 in VS_WORDS
+    # Texture table slot 0 and an inline point sampler. Ordinary sampling
+    # exposes all three mips. Comparison sampling is limited to level zero.
+    sampler = (0x88001012, 0, 0, 0) if form == 'cmp' else (0, 0x200000, 0x04000000, 0)
+    scalar = words(0xf40c0404, 0xfa000000)
+    for reg, value in enumerate(sampler, 24):
+        scalar += words(0xbe8003ff | reg << 16, value)
+    scalar += words(0xbf8cc07f)
+    prefix = M0 + scalar + (copy_exec(32) if flow != 'narrowed' else b'') + wqm() + p1 + p2
+    # 1.25 < interpolated 1.5 on the covered pixel. Keep the scalar branch and
+    # mask in the translated shader even though this one-pixel draw takes the body.
+    prefix += words(0x7e001700 | 21 << 17 | 20, 0x7c020000 | 21 << 9 | 255, 0x3fa00000)
+    opcode = {'plain': 0x20, 'bias': 0x25, 'cmp': 0x28, 'offset': 0x30}[form]
+    body = mov(12, 0x3ec00000) + mov(13, 0x3f200000)  # (3/8, 5/8)
+    if form != 'plain':
+        body += mov(11, {'bias': 0, 'cmp': 0x3e000000, 'offset': 1}[form])
+    body += words(0xf0000108 | opcode << 18, 0x00c41e00 | (12 if form == 'plain' else 11))
+    body += words(0xbf8c3f70)
+    if flow == 'narrowed':
+        active = save_exec(32, 106) + branch(8, body) + body + restore_exec(32)
+    else:
+        # Returning to the entry mask is a no-op in the main walk. In the
+        # guest it removes the helper lanes before the coordinate overwrite.
+        active = restore_exec(32)
+        if flow == 'placeholder':
+            active += branch(2, words(0xbf800000)) + words(0xbf800000) + scalar
+        active += body
+    return prefix + active + export_words(30, 30, 30, 30) + END
+
+
+def sample_stage(form='plain', flow='narrowed'):
+    return G.Pipeline(VS_WORDS, sample_fixture(form, flow), image_root_blob())
+
+
+def subset_fixture(control=None, *, shrink_op=0x15):
+    live, other, quad = 32, 34, 36
+    p1, p2 = interp_words(12, 20, 0, high=True)
+    prefix = M0 + copy_exec(live) + copy_exec(other) + wqm() + p1 + p2
+    prefix += words(0x7e001700 | 21 << 17 | 20, 0x7c020000 | 21 << 9 | 255, 0x3fc00000)
+    shrink = words(0x80000000 | shrink_op << 23 | live << 16 | 106 << 8 | live)
+    cover = mov(12, 0x3fa00000)
+    if control == 'shrink reverse':
+        # The copies initially match. Shrinking live must break quad <= live.
+        masks = wqm() + copy_exec(quad) + copy_exec(live) + shrink + restore_exec(live) + cover + restore_exec(quad)
+    elif control == 'helpers':
+        # The pre-WQM live mask cannot cover the helper lanes in quad.
+        masks = copy_exec(quad) + restore_exec(live) + cover + restore_exec(quad)
+    else:
+        # Both paths enter the join under wqm(live), then save it in quad.
+        narrowed = mov(29, 0x40000000)
+        # Shrink again after the join. The AND is idempotent and must keep
+        # the live <= EXEC fact learned from both WQM paths.
+        masks = (shrink + wqm(live) + branch(6, wqm(live)) + wqm(live) + shrink
+                 + save_exec(quad, 106) + branch(8, narrowed) + narrowed + restore_exec(quad) + cover)
+        if control == 'rewritten':
+            masks += words(0xbe800480 | live << 16)  # s_mov_b64 live, 0
+        if control == 'different pair':
+            masks += wqm(other) + copy_exec(other)
+        masks += restore_exec(other if control == 'different pair' else live)
+    # Match the comparison result and the overwritten coordinate itself.
+    read = words(0x7c020000 | 21 << 9 | (256 + 12))
+    select = mov(31, 0x3f800000) + words(0x02000000 | 30 << 17 | 31 << 9 | 128)
+    return prefix + masks + read + select + export_words(12, 30, 21, 31) + END
+
+
+def sample_and_subset_controls():
+    for form, call in (
+            ('plain', 'SampleLevel(q0, float2(F(v12), F(v13)), 0)'),
+            ('offset', 'SampleLevel(q0, float2(F(v12), F(v13)), 0, int2(1, 0))'),
+            ('cmp', 'SampleCmpLevelZero(q0, float2(F(v12), F(v13)), F(v11))')):
+        ps = sample_stage(form).hlsl_ps()
+        assert call in ps, (form, ps)
+    stale = ('v12 is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+             'a v_interp_p2_f16 that wrote another register')
+    for label, form, flow, opcode in (
+            ('exec_known', 'plain', 'entry', 'image_sample'),
+            ('plain placeholder', 'plain', 'placeholder', 'image_sample'),
+            ('bias', 'bias', 'narrowed', 'image_sample_b')):
+        try:
+            sample_stage(form, flow).hlsl_ps()
+        except G.Unsupported as error:
+            assert str(error) == stale % opcode, (label, error)
+        else:
+            raise AssertionError('%s was translated' % label)
+    for label in ('rewritten', 'different pair', 'helpers', 'shrink reverse'):
+        refused(label, subset_fixture(label), stale % 'v_cmp_lt_f32', vs_words=varying_vertex_words())
+    for shrink_op in (0x15, 0x0f):  # S_ANDN2_B64 and S_AND_B64
+        ps = translate(subset_fixture(shrink_op=shrink_op), varying_vertex_words()).hlsl_ps()
+        assert 'F(v12) < F(v21)' in ps, ps
+        assert ps.count('v12 = 0x3fa00000u;') == 1, ps
+    print('covered samples and EXEC subset controls passed')
 
 
 def f32(x):
@@ -1132,6 +1241,60 @@ def check_extended_flow_draw(dxc, renderer, adapter):
                 assert run.returncode == 1 and 'pixel mismatch' in diagnostic, (name, diagnostic)
             else:
                 assert run.returncode == 0 and 'all 32 pixels matched' in diagnostic, (name, diagnostic)
+            print(name, diagnostic, flush=True)
+        check_subset_draw(dxc, renderer, adapter, directory, vertex, width, height)
+        check_covered_sample_draw(dxc, renderer, adapter, directory)
+
+
+def check_subset_draw(dxc, renderer, adapter, directory, vertex, width, height):
+    # S drops pixels with an interpolated value greater than 1.5. The
+    # surviving pixels compare the replacement value 1.25 to interpolation.
+    reference = []
+    for x in range(width):
+        interpolated = 1 + (x + 0.5) / width
+        pixel = ((1.25, float(1.25 < interpolated), interpolated, 1.0)
+                 if interpolated <= 1.5 else (-1.0,) * 4)
+        reference.extend(map(f32_bits, pixel))
+    expected = directory / 'exec_subset.bin'
+    expected.write_bytes(words(*(reference * height)))
+    pipe = translate(subset_fixture(), vertex)
+    vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), 'exec_subset_vs', 'vs_6_0', directory)
+    source = pipe.hlsl_ps()
+    mutant = source.replace('v12 = 0x3fa00000u;', 'v12 = 0x3fb00000u;')  # 1.375
+    assert mutant != source
+    for name, text in (('exec_subset', source), ('exec_subset_wrong_value', mutant)):
+        ps = compile_hlsl(dxc, 'dxc', text, name, 'ps_6_0', directory)
+        run = gpu_case_runner.run(renderer, adapter, ['--startup-pixel-words', vs, ps, width, height, expected])
+        diagnostic = run.stdout + run.stderr
+        if text == source:
+            assert run.returncode == 0 and 'all %d pixels matched' % (width * height) in diagnostic, diagnostic
+        else:
+            assert run.returncode == 1 and 'pixel mismatch' in diagnostic, diagnostic
+        print(name, diagnostic, flush=True)
+
+
+def check_covered_sample_draw(dxc, renderer, adapter, directory):
+    def texel(mip, offset=0):
+        # Point sampling of (3/8, 5/8) in the 4x4 mip fixture, slice zero.
+        side = 4 >> mip
+        x, y = (3 * side) // 8 + offset, (5 * side) // 8
+        return (1 + x + 4 * y + 32 * mip) / 128
+
+    vs = compile_hlsl(dxc, 'dxc', sample_stage().hlsl_vs(), 'covered_sample_vs', 'vs_6_0', directory)
+    for form, reference, old, new, wrong in (
+            ('plain', texel(0), 'F(v13)), 0)', 'F(v13)), 1)', texel(1)),
+            ('offset', texel(0, 1), 'int2(1, 0)', 'int2(0, 0)', texel(0)),
+            ('cmp', float(0.125 < texel(0)), 'F(v13)), F(v11))', 'F(v13)), 0.0)', float(0.0 < texel(0)))):
+        pipe = sample_stage(form)
+        source = pipe.hlsl_ps()
+        sampler, = (line for line in pipe.manifest().splitlines() if line.startswith(('smpl ', 'smpc ')))
+        assert source.count(old) == 1 and wrong != reference
+        for name, text, value in ((form, source, reference), (form + '_mutant', source.replace(old, new), wrong)):
+            pixel = compile_hlsl(dxc, 'dxc', text, 'covered_sample_' + name, 'ps_6_0', directory)
+            run = gpu_case_runner.run(renderer, adapter, ['--startup-image-2d-view', vs, pixel, sampler, '0/3'])
+            expected = ','.join(['%08x' % f32_bits(value)] * 4)
+            diagnostic = run.stdout + run.stderr
+            assert run.returncode == 0 and 'view_rgba=' + expected in diagnostic, (name, diagnostic, expected)
             print(name, diagnostic, flush=True)
 
 

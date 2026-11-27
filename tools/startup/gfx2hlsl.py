@@ -3491,6 +3491,7 @@ class Stage:
     # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
     # (a class default keeps probes built without __init__ working).
     interp_scanned = False
+    interp_sample_obligations = None
     round_modes = None
     defined_uniform_s = None
     bad_sgprs = None
@@ -10496,6 +10497,12 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        offset_arg = ''
+        if how == 'o':
+            if dim != 'SQ_RSRC_IMG_2D' or 'a16' in mods or len(cs) != 3:
+                raise Unsupported('image_sample_o requires a 2D offset and two 32-bit coordinates')
+            offset_arg = self.image_sample_offset(cs.pop(0))
+            how = 'sample'
         integer_srvs = getattr(getattr(self, 'pipe', None), 'integer_texture_srvs', False)
         # The legacy 1D path models only sampling. Typed SRVs also use the generic load
         # path below, whose Texture1D address has one coordinate and a mip index.
@@ -10667,6 +10674,7 @@ class Stage:
                 if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
                     raise Unsupported('image_sample_lz d16 destination %s for dmask %#x' % (ops[0], dmask))
             if tex is None:
+                self.check_interp_sample_call(None)
                 self.null_image_read(dst, dmask)
                 return
             heap = self.heap_sampler(ops[3])
@@ -10737,20 +10745,24 @@ class Stage:
                     tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
                 if implicit_bias:
+                    self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
-                call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
+                call = '%s.SampleLevel(%s, %s, 0%s)' % (tex, smp, uv, offset_arg)
             elif len(self.blocks) > 0:
                 # Past a join the guest still takes the LOD from the quad's derivatives. Where the rule of image_sample_b
                 # holds (entry EXEC, wave-uniform control flow, no divergent back edge over the call) the call is the
                 # implicit-LOD Sample; otherwise it stays level 0 (resolve_plain_samples).
-                call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
+                call = '%s.SampleLevel(%s, %s, 0%s)' % (tex, smp, uv, offset_arg)
                 if getattr(self, 'uniform_cf', True) and hasattr(self, 'plain_samples'):
-                    self.plain_samples[self.pc] = (None if implicit_bias else call, '%s.Sample(%s, %s)' % (tex, smp, uv))
+                    self.plain_samples[self.pc] = (None if implicit_bias else call,
+                                                   '%s.Sample(%s, %s%s)' % (tex, smp, uv, offset_arg))
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
                 elif implicit_bias:
+                    self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             else:
-                call = '%s.Sample(%s, %s)' % (tex, smp, uv)
+                call = '%s.Sample(%s, %s%s)' % (tex, smp, uv, offset_arg)
+        self.check_interp_sample_call(call)
         if tex is None:
             self.null_image_read(dst, dmask, packed='d16' in mods)
             return
@@ -10838,6 +10850,7 @@ class Stage:
             raise Unsupported('%s sampler: %s' % (base, error))
         key = self.descriptor(ops[2])
         if key is None:
+            self.check_interp_sample_call(None)
             return self.null_image_read(reg_range(ops[0]), dmask)
         tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
@@ -10850,9 +10863,19 @@ class Stage:
         # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.
         max_lod = (words[1] >> 12) & 0xfff
         if how == 'c' and max_lod:
+            self.check_interp_sample_call(None)
             raise Unsupported('%s with implicit mip selection (sampler MAX_LOD %#x)' % (base, max_lod))
         call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
+        self.check_interp_sample_call(call)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % call)
+
+    def check_interp_sample_call(self, call):
+        obligations = self.interp_sample_obligations
+        if obligations and self.pc in obligations:
+            # The placeholder can resolve to Sample after the walk. Only a call
+            # already known to use an explicit level satisfies the scan.
+            if call is None or not re.match(r'\w+\.(?:SampleLevel|SampleCmpLevelZero|Load)\(', call):
+                raise Unsupported(obligations[self.pc])
 
     def op_image_sample_c(self, ops, mods):
         self.image_compare(ops, mods, 'c')
@@ -10865,6 +10888,32 @@ class Stage:
 
     def op_image_sample(self, ops, mods):
         self.image(ops, mods, 'sample')
+
+    def image_sample_offset(self, token):
+        # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
+        # HLSL needs immediate offsets in [-8, 7]. Look for a literal move in
+        # this basic block under the same EXEC as the sample.
+        reg = int(token[1:])
+        for i in range(self.descriptor_instruction_index - 1, self.descriptor_block_first - 1, -1):
+            _, _, name, asm = self.ins[i]
+            _, ops, _ = parse(asm)
+            name = re.sub(r'_e(32|64)$', '', name)
+            if writes_exec(name, ops):
+                break
+            if reg in lds_vgpr_writes(name, ops):
+                if name != 'v_mov_b32':
+                    break
+                packed = self.const_u32(ops[1]) if reg_range(ops[1]) is None else None
+                if packed is not None and not (packed & ~0x3f3f):
+                    x = ((packed & 63) ^ 32) - 32
+                    y = (((packed >> 8) & 63) ^ 32) - 32
+                    if -8 <= x <= 7 and -8 <= y <= 7:
+                        return ', int2(%d, %d)' % (x, y)
+                break
+        raise Unsupported('image_sample_o requires an immediate 2D offset in [-8, 7]')
+
+    def op_image_sample_o(self, ops, mods):
+        self.image(ops, mods, 'o')
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
@@ -12680,19 +12729,54 @@ class Stage:
     def interp_live_pairs(pairs, writes):
         return frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
 
+    def interp_subset_step(self, subsets, effects):
+        """Transfer (subset, superset) facts over simultaneous mask updates."""
+        writes, save, restore, exec_write, bounds, wqm, shrink = effects
+        if not writes and save is None and not exec_write:
+            return subsets
+        # Each old value can bound one or more new values. For example, a shrink
+        # keeps the old value as an upper bound for the new one.
+        exec_sources = tuple(mask for tok in bounds
+                             if (mask := 'exec' if tok == 'exec' else self.interp_scalar_pair(tok)) is not None)
+        if restore is not None:
+            exec_sources = (restore,)
+        elif not exec_write:
+            exec_sources = ('exec',)
+        left = {}
+        right = {}
+        for source in exec_sources:
+            left[source] = {'exec'}
+        if wqm is not None:
+            right[wqm] = {'exec'}
+        elif restore is not None or not exec_write:
+            right[exec_sources[0]] = {'exec'}
+        if save is not None:
+            left.setdefault('exec', set()).add(save)
+            right.setdefault('exec', set()).add(save)
+        if shrink is not None:
+            left.setdefault(shrink, set()).add(shrink)
+
+        def values(mask, replacements):
+            survive = mask != 'exec' and 'any' not in writes and not mask & writes
+            return replacements.get(mask, set()) | ({mask} if survive else set())
+
+        return frozenset((a, b) for old_a, old_b in subsets | {(m, m) for m in left.keys() | right.keys()}
+                         for a in values(old_a, left) for b in values(old_b, right) if a != b)
+
     def interp_exec_entry_facts(self, successors, effects, indirect):
-        """At each reachable instruction, pairs equal to EXEC or a proven superset of it."""
+        """At each reachable instruction, record EXEC identity and mask subset relations."""
         empty = frozenset()
         if not successors:
             return {}
-        facts = {0: (empty, empty)}
+        facts = {0: (empty, empty, empty)}
         work = [0]
         while work:
             i = work.pop()
             if i in indirect:
                 return {}  # An unknown incoming edge can invalidate facts at any origin.
-            writes, save, restore, exec_write, bounds = effects[i]
-            equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in facts[i])
+            writes, save, restore, exec_write, bounds, _, _ = effects[i]
+            equal, superset, subsets = facts[i]
+            equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in (equal, superset))
             if restore is not None:
                 if restore not in equal:
                     equal = superset = frozenset({restore})
@@ -12709,10 +12793,11 @@ class Stage:
                 equal |= {save}
                 superset |= {save}
 
+            transferred = equal, superset, self.interp_subset_step(subsets, effects[i])
             for j in successors[i]:
                 previous = facts.get(j)
-                merged = ((equal & previous[0], superset & previous[1])
-                          if previous is not None else (equal, superset))
+                merged = (tuple(a & b for a, b in zip(transferred, previous))
+                          if previous is not None else transferred)
                 if merged != previous:
                     facts[j] = merged
                     work.append(j)
@@ -12736,12 +12821,15 @@ class Stage:
         same, superset, masked, current, at_same, at_superset, covered = identity
         # 'masked' pairs may name different subsets of the lanes covered by the write.
         # Only 'current' records equality with the entire current mask.
-        writes, save, restore, exec_write, bounds = effects
+        writes, save, restore, exec_write, bounds, _, shrink = effects
         # Operands of saveexec describe the mask before it writes D, even when D aliases S.
         narrows_to_covered = any(covered if token == 'exec' else self.interp_scalar_pair(token) in masked
                                  for token in bounds)
+        shrinks_covered = shrink in masked
         same, superset, masked, current = (self.interp_live_pairs(pairs, writes)
                                            for pairs in (same, superset, masked, current))
+        if shrinks_covered:
+            masked |= {shrink}
         if save is not None:
             if at_same:
                 same |= {save}
@@ -12785,7 +12873,13 @@ class Stage:
                 bounds = ('exec',)
             elif name == 's_andn2_saveexec_b64':
                 bounds = (ops[1],)
-        return writes, save, restore, exec_write, bounds
+        wqm = None
+        if name == 's_wqm_b64' and len(ops) == 2 and ops[0] == 'exec':
+            wqm = 'exec' if ops[1] == 'exec' else self.interp_scalar_pair(ops[1])
+        shrink = None
+        if name in ('s_and_b64', 's_andn2_b64') and len(ops) == 3 and ops[0] == ops[1]:
+            shrink = self.interp_scalar_pair(ops[0])
+        return writes, save, restore, exec_write, bounds, wqm, shrink
 
     def interp_read_halves(self, name, asm, sources, mods):
         halves = [3] * len(sources)
@@ -12908,11 +13002,13 @@ class Stage:
                 work.extend(predecessors[i])
 
         entry_facts = self.interp_exec_entry_facts(successors, exec_effects, indirect)
+        covered_pairs = {}
+        sample_obligations = {}
         work = []
         for i, reg, halves in omitted:
             # EXEC cannot change between p1ll and p2. Using facts at p2 also drops pairs
             # clobbered since p1ll and includes any intervening copies of that same EXEC.
-            equal, superset = entry_facts.get(i, (empty, empty))
+            equal, superset, _ = entry_facts.get(i, (empty, empty, empty))
             identity = equal, superset | equal, empty, equal, True, True, False
             work.extend((j, reg, half, halves != 3, identity)
                         for half in (1, 2) if halves & half for j in successors[i])
@@ -12928,22 +13024,32 @@ class Stage:
             name, read, written, written_halves, lane_local = rows[i]
             if read.get(reg, 0) & half and not (identity[-1] and lane_local):
                 if alias:
-                    raise Unsupported('%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' %
-                                      (name, reg))
-                raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
-                                  'a v_interp_p2_f16 that wrote another register' % (reg, name))
+                    reason = '%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' % (name, reg)
+                else:
+                    reason = ('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+                              'a v_interp_p2_f16 that wrote another register' % (reg, name))
+                if identity[-1] and name in ('image_sample', 'image_sample_o', 'image_sample_c'):
+                    sample_obligations.setdefault(self.ins[i][0], reason)
+                else:
+                    raise Unsupported(reason)
             identity = self.interp_exec_step(identity, exec_effects[i])
             same, superset, masked, current, _, at_superset, _ = identity
             if reg in written and written_halves & half:
                 if at_superset:
                     continue
-                identity = same, superset, masked | current, current, False, False, True
+                if i not in covered_pairs:
+                    _, _, subsets = entry_facts.get(i, (empty, empty, empty))
+                    writes, _, _, exec_write, _, _, _ = exec_effects[i]
+                    covered_pairs[i] = (empty if exec_write else
+                                        self.interp_live_pairs((a for a, b in subsets if b == 'exec'), writes))
+                identity = same, superset, masked | current | covered_pairs[i], current, False, False, True
             if name.startswith(('s_setpc', 's_swappc')):
                 raise Unsupported('unmodelled v_interp_p2_f16 result across an indirect jump')
             for j in successors[i]:
                 if j <= i:
                     raise Unsupported('unmodelled v_interp_p2_f16 result across a backward branch')
                 work.append((j, reg, half, alias, identity))
+        self.interp_sample_obligations = sample_obligations
         self.interp_scanned = True
 
     def op_v_interp_p1ll_f16(self, ops, mods):
@@ -13449,6 +13555,21 @@ class Stage:
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             sext = token.startswith('sext(') and token.endswith(')')
+            if typ == 'f16':
+                if sext:
+                    raise Unsupported('%s: sext() on a float source' % base)
+                if selection not in ('WORD_0', 'WORD_1'):
+                    raise Unsupported('%s: f16 SDWA requires WORD_0 or WORD_1' % base)
+                if selection == 'WORD_0' and token in self.F16_INLINE:
+                    half_bits = int.from_bytes(struct.pack('<e', FLOATS[token]), 'little')
+                    sources.append('0x%04xu' % half_bits)
+                    continue
+                reg = reg_range(token)
+                if not (reg and reg[0] in ('s', 'v') and reg[1] == reg[2]) and not (
+                        re.fullmatch(r'-?\d+', token) and -16 <= int(token) <= 64):
+                    raise Unsupported('%s source %s' % (base, token))
+                sources.append(sdwa_source(self.u(token, low16_only=selection == 'WORD_0'), selection, False))
+                continue
             if float_src0 and index == 0:
                 if selection != 'DWORD' or sext:
                     raise Unsupported('%s requires a DWORD float source' % base)
@@ -13612,8 +13733,8 @@ class Stage:
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
             raise Unsupported(base)
-        # binary16: the five ordered relations and neq, which need no NaN test on the source words; no SDWA form.
-        if typ == 'f16' and (sdwa or mods or cond not in ('lt', 'eq', 'le', 'gt', 'ge', 'neq')):
+        # Binary16 supports the five ordered relations and neq.
+        if typ == 'f16' and ((mods and not sdwa) or cond not in ('lt', 'eq', 'le', 'gt', 'ge', 'neq')):
             raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
@@ -13638,8 +13759,9 @@ class Stage:
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
         if sdwa:
-            # f32 sources: DWORD selections only, read as in the e64 form, so {2} tests the registers.
-            x, y = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
+            # f32 sources use DWORD selections, so {2} still tests the registers.
+            selected = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
+            x, y = ('f16tof32(%s)' % half for half in selected) if typ == 'f16' else selected
         elif typ == 'f32':
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':
@@ -13659,7 +13781,14 @@ class Stage:
         ordered = ''
         if '{2}' in table[cond]:
             ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
-        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
+        predicate = table[cond].format(x, y, ordered)
+        if sdwa and typ == 'f16':
+            # Check the selected bits before HLSL's float compare. This keeps
+            # the NaN case even if the compiler simplifies a self-compare.
+            ordered = ' && '.join('(%s & 0x7fffu) <= 0x7c00u' % half for half in selected)
+            predicate = ('!(%s && %s == %s)' % (ordered, x, y) if cond == 'neq'
+                         else '(%s && %s)' % (ordered, predicate))
+        expr = '((%s) ? 1u : 0u)' % predicate
         if not self.exec_known:
             expr = '(exec & %s)' % expr
         if writes_exec or dst in ('exec', 'exec_lo'):
