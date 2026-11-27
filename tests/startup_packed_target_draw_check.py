@@ -43,43 +43,6 @@ def stored(texture_format):
     return tuple(out)
 
 
-def check_placeholder(work, consumer, dxc, vs, ps, root, image, env, key):
-    cache = Path(env["X2W_SHADER_CACHE"])
-    sources = {
-        "vs": """float4 main(uint id : SV_VertexID) : SV_Position {
-            float2 corner = float2(id == 1 ? 4 : -2, id == 2 ? -4 : 2);
-            return float4(corner, 0.5, 1);
-        }""",
-        "ps": """float4 main() : SV_Target { return float4(1, 1, 0, 1); }""",
-    }
-    for stage, source in sources.items():
-        shader = work / f"placeholder.{stage}.hlsl"
-        shader.write_text(source, encoding="ascii")
-        subprocess.run([dxc, "-T", f"{stage}_6_0", "-E", "main", "-Fo",
-                        cache / f"{key}.{stage}.cso", shader], check=True)
-
-    reference = bytes((255, 255, 0, 255)) * (8 * 8)
-    clear = bytes((0, 0, 255, 255)) * (8 * 8)
-    expected_report = ["x2w-render placeholder total: draws 1",
-                       f"x2w-render placeholder key {key}: draws 1, targets 8x8 format 28"]
-    manifest = cache / f"{key}.txt"
-    for marked, mode in ((False, "visible"), (True, "visible"), (True, "clipped")):
-        marker = "placeholder synthetic pixel refusal\n" if marked else ""
-        manifest.write_text("udsrc 0 rect\n" + marker, encoding="ascii")
-        image.unlink(missing_ok=True)
-        result = subprocess.run([consumer, vs, ps, root, "warp", image],
-                                env=dict(env, X2W_TEST_PLACEHOLDER_DRAW=mode), capture_output=True, text=True)
-        assert result.returncode == 0, f"{mode}: {result.returncode}\n{result.stderr[-2000:]}"
-        lines = [line for line in result.stdout.splitlines() if line.startswith("x2w-render placeholder ")]
-        assert lines == (expected_report if marked else []), lines
-        pixels = image.read_bytes()
-        if mode == "clipped":
-            assert pixels == clear and pixels != reference, "clipped draw must fail the CPU colour comparison"
-        else:
-            assert pixels == reference, f"{mode}, marked={marked}: unexpected RGBA8 readback"
-    print("startup placeholder WARP: marked and unmarked 8x8 readbacks matched; clipped draw failed the comparison")
-
-
 def check(work, consumer, dxc, backend):
     cache = work / "cache"
     cache.mkdir()
@@ -165,8 +128,6 @@ def check(work, consumer, dxc, backend):
     refused("B5G5R5A1 views of a B4G4R4A4 render target", B4G4R4A4, RT, B5G5R5A1)
     print(f"startup_packed_target_draw: PASS on {backend} (packed targets drawn {' and '.join(sorted(paths))} on this adapter; "
           f"1 drawn control, 2 refused view pairs; unordered-access writes and CPU-written texels not covered)")
-    if backend == "warp":
-        check_placeholder(work, consumer, dxc, vs, ps, root, image, env, key)
     return 0
 
 

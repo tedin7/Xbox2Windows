@@ -157,7 +157,6 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3, desc_word };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
-    bool placeholder = false;
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
@@ -599,10 +598,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         at = end + 1;
         int i = 0, x = 0, y = 0;
         char kind[16] = "", source[16] = "";
-        if (line.compare(0, 12, "placeholder ") == 0) {
-            // The rest of the line is the original pixel-stage refusal.
-            tr.placeholder = true;
-        } else if (line.compare(0, 5, "rtv1 ") == 0) {
+        if (line.compare(0, 5, "rtv1 ") == 0) {
             if (matched_rtv || line != rtv_request) {
                 log("x2w-draw RTV manifest mismatch for %016llx", tr.key);
                 return;
@@ -3306,70 +3302,6 @@ void note_target_draw(const Pass& pass, LONG frame, bool poisoned, ID3D12Resourc
     ReleaseSRWLockExclusive(&target_draw_census_lock);
 }
 
-struct PlaceholderDraws {
-    u64 draws = 0;
-    std::vector<x2w_startup::TargetDrawCensus::Surface> targets;
-};
-SRWLOCK placeholder_draw_lock = SRWLOCK_INIT;
-
-auto& placeholder_draws()
-{
-    static std::map<u64, PlaceholderDraws> keys;
-    return keys;
-}
-
-void note_placeholder_draw(u64 key, const Pass& pass)
-{
-    AcquireSRWLockExclusive(&placeholder_draw_lock);
-    auto& row = placeholder_draws()[key];
-    ++row.draws;
-    const auto note = [&](const x2w_startup::TargetDrawCensus::Surface& surface) {
-        if (!surface.resource) return;
-        const auto same = [&](const x2w_startup::TargetDrawCensus::Surface& target) {
-            return target.width == surface.width && target.height == surface.height && target.format == surface.format;
-        };
-        if (std::none_of(row.targets.begin(), row.targets.end(), same)) row.targets.push_back(surface);
-    };
-    for (UINT i = 0; i < pass.target_count; ++i) note(pass.target_surfaces[i]);
-    note(pass.depth_surface);
-    ReleaseSRWLockExclusive(&placeholder_draw_lock);
-}
-
-template<class Emit>
-void report_placeholder_draws(Emit emit)
-{
-    std::vector<std::pair<u64, PlaceholderDraws>> keys;
-    AcquireSRWLockShared(&placeholder_draw_lock);
-    for (const auto& item : placeholder_draws()) keys.emplace_back(item.first, item.second);
-    ReleaseSRWLockShared(&placeholder_draw_lock);
-    if (keys.empty()) return;
-
-    u64 total = 0;
-    for (const auto& item : keys) total += item.second.draws;
-    const auto total_line = "x2w-render placeholder total: draws " + std::to_string(total);
-    emit(total_line.c_str());
-    const auto end = keys.begin() + (std::min)(keys.size(), std::size_t{20});
-    std::partial_sort(keys.begin(), end, keys.end(), [](const auto& a, const auto& b) {
-        if (a.second.draws != b.second.draws) return a.second.draws > b.second.draws;
-        return a.first < b.first;
-    });
-    for (auto it = keys.begin(); it != end; ++it) {
-        char head[128];
-        snprintf(head, sizeof(head), "x2w-render placeholder key %016llx: draws %llu, targets ",
-                 it->first, it->second.draws);
-        std::string line = head;
-        const auto& targets = it->second.targets;
-        if (targets.empty()) line += "unknown";
-        for (std::size_t i = 0; i < targets.size(); ++i) {
-            const auto& target = targets[i];
-            if (i) line += ", ";
-            line += std::to_string(target.width) + "x" + std::to_string(target.height) +
-                    " format " + std::to_string(target.format);
-        }
-        emit(line.c_str());
-    }
-}
-
 // Called after releasing draw_lock, including for the late indexed refusal.
 static bool not_drawn(const Pass& pass, ID3D12GraphicsCommandList* list, u64 key, int site)
 {
@@ -4335,10 +4267,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
-    if (drawn) {
-        note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
-        if (tr->placeholder) note_placeholder_draw(tr->key, pass);
-    }
+    if (drawn) note_target_draw(pass, binding_frame, has_null_input, sampled_textures, sampled_count);
     if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     draw_lock_release_exclusive();
     if (index_refusal) not_drawn(pass, list, not_drawn_key, index_data_unavailable_site);
