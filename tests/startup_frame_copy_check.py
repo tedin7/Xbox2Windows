@@ -135,18 +135,21 @@ float4 main(float4 p : SV_Position) : SV_Target {
     expected = [bytes(255 if channel <= frame or channel == 3 else 0
                       for channel in range(4)) * 32 for frame in range(3)]
     cases = (
-        ("mirror", "1", "0", (512, 1, 1), (size, block, block), expected),
-        ("mirror_off", "0", "0", (1, 1, 1), (size, size, size), expected),
-        ("stale_mutant", "1", "1", (512, 0, 0), (size, 0, 0), [expected[0]] * 3),
+        ("mirror", "1", "0", "0", (512, 1, 1), (size, block, block), expected),
+        ("mirror_off", "0", "0", "0", (1, 1, 1), (size, size, size), expected),
+        ("stale_mutant", "1", "0", "1", (512, 0, 0), (size, 0, 0), [expected[0]] * 3),
+        ("mirror_shared", "1", "1", "0", (512, 1, 1), (size, block, block), expected),
+        ("shared_stale_mutant", "1", "1", "1", (512, 0, 0), (size, 0, 0), [expected[0]] * 3),
     )
-    for name, enabled, stale, copies, uploaded, reference in cases:
+    for name, enabled, shared, stale, copies, uploaded, reference in cases:
         folder = directory / name
         folder.mkdir()
         log = folder / "trap.log"
         last = draw_texture(folder, consumer, backend, shader, {
             "X2W_TEST_FRAME_COPY": "once-mirror", "X2W_TRAP_LOG": str(log),
             "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
-            "X2W_GPU_MIRROR": enabled, "X2W_TEST_GPU_MIRROR_STALE": stale,
+            "X2W_GPU_MIRROR": enabled, "X2W_GPU_MIRROR_SHARED": shared, "X2W_TEST_GPU_MIRROR_STALE": stale,
+            "X2W_TEST_GPU_MIRROR_SKIP_WAIT": "0", "X2W_TEST_GPU_MIRROR_UPLOAD_AFTER": "0",
             "X2W_TEST_GPU_MIRROR_FULL_COPY": "1" if enabled == "0" else "0",
         }, binding="srv 0 buf table 0 0")
         if last is None:
@@ -166,8 +169,77 @@ float4 main(float4 p : SV_Position) : SV_Target {
     return 0
 
 
+def check_shared_mirror(directory, consumer, backend):
+    shader = """ByteAddressBuffer data : register(t0);
+uint marker(uint block) { return block * 3 + 17; }
+float4 main(float4 pixel : SV_Position) : SV_Target {
+    uint left = data.Load(7 * 65536);
+    uint right = data.Load(1403 * 65536);
+    bool old = left == marker(7) && right == marker(1403);
+    bool updated = left == marker(7) + 8192 && right == marker(1403) + 8192;
+    if ((!old && !updated) || data.Load(100663292) != 73)
+        return float4(1, 0, 1, 1);
+    uint first = ((uint)pixel.x + (uint)pixel.y * 8) * 48;
+    for (uint i = first; i < first + 48; ++i) {
+        uint expected = marker(i) + ((updated && (i == 7 || i == 1403)) ? 8192 : 0);
+        if (data.Load(i * 65536) != expected)
+            return float4(1, 0, 1, 1);
+    }
+    return updated ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+}
+"""
+    old = RED * 32
+    updated = bytes((0, 255, 0, 255)) * 32
+    cases = ("shared", "present_upload", "upload_after", "skip_wait")
+    for case in cases:
+        folder = directory / case
+        folder.mkdir()
+        log = folder / "trap.log"
+        pixels = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "once-shared-p" if case == "present_upload" else "once-shared",
+            "X2W_TRAP_LOG": str(log),
+            "X2W_BIGBIND_ONCE": "1", "X2W_BIG_COPY_REUSE": "0",
+            "X2W_GPU_MIRROR": "1", "X2W_GPU_MIRROR_SHARED": "1", "X2W_TEST_GPU_MIRROR_STALE": "0",
+            "X2W_TEST_GPU_MIRROR_FULL_COPY": "0",
+            "X2W_TEST_GPU_MIRROR_UPLOAD_AFTER": str(int(case == "upload_after")),
+            "X2W_TEST_GPU_MIRROR_SKIP_WAIT": str(int(case == "skip_wait")),
+        }, binding="srv 0 buf table 0 0")
+        if pixels is None:
+            return 77
+        actual = [(folder / f"pixels.{frame}.{i}").read_bytes()
+                  for frame in range(2) for i in range(3) if (frame, i) != (1, 2)] + [pixels]
+        reference = [old] * 3 + [updated] * 3
+        if case == "upload_after":
+            # List 2, submitted first, sees the missing upload in frame 1
+            # and the previous snapshot in frame 2. All later lists see the copy.
+            if len(actual[2]) != len(old) or actual[2] == old:
+                raise AssertionError("upload_after: the first submitted list still matched the CPU")
+            reference[2] = actual[2]
+            reference[5] = old
+        elif case == "skip_wait":
+            # Two queued frame 1 readers see the new data after the overwrite.
+            reference[0:2] = [updated] * 2
+        for i, (actual_pixels, expected) in enumerate(zip(actual, reference)):
+            if actual_pixels != expected:
+                raise AssertionError(f"{case} frame {i // 3 + 1} list {i % 3}: "
+                                     f"actual {actual_pixels.hex()} expected {expected.hex()}")
+
+        counters = re.findall(
+            r"shared mirror frame (\d+): (\d+) lists, (\d+) blocks, (\d+) bytes, (\d+) binds, (\d+) fallbacks",
+            log.read_text(errors="replace"),
+        )
+        observed = [tuple(map(int, row)) for row in counters]
+        expected = [(1, 1, 1536, 96 << 20, 4, 0), (2, 1, 2, 128 << 10, 3, 0)]
+        if case == "present_upload":
+            expected = [(1, 1, 1536, 96 << 20, 1, 0), (2, 0, 0, 0, 3, 0), (3, 1, 2, 128 << 10, 3, 0)]
+        if observed != expected:
+            raise AssertionError(f"{case}: mirror counters {observed}, expected {expected}")
+        print(f"{backend} {case}: six readbacks and mirror counters match expected results")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = {"once": check_once, "mirror": check_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
+        check_mode = {"once": check_once, "mirror": check_mirror, "shared": check_shared_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))

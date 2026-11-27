@@ -1584,10 +1584,12 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 // Protected by allocator_lock. A detached recording cannot be submitted again, but
 // its allocator's queue fences still cover any in-flight reads and writes.
+struct GpuMirror;
 struct GpuMirrorRecording {
     DesktopAllocator* allocator;
     bool detached = false;
     bool submitted = false;
+    std::vector<GpuMirror*> shared_mirrors;  // draw_lock, read under both locks during submit.
 };
 std::unordered_map<Wrapper*, std::shared_ptr<GpuMirrorRecording>> gpu_mirror_recordings;
 
@@ -1899,7 +1901,7 @@ bool submit_fence_fails()
 // draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
 // the queue must pass before the allocator can be reset. If that fence cannot be created or
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
-void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
+bool note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
     auto& submit = queue_submits[queue];
     auto& fence = submit.fence;
@@ -1936,6 +1938,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         static LONG failures;
         if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
     }
+    return signaled;
 }
 
 // Fixtures: how many OMSetRenderTargets calls bound targets, and how many render target or depth handles
@@ -4564,7 +4567,20 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 submitted.push_back(w);
             }
         }
+        auto* mirror = ready.empty() ? nullptr : shared_mirror_device(queue);
+        SharedMirrorReadBatch mirror_reads;
+        if (mirror) {
+            // A pending upload belongs to the device, even when its first binding
+            // was on a recording that has since been reset.
+            if (!shared_mirror_upload_after_mutant()) flush_shared_mirror_upload(*mirror, queue);
+            if (!prepare_shared_mirror_reads(*mirror, queue, submitted, mirror_reads)) {
+                ReleaseSRWLockExclusive(&allocator_lock);
+                draw_lock_release_exclusive();
+                return;
+            }
+        }
         bool split = false;
+        bool tracked = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             const int gpu_slot = gpu_time_on() ? gpu_time_probe().before(queue, static_cast<std::uint64_t>(gpu_time_frame)) : -1;
@@ -4579,7 +4595,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             if (gpu_slot >= 0) gpu_time_probe().after(queue, gpu_slot);
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
-            note_submits(queue, wrappers);
+            tracked = note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
             residency_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
@@ -4603,6 +4619,10 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
         } else if (!ready.empty()) {
             submit(ready, submitted);
+        }
+        if (mirror) {
+            finish_shared_mirror_reads(*mirror, queue, mirror_reads, tracked);
+            if (shared_mirror_upload_after_mutant()) flush_shared_mirror_upload(*mirror, queue);
         }
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
@@ -7780,7 +7800,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const bool reuse_large_bindings = bigbind_once_enabled();
-    if (reuse_large_bindings) draw_lock_acquire_exclusive();
+    if (reuse_large_bindings) {
+        draw_lock_acquire_exclusive();
+        auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+        if (queue) {
+            if (auto* mirror = shared_mirror_device(queue)) {
+                flush_shared_mirror_upload(*mirror, queue);
+                reclaim_shared_mirror_uploads(*mirror);
+            }
+        }
+    }
     const LONG frame = InterlockedIncrement(&frames);
     gpu_time_frame = frame;
     frame_number = frame;

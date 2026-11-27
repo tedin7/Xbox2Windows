@@ -1600,22 +1600,268 @@ bool gpu_mirror_enabled()
     return on;
 }
 
+bool gpu_mirror_shared_enabled()
+{
+    static const bool on = [] {
+        const DWORD saved = GetLastError();
+        char value[2]{};
+        const bool enabled = GetEnvironmentVariableA("X2W_GPU_MIRROR_SHARED", value, sizeof(value)) == 1 &&
+                             value[0] == '1';
+        SetLastError(saved);
+        return enabled;
+    }();
+    return on;
+}
+
 constexpr std::size_t gpu_mirror_min_bytes = 16u << 20;
 constexpr std::size_t gpu_mirror_block_bytes = 64u << 10;
 constexpr std::size_t gpu_mirror_budget = 256u << 20;
 
+struct SharedMirrorQueue {
+    x2w_startup::ComPtr<ID3D12CommandQueue> queue;
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    u64 value = 0;
+};
+
+struct SharedMirrorPoint {
+    x2w_startup::ComPtr<ID3D12CommandQueue> queue;
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    u64 value = 0;
+
+    bool complete() const
+    {
+        if (!fence) return true;
+        const auto completed = fence->GetCompletedValue();
+        return completed != UINT64_MAX && completed >= value;
+    }
+
+    HRESULT wait(ID3D12CommandQueue* consumer) const
+    {
+        return queue.Get() == consumer || complete() ? S_OK : consumer->Wait(fence.Get(), value);
+    }
+};
+
 struct GpuMirror {
     x2w_startup::ComPtr<ID3D12Resource> resource;
     std::shared_ptr<GpuMirrorRecording> recording;
+    std::vector<std::weak_ptr<GpuMirrorRecording>> readers;
+    SharedMirrorPoint writer;
+    std::map<ID3D12CommandQueue*, SharedMirrorPoint> reads;
     std::vector<u64> hashes;
     std::size_t bytes = 0;  // Valid prefix of the mirror, including any partial final block.
     LONG frame = -1;
+    LONG shared_hash_frame = -1;
 };
 
 // Protected by draw_lock. Keyed by desktop device, title address, and declared span.
 using GpuMirrorKey = std::pair<u64, std::pair<u64, std::size_t>>;
 std::map<GpuMirrorKey, GpuMirror> gpu_mirrors;
 std::size_t gpu_mirror_bytes;
+
+// draw_lock protects the cache, per-queue fences, device batches and counters.
+struct SharedMirrorUpload {
+    x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
+    x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
+    std::vector<x2w_startup::ComPtr<ID3D12Resource>> staging;
+    std::vector<GpuMirror*> mirrors;
+    SharedMirrorPoint retire;
+    unsigned blocks = 0;
+    std::size_t bytes = 0;
+};
+
+struct SharedMirrorDevice {
+    std::map<ID3D12CommandQueue*, SharedMirrorQueue> queues;
+    std::array<SharedMirrorUpload, 4> uploads;
+    SharedMirrorUpload* pending = nullptr;
+    LONG pending_frame = -1;
+    bool failed = false;
+};
+
+std::map<ID3D12Device*, SharedMirrorDevice> shared_mirror_devices;
+struct SharedMirrorCounts {
+    unsigned lists = 0, blocks = 0, binds = 0, fallbacks = 0;
+    std::size_t bytes = 0;
+};
+SharedMirrorCounts shared_mirror_counts;
+
+bool shared_mirror_upload_after_mutant()
+{
+    static const bool on = x2w_local::env_on("X2W_TEST_GPU_MIRROR_UPLOAD_AFTER");
+    return on;
+}
+
+void reclaim_shared_mirror_uploads(SharedMirrorDevice& state)
+{
+    if (state.failed) return;  // A failed signal cannot prove completion.
+    for (auto& upload : state.uploads)
+        if (&upload != state.pending && upload.retire.complete()) upload.staging.clear();
+}
+
+SharedMirrorUpload* open_shared_mirror_upload(ID3D12Device* device, SharedMirrorDevice& state)
+{
+    if (state.pending) return state.pending_frame == frame_number ? state.pending : nullptr;
+    for (auto& upload : state.uploads) {
+        if (!upload.retire.complete()) continue;
+        upload.staging.clear();
+        upload.mirrors.clear();
+        upload.blocks = 0;
+        upload.bytes = 0;
+        if (!upload.allocator && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                       IID_PPV_ARGS(&upload.allocator)))) continue;
+        if (upload.list) {
+            if (FAILED(upload.allocator->Reset()) ||
+                FAILED(upload.list->Reset(upload.allocator.Get(), nullptr))) continue;
+        } else if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, upload.allocator.Get(),
+                                                    nullptr, IID_PPV_ARGS(&upload.list)))) continue;
+        state.pending_frame = frame_number;
+        return state.pending = &upload;
+    }
+    return nullptr;
+}
+
+SharedMirrorDevice* shared_mirror_device(ID3D12CommandQueue* queue)
+{
+    if (!gpu_mirror_shared_enabled() || shared_mirror_devices.empty() ||
+        queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return nullptr;
+    x2w_startup::ComPtr<ID3D12Device> device;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    const auto found = shared_mirror_devices.find(device.Get());
+    return found == shared_mirror_devices.end() ? nullptr : &found->second;
+}
+
+SharedMirrorQueue* shared_mirror_queue(SharedMirrorDevice& state, ID3D12CommandQueue* queue)
+{
+    try {
+        auto& activity = state.queues[queue];
+        activity.queue = queue;
+        if (activity.fence) return &activity;
+        x2w_startup::ComPtr<ID3D12Device> device;
+        if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) &&
+            SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&activity.fence)))) return &activity;
+    } catch (const std::bad_alloc&) {
+    }
+    return nullptr;
+}
+
+bool signal_shared_mirror_work(SharedMirrorDevice& state, SharedMirrorQueue& activity)
+{
+    if (FAILED(activity.queue->Signal(activity.fence.Get(), activity.value + 1))) {
+        state.failed = true;
+        log("x2w-draw shared mirror queue signal failed");
+        return false;
+    }
+    ++activity.value;
+    return true;
+}
+
+void flush_shared_mirror_upload(SharedMirrorDevice& state, ID3D12CommandQueue* queue)
+{
+    auto* upload = state.pending;
+    if (!upload || state.failed) return;
+    auto* activity = upload->blocks ? shared_mirror_queue(state, queue) : nullptr;
+    if (upload->blocks && !activity) {
+        state.failed = true;
+        log("x2w-draw shared mirror upload fence creation failed");
+        return;
+    }
+
+    // Queue order covers work submitted to this queue. Cross-queue writes
+    // wait for the last writer and every queue that read the old snapshot.
+    static const bool skip_wait = x2w_local::env_on("X2W_TEST_GPU_MIRROR_SKIP_WAIT");
+    for (auto* mirror : upload->mirrors) {
+        bool ordered = SUCCEEDED(mirror->writer.wait(queue));
+        if (!skip_wait)
+            for (const auto& read : mirror->reads)
+                ordered = ordered && SUCCEEDED(read.second.wait(queue));
+        if (!ordered) {
+            state.failed = true;
+            log("x2w-draw shared mirror upload wait failed");
+            return;
+        }
+    }
+    if (FAILED(upload->list->Close())) {
+        state.failed = true;
+        log("x2w-draw shared mirror upload close failed");
+        return;
+    }
+    state.pending = nullptr;
+    if (!activity) return;
+    // Separate ExecuteCommandLists calls give this upload and the title lists
+    // an execution boundary. Buffers decay to COMMON there and promote for SRV reads.
+    ID3D12CommandList* list = upload->list.Get();
+    queue->ExecuteCommandLists(1, &list);
+    ++shared_mirror_counts.lists;
+    shared_mirror_counts.blocks += upload->blocks;
+    shared_mirror_counts.bytes += upload->bytes;
+    if (!signal_shared_mirror_work(state, *activity)) return;
+    upload->retire = {activity->queue, activity->fence, activity->value};
+    for (auto* mirror : upload->mirrors) {
+        mirror->writer = upload->retire;
+        mirror->reads.clear();
+    }
+    upload->mirrors.clear();
+}
+
+struct SharedMirrorReadBatch {
+    std::vector<GpuMirror*> mirrors;
+};
+
+// Both locks held while collecting the ranges named by the closed recordings.
+bool prepare_shared_mirror_reads(SharedMirrorDevice& state, ID3D12CommandQueue* queue,
+                                 const std::vector<Wrapper*>& lists, SharedMirrorReadBatch& batch)
+{
+    try {
+        for (auto* list : lists) {
+            const auto found = gpu_mirror_recordings.find(list);
+            if (found == gpu_mirror_recordings.end()) continue;
+            for (auto* mirror : found->second->shared_mirrors)
+                if (std::find(batch.mirrors.begin(), batch.mirrors.end(), mirror) == batch.mirrors.end())
+                    batch.mirrors.push_back(mirror);
+        }
+        if (batch.mirrors.empty()) return true;
+        if (state.failed) return false;
+        for (auto* mirror : batch.mirrors) {
+            mirror->reads.try_emplace(queue);
+            // Readers depend only on their producer. Readers on distinct
+            // queues can run concurrently once that producer has completed.
+            if (FAILED(mirror->writer.wait(queue))) {
+                state.failed = true;
+                log("x2w-draw shared mirror reader wait failed");
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::bad_alloc&) {
+        log("x2w-draw shared mirror reader tracking allocation failed");
+        return false;
+    }
+}
+
+void finish_shared_mirror_reads(SharedMirrorDevice& state, ID3D12CommandQueue* queue,
+                                 const SharedMirrorReadBatch& batch, bool tracked)
+{
+    if (batch.mirrors.empty()) return;
+    if (!tracked) {
+        // Without a fence point, preserve the storage and refuse further
+        // mirror work on this device. The ordinary submit path logs the error.
+        state.failed = true;
+        return;
+    }
+    const auto& submit = queue_submits.at(queue);
+    const SharedMirrorPoint read{x2w_startup::ComPtr<ID3D12CommandQueue>(queue),
+                                 x2w_startup::ComPtr<ID3D12Fence>(submit.fence), submit.value};
+    for (auto* mirror : batch.mirrors) mirror->reads.at(queue) = read;
+}
+
+// Both locks held. Recording detachment is protected by allocator_lock.
+// Once detached a closed list cannot be replayed. GPU reads already submitted
+// are covered by the per-queue fences, including those still in flight.
+bool shared_mirror_has_live_readers(const GpuMirror& mirror)
+{
+    for (const auto& reader : mirror.readers)
+        if (const auto recording = reader.lock(); recording && !recording->detached) return true;
+    return false;
+}
 
 // allocator_lock held. Reuse is safe after the old recording becomes unreplayable
 // and all queues that may still be reading it have finished.
@@ -1678,6 +1924,138 @@ u64 gpu_mirror_hash(const unsigned char* data, std::size_t bytes)
     u64 tail = 0;
     std::memcpy(&tail, data, bytes);
     return mix(hash, tail);
+}
+
+ID3D12Resource* bind_shared_gpu_mirror(Wrapper* self, u64 address, std::size_t full_bytes, std::size_t bytes)
+{
+    if (full_bytes < gpu_mirror_min_bytes || full_bytes > gpu_mirror_budget || !bytes || bytes > full_bytes)
+        return nullptr;
+    auto* device = device_of(self->own().list_device);
+    const GpuMirrorKey key{reinterpret_cast<u64>(device), {address, full_bytes}};
+    auto found = gpu_mirrors.find(key);
+    const auto recording = gpu_mirror_recording(self);
+    if (!recording) return nullptr;
+    try {
+        auto& state = shared_mirror_devices[device];
+        if (state.failed) return nullptr;
+        if (found != gpu_mirrors.end() && found->second.frame == frame_number) {
+            auto& mirror = found->second;
+            auto& bound = recording->shared_mirrors;
+            if (std::find(bound.begin(), bound.end(), &mirror) == bound.end()) {
+                bound.reserve(bound.size() + 1);
+                mirror.readers.emplace_back(recording);
+                bound.push_back(&mirror);
+            }
+            return mirror.resource.Get();
+        }
+        AcquireSRWLockShared(&allocator_lock);
+        const bool live = found != gpu_mirrors.end() && shared_mirror_has_live_readers(found->second);
+        if (found == gpu_mirrors.end() && gpu_mirror_bytes + full_bytes > gpu_mirror_budget) {
+            for (auto it = gpu_mirrors.begin(); it != gpu_mirrors.end() && gpu_mirror_bytes + full_bytes > gpu_mirror_budget;) {
+                const auto& owner = shared_mirror_devices.at(reinterpret_cast<ID3D12Device*>(it->first.first));
+                const auto& old = it->second;
+                const bool idle = old.writer.complete() && std::all_of(old.reads.begin(), old.reads.end(),
+                    [](const auto& read) { return read.second.complete(); });
+                if (!owner.failed && !owner.pending && idle && !shared_mirror_has_live_readers(old)) {
+                    gpu_mirror_bytes -= it->first.second.second;
+                    it = gpu_mirrors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        ReleaseSRWLockShared(&allocator_lock);
+        if (live || (state.pending && state.pending_frame != frame_number)) return nullptr;
+        if (found == gpu_mirrors.end()) {
+            if (gpu_mirror_bytes + full_bytes > gpu_mirror_budget) return nullptr;
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto padded = (full_bytes + 3) & ~std::size_t{3};
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, padded, 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            GpuMirror created;
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created.resource)))) return nullptr;
+            x2w_budget::committed(device, created.resource.Get(), D3D12_HEAP_TYPE_DEFAULT);
+            found = gpu_mirrors.emplace(key, std::move(created)).first;
+            gpu_mirror_bytes += full_bytes;
+        }
+
+        auto& mirror = found->second;
+        // If staging is exhausted, subsequent bindings reuse the ring
+        // fallback for this frame without rescanning the title memory.
+        if (mirror.shared_hash_frame == frame_number) return nullptr;
+        mirror.shared_hash_frame = frame_number;
+        std::vector<u64> hashes((bytes + gpu_mirror_block_bytes - 1) / gpu_mirror_block_bytes);
+        std::vector<std::size_t> dirty;
+        std::size_t staging_bytes = 0;
+        const auto* title = reinterpret_cast<const unsigned char*>(address);
+        static const bool skip_updates = x2w_local::env_on("X2W_TEST_GPU_MIRROR_STALE");
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const std::size_t offset = i * gpu_mirror_block_bytes;
+            const std::size_t length = (std::min)(bytes - offset, gpu_mirror_block_bytes);
+            hashes[i] = gpu_mirror_hash(title + offset, length);
+            if (offset < mirror.bytes && length == (std::min)(mirror.bytes - offset, gpu_mirror_block_bytes) &&
+                (skip_updates || hashes[i] == mirror.hashes[i])) continue;
+            dirty.push_back(offset);
+            staging_bytes += (length + 3) & ~std::size_t{3};
+        }
+
+        // Allocate every CPU tracking entry before recording commands.
+        mirror.readers.reserve(1);
+        auto& bound = recording->shared_mirrors;
+        bound.reserve(bound.size() + 1);
+        auto* resource = mirror.resource.Get();
+        if (!dirty.empty()) {
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, staging_bytes, 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            auto* upload = open_shared_mirror_upload(device, state);
+            if (!upload) return nullptr;
+            x2w_startup::ComPtr<ID3D12Resource> staging;
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)))) return nullptr;
+            upload->mirrors.reserve(upload->mirrors.size() + 1);
+            upload->staging.push_back(staging);
+            void* data = nullptr;
+            const D3D12_RANGE no_reads{0, 0};
+            if (FAILED(staging->Map(0, &no_reads, &data))) {
+                upload->staging.pop_back();
+                return nullptr;
+            }
+            // The first copy implicitly promotes the buffer from COMMON to COPY_DEST.
+            std::size_t pos = 0;
+            for (const auto offset : dirty) {
+                const auto length = (std::min)(bytes - offset, gpu_mirror_block_bytes);
+                const auto padded = (length + 3) & ~std::size_t{3};
+                auto* dest = static_cast<unsigned char*>(data) + pos;
+                std::memcpy(dest, title + offset, length);
+                std::memset(dest + length, 0, padded - length);
+                upload->list->CopyBufferRegion(resource, offset, staging.Get(), pos, padded);
+                pos += padded;
+            }
+            staging->Unmap(0, nullptr);
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+            upload->list->ResourceBarrier(1, &barrier);
+            upload->mirrors.push_back(&mirror);
+            upload->bytes += staging_bytes;
+            upload->blocks += static_cast<unsigned>(dirty.size());
+            big_binding_counts.copied_bytes += staging_bytes;
+            big_binding_counts.copies += static_cast<unsigned>(dirty.size());
+            InterlockedIncrement64(&big_copies_made);
+        }
+        mirror.hashes.swap(hashes);
+        mirror.bytes = bytes;
+        mirror.frame = frame_number;
+        mirror.readers.clear();
+        mirror.readers.emplace_back(recording);
+        bound.push_back(&mirror);
+        return resource;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
 }
 
 ID3D12Resource* bind_gpu_mirror(Wrapper* self, u64 address, std::size_t full_bytes, std::size_t bytes, bool cache_hit)
@@ -1818,6 +2196,12 @@ void finish_bigbind_frame(LONG frame)
     if (report && big_binding_counts.trims)
         log("x2w-draw large bindings frame %ld: %u trims, %u copies, %u hits, %zu bytes", frame,
             big_binding_counts.trims, big_binding_counts.copies, big_binding_counts.hits, big_binding_counts.copied_bytes);
+    if (gpu_mirror_shared_enabled() && (shared_mirror_counts.binds || shared_mirror_counts.fallbacks || shared_mirror_counts.lists)) {
+        log("x2w-draw shared mirror frame %ld: %u lists, %u blocks, %zu bytes, %u binds, %u fallbacks", frame,
+            shared_mirror_counts.lists, shared_mirror_counts.blocks, shared_mirror_counts.bytes,
+            shared_mirror_counts.binds, shared_mirror_counts.fallbacks);
+        shared_mirror_counts = {};
+    }
     big_binding_counts = {};
 }
 
@@ -3599,10 +3983,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const LONG64 step_t1 = cache_hit ? 0 : step_now_us();
         bool have = false;
         if (readable_range && cached && mirror_candidate) {
-            chunk = bind_gpu_mirror(self, address, full_bytes, bytes, cache_hit);
+            chunk = gpu_mirror_shared_enabled()
+                ? bind_shared_gpu_mirror(self, address, full_bytes, bytes)
+                : bind_gpu_mirror(self, address, full_bytes, bytes, cache_hit);
             if (chunk) {
                 offset = 0;
                 have = true;
+            }
+        }
+        if (mirror_candidate && gpu_mirror_shared_enabled()) {
+            if (have) {
+                ++shared_mirror_counts.binds;
+            } else {
+                ++shared_mirror_counts.fallbacks;
+                bytes = (std::min)(bytes, gpu_mirror_min_bytes);
             }
         }
         if (readable_range && cached && !have) {

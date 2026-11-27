@@ -5251,6 +5251,10 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" warp mirror)
             set_tests_properties(startup_gpu_mirror_warp PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+            add_test(NAME startup_gpu_mirror_shared_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp shared)
+            set_tests_properties(startup_gpu_mirror_shared_warp PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         endif()
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
