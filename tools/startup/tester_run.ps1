@@ -503,6 +503,8 @@ foreach ($line in $parts) {
 }
 Write-Host ("Shader cache {0}: {1} translations were already present at start ({2} requests, {3} failed)." -f (Split-Path -Leaf $cache), $cacheAtStart[0], $cacheAtStart[1], $cacheAtStart[2])
 Write-Host (Invoke-Native { & $python -B $pack first-poll $logDir })
+$diskStatus = Invoke-Native { & $python -B $pack disk-status $logDir }
+if ($diskStatus) { Write-Host $diskStatus }
 if ($parts.Count -gt 1) { Write-Host "The report has $($parts.Count) parts: send all of them." }
 
 # F1: the report is packed, now finish what the run left. One translator pass over the cache (no --watch) until nothing is

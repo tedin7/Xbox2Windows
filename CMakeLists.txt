@@ -894,6 +894,10 @@ add_test(NAME startup_dstorage_hdd_queue_on COMMAND startup_dstorage_hdd_queue o
 add_test(NAME startup_dstorage_hdd_queue_off COMMAND startup_dstorage_hdd_queue off)
 add_test(NAME startup_dstorage_hdd_deep COMMAND startup_dstorage_hdd_queue deep)
 add_test(NAME startup_dstorage_hdd_forget COMMAND startup_dstorage_hdd_queue forget)
+add_test(NAME startup_dstorage_hdd_cold COMMAND startup_dstorage_hdd_queue cold)
+add_test(NAME startup_dstorage_hdd_cold_control COMMAND startup_dstorage_hdd_queue cold-control)
+set_tests_properties(startup_dstorage_hdd_cold startup_dstorage_hdd_cold_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_dstorage_hdd_cold_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_dstorage_hdd_queue_on startup_dstorage_hdd_queue_off startup_dstorage_hdd_forget startup_dstorage_hdd_deep PROPERTIES TIMEOUT 60)
 # Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
 # page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
