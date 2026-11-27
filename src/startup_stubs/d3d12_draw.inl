@@ -2870,7 +2870,7 @@ struct IndirectBufferView {
     u64 offset = 0, bytes = 0;
     UINT stride = 0;
     bool upload = false;
-    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
+    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy, 2 a placed snapshot, 3 zeros for a null descriptor, 4 a plain snapshot
     bool null_token = false;
     bool snapshot_reused = false;
 };
@@ -2988,6 +2988,22 @@ UploadReservation compute_snapshot(Wrapper* list, u64 address, std::size_t bytes
     return slice;
 }
 
+LONG compute_inputs_ring_full, compute_inputs_ring_retried;
+
+bool plain_compute_input_readable(u64 address, u64 bytes)
+{
+    // Check protections before readable_window, which probes with a load.
+    for (u64 checked = 0; checked < bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        const u64 at = address + checked;
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) ||
+            info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            return false;
+        checked += reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize - at;
+    }
+    return readable_window(address, static_cast<std::size_t>(bytes)) == bytes;
+}
+
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
@@ -3068,6 +3084,10 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         return {zero_ring, zero_offset, 16, 0, true, 3};
     }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
+    const bool title_inputs = compute_input && compute_title_inputs_enabled();
+    const u64 legacy_limit = limit;
+    if (title_inputs) limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+
     if (bytes > limit || bytes % 4) {
         static LONG size_logged;
         if (first_calls(size_logged, 16))
@@ -3076,12 +3096,41 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (bytes % 4) return refuse("an input buffer range is not a whole number of dwords");
         return refuse(limit == (16u << 20) ? "an input buffer range is over 16 MiB" : "an input buffer range exceeds the D3D12 raw SRV limit");
     }
+    const auto snapshot = [&](int source) -> IndirectBufferView {
+        if (bytes > compute_input_snapshot_limit) {
+            log("x2w-draw refused a title input snapshot of %llu bytes (limit 256 MiB)", bytes);
+            return refuse("an input snapshot is over 256 MiB");
+        }
+        const auto size = static_cast<std::size_t>(bytes);
+        if (source == 4 ? !plain_compute_input_readable(address, bytes) : readable_window(address, size) < bytes)
+            return refuse("an input range in title memory is not readable");
+
+        if (bytes > compute_input_chunk_bytes) {
+            auto* resource = large_compute_input_snapshot(self, address, bytes);
+            if (!resource) return refuse("an input range could not be copied from title memory");
+            return {resource, 0, bytes, stride, true, source};
+        }
+        auto reservation = reserve_upload_ring(self, size);
+        if (!reservation.mapped) {
+            reservation = reserve_upload_ring(self, size, nullptr, true);
+            if (!reservation.mapped) {
+                InterlockedIncrement(&compute_inputs_ring_full);
+                return refuse("an input range could not be copied from title memory (ring full)");
+            }
+            InterlockedIncrement(&compute_inputs_ring_retried);
+        }
+        // Snapshot at record time. Later title writes do not change the upload bytes.
+        if (!x2w_local::guarded_memcpy(reservation.mapped, reinterpret_cast<const void*>(address), size, true))
+            return refuse("an input range could not be copied from title memory");
+        return {reservation.resource, reservation.offset, bytes, stride, true, source};
+    };
     ID3D12Resource* native = nullptr;
     bool upload = false;
     int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
+            if (bytes > legacy_limit) return refuse("an input buffer range is over 16 MiB");
             if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
             return refuse("an input buffer view token names the list's upload memory");
         }
@@ -3090,18 +3139,24 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
         if (!placed.owner) {
             const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
-            const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
-            if (!alias.resource)
-                return refuse(in_upload ? "an input range crosses the end of its upload allocation"
-                                        : "an input is in title memory outside any placed buffer");
-            return {alias.resource, alias.offset, bytes, stride};
+            const auto alias = (allow_address_alias || title_inputs) && !in_upload && bytes <= compute_input_chunk_bytes
+                ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            if (alias.resource) return {alias.resource, alias.offset, bytes, stride};
+            if (in_upload) return refuse("an input range crosses the end of its upload allocation");
+            if (title_inputs) {
+                if (bytes > compute_input_chunk_bytes) return refuse("an input buffer range is over 16 MiB");
+                return snapshot(4);
+            }
+            return refuse("an input is in title memory outside any placed buffer");
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
         if (!placed.alias) {
-            if (native && list_copied_gpu_range(self, native, offset, bytes)) {
+            if (native && list_copied_gpu_range(self, native, offset, bytes, title_inputs)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
+            } else if (title_inputs) {
+                return snapshot(2);
             } else if (compute_input && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
                 // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
                 // bytes the title wrote are only in title memory: snapshot the range into the upload ring now. A later
@@ -3139,6 +3194,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return refuse("an input buffer view token's resource is not on a default or upload heap");
         upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
     }
+    if (!address && bytes > legacy_limit) return refuse("an input buffer range is over 16 MiB");
     if (!native) return refuse("an input buffer descriptor has a null address");
     if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return refuse("an input buffer range is not 16-byte aligned in its resource");
     if (!InterlockedCompareExchange(&owner->own().refs, 0, 0)) return refuse("an input buffer's resource is released");

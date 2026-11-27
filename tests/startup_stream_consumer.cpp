@@ -24,6 +24,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 extern "C" __declspec(dllimport) void x2w_d3d12_fixture_compute_snapshots();
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_fixture_fill_upload_ring(void* list, UINT bytes);
+extern "C" __declspec(dllimport) UINT x2w_d3d12_fixture_fill_compute_input_ring(void*, UINT, BOOL);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
 
@@ -238,6 +239,15 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool title_input = mode.rfind("dispatch-input-title-", 0) == 0;
+    const bool gpu_input = mode == "dispatch-input-title-gpu";
+    const bool alias_input = mode == "dispatch-input-title-alias";
+    const bool large_input = mode == "dispatch-input-title-large" || gpu_input || alias_input;
+    constexpr UINT gpu_offset = 16;
+    const bool ring_input = mode == "dispatch-input-title-ring" || mode == "dispatch-input-title-ring-full";
+    const bool protected_input = mode == "dispatch-input-title-protected";
+    const UINT input_bytes = large_input ? 40u << 20 : 12u << 10;
+    const UINT record_offsets[] = {0, input_bytes / 2, input_bytes - 16};
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -268,6 +278,52 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
+    }
+    void* title_readback = nullptr;
+    void* title_placement = nullptr;
+    void* title_upload = nullptr;
+    unsigned char* source = nullptr;
+    if (title_input) {
+        const D3D12_RESOURCE_DESC output_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(input), 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        title_readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, output_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!title_readback) return 71;
+
+        if (large_input || ring_input || protected_input) {
+            source = static_cast<unsigned char*>(VirtualAlloc(nullptr, input_bytes + 0x1000,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (source && ((large_input && !alias_input) || ring_input)) source += 16;  // deliberately cannot alias a placed heap
+        } else {
+            source = static_cast<unsigned char*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, input_bytes));
+        }
+        if (!source) return 70;
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, input_bytes + (gpu_input ? gpu_offset : 0), 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        if ((large_input || ring_input) &&
+            FAILED(static_cast<HRESULT>(invoke(device, 133, word(source), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                word(&__uuidof(ID3D12Resource)), word(&title_placement))))) return 71;
+
+        void* records = source;
+        if (gpu_input) {
+            title_upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (!title_upload || FAILED(static_cast<HRESULT>(invoke(title_upload, 8, 0, 0, word(&records)))) || !records)
+                return 71;
+        }
+        for (UINT record = 0; record < 3; ++record) {
+            UINT values[4];
+            for (UINT i = 0; i < 4; ++i) values[i] = (record + 1) * 37 + i * 9;
+            std::memcpy(static_cast<unsigned char*>(records) + record_offsets[record], values, sizeof(values));
+        }
+        if (gpu_input) invoke(title_upload, 9, 0, 0);
+        if (protected_input) {
+            DWORD old_protection = 0;
+            if (!VirtualProtect(source + 0x1000, 0x1000, PAGE_NOACCESS, &old_protection)) return 71;
+        }
+
+        const UINT64 address = reinterpret_cast<UINT64>(source) + (gpu_input ? gpu_offset : 0);
+        descriptors[0][0] = static_cast<UINT>(address);
+        descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
+        descriptors[0][2] = input_bytes / 4;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
@@ -347,7 +403,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     }
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
     const bool dynamic_heap = mode.rfind("dispatch-heap-dynamic", 0) == 0;
-    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
+    const UINT constants[3] = {title_input ? record_offsets[1] : 0x01234567u,
+        title_input ? record_offsets[2] : 0x9e3779b9u, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
         invoke(list, 32, 1, word(&heap));
@@ -564,7 +621,17 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(queue, 10, 1, word(&lists[t]));
         }
     } else if (formatted_heap) invoke(list, 14, 1, 1, 1);
-    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    else if (title_input) {
+        if (ring_input) {
+            const bool fill_overflow = mode == "dispatch-input-title-ring-full";
+            if (x2w_d3d12_fixture_fill_compute_input_ring(list, 16u << 10, fill_overflow) != (fill_overflow ? 5u : 4u))
+                return 81;
+        }
+        if (gpu_input) invoke(list, 15, word(title_placement), gpu_offset, word(title_upload), 0, input_bytes);
+        invoke(list, 14, 1, 1, 1);
+        if (!protected_input && !alias_input) std::memset(source, 0, 16);  // snapshot must have happened at record time
+        invoke(list, 15, word(title_readback), 0, word(placed[1]), 0, sizeof(input));
+    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
@@ -580,7 +647,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;
-    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
+    void* result = buffers[1];
+    if (title_readback && (FAILED(static_cast<HRESULT>(invoke(title_readback, 8, 0, 0, word(&result)))) || !result)) return 2;
+    std::ofstream(path, std::ios::binary).write(static_cast<const char*>(result), sizeof(input));
+    if (title_readback) invoke(title_readback, 9, 0, 0);
     return 0;
 }
 

@@ -347,13 +347,14 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                                                          to.resource == from.resource);
     if (refusal == x2w_startup::CopyRefusal::none) refusal = check_endpoint_roles(to, from);
     timer.enter(copy15_sync);
-    const bool authoritative = refusal == x2w_startup::CopyRefusal::none && indirect_copy_ranges() &&
+    const bool authoritative = refusal == x2w_startup::CopyRefusal::none &&
+        (indirect_copy_ranges() || compute_title_inputs_enabled()) &&
         copy_source_authoritative(self, from, source_offset, bytes);
     const bool title_pair = fast && refusal == x2w_startup::CopyRefusal::none && !authoritative &&
         to.wrapper && from.wrapper && to.wrapper->own().title_memory && from.wrapper->own().title_memory;
     const auto* source_info = title_pair ? resource_info(from.wrapper) : nullptr;
     const bool fast_title = source_info && source_info->placement == Placement::copied_buffer;
-    if (refusal == x2w_startup::CopyRefusal::none && !authoritative &&
+    if (refusal == x2w_startup::CopyRefusal::none && !(indirect_copy_ranges() && authoritative) &&
         (fast_title || !sync_title_source(self, from, fast ? &from_desc : nullptr)))
         refusal = x2w_startup::CopyRefusal::title_backed_source;
     if (refusal == x2w_startup::CopyRefusal::title_backed_source) {
@@ -407,7 +408,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     }
     note_linear_gpu_write(self, to);
     note_placed_gpu_write(to.wrapper, destination_offset, bytes);
-    if (indirect_copy_ranges()) {
+    if (indirect_copy_ranges() || compute_title_inputs_enabled()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
             info->placement == Placement::copied_buffer && info->placement_device == self->own().list_device);

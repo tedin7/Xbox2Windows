@@ -20,6 +20,8 @@ Last, dispatch-input-memory-view replaces the input descriptor with the token of
 memory no buffer is placed over, 16 bytes in, and writes the input words there after the view exists: all 320
 words match. The stand-in places that buffer in the consumer's own heap, outside its placement index.
 On WARP, a second program copies all records from title snapshots to a readback buffer.
+The title-input switch cases use a second program and a D3D12 readback heap. The CPU sum covers three records,
+including one in the final 16 bytes. A first-chunk-only copy must fail the same comparison.
 Exit 77 when the adapter is not available.
 """
 from math import prod
@@ -162,6 +164,97 @@ def check_snapshot_translation(assembler):
     print('snapshot fixture assembly and manifest: PASS')
 
 
+# One thread sums three four-dword records. The fixture supplies the middle and tail byte offsets as root constants.
+SUM_SOURCE = """\
+s_mov_b32 s20, s6
+s_mov_b32 s21, 0
+s_load_dwordx8 s[24:31], s[20:21], 0
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v8, 0
+v_mov_b32 v9, s4
+v_mov_b32 v10, s5
+buffer_load_dwordx4 v[12:15], v8, s[24:27], 0 offen
+buffer_load_dwordx4 v[16:19], v9, s[24:27], 0 offen
+buffer_load_dwordx4 v[20:23], v10, s[24:27], 0 offen
+s_waitcnt vmcnt(0)
+""" + ''.join(f'v_add_nc_u32 v12, v12, v{i}\n' for i in range(13, 24)) + """\
+buffer_store_dword v12, v8, s[28:31], 0 offen
+s_endpgm
+"""
+SUM_CODE = bytes.fromhex(
+    '060394be 800395be 0a060cf4 000000fa 7fc08cbf 8002107e 0402127e 0502147e '
+    '001038e0 080c0680 001038e0 09100680 001038e0 0a140680 703f8cbf '
+    '0c1b184a 0c1d184a 0c1f184a 0c21184a 0c23184a 0c25184a '
+    '0c27184a 0c29184a 0c2b184a 0c2d184a 0c2f184a 001070e0 080c0780 000081bf')
+
+
+def check_title_inputs(directory, cache, consumer, dxc, env, untouched):
+    env = dict(env, X2W_TEST_UPLOAD_RING_MAX_KIB='64', X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
+    enabled = dict(env, X2W_COMPUTE_TITLE_INPUTS='1')
+    (directory / 'program').write_bytes(SUM_CODE)
+    (directory / 'state').write_bytes(state_a((1, 1, 1), C.USER7))
+
+    def run(mode, settings):
+        got, result = dispatch(directory, consumer, settings, 'dispatch-input-title-' + mode)
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors
+        return got, result
+
+    def refused(mode, settings, reason):
+        got, result = run(mode, settings)
+        messages = lines(result, 'Dispatch(1, 1, 1) refused: ')
+        assert got == untouched and len(messages) == 1 and messages[0].endswith('refused: ' + reason), (
+            mode, got[0], result.stderr[-3000:])
+        return result
+
+    cold = refused('plain', env, 'no translation')
+    key, = [line.split()[3] for line in lines(cold, 'x2w-draw compute request') if ' published ' in line]
+    compiler = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True,
+                              capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc))
+    assert f'{key}: ok' in compiler.stdout, compiler.stdout
+
+    expected = [sum((r + 1) * 37 + i * 9 for r in range(3) for i in range(4))] + untouched[1:]
+
+    def compare(got, mode):
+        assert got == expected, f'{mode}: readback sum {got[0]}, CPU sum {expected[0]}'
+
+    for mode, reason in (
+        ('plain', 'an input is in title memory outside any placed buffer'),
+        ('large', 'an input buffer range is over 16 MiB'),
+        ('ring', 'an input range could not be copied from title memory'),
+    ):
+        refused(mode, env, reason)
+
+    for mode, gpu, placed, kib, plain, retries in (
+        ('plain', 0, 0, 0, 1, 0),
+        ('large', 0, 1, 40960, 0, 0),
+        ('gpu', 1, 0, 0, 0, 0),
+        ('alias', 0, 0, 0, 0, 0),
+        ('ring', 0, 1, 12, 0, 1),
+    ):
+        got, result = run(mode, enabled)
+        assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
+        totals, = lines(result, 'x2w-render compute dispatches:')
+        assert totals.endswith(f'from a GPU copy {gpu}, from a title snapshot {placed} ({kib} KiB), '
+                               f'from plain title memory {plain}, ring retries {retries}, ring full 0'), totals
+        compare(got, mode)
+
+    refused('protected', enabled, 'an input range in title memory is not readable')
+    full = refused('ring-full', enabled, 'an input range could not be copied from title memory (ring full)')
+    totals, = lines(full, 'x2w-render compute dispatches:')
+    assert totals.endswith('from plain title memory 0, ring retries 0, ring full 1'), totals
+
+    got, result = run('large', dict(enabled, X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY='1'))
+    assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
+    try:
+        compare(got, 'first-chunk-only mutant')
+    except AssertionError:
+        assert got == [sum(37 + i * 9 for i in range(4))] + untouched[1:], got
+    else:
+        raise AssertionError('first-chunk-only mutant unexpectedly passed the CPU comparison')
+    print('title inputs: five CPU matches, three switch-off refusals, protected page and ring-full refusals, mutant caught')
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
@@ -169,7 +262,9 @@ def main(consumer, dxc, adapter):
         for name in ('X2W_NULL_TOKEN_ZERO', 'X2W_COMPUTE_SNAPSHOT_REUSE', 'X2W_COMPUTE_SNAPSHOT_VERIFY',
                      'X2W_TEST_COMPUTE_SNAPSHOT_SKIP_HASH', 'X2W_TEST_UPLOAD_RING_MAX_KIB',
                      'X2W_D3D12_LINEAR_BUFFERS', 'X2W_D3D12_CAP_EXISTING_HEAP', 'X2W_TEST_DISPATCH_HARDWARE',
-                     'X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT'):
+                     'X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT', 'X2W_COMPUTE_TITLE_INPUTS',
+                     'X2W_TEST_COMPUTE_INPUT_FIRST_CHUNK_ONLY', 'X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS',
+                     'X2W_TRANSLATED_INDIRECT_COPY_RANGES'):
             env.pop(name, None)
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
@@ -271,11 +366,19 @@ def main(consumer, dxc, adapter):
         print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
+        check_title_inputs(directory, cache, consumer, dxc, env, untouched)
 
 
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == '--offline':
         check_snapshot_translation(sys.argv[2])
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == 'binary':
+        assert C.assemble(sys.argv[2], SUM_SOURCE) == SUM_CODE
+        pipe = G.ComputePipeline(SUM_CODE, C.root_blob(table_range=True), C.USER7, (1, 1, 1))
+        assert 'srv 0 buf table 1 0\nuav 0 table 1 16' in pipe.manifest()
+        assert pipe.hlsl_cs().count('= r0.Load(') == 12
+        print('title input sum fixture assembles and translates')
         sys.exit(0)
     if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
         sys.exit(__doc__)
