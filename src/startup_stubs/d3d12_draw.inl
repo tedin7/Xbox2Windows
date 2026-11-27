@@ -160,6 +160,7 @@ struct Translation {
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
+    bool dynamic_heap = false;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     x2w_startup::D16ImageSrvs d16_srvs;         // manifest 'd16srv': texture views that must match proven D16 formats (#2023)
@@ -578,6 +579,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             // so a translation whose stores would be silently skipped is never drawn (#1723).
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
+        } else if (line == "dynamic_heap") {
+            tr.dynamic_heap = true;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -642,7 +645,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
-    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if ((!tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
@@ -650,8 +653,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     }
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
-        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()));
+    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + (tr.dynamic_heap ? 1u : 0u),
+        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
         return;
@@ -2811,6 +2814,53 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     return {native, offset, bytes, stride, upload, input_source};
 }
 
+// Mirror the readable buffer records at their original indices. The translated tables follow those
+// records in the same shader-visible heap, since D3D12 binds only one CBV/SRV/UAV heap at a time.
+template <typename Writable>
+ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RESOURCE_STATES state,
+                                          Writable writable, UINT& count)
+{
+    const auto source = pass_of(self).title_view_heap;
+    constexpr UINT record_bytes = 32;
+    const UINT entries = pass_of(self).title_view_heap_entries;
+    if (u64{entries} + tables > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2) return nullptr;
+    count = entries;
+    auto* device = device_of(self->own().list_device);
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        (std::max)(1u, count + tables), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    x2w_upload::DescriptorSnapshot snapshot;
+    if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&snapshot.heap)))) return nullptr;
+    auto* heap = snapshot.heap.Get();
+    const UINT stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+    auto dest = heap->GetCPUDescriptorHandleForHeapStart();
+    const bool readable_heap = x2w_local::readable(reinterpret_cast<const void*>(source.address),
+                                                    std::size_t{count} * record_bytes);
+    try {
+        std::unordered_set<ID3D12Resource*> retained, transitions;
+        for (UINT i = 0; i < count; ++i, dest.ptr += stride) {
+            std::uint32_t words[4]{};
+            const auto* entry = reinterpret_cast<const void*>(source.record(u64{i} * record_bytes, sizeof(words)));
+            IndirectBufferView view;
+            if (entry && (readable_heap || x2w_local::readable(entry, sizeof(words)))) {
+                std::memcpy(words, entry, sizeof(words));
+                if (words[0] || words[1] || words[2] || words[3])
+                    view = indirect_table_buffer(self, words);
+            }
+            if (view.resource && writable(view.resource)) view = {};
+            if (view.resource) {
+                if (retained.insert(view.resource).second) snapshot.resources.emplace_back(view.resource);
+                if (!view.upload) transitions.insert(view.resource);
+            }
+            buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
+        }
+        if (!retain_descriptor_snapshot(self, std::move(snapshot))) return nullptr;
+        for (auto* resource : transitions) require_state(self, resource, state);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+    return heap;
+}
+
 struct FormattedBufferDescriptor {
     u64 entry = 0;
     std::uint32_t words[8] = {};
@@ -2967,10 +3017,12 @@ static const char* const not_drawn_names[] = {
     "indexed_validation_failed",
     "buffer_copy_failed",
     "index_data_unavailable",
+    "dynamic_resource_heap_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 2;
-constexpr int index_data_unavailable_site = not_drawn_sites - 1;
+constexpr int buffer_copy_failed_site = not_drawn_sites - 3;
+constexpr int index_data_unavailable_site = not_drawn_sites - 2;
+constexpr int dynamic_resource_heap_unavailable_site = not_drawn_sites - 1;
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -3181,10 +3233,27 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
-    if (first + views > draw_heap_size) {
-        first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
+    ID3D12DescriptorHeap* view_heap = draw_heap;
+    UINT first = 0;
+    if (tr->dynamic_heap) {
+        if (!indirect) {
+            view_heap = snapshot_buffer_heap(self, views, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, [&](ID3D12Resource* resource) {
+                    for (std::size_t i = 0; i < tr->uavs.size(); ++i)
+                        if (uav_bindings[i].resource == resource) return true;
+                    return false;
+                }, first);
+        } else view_heap = nullptr;
+        if (!view_heap) {
+            draw_lock_release_exclusive();
+            return not_drawn(dynamic_resource_heap_unavailable_site);
+        }
+    } else {
+        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
+        if (first + views > draw_heap_size) {
+            first = 0;
+            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
+        }
     }
     std::uint32_t strides[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
@@ -3248,7 +3317,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
-        const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
+        const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
         u64 address = 0, offset = 0;
         std::size_t bytes = 0;
         PlacedVertexView placed{};
@@ -3710,7 +3779,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
+        const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
@@ -3773,15 +3842,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                     pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN &&
                                     bound->stencil_ref != pass.stencil_reference;
     if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
-    list->SetGraphicsRootSignature(tr->root);
+    if (!tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
-    if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
-        x2w_startup::bind_translated_heaps(list, draw_heap, samplers);
-        pass.heap_set = true;
+    if (tr->dynamic_heap || !pass.heap_set || pass.bound_sampler_heap != samplers) {
+        x2w_startup::bind_translated_heaps(list, view_heap, samplers);
+        pass.heap_set = !tr->dynamic_heap;
         pass.bound_sampler_heap = samplers;
     }
-    list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
+    if (!tr->uds.empty()) list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
+    if (tr->dynamic_heap) list->SetGraphicsRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()));
+    if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
@@ -3883,17 +3954,18 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::SamplerSource source;
     x2w_startup::ViewTable heap_records;
     x2w_startup::ViewHeapSelection view_heaps;
+    UINT heap_entries = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         note_lock_acquire(false);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
-                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
                                                                    heap.increment, heap.desktop_gpu);
+                    heap_entries = static_cast<UINT>((std::min)(u64{heap.logical_count}, heap_records.bytes / 32));
+                }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -3909,6 +3981,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.source_view_heap = view_heaps.graphics;
     pass.title_samplers = source;
     pass.title_view_heap = heap_records;
+    pass.title_view_heap_entries = heap_entries;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).

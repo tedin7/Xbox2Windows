@@ -15,7 +15,8 @@ struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
     // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
     // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
-    // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
+    // at alone) is the index. A fixed heap view uses at directly as a byte offset. Non-root entry values name a
+    // descriptor by source and slot number.
     enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
     struct Slot {
         int a, b;
@@ -26,6 +27,7 @@ struct ComputeTranslation {
         bool array = false;
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
+        bool root_view = false;
         bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
         bool load = false;  // typed UAV load for a partial image store
     };
@@ -33,6 +35,7 @@ struct ComputeTranslation {
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    bool dynamic_heap = false;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -151,6 +154,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
+        if (line == "dynamic_heap") { tr.dynamic_heap = true; continue; }
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
@@ -160,6 +164,14 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 && whole() &&
+                 tr.dynamic_heap && i == tr.srvs.size() && a >= 0 && a < 64) {
+            tr.srvs.push_back({a, 0});
+            tr.srvs.back().root_view = true;
+        }
+        else if (std::sscanf(line.c_str(), "srv %u buf heap fixed %u%n", &i, &x, &used) == 2 && whole() &&
+                 tr.dynamic_heap && i == tr.srvs.size() && x <= 0xfffff && !(x % 32))
+            tr.srvs.push_back({-1, 0, false, true, -1, 0, x});
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
@@ -228,8 +240,9 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+    const UINT constants = (std::max)(1u, static_cast<UINT>(tr.uds.size()) + (tr.dynamic_heap ? 1u : 0u));
+    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants,
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -319,7 +332,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture)) {
+        if (dispatch.signature && (slot.heap || slot.texture || slot.root_view)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
@@ -353,9 +366,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
             }
         }
+        if (slot.root_view) {
+            const auto range = list_upload_range(self, pass.compute_root_addresses[slot.a], 1, true);
+            if (!range.resource || range.bytes < 4 || range.bytes > (16u << 20) ||
+                range.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                reason = "a root input is not an aligned range in this list's upload memory";
+            else views[i] = {range.resource, range.offset, range.bytes & ~u64{3}, false};
+            continue;
+        }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+        const UINT heap_offset = slot.word_param >= 0 || slot.a >= 0 ? std::uint32_t{index << 5} : slot.at;
+        const u64 entry = slot.heap ? pass.title_view_heap.record(heap_offset, 16)
             : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
@@ -547,6 +569,20 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be uploaded";
             std::memset(words, 0, sizeof(words));
         }
+    ID3D12DescriptorHeap* view_heap = draw_heap;
+    UINT first = 0;
+    if (!reason && tr->dynamic_heap) {
+        if (dispatch.signature) reason = "translated indirect Dispatch requires fixed-table raw buffers";
+        else {
+            view_heap = snapshot_buffer_heap(self, static_cast<UINT>(count), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                [&](ID3D12Resource* resource) {
+                    for (std::size_t i = inputs; i < count; ++i)
+                        if (views[i].resource == resource) return true;
+                    return false;
+                }, first);
+            if (!view_heap) reason = "the dynamic resource heap could not be bound";
+        }
+    }
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -564,12 +600,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         return reason;
     }
     const UINT n = static_cast<UINT>(count);
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
-    if (first + n > draw_heap_size) {
-        first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+    if (!tr->dynamic_heap) {
+        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
+        if (first + n > draw_heap_size) {
+            first = 0;
+            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
+        }
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
+    D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
@@ -601,15 +639,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (!pass.heap_set) {
-        x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
-        pass.heap_set = true;
+    if (tr->dynamic_heap || !pass.heap_set) {
+        x2w_startup::bind_translated_heaps(list, view_heap, nullptr);
+        pass.heap_set = !tr->dynamic_heap;
         pass.bound_sampler_heap = nullptr;
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()));
+    if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);

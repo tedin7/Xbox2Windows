@@ -316,6 +316,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
                         sizeof(descriptors[0]));
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
+    const bool dynamic_heap = mode.rfind("dispatch-heap-dynamic", 0) == 0;
     const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
@@ -386,6 +387,24 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         bind(list);
     }
     if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (dynamic_heap) {
+        auto* const index = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
+        if (!index) return 81;
+        index[0] = 3;
+        index[1] = mode.find("-outside") != std::string::npos ? 4 : 2;
+        invoke(list, mode.find("-cbv") != std::string::npos ? 41 : 43, 2, word(index));
+        const UINT64 index_address = reinterpret_cast<UINT64>(index);
+        const UINT index_view[4]{static_cast<UINT>(index_address), static_cast<UINT>(index_address >> 32), 16, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu), index_view, sizeof(index_view));
+        for (UINT slot : {2u, 3u}) {
+            auto* const data = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
+            if (!data) return 81;
+            *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
+            const UINT64 address = reinterpret_cast<UINT64>(data);
+            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
+        }
+    }
     if (mode == "dispatch-heap-word-null")
         std::memset(reinterpret_cast<void*>(cpu + 96), 0, 16);  // the index buffer's descriptor stays null: the word reads as 0
     else if (heap_word) {
@@ -403,7 +422,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+    if (dynamic_heap) invoke(list, 14, 1, 1, 1);
+    else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
@@ -832,6 +852,19 @@ int main(int argc, char** argv)
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
+        if (std::strncmp(argv[8], "dispatch-heap-dynamic", 21) == 0) {
+            ComPtr<ID3D12Device> desktop;
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop))) ||
+                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+                model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
+                options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3) {
+                std::puts("direct heap indexing requires Shader Model 6.6 and resource binding tier 3");
+                return 77;
+            }
+        }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
         if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {

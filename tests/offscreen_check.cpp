@@ -1587,6 +1587,13 @@ static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 // target must hold, compared bit for bit.
 OperationResult run_startup_entry_words(const OperationContext& ctx)
 {
+    const bool dynamic_heap = std::string_view(ctx.argv[2]) == "--startup-dynamic-heap";
+    if (dynamic_heap) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3)
+            return {OutcomeKind::skip, "direct heap indexing requires resource binding tier 3"};
+    }
     const auto entry = parse_hex_words(ctx.argv[5]);
     const auto expected = parse_hex_words(ctx.argv[6]);
     if (entry.empty() || entry.size() > 32)
@@ -1594,7 +1601,7 @@ OperationResult run_startup_entry_words(const OperationContext& ctx)
     if (expected.size() != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     std::uint32_t words[4]{};
-    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words);
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words, 1, 1, dynamic_heap);
     if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
                              "actual=%08x,%08x,%08x,%08x\n",
@@ -1684,6 +1691,9 @@ constexpr CapabilityGate kGateSm60MinLodLevels{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: MinLod exact mip and blend fixture requires SM 6.0",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66DynamicHeap{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "direct heap indexing requires Shader Model 6.6", CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: MinLod fixture requires SM 6.6",
@@ -1731,6 +1741,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
+    {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
