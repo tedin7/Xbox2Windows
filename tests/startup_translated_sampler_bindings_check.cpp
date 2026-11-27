@@ -1,7 +1,7 @@
 // Checks src/startup_stubs/translated_sampler_bindings.h without a device: how 16-byte title sampler
 // words decode to desktop samplers, which manifest lines the stand-in accepts, and what a snapshot of
 // title sampler memory keeps.
-#include "startup_stubs/translated_sampler_bindings.h"
+#include "startup_stubs/sampler_census.h"
 
 #include <cfloat>
 #include <cstdint>
@@ -43,6 +43,77 @@ constexpr unsigned desktop_mode[8] = {wrap, mirror, clamp, mirror_once, clamp, m
 std::uint32_t word0(unsigned u, unsigned v, unsigned w, unsigned aniso)
 {
     return u | v << 3 | w << 6 | aniso << 9;
+}
+
+void check_filter_reduction()
+{
+    // Encodings are independent of the decoder. Include the reserved mode and telemetry-only fields.
+    constexpr unsigned reduction[]{0x000, 0x100, 0x180, 0x000};
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        for (bool aniso : {false, true}) {
+            ++cases;
+            const SamplerWords words{(mode << 29) | 0x98189000u, 0xfff000u,
+                                     aniso ? 0x0aa04000u : 0x0a504000u, 0};
+            const unsigned base = aniso ? anisotropic : trilinear;
+            const unsigned compare_base = aniso ? mip_linear : trilinear;
+            TranslatedSamplers bindings;
+            for (bool comparison : {false, false, true}) {
+                bindings.statics.push_back(words);
+                bindings.comparison.push_back(comparison);
+                bindings.lod_limits.push_back(bindings.statics.size() == 2);
+            }
+            for (bool supported : {false, true}) {
+                const unsigned expected = base | (supported ? reduction[mode] : 0);
+                const auto statics = decode_statics(bindings, supported);
+                expect("reduction", "heap filter", dynamic_sampler(words, supported).Filter, expected);
+                expect("reduction", "smp filter", statics[0].Filter, expected);
+                expect("reduction", "smpl filter", statics[1].Filter, expected);
+                expect("reduction", "smpc filter", statics[2].Filter, compare_base | 0x80);
+            }
+            if (mode == 0) {
+                const auto heap_default = dynamic_sampler(words);
+                const auto heap_enabled = dynamic_sampler(words, true);
+                expect("blend", "same heap descriptor", std::memcmp(&heap_default, &heap_enabled, sizeof(heap_default)) == 0, 1);
+                const auto statics_default = decode_statics(bindings);
+                const auto statics_enabled = decode_statics(bindings, true);
+                for (unsigned i = 0; i < statics_default.size(); ++i)
+                    expect("blend", "same static descriptor",
+                           std::memcmp(&statics_default[i], &statics_enabled[i], sizeof(statics_default[i])) == 0, 1);
+            }
+        }
+    }
+}
+
+void check_sampler_census()
+{
+    ++cases;
+    static SamplerCensus census;
+    const SamplerWords first{0xb8188000u, 0, 0x01004000u, 0};
+    const SamplerWords second{0x40000000u, 0, 0x02080000u, 0};
+    expect("census", "log at one", census.observe(first), 1);
+    expect("census", "duplicate before two", census.observe(first), 0);
+    expect("census", "log at two", census.observe(second), 1);
+    expect("census", "quiet at three", census.observe({0, 0, 0, 0}), 0);
+    expect("census", "duplicate before four", census.observe(second), 0);
+    expect("census", "log at four (distinct word 3)", census.observe({0, 0, 0, 1}), 1);
+    const auto& c = census.counts();
+    expect("census", "distinct samplers", c.samplers, 4);
+    expect("census", "filter_min", c.filter_min, 1);
+    expect("census", "filter_max", c.filter_max, 1);
+    expect("census", "force_unnorm", c.force_unnorm, 1);
+    expect("census", "force_degamma", c.force_degamma, 1);
+    expect("census", "skip_degamma", c.skip_degamma, 1);
+    expect("census", "trunc_coord", c.trunc_coord, 1);
+    expect("census", "mc_trunc", c.mc_trunc, 1);
+    expect("census", "no_cube_wrap", c.no_cube_wrap, 1);
+    expect("census", "z_filter_point", c.z_filter_point, 1);
+    expect("census", "z_filter_linear", c.z_filter_linear, 1);
+    expect("census", "lod_bias_sec", c.lod_bias_sec, 2);
+    bool logged = false;
+    for (unsigned i = 1; i <= 8188; ++i) logged = census.observe({0, i, 0, 0});
+    expect("census", "log at capacity", logged, 1);
+    expect("census", "quiet past capacity", census.observe({0, 0, 0, 2}), 0);
+    expect("census", "frozen total", c.samplers, 8192);
 }
 
 void lod_range(const char* name, const char* kind, float bias, float min_lod, float max_lod, float expected_min,
@@ -376,6 +447,8 @@ int main(int argc, char** argv)
         if (other == first) fail("changed reserved entry", "equal", 1, 0);
     }
 
+    check_filter_reduction();
+    check_sampler_census();
     if (failures) {
         std::printf("startup_translated_sampler_bindings: %d FAILED in %d cases\n", failures, cases);
         return 1;

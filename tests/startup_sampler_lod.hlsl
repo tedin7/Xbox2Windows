@@ -7,7 +7,7 @@ SamplerComparisonState shadow : register(s0);
 
 cbuffer Probe : register(b0)
 {
-    uint mode;      // 0: SampleLevel through heap[entry]; 1: SampleCmpLevelZero through the static sampler; 2: implicit Sample
+    uint mode;      // 0: explicit LOD, 1: static comparison, 2: implicit LOD, 3: centre reduction
     uint entry;
     float lod;
     float reference;
@@ -29,6 +29,7 @@ Vertex vs_main(uint id : SV_VertexID)
 
 float4 ps_main(Vertex input) : SV_Target
 {
+    if (mode == 3) return texels.SampleLevel(heap[entry], float2(0.5, 0.5), 0).xxxx;
     const float2 uv = float2(0.5625, 0.5625);
     if (mode == 0) return texels.SampleLevel(heap[entry], uv, lod).xxxx;
     // UV spans 0..1 over two pixels. On the 8x8 base mip, 1/4 of that UV gives one texel per pixel.

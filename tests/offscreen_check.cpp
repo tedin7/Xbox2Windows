@@ -1317,6 +1317,14 @@ OperationResult run_startup_sampler_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_startup_sampler_reduction(const OperationContext& ctx)
+{
+    const int result = check_startup_sampler_lod(ctx.device, false, {}, nullptr, 0.0f, true);
+    if (result == 77) return {OutcomeKind::skip, "skip: sampler min/max or required R32_FLOAT features unavailable"};
+    if (result) return {OutcomeKind::fail, "sampler reduction readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-bias <ps.cso> <sampler manifest line> <expected red>
 OperationResult run_startup_sampler_bias(const OperationContext& ctx)
 {
@@ -1940,6 +1948,7 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-reduction", 3, 3, nullptr, kNoGate, run_startup_sampler_reduction},
     {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
     {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
     {"--startup-sampler-bias", 6, 6, nullptr, kNoGate, run_startup_sampler_bias},

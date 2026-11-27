@@ -26,7 +26,7 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 // lod_limits carries the unsigned 4.8 MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12)
 // for heap entries and smpl static samplers.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
-                                                bool lod_limits = false)
+                                                bool lod_limits = false, bool min_max_filtering = false)
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -34,8 +34,14 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
         D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_BORDER};
     const UINT mag = (words[2] >> 20) & 3, min = (words[2] >> 22) & 3, mip = (words[2] >> 26) & 3;
     D3D12_STATIC_SAMPLER_DESC s{};
-    s.Filter = (mag >= 2 || min >= 2) ? D3D12_FILTER_ANISOTROPIC
-        : D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+    D3D12_FILTER_REDUCTION_TYPE reduction = D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const UINT filter_mode = (words[0] >> 29) & 3u;
+    if (comparison) reduction = D3D12_FILTER_REDUCTION_TYPE_COMPARISON;
+    else if (min_max_filtering && filter_mode == 1) reduction = D3D12_FILTER_REDUCTION_TYPE_MINIMUM;
+    else if (min_max_filtering && filter_mode == 2) reduction = D3D12_FILTER_REDUCTION_TYPE_MAXIMUM;
+    s.Filter = !comparison && (mag >= 2 || min >= 2)
+        ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+        : D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, reduction);
     s.AddressU = modes[words[0] & 7];
     s.AddressV = modes[(words[0] >> 3) & 7];
     s.AddressW = modes[(words[0] >> 6) & 7];
@@ -43,7 +49,6 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
     s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     if (comparison) {
-        s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
     }
     // SQ_IMG_SAMP_WORD3 bits 31:30 (BORDER_COLOR_TYPE, Mesa gfx10-rsrc.json): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK,
@@ -107,13 +112,15 @@ inline float decode_sampler_lod_bias(const SamplerWords& words)
 }
 
 // The static sampler bound at register i, in manifest order.
-inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSamplers& samplers)
+inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSamplers& samplers,
+                                                                  bool min_max_filtering = false)
 {
     std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
     for (UINT i = 0; i < samplers.statics.size(); ++i) {
         const bool limits = i < samplers.lod_limits.size() && samplers.lod_limits[i];
         const auto& words = samplers.statics[i];
-        auto sampler = decode_sampler(words, i, i < samplers.comparison.size() && samplers.comparison[i], limits);
+        auto sampler = decode_sampler(words, i, i < samplers.comparison.size() && samplers.comparison[i],
+                                      limits, min_max_filtering);
         if (limits) {
             // The translator validates the D3D12 range and requires zero secondary bias.
             sampler.MipLODBias = decode_sampler_lod_bias(words);
@@ -125,6 +132,13 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
 
 // views: the SRVs and UAVs of the view table together.
 inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
+
+inline bool supports_sampler_min_max(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+           options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2;
+}
 
 // Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
@@ -148,7 +162,7 @@ inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT
         parameters[count].DescriptorTable = {1, &sampler_range};
         ++count;
     }
-    const auto statics = decode_statics(samplers);
+    const auto statics = decode_statics(samplers, !samplers.statics.empty() && supports_sampler_min_max(device));
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, static_cast<UINT>(statics.size()), statics.data(),
                                          dynamic_heap ? static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(root_flag_view_heap_indexed)
                                                       : D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -207,10 +221,10 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
     return snapshot;
 }
 
-inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
+inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words, bool min_max_filtering = false)
 {
     // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
-    auto s = decode_sampler(words, 0, false, true);
+    auto s = decode_sampler(words, 0, false, true, min_max_filtering);
     // MIP_FILTER 0 selects the view's base level for title heap descriptors.
     if (((words[2] >> 26) & 3u) == 0) {
         s.MinLOD = 0.0f;
