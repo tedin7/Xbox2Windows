@@ -3841,10 +3841,14 @@ output window read it, with a picture of the chosen target of the last frame. Th
   `rt:2560x1440:10`.
 
 Targets are noticed where a pass binds them (OMSetRenderTargets), so a target that was only cleared shows too. `depth`
-and `largest-rt` prefer the candidate whose size equals the presented surface's (the scene depth over a bigger shadow atlas),
-then the biggest, then the latest bound; `rt:` is exact. The picture is stretched to the presented surface.
+and `largest-rt` choose the target that received the most translated draws in the interval (the scene renders at 2560x1440 and is
+upscaled, so the screen size is not the scene's), then the one whose size equals the presented surface's, then the biggest, then
+the latest bound; `rt:` is exact. About every 10 s an automatic line gives the chosen depth's first silhouette without a picture:
+`x2w-render debug present: depth spread 0.25..0.75 covered 75.0% (depth 2560x1440 fmt 20, 41200 draws in the interval, ...)`
+(range of the non-clear depth values, share of sampled pixels that hold geometry). The picture is stretched to the presented surface.
 
-Cost: `X2W_DEBUG_PRESENT_FROM=<seconds>` does nothing before that much process time (default 0). The picture is made on every
+Cost: `X2W_DEBUG_PRESENT_FROM=<seconds>` does nothing before that much process time (default 0), and
+`X2W_DEBUG_PRESENT_FROM_DRAWS=<n>` starts at the first present after n translated draws were seen. The picture is made on every
 `X2W_DEBUG_PRESENT_EVERY`-th present (default 6; 1 = every present) and on the presents where a timed picture of the report is due
 (about 5 s after the last one), so the report's pictures show it while the frames between cost nothing. A target wider than 1024
 pixels is sampled at every `ceil(width / 1024)`-th pixel in both directions (a 4K target: 1/16 of the work). It also works in the replay: the player runs the same
