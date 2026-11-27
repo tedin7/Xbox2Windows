@@ -13,6 +13,8 @@ import os
 import re
 import struct
 import sys
+import tempfile
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -277,7 +279,7 @@ PKLIT = [
 for asm, regs, expected in PKLIT:
     got = run(asm, regs + [0] * (4 - len(regs)))[1]
     check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
-for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg_hi:[0,1]', 'v_pk_add_f16 v3, v0, v1 clamp',
+for asm in ('v_pk_add_f16 v3, v0, v1 clamp', 'v_pk_add_f16 v3, v0, v1 neg_lo:[1]',
             'v_pk_mul_f16 v3, 2.0, v1', 'v_pk_mul_f16 v3, 2.0, v1 op_sel:[1,0] op_sel_hi:[0,1]', 'v_pk_add_f16 v3, 3, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_min_f16 v3, v0, 0x7bef', 'v_pk_min_f16 v3, v0, 0x7bef op_sel:[0,1] op_sel_hi:[1,0]', 'v_pk_min_f16 v3, v0, 1.0', 'v_pk_add_f16 v3, s0, v1',
             'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
             'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
@@ -287,7 +289,91 @@ for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg
     except G.Unsupported:
         check('refuses ' + asm, True)
 
+PACKED_INPUTS = (
+    (0x40003c00, 0xc4004200),  # unequal magnitudes and signs
+    (0x80000000, 0x00008000),  # both signs of zero
+    (0x00017bff, 0x0400fbff),  # largest finite, smallest normal and subnormal
+    (0x7e157c00, 0x3c000000),  # quiet NaN and infinity
+    (0xfc008001, 0x7c007e75),  # negative infinity and NaN in the other source
+)
+
+
+def packed_negation_fixture(wrong_half=False):
+    from startup_compute_lds_dual_atomics_check import (
+        PREAMBLE_LINES, SENTINEL, USER7, WORDS, mubuf_store, root_blob, sopp, v_mov_imm, vop2, vopc,
+    )
+
+    code = bytearray(b''.join(raw for _, raw in PREAMBLE_LINES))
+    code += vop2(0x1a, 4, 0x82, 0)  # per-thread output byte address
+    for reg, value in enumerate(PACKED_INPUTS[0], 1):
+        code += v_mov_imm(reg, value)
+    for thread, pair in enumerate(PACKED_INPUTS[1:], 1):
+        code += vopc(0xc2, 0x80 + thread, 0)
+        for reg, value in enumerate(pair, 1):
+            code += v_mov_imm(5, value)
+            code += vop2(0x01, reg, 256 + reg, 5)  # select the table row for this thread
+
+    def result(op, pair, half, mask):
+        x = M.pick(pair[0], half) ^ (0x8000 if mask & 1 else 0)
+        y = M.pick(pair[1], half) ^ (0x8000 if mask & 2 else 0)
+        return D.canon_half(M.half_op(op, x, y))
+
+    expected = []
+    for op, opcode in (('add', 0x0f), ('sub', 0x0f), ('mul', 0x10), ('min', 0x11), ('max', 0x12)):
+        # The ISA expresses packed subtraction as addition with SRC1 negated in both halves.
+        sub = 2 if op == 'sub' else 0
+        for source in range(2):
+            for half in range(2):
+                lo = sub ^ ((1 << source) if half == 0 else 0)
+                hi = sub ^ ((1 << source) if half == 1 else 0)
+                if wrong_half:
+                    lo, hi = hi, lo
+                code += struct.pack('<2I', 0xcc000003 | (opcode << 16) | (hi << 8),
+                                    257 | (258 << 9) | (3 << 27) | (lo << 29))
+                code += mubuf_store(0x1c, 3, 4, offset=4 * len(expected))
+                alu = 'add' if op == 'sub' else op
+                expected.extend(result(alu, pair, 0, lo) | (result(alu, pair, 1, hi) << 16)
+                                for pair in PACKED_INPUTS)
+    code += sopp(0x01)
+    hlsl = G.ComputePipeline(bytes(code), root_blob(), USER7, (len(PACKED_INPUTS), 1, 1)).hlsl_cs()
+    # GPU arithmetic can return any quiet NaN encoding. Compare all other bits raw.
+    hlsl, stores = re.subn(r'\bStore\(a, v3\);', 'Store(a, nanc(v3));', hlsl)
+    assert stores * len(PACKED_INPUTS) == len(expected), (stores, len(expected))
+    return D.NAN_HLSL + hlsl, expected + [SENTINEL] * (WORDS - len(expected))
+
+
+def packed_negation_gpu(dxc, runner, adapter, fixtures):
+    from startup_compute_lds_dual_atomics_check import check_debug_layer, renderer_diagnostics, run_shader
+
+    good, mutant = fixtures
+    expected = good[1]
+    mismatch = next(i for i, (a, b) in enumerate(zip(expected, mutant[1])) if a != b)
+    wanted = 'word=%d expected=%08x actual=%08x' % (mismatch, expected[mismatch], mutant[1][mismatch])
+    out = Path(here).parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        for name, (source, _) in zip(('packed', 'wrong-half'), fixtures):
+            run = run_shader(name, dxc, runner, adapter, Path(tmp), source, expected)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                return 77
+            check_debug_layer(name, run.stdout, run.stderr)
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
+            if name == 'wrong-half':
+                assert run.returncode == 1 and diagnostics and diagnostics[0] == wanted, run.stderr
+                print('wrong-half control rejected at ' + diagnostics[0])
+            else:
+                assert not run.returncode and not diagnostics, (run.returncode, run.stderr)
+    return 0
+
+
+packed_fixtures = (packed_negation_fixture(), packed_negation_fixture(wrong_half=True))
+check('packed negation wrong-half reference differs', packed_fixtures[0][1] != packed_fixtures[1][1])
+
 if failures:
     print('FAILED: ' + ', '.join(failures))
     sys.exit(1)
 print('f16 alu ok')
+
+if sys.argv[1:2] == ['dispatch']:
+    sys.exit(packed_negation_gpu(*sys.argv[2:], packed_fixtures))

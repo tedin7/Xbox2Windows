@@ -4087,6 +4087,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_cvt_pk_int16_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_cvt_pknorm_u16_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_pk_int16_check.py" draw-unorm "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_cvt_pknorm_u16_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl RDNA 2 scalar null operand (code 125) and Stage.scalar destination guards (#2618, #1723, #2463):
     # 32-bit null-destination SCC updates, null source (0u), explicit Unsupported refusals replacing TypeError, and
     # WARP/hardware draws + root-constant buffer readbacks with negative controls.
@@ -4492,6 +4496,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_f16_alu_draw_${adapter} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_f16_alu_packed_neg_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_alu_check.py" dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_f16_alu_packed_neg_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.
     foreach(adapter IN ITEMS warp hardware)
@@ -4829,6 +4837,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Lane-exact EXEC core (tools/startup/lane_exec.py): range restore rule and DPP16 source validity against a per-lane reference.
     add_test(NAME startup_lane_exec COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_lane_exec_check.py")
+    add_test(NAME startup_lane_exec_cmpx_lt_u32_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_lane_exec_check.py" dispatch "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_lane_exec_cmpx_lt_u32_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # The high half of an unsigned 32x32 product (#1792).
     add_test(NAME startup_gfx2hlsl_mul_hi_u32 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_u32_check.py")
@@ -4885,7 +4897,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_compute_lds_dual_atomics_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(control IN ITEMS d-wrong-st64-stride d-drop-oob-zero d-drop-align d-drop-exec d-alias-overwrite
-                a-swap-minmax a-drop-exec a-drop-wrxchg-rtn a-oob-nonzero r-drop-add-rtn)
+                a-swap-minmax a-drop-exec a-drop-wrxchg-rtn a-oob-nonzero r-drop-add-rtn wide-offset-times-four)
             add_test(NAME startup_compute_lds_dual_atomics_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_dual_atomics_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})
