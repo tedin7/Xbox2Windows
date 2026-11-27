@@ -35,13 +35,20 @@ def recording(version, *, wire_version=None, slot=15, tail=False):
 
 def pre_install_device():
     """A recording that starts after the device existed: its first device call is the struct-return form (object = the
-    title's return buffer, the device second), and a second device-kind object never named by an OUTP appears later."""
+    title's return buffer, the device second), a second device-kind object never named by an OUTP appears later, and a
+    failed QueryInterface left its out pointer unrecorded."""
     stack, second = 0x7253F9E0, 0x5678
     data = chunk(b"XREC", struct.pack("<IIQ", 3, CALL[3].size, 10_000_000))
     data += chunk(b"XENV", data=b"X2W_D3D12_PERMISSIVE=1\0")
     calls = [(26, stack, [DEVICE, 0, 1]), (15, DEVICE, [2]), (15, DEVICE, [2]), (15, second, [2])]
     for seq, (slot, obj, args) in enumerate(calls, 1):
         data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, slot, obj, *(args + [0] * (11 - len(args))), 0, 0.0, 0, 0))
+    # A QueryInterface that failed (E_NOINTERFACE): the file holds its IID, not its out pointer, which is the title's
+    # stack. The stand-in writes null through the out pointer, so the player must hand it a buffer of its own.
+    riid, out = 0x7FF6C513CE88, 0x7253F8A0
+    data += chunk(b"CALL", CALL[3].pack(5, 1, 0, 0, DEVICE, riid, out, *([0] * 9), 0x80004002, 0.0, 0, 0))
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 5, 0, 0, riid, 16, 0x51D))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x51D, 16), bytes(range(1, 17)))
     return data
 
 
@@ -86,7 +93,7 @@ def main(player):
         code, text, out = play(player, directory, "pre-install", pre_install_device())
         assert code == 0, (code, text[-2500:])
         summary = json.loads((out / "replay_summary.json").read_text())
-        assert summary["calls"] == summary["played"] == 4 and summary["unknown_object"] == 0, summary
+        assert summary["calls"] == summary["played"] == 5 and summary["unknown_object"] == 0, summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
     return 0
 

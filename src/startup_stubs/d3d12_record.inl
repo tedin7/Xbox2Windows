@@ -268,11 +268,12 @@ struct ArgumentCapture {
         return bytes ? memory(arg, address, bytes, depth) : std::vector<unsigned char>{};
     }
 
+    // The out pointer's 8 bytes are kept even when the call failed (the player then hands the stand-in a copy, not the
+    // title's stack address); OUTP only for a created wrapper.
     void output(unsigned i)
     {
-        if (FAILED(static_cast<HRESULT>(call.ret))) return;
         const auto copy = memory(i, call.args[i], sizeof(u64));
-        if (copy.empty()) return;
+        if (FAILED(static_cast<HRESULT>(call.ret)) || copy.empty()) return;
         u64 value;
         std::memcpy(&value, copy.data(), sizeof(value));
         if (!as_wrapper(reinterpret_cast<const void*>(value))) return;

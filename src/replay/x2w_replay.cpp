@@ -88,6 +88,7 @@ struct Player {
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 adopted = 0;  // device-kind objects first seen as a call's object, bound to the player's device
+    u64 scratch_outputs = 0;  // out pointers the file did not hold, given a buffer of the player's own
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
@@ -396,6 +397,16 @@ bool play(Player& p, const Recording& r, const Step& step)
         call.sampled[2] = call.read_output(2, call.before[2]);
     u64 a[call_args];
     for (int i = 0; i < call_args; ++i) a[i] = call.top[i] ? call.top[i] : p.translate(c.args[i]);
+    // An out pointer the file does not hold (older files dropped it when the call failed) is the recorded process's
+    // stack address: the stand-in would write through it. It gets a zeroed buffer of the player's own.
+    if (const int out = x2w_replay_slots::output_arg(c.kind, c.slot);
+        out >= 0 && out < call_args && !call.top[out] && c.args[out] && a[out] == c.args[out] && !page_replay().reserved(a[out])) {
+        auto scratch = std::make_unique<unsigned char[]>(16);
+        std::memset(scratch.get(), 0, 16);
+        a[out] = reinterpret_cast<u64>(scratch.get());
+        p.arena.push_back(std::move(scratch));
+        ++p.scratch_outputs;
+    }
     u64 rcx = call.self;
     if (call.buffer_first) {
         if (!call.top[rcx_arg]) {
