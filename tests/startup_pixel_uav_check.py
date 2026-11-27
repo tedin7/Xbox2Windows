@@ -148,7 +148,7 @@ def describe(index):
 class Program:
     """One pixel program published and translated into its own cache."""
 
-    def __init__(self, directory, consumer, words, env, kind='tex2d', *, load=False, stale=False):
+    def __init__(self, directory, consumer, words, env, kind='tex2d', *, load=False, stale=False, stride=32):
         self.directory, self.consumer, self.kind = directory, consumer, kind
         directory.mkdir()
         self.cache = directory / 'cache'
@@ -165,7 +165,7 @@ class Program:
         assert lines[0] == 'x2w-manifest 2' and ('uav 0 %s table 0 0' % kind) in lines, lines
         if load or stale:
             assert [line for line in lines if line.startswith('srv ')] == (
-                ['srv 0 %s table 0 32' % kind] if stale else []), lines
+                ['srv 0 %s table 0 %d' % (kind, stride)] if stale else []), lines
             assert [line for line in lines if line.startswith('uavload ')] == (['uavload 0'] if load else []), lines
         else:
             assert not any(line.startswith('srv ') for line in lines), lines
@@ -302,8 +302,11 @@ def check_read_write(directory, consumer, env):
             if line.startswith('adapter='):
                 print(line)
 
-        mutant = Program(directory / (case + '-stale'), consumer, rw_program(array=array, stale=True), env,
-                         kind, stale=True)
+        # The stale copy sits one title descriptor stride into the table; the fixture prints the stride it used.
+        stride = int(next(line.rsplit(' ', 1)[1] for line in result[1].splitlines()
+                          if 'title descriptor stride' in line))
+        mutant = Program(directory / (case + '-stale'), consumer, rw_program(array=array, stale=True, stride=stride),
+                         env, kind, stale=True, stride=stride)
         stale = run_case(mutant, case + '-stale', env, 'warp')
         assert_read_write_result(stale, array=array, draws=1, draw_count=2)
         assert stale[4] != list(expected_read_write_words(array, 2)), 'stale SRV passed the two-draw CPU oracle'
