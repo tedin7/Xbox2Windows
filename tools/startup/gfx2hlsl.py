@@ -509,6 +509,10 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('%s with neg/abs' % name)
         if name in VOP3_ONLY_VEC_U and (word1 >> 18) & 0x1ff:
             raise Unsupported('%s with unused src2 field set' % name)
+    if name == 'v_cvt_pknorm_u16_f32':
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0xfc00 or word1 & 0x9ffc0000:
+            raise Unsupported('%s with reserved operand or modifier bits' % name)
     if name == 'v_cvt_off_f32_i4_e64':
         # Integer-nibble conversion: the instruction has one source, so only src0's VOP3A ABS (w0[8]) and NEG
         # (w1[29]) can carry a modifier. Masking all three bit positions of each field (w0[10:8], w1[31:29])
@@ -1415,7 +1419,8 @@ def _lds_quad(tok):
 
 
 def lds_byte_offsets(name, mods):
-    if name != 'ds_read2_b32':
+    dual = LDS_DUAL_OPS.get(name)
+    if name != 'ds_read2_b32' and dual is None:
         if not mods:
             return (0,)
         if len(mods) == 1 and re.fullmatch(r'offset:\d+', mods[0]):
@@ -1423,16 +1428,19 @@ def lds_byte_offsets(name, mods):
             if offset <= 0xffff:
                 return (offset,)
         raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
-    # DS_READ2 encodes each offset independently in dwords. An omitted field is zero.
+    # Dual forms encode two independent offsets in units of their opcode's stride.
+    stride = dual[2] if dual else 4
+    label = name if dual and dual[1] == 8 else 'LDS read2'
+    offset_description = 'ordinary dword offsets' if label == 'LDS read2' else 'two ordinary 8-bit offsets'
     offsets = {}
     for mod in mods:
         field = re.fullmatch(r'offset([01]):(\d+)', mod)
         if not field or field[1] in offsets or int(field[2]) > 255:
-            raise Unsupported('LDS read2 needs ordinary dword offsets')
-        offsets[field[1]] = 4 * int(field[2])
+            raise Unsupported('%s needs %s' % (label, offset_description))
+        offsets[field[1]] = stride * int(field[2])
     first, second = offsets.get('0', 0), offsets.get('1', 0)
     if first == second:
-        raise Unsupported('LDS read2 needs two distinct offsets')
+        raise Unsupported('%s needs two distinct offsets' % label)
     return first, second
 
 
@@ -7504,43 +7512,46 @@ class Stage:
         return words * 4
 
     def lds_dual(self, name, ops, mods):
-        """Lower 32-bit dual-offset and stride-64 LDS ops (ds_write2_b32, ds_write2st64_b32, ds_read2st64_b32)."""
+        """Lower dual-offset LDS operations onto the dword-indexed group array."""
         if getattr(self, 'kind', None) != 'cs':
             raise Unsupported(name)
-        is_write, stride = LDS_DUAL_OPS[name]
+        is_write, width, _ = LDS_DUAL_OPS[name]
+        dwords = width // 4
         if is_write:
+            first_reg = _lds_single if dwords == 1 else _lds_pair
             if (len(ops) != 3 or _lds_single(ops[0]) is None
-                    or _lds_single(ops[1]) is None or _lds_single(ops[2]) is None):
-                raise Unsupported('%s needs three single VGPRs (addr, data0, data1)' % name)
+                    or any(first_reg(op) is None for op in ops[1:])):
+                shape = ('three single VGPRs (addr, data0, data1)' if dwords == 1
+                         else 'a byte address VGPR and two 2-VGPR data pairs')
+                raise Unsupported('%s needs %s' % (name, shape))
         else:
-            if len(ops) != 2 or _lds_pair(ops[0]) is None or _lds_single(ops[1]) is None:
-                raise Unsupported('%s needs a 2-VGPR pair and a byte address VGPR' % name)
-        # Reuse ds_read2_b32 modifier/aliasing validation (offset0/offset1 in 0..255, distinct, no gds/unknown mods).
-        off0, off1 = lds_byte_offsets('ds_read2_b32', mods)
-        scale = stride // 4
-        off0, off1 = off0 * scale, off1 * scale
+            if len(ops) != 2 or _lds_vgpr_span(ops[0], 2 * dwords) is None or _lds_single(ops[1]) is None:
+                shape = '2-VGPR pair' if dwords == 1 else '4-VGPR range'
+                raise Unsupported('%s needs a %s and a byte address VGPR' % (name, shape))
+        offsets = lds_byte_offsets(name, mods)
         lds_bytes = self._lds_require_alloc(name)
         exec_prefix = '' if self.exec_known else '(exec & 1) && '
-        if is_write:
-            addr = self.u(ops[0])
-            d0, d1 = self.u(ops[1]), self.u(ops[2])
-            self.emit('a = %s;' % addr)
-            for off, val in ((off0, d0), (off1, d1)):
-                if off < lds_bytes:
-                    self.emit('if (%s((a & 3u) == 0u) && a < %du) lds[(a + %du) >> 2] = %s;'
-                              % (exec_prefix, lds_bytes - off, off, val))
-        else:
-            dst = _lds_pair(ops[0])
-            addr = self.u(ops[1])
-            self.emit('a = %s;' % addr)
-            for idx, off in enumerate((off0, off1)):
-                if off < lds_bytes:
+        self.emit('a = %s;' % self.u(ops[0 if is_write else 1]))
+        for slot, off in enumerate(offsets):
+            # Require the entire slot in bounds. Both widths have dword alignment.
+            limit = lds_bytes - off - width + 4
+            guard = '%s((a & 3u) == 0u) && a < %du' % (exec_prefix, limit)
+            if is_write:
+                data = first_reg(ops[slot + 1])
+            else:
+                dst = _lds_vgpr_span(ops[0], 2 * dwords) + slot * dwords
+            for index in range(dwords):
+                cell = 'lds[(a + %du) >> 2]' % (off + index * 4)
+                if is_write:
+                    value = self.u('v%d' % (data + index))
+                    if limit > 0:
+                        self.emit('if (%s) %s = %s;' % (guard, cell, value))
+                elif limit > 0:
                     self.emit('w = 0u;')
-                    self.emit('if (%s((a & 3u) == 0u) && a < %du) w = lds[(a + %du) >> 2];'
-                              % (exec_prefix, lds_bytes - off, off))
-                    self.set_v(dst + idx, 'w')
+                    self.emit('if (%s) w = %s;' % (guard, cell))
+                    self.set_v(dst + index, 'w')
                 else:
-                    self.set_v(dst + idx, '0u')
+                    self.set_v(dst + index, '0u')
 
     def lds_atomic(self, name, ops, mods):
         """Lower 32-bit unsigned/bitwise compute LDS atomics (non-rtn and _rtn forms) onto groupshared uint lds[N]."""
@@ -8789,6 +8800,19 @@ class Stage:
                 half = '(%s ^ 0x8000u)' % half
             halves.append(half)
         self.set_v(dst[1], '%s | (%s << 16)' % (halves[0], halves[1]))
+
+    def op_v_cvt_pknorm_u16_f32(self, ops, mods):
+        name = 'v_cvt_pknorm_u16_f32'
+        if mods:
+            raise Unsupported('%s with %s' % (name, ' '.join(mods)))
+        if len(ops) != 3:
+            raise Unsupported('%s needs a destination and two sources' % name)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        lo, hi = (self.f(token) for token in ops[1:])
+        self.pipe.uses_pknorm_u16 = True
+        self.set_v(dst[1], 'pknorm_u16(asuint(%s)) | (pknorm_u16(asuint(%s)) << 16u)' % (lo, hi))
 
     def op_v_cvt_pk_u8_f32(self, ops, mods):
         # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
@@ -10119,12 +10143,14 @@ class Stage:
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR, or a literal or
-        inline float constant read through its low half in both lanes (a high-half read and inline integers are not proven).
+        The binary operations support neg_lo and neg_hi after half selection. Clamp and other modifiers are refused.
+        Each source must be a plain VGPR, or a literal or inline float constant read through its low half in both lanes.
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
         sel = {'op_sel': [0] * arity, 'op_sel_hi': [1] * arity}
+        if arity == 2:
+            sel.update(neg_lo=[0] * arity, neg_hi=[0] * arity)
         for m in mods:
             key, _, value = m.partition(':')
             if key not in sel or not (value.startswith('[') and value.endswith(']')):
@@ -10155,14 +10181,17 @@ class Stage:
                 continue
             raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
         lanes = []
-        for picks in (sel['op_sel'], sel['op_sel_hi']):
+        for pick, neg in (('op_sel', 'neg_lo'), ('op_sel_hi', 'neg_hi')):
             args = []
-            for n, (tok, hi, both) in enumerate(zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi']))):
+            for n, (tok, hi, both) in enumerate(zip(ops[1:], sel[pick], zip(sel['op_sel'], sel['op_sel_hi']))):
                 if n in literal:
-                    args.append('f16tof32(0x%xu)' % literal[n])
-                    continue
-                word = self.u(tok, low16_only=not any(both))
-                args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
+                    half = '0x%xu' % literal[n]
+                else:
+                    word = self.u(tok, low16_only=not any(both))
+                    half = '(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word
+                if neg in sel and sel[neg][n]:
+                    half = '(%s) ^ 0x8000u' % half
+                args.append('f16tof32(%s)' % half)
             lanes.append('f16rn(%s)' % text.format(*args))
         d = reg_range(ops[0])[1]
         self.set_v(d, '%s | (%s << 16)' % tuple(lanes))
@@ -11262,11 +11291,15 @@ LEGACY_LDS_EXCHANGE_OPS = frozenset((
     'ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64', 'ds_write_b128', 'ds_read_b128',
 ))
 
-# Dual-offset & stride-64 32-bit LDS ops: name -> (is_write, offset_stride_bytes)
+# Dual-offset LDS ops: name -> (is_write, slot_bytes, offset_stride_bytes)
 LDS_DUAL_OPS = {
-    'ds_write2_b32': (True, 4),
-    'ds_write2st64_b32': (True, 256),
-    'ds_read2st64_b32': (False, 256),
+    'ds_write2_b32': (True, 4, 4),
+    'ds_write2st64_b32': (True, 4, 256),
+    'ds_read2st64_b32': (False, 4, 256),
+    'ds_write2_b64': (True, 8, 8),
+    'ds_write2st64_b64': (True, 8, 512),
+    'ds_read2_b64': (False, 8, 8),
+    'ds_read2st64_b64': (False, 8, 512),
 }
 
 # 32-bit unsigned/bitwise LDS atomics: name -> (HLSL Interlocked* suffix, has_rtn)
@@ -11290,9 +11323,8 @@ LDS_DUAL_ATOMIC_OPS = frozenset((*LDS_DUAL_OPS, *LDS_ATOMIC_OPS))
 # w1[7:0]=ADDR, w1[15:8]=DATA0, w1[23:16]=DATA1, w1[31:24]=VDST.
 LDS_UNUSED_W1_MASK = {
     'ds_write_b32': 0xffff0000,
-    'ds_write2_b32': 0xff000000,
-    'ds_write2st64_b32': 0xff000000,
-    'ds_read2st64_b32': 0x00ffff00,
+    **{op: (0xff000000 if is_write else 0x00ffff00)
+       for op, (is_write, _, _) in LDS_DUAL_OPS.items()},
     **{op: (0x00ff0000 if has_rtn else 0xffff0000) for op, (_, has_rtn) in LDS_ATOMIC_OPS.items()},
 }
 
@@ -12106,6 +12138,31 @@ class Pipeline:
                 '        if (prev == cur) break;',
                 '        cur = prev;',
                 '    }',
+                '}',
+            ))
+        if getattr(self, 'uses_pknorm_u16', False):
+            # Compute the 40-bit significand product as (m << 16) - m, then divide
+            # by the power of two with one nearest-even rounding.
+            out.extend((
+                'uint pknorm_u16(uint bits) {',
+                '    if (bits > 0x7f800000u || bits < 0x37000000u) return 0u;',
+                '    if (bits >= 0x3f800000u) return 65535u;',
+                '    uint m = 0x800000u | (bits & 0x7fffffu);',
+                '    uint lo = (m << 16u) - m;',
+                '    uint hi = (m >> 16u) - uint((m << 16u) < m);',
+                '    uint shift = 150u - (bits >> 23u);',
+                '    uint q, guard; bool sticky;',
+                '    if (shift > 32u) {',
+                '        uint k = shift - 32u;',
+                '        q = hi >> k;',
+                '        guard = (hi >> (k - 1u)) & 1u;',
+                '        sticky = lo != 0u || (hi & ((1u << (k - 1u)) - 1u)) != 0u;',
+                '    } else {',
+                '        q = shift == 32u ? hi : (hi << (32u - shift)) | (lo >> (shift & 31u));',
+                '        guard = (lo >> (shift - 1u)) & 1u;',
+                '        sticky = (lo & ((1u << (shift - 1u)) - 1u)) != 0u;',
+                '    }',
+                '    return q + (guard & uint(sticky || (q & 1u) != 0u));',
                 '}',
             ))
         if getattr(self, 'uses_ldexp', False):
