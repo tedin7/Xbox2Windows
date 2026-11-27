@@ -99,6 +99,10 @@ HEAP_MESH[1:1] = HEAP_SETUP + [
 ] + HEAP_ARM + ['bf800000']  # s_nop 0, the join before the exchange
 
 
+FORMATTED_HEAP_MESH = HEAP_MESH.copy()
+FORMATTED_HEAP_MESH[FORMATTED_HEAP_MESH.index('e03810c0')] = 'e00c10c0'
+
+
 def heap_root():
     params = [(1, 0, 60), (0, 0, 72), (1, 0, 80)]
     rts = (struct.pack('<6I', 2, 3, 24, 0, 0, 0x400)
@@ -1473,8 +1477,7 @@ def controls():
         advanced[advanced.index('bf840004')] = 'bf840005'
         expect('advanced heap refused', request(tmp, advanced, root_blob=heap_root())[1],
                "unsupported: s_load through s26: the pointer was advanced by an untracked offset")
-        formatted = HEAP_MESH.copy()
-        formatted[formatted.index('e03810c0', formatted.index('f408070d'))] = 'e00c10c0'
+        formatted = FORMATTED_HEAP_MESH.copy()
         key, result = request(tmp, formatted, root_blob=heap_root())
         expect('formatted heap translates', result, 'ok')
         source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
@@ -2447,11 +2450,13 @@ def reference_per_lane(points, colours, triangles, bound, old, wave_red):
     return rasterise(points, rendered, triangles, 128, len(triangles))
 
 
-def publish_request(directory, publisher, adapter, mesh=MESH):
+def publish_request(directory, publisher, adapter, mesh=MESH, heap=None):
     ms, ps = code(mesh), code(PIXEL)
     (directory / 'ms.bin').write_bytes(ms)
     (directory / 'ps.bin').write_bytes(ps)
     env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
+    if heap is not None:
+        env['X2W_TEST_MESH57_HEAP'] = str(heap)
     result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
     print(result.stdout, end='')
     if result.returncode:
@@ -2550,6 +2555,48 @@ def runtime(dxc, renderer, adapter, publisher):
                                           ((1, 1, 1), group_zero, False), ((2, 1, 1), clear, True)):
             if execute(groups, expected, missing) == 77:
                 return 77
+    # Publish the heap-indexed root with the exact fixture used for the runtime draw.
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        heap = directory / 'heap.bin'
+        heap_colours = [(255, 0, 0, 255), (0, 255, 0, 255)]
+        heap_bytes = b''.join(buffer(points, [colour] * len(points), words) for colour in heap_colours)
+        heap.write_bytes(heap_bytes)
+        decoded = [tuple(round(c * 255) for c in struct.unpack_from('<4f', heap_bytes, i * 512 + 192))
+                   for i in range(2)]
+        images = [b''.join(map(bytes, rasterise(points, [colour] * len(points), indices[:2], len(points), 2)))
+                  for colour in [(0, 0, 0, 0), *decoded]]
+        assert len(set(images)) == 3
+        status, published = publish_request(directory, publisher, adapter, FORMATTED_HEAP_MESH, heap)
+        if status:
+            return status
+        cache, key, root_blob = published
+        pipe = G.MeshPipeline(code(FORMATTED_HEAP_MESH), code(PIXEL), root_blob)
+        pipe.hlsl_ms()
+        assert 'dynamic_heap_formats\n' in pipe.manifest()
+        if G.translate_request(str(cache), key) != 'ok':
+            raise AssertionError('formatted heap mesh request translation failed')
+        data, arguments, pixels, log = (directory / name for name in ('data.bin', 'args.bin', 'pixels.bin', 'runtime.log'))
+        data.write_bytes(buffer(points, colours, words))
+        arguments.write_bytes(struct.pack('<3I', 1, 1, 1))
+        env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory),
+                   X2W_TEST_MESH57_RUNTIME='1', X2W_TEST_MESH57_DATA=str(data),
+                   X2W_TEST_MESH57_ARGS=str(arguments), X2W_TEST_MESH57_PIXELS=str(pixels),
+                   X2W_TEST_MESH57_HEAP=str(heap), X2W_TRAP_LOG=str(log))
+        env.pop('X2W_TEST_MESH57_NO_CONSTANTS', None)
+        for index in (1, 0, 2):
+            pixels.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+            result = subprocess.run([publisher, adapter, 'mesh'], env=dict(env, X2W_TEST_MESH57_HEAP_INDEX=str(index)),
+                                    capture_output=True, text=True)
+            if result.returncode == 77:
+                return 77
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+            actual = pixels.read_bytes()
+            if actual != images[index]:
+                raise AssertionError(f'formatted heap record {index}: image differs\n' +
+                                     runtime_mismatch_report(actual, images[index], images[1], images[2], clear, log))
     return 0
 
 
