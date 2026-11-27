@@ -219,7 +219,7 @@ got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, '
 check('read after a compare into EXEC recomputed', isinstance(got, list) and 's9 = s2;' in got, repr(got))
 got = run(MOVE, 's_cbranch_scc0 label_0014', 's_or_b32 exec_lo, exec_lo, s3', READ, 's_endpgm', 's_endpgm')
 check('read after an EXEC write that can widen refused', got == REFUSAL, repr(got))
-original_narrows = G.Stage.exec_write_only_narrows
+original_narrows = G.Stage.__dict__['exec_write_only_narrows']
 G.Stage.exec_write_only_narrows = staticmethod(lambda name, ops: False)
 got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
 G.Stage.exec_write_only_narrows = original_narrows
