@@ -33,10 +33,11 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               std::uint32_t* words, UINT width, UINT height,
                               D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
                               const std::uint32_t* constants, UINT constant_count,
-                              const std::vector<std::uint32_t>& raw_srv, UINT instances, DXGI_FORMAT format)
+                              const std::vector<std::uint32_t>& raw_srv, UINT instances, DXGI_FORMAT format,
+                              bool rgba8, std::uint32_t* uint_words)
 {
     const auto vs = read_blob(vertex_path);
-    const auto ps = read_blob(pixel_path);
+    const auto ps = pixel_path ? read_blob(pixel_path) : std::vector<char>{};
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -61,17 +62,21 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     pd.VS = {vs.data(), vs.size()};
     pd.PS = {ps.data(), ps.size()};
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.BlendState.IndependentBlendEnable = uint_words != nullptr;
+    pd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = cull;
     pd.RasterizerState.FrontCounterClockwise = front_ccw;
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = format;
+    pd.NumRenderTargets = uint_words ? 2 : 1;
+    pd.RTVFormats[0] = rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
+    if (uint_words) pd.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UINT;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
-    check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create flat parameter PSO");
+    if (pixel_path)
+        check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create flat parameter PSO");
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -79,26 +84,36 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = format;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE clear{format, {-1.0f, -1.0f, -1.0f, -1.0f}};
-    if (format == DXGI_FORMAT_R16_UNORM) clear.Color[0] = 1.0f;
-    const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 readback_size = 0;
-    device->GetCopyableFootprints(&rd, 0, 1, 0, &footprint, nullptr, nullptr, &readback_size);
-    const auto readback = make_buffer(device, readback_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, pd.NumRenderTargets, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     ComPtr<ID3D12DescriptorHeap> rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create flat parameter RTV heap");
-    const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+    const auto first_rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ComPtr<ID3D12Resource> targets[2], readbacks[2];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};
+    UINT64 sizes[2]{};
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
+    for (UINT t = 0; t < pd.NumRenderTargets; ++t) {
+        rd.Format = pd.RTVFormats[t];
+        D3D12_CLEAR_VALUE clear{rd.Format, {-1.0f, -1.0f, -1.0f, -1.0f}};
+        if (rgba8 || t != 0) {
+            clear.Color[0] = clear.Color[1] = clear.Color[2] = 0.0f;
+            clear.Color[3] = 1.0f;
+        } else if (format == DXGI_FORMAT_R16_UNORM) {
+            clear.Color[0] = 1.0f;
+        }
+        targets[t] = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
+        device->GetCopyableFootprints(&rd, 0, 1, 0, &footprints[t], nullptr, nullptr, &sizes[t]);
+        readbacks[t] = make_buffer(device, sizes[t], D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv{first_rtv.ptr + size_t(t) * stride};
+        device->CreateRenderTargetView(targets[t].Get(), nullptr, rtv);
+        list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
+    }
     list->SetGraphicsRootSignature(root.Get());
     const std::vector<std::uint32_t> zeros(constants ? 0 : constant_count);
     list->SetGraphicsRoot32BitConstants(0, constant_count, constants ? constants : zeros.data(), 0);
@@ -117,35 +132,43 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list->OMSetRenderTargets(pd.NumRenderTargets, &first_rtv, TRUE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(vertices, instances, 0, 0);
-    transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION out{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    out.PlacedFootprint = footprint;
-    D3D12_TEXTURE_COPY_LOCATION in{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    list->CopyTextureRegion(&out, 0, 0, 0, &in, nullptr);
+    if (pixel_path) list->DrawInstanced(vertices, instances, 0, 0);
+    for (UINT t = 0; t < pd.NumRenderTargets; ++t) {
+        transition(list, targets[t].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION out{readbacks[t].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        out.PlacedFootprint = footprints[t];
+        D3D12_TEXTURE_COPY_LOCATION in{targets[t].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        list->CopyTextureRegion(&out, 0, 0, 0, &in, nullptr);
+    }
     commands.submit_and_wait(device);
 
-    void* mapped = nullptr;
-    const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_size)};
-    const D3D12_RANGE none{0, 0};
-    check(readback->Map(0, &read, &mapped), "Map flat parameter readback");
-    const auto* first = static_cast<const std::uint8_t*>(mapped) + footprint.Offset;
-    for (UINT y = 0; y < height; ++y) {
-        const auto* row = first + size_t(y) * footprint.Footprint.RowPitch;
-        if (format == DXGI_FORMAT_R16_UNORM) {
-            for (UINT x = 0; x < width; ++x) {
-                std::uint16_t packed;
-                std::memcpy(&packed, row + size_t(x) * sizeof(packed), sizeof(packed));
-                auto* pixel = words + (size_t(y) * width + x) * 4;
-                pixel[0] = packed;
-                pixel[1] = pixel[2] = pixel[3] = 0;
+    for (UINT t = 0; t < pd.NumRenderTargets; ++t) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read{0, static_cast<SIZE_T>(sizes[t])};
+        const D3D12_RANGE none{0, 0};
+        check(readbacks[t]->Map(0, &read, &mapped), "Map flat parameter readback");
+        const auto& footprint = footprints[t];
+        const auto* first = static_cast<const std::uint8_t*>(mapped) + footprint.Offset;
+        auto* output = t ? uint_words : words;
+        const size_t row_words = size_t(width) * ((rgba8 || t != 0) ? 1 : 4);
+        for (UINT y = 0; y < height; ++y) {
+            const auto* row = first + size_t(y) * footprint.Footprint.RowPitch;
+            if (t == 0 && !rgba8 && format == DXGI_FORMAT_R16_UNORM) {
+                for (UINT x = 0; x < width; ++x) {
+                    std::uint16_t packed;
+                    std::memcpy(&packed, row + size_t(x) * sizeof(packed), sizeof(packed));
+                    auto* pixel = output + (size_t(y) * width + x) * 4;
+                    pixel[0] = packed;
+                    pixel[1] = pixel[2] = pixel[3] = 0;
+                }
+            } else {
+                std::memcpy(output + size_t(y) * row_words, row, row_words * sizeof(*words));
             }
-        } else {
-            std::memcpy(words + size_t(y) * width * 4, row, size_t(width) * 4 * sizeof(*words));
         }
+        readbacks[t]->Unmap(0, &none);
     }
-    readback->Unmap(0, &none);
+    if (rgba8) return;
     std::printf("startup_flat_param words=%08x,%08x,%08x,%08x\n", words[0], words[1], words[2], words[3]);
 }

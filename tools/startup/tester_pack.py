@@ -371,7 +371,11 @@ def clean_reason(text):
     if compiler:
         codes = sorted(set(COMPILER_CODE_RE.findall(text)))
         return ("%s compile failed" % compiler.group(0).rstrip(":")) + (" (" + ", ".join(codes[:6]) + ")" if codes else "")
-    return re.sub(r"\s+", " ", line)[:REASON_CHARS]
+    line = re.sub(r"\s+", " ", line)
+    suffix = " (placeholder drawn)"
+    if line.endswith(suffix):
+        return line[:-len(suffix)][:REASON_CHARS - len(suffix)] + suffix
+    return line[:REASON_CHARS]
 
 
 def normal_reason(reason):

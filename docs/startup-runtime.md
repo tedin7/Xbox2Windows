@@ -984,6 +984,22 @@ print the same results and write the same failures as one, an unexpected transla
 `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
 with a child process.
 
+### Placeholder pixel shaders
+
+Set `X2W_PLACEHOLDER_PS=1` in the environment of the translator and runtime to mark
+draws whose pixel shader was refused. The vertex or primitive stage must translate,
+and the translator must be able to read the pixel program's export targets.
+The placeholder writes each declared color target. Set `X2W_PLACEHOLDER_RGB=0,255,0`
+for green, or leave it unset for magenta. The RGB values are bytes and alpha is one.
+Integer targets receive `(1, 2, 3, 1)`. A depth export passes through the
+rasterized depth. The placeholder discards no fragments.
+
+The manifest records `placeholder ps <reason>`. The cache report keeps the
+refusal under its original key with ` (placeholder drawn)` appended. A cache scan
+revisits existing refusals when the mode is enabled and refreshes cached
+placeholders when their color changes. Windows coverage uses 8×8 WARP readback
+with one color target and with mixed float and integer targets.
+
 ### Compute pipeline requests
 
 Device slot 67 creates a pipeline from a console compute program. The stand-in reads 12 64-bit words of the

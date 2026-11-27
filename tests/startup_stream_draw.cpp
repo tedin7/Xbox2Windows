@@ -456,8 +456,6 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const UINT scissor_width = legacy && !bc7 && !bc_chain && !full_target && !placeholder_fixture ? width / 2 : width;
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           scissor_width, frame)) return rc;
-||||||| 82f5cf5c0
-                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
