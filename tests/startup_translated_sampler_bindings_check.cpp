@@ -46,16 +46,16 @@ std::uint32_t word0(unsigned u, unsigned v, unsigned w, unsigned aniso)
 }
 
 void lod_range(const char* name, const char* kind, float bias, float min_lod, float max_lod, float expected_min,
-               float expected_max)
+               float expected_max, float expected_bias = 0.0f)
 {
-    if (bias == 0.0f && min_lod == expected_min && max_lod == expected_max) return;
-    std::printf("FAIL %s: %s LOD bias %g, range %g..%g, expected 0, %g..%g\n", name, kind, bias, min_lod, max_lod,
-                expected_min, expected_max);
+    if (bias == expected_bias && min_lod == expected_min && max_lod == expected_max) return;
+    std::printf("FAIL %s: %s LOD bias %g, range %g..%g, expected %g, %g..%g\n", name, kind, bias, min_lod, max_lod,
+                expected_bias, expected_min, expected_max);
     ++failures;
 }
 
-// min_lod and max_lod are the expected word 1 limits of a table entry (and of an smpl static sampler); word 1 = 0
-// is MIN_LOD = MAX_LOD = 0. An smp static sampler keeps MinLOD 0 and an unbounded MaxLOD.
+// min_lod and max_lod are the expected limits for table entries and smpl static samplers.
+// Ordinary static samplers have an unbounded MaxLOD when mipmapping is enabled.
 void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v, unsigned w, unsigned filter,
              unsigned anisotropy, UINT reg = 0, float min_lod = 0.0f, float max_lod = 0.0f)
 {
@@ -73,7 +73,8 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "static ShaderRegister", s.ShaderRegister, reg);
     expect(name, "static RegisterSpace", s.RegisterSpace, 0);
     expect(name, "static ShaderVisibility", s.ShaderVisibility, 0);  // ALL
-    lod_range(name, "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, FLT_MAX);
+    const bool mip_none = ((words[2] >> 26) & 3u) == 0;
+    lod_range(name, "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, mip_none ? 0.0f : FLT_MAX);
     const D3D12_STATIC_SAMPLER_DESC limited = decode_sampler(words, reg, false, true);
     lod_range(name, "static smpl", limited.MipLODBias, limited.MinLOD, limited.MaxLOD, min_lod, max_lod);
 
@@ -202,23 +203,53 @@ int main(int argc, char** argv)
     decoded("anisotropic mag", {0, 0, 2u << 20, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic min", {0, 0, 2u << 22, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic mag 3, ratio 4", {word0(0, 0, 0, 4), 0, 3u << 20, 0}, wrap, wrap, wrap, anisotropic, 16);
+    constexpr std::uint32_t point_mip = 1u << 26;
     // Bits the decoder does not read: PERF_MIP and PERF_Z in word 1, word 3 bits 29:0 (and BORDER_COLOR_TYPE 3
     // falls back to transparent black), Z_FILTER and the high bits of words 0 and 2. MIN_LOD and MAX_LOD are
     // both 0xfff, 4095 / 256, for a table entry.
-    decoded("ignored bits", {word0(2, 1, 3, 0) | 0xfffff000u, ~0u, 1u << 22 | 3u << 24 | 0xf0000000u | 0xfffffu, ~0u},
+    decoded("ignored bits", {word0(2, 1, 3, 0) | 0xfffff000u, ~0u, 1u << 22 | 3u << 24 | point_mip | 0xf0000000u | 0xfc000u, ~0u},
             clamp, mirror, mirror_once, min_linear, 1, 7, 15.99609375f, 15.99609375f);
     // Word 1: MIN_LOD bits 11:0 and MAX_LOD bits 23:12, unsigned 4.8 fixed point. Each field is read on its
     // own: a whole level, a fraction, the smallest step and the largest value.
-    decoded("min lod 2", {0, 0x200u | 0xfffu << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 2.0f, 15.99609375f);
-    decoded("max lod 1", {0, 0x100u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.0f, 1.0f);
-    decoded("lod fractions", {0, 0x140u | 0x1c0u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.25f, 1.75f);
+    decoded("min lod 2", {0, 0x200u | 0xfffu << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0, 2.0f, 15.99609375f);
+    decoded("max lod 1", {0, 0x100u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0, 0.0f, 1.0f);
+    decoded("lod fractions", {0, 0x140u | 0x1c0u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0, 1.25f, 1.75f);
     // MIN_LOD above MAX_LOD is passed through unchanged: D3D12 documents MaxLOD >= MinLOD, and no source here
     // says what the console sampler does with that pair, so the decoder does not pick one. Device-free only.
-    decoded("min lod above max lod", {0, 0x1c0u | 0x140u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
-    decoded("lod smallest steps", {0, 0x001u | 0x001u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.00390625f,
+    decoded("min lod above max lod", {0, 0x1c0u | 0x140u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
+    decoded("lod smallest steps", {0, 0x001u | 0x001u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0, 0.00390625f,
             0.00390625f);
-    decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0,
+    decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, point_mip, 0}, wrap, wrap, wrap, point, 1, 0,
             0.5f, 3.0f);
+
+    // Nonzero word 1 limits must be ignored when mipmapping is disabled.
+    decoded("mip none", {0, 0x100u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1);
+
+    const struct {
+        const char* name;
+        std::uint32_t field;
+        float expected;
+    } biases[] = {
+        {"bias +2", 0x0200u, 2.0f},
+        {"bias -1", 0x3f00u, -1.0f},
+        {"bias +31 clamped", 0x1f00u, 15.99f},
+        {"bias -32 clamped", 0x2000u, -16.0f},
+    };
+    for (const auto& test : biases) {
+        ++cases;
+        const auto s = dynamic_sampler({0, 0x300u << 12, point_mip | test.field, 0});
+        lod_range(test.name, "dynamic", s.MipLODBias, s.MinLOD, s.MaxLOD, 0.0f, 3.0f, test.expected);
+    }
+    {
+        ++cases;
+        TranslatedSamplers samplers;
+        if (!samplers.read_manifest_line("smpl 0 0x0 0x300100 0x04003f00 0x0") || samplers.statics.size() != 1) {
+            fail("smpl bias", "manifest sampler count", static_cast<unsigned>(samplers.statics.size()), 1);
+        } else {
+            const auto s = decode_statics(samplers).front();
+            lod_range("smpl bias", "static", s.MipLODBias, s.MinLOD, s.MaxLOD, 1.0f, 3.0f, -1.0f);
+        }
+    }
 
     // Word 3 bits 31:30 (BORDER_COLOR_TYPE): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK, 2 = OPAQUE_WHITE, and 3 = REGISTER
     // (falls back to TRANS_BLACK). BORDER_COLOR_PTR in bits 11:0 does not alter the fixed border colors.
@@ -252,6 +283,7 @@ int main(int argc, char** argv)
         ++cases;
         const D3D12_SAMPLER_DESC b = border_sampler();
         expect("border sampler", "Filter", b.Filter, point);
+        expect("border sampler", "MaxAnisotropy", b.MaxAnisotropy, 1);
         expect("border sampler", "ComparisonFunc", b.ComparisonFunc, 1);
         expect("border sampler", "AddressU", b.AddressU, border);
         expect("border sampler", "AddressV", b.AddressV, border);
