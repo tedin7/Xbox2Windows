@@ -961,17 +961,27 @@ def helper_taint_fixture(case='lerp'):
     # U gradient spans four texels per pixel, so the CPU expects mip 2.
     code += (mov(28, f32_bits(4)) + valu(0x08, 29, 21, 28)
              + mov(30, f32_bits(3 / 8)) + sample(31, 29))
-    shrink = case in ('lerp', 'lowered_level', 'rewritten')
+    clobbered = case in ('clobbered', 'unrelated_kill')
+    shrink = clobbered or case in ('lerp', 'lowered_level', 'rewritten')
+    p1, p2 = interp_words(12, 20, 0, high=True)
+    if clobbered:
+        first_quad, null_desc = 38, 40
+        code += copy_exec(first_quad) + restore_exec(first_quad) + p1 + p2
+        # Load from a null descriptor so the test needs no buffer binding.
+        code += words(0xbe800480 | null_desc << 16, 0xbe800480 | (null_desc + 2) << 16,
+                      0xf4240000 | first_quad << 6 | null_desc >> 1, 0xfa000000, 0xbf8cc07f)
     if shrink:
         code += (mov(28, f32_bits(2.25)) + words(0x7c020000 | 21 << 9 | (256 + 28))
                  + words(0x8a800000 | live << 16 | 106 << 8 | live) + wqm(live))
-    p1, p2 = interp_words(12, 20, 0, high=True)
-    code += p1 + p2
-    code += copy_exec(quad)
+    code += save_exec(quad, 106) if clobbered else p1 + p2 + copy_exec(quad)
+    overwrite_mask = live
     if case == 'rewritten':
         # Rewrite before the overwrite so the new L still reaches masked.
         code += words(0xbe800480 | live << 16)  # s_mov_b64 L, 0
-    code += (restore_exec(live) + mov(12, f32_bits(5 / 16))
+    elif case == 'unrelated_kill':
+        overwrite_mask = 44
+        code += words(0xbe800480 | overwrite_mask << 16)
+    code += (restore_exec(overwrite_mask) + mov(12, f32_bits(5 / 16))
              + mov(13, f32_bits(3 / 8)) + sample(16, 12 if shrink else 29) + restore_exec(quad))
     code += (mov(24, f32_bits(3 / 8)) + mov(25, f32_bits(1 / 2))
              + valu(0x04, 23, 21, 12) + valu(0x2b, 12, 23, 25))  # lerp into v12
@@ -1000,21 +1010,24 @@ def helper_taint_stage(case):
 
 
 def helper_taint_controls():
-    lerp = helper_taint_stage('lerp').hlsl_ps()
-    assert 'F(v21) - F(v12)' in lerp and 'F(v23)' in lerp and '.SampleLevel(' in lerp, lerp
+    for case in ('lerp', 'clobbered'):
+        lerp = helper_taint_stage(case).hlsl_ps()
+        assert 'F(v21) - F(v12)' in lerp and 'F(v23)' in lerp and '.SampleLevel(' in lerp, lerp
     whole = helper_taint_stage('whole_clear').hlsl_ps()
     assert re.search(r'\.Sample\(\w+, float2\(F\(v23\), F\(v24\)\)\)', whole), whole
     for case in ('explicit', 'lowered_level'):
         explicit = helper_taint_stage(case).hlsl_ps()
         assert re.search(r'\.SampleLevel\(\w+, float2\(F\(v23\), F\(v24\)\)', explicit), explicit
     reason = 'v23 may hold a stale v_interp_p1ll_f16 value in helper lanes: '
+    stale = ('v12 is the v_interp_p1ll_f16 result, which emits nothing: v_sub_f32 reads it after '
+             'a v_interp_p2_f16 that wrote another register')
     for case, diagnostic in (
             ('implicit', reason + 'image_sample reads it across lanes'),
             ('exact_clear', reason + 'image_sample reads it across lanes'),
             ('compare', reason + 'v_cmp_lt_f32 uses it to write a lane mask'),
             ('dpp', reason + 'v_mov_b32_dpp reads it across lanes'),
-            ('rewritten', 'v12 is the v_interp_p1ll_f16 result, which emits nothing: v_sub_f32 reads it after '
-             'a v_interp_p2_f16 that wrote another register')):
+            ('rewritten', stale),
+            ('unrelated_kill', stale)):
         try:
             helper_taint_stage(case).hlsl_ps()
         except G.Unsupported as error:
@@ -1049,7 +1062,42 @@ def helper_taint_controls():
     sample = 'image_sample v30, v[23:24], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D'
     joined = scan_decoded(*prefix, 's_cbranch_scc0 label_002c', 'v_mov_b32 v23, 0', sample, pixel=True)
     assert joined.interp_sample_obligations == {44: reason + 'image_sample reads it across lanes'}
+    helper_wqm_clear_controls(sample, reason + 'image_sample reads it across lanes')
     print('helper-lane interpolation taint controls passed')
+
+
+def helper_wqm_clear_controls(sample, diagnostic):
+    # Use the decoded clobbered-mask draw through the lerp. The real shader's
+    # explicit-level fallback can satisfy the obligation, so test the implicit
+    # call at the lowering gate with the obligation produced by the scan.
+    prefix = [asm for _, _, _, asm in G.decode(helper_taint_fixture('clobbered'))][:-3]
+    assert 's_buffer_load_dwordx2 s[38:39], s[40:43], 0x0' in prefix, prefix
+    assert prefix[-2].startswith('v_sub_f32') and prefix[-1].startswith('v_fmac_f32'), prefix
+    scan_decoded(*prefix[:-2], 's_and_b64 exec, exec, vcc', *prefix[-2:], pixel=True)
+    quad = 's_mov_b64 exec, s[36:37]'
+    clear = 'v_mov_b32 v23, 0'
+    implicit = 'r0.Sample(q0, float2(F(v23), F(v24)))'
+    live_wqm = 's_wqm_b64 exec, s[32:33]'
+    save = 's_and_saveexec_b64 s[46:47], vcc'
+    restore = 's_mov_b64 exec, s[46:47]'
+    for setup in ((live_wqm,), (live_wqm, save, restore)):
+        stage = scan_decoded(*prefix, *setup, clear, quad, sample, pixel=True)
+        stage.pc = stage.ins[-1][0]
+        stage.check_interp_sample_call(implicit)
+
+    wqm_index = prefix.index('s_wqm_b64 exec, exec')
+    sibling = prefix[:wqm_index] + ['s_mov_b64 s[44:45], exec'] + prefix[wqm_index:]
+    for label, body, write_x in (
+            ('unrelated_wqm_clear', prefix, 's_mov_b64 s[44:45], 0'),
+            ('independently_shrunk_wqm_clear', sibling, 's_and_b64 s[44:45], s[44:45], 0')):
+        stage = scan_decoded(*body, write_x, 's_wqm_b64 exec, s[44:45]', clear, quad, sample, pixel=True)
+        stage.pc = stage.ins[-1][0]
+        try:
+            stage.check_interp_sample_call(implicit)
+        except G.Unsupported as error:
+            assert str(error) == diagnostic, (label, error)
+        else:
+            raise AssertionError('%s allowed an implicit sample' % label)
 
 
 def f32(x):
@@ -1431,7 +1479,7 @@ def helper_taint_reference(case):
         for x in range(8):
             interpolated = 1 + (x + 0.5) / 4
             covered = 7 * (2 * x + 1) + 8 * (2 * y + 1) < 112  # edge through (8,0) and (0,7)
-            if not covered or (case in ('lerp', 'lowered_level') and interpolated > 2.25):
+            if not covered or (case in ('lerp', 'lowered_level', 'clobbered') and interpolated > 2.25):
                 reference.extend([f32_bits(-1)] * 4)
                 continue
             # This interpolant is exactly representable in binary16. v12 starts
@@ -1445,7 +1493,7 @@ def helper_taint_reference(case):
 def check_helper_taint_draw(dxc, renderer, adapter):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        for case in ('lerp', 'whole_clear', 'explicit', 'lowered_level'):
+        for case in ('lerp', 'whole_clear', 'explicit', 'lowered_level', 'clobbered'):
             pipe = helper_taint_stage(case)
             source = pipe.hlsl_ps()
             sampler, = (line for line in pipe.manifest().splitlines() if line.startswith('smpl '))

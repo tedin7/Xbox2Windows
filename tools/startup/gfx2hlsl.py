@@ -12817,7 +12817,7 @@ class Stage:
         return 'reads it across lanes'
 
     def interp_helper_scan(self, work, rows, effects, successors, entry_facts, sample_obligations):
-        """Follow differences confined to helper lanes of the omitted interpolant's EXEC."""
+        """Follow differences confined to lanes outside the live mask."""
         seen = set()
         while work:
             state = work.pop()
@@ -12829,10 +12829,11 @@ class Stage:
             i, taint, identity = state
             name, _, written, written_halves, lane_local, helper_reads = rows[i]
             _, _, subsets, live, _, flags = entry_facts[i]
+            _, _, masked, _, _, at_superset, covered = identity
             sources = taint & helper_reads
             if sources:
                 # The exact mask must also exclude the original stale lanes.
-                exact = identity[-1] and ('entry' in flags or any(a == 'exec' and b in live for a, b in subsets))
+                exact = covered and ('entry' in flags or any(a == 'exec' and b in live for a, b in subsets))
                 observer = self.interp_helper_observer(name, lane_local, exact)
                 if observer:
                     reason = ('v%d may hold a stale v_interp_p1ll_f16 value in helper lanes: %s %s'
@@ -12842,9 +12843,11 @@ class Stage:
                     else:
                         raise Unsupported(reason)
                 taint |= written
-            elif written_halves == 3 and identity[-2]:
-                # Lane-local operations cannot spread taint to lanes outside its
-                # original EXEC. Only a whole write covering that EXEC kills it.
+            elif written_halves == 3 and (at_superset or (
+                    'quad' in flags and any(b == 'exec' and a in live and a in masked for a, b in subsets))):
+                # Lane-local operations keep differences inside the original
+                # EXEC. Whole-quad EXEC containing the covered live mask also
+                # reaches every observable quad, even after the old alias is lost.
                 taint -= written
             if not taint:
                 continue
@@ -13073,9 +13076,10 @@ class Stage:
                               'a v_interp_p2_f16 that wrote another register' % (reg, name))
                 if identity[-1] and name in ('image_sample', 'image_sample_c'):
                     sample_obligations.setdefault(self.ins[i][0], reason)
-                elif (getattr(self, 'kind', None) == 'ps' and identity[-2] and i in entry_facts
-                      and 'quad' in entry_facts[i][-1] and identity[2] & entry_facts[i][3]
+                elif (getattr(self, 'kind', None) == 'ps' and i in entry_facts and identity[2] & entry_facts[i][3]
                       and name.startswith('v_') and not self.interp_helper_observer(name, lane_local)):
+                    # A write covering the live mask leaves differences only
+                    # in helpers, even if the original EXEC alias was lost.
                     helper_work.append((i, frozenset({reg}), identity))
                     continue
                 else:
