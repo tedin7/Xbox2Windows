@@ -104,11 +104,11 @@ EMPTY_ROOT = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 68, 1, 36) + b"RTS0" +
               + struct.pack("<6I", 1, 0, 24, 0, 24, 0))
 
 
-def translate(directory, vs, ps, root=EMPTY_ROOT):
+def translate(directory, vs, ps):
     """Publish a request and translate it without compiling: (status, ps.hlsl)."""
     directory.mkdir(parents=True)
-    key = gfx2hlsl.pipeline_key(vs, ps, root)
-    for ext, data in ((".a", vs), (".b", ps), (".root", root)):
+    key = gfx2hlsl.pipeline_key(vs, ps, EMPTY_ROOT)
+    for ext, data in ((".a", vs), (".b", ps), (".root", EMPTY_ROOT)):
         (directory / ("req_%016x%s" % (key, ext))).write_bytes(data)
     status = gfx2hlsl.translate_request(str(directory), key)
     hlsl = directory / ("%016x.ps.hlsl" % key)
@@ -192,20 +192,16 @@ def check_pixels(pixels):
     return None
 
 
-def draw(directory, consumer, backend, numbered, *, vertex_blob=None, pixel_blob=None, full_target=False, entry_word=None):
+def draw(directory, consumer, backend, numbered):
     cache = directory / "cache"
     cache.mkdir(parents=True)
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
-    vs.write_bytes(vertex() if vertex_blob is None else vertex_blob)
-    ps.write_bytes(pixel() if pixel_blob is None else pixel_blob)
+    vs.write_bytes(vertex())
+    ps.write_bytes(pixel())
     args = [consumer, vs, ps, root]
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_SHADER_CACHE=str(cache))
     env.setdefault("X2W_D3D12_DEBUG", "0")
-    if entry_word is not None:
-        env["X2W_TEST_ENTRY_WORD"] = str(entry_word)
-    if full_target:
-        env["X2W_TEST_FULL_TARGET"] = "1"
     subprocess.run(args, env=env, check=True)
     key = int(sorted(cache.glob("req_*.a"))[0].name[4:20], 16)
     original = gfx2hlsl.stream_interface

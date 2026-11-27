@@ -5,7 +5,6 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
@@ -448,18 +447,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
-    const bool full_target = GetEnvironmentVariableW(L"X2W_TEST_FULL_TARGET", nullptr, 0) != 0;
-    const UINT scissor_width = legacy && !bc7 && !bc_chain && !full_target ? width / 2 : width;
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          scissor_width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
-    char entry_word[16]{};
-    const DWORD entry_length = GetEnvironmentVariableA("X2W_TEST_ENTRY_WORD", entry_word, sizeof(entry_word));
-    if (entry_length >= sizeof(entry_word)) return 2;
-    if (entry_length) export_word = static_cast<UINT>(std::strtoul(entry_word, nullptr, 10));
-    if (export_word || entry_length) invoke(list, 40, 0, 1, arg(&export_word), 0);
+    if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
     char index_probe[32]{};
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;

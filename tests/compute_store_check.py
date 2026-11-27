@@ -3867,14 +3867,16 @@ def two_exits(directory, assembler, objcopy, library):
         pc = next(pc for pc, line in disassemble(code, library, offsets=True) if line.startswith("s_cbranch"))
         return code[:pc] + struct.pack("<h", (target - pc - 4) // 4) + code[pc + 2:]
 
+    accepted = []
     for lines, first_stop in ((EXIT_KERNEL, "s_load_dword s3, s[0:1], 0x8"), (EXIT_CS, "s_cmp_ge_u32 s5, s4")):
         code = assemble(directory, assembler, objcopy, lines)
         decoded = disassemble(code, library)
         assert decoded.count("s_endpgm") == 2 and "s_cbranch_scc0 1" in decoded, decoded
         assert extract(code) == code
-        # Validate the decoder requirement and the mesh allocation guard.
+        accepted.append(code)
+        # The stage and the exact count stay explicit: LLVM is required, mesh stays rejected.
         rejects("Unverified multi-exit program", extract, code, llvm=None)
-        rejects("multi-exit mesh requires the gfx1013 wave64 layout", extract, code, mesh=True)
+        rejects("Unverified multi-exit program", extract, code, mesh=True)
         # The CLI and the audit pass LLVM through, so the first stop moves to the lowering.
         blob = bounded_container(code)
         container, output = directory / "exit.dxbc", directory / "exit.hlsl"
@@ -3885,16 +3887,17 @@ def two_exits(directory, assembler, objcopy, library):
         assert cli.returncode == 1 and f"Unsupported compute instruction: {first_stop}" in cli.stderr, cli.stderr
         assert shader_profile_audit.classify(blob, parts(blob), 5, library, None) == ([], "store lowering")
 
+    kernel = accepted[0]
     # A per-lane return is one exit and passes without the two-exit check.
     lane = assemble(directory, assembler, objcopy, LANE_EXIT)
     assert extract(lane, llvm=None) == lane
-    # All instructions in the span must be reachable, including interior NOPs.
+    # A direct branch may skip alignment NOPs, which stay in the span; any other skipped word fails.
     nop = assemble(directory, assembler, objcopy, ["s_branch .Lstart", "s_nop 0", ".Lstart:"] + EXIT_KERNEL)
-    rejects("unreachable instruction", extract, nop)
+    assert extract(nop) == nop and nop.endswith(kernel)
     exit_at = EXIT_KERNEL.index(".Lbody:")
     skipped = EXIT_KERNEL[:exit_at] + ["s_mov_b32 s9, 0"] + EXIT_KERNEL[exit_at:]
     skipped_start = ["s_branch .Lstart", "s_mov_b32 s9, 0", ".Lstart:"] + EXIT_KERNEL
-    # A NOP behind the exit and before the branch target is unreachable.
+    # The target must directly follow the early exit, even with a NOP between them.
     after_exit = EXIT_KERNEL[:exit_at] + ["s_nop 0"] + EXIT_KERNEL[exit_at:]
     # Wrong targets: one instruction late, or the final exit with the store block unreachable.
     late = EXIT_KERNEL[:exit_at] + EXIT_KERNEL[exit_at + 1:exit_at + 2] + [".Lbody:"] + EXIT_KERNEL[exit_at + 2:]
@@ -3903,25 +3906,24 @@ def two_exits(directory, assembler, objcopy, library):
     jump = [line.replace("s_cbranch_scc0", "s_branch") for line in EXIT_KERNEL]
     straight = [line.replace("s_cbranch_scc0 .Lbody", "s_nop 0") for line in EXIT_KERNEL]
     for lines in (skipped, skipped_start, after_exit, late, final, jump, straight):
-        rejects("unreachable instruction",
+        rejects("Unreachable code or unverified alternate exit",
                 extract, assemble(directory, assembler, objcopy, lines))
-    # A third reachable exit and literals that spell s_endpgm are accepted.
-    third = EXIT_KERNEL[:exit_at + 1] + ["s_cmp_eq_u32 s3, 0", "s_cbranch_scc0 .Lmid", "s_endpgm", ".Lmid:"] + \
-        EXIT_KERNEL[exit_at + 1:]
+    # A third exit, and a literal that spells s_endpgm, exceed the exact two-marker limit.
+    third = EXIT_KERNEL[:exit_at] + ["s_cmp_eq_u32 s3, 0", "s_cbranch_scc0 .Lmid", "s_endpgm", ".Lmid:"] + \
+        EXIT_KERNEL[exit_at:]
     spelled = [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in EXIT_KERNEL]
     for lines in (third, spelled):
-        code = assemble(directory, assembler, objcopy, lines)
-        assert extract(code) == code
-    literal_one_exit = assemble(directory, assembler, objcopy, [
-        line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in LANE_EXIT])
-    assert extract(literal_one_exit) == literal_one_exit
+        rejects("Unverified multi-exit program", extract, assemble(directory, assembler, objcopy, lines))
+    # In a one-exit program the same literal makes two raw markers but only one decoded exit.
+    rejects("Expected two decoded exits", extract, assemble(directory, assembler, objcopy, [
+        line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in LANE_EXIT]))
     # Branches into a literal operand or into the trailing s_code_end padding.
     literal = assemble(directory, assembler, objcopy,
                        [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0x12345678") for line in EXIT_KERNEL])
     assert extract(literal) == literal
     operand = next(pc for pc, line in disassemble(literal, library, offsets=True) if "0x12345678" in line) + 4
     for target in (operand, len(literal)):
-        rejects("targets outside decoded instruction boundaries", extract, retarget(literal, target))
+        rejects("Branch outside decoded instruction boundaries", extract, retarget(literal, target))
 
 
 def store_container(code, dims):

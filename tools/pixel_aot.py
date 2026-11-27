@@ -74,66 +74,64 @@ def _bounded_code(image, start):
     end = limit
     while end > start and image[end-4:end] == b"\x00\x00\x9f\xbf":
         end -= 4
-    if end <= start or end == limit:
-        raise ValueError("Expected native code followed by code padding")
+    if end <= start or end == limit or image[end-4:end] != b"\x00\x00\x81\xbf":
+        raise ValueError("Expected termination followed by code padding")
     return image[start:end]
 
 
-def _check_decoded_exits(code, stage, decoder, *, vertex_fetch, mesh_layout):
-    """Validate the graph of the bounded program using only decoded instruction boundaries."""
-    try:
-        instructions = [(pc, line.split()[0], line) for pc, line in decoder(code)]
-    except ValueError as error:
-        raise ValueError(f"stage {stage}, decoded exits unavailable: {error}") from error
-    exits = sum(op == "s_endpgm" for _, op, _ in instructions)
+def _check_two_exits(code, llvm, *, cpu, features, mesh=False, decoder=None):
+    """Both decoded exits must be reachable from the single entry.
 
-    def fail(rule):
-        raise ValueError(f"stage {stage}, {exits} decoded exits: {rule}")
-
-    if not 1 <= exits <= 8:
-        fail("expected 1 to 8 exits")
-    if instructions[-1][1] not in ("s_endpgm", "s_branch"):
-        fail("last instruction is neither an exit nor an unconditional branch")
-    mesh_multi_exit = stage == 13 and exits > 1
-    allocation = ("s_sendmsg 0x9", "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)")
-    if mesh_multi_exit:
-        if not mesh_layout:
-            fail("multi-exit mesh requires the gfx1013 wave64 layout")
-        if not any(line in allocation for _, _, line in instructions):
-            fail("missing mesh allocation")
-
-    offsets = [pc for pc, _, _ in instructions]
-    pcs = set(offsets)
-    successors = {}
-    for (pc, op, line), following in zip(instructions, offsets[1:] + [len(code)]):
-        if mesh_multi_exit and op == "s_sendmsg" and line not in allocation:
-            fail(f"unsupported mesh message {line} at +0x{pc:x}")
-        if op.startswith(("s_setpc", "s_swappc", "s_rfe")):
-            # The validated vertex fetch prologue calls a separately described fetch shader.
-            if not (vertex_fetch and stage == 1 and pc == 0 and code[:4] == vertex_fetch):
-                fail(f"computed jump {op} at +0x{pc:x}")
-        if op.startswith(("s_call", "s_trap", "s_endpgm_", "s_sendmsghalt", "s_sethalt")):
-            fail(f"unsupported control flow {op} at +0x{pc:x}")
-        edges = []
-        if op == "s_branch" or op.startswith("s_cbranch_"):
-            target = pc + 4 + 4 * struct.unpack_from("<h", code, pc)[0]
-            if target not in pcs:
-                fail(f"branch at +0x{pc:x} targets outside decoded instruction boundaries ({target:#x})")
-            edges.append(target)
-        if op not in ("s_branch", "s_endpgm"):
-            edges.append(following)
-        successors[pc] = edges
-
-    pending, visited = [0], set()
+    The instruction boundaries come from LLVM, or from `decoder(code)` (a list of (byte offset, text)) when the caller has
+    no LLVM library and decodes the code itself (the startup translator); it must raise ValueError on an undecodable word."""
+    instructions = dict(decoder(code) if decoder else disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
+    exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
+    if len(exits) != 2 or exits[-1] + 4 != len(code):
+        raise ValueError("Expected two decoded exits")
+    # Match the full mesh barrier and allocation instructions so extra operands
+    # or a different message cannot inherit their fall-through behavior.
+    mesh_alloc = "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"
+    if mesh and mesh_alloc not in instructions.values():
+        raise ValueError("Unverified multi-exit program: missing mesh allocation")
+    # An aligned word can be a literal or the second half of an instruction.
+    # Follow branches only from decoded PCs and reject unresolved transfers.
+    pcs = list(instructions)
+    following = dict(zip(pcs, pcs[1:] + [len(code)]))
+    pending, visited, targets = [0], set(), set()
     while pending:
         pc = pending.pop()
-        if pc not in visited:
-            visited.add(pc)
-            pending.extend(successors[pc])
-    # A direct branch may skip alignment NOPs after an exit: they run nothing, so they may stay unreachable.
-    nops = {pc for pc, op, _ in instructions if op in ("s_nop", "v_nop")}
-    if pcs - visited - nops:
-        fail(f"unreachable instruction at +0x{min(pcs - visited - nops):x}")
+        if pc in visited:
+            continue
+        if pc not in instructions:
+            raise ValueError("Branch outside decoded instruction boundaries")
+        visited.add(pc)
+        op = instructions[pc].split()[0]
+        if op == "s_endpgm":
+            continue
+        if op == "s_branch" or op in ("s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz",
+                                      "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
+            target = pc + 4 + 4 * struct.unpack_from("<h", code, pc)[0]
+            targets.add(target)
+            pending.append(target)
+            if op == "s_branch":
+                continue
+        elif not ((mesh and instructions[pc] in ("s_barrier", mesh_alloc))
+                  or op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
+                                 "scratch_", "exp", "s_load_", "s_buffer_load_", "s_cmp", "s_bitcmp",
+                                 "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
+                                 "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
+                                 "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
+                  or op in ("s_nop", "s_version", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
+                            "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
+                            "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                            "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
+                            "s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32")):
+            raise ValueError(f"Unverified multi-exit control flow: {op}")
+        pending.append(following[pc])
+    # A direct branch may skip alignment NOPs. Keep them in the original span.
+    unreachable = instructions.keys() - visited
+    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] not in ("s_nop", "v_nop") for pc in unreachable):
+        raise ValueError("Unreachable code or unverified alternate exit")
 
 
 def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None,
@@ -182,7 +180,7 @@ def container_image(program, *, stage):
     return image
 
 
-def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", decoder=None, vertex_fetch=None):
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", decoder=None):
     """Extract the stage-specific instruction stream from a DXIL program part."""
     image = container_image(program, stage=stage)
     start = struct.unpack_from("<I", image, 192)[0] + 40
@@ -190,17 +188,24 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", d
         raise ValueError("Invalid native code offset")
     if struct.unpack_from("<I", image, 4)[0] == 0x101:
         code = _bounded_code(image, start)
-        if decoder is None and llvm is not None:
-            def decoder(span):
-                return disassemble(span, llvm, offsets=True, cpu=cpu, features=features)
-        if decoder is not None:
-            mesh_layout = llvm is None or (cpu == b"gfx1013" and features == MESH_WAVE64)
-            _check_decoded_exits(code, stage, decoder, vertex_fetch=vertex_fetch, mesh_layout=mesh_layout)
-            return code
-        if not code.endswith(b"\x00\x00\x81\xbf"):
-            raise ValueError("Expected termination followed by code padding")
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
+            return code
+        mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
+        if decoder is not None and stage == 0:
+            # A word equal to s_endpgm can be a literal or half of another instruction. Count the decoded exits: one
+            # (the last instruction) is the ordinary program, two take the reachability check, more are not verified.
+            exits = [pc for pc, line in decoder(code) if line == "s_endpgm"]
+            if len(exits) == 1 and exits[0] + 4 == len(code):
+                return code
+            if len(exits) != 2:
+                raise ValueError("Unverified multi-exit program (%d end-program words, %d decoded exits)"
+                                 % (markers, len(exits)))
+        if (stage in (0, 5) or mesh) and markers == 2 and (llvm is not None or decoder is not None):
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, decoder=decoder)
+            return code
+        if decoder is not None and stage == 0 and markers > 2:
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, decoder=decoder)   # two decoded exits among literals
             return code
         raise ValueError("Unverified multi-exit program (%d end-program words, stage %d)" % (markers, stage))
     # Older fixtures lack the section extent; preserve their unique-marker rule.
