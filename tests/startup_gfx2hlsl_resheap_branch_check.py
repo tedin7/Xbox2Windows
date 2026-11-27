@@ -165,6 +165,23 @@ def translate_image_loop(words):
     return pipe, pipe.hlsl_vs(), pipe.hlsl_ps()
 
 
+def descriptor_word_vertex(load):
+    # v8 = float(s25 + 3), where s25 is a copy of the third descriptor word.
+    return (HEAD + load + sopp(S_WAITCNT, LGKM0) + sop1(S_MOV_B32, 25, 18)
+            + bytes.fromhex('8302107e1910104a080d107e') + COPY_V8 + EXPORTS)
+
+
+def descriptor_word_control():
+    load = sop1(S_MOV_B32, 14, 11) + sop1(S_MOV_B32, 15, ZERO) + smem(0x02, 16, 14, 125)
+    pipe, vs, ps = translate_image_loop(descriptor_word_vertex(load))
+    index = pipe.uds.index(('descword', 1, 8))
+    assert f'udsrc {index} descword 1 8' in pipe.manifest()
+    assert f'v8 = ud{index} + v8;' in vs
+    reason = refusal(descriptor_word_vertex(SETUP[0] + LOAD))
+    assert reason and 'cannot materialize descriptor word 2' in reason, reason
+    return pipe, vs, ps, index
+
+
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
 # picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
 # index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
@@ -211,6 +228,7 @@ def expect(label, condition, detail=''):
 def main(dxc=None):
     vertex_image_control()
     vertex_image_loop_control()
+    descriptor_word_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
     tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
@@ -278,10 +296,12 @@ def else_arm_controls():
     print('heap record in an else arm: controls matched')
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, heap_count=2):
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, heap_count=2, extra=None):
     """One draw of the vertex stage that reads the heap record named by `offset` (ud1) when ud2 is `cond`."""
     entry = [0] * count + [heap_count]
     entry[1], entry[2] = offset, cond
+    for index, word in (extra or {}).items():
+        entry[index] = word
     as_hex = lambda words: ','.join('%08x' % word for word in words)
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
                              as_hex([reference] * 4)], capture_output=True, text=True)
@@ -370,6 +390,20 @@ def warp_image_loop(offscreen, dxc):
         draw(offscreen, wrong, ps, 0, expected, count, negative=True, heap_count=8)
 
 
+def warp_descriptor_word(offscreen, dxc):
+    pipe, source, ps_source, index = descriptor_word_control()
+    num_records = 37
+    expected, = struct.unpack('<I', struct.pack('<f', num_records + 3))
+    count = len(pipe.uds)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        draw(offscreen, vs, ps, 0, expected, count, extra={index: num_records})
+        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, f'ud{index} + v8', f'ud{index} + v8 + 1u'))
+        draw(offscreen, wrong, ps, 0, expected, count, negative=True, extra={index: num_records})
+
+
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
@@ -396,5 +430,7 @@ if __name__ == '__main__':
         warp_image(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-image-loop']:
         warp_image_loop(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-descriptor-word']:
+        warp_descriptor_word(*sys.argv[2:4])
     else:
         main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())

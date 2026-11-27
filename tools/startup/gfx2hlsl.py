@@ -3769,6 +3769,9 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'desc' and getattr(self, 'kind', None) in ('ps', 'vs') and names_one_value(s):
+                # The runtime supplies the original root-table dword for a numeric use of the descriptor.
+                return self.descriptor_number(s[:4], fixed_only=True)
             if s[0] == 'descnum' and len(s) == 3:
                 return self.descriptor_number(self.descriptor_number_node(s))
             if s[0] == 'tg_size':
