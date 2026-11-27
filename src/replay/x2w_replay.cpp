@@ -88,8 +88,8 @@ struct Player {
     std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
     std::map<u64, Range> handles;              // recorded handle / mapped / GPU address start -> replay start, span
-    std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
-    u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
+    std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory: kept for calls the stand-in may hold pointers of, freed after the others
+    u64 arena_bytes = 0, arena_released = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
@@ -243,6 +243,21 @@ u64 buffer_bytes(u64 resource)
     return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc.Width : 0;
 }
 
+// Calls whose argument memory the stand-in copies before the call returns (descriptor writes and copies, command list
+// calls, fence and resource calls). Creations and queue calls keep theirs: the stand-in may hold those pointers.
+bool copies_are_transient(const CallRecord& c)
+{
+    if (c.kind == device_kind) return (c.slot >= 17 && c.slot <= 24) || c.slot == 70;
+    return c.kind == x2w_replay_slots::list || c.kind == fence_kind || c.kind == resource_kind;
+}
+
+// Frees the argument copies a call added to the arena (everything past `mark`).
+void release_arena(Player& p, std::size_t mark)
+{
+    p.arena_released += p.arena.size() - mark;
+    p.arena.resize(mark);
+}
+
 // What one played call teaches: new objects, and the recorded -> replay value of returned addresses.
 void learn_after(Player& p, const Recording& r, const Played& call)
 {
@@ -342,6 +357,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         return false;
     }
     apply_pages_before(r, c.seq, [&p](u64 address, u64& bytes) { return p.page_target(address, bytes); });
+    const std::size_t arena_mark = p.arena.size();
     std::vector<unsigned char*> copies;
     relocate(p, r, step, call.top, copies);
     for (int i = 0; i < top_slots; ++i)
@@ -420,6 +436,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     if (c.kind == queue_kind && c.slot == queue_present) ++p.presents;
     learn_after(p, r, call);
     ++p.played;
+    if (copies_are_transient(c)) release_arena(p, arena_mark);
     return true;
 }
 
