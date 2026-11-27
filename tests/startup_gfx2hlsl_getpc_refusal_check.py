@@ -1,4 +1,4 @@
-"""Check GETPC refusals and draw a program-embedded vertex table on WARP."""
+"""Check GETPC refusals and draw program-embedded tables on WARP."""
 import struct
 import sys
 import tempfile
@@ -184,6 +184,96 @@ def table_controls():
             raise AssertionError('%s was accepted' % label)
 
 
+# Two distinct RGBA rows. The offset mutant selects the second row.
+PIXEL_COLORS = ((0.125, 0.75, -0.5, 1.0), (0.625, -0.25, 0.375, 0.5))
+PIXEL_TABLE = struct.pack('<8f', *(component for row in PIXEL_COLORS for component in row))
+
+
+def pixel_table(*, row=0, skew=0, escape=False, skip_load=False, wait_word=0xbf8c0000, smem_bits=0):
+    address, color = 36, 48
+    moves = words(*(0x7e000200 | channel << 17 | (color + channel) for channel in range(4)))
+    tail = (words(wait_word) + moves
+            + (words(0x7e080200 | address) if escape else b'')
+            + export(0, (0, 1, 2, 3), done=True) + words(0xbf810000))
+    # GETPC points to the SMEM instruction. Include one dword of padding after ENDPGM.
+    disp = 8 + len(tail) + 4 + 16 * row + skew
+    return (G.PREFETCH + (words(0xbf820003) if skip_load else b'')
+            + words(0xbe801f00 | address << 16,
+                    0xf4080000 | color << 6 | address // 2 | smem_bits, 0xfa000000 | disp)
+            + tail + words(0xbf810000) + PIXEL_TABLE)
+
+
+def scalar_table_pipeline(code, **kwargs):
+    vs = G.PREFETCH + export(12, (0, 0, 0, 0), done=True) + words(0xbf810000)
+    return G.Pipeline(vs, code, root_blob(), **kwargs)
+
+
+def scalar_table_controls():
+    for row, color in enumerate(PIXEL_COLORS):
+        code = pixel_table(row=row)
+        source = scalar_table_pipeline(code).hlsl_ps()
+        assert G.classify(code) == 'ps'
+        assert all('0x%08xu' % value in source
+                   for value in struct.unpack('<4I', struct.pack('<4f', *color)))
+        refusals = []
+        decoded = G.decode(G.strip_header(code), refusals, embedded_pixel=True)
+        assert decoded[-1][:3] == (44, 4, 's_endpgm')
+        assert scalar_table_pipeline(code, refusals=refusals, decoded={'ps': decoded}).hlsl_ps() == source
+        assert not refusals
+        assert not scalar_table_pipeline(code).resources
+
+    for label, code in {
+        'table overlaps the program': pixel_table(skew=-8),
+        'misaligned table': pixel_table(skew=2),
+        'table extends past the image': pixel_table(row=2),
+        'numerical use of the address': pixel_table(escape=True),
+        'entry branch around the load': pixel_table(skip_load=True),
+        'missing scalar wait': pixel_table(wait_word=0xbf800000),
+        'reserved scalar load bit': pixel_table(smem_bits=1 << 13),
+    }.items():
+        try:
+            scalar_table_pipeline(code)
+        except G.Unsupported as error:
+            assert str(error) == REASON, (label, error)
+        else:
+            raise AssertionError('%s was accepted' % label)
+    print('pixel scalar table translation and refusal controls: ok')
+
+
+def draw_scalar_table(compiler, renderer, kind='dxc'):
+    vertex_hlsl = """
+float4 main(uint vertex : SV_VertexID) : SV_Position {
+    return float4(vertex == 1u ? 3.0 : -1.0, vertex == 2u ? -3.0 : 1.0, 0.0, 1.0);
+}
+"""
+    model = '5_1' if kind == 'fxc' else '6_0'
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(compiler, kind, vertex_hlsl, 'fullscreen', 'vs_' + model, directory)
+        expected = directory / 'expected.bin'
+        width, height = 3, 2
+
+        def draw(ps, row, differing=False):
+            expected.write_bytes(struct.pack('<4f', *PIXEL_COLORS[row]) * (width * height))
+            run = gpu_case_runner.run(renderer, 'warp', [
+                '--startup-pixel-words', vs, ps, str(width), str(height), expected])
+            output = run.stdout + run.stderr
+            print(output, end='')
+            if run.returncode == 77:
+                raise SystemExit(77)
+            if differing:
+                assert run.returncode != 0 and '6 of 6 pixels differ' in output
+            else:
+                assert run.returncode == 0
+
+        for row in range(len(PIXEL_COLORS)):
+            source = scalar_table_pipeline(pixel_table(row=row)).hlsl_ps()
+            ps = compile_hlsl(compiler, kind, source, 'scalar_table_%d' % row, 'ps_' + model, directory)
+            draw(ps, row)
+            if row == 1:
+                draw(ps, 0, differing=True)
+
+
 def draw_tables(compiler, renderer, kind='dxc'):
     # The production vertex ABI takes a single vertex index. The fixture packs the
     # instance ID into it and supplies a triangle covering just that instance's pixel.
@@ -236,9 +326,12 @@ DrawOut main(uint corner : SV_VertexID, uint row : SV_InstanceID) {
 if __name__ == '__main__':
     refusal_controls()
     table_controls()
+    scalar_table_controls()
     if len(sys.argv) > 1:
         dxc, renderer, *fxc = sys.argv[1:]
         draw_tables(dxc, renderer)
+        draw_scalar_table(dxc, renderer)
         if fxc and fxc[0]:
             draw_tables(fxc[0], renderer, 'fxc')
+            draw_scalar_table(fxc[0], renderer, 'fxc')
     print('PASS')
