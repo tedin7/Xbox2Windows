@@ -13,13 +13,20 @@ import startup_compute_gather_l_check as lod_control
 import startup_compute_gather_lz_check as lz_control
 
 
-def shader(dynamic=False, nsa=False, *, flags=0, mask=1, u='0'):
-    # v0 is the packed signed offset; v1..v3 are u, v and lod.
-    # Thread ID v0 is zero for the single dispatched lane, but unknown at translation time.
-    moves = (bytes.fromhex('ff00004a') + struct.pack('<I', 0x3e01) if dynamic
-             else v_mov_word(0, '0x3e01'))
+UV = (0.328125, 0.6875)
+
+
+def shader(dynamic=False, nsa=False, *, flags=0, mask=1, nan=None):
+    # Add the lane ID to IEEE-754 bit patterns: runtime VGPR values, not literal moves.
     coords = (10, 11, 12) if nsa else (1, 2, 3)
-    moves += v_mov_word(coords[0], u) + v_mov_word(coords[1], '0') + v_mov_word(coords[2], '1.0')
+    def add_tid(reg, value):
+        return struct.pack('<II', 0x4a0000ff | (reg << 17), value)
+    moves = add_tid(coords[0], 0x7fc00000 if nan == 'u' else 0x3ea80000)
+    moves += add_tid(coords[1], 0x3f300000)
+    moves += v_mov_word(coords[2], '0x7fc00000' if nan == 'lod' else '1.0')
+    # Thread ID v0 is zero for the single dispatched lane, but unknown at translation time.
+    moves += (bytes.fromhex('ff00004a') + struct.pack('<I', 0x3e01) if dynamic
+              else v_mov_word(0, '0x3e01'))
     insn = gather_insn(mask=mask, opcode=0x54, flags=flags)
     if nsa:
         insn = bytearray(insn)
@@ -31,8 +38,8 @@ def shader(dynamic=False, nsa=False, *, flags=0, mask=1, u='0'):
 
 def reference(level, offset=(1, -2)):
     width, height = WIDTH >> level, HEIGHT >> level
-    x = math.floor(0.0 * width - 0.5) + offset[0]
-    y = math.floor(0.0 * height - 0.5) + offset[1]
+    x = math.floor(UV[0] * width - 0.5) + offset[0]
+    y = math.floor(UV[1] * height - 0.5) + offset[1]
     taps = [texel(level, min(max(x + dx, 0), width - 1), min(max(y + dy, 0), height - 1), 0)
             for dx, dy in ORDER]
     return taps + [SENTINEL] * (WORDS - 4)
@@ -51,8 +58,14 @@ def controls():
             hlsl = cs_pipe(shader(dynamic, nsa)).hlsl_cs()
             regs = (10, 11, 12) if nsa else (1, 2, 3)
             assert f'gather_2d_lod_offset(r0, float2(F(v{regs[0]}), F(v{regs[1]})), F(v{regs[2]}), v0, 0, 15.99609375f)' in hlsl
+            assert f'v{regs[0]} = 0x3ea80000u + v0;' in hlsl
+            assert f'v{regs[1]} = 0x3f300000u + v0;' in hlsl
             assert 'int2 offset = int2(asint(packed_offset << 26u)' in hlsl
-    refused('literal 0.0 or 1.0 coordinates', lambda: cs_pipe(shader(u='0.5')))
+    for coord, size in zip(UV, (WIDTH >> 1, HEIGHT >> 1)):
+        scaled = coord * size - 0.5
+        assert abs(scaled - round(scaled)) >= 1 / 16
+    for nan in ('u', 'lod'):
+        assert '0x7f800000u' in cs_pipe(shader(nan=nan)).hlsl_cs()
     refused('one-hot dmask', lambda: cs_pipe(shader(mask=3)))
     refused('modifier tfe', lambda: cs_pipe(shader(flags=1 << 16)))
     refused('modifier lwe', lambda: cs_pipe(shader(flags=1 << 17)))
@@ -67,6 +80,13 @@ def dispatch(directory, compiler, renderer, adapter):
             if result.returncode == 77:
                 return 77
             assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (result.stdout, result.stderr)
+    for nan in ('u', 'lod'):
+        source = cs_pipe(shader(nan=nan)).hlsl_cs()
+        want = [0] * 4 + [SENTINEL] * (WORDS - 4)
+        result = run_case(directory, compiler, renderer, adapter, f'gather_l_o_nan_{nan}', source, want, 0)
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and f'compared_words={WORDS} mismatches=0' in result.stdout, (result.stdout, result.stderr)
     return 0
 
 

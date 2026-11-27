@@ -11450,22 +11450,18 @@ class Stage:
             self.set_v(i, 'U(t.%s)' % component)
 
     def op_image_gather4_l_o(self, ops, mods):
-        # AMD RDNA 2 ISA, section 8.2: offset precedes coordinates and explicit LOD.
+        """Explicit-LOD 2D gather with a signed texel offset.
+
+        AMD RDNA 2 ISA section 8.2 puts offset before coordinates and LOD.
+        The float footprint can select a neighbouring texel within about 2^-8
+        of a texel centre, as in the other Load-based gather lowerings.
+        """
         name = 'image_gather4_l_o'
         regs = []
         dst, _, words, (_, channel), tex = self.gather_2d_setup(
             name, ops, mods, 4, 'four address registers', mip_preclamp=False, regs_out=regs)
         if tex is None:
             return self.null_image_read(dst, 15)
-        # Arbitrary normalized coordinates can lie on a sampler fixed-point rounding boundary.
-        # At 0 or 1 the footprint is exactly half a texel from the edge at every mip.
-        for reg in regs[1:3]:
-            try:
-                coordinate = self.constant_vgpr_word(reg, name)
-            except Unsupported as error:
-                raise Unsupported('%s requires literal 0.0 or 1.0 coordinates for exact footprint' % name) from error
-            if coordinate not in (0, 0x3f800000):
-                raise Unsupported('%s requires literal 0.0 or 1.0 coordinates for exact footprint' % name)
         self.pipe.uses_gather_2d_lod_offset = True
         max_lod = ((words[1] >> 12) & 0xfff) / 256.0
         off = self.u('v%d' % regs[0])

@@ -1,11 +1,11 @@
 # Explicit-LOD gather with an offset
 
 The startup translator supports 2D `image_gather4_l_o` with either contiguous
-or NSA address registers, a validated constant sampler, and coordinates proven
-to be literal 0.0 or 1.0. The signed six-bit texel offset may be dynamic. These
-coordinates keep the footprint away from sampler fixed-point rounding boundaries
-at every mip; arbitrary coordinates are refused until an exact footprint is
-available. The LOD and mip selection follow the existing explicit-LOD gather.
+or NSA address registers and a validated constant sampler. Coordinates and the
+signed six-bit texel offset may be computed at runtime. The float footprint can
+select a neighbouring texel within about 2^-8 of a texel centre, as with the
+other Load-based gather lowerings. The LOD and mip selection follow the
+existing explicit-LOD gather.
 
 The runtime can forward application resources into shader resource views and
 exposes reserved-resource creation. Consequently this experiment does not assume
