@@ -98,11 +98,12 @@ void teaching_calls()
     const auto gpu1 = f.add(resource, 11, r);
     const auto gpu2 = f.add(resource, 11, r);
     CHECK(!f.live.left_out(gpu1) && f.live.left_out(gpu2));
+    // Heap starts are never left out, however often one object (a stack address in the struct-return form) is named.
     const auto cpu1 = f.add(heap, 9, h);
     const auto cpu2 = f.add(heap, 9, h);
     const auto gpu_start1 = f.add(heap, 10, h);
     const auto gpu_start2 = f.add(heap, 10, h);
-    CHECK(!f.live.left_out(cpu1) && f.live.left_out(cpu2) && !f.live.left_out(gpu_start1) && f.live.left_out(gpu_start2));
+    CHECK(!f.live.left_out(cpu1) && !f.live.left_out(cpu2) && !f.live.left_out(gpu_start1) && !f.live.left_out(gpu_start2));
     // Resource slot 9 is Unmap, heap slot 9 is the CPU start: the kinds do not share state.
     const auto unrelated = f.add(heap, 9, r);
     CHECK(!f.live.left_out(unrelated));
@@ -111,7 +112,7 @@ void teaching_calls()
     const auto map3 = f.add(resource, 8, r);
     const auto gpu3 = f.add(resource, 11, r);
     CHECK(!f.live.left_out(map3) && !f.live.left_out(gpu3));
-    CHECK(f.live.counts().repeated_teaching == 7);
+    CHECK(f.live.counts().repeated_teaching == 5);
 }
 
 void queries_and_the_rest()

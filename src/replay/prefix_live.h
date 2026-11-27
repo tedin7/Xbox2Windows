@@ -8,8 +8,10 @@
 //  - a descriptor write (device slots 17 to 22 and 70) that a later write to the SAME destination handle replaces. A copy
 //    (device 23 or 24) pins every write before it: a copy may read them, so the table of "last writes" starts again after it;
 //  - the repeats of a call that only teaches the player a translation, per (object, its creation): the first Map (resource
-//    slot 8), the first GetGPUVirtualAddress (resource slot 11), the first heap CPU start (descriptor heap slot 9), the first heap
-//    GPU start (slot 10). Every Unmap (resource slot 9) after that object's first Map is left out; an Unmap before any Map stays.
+//    slot 8) and the first GetGPUVirtualAddress (resource slot 11). Every Unmap (resource slot 9) after that object's first Map
+//    is left out; an Unmap before any Map stays. Heap starts (descriptor heap slots 9 and 10) are NEVER left out: a title calls
+//    them in the struct-return form, so the recorded object is the caller's stack address, not the heap, and two heaps queried
+//    from one stack slot would share a key (the second one's whole handle translation would be lost).
 //    The creation is the sequence number of the last output naming the pointer (0 when none), so a pointer the title got again
 //    for a new object starts over;
 //  - pure queries that return a value: device slots 25 and 108 (resource allocation info).
@@ -39,7 +41,7 @@ struct PrefixLiveCounts {
 
 class PrefixLive {
 public:
-    static constexpr std::uint16_t device_kind = 0, descriptor_heap_kind = 5, resource_kind = 7;
+    static constexpr std::uint16_t device_kind = 0, resource_kind = 7;
 
     // Prefix calls, in sequence order.
     void add(const LiveCall& call)
@@ -51,8 +53,6 @@ public:
             add_device(call, index);
         } else if (call.kind == resource_kind) {
             add_resource(call, index);
-        } else if (call.kind == descriptor_heap_kind) {
-            add_heap(call, index);
         }
         for (std::size_t i = 0; i < call.output_count && call.outputs; ++i) created_[call.outputs[i]] = call.seq;
     }
@@ -73,7 +73,7 @@ private:
         }
     };
     struct Seen {
-        bool map = false, gpu_address = false, cpu_start = false, gpu_start = false;
+        bool map = false, gpu_address = false;
     };
 
     // The argument index of the destination handle, or -1 for a slot that is not a descriptor write.
@@ -129,15 +129,6 @@ private:
             if (seen.gpu_address) leave_out(index, counts_.repeated_teaching);
             seen.gpu_address = true;
         }
-    }
-
-    void add_heap(const LiveCall& call, std::size_t index)
-    {
-        if (call.slot != 9 && call.slot != 10) return;
-        Seen& seen = seen_[key_of(call)];
-        bool& done = call.slot == 9 ? seen.cpu_start : seen.gpu_start;
-        if (done) leave_out(index, counts_.repeated_teaching);
-        done = true;
     }
 
     std::vector<bool> left_out_;
