@@ -1108,8 +1108,10 @@ def verify(input_op, channels, words, tagged=False, missing_restore=False):
     facts = ('covered=%d waves=%d lane_count=%s partial_waves=%d partial_quads=%d'
              % (len(covered), len(groups), '/'.join(map(str, sorted(counts))),
                 sum(1 for members in groups.values() if len(members) < lane_count), partial_quads))
-    if paired and len(covered) != SIZE * SIZE:
-        errors.append('fullscreen draw missed pixels: ' + facts)
+    # Without the restore the export runs under the narrowed EXEC: the even-x pixels of the taken arm export nothing.
+    expected = {(x, y) for x in range(SIZE) for y in range(SIZE) if not (missing_restore and y >= 10 and not x & 1)}
+    if paired and covered != expected:
+        errors.append('fullscreen draw covered %d pixels, %d expected: %s' % (len(covered), len(expected), facts))
     if not paired and (partial_quads == 0 or len(covered) < 100):
         errors.append('the draw does not exercise partly covered quads: ' + facts)
     return errors, facts
@@ -1146,15 +1148,16 @@ def check_paired_draws(dxc, renderer, adapter, directory):
                 check(tag + ' draws', False, run.stdout + run.stderr)
                 continue
             readback = out.read_bytes()
-            errors, facts = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback)
-            masked_errors, _ = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback, missing_restore=True)
-            mismatch = next((error for error in errors if error.startswith('pixel (')), None)
+            # The narrowed-out pixels export nothing, so only the fold tells the two lowerings apart: the unfolded
+            # mutant also counts the even-x lanes of the taken arm (the min channel then differs).
+            masked_errors, facts = verify(PAIRED_INPUT, PAIRED_CHANNELS, readback, missing_restore=True)
+            mismatch = next((error for error in masked_errors if error.startswith('pixel (')), None)
             if mutant:
-                check(label + ' unfolded mutant fails the masked reference', bool(masked_errors), str(masked_errors[:3]))
+                check(label + ' unfolded mutant fails the masked reference', bool(mismatch), str(masked_errors[:3]))
             else:
                 print(run.stdout)
-                check(label + ' matches masked and differs from whole-wave reference (' + facts + ')',
-                      not masked_errors and bool(mismatch), str(mismatch) + ' ' + ' / '.join(masked_errors[:3]))
+                check(label + ' matches the masked CPU reference at every pixel (' + facts + ')',
+                      not masked_errors, ' / '.join(masked_errors[:3]))
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
