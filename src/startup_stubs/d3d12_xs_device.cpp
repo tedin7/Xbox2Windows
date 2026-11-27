@@ -2765,11 +2765,11 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // no recording can submit its bytes and every queue that used it has finished.
 
 volatile LONG64 upload_ring_reserved_bytes;
-volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled;
+volatile LONG upload_ring_reservations, upload_ring_refusals, upload_ring_recycled, upload_ring_oversize;
 
 struct UploadRingStats {
     unsigned long long reserved_bytes = 0, capacity = 0;
-    long reservations = 0, refusals = 0, recycled = 0;
+    long reservations = 0, refusals = 0, recycled = 0, oversize = 0;
     std::size_t chunks = 0;
 };
 UploadRingStats upload_ring_stats()
@@ -2778,6 +2778,7 @@ UploadRingStats upload_ring_stats()
     stats.reserved_bytes = static_cast<unsigned long long>(upload_ring_reserved_bytes);
     stats.reservations = upload_ring_reservations;
     stats.refusals = upload_ring_refusals;
+    stats.oversize = upload_ring_oversize;
     stats.recycled = upload_ring_recycled;
     AcquireSRWLockShared(&allocator_lock);
     stats.chunks = upload_chunks.size();
@@ -2803,7 +2804,13 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, UploadCh
     const u64 ring_max_bytes = upload_ring_max_bytes();
     const u64 max_alloc_bytes = ring_max_bytes / 4;
     UploadReservation reservation;
-    if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
+    if (bytes == 0) return reservation;
+    if (bytes > max_alloc_bytes) {
+        if (InterlockedIncrement(&upload_ring_oversize) <= 8)
+            log("x2w-draw upload ring reservation refused: oversize (asked %zu bytes, maximum %llu bytes)",
+                bytes, max_alloc_bytes);
+        return reservation;
+    }
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
     auto& chunks = upload_chunks;
@@ -7887,8 +7894,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (render_mode() && frame % 300 == 0) {
         UploadRingStats ring = upload_ring_stats();
-        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld",
-            ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled);
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, chunks %zu (%llu MiB), chunks recycled %ld, oversize %ld",
+            ring.reserved_bytes >> 20, ring.reservations, ring.refusals, ring.chunks, ring.capacity >> 20, ring.recycled, ring.oversize);
         log("x2w-render buffer bindings: %lld MiB of zero tail not copied", static_cast<long long>(zero_tail_bytes_saved >> 20));
         log("x2w-render big buffer copies (64 KiB and larger): reused %lld, made %lld", big_copies_reused, big_copies_made);
         for (int size_class = 0; size_class < 2; ++size_class) {
