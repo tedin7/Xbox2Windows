@@ -369,7 +369,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
 // A copy of an input texture made on the recording before a dispatch whose output is the same texture: the shader reads
 // the copy (what the title's input read) while the output unordered access view writes the original. Null when the copy
 // cannot be made or kept with the recording (the dispatch is refused then). The copy has no render or unordered-access flags.
-LONG compute_input_snapshots;
+LONG compute_aliased_input_copies;
 ID3D12Resource* snapshot_input_texture(Wrapper* self, ID3D12Resource* source)
 {
     auto* list = recording(self);
@@ -756,7 +756,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "an input texture could not be copied before its own output";
             std::memset(words, 0, sizeof(words));
         } else {
-            InterlockedIncrement(&compute_input_snapshots);
+            InterlockedIncrement(&compute_aliased_input_copies);
         }
     }
     ID3D12DescriptorHeap* view_heap = draw_heap;
