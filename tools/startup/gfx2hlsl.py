@@ -8705,7 +8705,7 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        integer_srvs = getattr(self.pipe, 'integer_texture_srvs', False)
+        integer_srvs = getattr(getattr(self, 'pipe', None), 'integer_texture_srvs', False)
         # The legacy 1D path models only sampling. Typed SRVs also use the generic load
         # path below, whose Texture1D address has one coordinate and a mip index.
         if one and not (integer_srvs and how in ('load', 'load_mip')):
