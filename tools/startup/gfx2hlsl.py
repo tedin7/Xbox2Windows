@@ -4800,6 +4800,9 @@ class Stage:
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
         self.retry_scc_edges = False
+        # Retry only an existing odd-D16 refusal, leaving successful output untouched.
+        self.retry_odd_d16_paths = False
+        self.odd_d16_first_refusal = None
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -4829,9 +4832,27 @@ class Stage:
             try:
                 self.translate()
             except Unsupported as reason:
+                if (not self.retry_odd_d16_paths and
+                        str(reason).startswith('whole-word read of v') and
+                        ' after odd d16 image_load: upper half used by ' in str(reason)):
+                    self.retry_odd_d16_paths = True
+                    self.odd_d16_first_refusal = reason
+                    continue
                 if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
                         or self.retry_lane_mask_joins(str(reason)) or self.retry_scc_edge_proof(str(reason))):
+                    # If another unsupported instruction prevents completing the
+                    # proof, retain the refusal that caused this retry.
+                    if (self.retry_odd_d16_paths and self.odd_d16_first_refusal is not None and
+                            ' after odd d16 image_load: upper half used by ' not in str(reason)):
+                        raise self.odd_d16_first_refusal
                     raise
+                continue
+            if (refusals is not None and not self.retry_odd_d16_paths and any(
+                    stage == kind and reason.startswith('whole-word read of v') and
+                    ' after odd d16 image_load: upper half used by ' in reason
+                    for reason, stage in refusals[first_refusal:])):
+                self.retry_odd_d16_paths = True
+                del refusals[first_refusal:]
                 continue
             if refusals is not None and any(
                     stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason)
@@ -5111,7 +5132,10 @@ class Stage:
 
     def note_whole_read(self, reg):
         asm = getattr(self, 'current_asm', '<unknown instruction>')
-        if reg in self.low16_only_v:
+        events = getattr(self, 'odd_d16_events', None)
+        if events is not None:
+            events.setdefault(self.pc, []).append(('read', reg, asm))
+        if reg in self.low16_only_v and events is None:
             raise self.odd_d16_read_error(reg, asm)
         if isinstance(self.whole_read_v, set):
             self.whole_read_v.add(reg)
@@ -5426,7 +5450,16 @@ class Stage:
             if generation is not None:
                 del self.low16_generation[n]
 
-    def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
+    def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False, upper_effect=None):
+        events = getattr(self, 'odd_d16_events', None)
+        if events is not None:
+            if upper_effect is None:
+                # Expressions that preserve any bits of the destination cannot
+                # generally prove the upper half, even if the legacy linear
+                # state has not yet seen a back-edge definition.
+                preserve = low16_only or ignore_exec or re.search(r'\bv%d\b' % n, expr)
+                upper_effect = 'preserve' if preserve else 'full'
+            events.setdefault(self.pc, []).append(('write', n, upper_effect, self.exec_generation))
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
@@ -6851,6 +6884,8 @@ class Stage:
         if scalar_vote:
             self.wave_exec = True
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.odd_d16_entry_exec = (self.entry_exec_sites(self.spill_cfg)
+                                   if getattr(self, 'retry_odd_d16_paths', False) else set())
         self.signed_pack_entry_exec = (self.entry_exec_sites(self.spill_cfg)
                                        if 'v_cvt_pknorm_i16_f32' in names.values() else None)
         if retry_wave:
@@ -6932,6 +6967,7 @@ class Stage:
         self.firstlane_ps_full_exec = (self.entry_exec_sites(self.spill_cfg, pixel_full=True)
                                        if self.firstlane_ps_exec is not None else set())
         for _ in range(max(4, len(self.ins) + 2)):
+            self.odd_d16_events = {} if getattr(self, 'retry_odd_d16_paths', False) else None
             scc_effects = {}
             self.scc_data_reads = {}
             self.advanced_descriptor_words = set()
@@ -7594,6 +7630,15 @@ class Stage:
             if refusals is None:
                 raise
             refusals.append((str(reason), self.kind))
+        if self.odd_d16_events is not None:
+            leak_site = self.odd_d16_unsafe_read()
+            if leak_site is not None:
+                reg, asm = leak_site
+                reason = self.odd_d16_read_error(reg, asm)
+                if refusals is None:
+                    raise reason
+                refusals.append((str(reason), self.kind))
+            return
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
             reg = min(leak, key=lambda n: (self.whole_read_sites[n][0], n))
@@ -7601,6 +7646,66 @@ class Stage:
             if refusals is None:
                 raise reason
             refusals.append((str(reason), self.kind))
+
+    def odd_d16_unsafe_read(self):
+        """May analysis of undefined upper halves, including loop back edges.
+
+        A generation is local to a block: an edge forgets it, since another
+        iteration or a different predecessor may have changed EXEC. RDNA 2
+        ISA guide, sections 3.3, 6.8 and 8.2: VALU writes use EXEC, SDWA can
+        preserve the other half, and an odd D16 result leaves its tail unknown.
+        """
+        bounds, _, succ, _ = self.spill_cfg
+        if not bounds:
+            return None
+        incoming = {0: set()}
+        pending = [0]
+        unsafe = {}
+        while pending:
+            block = pending.pop()
+            facts = incoming[block].copy()  # (VGPR, generation or None)
+            lo, hi = bounds[block]
+            for i in range(lo, hi):
+                pc = self.ins[i][0]
+                for event in self.odd_d16_events.get(pc, ()):
+                    kind, reg, detail = event[:3]
+                    if kind == 'read':
+                        if any(r == reg for r, _ in facts):
+                            unsafe.setdefault((i, reg), detail)
+                        continue
+                    generation = event[3]
+                    old = {fact for fact in facts if fact[0] == reg}
+                    entry = pc in self.odd_d16_entry_exec
+                    if detail == 'undefined':
+                        if entry:
+                            facts.difference_update(old)
+                        else:
+                            facts.difference_update(f for f in old if f[1] == generation)
+                        facts.add((reg, generation))
+                    elif isinstance(detail, tuple) and detail[0] == 'copy':
+                        source = detail[1]
+                        source_unknown = any(r == source for r, _ in facts)
+                        if entry:
+                            facts.difference_update(old)
+                        else:
+                            facts.difference_update(f for f in old if f[1] == generation)
+                        if source_unknown:
+                            facts.add((reg, generation))
+                    elif detail == 'full':
+                        if entry:
+                            facts.difference_update(old)
+                        else:
+                            facts.difference_update(f for f in old if f[1] == generation)
+            outgoing = {(reg, None) for reg, _ in facts}
+            for target in succ[block]:
+                merged = incoming.get(target, set()) | outgoing
+                if target not in incoming or merged != incoming[target]:
+                    incoming[target] = merged
+                    pending.append(target)
+        if unsafe:
+            (_, reg), asm = min(unsafe.items())
+            return reg, asm
+        return None
 
     def unverified_scc_data_paths(self, branches, effects, uniform_writes, dependent_writes, reads):
         """Check the paths to explicit reads that failed the legacy single-definition proof.
@@ -9718,7 +9823,9 @@ class Stage:
         result = '(f16rn(%s))' % text.format(*args)
         # Keeping the old high half of a register whose high half is undefined leaves it undefined.
         keep_low16 = select == 'WORD_0' and unused == 'UNUSED_PRESERVE' and destination in self.low16_only_v
-        self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
+        upper_effect = 'preserve' if select not in ('WORD_1', 'DWORD') and unused == 'UNUSED_PRESERVE' else 'full'
+        self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination),
+                   low16_only=keep_low16, upper_effect=upper_effect)
 
     def sdwa(self, base, ops, mods):
         if base in ('v_add_f16', 'v_sub_f16', 'v_subrev_f16', 'v_mul_f16', 'v_exp_f16', 'v_rcp_f16'):
@@ -9782,7 +9889,9 @@ class Stage:
         unused = fields.get('dst_unused', 'UNUSED_PAD')
         keep_low16 = (unused == 'UNUSED_PRESERVE' and select not in ('DWORD', 'WORD_1') and
                       destination in self.low16_only_v)
-        self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
+        upper_effect = 'preserve' if select not in ('WORD_1', 'DWORD') and unused == 'UNUSED_PRESERVE' else 'full'
+        self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination),
+                   low16_only=keep_low16, upper_effect=upper_effect)
 
     def pointer_add(self, base, dname, srcs, syms):
         """Propagate a descriptor pointer through s_add_u32 sD, sP, <literal> / s_addc_u32 sD+1, sP+1, 0.
@@ -12430,7 +12539,8 @@ class Stage:
             for i in range(0, len(halves), 2):
                 odd_tail = i + 1 == len(halves)
                 expr = halves[i] if odd_tail else '%s | (%s << 16)' % (halves[i], halves[i + 1])
-                self.set_v(dst[1] + i // 2, expr, low16_only=odd_tail)
+                self.set_v(dst[1] + i // 2, expr, low16_only=odd_tail,
+                           upper_effect='undefined' if odd_tail else 'full')
         else:
             n = dst[1]
             for bit, comp in enumerate('xyzw'):
@@ -12447,7 +12557,9 @@ class Stage:
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('null image destination does not match dmask')
         for i in range(count):
-            self.set_v(dst[1] + i, '0u', low16_only=packed and i == count - 1 and bool(dmask.bit_count() % 2))
+            odd_tail = packed and i == count - 1 and bool(dmask.bit_count() % 2)
+            self.set_v(dst[1] + i, '0u', low16_only=odd_tail,
+                       upper_effect='undefined' if odd_tail else 'full')
 
     def image_compare(self, ops, mods, how):
         """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
@@ -14175,7 +14287,8 @@ class Stage:
         if copy and getattr(self, 'has_branches', False) and hasattr(self, 'low16_copies'):
             self.low16_copies.setdefault(src[1], set()).add(dst)
         self.set_v(dst, self.u(ops[1], low16_only=copy),
-                   low16_only=copy and src[1] in self.low16_only_v, align4=align4)
+                   low16_only=copy and src[1] in self.low16_only_v, align4=align4,
+                   upper_effect=('copy', src[1]) if copy else None)
 
     def op_v_swap_b32(self, ops, mods):
         # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
