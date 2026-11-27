@@ -32,7 +32,8 @@ std::vector<char> read_blob(const char* path)
 
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
-                               UINT width, UINT height, bool dynamic_heap)
+                               UINT width, UINT height, bool dynamic_heap,
+                               const std::vector<std::vector<std::uint32_t>>& records)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -97,7 +98,28 @@ void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, co
     ComPtr<ID3D12Resource> source;
     ComPtr<ID3D12DescriptorHeap> views, image_rtvs;
     ComPtr<ID3D12Resource> images[2];
-    if (dynamic_heap) {
+    if (dynamic_heap && !records.empty()) {
+        constexpr UINT region = 256;
+        source = make_buffer(device, records.size() * region, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        const D3D12_RANGE none{0, 0};
+        check(source->Map(0, &none, &mapped), "Map heap records");
+        std::memset(mapped, 0, records.size() * region);
+        for (size_t i = 0; i < records.size(); ++i)
+            std::memcpy(static_cast<unsigned char*>(mapped) + i * region, records[i].data(), records[i].size() * 4);
+        source->Unmap(0, nullptr);
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, static_cast<UINT>(records.size()), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&views)), "Create heap records");
+        auto cpu = views->GetCPUDescriptorHandleForHeapStart();
+        const UINT increment = device->GetDescriptorHandleIncrementSize(desc.Type);
+        for (UINT i = 0; i < records.size(); ++i, cpu.ptr += increment) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            srv.Buffer = {i * (region / 4), static_cast<UINT>(records[i].size()), 0, D3D12_BUFFER_SRV_FLAG_RAW};
+            device->CreateShaderResourceView(source.Get(), &srv, cpu);
+        }
+        ID3D12DescriptorHeap* binding[]{views.Get()};
+        list->SetDescriptorHeaps(1, binding);
+    } else if (dynamic_heap) {
         constexpr std::uint32_t values[]{0x3fa00000u, 0x40200000u, 0x40800000u};
         constexpr UINT buffer_stride = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
         source = make_buffer(device, 3 * buffer_stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
