@@ -10,7 +10,9 @@ After a revision change the runtime asks for new keys, so a kept cache is cold a
 key of every such request with the gfx2hlsl.py next to it and copies the request files under the new names into
 <new request dir>. `gfx2hlsl.py --pending <new request dir>` can then translate them without a running title.
 
-The old cache is only read. Only request files (req_*) are written; results and .fail files are not, and a file
+The old cache is only read. The tool writes request files (req_*) and stamps the new directory with the translator's
+key seed (x2w_key_seed.txt) after a successful copy. An existing different stamp causes exit 1 before copying.
+Results and .fail files are not written, and a file
 that already exists in <new request dir> is left as it is. Each file is written to a temporary name and renamed;
 the ready marker (.a, .c67, .m57) goes last, as the runtime writes it. A stream description (.psin) is written
 again under the new key with the same masks, since its line names the key and its masks are part of the key.
@@ -30,10 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gfx2hlsl as g  # noqa: E402
 
 REQUEST = re.compile(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57|m86)')
-# Request files of each kind; the ready marker is last.
-PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
-         'm57': ('.ps57', '.root', '.m57')}
-OPTIONAL = {'.ia', '.psin'}  # a graphics request may have no input layout (.ia) and no stream description (.psin)
+PARTS = g.KEY_REQUEST_PARTS
+read_parts = g.read_key_request_parts
 
 
 class Incomplete(Exception):
@@ -44,34 +44,17 @@ def request_name(directory, key, ext=''):
     return os.path.join(directory, 'req_%016x%s' % (key, ext))
 
 
-def read_parts(src, kind, key):
-    parts = {}
-    for ext in PARTS[kind]:
-        path = request_name(src, key, ext)
-        if ext in OPTIONAL and not os.path.isfile(path):
-            continue
-        with open(path, 'rb') as file:
-            parts[ext] = file.read()
-    return parts
-
-
 def current_key(job):
     """(kind, old key, new key, None) or (kind, old key, None, reason)."""
     src, kind, key = job
     try:
-        p = read_parts(src, kind, key)
+        parts = read_parts(src, kind, key)
     except OSError as error:
         return kind, key, None, 'unreadable %s: %s' % (os.path.basename(error.filename or ''), error.strerror)
-    if kind == 'g':
-        # The pixel input masks of a stream description are part of the key; the description names its key.
-        try:
-            masks = g.read_ps_inputs(request_name(src, key, '.psin'), key)
-        except g.Unsupported as reason:
-            return kind, key, None, str(reason)
-        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks), None
-    if kind == 'm57':
-        return kind, key, g.mesh57_key(p['.m57'], p['.ps57'], p['.root']), None
-    return kind, key, g.compute_key(p['.c67'], p['.data'], p['.root'], p['.desc'], p['.sa'], p['.sb']), None
+    try:
+        return kind, key, g.recompute_request_key(src, kind, key, parts), None
+    except g.Unsupported as reason:
+        return kind, key, None, str(reason)
 
 
 def rtv_request(src, key, new_base):
@@ -121,6 +104,17 @@ def rekey(src, dst, jobs=None, out=None):
     if os.path.exists(dst) and os.path.samefile(src, dst):
         print('error: the new request dir must not be the old cache', file=sys.stderr)
         return 2
+    seed = g.key_seed_line()
+    stamp = os.path.join(dst, g.KEY_SEED_NAME)
+    try:
+        existing_seed = g.read_key_seed(dst)
+    except OSError as error:
+        print('error: cannot read key seed in %s: %s' % (dst, error), file=sys.stderr)
+        return 1
+    if existing_seed != seed and os.path.lexists(stamp):
+        print(f"error: destination key seed mismatch in {dst}: cache has '{existing_seed}', "
+              f"this translator uses '{seed}'; nothing written", file=sys.stderr)
+        return 1
     found = {kind: [] for kind in (*PARTS, 'rtv')}
     m86 = 0
     try:
@@ -136,7 +130,7 @@ def rekey(src, dst, jobs=None, out=None):
         if ext == 'm86':
             m86 += 1
         else:
-            found[{'a': 'g', 'c67': 'c'}.get(ext, ext)].append(key)
+            found[g.KEY_REQUEST_KINDS.get(ext, ext)].append(key)
 
     work = [(src, kind, key) for kind in PARTS for key in found[kind]]
     jobs = min(jobs or g.translation_jobs(), len(work))
@@ -192,6 +186,12 @@ def rekey(src, dst, jobs=None, out=None):
             print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)
         for key, text in sorted(rtv.items()):
             publish(request_name(dst, key, '.rtv'), text.encode('ascii'), stats)
+        if existing_seed is None:
+            try:
+                g.atomic_retry_text(stamp, seed + '\n', replace=False)
+            except FileExistsError:
+                if g.read_key_seed(dst) != seed:
+                    raise
     except OSError as error:
         print('error: failed writing %s: %s' % (dst, error), file=sys.stderr)
         return 1
