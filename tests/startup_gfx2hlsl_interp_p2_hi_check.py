@@ -85,7 +85,7 @@ def reference():
 def evaluate(ps):
     """Evaluate the translated pixel text: `vN = expr;` over f32tof16, f16tof32, U and the interpolated param0."""
     regs = {}
-    env = {'f32tof16': f16_bits, 'U': f32_bits, 'regs': regs,
+    env = {'f16rn': f16_bits, 'U': f32_bits, 'regs': regs,
            'f16tof32': lambda w: struct.unpack('<e', struct.pack('<H', w & 0xffff))[0]}
     for line in ps.splitlines():
         m = re.fullmatch(r'    (v\d+) = (.*);', line)
@@ -98,18 +98,15 @@ def evaluate(ps):
     return tuple(regs['v%d' % n] for n in (4, 5, 6, 7))
 
 
-def patched(words, name, index, *, set_bits=0, clear_bits=0, drop=False):
-    """Words with the index-th `name` instruction's word 0 changed (set_bits ORed, clear_bits cleared), or removed."""
+def patched(words, name, index, *, set_bits=0, clear_bits=0):
+    """Words with the index-th `name` instruction's word 0 changed (set_bits ORed, clear_bits cleared)."""
     out, pos, seen = bytearray(), 0, 0
     while pos < len(words):
         n, got, _, _ = G.D.decode_instruction(words, pos)
         chunk = bytearray(words[pos:pos + n])
         if got == name:
             if seen == index:
-                if drop:
-                    chunk = bytearray()
-                else:
-                    chunk[:4] = struct.pack('<I', struct.unpack('<I', chunk[:4])[0] & ~clear_bits | set_bits)
+                chunk[:4] = struct.pack('<I', struct.unpack('<I', chunk[:4])[0] & ~clear_bits | set_bits)
             seen += 1
         out += chunk
         pos += n
@@ -138,18 +135,21 @@ def controls():
     assert got == expected, ('translated words', [hex(w) for w in got], [hex(w) for w in expected])
     print('op_sel 0x8 pair: %s' % ','.join('%08x' % w for w in got))
 
-    hi_line = '    v8 = (v8 & 0xffffu) | (f32tof16(i.param0.z) << 16);'
+    hi_line = '    v8 = (v8 & 0xffffu) | (f16rn(i.param0.z) << 16);'
     assert hi_line in ps.splitlines(), ps
     # Negative control 1: the op_sel bit cleared on both (p2 writes the low half again), and a lowering that writes
     # the low half instead of the high half.
     bit_off = PS_WORDS
     for index in HI_P2:
         bit_off = patched(bit_off, 'v_interp_p2_f16', index, clear_bits=0x4000)
-    refused('op_sel cleared on the high-half p2', bit_off, 'upper 16 bits')  # the readers see an unwritten half
-    low_write = ps.replace(hi_line, '    v8 = (v8 & 0xffff0000u) | f32tof16(i.param0.z);')
+    # A second low-half write replaces the first low half and leaves the initialized high half.
+    initial_high = struct.pack('<4I', 0x7e1002ff, 0x3c000000, 0x7e1202ff, 0xc4000000)
+    preserved_high = evaluate(translate(initial_high + bit_off))
+    assert preserved_high == tuple(f32_bits(v) for v in (0.5, 1.0, 3.0, -4.0)), preserved_high
+    low_write = ps.replace(hi_line, '    v8 = (v8 & 0xffff0000u) | f16rn(i.param0.z);')
     assert evaluate(low_write) != expected, 'a low-half write is not detected'
     # Negative control 2: the lowering clearing the other half instead of keeping it.
-    assert evaluate(ps.replace(hi_line, '    v8 = (f32tof16(i.param0.z) << 16);')) != expected, 'a clearing write is not detected'
+    assert evaluate(ps.replace(hi_line, '    v8 = (f16rn(i.param0.z) << 16);')) != expected, 'a clearing write is not detected'
     print('negative controls: low-half write and clearing write differ from the reference')
 
     # Negative control 3: every other op_sel pattern is refused, on p2 and on p1ll (bit 14 alone is the lowered one).
@@ -158,14 +158,18 @@ def controls():
             if sel == 8 and index in HI_P2:
                 continue
             word = patched(PS_WORDS, 'v_interp_p2_f16', index, clear_bits=0x7800, set_bits=sel << 11)
-            if sel == 8:  # a p2 that is not the second of a pair holds no plain p2 low half in its destination
-                refused('op_sel 0x8 on p2 #%d' % index, word, 'holds no v_interp_p2_f16 low half')
+            if sel == 8:
+                # Two high-half writes leave the original low half (zero in this fixture).
+                actual = evaluate(translate(word))
+                assert actual[index] == 0 and actual[index + 1] == expected[index + 1], actual
             else:
                 refused('p2 #%d op_sel 0x%x' % (index, sel), word, 'op_sel 0x%x' % sel)
         refused('p1ll op_sel 0x%x' % sel, patched(PS_WORDS, 'v_interp_p1ll_f16', 0, set_bits=sel << 11),
                 'op_sel 0x%x' % sel)
-    # Without its high-half p2, v8 has an undefined upper half and the shift reads it.
-    refused('read before the high half is written', patched(PS_WORDS, 'v_interp_p2_f16', 1, drop=True), 'upper 16 bits')
+    # Keep the known, nonzero low half of a destination with no preceding low p2.
+    initial = struct.pack('<II', 0x7e1002ff, 0x3c00)
+    high_only = patched(PS_WORDS, 'v_interp_p2_f16', 0, set_bits=0x4000)
+    assert evaluate(translate(initial + high_only))[:2] == (f32_bits(1.0), expected[1])
     print('op_sel controls ok')
 
 

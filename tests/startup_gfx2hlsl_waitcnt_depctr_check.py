@@ -8,7 +8,7 @@ definition, use or side effect (llvm/lib/Target/AMDGPU/SOPInstructions.td) and e
 (GCNHazardRecognizer.cpp, fixVMEMtoScalarWriteHazards, immediate 0xffe3). The translator therefore lowers it
 like s_nop: a program with the wait must translate to the same text and state as the program without it.
 
-Controls: s_wait_idle, s_sleep and s_round_mode stay refused, and replacing the wait by a scalar move changes
+Controls: s_wait_idle, s_sleep and a binary32 s_round_mode stay refused, and replacing the wait by a scalar move changes
 the compared text, so the comparison can fail.
 """
 from pathlib import Path
@@ -61,10 +61,10 @@ def controls():
     # The comparison notices an instruction with an effect in the same position.
     moved, _ = run(MOV, encode_sop1(0x03, 2, 5), ADD)
     assert state(moved) != state(plain)
-    # Neighbouring SOPP forms keep their refusal.
-    for op, name in ((0x22, 's_wait_idle'), (0x0e, 's_sleep'), (0x24, 's_round_mode')):
+    # Neighbouring SOPP forms keep their refusal (s_round_mode only where it leaves binary32 nearest even).
+    for op, imm, name in ((0x22, 0, 's_wait_idle'), (0x0e, 0, 's_sleep'), (0x24, 0x3, 's_round_mode')):
         try:
-            run(MOV, sopp(op), ADD)
+            run(MOV, sopp(op, imm), ADD)
         except G.Unsupported as reason:
             assert name in str(reason), reason
         else:

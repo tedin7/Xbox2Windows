@@ -85,7 +85,7 @@ MUTATIONS = {
     'v_cvt_f32_ubyte2': (r'(v\d+) >> 16\) & 255', r'\1 >> 8) & 255', lambda a: f32(float(a >> 8 & 255))),
     'v_cvt_f32_ubyte3': (r'U\(float\((v\d+) >> 24\)\)', r'U(float((\1 >> 16) & 255))', lambda a: f32(float(a >> 16 & 255))),
     'v_cvt_f32_f16': (r'f16tof32\((v\d+)\)', r'f16tof32(\1 >> 16)', lambda a: f32(half(a >> 16))),
-    'v_cvt_f16_f32': (r'f32tof16\(F\((v\d+)\)\)', r'f32tof16(-F(\1))', lambda a: to_half(a ^ 0x80000000)),
+    'v_cvt_f16_f32': (r'f16rn\(F\((v\d+)\)\)', r'f16rn(-F(\1))', lambda a: to_half(a ^ 0x80000000)),
 }
 BODY = {
     'v_cvt_f32_u32': words('000d187e0d0086d501010000020d1c7e0f0086d503010000'),
