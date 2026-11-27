@@ -1,6 +1,7 @@
 """Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,74 @@ def pixel(green):
     return container(0, [vop1(1, 0, 128), vop1(1, 1, 242), 0xf800180f, channels, 0xbf810000])
 
 
-def check(directory, consumer, backend):
+def census_rows(log, slot, *, device=False):
+    prefix = f"x2w-noop census{' device' if device else ''} slot {slot}"
+    headers = re.findall(rf"^{prefix}: calls (\d+), shapes (\d+), overflow (\d+)$", log, re.M)
+    assert len(headers) == 1, f"{prefix} expected one exit report, got {len(headers)}"
+    calls, shapes, overflow = map(int, headers[0])
+    rows = re.findall(
+        rf"^{prefix} shape \d+: calls (\d+), before draw (\d+), before indexed (\d+), "
+        r"before dispatch (\d+), before indirect (\d+), after pipeline (\d+), args (.+)$",
+        log, re.M,
+    )
+    assert len(rows) == shapes and sum(int(row[0]) for row in rows) + overflow == calls, prefix
+    return calls, overflow, [(tuple(map(int, row[:6])), row[6].split()) for row in rows]
+
+
+def check_census(log, *, mutant):
+    calls, overflow, rows = census_rows(log, 110)
+    assert (calls, overflow, len(rows)) == (9, 0, 3)
+    by_count = {counts[0]: (counts, args) for counts, args in rows}
+    assert set(by_count) == {5, 3, 1}
+    sample = bytes(71 + 3 * i for i in range(32)).hex()
+    assert by_count[5] == ((5, 5, 0, 0, 0, 1),
+                           ["wrapper:CommandList", "wrapper:Resource/buffer", "small:11",
+                            "zero", f"readable:{sample}", "zero"])
+    assert by_count[1] == ((1, 0, 0, 0, 0, 0), ["wrapper:CommandList", "zero", "zero", "zero", "zero", "other"])
+    counts, args = by_count[3]
+    assert counts == (3, 0, 0, 3, 0, 0)
+    assert args[0] == "wrapper:CommandList" and args[2:] == ["upload", "zero", "zero", "small:29"]
+    calls, overflow, rows = census_rows(log, 111)
+    assert (calls, overflow, len(rows)) == (13, 1, 12) and all(counts[0] == 1 for counts, _ in rows)
+    assert census_rows(log, 61, device=True) == (
+        1, 0, [((1, 0, 0, 0, 0, 0), ["wrapper:Device", "small:23", "zero", "zero", "zero", "zero"])]
+    )
+    if mutant:
+        assert args[1].startswith("readable:"), "mutant did not route the token to the readable-pointer classifier"
+    if args[1] != "view:slot18/SRV":
+        raise ViewShapeMismatch("SRV token did not retain its view shape")
+
+
+class ViewShapeMismatch(AssertionError):
+    pass
+
+
+def run_census(args, env, output, ps, cache):
+    ps.write_bytes(pixel(False))
+    subprocess.run(args, env=env, check=True)
+    subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
+    env = dict(env, X2W_TEST_NOOP_CENSUS="1", X2W_D3D12_DEVICE_NOOP="1")
+    env.pop("X2W_TEST_NOOP_CENSUS_MUTANT", None)
+    expected = (bytes((255, 0, 0, 255)) * 4 + bytes((0, 0, 255, 255)) * 4) * 4
+    for mutant in (False, True):
+        run_env = dict(env, X2W_TEST_NOOP_CENSUS_MUTANT="1") if mutant else env
+        output.unlink(missing_ok=True)
+        result = subprocess.run(args + ["warp", output], env=run_env, capture_output=True, text=True, timeout=30)
+        if result.returncode or "-> drawn;" not in result.stderr:
+            raise RuntimeError(f"census draw failed ({result.returncode}): {result.stderr}")
+        assert output.read_bytes() == expected, "translated WARP pixels differ from the CPU reference"
+        try:
+            check_census(result.stderr, mutant=mutant)
+        except ViewShapeMismatch:
+            if not mutant:
+                raise
+        else:
+            assert not mutant, "view-as-pointer mutant passed the census oracle"
+    print("WARP census: 32 pixels exact in both runs, 3 shapes and 1 overflow verified, view mutant rejected")
+    return 0
+
+
+def check(directory, consumer, backend, mode=None):
     cache = directory / "cache"
     cache.mkdir()
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
@@ -40,6 +108,8 @@ def check(directory, consumer, backend):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_SHADER_CACHE=str(cache))
     env.setdefault("X2W_D3D12_DEBUG", "0")
+    if mode == "noop-census":
+        return run_census(args, env, output, ps, cache)
     observations = []
     for green in (False, True):
         ps.write_bytes(pixel(green))

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "startup_stream_draw.h"
+#include "startup_noop_census_fixture.h"
 #include "../src/startup_stubs/packed_target_format.h"
 #include "startup_stream_setup.h"
 
@@ -451,7 +452,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
     void* vertex_resource = nullptr;
-    if (index_probe[0]) {
+    if (GetEnvironmentVariableW(L"X2W_TEST_NOOP_CENSUS", nullptr, 0)) {
+        if (const int result = record_noop_census_fixture(guest, list, pso)) return result;
+    } else if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
         const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;

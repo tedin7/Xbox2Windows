@@ -43,6 +43,7 @@
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
+#include <atomic>
 #include <optional>
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
@@ -179,6 +180,7 @@ struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
     Kind kind;
+    D3D12_RESOURCE_DIMENSION census_dimension;
     x2w_budget::Ticket* budget;
     x2w_budget::Ticket* backing_budget;
     void* title_memory;       // Resource: the title-side memory (placement address or hook allocation), or null
@@ -186,6 +188,7 @@ struct alignas(16) WrapperOwn {
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
+    volatile LONG noop_previous;  // Last list command for the adjacency census.
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
@@ -509,7 +512,7 @@ constexpr u64 out_of_memory = static_cast<std::uint32_t>(E_OUTOFMEMORY);  // for
 
 // Returns nullptr when the wrapper cannot be allocated or registered (#2653). The caller still owns
 // `real` then: it releases what it created and returns E_OUTOFMEMORY.
-Wrapper* wrap(IUnknown* real, Kind kind)
+Wrapper* wrap(IUnknown* real, Kind kind, D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN)
 {
     for (LONG n = wraps_to_fail; n > 0; n = wraps_to_fail)
         if (InterlockedCompareExchange(&wraps_to_fail, n - 1, n) == n) return nullptr;
@@ -526,6 +529,7 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    w->own().census_dimension = dimension;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
@@ -631,6 +635,8 @@ ListTyped list_typed[slot_count];
 bool compute_binding_trace_enabled();
 void trace_compute_binding(Wrapper*, int slot, u64 first, u64 second, u64 third, u64 fourth);
 namespace capture { void list_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, const u64* stack, u64 ret); }
+void noop_census_record(Kind kind, int slot, const u64 (&args)[6]);
+void noop_census_list_command(Wrapper* list, int slot);
 const char* arg_kind(u64 value)
 {
     Wrapper* w = as_wrapper(reinterpret_cast<const void*>(value));
@@ -669,7 +675,12 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     if constexpr (K == list_kind && (N == 14 || N == 35 || N == 37 || N == 39 || N == 41 || N == 43 || N == 45)) {
         if (compute_binding_trace_enabled()) trace_compute_binding(reinterpret_cast<Wrapper*>(rcx), N, rdx, r8, r9, s0);
     }
-    if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
+    if constexpr (K == list_kind) {
+        if (list_typed[N]) {
+            noop_census_list_command(reinterpret_cast<Wrapper*>(rcx), N);
+            return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
+        }
+    }
     // Register arguments only: stale caller stack words often still point at an IID. The probe
     // costs over a millisecond per call in this process (memory queries), so only the first calls
     // of each slot are checked.
@@ -679,6 +690,8 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
         std::snprintf(name, sizeof(name), "%s::slot%d(passes an IID)", kind_names[K], N);
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
     }
+    if constexpr (K == list_kind || K == device_kind)
+        noop_census_record(static_cast<Kind>(K), N, {rcx, rdx, r8, r9, s0, s1});
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
@@ -713,6 +726,7 @@ __declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 
             N, rdx, r8, r9, s0, s1, s2, s3, first);
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
     }
+    noop_census_record(device_kind, N, {rcx, rdx, r8, r9, s0, s1});
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
@@ -770,6 +784,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 template <int K, int N>
 __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h)
 {
+    if constexpr (K == list_kind) noop_census_list_command(self, N);
     Timed timed(time_forward);
     if (!self->own().real) {
         if constexpr (K == resource_kind) {
@@ -955,7 +970,7 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         kind = kind_for(*iid);
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
-        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind, desc_copy.Dimension);
         if (!child) {
             static_cast<IUnknown*>(*out)->Release();
             *out = nullptr;
@@ -1040,6 +1055,7 @@ Wrapper* receiver(void* a, void* b, void** result, const char* method)
 // Slot 0, all kinds.
 HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 {
+    if (self && self->own().kind == list_kind) noop_census_list_command(self, 0);
     char text[48];
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
@@ -1056,6 +1072,7 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 }
 ULONG __stdcall add_ref(Wrapper* self)
 {
+    if (self && self->own().kind == list_kind) noop_census_list_command(self, 1);
     const auto refs = InterlockedIncrement(&self->own().refs);
     if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
     return static_cast<ULONG>(refs);
@@ -1135,6 +1152,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 bool retire_unmaterialized_lazy_texture(Wrapper* w);
 ULONG __stdcall release(Wrapper* self)
 {
+    if (self && self->own().kind == list_kind) noop_census_list_command(self, 2);
     const auto refs = InterlockedDecrement(&self->own().refs);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
@@ -1168,6 +1186,7 @@ ULONG __stdcall release(Wrapper* self)
 // Slot 7 of every device child, desktop ID3D12DeviceChild::GetDevice(riid, ppv).
 HRESULT __stdcall child_get_device(Wrapper* self, const GUID* iid, void** out)
 {
+    if (self && self->own().kind == list_kind) noop_census_list_command(self, 7);
     if (!out || !iid) return E_POINTER;
     return query_interface(the_device, iid, out);
 }
@@ -2368,6 +2387,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
+#include "startup_stubs/noop_census.inl"
 
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
@@ -3975,6 +3995,7 @@ bool format_has_stencil(DXGI_FORMAT format)
 void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_FLAGS flags, float depth, UINT8 stencil,
                                        UINT rect_count, const D3D12_RECT* rects)
 {
+    if (self) noop_census_list_command(self, 51);
     if (!self || !self->own().list_open) return;
     Timed timed(time_list);
     InterlockedIncrement(&draw_calls_seen);
@@ -5661,7 +5682,7 @@ volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_qu
 HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
                               ID3D12Resource* resource, bool aliased, x2w_budget::Ticket* backing_budget, void** out)
 {
-    Wrapper* w = wrap(resource, resource_kind);
+    Wrapper* w = wrap(resource, resource_kind, desc->Dimension);
     if (!w) {
         if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().discard(resource);
         resource->Release();
@@ -5719,7 +5740,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) == 0;
         if (lazy_textures_enabled() && read_only_texture) {
-            Wrapper* w = wrap(nullptr, resource_kind);
+            Wrapper* w = wrap(nullptr, resource_kind, desc->Dimension);
             if (!w) return E_OUTOFMEMORY;
             const DXGI_FORMAT requested_format = desktop_format(desc->Format);
             bool stored = false;
@@ -5778,7 +5799,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         }
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
-        Wrapper* w = wrap(created, resource_kind);
+        Wrapper* w = wrap(created, resource_kind, desc->Dimension);
         if (!w) {
             created->Release();
             return E_OUTOFMEMORY;
@@ -7347,7 +7368,7 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
-    Wrapper* w = wrap(resource, resource_kind);
+    Wrapper* w = wrap(resource, resource_kind, desc->Dimension);
     if (!w) {
         // The title-memory block is not returned here. __XMemAllocationHooks__ is documented as
         // {alloc, free, ...} (title_alloc_hook above), but the free entry's signature and attributes
@@ -7944,6 +7965,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (calls) n += std::snprintf(line + n, sizeof(line) - n, " %d:%.1f", i, calls / 300.0);
         }
         log("%s", line);
+        report_noop_census();
     }
     if (now - last_report >= 5000) {
         last_report = now;
@@ -8219,6 +8241,18 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+
+// Deliberately misclassify view tokens for the WARP census negative control.
+extern "C" __declspec(dllexport) void x2w_d3d12_noop_census_mutant(BOOL on)
+{
+    noop_census::view_as_pointer_for_test = on != FALSE;
+}
+
+// Compare the shape totals to the independent list-slot counter before any presents.
+extern "C" __declspec(dllexport) UINT64 x2w_d3d12_noop_census_list_calls(UINT slot)
+{
+    return slot < 256 ? InterlockedCompareExchange64(&list_slot_census[slot], 0, 0) : 0;
+}
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

@@ -1364,7 +1364,8 @@ add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGE
     tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
-target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
+target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp tests/startup_debug_calls.cpp)
+target_compile_definitions(startup_stream_consumer PRIVATE X2W_BUILD_NOOP_CENSUS_FIXTURE)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
@@ -5070,6 +5071,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardware_adapter_filter_check.py"
         "$<TARGET_FILE:startup_indirect_dispatch>" hardware count)
     set_tests_properties(startup_indirect_dispatch_adapter_filter PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_noop_census_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+        "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
+        "$<TARGET_FILE:startup_stream_consumer>" warp noop-census)
+    set_tests_properties(startup_noop_census_warp PROPERTIES TIMEOUT 90)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"

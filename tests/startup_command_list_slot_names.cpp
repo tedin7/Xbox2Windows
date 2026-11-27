@@ -3,6 +3,7 @@
 // written out here, slot by slot, for the slots the implementation already handles and for the runs
 // between them, and the slots that must stay unnamed are listed. Synthetic: no title data.
 #include "../src/startup_stubs/command_list_slot_names.h"
+#include "startup_noop_census_fixture.h"
 
 #include <cstdio>
 #include <cstring>
@@ -88,6 +89,9 @@ int main()
     std::vector<int> unknown = {10, 11, 27, 28, 29, 30, 31, 60, 62, 63, 64, 66, 68, 70, 71, 72, 74, 75, 100, 126,
                                 131, 132, 138, 140, 142, 146, 255, 256, 999, 4096, -1, -100};
     for (const int slot : unknown) expect(x2w_list_slots::name(slot) == nullptr, "slot " + std::to_string(slot) + " has no name");
+
+    expect(!x2w_list_slots::name(census_test_slot), "census fixture slot remains unnamed");
+    expect(!x2w_list_slots::name(census_overflow_test_slot), "census overflow slot remains unnamed");
 
     // Names are unique within the table and never empty, so a log line says which method it was.
     std::vector<std::string> seen;

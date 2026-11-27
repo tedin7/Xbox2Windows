@@ -8,6 +8,27 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Unimplemented command-list and device slots
+
+Each no-op slot reports cumulative argument shapes with the render totals and on normal exit.
+The first-call log remains available. The census records RCX, RDX, R8, R9 and the first two
+stack words. It retains up to 12 shapes per slot and counts further shapes in overflow.
+Readable memory contributes up to 32 sample bytes per argument from the call that first
+claimed the shape. These bytes stay in the local diagnostic log.
+
+On each list, adjacency means the immediately preceding list call. The census counts a
+no-op immediately following a pipeline bind or immediately preceding a draw, indexed draw,
+dispatch or indirect execution call. Credits count call order, including commands the shim
+later refuses. Metadata lookups use try-only access to the existing indexes and report
+`index-busy` when a writer prevents classification.
+
+After building `startup_stream_consumer`, run
+`ctest --preset dev --no-tests=error -R '^startup_noop_census_warp$' -V`.
+The fixture checks 32 translated pixels against a CPU reference, three census shapes, the
+first readable sample, an inaccessible address, adjacency, a device no-op and slot overflow.
+The same pixel reference must pass with the view-as-pointer mutant, and the census oracle
+must reject its view classification.
+
 ## Derived pipeline blend state
 
 Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics

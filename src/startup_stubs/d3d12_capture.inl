@@ -377,12 +377,13 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
+// The caller holds note_lock while looking up both the owner and its size.
+PlacedVertexView find_placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only,
+                                          u64* owner_bytes = nullptr)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
     if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
-    note_lock_acquire(false);
     const u64 end = start + bytes;
     for (const auto& group : placement_index) {
         if (group.by_start.empty()) continue;
@@ -399,11 +400,20 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
                 break;
             }
             result.owner = owner;
+            if (owner_bytes) *owner_bytes = info.bytes;
             if (info.placement == Placement::aliased_buffer)
                 result.alias = static_cast<ID3D12Resource*>(owner->own().real);
         }
         if (result.reject) break;
     }
+    return result;
+}
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
+{
+    if (!start || !bytes) return {};
+    if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
+    note_lock_acquire(false);
+    const auto result = find_placed_buffer_range(device, start, bytes, aliases_only);
     ReleaseSRWLockShared(&note_lock);
     return result;
 }
