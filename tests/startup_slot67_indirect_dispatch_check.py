@@ -150,6 +150,31 @@ def main(consumer, dxc, adapter):
             refusals = lines(run, 'ExecuteIndirect refused')
             assert len(refusals) == 1 and 'requires fixed-table raw buffers' in refusals[0], run.stderr[-2500:]
             print(refusals[0])
+        # An input texture of an indirect Dispatch: refused without X2W_INDIRECT_DISPATCH_TEXTURES, with it read as a
+        # direct Dispatch reads it, once per GPU-written group (the texel's red, green and blue, and the group number).
+        shader = directory / 'indirect_texture.hlsl'
+        shader.write_text("""\
+Texture2D<float4> source : register(t0);
+RWByteAddressBuffer target : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint4 rgba = uint4(round(source.Load(int3(0, 0, 0)) * 255.0));
+    target.Store(group.x * 4, rgba.x | (rgba.y << 8) | (rgba.z << 16) | ((group.x + 1) << 24));
+}
+""")
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cache / f'{key}.cs.cso', shader], check=True)
+        manifest.write_text('x2w-manifest 2\nstage cs\nud 0\nsrv 0 tex2d table 1 64\nuav 0 table 1 16\n')
+        got, run = dispatch(directory, consumer, env, 'dispatch-indirect-texture')
+        refusals = lines(run, 'ExecuteIndirect refused')
+        assert got == expected_words(0) and len(refusals) == 1 and 'requires fixed-table raw buffers' in refusals[0], run.stderr[-2500:]
+        got, run = dispatch(directory, consumer, dict(env, X2W_INDIRECT_DISPATCH_TEXTURES='1'), 'dispatch-indirect-texture')
+        assert '[5,1,1]' in run.stdout and not lines(run, 'ExecuteIndirect refused'), run.stdout + run.stderr[-2500:]
+        expected = [(((i + 1) << 24) | (128 << 16) | (64 << 8) | 255) if i < 5 else C.SENTINEL for i in range(C.WORDS)]
+        wrong = compare_words(got, expected)
+        assert not wrong, f'indirect texture input: word {wrong[0]} got {got[wrong[0]]:08x}, expected {expected[wrong[0]]:08x}'
+        for line in lines(run, 'x2w-d3d12-debug '):
+            assert ' sev=0 ' not in line and ' sev=1 ' not in line, line
+        print('indirect texture input: refused off, five groups match the CPU reference on')
         layer = lines(run, 'x2w-d3d12 debug layer: ')
         print('debug layer:', 'enabled' if layer and '0x00000000' in layer[0] else 'unavailable')
 

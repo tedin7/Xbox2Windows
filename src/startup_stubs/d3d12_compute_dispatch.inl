@@ -74,6 +74,12 @@ bool float_output_format(DXGI_FORMAT format)
         return false;
     }
 }
+// X2W_INDIRECT_DISPATCH_TEXTURES=1: a translated indirect Dispatch also binds input textures (off: fixed-table raw buffers only).
+bool indirect_dispatch_textures_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_INDIRECT_DISPATCH_TEXTURES");
+    return enabled;
+}
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 bool compute_texture_srv_range_fits(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& resource)
@@ -447,7 +453,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture || slot.root_view)) {
+        // An input texture is bound exactly as for a direct Dispatch; only the group counts come from the GPU.
+        const bool indirect_input_texture = indirect_dispatch_textures_enabled() && !output && slot.texture &&
+                                            !slot.heap && !slot.root_view;
+        if (dispatch.signature && (slot.heap || slot.texture || slot.root_view) && !indirect_input_texture) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
