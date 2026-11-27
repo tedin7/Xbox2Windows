@@ -104,6 +104,11 @@ def main(scene, backend):
         assert "replay quad: recorder access exceptions 0" in text, text[-3000:]
         end_totals(memory)
         check_argument_memory(memory)
+        # XOBJ names the device D3D12XboxCreateDevice made outside the recorded slots: the object of the device calls.
+        named = [struct.unpack_from("<IIQ", header) for tag, header, _ in chunks(memory.read_bytes()) if tag == "XOBJ"]
+        device_objects = {CALL.unpack(header)[4] for tag, header, _ in chunks(memory.read_bytes())
+                          if tag == "CALL" and CALL.unpack(header)[2] == 0 and CALL.unpack(header)[3] not in (25, 26, 108)}
+        assert [(kind, obj) for kind, _, obj in named] == [(0, obj) for obj in device_objects] and len(named) == 1, (named, device_objects)
         # Recordings are mailed: no folder of this machine in the file (the shader cache and the run's temp folder are).
         settings = [payload for tag, _, payload in chunks(memory.read_bytes()) if tag == "XENV"]
         assert settings and b"X2W_D3D12_RENDER=1" in settings[0], settings

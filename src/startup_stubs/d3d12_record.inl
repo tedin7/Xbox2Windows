@@ -1017,6 +1017,20 @@ void install()
 
 }  // namespace replay_record
 
+// A device made outside the recorded slots (D3D12XboxCreateDevice wraps it after install): an XOBJ chunk (kind,
+// wrapper) names it, so a player binds it even when the first device call is a struct-return form.
+extern "C" void x2w_d3d12_replay_record_object(int kind, const void* wrapper)
+{
+    using namespace replay_record;
+    if (!active.load(std::memory_order_relaxed) || !wrapper) return;
+    std::vector<unsigned char> chunk;
+    const struct { std::uint32_t kind, pad; u64 object; } header{static_cast<std::uint32_t>(kind), 0, reinterpret_cast<u64>(wrapper)};
+    append_chunk(chunk, "XOBJ", &header, sizeof(header), nullptr, 0);
+    AcquireSRWLockExclusive(&file_lock);
+    write_raw(chunk.data(), chunk.size());
+    ReleaseSRWLockExclusive(&file_lock);
+}
+
 // Ends the recording now (a fixture at its end, or a recording window that is still open when the process exits:
 // DllMain, `at_exit` 1).
 extern "C" __declspec(dllexport) void x2w_d3d12_replay_record_stop(int at_exit)

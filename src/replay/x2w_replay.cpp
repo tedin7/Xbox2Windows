@@ -87,6 +87,7 @@ struct Player {
     std::map<u64, Range> handles;              // recorded handle / mapped / GPU address start -> replay start, span
     std::vector<std::unique_ptr<unsigned char[]>> arena;  // argument memory, kept: the stand-in may hold pointers
     u64 arena_bytes = 0, played = 0, unknown_object = 0, missing_blob = 0, presents = 0, fence_timeouts = 0;
+    u64 adopted = 0;  // device-kind objects first seen as a call's object, bound to the player's device
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
@@ -375,6 +376,11 @@ bool play(Player& p, const Recording& r, const Step& step)
     } else if (const auto second = p.objects.find(c.args[0]); accepts_buffer_first(c) && second != p.objects.end()) {
         call.self = second->second;  // (return buffer, object): the struct-return form the stand-in accepts too
         call.buffer_first = true;
+    } else if (c.kind == device_kind && !accepts_buffer_first(c)) {
+        // A device-kind object created before the recorder installed (no OUTP names it): the player's device.
+        p.objects[c.object] = reinterpret_cast<u64>(p.device);
+        call.self = reinterpret_cast<u64>(p.device);
+        if (++p.adopted <= 8) say("replay: adopted pre-install wrapper %u 0x%llx", c.kind, static_cast<unsigned long long>(c.object));
     } else {
         ++p.unknown_object;
         return false;
@@ -792,11 +798,22 @@ int run(const Options& o)
         say("x2w-replay: the stand-in made no device");
         return 4;
     }
-    for (const Step& s : r.steps)
-        if (s.call.kind == device_kind) {
-            p.objects[s.call.object] = reinterpret_cast<u64>(p.device);
-            break;
-        }
+    // The recorded device: the object most device-kind calls are made on. A struct-return call (slots 25, 26, 108) names
+    // the title's return buffer as its object and the device second, so those calls do not vote; a recording that starts
+    // with one must not bind a stack address as the device.
+    {
+        std::unordered_map<u64, u64> votes;
+        u64 device = 0, best = 0;
+        for (const Step& s : r.steps)
+            if (s.call.kind == device_kind && !accepts_buffer_first(s.call) && ++votes[s.call.object] > best) {
+                best = votes[s.call.object];
+                device = s.call.object;
+            }
+        if (device) p.objects[device] = reinterpret_cast<u64>(p.device);
+        // XOBJ: devices the recorder saw made outside the recorded slots (D3D12XboxCreateDevice) are the player's device.
+        for (const auto& [kind, object] : r.live_objects)
+            if (kind == device_kind) p.objects[object] = reinterpret_cast<u64>(p.device);
+    }
     phase = "playing";
     const auto started = ReplayClock::now();
     std::optional<ReplayTiming> timing;

@@ -33,6 +33,18 @@ def recording(version, *, wire_version=None, slot=15, tail=False):
     return data
 
 
+def pre_install_device():
+    """A recording that starts after the device existed: its first device call is the struct-return form (object = the
+    title's return buffer, the device second), and a second device-kind object never named by an OUTP appears later."""
+    stack, second = 0x7253F9E0, 0x5678
+    data = chunk(b"XREC", struct.pack("<IIQ", 3, CALL[3].size, 10_000_000))
+    data += chunk(b"XENV", data=b"X2W_D3D12_PERMISSIVE=1\0")
+    calls = [(26, stack, [DEVICE, 0, 1]), (15, DEVICE, [2]), (15, DEVICE, [2]), (15, second, [2])]
+    for seq, (slot, obj, args) in enumerate(calls, 1):
+        data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, slot, obj, *(args + [0] * (11 - len(args))), 0, 0.0, 0, 0))
+    return data
+
+
 def play(player, directory, name, data):
     path = directory / f"{name}.x2wr"
     path.write_bytes(data)
@@ -68,6 +80,14 @@ def main(player):
             assert summary["version"] == version and summary["calls"] == summary["played"] == calls, summary
             assert summary["unknown_object"] == summary["missing_blob"] == 0, summary
             assert summary["pages"]["title_memory_args"] == calls - 1, summary
+
+        # The device is the object most device calls name, not the return buffer of a first struct-return call; a
+        # device-kind object no OUTP named is adopted as the player's device.
+        code, text, out = play(player, directory, "pre-install", pre_install_device())
+        assert code == 0, (code, text[-2500:])
+        summary = json.loads((out / "replay_summary.json").read_text())
+        assert summary["calls"] == summary["played"] == 4 and summary["unknown_object"] == 0, summary
+        assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
     return 0
 
 

@@ -92,6 +92,7 @@ struct Recording {
     std::vector<Step> steps;  // sorted by seq
     std::unordered_map<u64, Blob> blobs;
     std::vector<std::string> settings;
+    std::vector<std::pair<std::uint32_t, u64>> live_objects;  // XOBJ: (kind, wrapper) made outside the recorded slots
     std::vector<ShaderFile> shader_files;  // SHDR
     std::unordered_map<PageKey, const unsigned char*, PageKeyHash> pages;  // PAGE: key -> its 4 KiB
     std::vector<PageMap> maps;                                             // MAP, sorted by seq (stable)  // XENV: the recorded process's X2W_ settings, "name=value"
@@ -252,6 +253,12 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&map, h, sizeof(map));
             if (map.address % page_bytes || map.bytes % page_bytes) return "MAP not page aligned at " + std::to_string(at);
             out.maps.push_back(PageMap{map.address, map.bytes, map.seq, map.runs, out.base + data_at, data_bytes});
+        } else if (name == "XOBJ" && header_bytes >= 16) {
+            std::uint32_t kind;
+            u64 object;
+            std::memcpy(&kind, h, sizeof(kind));
+            std::memcpy(&object, h + 8, sizeof(object));
+            out.live_objects.emplace_back(kind, object);
         } else if (name == "PRES") {
             ++out.presents_marked;
         } else if (name == "XEND" && header_bytes >= 8) {
