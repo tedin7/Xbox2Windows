@@ -607,7 +607,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             const auto* desc = view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr;
             const auto dimension = tr->srvs[i].srv_dimension;
-            const UINT integer = integer_view_type(desc ? desc->Format : view.resource->GetDesc().Format);
+            const UINT integer = view.resource ? integer_view_type(desc ? desc->Format : view.resource->GetDesc().Format) : 0;
             if (const auto* twin = tr->integer_srvs.find(static_cast<UINT>(i))) {
                 values[twin->entry] = integer;
                 const D3D12_CPU_DESCRIPTOR_HANDLE twin_dest{dest.ptr + (twin->reg - i) * draw_heap_increment};

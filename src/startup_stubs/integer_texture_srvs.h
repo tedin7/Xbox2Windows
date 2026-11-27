@@ -39,7 +39,7 @@ struct IntegerTextureSrvs {
         std::bitset<32> seen;
         for (UINT i = 0; i < twins.size(); ++i) {
             const auto& twin = twins[i];
-            if (twin.input >= inputs || !is_texture(twin.input) || seen.test(twin.input) ||
+            if (twin.input >= inputs || twin.input >= seen.size() || !is_texture(twin.input) || seen.test(twin.input) ||
                 twin.reg != inputs + i * 2 || twin.entry != entries + i)
                 return false;
             seen.set(twin.input);
