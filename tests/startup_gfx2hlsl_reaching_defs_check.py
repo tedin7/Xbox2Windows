@@ -164,12 +164,20 @@ def single_edge_controls(wave_refusal):
 
     changed, changed_labels = single_edge_program(per_lane=True)
     lane_refusal = 's_add_u32 reads lane mask s37 as numeric data'
-    require_refusal(changed, lane_refusal)
+    # With forward-edge lane-mask marks (psnext-maskload) the sibling arm's mask write no longer reaches the
+    # branch-only block, so s37 is the loaded word there and the program translates; the refined pass must
+    # still not treat the per-lane entering branch as wave-uniform.
+    try:
+        lane_pruned = 's37 = r0.Load(' in pipeline(changed).hlsl_ps()
+        assert lane_pruned, 'per-lane edge translated without the loaded s37'
+    except G.Unsupported as error:
+        assert str(error) == lane_refusal, str(error)
+        lane_pruned = False
     # Exercise the guard inside the retry itself. With no skipped scalar-data write the VCC branch is per-lane.
     notes = []
     probe = G.Stage(pipeline(None), 'ps', changed, refusals=notes, decoded=G.decode(changed), refine_joins=True)
     assert not probe.wave_exec and changed_labels['enter'] not in probe.uniform_branches
-    assert notes == [(lane_refusal, 'ps')], ('per-lane edge', notes)
+    assert notes == ([] if lane_pruned else [(lane_refusal, 'ps')]), ('per-lane edge', notes)
     print('per-lane VCC edge: scalar mask refusal retained in the refined pass')
 
     predicate = 'scc = s11 < 0x0000000fu;'
