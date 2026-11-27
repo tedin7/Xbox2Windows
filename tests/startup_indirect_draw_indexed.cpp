@@ -1851,6 +1851,253 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
     std::puts("slot 57 creation result and output matched all controls");
     return true;
 }
+// The copied mip and the feedback view share a desktop resource and use the title view table.
+class TargetReadFixture {
+public:
+    TargetReadFixture(ID3D12Device* device, ID3D12Device* guest, const char* mode)
+        : device(device), guest(guest),
+          cache(std::filesystem::current_path() / (std::string(mode) + "-" + std::to_string(GetCurrentProcessId())))
+    {
+        std::filesystem::create_directory(cache);
+        check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set target read cache");
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER table{};
+        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        table.DescriptorTable = {1, &range};
+        root = create_root(guest, {1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT},
+                           &root_blob);
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        check(guest->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create target read queue");
+        native_queue = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create target read fence");
+    }
+
+    ~TargetReadFixture()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(cache, ignored);
+    }
+
+    ComPtr<ID3D12DescriptorHeap> heap(D3D12_DESCRIPTOR_HEAP_TYPE type)
+    {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 backing, bytes;
+        } args{{type, 1, type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+                             ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0};
+        ComPtr<ID3D12DescriptorHeap> out;
+        check(guest->CreateDescriptorHeap(&args.desc, IID_PPV_ARGS(&out)), "create target read heap");
+        return out;
+    }
+
+    static UINT64 handle(ID3D12DescriptorHeap* heap, unsigned index)
+    {
+        return slot<UINT64 (WINAPI*)(IUnknown*, void*)>(heap, index)(heap, nullptr);
+    }
+
+    ComPtr<ID3D12DescriptorHeap> srv(ID3D12Resource* texture, DXGI_FORMAT format, UINT mip, UINT plane = 0)
+    {
+        auto views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        struct {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+            UINT64 tail[3]{};
+        } view;
+        view.desc.Format = format;
+        view.desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.desc.Texture2D = {mip, 1, plane, 0};
+        using View = void (WINAPI*)(IUnknown*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, UINT64, UINT64);
+        slot<View>(guest, 18)(guest, texture, &view.desc, handle(views.Get(), 9), 0);
+        return views;
+    }
+
+    void draw(IUnknown* list, IUnknown* pso, ID3D12DescriptorHeap* views,
+              const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor)
+    {
+        using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+        slot<Bind>(list, 25)(list, pso);
+        slot<Bind>(list, 34)(list, root.Get());
+        slot<void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*)>(list, 32)(list, 1, &views);
+        slot<void (WINAPI*)(IUnknown*, UINT, UINT64)>(list, 36)(list, 0, handle(views, 10));
+        slot<void (WINAPI*)(IUnknown*, D3D12_PRIMITIVE_TOPOLOGY)>(list, 20)(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        slot<void (WINAPI*)(IUnknown*, UINT, const D3D12_VIEWPORT*)>(list, 21)(list, 1, &viewport);
+        slot<void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*)>(list, 22)(list, 1, &scissor);
+        slot<void (WINAPI*)(IUnknown*, UINT, UINT, UINT, UINT)>(list, 12)(list, 3, 1, 0, 0);
+    }
+
+    void targets(IUnknown* list, const D3D12_CPU_DESCRIPTOR_HANDLE* rtv, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv = nullptr)
+    {
+        using Targets = void (WINAPI*)(IUnknown*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+        slot<Targets>(list, 50)(list, rtv ? 1u : 0u, rtv, FALSE, dsv);
+    }
+
+    void submit_guest(IUnknown* list)
+    {
+        check(slot<HRESULT (WINAPI*)(IUnknown*)>(list, 9)(list), "close target read list");
+        submit_wrapped(queue.Get(), list);
+        wait();
+    }
+
+    void submit_native(ID3D12GraphicsCommandList* list)
+    {
+        check(list->Close(), "close native target read list");
+        ID3D12CommandList* lists[]{list};
+        native_queue->ExecuteCommandLists(1, lists);
+        wait();
+    }
+
+    bool overlap_refused()
+    {
+        std::string report(x2w_d3d12_not_drawn_keys_report(nullptr, 0) + 1, '\0');
+        x2w_d3d12_not_drawn_keys_report(report.data(), report.size());
+        if (report.find("sampled_target_overlap 1") != std::string::npos) return true;
+        std::fprintf(stderr, "expected one sampled_target_overlap refusal:\n%s\n", report.c_str());
+        return false;
+    }
+
+    bool readback(ID3D12Resource* texture, UINT subresource, std::uint32_t reference, std::uint32_t mask = UINT32_MAX)
+    {
+        const auto desc = texture->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, nullptr, nullptr, &bytes);
+        const auto buffer = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        to(copy.list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION src{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        src.SubresourceIndex = subresource;
+        D3D12_TEXTURE_COPY_LOCATION dst{buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        dst.PlacedFootprint = footprint;
+        copy.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        to(copy.list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        submit_native(copy.list.Get());
+
+        void* memory = nullptr;
+        const D3D12_RANGE read{0, static_cast<SIZE_T>(bytes)};
+        check(buffer->Map(0, &read, &memory), "map target readback");
+        bool match = true;
+        for (UINT y = 0; y < footprint.Footprint.Height && match; ++y) {
+            for (UINT x = 0; x < footprint.Footprint.Width; ++x) {
+                std::uint32_t actual;
+                const auto offset = footprint.Offset + y * footprint.Footprint.RowPitch + x * sizeof(actual);
+                std::memcpy(&actual, static_cast<const char*>(memory) + offset, sizeof(actual));
+                if ((actual & mask) == reference) continue;
+                std::fprintf(stderr, "subresource %u (%u,%u): got 0x%08x, expected 0x%08x\n",
+                             subresource, x, y, actual & mask, reference);
+                match = false;
+                break;
+            }
+        }
+        const D3D12_RANGE written{0, 0};
+        buffer->Unmap(0, &written);
+        return match;
+    }
+
+    static void to(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, UINT subresource,
+                   D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+    {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {texture, subresource, from, to};
+        list->ResourceBarrier(1, &barrier);
+    }
+
+    ID3D12Device* device;
+    ID3D12Device* guest;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3DBlob> root_blob;
+
+private:
+    void wait()
+    {
+        check(native_queue->Signal(fence.Get(), ++tick), "signal target read fence");
+        check(fence->SetEventOnCompletion(tick, nullptr), "wait for target read fence");
+    }
+
+    std::filesystem::path cache;
+    ComPtr<ID3D12CommandQueue> queue, native_queue;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 tick = 0;
+};
+
+struct TargetReadDebug {
+    std::atomic<unsigned> errors{0};
+    ComPtr<ID3D12InfoQueue1> info;
+    DWORD cookie = 0;
+    bool registered = false;
+
+    bool watch(ID3D12Device* device)
+    {
+        registered = SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&info))) &&
+            SUCCEEDED(info->RegisterMessageCallback(message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, this, &cookie));
+        return registered;
+    }
+
+    ~TargetReadDebug()
+    {
+        if (registered) info->UnregisterMessageCallback(cookie);
+    }
+
+    static void WINAPI message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+                               D3D12_MESSAGE_ID, LPCSTR description, void* context)
+    {
+        auto& self = *static_cast<TargetReadDebug*>(context);
+        if (severity <= D3D12_MESSAGE_SEVERITY_ERROR && ++self.errors <= 12)
+            std::fprintf(stderr, "debug layer: %.400s\n", description);
+    }
+};
+
+bool check_render_target_read(TargetReadFixture& fixture)
+{
+    auto* const device = fixture.device;
+    auto* const guest = fixture.guest;
+    const auto pso = translated_pipeline(guest, fixture.root.Get(), fixture.root_blob.Get(), false);
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 2, format, {1, 0},
+                                   D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    const auto texture = resource(guest, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    const auto native = native_object<ID3D12Resource>(device, guest, texture.Get());
+    const auto target_heap = fixture.heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE bound{fixture.handle(target_heap.Get(), 9)};
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+    rtv.Format = format;
+    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtv.Texture2D.MipSlice = 1;
+    guest->CreateRenderTargetView(texture.Get(), &rtv, bound);
+    const auto mip0 = fixture.srv(texture.Get(), format, 0);
+    const auto mip1 = fixture.srv(texture.Get(), format, 1);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    ComPtr<ID3D12DescriptorHeap> clear_heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&clear_heap)), "create mip clear heap");
+    const auto clear0 = clear_heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE clear1{clear0.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    device->CreateRenderTargetView(native.Get(), &rtv, clear1);
+    rtv.Texture2D.MipSlice = 0;
+    device->CreateRenderTargetView(native.Get(), &rtv, clear0);
+    ComputeCommands clear(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    transition(clear.list.Get(), native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float sampled[]{0, 1, 0, 1};
+    const float initial[]{0, 0, 1, 1};
+    clear.list->ClearRenderTargetView(clear0, sampled, 0, nullptr);
+    clear.list->ClearRenderTargetView(clear1, initial, 0, nullptr);
+    transition(clear.list.Get(), native.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    fixture.submit_native(clear.list.Get());
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create target read allocator");
+    const auto list = begin_guest_list(guest, allocator.Get());
+    fixture.targets(list.Get(), &bound);
+    const D3D12_VIEWPORT viewport{0, 0, 2, 2, 0, 1};
+    fixture.draw(list.Get(), pso.Get(), mip0.Get(), viewport, {0, 0, 1, 2});
+    fixture.draw(list.Get(), pso.Get(), mip0.Get(), viewport, {1, 0, 2, 2});
+    fixture.draw(list.Get(), pso.Get(), mip1.Get(), viewport, {0, 0, 2, 2});
+    fixture.submit_guest(list.Get());
+
+    // The native readback list also drains GPU validation messages after the draw fence.
+    const bool pixels = fixture.readback(native.Get(), 1, 0xff00ff00u);
+    return fixture.overlap_refused() && pixels;
+}
+
 // Direct translated draws exercise null descriptors that the indirect path refuses.
 int check_starved_target(ID3D12Device* device, ID3D12Device* guest, ID3D12InfoQueue* info,
                          const std::wstring& log_path, bool keep_writing, bool omit_target)
@@ -2327,6 +2574,7 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
+    const bool target_read = argc == 3 && std::strcmp(argv[2], "render-target-read") == 0;
     const bool null_census = argc == 3 && std::strcmp(argv[2], "null-census") == 0;
     const bool lease_writer = argc == 3 && std::strcmp(argv[2], "mesh-lease-writer") == 0;
     const bool skip_argument_wait = argc == 3 && std::strcmp(argv[2], "mesh-xmem-arguments-skip-wait") == 0;
@@ -2388,7 +2636,7 @@ int main(int argc, char** argv) try
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    if (target_read || (translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
@@ -2401,8 +2649,16 @@ int main(int argc, char** argv) try
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
     const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
-    if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
+    if (!target_read && debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
     if (debug) debug->EnableDebugLayer();
+    if (target_read) {
+        ComPtr<ID3D12Debug1> validation;
+        if (!debug || FAILED(debug.As(&validation))) {
+            std::fputs("no debug layer\n", stderr);
+            return 1;
+        }
+        validation->SetEnableGPUBasedValidation(TRUE);
+    }
     ComPtr<IDXGIFactory6> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
     ComPtr<IDXGIAdapter1> adapter;
@@ -2459,6 +2715,21 @@ int main(int argc, char** argv) try
     }
     const std::array<unsigned char, 64> parameters{};
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
+    if (target_read) {
+        ComPtr<ID3D12Device> desktop;
+        check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)), "open desktop target read device");
+        TargetReadDebug debug_messages;
+        if (!debug_messages.watch(desktop.Get())) {
+            std::fputs("no debug layer\n", stderr);
+            return 1;
+        }
+        TargetReadFixture fixture(desktop.Get(), guest.Get(), argv[2]);
+        const bool pixels = check_render_target_read(fixture);
+        const auto errors = debug_messages.errors.load();
+        const auto removed = desktop->GetDeviceRemovedReason();
+        std::printf("render target read: debug errors %u, device status 0x%08lx\n", errors, static_cast<unsigned long>(removed));
+        return pixels && errors == 0 && removed == S_OK ? 0 : 1;
+    }
     if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");

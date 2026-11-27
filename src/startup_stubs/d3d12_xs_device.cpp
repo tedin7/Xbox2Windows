@@ -62,6 +62,7 @@
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
 #include "startup_stubs/dsv_planes.h"
+#include "startup_stubs/subresource_states.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -3378,6 +3379,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
+    std::vector<x2w_substates::Split> split;
     std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
@@ -3411,6 +3413,7 @@ struct Pass {
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
+    x2w_substates::Range bound_target_ranges[8]{};
     ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
@@ -3526,11 +3529,41 @@ bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
     ReleaseSRWLockShared(&placed_gpu_writes_lock);
     return written;
 }
+auto find_split(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.split.begin(), pass.split.end(),
+                        [resource](const auto& known) { return known.resource == resource; });
+}
+
+auto find_state(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.states.begin(), pass.states.end(),
+                        [resource](const auto& known) { return known.first == resource; });
+}
+
+x2w_substates::Split& split_state(Pass& pass, ID3D12Resource* resource)
+{
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) return *split;
+    const auto known = find_state(pass, resource);
+    const auto state = known == pass.states.end() ? D3D12_RESOURCE_STATE_COMMON : known->second;
+    pass.split.push_back(x2w_substates::make_split(resource, x2w_substates::whole(resource->GetDesc()), state));
+    if (known != pass.states.end()) pass.states.erase(known);
+    return pass.split.back();
+}
+
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) {
+        x2w_substates::move_all(list, *split, state);
+        pass.split.erase(split);
+        pass.states.emplace_back(resource, state);
+        return;
+    }
     for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
         if (it->resource != resource) continue;
         // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
@@ -3565,6 +3598,41 @@ D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
+bool require_read(Wrapper* self, ID3D12Resource* resource, const x2w_substates::Range& read,
+                  D3D12_RESOURCE_STATES read_state)
+{
+    auto& pass = pass_of(self);
+    bool bound = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        if (pass.bound_targets[i] != resource) continue;
+        bound = true;
+        // Enhanced Barriers, No Self Copy: one subresource cannot combine read and write access.
+        if (x2w_substates::overlaps(read, pass.bound_target_ranges[i])) return false;
+    }
+    if (bound) {
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        x2w_substates::move(list, split_state(pass, resource), read, read_state);
+    } else {
+        require_state(self, resource, read_state);
+    }
+    return true;
+}
+
+void restore_bound_targets(ID3D12GraphicsCommandList* list, Pass& pass)
+{
+    bool moved = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        auto* resource = pass.bound_targets[i];
+        const auto known = find_state(pass, resource);
+        if (known != pass.states.end() && known->second == D3D12_RESOURCE_STATE_RENDER_TARGET) continue;
+        moved |= x2w_substates::move(list, split_state(pass, resource), pass.bound_target_ranges[i],
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    static LONG restored;
+    if (moved && first_calls(restored, 6))
+        log("x2w-draw bound target moved back to its bind state before the draw");
+}
+
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 
 #include "startup_stubs/d3d12_replay_dump.inl"
@@ -3596,6 +3664,8 @@ void release_targets(Wrapper* self)
     Pass& pass = pass_of(self);
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& split : pass.split)
+        x2w_substates::move_all(static_cast<ID3D12GraphicsCommandList*>(self->own().real), split, D3D12_RESOURCE_STATE_COMMON);
     for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
     pass = Pass{};
 }
@@ -3611,6 +3681,7 @@ void retire_drop_recording(Wrapper* list)
     if (!release_retired_enabled()) return;
     if (list->own().pass) {
         pass_of(list).states.clear();
+        pass_of(list).split.clear();
         pass_of(list).mixed.clear();
     }
     retire_discard_holds(list);
@@ -4420,6 +4491,7 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 // other kind is wrong_kind; a handle with no record falls back to the creation-time map (render targets only).
 struct ResolvedView {
     ID3D12Resource* resource = nullptr;
+    x2w_substates::Range range{};
     UINT dsv_flags = 0;
     bool wrong_kind = false;
     bool skipped = false;
@@ -4441,6 +4513,7 @@ ResolvedView resolve_view(u64 handle, int slot)
     }
     if (!known) {
         if (slot == 20 || slot == 21) out.resource = view_target(handle, slot);
+        if (out.resource) out.range = x2w_substates::whole(out.resource->GetDesc());
         return out;
     }
     if (static_cast<int>(record.slot) != slot) {
@@ -4452,6 +4525,11 @@ ResolvedView resolve_view(u64 handle, int slot)
         return out;
     }
     out.resource = record.resource ? reinterpret_cast<ID3D12Resource*>(unwrap(record.resource)) : nullptr;
+    if (slot == 20 && out.resource) {
+        D3D12_RENDER_TARGET_VIEW_DESC desc{};
+        if (record.desc_bytes == sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+        out.range = x2w_substates::rtv(out.resource->GetDesc(), record.desc_bytes ? &desc : nullptr);
+    }
     if (slot == 21 && record.desc_bytes >= 12) std::memcpy(&out.dsv_flags, record.desc + 8, 4);
     return out;
 }
@@ -4690,6 +4768,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     std::fill_n(pass.bound_targets, 8, nullptr);
+    std::fill_n(pass.bound_target_ranges, 8, x2w_substates::Range{});
     pass.bound_depth = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list) return;
@@ -4712,6 +4791,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
+    x2w_substates::Range ranges[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
         const u64 step = u64{i} * stride;
@@ -4734,6 +4814,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                     view.skipped ? "holds a skipped view" : "holds no view");
             return;
         }
+        ranges[i] = view.range;
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
@@ -4807,6 +4888,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
+    std::copy_n(ranges, 8, pass.bound_target_ranges);
     pass.bound_depth = dsv_target;
     pass.dsv_format = dsv_format;
     const auto inspect = [](ID3D12Resource* resource, DXGI_FORMAT format, auto& surface) {
@@ -5613,8 +5695,9 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
-        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : 16;
+        const u64 description = N == 20 ? args[1] : raw[described];
+        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(description),
                   described_bytes, title_dest, args[D], materialized);
     };
     Wrapper* const lazy_wrapper = (N >= 18 && N <= 21) ? as_wrapper(reinterpret_cast<const void*>(a)) : nullptr;
