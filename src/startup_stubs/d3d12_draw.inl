@@ -2805,8 +2805,11 @@ bool plain_compute_input_readable(u64 address, u64 bytes)
     for (u64 checked = 0; checked < bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         const u64 at = address + checked;
-        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) ||
-            info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        const auto* pointer = reinterpret_cast<const void*>(at);
+        const bool queried = x2w_local::mapped_cache_enabled()
+            ? x2w_local::query_readable_mapped_span(pointer, &info)
+            : VirtualQuery(pointer, &info, sizeof(info)) != 0;
+        if (!queried || info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
             return false;
         checked += reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize - at;
     }
@@ -3912,7 +3915,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         } else {
             if (address && large_raw) {
                 bool extent_ok = false;
-                const std::size_t extent = x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
+                const std::size_t extent = x2w_local::mapped_cache_enabled()
+                    ? x2w_local::committed_extent_with(address, bytes, x2w_local::query_readable_mapped_span, &extent_ok)
+                    : x2w_local::committed_extent(reinterpret_cast<const void*>(address), bytes, &extent_ok);
                 if (extent_ok) bytes = extent ? extent : 256;
             }
             readable_range = address && bytes && readable_window(address, bytes) >= bytes;

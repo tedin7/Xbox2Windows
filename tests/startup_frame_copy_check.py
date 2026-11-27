@@ -221,8 +221,66 @@ float4 main(float4 p : SV_Position) : SV_Target {
     return 0
 
 
+MAPPED_COUNTS = re.compile(r"^x2w-render mapped spans: (\d+) queries, (\d+) hits, (\d+) forgets$", re.M)
+
+
+def mapped_reference(frame):
+    return b"".join(
+        bytes((0, 0, 0, 255)) if (frame, region) == (50, 0)
+        else bytes((1 + (3 * region + frame) % 251, 1 + (region + 7 * frame) % 251, 0, 255))
+        for region in range(64)
+    )
+
+
+def mapped_query_budget(queries):
+    # One cold fill, one rewarm after the stale touch, and room for shim bookkeeping.
+    if not 64 <= queries <= 192:
+        raise AssertionError(f"{queries} mapped queries outside the 64–192 budget")
+
+
+def check_mapped_spans(directory, consumer, backend):
+    shader = """ByteAddressBuffer input_data : register(t0);
+float4 main() : SV_Target {
+    return float4(asfloat(input_data.Load2(0)), 0, 1);
+}
+"""
+    for name, single in (("table", "0"), ("one_entry", "1")):
+        folder = directory / name
+        folder.mkdir()
+        log = folder / "trap.log"
+        last = draw_texture(folder, consumer, backend, shader, {
+            "X2W_TEST_FRAME_COPY": "mapped-spans", "X2W_TRAP_LOG": str(log),
+            "X2W_MAPPED_SPAN_TABLE": "1", "X2W_TEST_MAPPED_SPAN_ONE": single,
+            "X2W_BIGBIND_ONCE": "0", "X2W_BIG_COPY_REUSE": "0",
+            "X2W_DRAW_NULL_IDENTITY": "0",
+        }, binding="srv 0 buf table 0 0")
+        if last is None:
+            return 77
+        for frame in range(100):
+            pixels = last if frame == 99 else (folder / f"pixels.{frame}").read_bytes()
+            expected = mapped_reference(frame)
+            if pixels != expected:
+                raise AssertionError(f"{name} frame {frame}: actual {pixels.hex()} expected {expected.hex()}")
+        [(queries, hits, forgets)] = read_counts(log, MAPPED_COUNTS)
+        if single == "0":
+            mapped_query_budget(queries)
+            if hits < 6300 or forgets != 1:
+                raise AssertionError(f"expected at least 6300 hits and one failed touch, got {hits}, {forgets}")
+        else:
+            try:
+                mapped_query_budget(queries)
+            except AssertionError:
+                if queries < 6000:
+                    raise AssertionError(f"one-entry table made only {queries} queries") from None
+            else:
+                raise AssertionError("one-entry table passed the query budget")
+        print(f"{backend} {name}: 6400 pixels match CPU, {queries} queries, {hits} hits, {forgets} forgets")
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = {"once": check_once, "mirror": check_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
+        modes = {"once": check_once, "mirror": check_mirror, "mapped-spans": check_mapped_spans}
+        check_mode = modes[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))
