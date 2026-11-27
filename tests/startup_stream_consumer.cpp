@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <cstdio>
@@ -15,11 +16,18 @@
 #include <thread>
 #include <vector>
 
+#include "../src/startup_stubs/buffer_input_addressing.h"
 #include "startup_stream_draw.h"
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
 
 using Microsoft::WRL::ComPtr;
+
+static_assert(!x2w_startup::buffer_input_addressing_refusal(0, 0));
+static_assert(!x2w_startup::buffer_input_addressing_refusal(1u << 30, 3u << 21));
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 0) == x2w_startup::swizzled_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(0, 1u << 23) == x2w_startup::add_tid_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 1u << 23) == x2w_startup::swizzled_input_buffer);
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
@@ -252,8 +260,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     constexpr UINT gpu_offset = 16;
     const bool ring_input = mode == "dispatch-input-title-ring" || mode == "dispatch-input-title-ring-full";
     const bool protected_input = mode == "dispatch-input-title-protected";
-    const UINT input_bytes = large_input ? 40u << 20 : 12u << 10;
-    const UINT record_offsets[] = {0, input_bytes / 2, input_bytes - 16};
+    const bool raw_range = mode == "dispatch-input-title-raw-range";
+    const bool range_control = mode == "dispatch-input-title-raw-range-control";
+    const bool range_fixture = raw_range || range_control;
+    const UINT input_bytes = range_fixture ? 16u * 64u : large_input ? 40u << 20 : 12u << 10;
+    const UINT record_offsets[] = {0, range_fixture ? 48u : input_bytes / 2, range_fixture ? 64u : input_bytes - 16};
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -331,8 +342,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 
         const UINT64 address = reinterpret_cast<UINT64>(source) + (gpu_input ? gpu_offset : 0);
         descriptors[0][0] = static_cast<UINT>(address);
-        descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
-        descriptors[0][2] = input_bytes / 4;
+        descriptors[0][1] = static_cast<UINT>(address >> 32) | (range_fixture ? 16u : 4u) << 16;
+        descriptors[0][2] = range_fixture ? 64u : input_bytes / 4;
+        if (range_fixture) descriptors[0][3] = raw_range ? 3u << 28 : 0;
+        if (mode == "dispatch-input-title-swizzled") descriptors[0][1] |= 1u << 31;
+        if (mode == "dispatch-input-title-add-tid") descriptors[0][3] |= 1u << 23;
+        if (mode == "dispatch-input-title-cache-hint") descriptors[0][1] |= 1u << 30;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
@@ -400,9 +415,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             format = DXGI_FORMAT_R8G8B8A8_UINT;
             element = 4;
             mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
+        } else if (mode == "dispatch-heap-format-r32-uint" || mode == "dispatch-heap-format-snorm" ||
+                   mode == "dispatch-heap-format-ufloat") {
+            format = mode == "dispatch-heap-format-r32-uint" ? DXGI_FORMAT_R32_UINT :
+                     mode == "dispatch-heap-format-snorm" ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R11G11B10_FLOAT;
+            element = 4;
+            mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
         } else if (mode == "dispatch-heap-format-unsupported") {
-            format = DXGI_FORMAT_R16G16B16A16_UINT;
-            element = 8;
+            format = DXGI_FORMAT_R32G32B32_UINT;
+            element = 12;
         } else {
             return 2;
         }
@@ -549,7 +570,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             if (!data) return 81;
             *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
             const UINT64 address = reinterpret_cast<UINT64>(data);
-            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            if ((slot == 2 && mode.find("-selected-swizzled") != std::string::npos) ||
+                (slot == 3 && mode.find("-unrelated-swizzled") != std::string::npos))
+                raw[1] |= 1u << 31;
             std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
         }
     }
@@ -711,6 +735,154 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (title_readback && (FAILED(static_cast<HRESULT>(invoke(title_readback, 8, 0, 0, word(&result)))) || !result)) return 2;
     std::ofstream(path, std::ios::binary).write(static_cast<const char*>(result), sizeof(input));
     if (title_readback) invoke(title_readback, 9, 0, 0);
+    return 0;
+}
+
+// Slot 67 compute fixture: 32 translated descriptors per dispatch, with a bank change at the old wrap.
+static int dispatch_descriptor_ring(IDXGIAdapter* adapter, void* device)
+{
+    static constexpr UINT first_bank = (1u << 18) / 32;
+    static constexpr UINT first_batch = first_bank + 1;
+    static constexpr UINT count = first_batch + 128;
+    static constexpr UINT bank_words = (count + 3u) & ~3u;
+    static constexpr UINT64 bytes = count * sizeof(UINT);
+    static constexpr UINT64 input_bytes = 2 * bank_words * sizeof(UINT);
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    const auto ok = [](StreamWord hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); };
+    const auto expected = [](UINT bank, UINT i) { return (bank ? 0x42000000u : 0x17000000u) + i; };
+    struct Debug {
+        ComPtr<ID3D12InfoQueue1> queue;
+        std::atomic<unsigned> errors{0};
+        DWORD cookie = 0;
+        bool registered = false;
+        ~Debug() { if (registered) queue->UnregisterMessageCallback(cookie); }
+        static void WINAPI message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+                                   D3D12_MESSAGE_ID, LPCSTR text, void* context)
+        {
+            if (severity <= D3D12_MESSAGE_SEVERITY_ERROR && ++static_cast<Debug*>(context)->errors <= 12)
+                std::printf("debug layer: %.300s\n", text);
+        }
+    } debug;
+
+    ComPtr<ID3D12Device> desktop;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop)))) return 80;
+    debug.registered = SUCCEEDED(desktop.As(&debug.queue)) &&
+        SUCCEEDED(debug.queue->RegisterMessageCallback(Debug::message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, &debug, &debug.cookie));
+    if (!debug.registered) {
+        std::puts("no debug layer");
+        return 81;
+    }
+
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, input_bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* input = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+    desc.Width += bytes;
+    void* upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    desc.Width = bytes;
+    void* readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void* output = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+    void* mapped = nullptr;
+    if (!input || !upload || !output || !readback || !ok(invoke(upload, 8, 0, 0, word(&mapped))) || !mapped)
+        return 82;
+    for (UINT bank = 0; bank < 2; ++bank)
+        for (UINT i = 0; i < count; ++i)
+            static_cast<UINT*>(mapped)[bank * bank_words + i] = expected(bank, i);
+    for (UINT i = 0; i < count; ++i) static_cast<UINT*>(mapped)[2 * bank_words + i] = 0xc5c5c5c5u;
+    invoke(upload, 9, 0, 0);
+
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    void *heap = nullptr, *queue = nullptr, *alloc = nullptr, *late_alloc = nullptr, *list = nullptr;
+    void *gate = nullptr, *done = nullptr;
+    if (!ok(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&heap))) ||
+        !ok(invoke(device, 8, word(&queue_desc), word(&__uuidof(ID3D12CommandQueue)), word(&queue))) ||
+        !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&alloc))) ||
+        !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&late_alloc))) ||
+        !ok(invoke(device, 73, word(list_desc), word(alloc), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&list))) ||
+        !ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&gate))) ||
+        !ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&done))))
+        return 83;
+
+    const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
+    if (!cpu || !gpu) return 84;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                                      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    // Create the views at aligned handles, then pack their tokens into the guest table.
+    const auto staging = StreamWord{32} * desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    srv.Buffer = {0, count, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    invoke(device, 18, word(input), word(&srv), cpu);
+    srv.Buffer.FirstElement = bank_words;
+    invoke(device, 18, word(input), word(&srv), cpu + staging);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+    uav.Buffer.NumElements = count;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    invoke(device, 19, word(output), 0, word(&uav), cpu + 2 * staging);
+    std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<const void*>(cpu + 2 * staging), 32);
+    const UINT unfilled[4]{1, 0, 0, 0};
+    std::memcpy(reinterpret_cast<void*>(cpu + 96), unfilled, sizeof(unfilled));
+
+    const auto bind = [&] {
+        invoke(list, 32, 1, word(&heap));
+        invoke(list, 25, word(slot67_pipeline));
+        invoke(list, 33, word(slot67_root));
+        invoke(list, 35, 1, gpu);
+    };
+    const auto record = [&](UINT begin, UINT end) {
+        for (UINT i = begin; i < end; ++i) {
+            invoke(list, 37, 0, i, 0);
+            invoke(list, 14, 1, 1, 1);
+        }
+    };
+
+    const auto started = GetTickCount64();
+    if (!ok(invoke(list, 139, word(alloc)))) return 85;
+    invoke(list, 15, word(input), 0, word(upload), 0, input_bytes);
+    invoke(list, 15, word(output), 0, word(upload), input_bytes, bytes);
+    bind();
+    record(0, first_bank);
+    std::memcpy(reinterpret_cast<void*>(cpu), reinterpret_cast<const void*>(cpu + staging), 32);
+    record(first_bank, first_batch);
+    if (!ok(invoke(list, 9)) || !ok(invoke(queue, 17, word(gate), 1))) return 86;
+    invoke(queue, 10, 1, word(&list));
+
+    // Detach the submitted recording, then reset its title allocator while the queue fence is pending.
+    bool late = ok(invoke(list, 139, word(late_alloc))) && ok(invoke(alloc, 8));
+    if (late) {
+        bind();
+        record(first_batch, count);
+        invoke(list, 15, word(readback), 0, word(output), 0, bytes);
+        late = ok(invoke(list, 9));
+        if (late) invoke(queue, 10, 1, word(&list));
+    }
+    if (!ok(invoke(gate, 10, 1)) || !ok(invoke(queue, 14, word(done), 1))) return 87;
+    for (const auto deadline = GetTickCount64() + 60000; invoke(done, 8) < 1;) {
+        if (GetTickCount64() >= deadline) {
+            std::puts("descriptor ring queue fence timed out");
+            return 88;
+        }
+        Sleep(1);
+    }
+    if (desktop->GetDeviceRemovedReason() != S_OK || debug.errors.load() || !late) return 89;
+    mapped = nullptr;
+    if (!ok(invoke(readback, 8, 0, 0, word(&mapped))) || !mapped) return 90;
+    const auto* results = static_cast<const UINT*>(mapped);
+    bool match = true;
+    for (UINT i = 0; i < count; ++i) {
+        const UINT reference = expected(i >= first_bank, i);
+        if (results[i] == reference) continue;
+        std::printf("descriptor ring: word %u read %08x, expected %08x\n", i, results[i], reference);
+        match = false;
+        break;
+    }
+    invoke(readback, 9, 0, 0);
+    if (!match) return 91;
+    std::printf("PASS: %u dispatches, %u translated descriptors, %llu ms\n",
+                count, 32 * count, GetTickCount64() - started);
     return 0;
 }
 
@@ -1102,6 +1274,8 @@ int main(int argc, char** argv)
             }
         }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
+        if (std::strcmp(argv[8], "dispatch-descriptor-ring") == 0)
+            return dispatch_descriptor_ring(adapter.Get(), device);
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
         if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
             if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;

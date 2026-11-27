@@ -7,6 +7,7 @@
 // every other texel must still hold -1.0.
 #include "desktop_gpu.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -31,9 +32,9 @@ std::vector<char> read_shader(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device)
+ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device, UINT count)
 {
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, count, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, entry_constants};
@@ -49,17 +50,22 @@ ComPtr<ID3D12RootSignature> store_root(ID3D12Device* device)
           "Create image store root");
     return root;
 }
-}  // namespace
+struct Image {
+    DXGI_FORMAT format;
+    UINT channels;
+    const std::uint32_t* initial;
+    const std::uint32_t* expected;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 bytes = 0;
+    ComPtr<ID3D12Resource> texture, upload, readback;
+};
 
-// Returns 0 when texel (x, y) holds expected and every other texel holds -1.0; otherwise prints the first
-// differing texel as "texel_mismatch x=.. y=.. expected=.. actual=.." and returns 1.
-int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4])
+int draw_and_check(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                   Image* images, UINT count, UINT draw_side)
 {
-    if (x >= side || y >= side) throw std::runtime_error("Expected a texel inside the 4x4 image");
     const auto vs = read_shader(vertex_path);
     const auto ps = read_shader(pixel_path);
-    const auto root = store_root(device);
+    const auto root = store_root(device, count);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -83,34 +89,40 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     td.Height = side;
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    const auto image = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 bytes = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-    const auto upload = make_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    const auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
-    check(upload->Map(0, &none, &mapped), "Map image store upload");
-    for (UINT row = 0; row < side; ++row)
-        for (UINT word = 0; word < side * 4; ++word)
-            std::memcpy(static_cast<std::uint8_t*>(mapped) + footprint.Offset + row * footprint.Footprint.RowPitch + 4 * word,
-                        &untouched, 4);
-    upload->Unmap(0, nullptr);
+    for (UINT i = 0; i < count; ++i) {
+        Image& image = images[i];
+        td.Format = image.format;
+        image.texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        device->GetCopyableFootprints(&td, 0, 1, 0, &image.footprint, nullptr, nullptr, &image.bytes);
+        image.upload = make_buffer(device, image.bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        image.readback = make_buffer(device, image.bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        void* mapped = nullptr;
+        check(image.upload->Map(0, &none, &mapped), "Map image write upload");
+        const UINT row_words = side * image.channels;
+        for (UINT row = 0; row < side; ++row)
+            std::memcpy(static_cast<std::uint8_t*>(mapped) + image.footprint.Offset + row * image.footprint.Footprint.RowPitch,
+                        image.initial + row * row_words, sizeof(std::uint32_t) * row_words);
+        image.upload->Unmap(0, nullptr);
+    }
 
     D3D12_RESOURCE_DESC rd = td;
-    rd.Width = rd.Height = 1;
+    rd.Width = rd.Height = draw_side;
+    rd.Format = pd.RTVFormats[0];
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R32G32B32A32_FLOAT, {0.0f, 0.0f, 0.0f, 0.0f}};
+    const D3D12_CLEAR_VALUE clear{rd.Format, {0.0f, 0.0f, 0.0f, 0.0f}};
     const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image store view heap");
-    device->CreateUnorderedAccessView(image.Get(), nullptr, nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    auto dest = views->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < count; ++i) {
+        device->CreateUnorderedAccessView(images[i].texture.Get(), nullptr, nullptr, dest);
+        dest.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image store RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -118,11 +130,14 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION texture_location{image.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION upload_location{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    upload_location.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&texture_location, 0, 0, 0, &upload_location, nullptr);
-    transition(list, image.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (UINT i = 0; i < count; ++i) {
+        const Image& image = images[i];
+        const D3D12_TEXTURE_COPY_LOCATION texture{image.texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION upload{image.upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        upload.PlacedFootprint = image.footprint;
+        list->CopyTextureRegion(&texture, 0, 0, 0, &upload, nullptr);
+        transition(list, image.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};
@@ -130,37 +145,77 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
     const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};  // ud0 = 0: plain triangles
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
+    const D3D12_VIEWPORT viewport{0, 0, float(draw_side), float(draw_side), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(draw_side), LONG(draw_side)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
-    transition(list, image.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION readback_location{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    readback_location.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&readback_location, 0, 0, 0, &texture_location, nullptr);
+    for (UINT i = 0; i < count; ++i) {
+        const Image& image = images[i];
+        transition(list, image.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const D3D12_TEXTURE_COPY_LOCATION texture{image.texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION readback{image.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        readback.PlacedFootprint = image.footprint;
+        list->CopyTextureRegion(&readback, 0, 0, 0, &texture, nullptr);
+    }
     commands.submit_and_wait(device);
 
-    const D3D12_RANGE read{0, static_cast<SIZE_T>(bytes)};
-    check(readback->Map(0, &read, &mapped), "Map image store readback");
     int result = 0;
-    for (UINT ty = 0; ty < side && !result; ++ty)
-        for (UINT tx = 0; tx < side && !result; ++tx) {
-            std::uint32_t texel[4];
-            std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + footprint.Offset + ty * footprint.Footprint.RowPitch +
-                                   16 * tx, sizeof(texel));
-            const bool stored = tx == x && ty == y;
-            const std::uint32_t want[4] = {stored ? expected[0] : untouched, stored ? expected[1] : untouched,
-                                           stored ? expected[2] : untouched, stored ? expected[3] : untouched};
-            if (std::memcmp(texel, want, sizeof(texel)) != 0) {
-                std::fprintf(stderr, "texel_mismatch x=%u y=%u expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
-                             tx, ty, want[0], want[1], want[2], want[3], texel[0], texel[1], texel[2], texel[3]);
+    for (UINT i = 0; i < count; ++i) {
+        const Image& image = images[i];
+        const D3D12_RANGE read{0, static_cast<SIZE_T>(image.bytes)};
+        void* mapped = nullptr;
+        check(image.readback->Map(0, &read, &mapped), "Map image write readback");
+        for (UINT y = 0; y < side; ++y)
+            for (UINT x = 0; x < side; ++x) {
+                std::uint32_t actual[4]{};
+                const auto* want = image.expected + (y * side + x) * image.channels;
+                const auto* address = static_cast<const std::uint8_t*>(mapped) + image.footprint.Offset
+                                    + y * image.footprint.Footprint.RowPitch + 4 * x * image.channels;
+                const auto size = sizeof(std::uint32_t) * image.channels;
+                std::memcpy(actual, address, size);
+                if (std::memcmp(actual, want, size) == 0) continue;
+                if (image.channels == 1)
+                    std::fprintf(stderr, "texel_mismatch uav=%u x=%u y=%u expected=%08x actual=%08x\n",
+                                 i, x, y, want[0], actual[0]);
+                else
+                    std::fprintf(stderr, "texel_mismatch x=%u y=%u expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+                                 x, y, want[0], want[1], want[2], want[3], actual[0], actual[1], actual[2], actual[3]);
                 result = 1;
             }
-        }
-    readback->Unmap(0, &none);
+        image.readback->Unmap(0, &none);
+    }
+    return result;
+}
+}  // namespace
+
+int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
+                              const std::uint32_t expected[4])
+{
+    if (x >= side || y >= side) throw std::runtime_error("Expected a texel inside the 4x4 image");
+    std::array<std::uint32_t, side * side * 4> initial, want;
+    initial.fill(untouched);
+    want = initial;
+    std::memcpy(want.data() + (y * side + x) * 4, expected, 4 * sizeof(std::uint32_t));
+    Image image{DXGI_FORMAT_R32G32B32A32_FLOAT, 4, initial.data(), want.data()};
+    const int result = draw_and_check(device, vertex_path, pixel_path, &image, 1, 1);
     if (!result) std::printf("image store: texel (%u, %u) written, %u others untouched\n", x, y, side * side - 1);
     return result;
+}
+
+int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                               const char* fixture_path, bool signed_view)
+{
+    // Initial texels of u0 and u1, followed by both CPU references, in row-major order.
+    std::uint32_t fixture[4][side * side]{};
+    std::ifstream file(fixture_path, std::ios::binary);
+    if (!file.read(reinterpret_cast<char*>(fixture), sizeof(fixture)) || file.peek() != std::ifstream::traits_type::eof())
+        throw std::runtime_error("Expected four 4x4 images in the atomic fixture");
+    Image images[] = {
+        {signed_view ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT, 1, fixture[0], fixture[2]},
+        {DXGI_FORMAT_R32_UINT, 1, fixture[1], fixture[3]},
+    };
+    return draw_and_check(device, vertex_path, pixel_path, images, 2, side);
 }

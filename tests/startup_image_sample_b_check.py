@@ -529,7 +529,9 @@ def controls():
     refused('c_b', 'image_sample_c_b')
     refused('offset', 'image_sample_b_o')
     refused('gather', 'image_gather4_b')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    cube = stage('cube').hlsl_ps()
+    assert 'TextureCube<float4> r0' in cube
+    assert 'r0.SampleBias(q0, x2w_cube_dir(F(v1), F(v2), F(v3)), F(v0))' in cube
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     refused('dim1d', 'unverified 1D image b address or modifiers')
     refused('unorm', 'image_sample_b modifier unorm')
@@ -543,7 +545,7 @@ def controls():
         refused(name, 'image_sample_b modifier reserved')
     refused('sampler bias', 'image_sample_b with a sampler LOD bias (word 2 0x4000001)')
     refused('sampler bias sec', 'image_sample_b with a sampler LOD bias (word 2 0x4004000)')
-    print('refused: b_cl, c_b, offset, gather4_b, cube, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
+    print('refused: b_cl, c_b, offset, gather4_b, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
           'reserved bits, sampler LOD bias')
 
     # Guest sampler limits: carried over for a constant descriptor, refused where they cannot be shown irrelevant.

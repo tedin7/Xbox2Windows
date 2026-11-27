@@ -1,6 +1,6 @@
 """Offline side of device slot 67 compute requests, pure Python (no Windows or D3D12 needed).
 
-- compute_key of fixed synthetic parts equals a key computed here from the framing rule (revision + "cs", then
+- compute_key of fixed synthetic parts equals a key computed here from the framing rule (revision + "cs", the feature tag when enabled, then
   each part preceded by its u64 length, in the order code, data, root, desc, state A, state B) and a literal.
 - A cache directory with one synthetic request (req_<key>.{desc,sa,sb,data,root,c67}) is found by
   request_keys(compute=True) and pending_keys, but not by the graphics request_keys; gfx2hlsl.py --pending
@@ -25,12 +25,15 @@ ROOT = b'RTS0 synthetic root'
 DESC = struct.pack('<12Q', 0, 0, 24, 0, 20, 0, len(CODE), 0, len(DATA), 0, 0, 11)
 STATE_A = struct.pack('<3Q', 1, 0x2c, 0xfff0000000000003)
 STATE_B = struct.pack('<5I', 0x1234abcd, 0xffff0000, 0, 0, 0)
-KEY = 0x39e7422f5da15950  # framed key at revision 28cs
+KEYS = {False: 0x39e7422f5da15950, True: 0x00afee74a0d32ab6}
 
 
-def framed_key():
+def framed_key(extended):
     h = 1469598103934665603
-    for b in b'x2w-startup-shader-28cs':
+    seed = b'x2w-startup-shader-28cs'
+    if extended:
+        seed += b'extended-buffer-formats1'
+    for b in seed:
         h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
     for part in (CODE, DATA, ROOT, DESC, STATE_A, STATE_B):
         for b in struct.pack('<Q', len(part)) + part:
@@ -39,9 +42,10 @@ def framed_key():
 
 
 def main():
-    key = G.compute_key(CODE, DATA, ROOT, DESC, STATE_A, STATE_B)
-    assert key == framed_key(), '%016x != %016x' % (key, framed_key())
-    assert key == KEY, '%016x != literal %016x' % (key, KEY)
+    for extended, expected in KEYS.items():
+        os.environ['X2W_EXTENDED_BUFFER_FORMATS'] = str(int(extended))
+        key = G.compute_key(CODE, DATA, ROOT, DESC, STATE_A, STATE_B)
+        assert key == framed_key(extended) == expected, (extended, hex(key), hex(expected))
     with tempfile.TemporaryDirectory() as temporary:
         cache = Path(temporary)
         for ext, part in (('.desc', DESC), ('.sa', STATE_A), ('.sb', STATE_B), ('.data', DATA), ('.root', ROOT),

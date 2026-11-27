@@ -1,6 +1,7 @@
 #include "startup_stubs/clear_value_format.h"
 #include "startup_stubs/debug_drain_budget.h"
 #include "startup_stubs/descriptor_heap_rules.h"
+#include "startup_stubs/resource_map_counts.h"
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -9,10 +10,35 @@
 #include <cstring>
 #include <limits>
 using namespace x2w_startup;
+
+void check_resource_map_counts()
+{
+    ResourceMapCounts<unsigned> maps;
+    assert(!maps.consume_map(1, 0));
+    maps.record_map(1, 0);
+    maps.record_map(1, 0);
+    maps.record_map(1, 1);
+    maps.record_map(2, 0);
+    assert(maps.size() == 2);
+    assert(!maps.consume_map(1, 2));
+    assert(maps.consume_map(1, 0));
+    assert(maps.consume_map(1, 0));
+    assert(!maps.consume_map(1, 0));
+    assert(maps.size() == 2);
+    maps.record_map(1, 2);
+    maps.forget(1);
+    maps.forget(1);
+    assert(maps.size() == 1);
+    assert(!maps.consume_map(1, 1) && !maps.consume_map(1, 2));
+    maps.record_map(1, 1);
+    assert(maps.consume_map(1, 1) && !maps.consume_map(1, 1));
+    assert(maps.size() == 1);
+    assert(maps.consume_map(2, 0));
+    assert(maps.size() == 0);
+}
+
 int main() {
-    std::uint64_t maps = 0; assert(!consume_map_count(maps));
-    maps = 2; assert(consume_map_count(maps) && maps == 1);
-    assert(consume_map_count(maps) && !consume_map_count(maps));
+    check_resource_map_counts();
     D3D12_RESOURCE_DESC d{}; D3D12_CLEAR_VALUE c{}, copy{};
     c.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     assert(!optimized_clear_value(nullptr, d, copy));

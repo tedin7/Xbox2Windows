@@ -4,6 +4,10 @@ New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiment
 
 [Indexed indirect draws from title memory](experiments/indirect-index-shadow.md) documents the opt-in index staging path and its WARP fixture.
 
+[Startup pixel image atomics](experiments/startup-pixel-image-atomics.md) documents the unsigned UAV readback and runtime format checks.
+
+[Startup pixel EXEC masks and binary16 compares](experiments/startup-pixel-interp-masks.md) records the explicit-LOD and mask subset proofs and their synthetic readback fixtures.
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
@@ -12608,6 +12612,8 @@ $env:X2W_D3D12_DEBUG = '1'
 ctest --preset dev --no-tests=error -R '^startup_xg_bc7_draw_' -V
 ```
 
+Before device creation, set `X2W_D3D12_DEBUG=1` for the debug layer or `X2W_D3D12_DEBUG=2` to also enable slower GPU-based validation.
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
@@ -15367,23 +15373,22 @@ and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
 64 differences with the store omitted and 128 with the layer changed. Use the
 startup_compute_image_store CTests above to repeat the comparison.
 
-For FP32 stores with DMASK `0x1` through `0xe`, the startup compute translator
-reads the texel through the same UAV, replaces the selected channels in
-consecutive VDATA order, and writes it back under EXEC. This covers 1D, 2D,
-2D-array and 3D output views. The version 2 manifest adds `uavload N` for
-each affected output. Dispatch requires typed UAV load and store support for
-the bound format. [D3D12 typed UAV load support](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads)
+For FP32 stores with DMASK `0x1` through `0xe`, the startup translator
+writes the entire texel under EXEC. Selected channels use consecutive VDATA
+words, and the other channels receive zero. This covers pixel 2D and 2D-array
+views and compute 1D, 2D, 2D-array and 3D views. A store alone needs typed UAV
+store support. An explicit load from a shared pixel UAV still needs typed UAV
+load support and contributes `uavload N` to the manifest.
 
-The read-modify-write assumes exclusive texel ownership by each active lane,
-including across groups and through aliasing UAV views, for the duration of
-the operation. The translator does not prove ownership. Lanes that write
-different channels of the same texel can lose updates. A partial D16 store
-remains unsupported.
+Partial compute D16 stores support 2D and 2D-array views. Selected channels
+consume the packed half-floats in VDATA order, low half first, and the other
+channels receive zero.
 
-The WARP fixtures dispatch two groups against an RGBA32_FLOAT UAV. They compare
-every channel of every texel, including untouched mips and slices, against a
-CPU reference for each of the 14 masks on all four shapes. Each control
-replaces the typed load with zero and must fail at the first preserved channel.
+The WARP compute FP32 fixtures compare every texel, including untouched mips and
+slices, against the CPU reference for all 14 partial masks on each of the four
+shapes. Compute D16 compares masks `0x3`, `0x9` and `0x7` against raw half-float
+references. Preserving the initial channels or filling them with nonzero
+values causes a readback mismatch.
 
 ```powershell
 ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_image_store_partial_(1d|2d|array|3d)_warp$' -V
@@ -15573,7 +15578,87 @@ lane masks and the discard destination. Run
 
 `tests/startup_gfx2hlsl_bit_alu_check.py` translates a source-built pixel stage that applies each operation to four lanes (the VOP1 operations alternate `_e32` and `_e64`) and evaluates the generated text with a small 32-bit HLSL evaluator against a reference written from the ISA description with bit loops, string reversal and integer arithmetic. The grid holds 17,459 inputs for `v_bfe_i32` (every offset and width 0 to 31 for 17 base words, plus offsets and widths above 31), 324 for `v_bcnt_u32_b32` and 81 for each scan. Each lowering also has a mutation that must read a wrong word: no sign extension, a subtracted addend, 0 instead of 0xffffffff for zero, no `31u -`, a negative value scanned unchanged, and no bit reversal. On `origin/main` the check fails with `Unsupported: v_bfe_i32`. `binary <llvm-mc>` reassembles the fixtures (llvm-mc 19 here; the CI job passes llvm-mc 15). The `draw` mode compiles the translated pair with FXC and DXC and draws one pixel per four input sets through `offscreen_check --startup-flat-param`; the inputs travel as flat vertex parameters so the compilers cannot fold them. It also draws the first set of each operation with the mutated lowering and requires the mutated words in the readback. The evaluator and reference results above come from Linux. The draw mode passed at `48d9571d` on Windows 11 build 26300.9974 with DXC 1.8.2502.11 and the Windows SDK 10.0.26100 FXC, with the debug layer on and 0 errors and 0 warnings. It passed on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). On each adapter, all 34 draws (17 through FXC `ps_5_1` and 17 through DXC `ps_6_0`) matched the reference words, and all 12 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_bit_alu_controls`, `startup_gfx2hlsl_bit_alu_warp` and `startup_gfx2hlsl_bit_alu_hardware`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) `v_xor3_b32` (`D = S0 ^ S1 ^ S2`, the LLVM 15 and RDNA 2 definition, as in the compute lowering of #1573) joins the same check with 729 grid inputs and three draw sets whose three sources differ in every byte (0x13579bdf, 0x2468ace0, 0xfedcba98 and their rotations); its mutation drops the third operand and reads `src0 ^ src1`. Source modifiers, `clamp`, `op_sel` and a wrong operand count stay refused. `binary` matches the xor3 words with llvm-mc 23; the draw has not run on Windows for it yet.
 
-`tools/startup/gfx2hlsl.py` lowers the gfx1013 binary16 interpolation pair `v_interp_p1ll_f16` / `v_interp_p2_f16` (#1996, item C). The attribute channel holds two binary16 values that the vertex stage exports with `compr`; half `h` of channel `c` is float channel `2 * c + h` of the parameter, and the pair becomes `(vD & 0xffff0000u) | f32tof16(i.paramN.<channel>)`, with the upper half of the destination kept. Only the plain form and `high` are lowered: `clamp`, an output modifier, a source modifier, a `p2` whose third source is not the matching `p1ll` result, and an attribute that the vertex stage does not export are refused. A vertex stage that packs the halves into a plain 32-bit export (no `compr`, e.g. with `v_cvt_pkrtz_f16_f32`) is lowered too, for all four channels: half `h` of channel `c` is `f16tof32(word_c >> 16 * h)`, carried by the extra interpolated outputs `hparamN_lo` and `hparamN_hi` that exist only when the pixel stage reads the attribute this way. An attribute exported both with `compr` and plain, and a read of a channel the plain export leaves `off`, are refused; the compr export still fills only `x` and `y`. `tests/startup_gfx2hlsl_interp_f16_check.py` evaluates the translated text on the CPU against a reference from the ISA layout and fails when the lowering is removed or the `high` bit is inverted; `binary <llvm-mc>` reassembles the fixtures and `draw` is the desktop readback (tests `startup_gfx2hlsl_interp_f16_controls`, `_warp` and `_hardware`). `v_interp_p2_f16` with `op_sel` 0x8 (word 0 bit 14; Mesa ACO's `v_interp_p2_hi_f16`) writes bits 31:16 of the destination and keeps bits 15:0: `(vD & 0xffffu) | (f32tof16(...) << 16)`. It is lowered only when the destination holds the low half written by a preceding plain `p2` that no reader has consumed yet; the pair then defines the whole register, which any reader may use. The semantics come from Mesa `aco_assembler.cpp` (the `op_sel` value 0x8 of `v_interp_p2_hi_f16`) and `aco_register_allocation.cpp` (`add_subdword_definition` places a 16-bit `p2` result at byte 2 of a register that holds another 16-bit value, so the instruction must keep the low half); LLVM 15 leaves word 0 bits 14:11 undefined for this instruction (`VOP3Interp_gfx10`) and its assembler rejects `op_sel` here, so the fixture sets the bit on the assembled plain word. `tests/startup_gfx2hlsl_interp_p2_hi_check.py` evaluates the translated text against a reference from that layout and fails when the high half is written as the low half or the low half is cleared (test `startup_gfx2hlsl_interp_p2_hi_controls`). Every other `op_sel` value, `op_sel` on `v_interp_p1ll_f16`, and any read of the upper 16 bits of a plain `p2` destination stay refused. The kept low half rests on the ACO sources, not on an ISA statement or a hardware read-back; a hardware draw on RDNA that reads back both halves would settle it.
+## Startup pixel binary16 interpolation and rounding
+
+The gfx1013 binary16 interpolation pair obtains the pixel value from a rasterizer interpolant.
+A compressed vertex export maps attribute channel `c`, half `h`, to float channel `2*c+h`.
+A plain packed export supplies separate `hparamN_lo` and `hparamN_hi` interpolants.
+The destination of `v_interp_p2_f16` keeps its other half. When p2 and p1ll share a destination,
+that half still belongs to the omitted binary32 partial result. The translator refuses a read
+of that unmodeled half. [RDNA 2 ISA reference, PDF pp.102, 188, 190](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+
+A forward control-flow proof tracks both halves of an omitted result separately. Full
+32- and 64-bit VALU results and full-width image results replace the written registers.
+Half writes replace only their destination half. Saved EXEC pairs can restore the mask
+under which a write is valid. A later write keeps older covered masks. An EXEC update
+bounded by a covered mask preserves coverage for lane-local reads. The Python controls
+exercise consecutive AND and AND-NOT narrowing and reject widening OR.
+A forward must-dataflow pass intersects saved EXEC facts at joins. Restoring
+a saved superset of the p1ll mask lets a write replace all omitted lanes.
+Ordinary vector memory accesses and explicit-LOD samples can read within
+covered EXEC. Implicit-LOD, bias and cross-lane LDS accesses require the
+omitted source to be replaced.
+Compressed exports to R-only render targets need only the first register's low half and
+still require the second register for blending. A write to an entry barycentric register
+is allowed when no reachable interpolation uses the old entry value.
+[RDNA 2 ISA reference, PDF p.107](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+
+`s_round_mode 0xc` keeps binary32 rounding at nearest even and selects rounding toward zero
+for binary16 and binary64. A forward dataflow pass selects an integer binary32-to-binary16
+converter for the mixed FMA half results. Other mode-sensitive half or double producers
+are refused, as are half producers at a join with mixed modes.
+[RDNA 2 ISA reference, PDF pp.45, 55, 137, 173–174](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+
+Run the Python controls with `python3 -B tests/startup_gfx2hlsl_interp_f16_check.py` and
+`python3 -B tests/startup_gfx2hlsl_interp_p2_hi_check.py`. The varying 8 × 4 triangle
+covers both arms of a lane branch, preservation of both destination halves, reuse of the
+barycentric registers and mixed FMA rounding. Its GPU reference compares all four output
+words at each pixel. Three mutated shaders must produce readback mismatches.
+The Python controls passed on Linux x86-64 with Python 3.14.8. Seven previously accepted
+fixture pairs generated byte-identical vertex and pixel HLSL against `44043a98b`.
+The Windows readback tests are pending. On Windows, select the new draws with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_interp_f16_flow_(warp|hardware)$' -V`.
+
+The EXEC/half-write draw compares an R16_UNORM export after restoring a narrower EXEC mask
+and two full RGBA readbacks after restoring the original EXEC, one with a 64-bit overwrite.
+The R16_UNORM control with the restore removed must mismatch. The Python controls passed on
+Linux x86-64 with Python 3.14.8. The Windows readbacks are pending. Select the draw with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_interp_f16_exec_halves_(warp|hardware)$' -V`.
+
+The pixel scan also accepts lane-local reads of an omitted partial interpolant when a
+whole-register overwrite covered the live mask, even if the original EXEC alias was
+overwritten. The live mask must come from entry EXEC and may only shrink in place. The
+scan propagates stale helper-lane values through vector operations. A whole write from
+clean sources under an EXEC covering the original interpolant's EXEC clears taint. A whole
+write under a whole-quad EXEC that contains the proven live mask also clears taint. This
+includes restoring a saved copy of that whole-quad EXEC. Derivative operations, cross-lane
+reads, mask writes and memory writes that may run in helper lanes reject tainted operands.
+Plain and comparison samples use the existing explicit-level check on the lowered call.
+[RDNA 2 ISA, SOP1](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf),
+[D3D11.3 functional specification, §16.13](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#PixelShaderDiscardedPixelsandHelperPixels),
+[Shader Model 6.7 helper lane rules](https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_7_Wave_Ops_Include_Helper_Lanes.html)
+
+The Python checks passed on Linux x86-64 with Python 3.14.8 using
+`nice -n 15 python3 -B tests/startup_gfx2hlsl_interp_f16_check.py` and
+`nice -n 15 python3 -B tests/startup_gfx2hlsl_interp_p2_hi_check.py`.
+Against `f18dedec3`, 22 distinct legacy HLSL outputs matched byte for byte and the four new
+positive cases reproduced the old `v_sub_f32` refusal. Removing taint propagation, allowing a
+whole write under exact EXEC to clear taint, and keeping the live proof across an arbitrary
+write each made its Python refusal control fail. Against `c953f83f5`, 26 distinct HLSL
+outputs matched byte for byte. The new clobbered-mask fixture reproduced the old
+`v_sub_f32` refusal on that revision. Allowing a clear under WQM from an unrelated mask
+made the implicit-sample control fail. Dropping the subset check made its independently
+shrunk mask control fail.
+
+The WARP leg compares all 64 RGBA32F pixels against a CPU reference for an 8 × 8 target,
+including the triangle edge through partial quads and the coverage removed by the live
+mask shrink. The five draws cover the interpolation lerp, a whole-quad clear before implicit
+sampling, explicit level zero, plain sampling lowered to level zero, and the lerp after
+`s_buffer_load_dwordx2` clobbers the original EXEC copy. The last reference has 25 shaded
+pixels and 39 clear pixels. Changing the lerp weight or the coordinate after the whole-quad
+clear must cause a pixel mismatch. The Windows readbacks are pending. Select the controls and
+WARP draw with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_interp_f16_(controls|helper_taint_warp)$' -V`.
 
 The startup pixel stage lowers DPP16 quad swaps (#2125 item B): `v_mov_b32_dpp` and the VOP2 forms in the integer and binary32 operation tables with `quad_perm:[1,0,3,2]`, `[2,3,0,1]` or `[3,2,1,0]` and full `row_mask`/`bank_mask` read the source from the neighbouring pixel of the 2x2 quad (X, Y or diagonal), written as `QuadReadAcrossX`, `QuadReadAcrossY` and `QuadReadAcrossDiagonal` (SM 6.0, helper lanes included). The second source of a VOP2 keeps the lane's own register. The form needs a straight-line pixel stage at entry EXEC, proven whole-quad by an earlier `s_wqm_b64 exec, exec` (a partly covered quad has inactive source lanes that the hardware masks and `QuadReadAcross*` does not; a later write to EXEC or a restored older copy drops the proof), and plain VGPR operands. A binary32 source may carry the `neg`/`abs` modifier (`-vN`, `|vN|`, `-|vN|`): the permuted word is read from the neighbour first and the modifier applies to that value (RDNA 2 ISA 12.19, LLVM 15 prints them on the `_dpp` spelling), while integer sources, SGPR sources and every other modifier stay refused. Vertex stages, broadcast and pair selections (items A and C), row shifts, mirrors, DPP8, partial masks and operations without a table entry are refused. `fi:1` (fetch inactive) is accepted under the same whole-quad proof, where no source lane is disabled, and gives the same translation. FXC ps_5_1 has no quad intrinsic, so `translate_to` compiles a pair that uses one with DXC as vs_6_0/ps_6_0 (`X2W_DXC`, then PATH) and refuses it when no DXC exists. `tests/startup_gfx2hlsl_dpp_quad_swap_check.py` builds three pixel programs from the lane rule (OR and move forms, plus `v_min_u32_dpp` of the exchanged and own positions, #2023 item H, whose reference is the integer unsigned minimum and which also rejects a maximum) (the packed position in v0, the neighbour at x^1, y^1 or both, an own-lane control), draws 16 x 16 pixels and compares every word with an integer reference; three wrong exchanges, a missing exchange and (for the minimum) a maximum must read a different image, and a reference with one swap dropped must be rejected. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_quad_swap_' -V`. The Python controls run on Linux; the draws need DXC and `offscreen_check` on Windows. `startup_gfx2hlsl_dpp_quad_swap_controls` checks `-v0` and `|v0|` against the emitted `QuadReadAcrossX` text and keeps an integer `-v0` refused; the draw mode also checks all 256 pixels of a binary32 multiply-by-one fixture. Its three channels use NEG, ABS and NEG+ABS on different neighbours, and each dropped modifier produces a mismatch. The binary mode reassembles the modified DPP source words. [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
 
@@ -17296,15 +17381,31 @@ cmake --build --preset dev --target startup_resource_retire_title startup_resour
 ctest --preset dev --no-tests=error -R '^startup_resource_retire(_title)?_' -V
 ```
 
-## Single-wave `TG_SIZE_EN` wave-ID folding in the startup compute translator
+## Guest wave ID and wave count in the startup compute translator
 
-[The startup translator](../tools/startup/gfx2hlsl.py) accepts `COMPUTE_PGM_RSRC2.TG_SIZE_EN` (bit 10) in `ComputePipeline` when the thread-group size is at most 32 threads (`x * y * z <= 32`, one wave per workgroup). The `TG_SIZE` entry SGPR sits immediately after `USER_SGPR` and any enabled `TGID_X/Y/Z` SGPRs (`user + len(groups)`) and is tagged `('tg_size',)`. Only `s_and_b32 R, TG, 0xfc0` (or `0xfc0, TG`) into an SGPR `R <= 105` is accepted for an untouched `TG_SIZE` register: because a single-wave group has wave index `TG_SIZE[11:6] == 0`, it lowers to `R = 0u; scc = false;` with `R` tracked as `('const', 0)` (feeding `v_mbcnt_lo_u32_b32` as a known zero base). Every other read of an untouched `('tg_size',)` register (other masks, moves, arithmetic, vector instructions, or direct `v_mbcnt_lo_u32_b32`) is refused, while overwriting `TG` restores ordinary scalar behavior. Larger groups (`> 32` threads) with `TG_SIZE_EN` remain refused in `ComputePipeline`, and `tools/compute_store_aot.py` continues to refuse `TG_SIZE_EN` unconditionally.
+The startup translator places the `COMPUTE_PGM_RSRC2.TG_SIZE_EN` entry word
+after the user and enabled group-ID SGPRs. An `s_and_b32` into an ordinary
+SGPR can read the wave ID with mask `0xfc0` or the wave count with `0x3f`.
+For a known guest wave size, the ID is the x-major flat thread index divided
+by the guest wave size and shifted left by six. The count is the group size
+divided by the guest wave size, rounded up. The last wave can be partial.
+The existing per-thread EXEC model still applies and its unsupported lane
+operations still refuse. Without a wave-size proof, the translator only
+accepts the legacy wave-ID fold for groups of up to 32 threads. Other reads
+of the untouched word, including first-wave and ordered-append fields,
+remain unsupported.
+
+The WARP fixture compares both fields against a CPU reference for wave32
+groups of 33, 48, 64 and 96 threads and wave64 groups of 64 and 128 threads.
+It checks 320 words per dispatch, including sentinel words past the last
+thread. Three mutations exercise the readback: swapping the shift for each
+wave size and zeroing the wave-count result.
 
 [The `TG_SIZE_EN` check](../tests/startup_compute_tg_size_check.py) verifies SGPR placement, `s_and_b32` folding, `v_mbcnt_lo_u32_b32` lowering, overwrite/branch/refusal controls, and a two-group `4x2x2` WARP dispatch (`320` words compared, `0` mismatches on Microsoft Basic Render Driver `10.0.26100.9818`, with `dropped-base` rejected at word 5 and `swapped-mask` rejected at word 8).
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tests/startup_compute_tg_size_check.py
-ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_' -V
+ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_.*(controls|warp)$' -V
 ```
 
 ## Explicit-level 1D image sampling in the startup translator

@@ -127,6 +127,7 @@ jobs:
               (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_float_round_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_2d_array_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_cube_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_a16_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_a16_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_image_load_d16_check.py", "binary", "llvm-mc-15"], {}),
@@ -271,6 +272,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_arity_check.py \
           tests/startup_gfx2hlsl_scalar_table_arity_check.py \
             tests/startup_image_2d_array_check.py \
+            tests/startup_image_cube_check.py \
             tests/startup_image_sample_a16_check.py \
             tests/startup_image_load_d16_check.py \
             tests/startup_host_cpu_check.py \

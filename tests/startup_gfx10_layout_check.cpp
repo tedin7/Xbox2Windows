@@ -307,6 +307,25 @@ void check_address_textures()
     v.Texture3D.MipLevels = 10;
     fits("3D view on 2D chain", false);
 
+    auto cubes = texture(2, 2, 1, 12, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    v = {};
+    v.Format = cubes.Format;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    v.TextureCubeArray = {0, 1, 6, 1, 0};
+    if (!x2w_startup::desktop_address_array(cubes) || x2w_startup::address_view_fits(cubes, v) ||
+        !x2w_startup::address_view_fits(cubes, v, true))
+        fail("opt-in view of the second cube");
+    v.TextureCubeArray.NumCubes = ~0u;
+    if (x2w_startup::address_view_fits(cubes, v, true)) fail("overflowing cube count");
+    v.TextureCubeArray.NumCubes = 1;
+    v.TextureCubeArray.First2DArrayFace = 7;
+    if (x2w_startup::address_view_fits(cubes, v, true)) fail("cube array extends past the last face");
+    v.TextureCubeArray.First2DArrayFace = 6;
+    cubes.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    if (!x2w_startup::console_address_texture(cubes) || !x2w_startup::address_view_fits(cubes, v, true))
+        fail("console-swizzled view of the second cube");
+
     D3D12_RESOURCE_DESC vol = texture(32, 32, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     vol.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     vol.DepthOrArraySize = 16;

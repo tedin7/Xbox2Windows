@@ -14,6 +14,7 @@
 // After the fence every subresource of the four textures is written to <pixels>.uav, and the debug layer's
 // errors are counted when it is on. The rw cases use 8x8 textures and two draws that add a colour to each texel.
 // The stale cases read an untouched copy from entry 1.
+// The atomic cases use one word per texel in R32_UINT, R32_FLOAT and R32_SINT views.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <wrl/client.h>
@@ -41,6 +42,7 @@ std::uint32_t array_sentinel(UINT s, UINT m, UINT texel, UINT c) { return 0xd000
 struct Fixture {
     ID3D12Device* desktop = nullptr;
     bool array_mode = false;
+    bool atomic_mode = false;
     bool read_write = false;
     UINT side = side_default;
     void* resources[textures]{};
@@ -82,6 +84,12 @@ void draw_twice(void* list)
 
 D3D12_RESOURCE_DESC texture_desc(UINT t)
 {
+    if (fixture.atomic_mode) {
+        constexpr DXGI_FORMAT formats[]{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_SINT,
+                                        DXGI_FORMAT_R32_TYPELESS};
+        return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, fixture.side, fixture.side, 1, mips,
+                formats[t], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    }
     return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, fixture.side, fixture.side, 1, mips,
             t == 3 ? DXGI_FORMAT_R32G32B32A32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0},
             D3D12_TEXTURE_LAYOUT_UNKNOWN, t == 2 ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
@@ -141,11 +149,16 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, UINT64
 // Fills every subresource of the four textures with its sentinels (to_textures) or copies them all back.
 bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>* words)
 {
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[mips]{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[textures][mips]{};
     UINT64 total = 0;
-    const auto desc = texture_desc(0);
-    device->GetCopyableFootprints(&desc, 0, mips, 0, footprints, nullptr, nullptr, &total);
-    if (!total || total == ~UINT64{0}) return false;
+    for (UINT t = 0; t < textures; ++t) {
+        const auto desc = texture_desc(t);
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&desc, 0, mips, 0, footprints[t], nullptr, nullptr, &bytes);
+        if (!bytes || bytes == ~UINT64{0}) return false;
+        if (bytes > total) total = bytes;
+    }
+    const UINT channels = fixture.atomic_mode ? 1 : 4;
     constexpr UINT64 alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     const UINT64 stride = (total + alignment - 1) & ~(alignment - 1);
     auto staging = buffer(device, to_textures ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, stride * textures,
@@ -160,10 +173,11 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
                 const UINT n = fixture.side >> m;
                 for (UINT y = 0; y < n; ++y)
                     for (UINT x = 0; x < n; ++x)
-                        for (UINT c = 0; c < 4; ++c) {
+                        for (UINT c = 0; c < channels; ++c) {
                             const std::uint32_t value = fixture.read_write && t < 2 && m == 0
                                 ? pattern(0, y * n + x, c) : sentinel(t, m, y * n + x, c);
-                            std::memcpy(memory + t * stride + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + (x * 4 + c) * 4,
+                            const auto& f = footprints[t][m];
+                            std::memcpy(memory + t * stride + f.Offset + y * f.Footprint.RowPitch + (x * channels + c) * 4,
                                         &value, 4);
                         }
             }
@@ -175,7 +189,7 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
         barrier(copier.list.Get(), texture, D3D12_RESOURCE_STATE_COMMON, state);
         for (UINT m = 0; m < mips; ++m) {
             D3D12_TEXTURE_COPY_LOCATION placed{staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            placed.PlacedFootprint = footprints[m];
+            placed.PlacedFootprint = footprints[t][m];
             placed.PlacedFootprint.Offset += t * stride;
             D3D12_TEXTURE_COPY_LOCATION subresource{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             subresource.SubresourceIndex = m;
@@ -191,9 +205,10 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
         for (UINT m = 0; m < mips; ++m) {
             const UINT n = fixture.side >> m;
             for (UINT y = 0; y < n; ++y)
-                for (UINT x = 0; x < n * 4; ++x) {
+                for (UINT x = 0; x < n * channels; ++x) {
                     std::uint32_t value = 0;
-                    std::memcpy(&value, memory + t * stride + footprints[m].Offset + y * footprints[m].Footprint.RowPitch + x * 4, 4);
+                    const auto& f = footprints[t][m];
+                    std::memcpy(&value, memory + t * stride + f.Offset + y * f.Footprint.RowPitch + x * 4, 4);
                     words->push_back(value);
                 }
         }
@@ -275,6 +290,7 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     const std::string which(mode);
     fixture.desktop = desktop;
     fixture.array_mode = which.rfind("arr-", 0) == 0;
+    fixture.atomic_mode = which.rfind("atomic-", 0) == 0;
     fixture.read_write = GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV_RW", nullptr, 0) != 0;
     fixture.side = fixture.read_write ? 8 : side_default;
     const bool stale = which == "rw-stale" || which == "arr-rw-stale";
@@ -369,6 +385,22 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     const Word cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
     if (!cpu || !gpu || stride < 32) return 73;
+
+    if (fixture.atomic_mode) {
+        UINT entry = 0;
+        if (which == "atomic-float") entry = 1;
+        else if (which == "atomic-sint") entry = 2;
+        else if (which == "atomic-cast") entry = 3;
+        else if (which != "atomic-uint") return 74;
+        const auto format = entry == 3 ? DXGI_FORMAT_R32_UINT : texture_desc(entry).Format;
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
+        invoke(guest, 19, ptr(fixture.resources[entry]), 0, ptr(&view), cpu);
+        invoke(list, 32, 1, ptr(&heap));
+        invoke(list, 36, 0, gpu);
+        std::printf("pixel uav case %s: table entry 0, title descriptor stride %u\n", which.c_str(), stride);
+        invoke(list, 12, 3, 1);
+        return 0;
+    }
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
     invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&view), cpu + 0 * stride);

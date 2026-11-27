@@ -383,7 +383,7 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
     if (!cache_path(path, L"", output_key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     const UINT constants = (std::max)(1u, entries + (tr.dynamic_heap ? 1u : 0u));
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants,
+    if (FAILED(create_title_translated_root(device_of(the_device), constants,
             static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
@@ -527,9 +527,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 break;
             }
             std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+            if ((reason = refuse_native_buffer_addressing(words))) break;
             const std::uint32_t at = slot.at + index * slot.times;
             const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-            const UINT stride = (words[1] >> 16) & 0x3fff;
             if (!(words[0] | words[1] | words[2] | words[3])) {
                 // A null buffer descriptor (all four words zero, no records): every read of it is out of range and the
                 // hardware returns zero, so the program's index word is 0 and the dispatch reads heap record 0.
@@ -539,7 +539,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "a heap index word is not in the list's upload memory";
                     break;
                 }
-                if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                if (u64{at} + 4 > x2w_startup::buffer_descriptor_bytes(words[1], words[2], words[3])) {
                     reason = "a heap index word is outside its table buffer";
                     break;
                 }
@@ -647,7 +647,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // word verbatim, including unknown formats handled by the generated switch.
             if (slot.heap && formatted_inputs[i] && words[0] == view_token_magic) {
                 std::uint32_t format = 0;
-                if (const char* refusal = formatted_buffer_word3(words, format)) {
+                if (const char* refusal = formatted_buffer_word3(words, format, extended_buffer_formats())) {
                     reason = refusal == x2w_startup::undecoded_view_format
                         ? "a formatted input view has no buffer format code"
                         : "a formatted input has no word 3 the program decodes";
@@ -693,7 +693,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         // Native buffer descriptors must cover a placement that aliases title memory.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
-        const u64 bytes = u64{stride ? stride : 1} * words[2];
+        const u64 bytes = x2w_startup::buffer_descriptor_bytes(words[1], words[2], words[3]);
         const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
@@ -738,7 +738,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 break;
             }
             std::memcpy(word, view.words, sizeof(word));
-            if (formatted_buffer_word3(word, format)) {
+            if (formatted_buffer_word3(word, format, extended_buffer_formats())) {
                 reason = "a formatted input has no word 3 the program decodes";
                 std::memcpy(words, view.words, sizeof(view.words));
             }
@@ -768,7 +768,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             InterlockedIncrement(&compute_aliased_input_copies);
         }
     }
-    ID3D12DescriptorHeap* view_heap = draw_heap;
+    ID3D12DescriptorHeap* view_heap = draw_heaps[0].heap;
     UINT first = 0;
     if (!reason && tr->dynamic_heap) {
         if (dispatch.signature) reason = "translated indirect Dispatch requires fixed-table raw buffers";
@@ -782,6 +782,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!view_heap) reason = "the dynamic resource heap could not be bound";
         }
     }
+    const UINT twins = static_cast<UINT>(tr->integer_srvs.twins.size());
+    const UINT extra_srvs = tr->integer_srvs.descriptors();
+    const UINT n = static_cast<UINT>(count) + extra_srvs;
+    if (!reason && !tr->dynamic_heap) reason = allocate_draw_table(self, n, view_heap, first);
     timer.valued();
     if (reason) {
         if (!tr->first_refusal) {
@@ -798,16 +802,6 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (!dispatch.signature && first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16))
             log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return reason;
-    }
-    const UINT twins = static_cast<UINT>(tr->integer_srvs.twins.size());
-    const UINT extra_srvs = tr->integer_srvs.descriptors();
-    const UINT n = static_cast<UINT>(count) + extra_srvs;
-    if (!tr->dynamic_heap) {
-        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
-        if (first + n > draw_heap_size) {
-            first = 0;
-            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
-        }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
@@ -856,9 +850,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    if (tr->dynamic_heap || !pass.heap_set) {
+    if (tr->dynamic_heap || pass.bound_view_heap != view_heap) {
         x2w_startup::bind_translated_heaps(list, view_heap, nullptr);
-        pass.heap_set = !tr->dynamic_heap;
+        pass.bound_view_heap = tr->dynamic_heap ? nullptr : view_heap;
         pass.bound_sampler_heap = nullptr;
     }
     list->SetPipelineState(tr->pipeline.Get());

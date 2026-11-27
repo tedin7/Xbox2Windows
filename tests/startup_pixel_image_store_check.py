@@ -142,6 +142,16 @@ def read_write_controls():
         decoded_pipe = G.Pipeline(VS_WORDS, words, rw_root(), refusals=census)
         assert not census and decoded_pipe.hlsl_ps() == hlsl and decoded_pipe.manifest() == manifest
 
+        full_store = (b'\x28' + RW_STORE[1:]) if array else RW_STORE
+        partial_store = full_store[:1] + b'\x09' + full_store[2:]
+        partial_words = words.replace(full_store, partial_store)
+        partial = G.Pipeline(VS_WORDS, partial_words, rw_root())
+        partial_hlsl = partial.hlsl_ps()
+        assert store + ' asfloat(uint4(v32, 0u, 0u, v33));' in partial_hlsl, partial_hlsl
+        assert partial_hlsl.count(f'w0[{coord}]') == 2, partial_hlsl
+        # The explicit image_load still needs typed UAV loads on the shared binding.
+        assert 'uavload 0' in partial.manifest().splitlines()
+
         stale = G.Pipeline(VS_WORDS, rw_program(array=array, stale=True), rw_root())
         assert 'srv 0 %s table 0 32' % kind in stale.manifest() and 'uavload' not in stale.manifest()
 
@@ -332,23 +342,22 @@ def controls():
         assert 'modifier d16' in str(error), error
     else:
         raise AssertionError('pixel 2D-array d16 store was accepted')
-    # A partial channel mask, encoded: the decoder sizes VDATA from the mask (v[4:6], v4). The store reads the texel
-    # back, replaces only the selected channels in order from consecutive VDATA registers, and writes it again.
-    for mask, data, line in (
-            (0x7, 'v[4:6]', 't = w0[uint2(v0, v1)]; t.x = asfloat(v4); t.y = asfloat(v5); t.z = asfloat(v6); '
-                            'w0[uint2(v0, v1)] = t;'),
-            (0x1, 'v4', 't = w0[uint2(v0, v1)]; t.x = asfloat(v4); w0[uint2(v0, v1)] = t;'),
-            (0x5, 'v[4:5]', 't = w0[uint2(v0, v1)]; t.x = asfloat(v4); t.z = asfloat(v5); w0[uint2(v0, v1)] = t;')):
+    # The decoder sizes VDATA from DMASK. The typed store supplies zeros for unselected channels.
+    for mask, data, values in (
+            (0x7, 'v[4:6]', 'v4, v5, v6, 0u'),
+            (0x1, 'v4', 'v4, 0u, 0u, 0u'),
+            (0x5, 'v[4:5]', 'v4, 0u, v5, 0u')):
         store = patched(1, 0, mask)
         decoded = D.decode_instruction(store, 0)[2]
         assert decoded.startswith('image_store %s, ' % data) and 'dmask:%#x' % mask in decoded, decoded
         partial_pipe = translate(with_store(store))
         ps = partial_pipe.hlsl_ps()
-        assert '    { %s }' % line in ps and STORE_LINE not in ps, ps
-        # The read-back needs typed UAV load, so the manifest says so right after the uav line.
-        assert 'uav 0 tex2d table 0 0\nuavload 0\n' in partial_pipe.manifest(), partial_pipe.manifest()
-        print('partial dmask %#x: { %s }' % (mask, line))
-    # The mask must match the data registers, and an empty mask or a 16-bit partial store stays refused.
+        line = f'w0[uint2(v0, v1)] = asfloat(uint4({values}));'
+        assert ps.count(line) == 1 and ps.count('w0[uint2(v0, v1)]') == 1, ps
+        manifest = partial_pipe.manifest().splitlines()
+        assert 'uav 0 tex2d table 0 0' in manifest and 'uavload 0' not in manifest, manifest
+        print('partial dmask %#x: %s' % (mask, line))
+    # The mask must match the data registers. An empty mask stays refused.
     for mask, data, needle in ((0x7, 'v[4:7]', 'three VGPRs expected'), (0x3, 'v4', 'two VGPRs expected'),
                                (0x0, 'v4', 'no channel selected')):
         try:
@@ -477,38 +486,34 @@ def check_draw(dxc, renderer, adapter):
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
 
-        # Partial dmask 0x5 stores v4 (1.0) to x and v5 (2.0) to z; y and w keep the starting value -1.0. Controls:
-        # without the read-back the other channels become 0; with the data in the wrong channels x and z differ.
+        # Preserving the old channels with read-modify-write would leave -1.0 and fail the zero comparison.
         partial_source = translate(with_store(patched(1, 0, 0x5))).hlsl_ps()
-        partial_want = ','.join((BITS[0], 'bf800000', BITS[1], 'bf800000'))
+        partial_want = ','.join((BITS[0], '00000000', BITS[1], '00000000'))
         run = draw(partial_source, 'partial_store', partial_want)
         if run.returncode:
             raise AssertionError('partial store draw failed\n%s\n%s' % (run.stdout, run.stderr))
-        print('draw dmask 0x5: texel (1, 2) = %s, other channels and texels untouched' % partial_want)
-        readback = 't = w0[uint2(v0, v1)];'
-        for label, text in (('partial no read-back', partial_source.replace(readback, 't = 0;')),
-                            ('partial channels swapped', partial_source.replace('t.x = asfloat(v4); t.z = asfloat(v5);',
-                                                                               't.z = asfloat(v4); t.x = asfloat(v5);'))):
+        print('draw dmask 0x5: texel (1, 2) = %s, other texels untouched' % partial_want)
+        values = 'uint4(v4, 0u, v5, 0u)'
+        for label, replacement in (('partial channels preserved', 'uint4(v4, 0xbf800000u, v5, 0xbf800000u)'),
+                                   ('partial channels swapped', 'uint4(v5, 0u, v4, 0u)')):
+            text = partial_source.replace(values, replacement)
             assert text != partial_source, label
             run = draw(text, label.replace(' ', '_'), partial_want)
             if run.returncode == 0 or 'texel_mismatch x=1 y=2' not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
 
-        # Every partial mask the lowering accepts: the k-th selected channel takes the k-th data register (v4..), the
-        # others keep the starting value -1.0. Control: a store of all four channels from v4..v7 overwrites them.
         for mask in (0x1, 0x2, 0x4, 0x7, 0x9):
             channels = [c for c in range(4) if mask >> c & 1]
-            want = ','.join(BITS[channels.index(c)] if c in channels else 'bf800000' for c in range(4))
+            want = ','.join(BITS[channels.index(c)] if c in channels else '00000000' for c in range(4))
             source_m = translate(with_store(patched(1, 0, mask))).hlsl_ps()
             label = 'dmask_%#x' % mask
             run = draw(source_m, label, want)
             if run.returncode:
                 raise AssertionError('partial store %#x draw failed\n%s\n%s' % (mask, run.stdout, run.stderr))
-            print('draw dmask %#x: texel (1, 2) = %s, other channels and texels untouched' % (mask, want))
-            start = source_m.index('{ t = w0[')
-            end = source_m.index('= t; }', start) + len('= t; }')
-            full = source_m[:start] + 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));' + source_m[end:]
+            print('draw dmask %#x: texel (1, 2) = %s, other texels untouched' % (mask, want))
+            store = next(line for line in source_m.splitlines() if 'w0[uint2(v0, v1)] = asfloat(uint4(' in line)
+            full = source_m.replace(store, '    w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));')
             run = draw(full, label + '_all_four', want)
             if run.returncode == 0 or 'texel_mismatch x=1 y=2' not in run.stderr:
                 raise AssertionError('control all-four-channels %#x was not detected\n%s\n%s' % (mask, run.stdout, run.stderr))

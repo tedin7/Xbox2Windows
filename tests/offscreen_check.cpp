@@ -1006,6 +1006,12 @@ OperationResult run_mesh_textured(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::textured));
 }
 
+OperationResult run_mesh_texture_load(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::mesh_texture_load));
+}
+
 OperationResult run_compute_mesh_texture(const OperationContext& ctx)
 {
     const MeshTextureProducers producers{ctx.argv[6], ctx.argc >= 8 ? ctx.argv[7] : nullptr, ctx.argc == 9};
@@ -1317,6 +1323,14 @@ OperationResult run_startup_sampler_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_startup_sampler_reduction(const OperationContext& ctx)
+{
+    const int result = check_startup_sampler_lod(ctx.device, false, {}, nullptr, 0.0f, true);
+    if (result == 77) return {OutcomeKind::skip, "skip: sampler min/max or required R32_FLOAT features unavailable"};
+    if (result) return {OutcomeKind::fail, "sampler reduction readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-bias <ps.cso> <sampler manifest line> <expected red>
 OperationResult run_startup_sampler_bias(const OperationContext& ctx)
 {
@@ -1352,6 +1366,7 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
+    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
     const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
     const bool one_dimensional_mips = std::strcmp(ctx.argv[2], "--startup-image-1d-mips") == 0;
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
@@ -1373,7 +1388,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
-                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
+                           cube ? 2 : (array_mips || one_dimensional_mips ? 3 : 1),
+                           one_dimensional, two_dimensional, 0, 0, cube);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1451,6 +1467,17 @@ OperationResult run_startup_image_store(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
         return {OutcomeKind::fail, "image store readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-atomic <vs.cso> <ps.cso> <fixture.bin> <uint|sint>
+OperationResult run_startup_image_atomic(const OperationContext& ctx)
+{
+    const bool signed_view = std::strcmp(ctx.argv[6], "sint") == 0;
+    if (!signed_view && std::strcmp(ctx.argv[6], "uint") != 0)
+        return {OutcomeKind::fail, "atomic view must be uint or sint"};
+    if (check_startup_image_atomic(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], signed_view))
+        return {OutcomeKind::fail, "image atomic readback differs"};
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1535,6 +1562,7 @@ OperationResult run_startup_descriptor_limits(const OperationContext& ctx)
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
 // row by row. Reports the first differing pixel and the number of differing pixels.
 // --startup-pixel-buffer-words appends comma-separated hex words for b0 and the raw t0 buffer.
+// --startup-pixel-image-words appends a sampler manifest line for the three-mip 2D fixture.
 OperationResult run_startup_pixel_words(const OperationContext& ctx)
 {
     const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
@@ -1558,7 +1586,12 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
                           mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
                                 cull, winding == "ccw", 6);
-    } else if (std::string_view(ctx.argv[2]) == "--startup-pixel-buffer-words") {
+    } else if (operation == "--startup-pixel-image-words") {
+        std::vector<float> colors(pixels.size());
+        check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, colors.data(), ctx.argv[8],
+                               false, 3, false, true, 0, 3, false, UINT(width), UINT(height));
+        std::memcpy(pixels.data(), colors.data(), pixels.size() * sizeof(std::uint32_t));
+    } else if (operation == "--startup-pixel-buffer-words") {
         const auto entry = parse_hex_words(ctx.argv[8]);
         const auto buffer = parse_hex_words(ctx.argv[9]);
         if (entry.empty() || entry.size() > 32 || buffer.empty())
@@ -1821,6 +1854,8 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-atomic", 7, 7, nullptr, kNoGate, run_startup_image_atomic},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},
@@ -1833,6 +1868,7 @@ const OperationSpec kOperations[] = {
     {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-image-words", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-r16-unorm", 9, 9, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
@@ -1902,6 +1938,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
+    {"--mesh-texture-load", 6, 6, nullptr, kNoGate, run_mesh_texture_load},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
     {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
      kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
@@ -1940,6 +1977,7 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-reduction", 3, 3, nullptr, kNoGate, run_startup_sampler_reduction},
     {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
     {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
     {"--startup-sampler-bias", 6, 6, nullptr, kNoGate, run_startup_sampler_bias},

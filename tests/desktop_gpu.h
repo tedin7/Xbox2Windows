@@ -22,13 +22,14 @@ void check_dynamic_sampler_index(ID3D12Device* device);
 // Returns 0 on the expected readback, 1 otherwise, 77 when R32_FLOAT lacks a needed capability.
 int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp,
                               D3D12_SHADER_BYTECODE translated = {}, const char* sampler_line = nullptr,
-                              float expected_bias_pixel = 0.0f);
+                              float expected_bias_pixel = 0.0f, bool reduction_draw = false);
 float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                  std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
+                            float* colors, const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false,
-                            UINT first_mip = 0, UINT view_levels = 0);
+                            UINT first_mip = 0, UINT view_levels = 0, bool cube = false, UINT width = 1,
+                            UINT height = 1);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64], bool array, bool sampled,
                                   bool half_float = false, bool red_only = false,
@@ -36,6 +37,8 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
                                   bool descriptor_bound = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
+int check_startup_image_atomic(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                               const char* fixture_path, bool signed_view);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
@@ -74,7 +77,7 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
 // multi_primitive: one native color draw whose export trace size comes from the fixture.
-enum class MeshDrawMode { color, textured, depth_pair, multi_primitive };
+enum class MeshDrawMode { color, textured, mesh_texture_load, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;

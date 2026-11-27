@@ -208,11 +208,17 @@ def main(scene, backend):
         print("replay finisher: XEND last, %d shader cache files in the file" % shaders)
 
         stalled_tail = directory / "stalled_tail.x2wr"
-        code, text, _ = timed(args + [6], dict(env, X2W_SHADER_CACHE=str(big_cache), X2W_REPLAY_RECORD="f3,2",
-                                              X2W_REPLAY_RECORD_FILE=str(stalled_tail),
-                                              X2W_TEST_REPLAY_FINISHER_STALL_MS="200"))
+        code, text, seconds = timed(args + [6], dict(env, X2W_SHADER_CACHE=str(big_cache), X2W_REPLAY_RECORD="f3,2",
+                                                     X2W_REPLAY_RECORD_FILE=str(stalled_tail),
+                                                     X2W_TEST_REPLAY_FINISHER_STALL_MS="200",
+                                                     X2W_TEST_REPLAY_PAUSE="5,500"))
         assert code == 0, text[-3000:]
         end_totals(stalled_tail)
+        assert "shader cache cut short by process exit after" in text, text[-3000:]
+        shaders = sum(tag == "SHDR" for tag, _, _ in chunks(stalled_tail.read_bytes()))
+        cache_files = sum(item.is_file() for item in big_cache.iterdir())
+        assert shaders < cache_files, (shaders, cache_files)
+        assert seconds < 20, "stalled finisher took %.2f s" % seconds
 
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),

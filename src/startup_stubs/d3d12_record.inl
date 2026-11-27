@@ -34,7 +34,8 @@ LONG volatile presents;
 LONG first_present = 0, last_present = 0x7fffffff;
 double start_s = 0.0, end_s = 1e300;
 LARGE_INTEGER started{}, frequency{};
-HANDLE file = INVALID_HANDLE_VALUE;
+std::atomic<HANDLE> file{INVALID_HANDLE_VALUE};
+std::atomic<bool> exiting{false};
 // Lock order: a thread buffer's lock, then file_lock. blob_lock and buffers_lock are taken alone.
 SRWLOCK file_lock = SRWLOCK_INIT, blob_lock = SRWLOCK_INIT, buffers_lock = SRWLOCK_INIT;
 LONG64 volatile calls_written, blobs_stored;
@@ -90,6 +91,7 @@ std::vector<ThreadBuffer*>& thread_buffers() { static std::vector<ThreadBuffer*>
 std::unordered_set<u64>& stored_blobs() { static std::unordered_set<u64> s; return s; }  // blob_lock
 
 u64 volatile whole_bytes;  // the file size after the last whole chunk: where a recording cut off at exit is closed
+// file_lock keeps the handle open during writes. Detach can cut the file after a writer dies holding the lock.
 void write_raw(const void* data, std::size_t bytes)
 {
     DWORD written = 0;
@@ -636,9 +638,11 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
 }
 
 void stop(bool at_exit, bool from_present = false);
+bool draw_pages;
+double draw_pages_ms = 100.0;
 bool extra_title_pages;  // set before installing the recording thunks
 void remember_heap_start(u64 object, u64 second);
-u64 pages_before_call(bool root, u64 address, bool submit);
+u64 pages_before_call(int kind, int slot, u64 rcx, u64 rdx, u64 r8, u64 r9, bool root, bool submit, bool scan);
 void remember_cbv_pages(u64 desc);
 
 template <int K, int N>
@@ -657,16 +661,22 @@ __declspec(noinline) u64 thunk(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1,
     constexpr bool descriptor_copy = K == device_kind && N == 23;
     // These slots have no floating-point arguments, so a page scan may run before the real call (opt-in: named title
     // ranges X2W_REPLAY_TITLE_RANGES, or a scan before each submit X2W_REPLAY_PAGES_AT_SUBMIT).
+    // Draw-page captures use the same sequence lock as scans.
     constexpr bool root = K == list_kind && N >= 41 && N <= 46;
     constexpr bool submit = K == queue_kind && N == 10;
     constexpr bool consumes_pages = root || (K == list_kind && ((N >= 12 && N <= 19) || N == 61)) ||
                                     (K == device_kind && (N == 23 || N == 24)) || submit;
+    constexpr bool draw_page_slot = K == list_kind && (N == 12 || N == 13 || N == 14 || N == 61 || (N >= 41 && N <= 48));
     u64 seq;
-    if constexpr (consumes_pages)
-        seq = (extra_title_pages || (submit && (scan_submit_pages || replay_dump_enabled()) && window_open)) ? pages_before_call(root, r8, submit)
-                                                                                   : static_cast<u64>(InterlockedIncrement64(&next_seq));
-    else
+    if constexpr (consumes_pages || draw_page_slot) {
+        const bool scan = consumes_pages && (extra_title_pages ||
+            (submit && (scan_submit_pages || replay_dump_enabled()) && window_open));
+        const bool capture = draw_page_slot && draw_pages && window_open.load(std::memory_order_relaxed);
+        seq = scan || capture ? pages_before_call(K, N, rcx, rdx, r8, r9, root, submit, scan)
+                              : static_cast<u64>(InterlockedIncrement64(&next_seq));
+    } else {
         seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
+    }
     if constexpr (K == device_kind && N == 17)
         if (extra_title_pages) remember_cbv_pages(rdx);
     HeapPlacement placement{};
@@ -753,8 +763,14 @@ void write_shader_cache(bool at_exit)
     u64 files = 0, total = 0, left_out = 0;
     const ULONGLONG deadline = GetTickCount64() + (at_exit ? 5000 : 120000);
     std::vector<unsigned char> chunk;
+    bool cut_short = false;
     do {
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!at_exit && exiting.load()) {
+            cut_short = true;
+            ++left_out;
+            continue;
+        }
         const u64 size = (static_cast<u64>(found.nFileSizeHigh) << 32) | found.nFileSizeLow;
         if (size > file_max || total + size > total_max || GetTickCount64() > deadline) {
             ++left_out;
@@ -781,6 +797,8 @@ void write_shader_cache(bool at_exit)
         if (stall_ms) Sleep(stall_ms);
     } while (FindNextFileW(find, &found));
     FindClose(find);
+    if (cut_short)
+        log("x2w-replay record: shader cache cut short by process exit after %llu files", files);
     if (!at_exit)
         log("x2w-replay record: shader cache %llu files, %llu bytes, %llu left out", files, total, left_out);
 }
@@ -795,23 +813,36 @@ void unwrap_all()
             if (original[k][i]) tables[k][i] = original[k][i];
 }
 
-void write_end_and_close()
+void write_end_and_close(bool cut = false)
 {
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
     write_raw(tail.data(), tail.size());
     FlushFileBuffers(file);
+    if (cut) {
+        LARGE_INTEGER end_offset;
+        end_offset.QuadPart = static_cast<LONGLONG>(bytes_written);
+        LARGE_INTEGER size;
+        // Pending I/O from the terminated writer can extend the file past XEND.
+        for (int retry = 0; retry < 3 && GetFileSizeEx(file, &size) && size.QuadPart > end_offset.QuadPart; ++retry) {
+            if (SetFilePointerEx(file, end_offset, nullptr, FILE_BEGIN) && SetEndOfFile(file))
+                FlushFileBuffers(file);
+            Sleep(10);
+        }
+        if (!GetFileSizeEx(file, &size) || size.QuadPart != end_offset.QuadPart)
+            log("x2w-replay record: could not verify the file size after the exit cut");
+    }
     CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
 }
 
 // When a present ends the recording, the file's tail (shader cache, end chunk) is written by a finisher thread: a cache
 // of thousands of files takes minutes on a tester's disk and must not stall the title's presents. finished is set once
-// the file is closed; a later stop (a fixture, FreeLibrary) waits for it. At process exit an interrupted recording
-// is cut back to its last whole chunk and closed with the end chunk.
+// the file is closed; a later stop (a fixture, FreeLibrary) waits for it. The exit path asks a running finisher
+// to skip the rest of the shader cache and waits on its thread handle, which also signals if it was terminated.
 HANDLE finished = nullptr;
-HANDLE finisher_thread = nullptr;  // retained for process exit
+static std::atomic<HANDLE> finisher_thread{nullptr};
 bool stopped_in_prefix;
 
 void close_cut_file();
@@ -819,10 +850,14 @@ void close_cut_file();
 void finish_file(bool at_exit)
 {
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) {
-        close_cut_file();  // the writer may have exited while holding the file lock
+        close_cut_file();
         return;
     }
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
+    if (file == INVALID_HANDLE_VALUE) {
+        ReleaseSRWLockExclusive(&file_lock);
+        return;
+    }
     const bool in_prefix = stopped_in_prefix;
     whole_bytes = bytes_written;
     write_shader_cache(at_exit);
@@ -863,30 +898,38 @@ DWORD WINAPI finisher(void*)
     return 0;
 }
 
-// ExitProcess can interrupt the finisher mid-chunk. Its synchronous write can still complete, so wait for the thread
-// handle to signal before cutting the file or that write could overwrite XEND or extend the file past it.
 void close_cut_file()
 {
-    if (finisher_thread && GetThreadId(finisher_thread) != GetCurrentThreadId() &&
-        WaitForSingleObject(finisher_thread, 10000) == WAIT_TIMEOUT)
-        log("x2w-replay record: the finisher thread did not end within 10 s");
-    if (file == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER at;
-    at.QuadPart = static_cast<LONGLONG>(whole_bytes);
-    if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return;
-    bytes_written = whole_bytes;
-    write_end_and_close();
+    exiting.store(true);
+    const HANDLE thread = finisher_thread.load();
+    DWORD waited = WAIT_OBJECT_0;
+    if (thread && GetThreadId(thread) != GetCurrentThreadId()) {
+        waited = WaitForSingleObject(thread, 30000);
+        if (waited == WAIT_TIMEOUT)
+            log("x2w-replay record: the finisher thread did not end within 30 s");
+    }
+    const bool locked = TryAcquireSRWLockExclusive(&file_lock);
+    // A terminated writer may leave the SRW lock held. A live writer still needs exclusive access.
+    if (!locked && waited != WAIT_OBJECT_0) return;
+    if (file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER at;
+        at.QuadPart = static_cast<LONGLONG>(whole_bytes);
+        if (SetFilePointerEx(file, at, nullptr, FILE_BEGIN) && SetEndOfFile(file)) {
+            bytes_written = whole_bytes;
+            write_end_and_close(true);
+        }
+    }
+    if (locked) ReleaseSRWLockExclusive(&file_lock);
 }
 
 void wait_finisher(bool at_exit)
 {
-    if (!finished || WaitForSingleObject(finished, 0) == WAIT_OBJECT_0) return;
-    if (!at_exit) {
-        WaitForSingleObject(finished, INFINITE);
+    if (at_exit) {
+        if (file != INVALID_HANDLE_VALUE) close_cut_file();
         return;
     }
-    // The finisher may still have pending I/O even though process exit has terminated it.
-    close_cut_file();
+    if (finished && WaitForSingleObject(finished, 0) != WAIT_OBJECT_0)
+        WaitForSingleObject(finished, INFINITE);
 }
 
 void stop(bool at_exit, bool from_present)
@@ -903,8 +946,9 @@ void stop(bool at_exit, bool from_present)
     if (from_present && !at_exit) {
         finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (finished) {
-            finisher_thread = CreateThread(nullptr, 0, finisher, nullptr, 0, nullptr);
-            if (finisher_thread) return;
+            const HANDLE thread = CreateThread(nullptr, 0, finisher, nullptr, 0, nullptr);
+            finisher_thread.store(thread);
+            if (thread) return;
             CloseHandle(finished);
             finished = nullptr;
         }
@@ -958,10 +1002,9 @@ void present()
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
         append_chunk(b.bytes, "PRES", &mark, sizeof(mark), nullptr, 0);
-        if (!extra_title_pages) {
-            if (window_open && !was_open) pages_at_window_open(b, seq, present);
-            else if (window_open) pages_at_present(b, seq, present);
-        }
+        if (!extra_title_pages && window_open && !was_open) pages_at_window_open(b, seq, present);
+        if (window_open && (draw_pages || (!extra_title_pages && was_open)))
+            pages_at_present(b, seq, present, !extra_title_pages && was_open);
     }
     if (!base_warming && (present >= last_present || (end_s < 1e300 && seconds_now() >= end_s)))
         InterlockedExchange(&stop_requested, 1);
@@ -1078,12 +1121,21 @@ void install()
         FreeEnvironmentStringsW(block);
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
+    AcquireSRWLockExclusive(&file_lock);
     write_raw(head.data(), head.size());
     whole_bytes = bytes_written;
+    ReleaseSRWLockExclusive(&file_lock);
     scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
-    char ranges[8]{}, pages[8]{};
-    extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
-        !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
+    char ranges[8]{}, pages[8]{}, draw[8]{}, draw_ms[32]{};
+    const bool pages_enabled = !(GetEnvironmentVariableA("X2W_REPLAY_PAGES", pages, sizeof(pages)) == 1 && pages[0] == '0');
+    extra_title_pages = pages_enabled &&
+        GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1';
+    draw_pages = pages_enabled && !(GetEnvironmentVariableA("X2W_REPLAY_DRAW_PAGES", draw, sizeof(draw)) == 1 && draw[0] == '0');
+    const DWORD draw_ms_length = GetEnvironmentVariableA("X2W_REPLAY_DRAW_PAGES_MS", draw_ms, sizeof(draw_ms));
+    if (draw_ms_length && draw_ms_length < sizeof(draw_ms)) {
+        const double ms = std::atof(draw_ms);
+        if (ms > 0) draw_pages_ms = ms;
+    }
     prefix_open = std::strcmp(value, "all") != 0;
     update_window();
     armed = true;

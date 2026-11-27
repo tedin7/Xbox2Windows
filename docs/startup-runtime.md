@@ -2039,10 +2039,9 @@ passed first, the object second), its memory after the call is `ARGM` argument 1
 argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7; the replayer reads both).
 Float argument values and device creation are not recorded.
 When a present ends the recording, a finisher thread writes the `SHDR` files and `XEND`, so the title's presents go
-on meanwhile; a later stop waits for it, and if the process exits first the file ends at its last whole chunk followed by
-`XEND`. The same holds when the exit finds the file lock held by a thread that is gone: the file is cut back to its last
-whole chunk (kept up to date after every written buffer) and closed with `XEND`.
-Before cutting at exit, the recorder waits up to 10 seconds for the finisher thread and its pending I/O.
+on meanwhile. The exit cut waits up to 30 seconds for the finisher, which stops reading shader files early and
+writes `XEND` if still running. If the finisher has terminated with the file still open, the exit path cuts back
+to the last whole chunk and writes `XEND`, even if the terminated thread left the file lock held.
 
 `X2W_REPLAY_PAGES_AT_SUBMIT=1` scans registered title-memory pages before `ExecuteCommandLists` inside the recording
 window. Use `X2W_REPLAY_RECORD=all` for a workload without Present. The first submit can initialize the page store.
@@ -2079,6 +2078,24 @@ copies can capture named ranges before the window opens. The regular page and sc
 `startup_replay_title_ranges_warp` uses an 8 KiB constant buffer in a plain allocation and alternates the colour
 at byte 4096. It covers a root CBV and a CBV descriptor copied through both kinds of heap memory. Each replay
 must match the original pictures with the switch enabled and differ when the switch is off.
+
+A window rescan reads only a few MiB per Present in a large title, so a per-frame ring the title fills after the base
+image can stay zero in the file, and the replay then draws from zero bytes. Draw pages close that gap. By default the
+recorder captures up to 64 KiB at each root descriptor setter (list slots 41 to 46; slot 44 copies its bytes then),
+and captures those root spans again with the bound vertex and index views (slots 47 and 48) before the list's next
+draw, dispatch or indirect execution. Only changed pages are written, stamped just before the call, so the player
+applies them before the call that reads them. Only spans inside the title ranges the page scans cover are captured
+(resources with title memory, and the named ranges of `X2W_REPLAY_TITLE_RANGES=1`). The recorder clips each span to
+4 MiB and to its containing title range. `X2W_REPLAY_DRAW_PAGES_MS` sets the time budget per Present (default 100 ms).
+The `x2w-replay draw pages` counters report captures, spans outside title memory, time skips, pending drops and
+time used. Set `X2W_REPLAY_DRAW_PAGES=0` to disable these captures. `X2W_REPLAY_PAGES=0` disables them too.
+The recorder uses the same `PAGE` and `MAP` chunks, which older players can read.
+
+The player applies MAP chunks in stamp order, and a Present rescan is stamped at the previous Present, before the draws
+captured since. So the page writer compares each page with the MAP of the newest stamp for it: a rescan with an older
+stamp is written when it differs but does not change that reference, and two different MAPs with the same stamp (two
+threads, file order unknown) make the next later capture write the page again. `startup_replay_draw_pages_warp` compares four live and replayed ring colours
+and checks that disabling draw pages changes the replay while leaving the live pictures identical.
 
 The descriptors a window starts with are a call recipe. The prefix of a timed window records heap creation, view
 creation and copies in sequence order, including copies from heaps released before the window. `DARR` supplies the exact
@@ -2827,7 +2844,15 @@ These are measured on one executable; treat them as hypotheses for others.
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
   texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
-- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
+- **Pixel-stage image atomics.** A 2D image atomic with `dmask:0x1` and GLC clear uses a
+  `RWTexture2D<uint>` and a manifest line `uav N tex2du table P O`. This covers unsigned min
+  and max, add, sub, and, or and xor. The instruction reads one VGPR and leaves it unchanged.
+  Every path into the instruction must prove that EXEC excludes helper lanes. A saved live
+  mask still proves this after discards shrink it in place. The atomic can run after EXEC
+  is restored from that mask or set to a subset of it.
+  Returning atomics, signed min and max, and SRV or float UAV access through the same descriptor
+  are refused. [RDNA 2 ISA §§8.1.10, 8.2, 12.16](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+- **Binding pixel-stage image writes.** A translated draw binds each `uav N tex2d|tex2da|tex2du table P O` line
   as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
   view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
   mip 0 of a 2D texture or the slices named by a 2D-array view. The texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
@@ -2838,11 +2863,16 @@ These are measured on one executable; treat them as hypotheses for others.
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
   entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
   array for a 2D view, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
-  sRGB or non-colour format, a format without typed UAV store (or without typed UAV load when the manifest
+  sRGB or non-colour format for a float view, a format without typed UAV store (or without typed UAV load when the manifest
   has a `uavload N` line for that view; `tests/startup_pixel_uav_support_check.cpp`), and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
   written or any texture changes state. Indirect draws refuse a translation with a `uav` line. A resource-specific
-  UAV barrier before a draw with `uavload N` orders earlier writes to that resource. `tests/startup_pixel_uav_check.py`
+  UAV barrier before a draw with `uavload N` or a `tex2du` view orders earlier writes to that resource.
+  The effective format for `tex2du` must be `R32_UINT`. If no format is specified in the title's view,
+  the runtime uses the resource format and views `R32_TYPELESS` as `R32_UINT`.
+  Interlocked operations require typed UAV store support. The manifest has no `uavload N` for `tex2du`.
+  [Direct3D functional specification §22.17](https://microsoft.github.io/DirectX-Specs/d3d/D3D11_3_FunctionalSpec.html)
+  `tests/startup_pixel_uav_check.py`
   draws the program above through the runtime with four 4x4 two-mip textures in which every word is
   a distinct sentinel. The texel lands only in the texture the table names, and every other word of
   the four textures stays unchanged; each refusal leaves every word unchanged. The exec-off variant

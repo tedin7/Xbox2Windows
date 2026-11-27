@@ -4,8 +4,8 @@
 // header; data}:
 //   PAGE  header {key (16 B)}, data 4 KiB: one distinct non-zero page, written the first time its content is seen.
 //   MAP   header {address, bytes, seq, run count}, data: runs {u32 first page, u32 pages, u32 kind} each followed by `pages` keys
-//         (16 B) when kind is 0. A zero page run (kind 1) has no keys. Only pages that differ from what this writer last recorded
-//         at the same page address are listed, so a second capture of a mostly unchanged range is a few runs.
+//         (16 B) when kind is 0. A zero page run (kind 1) has no keys. Pages are compared with the newest MAP stamp for
+//         their address. A conflict at the same stamp forces the next later capture to write the page again.
 // ImageReader replays the chunks in order and rebuilds the memory image a reader would see at each MAP.
 // Pure C++: no Windows calls, so a fixture can compare the rebuilt image byte for byte.
 #pragma once
@@ -71,6 +71,8 @@ public:
 
     // address and bytes must be multiples of the page size (title ranges come from VirtualAlloc). False: nothing written.
     // PAGE chunks for content never written before go to the sink first, then one MAP chunk with the changed runs.
+    // Track the newest MAP stamp per page. Older writes leave it intact, and conflicting equal stamps
+    // force the next later capture to write the page again.
     bool capture(std::uint64_t address, const void* data, std::size_t bytes, std::uint64_t seq)
     {
         if (!bytes || address % page_bytes || bytes % page_bytes) return false;
@@ -101,12 +103,14 @@ public:
             const bool zero = page_is_zero(page);
             const PageKey key = zero ? PageKey{} : page_key(page);
             const auto last = last_.find(at);
-            if (last != last_.end() && last->second.zero == zero && last->second.key == key) {
+            if (last != last_.end() && last->second.zero == zero && last->second.key == key &&
+                !(seq > last->second.seq && last->second.uncertain)) {
                 ++stats_.unchanged;
                 close_run();
                 continue;
             }
-            last_[at] = {key, zero};
+            if (last == last_.end() || seq >= last->second.seq)
+                last_[at] = {key, zero, seq, last != last_.end() && seq == last->second.seq};
             if (open && run_zero != zero) close_run();
             if (!open) { open = true; run_zero = zero; first = i; run_pages_ = 0; }
             ++run_pages_;
@@ -121,7 +125,7 @@ public:
             }
         }
         close_run();
-        if (!run_count) return true;  // nothing changed since the last capture of these pages: no chunk
+        if (!run_count) return true;  // no page changes need a MAP at this stamp
         MapHeader header{address, bytes, seq, run_count, 0};
         sink_("MAP ", &header, sizeof(header), runs.data(), runs.size());
         return true;
@@ -130,7 +134,7 @@ public:
     const PageStats& stats() const { return stats_; }
 
 private:
-    struct Last { PageKey key; bool zero; };
+    struct Last { PageKey key; bool zero; std::uint64_t seq; bool uncertain; };
     Sink sink_;
     PageStats stats_;
     std::size_t run_pages_ = 0;

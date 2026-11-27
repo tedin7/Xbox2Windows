@@ -15,7 +15,8 @@ scales it by 16 is refused instead of passing. Three runs share one cache:
 3. dispatch-heap-outside (the constant is 0x07ffffff, a record past the heap): refused with one
    logged reason, every word keeps the sentinel and the input is unchanged.
 A second program reads four typed elements from the heap. One cached translation is used for three desktop
-views and two native descriptor records. Unsupported desktop formats leave the output untouched. Mutated DXIL
+views and two native descriptor records. Extended formats also run as both native records and typed views,
+with an opt-out control. Unsupported desktop formats leave the output untouched. Mutated DXIL
 must dispatch successfully and produce a readback mismatch against the same CPU oracle.
 Exit 77 when the adapter is not available.
 """
@@ -73,6 +74,9 @@ FORMATTED_INDEXED_BINDINGS = (
     'srv 1 buf heap word table 1 96 at 52\nuav 0 table 1 16\n'
 )
 INPUT = struct.pack('<16e', -1, 1.5, 2, -2.5, 3, -3.5, 4, -4.5, 0.125, 0.25, 128, 16, 21, 31, -41, 51)
+EXTENDED_INPUT = struct.pack('<4I', 0x816f01ff, 0x3c180f00, 0x401e0380, 0x7f008000)
+EXTENDED_CODES = {'r32-uint': 20, 'snorm': 57, 'ufloat': 36}
+EXTENDED_SELECT = 6 | 4 << 3 | 7 << 6 | 5 << 9  # z, x, w, y, as in the view tokens
 NO_FORMAT = 'a formatted input view has no buffer format code'
 
 
@@ -89,35 +93,56 @@ def formatted_expected(kind):
                 for shift, width in ((0, 10), (10, 10), (20, 10), (30, 2))]
     if kind == 'uint':
         return [INPUT[4 * element + channel] for element in range(4) for channel in (2, 0, 3, 1)]
+    if kind == 'r32-uint':
+        return [channel for word in struct.unpack('<4I', EXTENDED_INPUT) for channel in (0, word, 1, 0)]
+    if kind == 'snorm':
+        return [f32_word(max(-1.0, value / 127))
+                for element in struct.iter_unpack('<4b', EXTENDED_INPUT)
+                for value in (element[2], element[0], element[3], element[1])]
+    if kind == 'ufloat':
+        # Expand each unsigned float to binary16, whose exponent has the same width and bias.
+        values = []
+        for (word,) in struct.iter_unpack('<I', EXTENDED_INPUT):
+            x = struct.unpack('<e', struct.pack('<H', (word & 0x7ff) << 4))[0]
+            y = struct.unpack('<e', struct.pack('<H', ((word >> 11) & 0x7ff) << 4))[0]
+            z = struct.unpack('<e', struct.pack('<H', (word >> 22) << 5))[0]
+            values.extend(map(f32_word, (z, x, 1.0, y)))
+        return values
     assert kind == 'unknown'
     return [0] * 16
 
 
-def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False):
+def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False, extended=True):
     cache, env = prepare(directory)
     env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
+    if extended:
+        env.pop('X2W_EXTENDED_BUFFER_FORMATS', None)
+    else:
+        env['X2W_EXTENDED_BUFFER_FORMATS'] = '0'
     root = directory / 'compute_root'
     root.write_bytes(H.root_blob(table_range=True))
     (directory / 'program').write_bytes(FORMATTED_INDEXED_CODE if indexed else FORMATTED_CODE)
     (directory / 'data').write_bytes(DATA)
     (directory / 'state').write_bytes(state_a(FORMATTED_GROUP, FORMATTED_RSRC2))
     source = directory / 'input.bin'
-    source.write_bytes(INPUT.ljust(C.WORDS * 4, b'\0'))
     env.update(X2W_TEST_COMPUTE_ROOT=str(root), X2W_TEST_DISPATCH_IN=str(source))
     untouched = [C.SENTINEL] * C.WORDS
 
     def run(kind, hardware_word=None):
+        payload = EXTENDED_INPUT if kind in EXTENDED_CODES else INPUT
+        source.write_bytes(payload.ljust(C.WORDS * 4, b'\0'))
         binding = dict(env)
         if hardware_word is not None:
             fields = directory / 'fields.bin'
-            fields.write_bytes(struct.pack('<6I', 8, 4, hardware_word, 4, C.WORDS, 0))
+            stride = 4 if kind in EXTENDED_CODES else 8
+            fields.write_bytes(struct.pack('<6I', stride, 4, hardware_word, 4, C.WORDS, 0))
             binding['X2W_TEST_DISPATCH_FIELDS'] = str(fields)
         mode = 'indexed' if indexed else 'plain' if hardware_word is not None else kind
         return dispatch(directory, consumer, binding, 'dispatch-heap-format-' + mode)
 
-    def mismatches(kind, hardware_word=None):
+    def mismatches(kind, hardware_word=None, expected_kind=None):
         got, result = run(kind, hardware_word)
         assert len(lines(result, 'Dispatch(1, 1, 1) translated')) == 1, result.stderr[-3000:]
         assert not lines(result, 'refused: '), result.stderr[-3000:]
@@ -126,14 +151,14 @@ def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False):
         assert got[16:] == untouched[16:], f'{kind}: wrote past the four output elements'
         # DXC can lower division by a constant to reciprocal multiplication.
         tolerance = 1 if kind == 'packed' else 0
-        return [(i, actual, expected) for i, (actual, expected) in enumerate(zip(got, formatted_expected(kind)))
+        return [(i, actual, expected) for i, (actual, expected) in enumerate(zip(got, formatted_expected(expected_kind or kind)))
                 if abs(actual - expected) > tolerance]
 
     got, result = run('half')
     assert got == untouched and len(lines(result, 'Dispatch(1, 1, 1) refused: no translation')) == 1, result.stderr[-3000:]
     key = lines(result, 'x2w-draw compute request')[0].split()[3]
     translated = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True,
-                                capture_output=True, text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
+                                capture_output=True, text=True, env=dict(env, X2W_DXC=dxc)).stdout
     assert f'{key}: ok' in translated, translated
     manifest = (cache / f'{key}.txt').read_text()
     assert manifest.endswith(FORMATTED_INDEXED_BINDINGS if indexed else FORMATTED_BINDINGS), manifest
@@ -142,6 +167,24 @@ def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False):
         assert not wrong, wrong
         print(f'formatted heap on {adapter}: table-word index matched the half-float reference')
         return
+
+    for kind, code in EXTENDED_CODES.items():
+        # Restoring kind != 'cs' yields zeros and fails readback. Dropping extended
+        # at the runtime token call site refuses the typed-view leg.
+        native = code << 12 | EXTENDED_SELECT
+        if extended:
+            for binding, word in (('native', native), ('typed view', None)):
+                wrong = mismatches(kind, word)
+                assert not wrong, (kind, binding, 'first mismatch (index, actual, expected)', wrong[0])
+        else:
+            assert not mismatches(kind, native, expected_kind='unknown'), (kind, 'opt-out native readback mismatch')
+            got, result = run(kind)
+            assert got == untouched, (kind, 'opt-out view wrote the output')
+            refused = lines(result, 'refused: ')
+            assert len(refused) == 1 and refused[0].endswith(NO_FORMAT), result.stderr[-3000:]
+    if not extended:
+        print(f'formatted heap on {adapter}: opt-out native zeros and typed-view refusals passed')
+        return key
 
     for kind in ('half', 'packed', 'uint'):
         wrong = mismatches(kind)
@@ -174,7 +217,8 @@ def check_formatted_dispatch(directory, consumer, dxc, adapter, indexed=False):
             assert wrong, (new, kind, 'mutant matched the CPU reference')
             print(f'{kind}: mutant {new!r} differs at word {wrong[0][0]}')
 
-    print(f'formatted heap on {adapter}: three typed views, two native records and the named refusal passed')
+    print(f'formatted heap on {adapter}: six typed views, five native records and the named refusal passed')
+    return key
 
 
 def main(consumer, dxc, adapter):
@@ -224,7 +268,9 @@ def main(consumer, dxc, adapter):
         assert len(census) == 3 and census[1].endswith(f'reason "{OUTSIDE}": 1 keys, 1 dispatches'), census
         print(f'startup_compute_dispatch_heap: PASS on {adapter} (all {C.WORDS} words match through heap record 2; '
               'untouched before translation and for a record outside the heap)')
-        check_formatted_dispatch(directory / 'formatted', consumer, dxc, adapter)
+        enabled_key = check_formatted_dispatch(directory / 'formatted', consumer, dxc, adapter)
+        disabled_key = check_formatted_dispatch(directory / 'formatted-off', consumer, dxc, adapter, extended=False)
+        assert enabled_key != disabled_key, 'compute cache key ignored the extended format setting'
         check_formatted_dispatch(directory / 'formatted-indexed', consumer, dxc, adapter, indexed=True)
 
 

@@ -7,7 +7,7 @@ The output is HLSL for both stages plus a manifest that tells the runtime what t
 """
 import bisect
 import copy
-from collections import Counter
+from collections import Counter, deque
 from contextlib import suppress
 from contextvars import ContextVar
 from copy import deepcopy
@@ -1016,7 +1016,7 @@ def reg_range(tok):
 # operand both, so a write of one half never counts as writing the other.
 SCALAR_TOKEN = re.compile(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b|\b(vcc|exec)(_lo|_hi)?\b|\b(m0)\b|\bsrc_(scc)\b')
 EXEC_KEYS = {'exec', 'exec_hi'}
-NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch', 's_round_mode')
 # Forms that print no destination: every printed scalar operand is read. v_cmpx writes EXEC implicitly; its e32 and
 # SDWA forms print only sources, and the repository decoder prints the e64 form's unused SDST field first.
 # s_setpc reads its address; s_movrel* address a register through m0, so their printed operand is not a plain write.
@@ -1168,8 +1168,14 @@ def lane_read(name, asm, word, halves):
         w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
 
 
-def effect_destinations(base, ops):
+def image_atomic_no_return(name, mods):
+    return name.startswith('image_atomic_') and 'glc' not in mods
+
+
+def effect_destinations(base, ops, mods=()):
     """Split the decoded operands into destination and source fields."""
+    if image_atomic_no_return(base, mods):
+        return [], ops
     count = 2 if base.startswith(TWO_DESTINATIONS) or base == 'v_swap_b32' else 1
     return ops[:count], ops[count:]
 
@@ -1177,7 +1183,7 @@ def effect_destinations(base, ops):
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
-    _, ops, _ = parse(asm)
+    _, ops, mods = parse(asm)
     if base.startswith(NO_SCALAR_EFFECT) or base == 's_endpgm':
         reads = {'scc'} if base.startswith('s_cbranch_scc') else {'vcc'} if base.startswith('s_cbranch_vcc') else \
             {'exec'} if base.startswith('s_cbranch_exec') else set()
@@ -1188,7 +1194,7 @@ def scalar_effects(name, asm):
         return scalar_tokens(' '.join(ops)) | ({'m0'} if 'movrel' in base else set()), set(), set()
     if base.startswith(('s_cmp', 's_bitcmp')):
         return scalar_tokens(' '.join(ops)), {'scc'}, {'scc'}
-    dests, srcs = effect_destinations(base, ops)
+    dests, srcs = effect_destinations(base, ops, mods)
     writes = scalar_tokens(' '.join(dests))
     reads = scalar_tokens(' '.join(srcs))
     if base.startswith(READ_MODIFY_WRITE) or base == 'v_swap_b32':
@@ -1212,7 +1218,7 @@ def scalar_effects(name, asm):
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
 # symbolic tracking does not hold).
 NO_SCALAR_DESTINATION = ('s_cbranch', 's_branch', 's_waitcnt', 's_nop', 's_endpgm', 's_cmp', 's_bitcmp', 's_setpc',
-                         's_barrier', 's_sendmsg', 's_inst_prefetch', 's_clause', 's_setprio', 's_sleep', 's_setreg',
+                         's_barrier', 's_sendmsg', 's_inst_prefetch', 's_round_mode', 's_clause', 's_setprio', 's_sleep', 's_setreg',
                          's_code_end', 's_dcache', 's_icache', 's_ttrace', 'exp', 'ds_write', 'v_cmpx')
 TWO_SCALAR_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
 # Symbols whose register also holds the value at run time: constants are assigned when set, entry root constants are
@@ -1429,16 +1435,16 @@ INTERP_STORE_PREFIXES = ('buffer_store', 'tbuffer_store', 'global_store', 'flat_
 VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v_mad_[iu]64_[iu]32')
 
 
-def destinations(name, ops):
+def destinations(name, ops, mods=()):
     """The operands an instruction writes: the first, and the SGPR destination of the VOP3b forms. Compares write none."""
-    if not ops or name.startswith(('s_cmp', 's_bitcmp')):
+    if not ops or name.startswith(('s_cmp', 's_bitcmp')) or image_atomic_no_return(name, mods):
         return []
     return [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
 
 
-def writes_exec(name, ops):
+def writes_exec(name, ops, mods=()):
     """Conservatively: whether the instruction can write EXEC, explicitly or implicitly."""
-    for tok in destinations(name, ops):
+    for tok in destinations(name, ops, mods):
         r = reg_range(tok)
         if tok in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126:
             return True
@@ -2366,13 +2372,13 @@ LDS_EXCHANGE_OPS = {
 }
 
 
-def lds_vgpr_writes(base, ops):
+def lds_vgpr_writes(base, ops, mods=()):
     """VGPR may-writes, including register spans and both destinations of a swap."""
     if base.startswith(INTERP_STORE_PREFIXES + ('s_', 'v_cmp', 'v_readlane', 'v_readfirstlane')):
         return set()
     if base.startswith('v_movrel'):
         return set(range(256))
-    dests, _ = effect_destinations(base, ops)
+    dests, _ = effect_destinations(base, ops, mods)
     return {reg for tok in dests if (r := reg_range(tok)) and r[0] == 'v'
             for reg in range(r[1], r[2] + 1)}
 
@@ -2550,7 +2556,7 @@ def check_lds_exchange(ins, group, words):
                     base.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane', 'v_permlane', 'v_movrel',
                                      's_sendmsg', 's_sethalt')) or base.endswith(('_dpp', '_dpp8'))):
                 raise Unsupported('LDS fill needs the unchanged entry local X ID: ' + name)
-            written = lds_vgpr_writes(base, ops)
+            written = lds_vgpr_writes(base, ops, mods)
             dest = _lds_single(ops[0]) if ops else None
             value = lds_affine(base, ops[1:], addresses, group[0]) if dest in written and not mods else None
             if 0 in written and first_x_write is None:
@@ -2646,6 +2652,8 @@ def mesh_run(ins, at, what, patterns, env):
 
 
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
+MESH_EXEC_BRANCHES = ('s_cbranch_execz', 's_cbranch_execnz')
+MESH_SCC_BRANCHES = ('s_cbranch_scc0', 's_cbranch_scc1')
 # Vector ALU forms that take a lane mask as a per-lane select or carry, which the one-lane model handles.
 MASK_AWARE_VALU = frozenset({'v_cndmask_b32', 'v_cndmask_b16', 'v_readlane_b32', 'v_writelane_b32', 'v_readfirstlane_b32'})
 MASK_AWARE_VALU_RE = re.compile(r'_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$|^v_(cndmask|readlane|writelane|readfirstlane)_')
@@ -2813,6 +2821,387 @@ def lane_mask_read_exact(ins, at, mask, voted=frozenset()):
         todo.extend((i + 1 if target is None else index[target], after) for target, after in edges
                     if (i + 1 if target is None else index[target]) <= at)
     return True
+
+
+LANE_MASK_SAVEEXEC = re.compile(r's_(and|or|xor|andn2|orn2|nand|nor|xnor)_saveexec_b64$')
+LANE_MASK_CARRY = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32(?:_e(?:32|64))?$')
+LANE_MASK_LOGIC = re.compile(r's_(and|or|xor|andn2|orn2|nand|nor|xnor|not)_b64$')
+
+
+def lane_mask_pair(token):
+    """Canonical name of a full wave64 operand. Individual SGPR words are numeric."""
+    if token in ('exec', 'vcc'):
+        return token
+    reg = reg_range(token)
+    if reg and reg[0] == 's' and reg[2] == reg[1] + 1:
+        return token
+    return None
+
+
+def lane_mask_positions(name, ops):
+    """Return operand positions that can write and consume whole lane masks."""
+    if not ops:
+        return (), ()
+    if (LANE_MASK_LOGIC.fullmatch(name) or LANE_MASK_SAVEEXEC.fullmatch(name)
+            or name in ('s_mov_b64', 's_cselect_b64')):
+        return (0,), tuple(range(1, len(ops)))
+    if LANE_MASK_CARRY.fullmatch(name) and len(ops) in (4, 5):
+        return (1,), (4,) if len(ops) == 5 else ()
+    if name.startswith('v_cmp_') and len(ops) == 3:
+        return (0,), ()
+    if name.startswith('v_cndmask_b32') and len(ops) == 4:
+        return (), (3,)
+    if name in MESH_VCC_BRANCHES:
+        return (), (1,)
+    return (), ()
+
+
+def lane_mask_operands(name, ops):
+    """Expose implicit lane-mask operands and expand decoded compare destinations."""
+    if name in MESH_VCC_BRANCHES:
+        return [*ops, 'vcc']
+    if name == 'v_cndmask_b32_e32' and len(ops) == 3:
+        return [*ops, 'vcc']
+    writes, reads = lane_mask_positions(name, ops)
+    if not (name.startswith(('v_cmp_', 'v_cndmask_b32')) or LANE_MASK_CARRY.fullmatch(name)):
+        return ops
+    normalized = list(ops)
+    for at in writes + reads:
+        token = ops[at]
+        if token == 'vcc_lo':
+            normalized[at] = 'vcc'
+        elif (name.endswith('_e64') or LANE_MASK_CARRY.fullmatch(name)) and re.fullmatch(r's\d+', token):
+            lo = int(token[1:])
+            if lo % 2 == 0 and lo < 105:
+                normalized[at] = 's[%d:%d]' % (lo, lo + 1)
+    return normalized
+
+
+def lane_mask_words(token):
+    """Scalar words touched by an operand, accounting for VCC/SGPR aliases."""
+    aliases = {'vcc': 's106', 'vcc_hi': 's107'}
+    if token == 'src_vccz':
+        return {'s106', 's107'}
+    return {aliases.get(word, word) for word in scalar_tokens(token)}
+
+
+def lane_mask_cfg(ins, edges=None):
+    """Build instruction successors, including untaken conditional edges."""
+    index = {off: i for i, (off, *_rest) in enumerate(ins)}
+    jumps = dict(edges or ())
+    if edges is None:
+        for i, (_, _, name, asm) in enumerate(ins):
+            if name.startswith(('s_branch', 's_cbranch')):
+                jumps[i] = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+    if None in jumps.values():
+        return ()
+    return [tuple(j for j in (jumps.get(i), i + 1 if name not in ('s_branch', 's_endpgm') else None)
+                  if j is not None and j < len(ins)) for i, (_, _, name, _) in enumerate(ins)]
+
+
+def lane_mask_flow_supported(successors):
+    """Decline a backward edge when its target is not a proven single entry."""
+    for src, successors_of_src in enumerate(successors):
+        for dst in successors_of_src:
+            if dst >= src or dst == 0:
+                continue
+            pending, seen = [0], {dst}
+            while pending:
+                i = pending.pop()
+                if i in seen:
+                    continue
+                if i == src:
+                    return False
+                seen.add(i)
+                pending.extend(successors[i])
+    return True
+
+
+def reaching_mask_words(successors, writes, possible_writes, words):
+    """Track the last definitions of each relevant scalar word on every incoming edge."""
+    incoming = [None] * len(successors)
+    incoming[0] = {word: {-1} for word in words}
+    pending = deque([0])
+    queued = {0}
+    while pending:
+        i = pending.popleft()
+        queued.remove(i)
+        after = incoming[i].copy()
+        for word in possible_writes[i] & words:
+            after[word] = after[word] | {i}
+        after.update({word: {i} for word in writes[i] & words})
+        for j in successors[i]:
+            before = incoming[j]
+            joined = after if before is None else {w: before[w] | after[w] for w in words}
+            if joined != before:
+                incoming[j] = joined
+                if j not in queued:
+                    pending.append(j)
+                    queued.add(j)
+    return incoming
+
+
+def lane_mask_accesses(ins):
+    """Normalize mask operands and account for full pair, half, and alias writes."""
+    accesses, writes, possible_writes, candidates = [], [], [], {}
+    for i, (_, _, name, asm) in enumerate(ins):
+        ops = lane_mask_operands(name, parse(asm)[1])
+        dests, sources = lane_mask_positions(name, ops)
+        dest = lane_mask_pair(ops[dests[0]]) if dests else None
+        read, must, may = scalar_effects(name, asm)
+        written = lane_mask_words(' '.join(must))
+        if dest and dest != 'exec':
+            written |= lane_mask_words(dest)
+            if all(lane_mask_pair(ops[j]) or ops[j] in ('0', '-1') for j in sources):
+                candidates[i] = dest
+        read_words = lane_mask_words(' '.join(read))
+        if not dests and ops and lane_mask_words(ops[0]) <= written:
+            if not lane_mask_words(ops[0]) & read_words or ops[0] in ops[1:]:
+                dests = (0,)
+        explicit = set().union(*(lane_mask_words(token) for j, token in enumerate(ops) if j not in dests))
+        accesses.append((ops, dests, sources, read_words - explicit))
+        writes.append(written)
+        possible_writes.append(lane_mask_words(' '.join(may)) - written)
+    return accesses, writes, possible_writes, candidates
+
+
+def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
+    """Map pure mask operands by reaching values of both words, with optional use diagnostics."""
+    if any(name.startswith(('s_setpc', 's_swappc', 's_movrel', 'v_movrel')) for _, _, name, _ in ins):
+        return {}  # an indirect transfer/access can hide a definition or read
+    successors = lane_mask_cfg(ins, edges)
+    accesses, writes, possible_writes, candidates = lane_mask_accesses(ins)
+    if not successors or not candidates or not lane_mask_flow_supported(successors):
+        return {}
+    pairs = set(candidates.values())
+    pairs.update(pair for ops, _, sources, _ in accesses for j in sources
+                 if (pair := lane_mask_pair(ops[j])) not in (None, 'exec'))
+    words = set().union(*(lane_mask_words(pair) for pair in pairs))
+    incoming = reaching_mask_words(successors, writes, possible_writes, words)
+    bad, uses, links = set(), {}, {}
+    numeric_uses = {}
+    for i, (ops, dests, sources, implicit) in enumerate(accesses):
+        if incoming[i] is None:
+            continue
+        for word in implicit & words:
+            defs = incoming[i][word] & candidates.keys()
+            bad.update(defs)
+            if defs and numeric_reads is not None:
+                numeric_uses.setdefault(i, set()).update(defs)
+        graph_defs = links.setdefault(i, set()) if i in candidates else set()
+        for j, token in enumerate(ops):
+            if j in dests:
+                continue
+            touched = lane_mask_words(token) & words
+            if not touched:
+                continue
+            reached = set().union(*(incoming[i][word] for word in touched))
+            defs = reached & candidates.keys()
+            if (j not in sources or not lane_mask_pair(token) or
+                    not all(candidates.get(d) == token for d in reached) or
+                    any(incoming[i][word] != reached for word in touched)):
+                bad.update(defs)
+                if defs and numeric_reads is not None and j not in sources:
+                    numeric_uses.setdefault(i, set()).update(defs)
+                if j in sources and i in candidates:
+                    bad.add(i)
+                continue
+            uses.setdefault(i, {})[token] = reached
+            graph_defs.update(reached)
+            for d in reached:
+                links.setdefault(d, set()).update(reached - {d})
+                if i in candidates:
+                    links[d].add(i)
+    if numeric_uses:
+        # A pair copy or a 64-bit constant can also be ordinary scalar data.
+        # Diagnose numeric reads only when the reaching web has a mask source.
+        mask_values = {
+            i for i, pair in candidates.items()
+            if pair == 'vcc' or ins[i][2].startswith('v_cmp_')
+            or LANE_MASK_CARRY.fullmatch(ins[i][2]) or LANE_MASK_SAVEEXEC.fullmatch(ins[i][2])
+            or any(accesses[i][0][arg] == 'exec' for arg in accesses[i][2])
+        }
+        consumers = {}
+        for i in candidates.keys() & uses.keys():
+            for definitions in uses[i].values():
+                for d in definitions:
+                    consumers.setdefault(d, set()).add(i)
+        pending = list(mask_values)
+        while pending:
+            fresh = consumers.get(pending.pop(), set()) - mask_values
+            mask_values.update(fresh)
+            pending.extend(fresh)
+        numeric_reads.update(i for i, defs in numeric_uses.items() if defs & mask_values)
+    pending = list(bad)
+    while pending:
+        d = pending.pop()
+        fresh = links.get(d, set()) - bad
+        bad.update(fresh)
+        pending.extend(fresh)
+    result = {i: {pair} for i, pair in candidates.items() if i not in bad and incoming[i] is not None}
+    for i, operands in uses.items():
+        for pair, defs in operands.items():
+            if defs & bad:
+                continue
+            result.setdefault(i, set()).add(pair)
+            if readers is not None:
+                for d in defs:
+                    readers.setdefault(d, set()).add(i)
+    return result
+
+
+def lane_mask_instruction(name, ops, masks):
+    """Prove that an instruction with a mask destination works one bit at a time."""
+    ops = lane_mask_operands(name, ops)
+    writes, reads = lane_mask_positions(name, ops)
+    return (writes == (0,) and lane_mask_pair(ops[0]) in masks | {'exec'}
+            and all(ops[i] in masks | {'0', '-1', 'exec'} for i in reads))
+
+
+def skipped_mask_write(name, ops, zero, lane, width=64):
+    """Effect of a mask definition on a lane whose EXEC bit is clear."""
+    dst, *src = ops
+    exec_word = 'exec' if width == 64 else 'exec_lo'
+    suffix = '_b%d' % width
+    if name == 's_mov' + suffix and src == [exec_word]:
+        return 'zero'
+    if name == 's_and' + suffix and len(src) == 2 and exec_word in src:
+        if lane(src[1] if src[0] == exec_word else src[0]):
+            return 'zero'
+    if name.startswith('v_cmp') and not name.startswith('v_cmpx'):
+        return 'zero'
+    if name == 's_orn2' + suffix and len(src) == 2 and src[1] == exec_word and lane(src[0]):
+        return 'ones'
+    if name == 's_andn2' + suffix and src == [dst, exec_word]:
+        return 'keep'
+    if name == 's_or' + suffix and len(src) == 2 and dst in src:
+        other = src[1] if src[0] == dst else src[0]
+        if other != dst and zero(other):
+            return 'keep'
+    return None
+
+
+def mask_join_read(ins, join, pair):
+    """Reject whole-word observations of either half after a per-lane join."""
+    words = lane_mask_words(pair)
+    successors = lane_mask_cfg(ins)
+    if not successors:
+        return False
+    pending, seen = [join], set()
+    while pending:
+        i = pending.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        _, _, name, asm = ins[i]
+        _, args, _ = parse(asm)
+        args = lane_mask_operands(name, args)
+        writes, reads = lane_mask_positions(name, args)
+        read, must, _ = scalar_effects(name, asm)
+        read_words = lane_mask_words(' '.join(read))
+        overwritten = lane_mask_words(' '.join(must))
+        for j, arg in enumerate(args):
+            touched = lane_mask_words(arg) & words
+            if not touched or (j in writes and arg == pair):
+                continue
+            if j == 0 and not writes and touched <= overwritten and not touched & read_words:
+                continue
+            local = (name.startswith('v_cndmask_b32') or LANE_MASK_CARRY.fullmatch(name)
+                     or name == 's_and_saveexec_b64' or (name == 's_and_b64' and 'exec' in args[1:]))
+            if not local or j not in reads or arg != pair:
+                return False
+        for j in writes:
+            overwritten |= lane_mask_words(args[j])
+        if not words <= overwritten:
+            pending.extend(successors[i])
+    return True
+
+
+def lane_mask_entry(ins, branch, edges, masks):
+    """Find defined lane-bit values and last full writes in the branch's own basic block."""
+    targets = {dst for _, dst in edges}
+    known, last = {'exec', '0', '-1'}, {}
+    for i in range(branch - 1, -1, -1):
+        if i + 1 in targets or ins[i][2].startswith(('s_branch', 's_cbranch', 's_setpc')):
+            break
+        name, asm = ins[i][2:]
+        args = lane_mask_operands(name, parse(asm)[1])
+        writes, _ = lane_mask_positions(name, args)
+        for j in writes:
+            pair = args[j]
+            if pair == 'exec' or pair not in masks.get(i, ()) or pair in last:
+                continue
+            last[pair] = i
+            if (name.startswith('v_cmp_') or LANE_MASK_CARRY.fullmatch(name)
+                    or (name == 's_mov_b64' and args[1] in ('0', '-1', 'exec'))):
+                known.add(pair)
+    return known, last
+
+
+def skipped_lane_mask_writes(ins, branch, join, edges, live_at_join, masks):
+    """Prove full-pair assignments on a straight, EXEC-preserving skip edge.
+
+    Return writer and initializer indices. A live register has the same bit
+    on both paths if every write keeps that bit or writes its skipped value.
+    """
+    if any(branch < src < join or (branch < dst <= join and src != branch) or dst <= branch <= src
+           for src, dst in edges):
+        return {}, set()
+    if any(writes_exec(name, parse(asm)[1]) for _, _, name, asm in ins[branch + 1:join]):
+        return {}, set()
+    known, last = lane_mask_entry(ins, branch, edges, masks)
+    assigned, positions, zero = {}, {}, {'0', 'exec'}
+    for i in range(branch + 1, join):
+        name, asm = ins[i][2:]
+        args = lane_mask_operands(name, parse(asm)[1])
+        if name == 's_cselect_b64' or not lane_mask_instruction(name, args, masks.get(i, set())) or args[0] == 'exec':
+            continue
+        if 'scc' in scalar_effects(name, asm)[1] and live_at_join('scc', i + 1):
+            return {}, set()
+        pair = args[0]
+        _, reads = lane_mask_positions(name, args)
+        if any(args[j] not in known for j in reads):
+            return {}, set()
+        action = skipped_mask_write(name, args, zero.__contains__, known.__contains__)
+        known.add(pair)
+        assigned.setdefault(pair, set()).add(action)
+        positions.setdefault(pair, []).append(i)
+        if action == 'zero':
+            zero.add(pair)
+        elif action != 'keep':
+            zero.discard(pair)
+    admitted, initializers = {}, set()
+    for pair, actions in assigned.items():
+        words = scalar_tokens(pair)
+        if not any(live_at_join(word, join) for word in words):
+            admitted.update((i, words) for i in positions[pair])
+            continue
+        if None in actions or {'zero', 'ones'} <= actions or not mask_join_read(ins, join, pair):
+            continue
+        need = '0' if 'zero' in actions else '-1' if 'ones' in actions else None
+        i = last.get(pair)
+        if i is None:
+            continue
+        if need is not None and ins[i][3] != 's_mov_b64 %s, %s' % (pair, need):
+            continue
+        if need is None and not (ins[i][2].startswith('v_cmp_') or ins[i][3] in (
+                's_mov_b64 %s, %s' % (pair, value) for value in ('0', '-1', 'exec'))):
+            continue
+        initializers.add(i)
+        admitted.update((k, words) for k in positions[pair])
+    return admitted, initializers
+
+
+def lane_mask_narrows_exec(name, ops):
+    """True when an EXEC write can only retain or disable previously active lanes."""
+    return (name == 's_and_saveexec_b64' or name.startswith('v_cmpx_')
+            or (name == 's_and_b64' and 'exec' in ops[1:]))
+
+
+def lane_predicated_load(name, asm):
+    """These vector loads have only EXEC-predicated VGPR effects."""
+    return (name.startswith(('tbuffer_load_format_', 'image_load'))
+            and not set(parse(asm)[2]) & {'glc', 'slc', 'tfe', 'lwe'})
 
 
 MESH_LOOP_REFUSAL = 'slot 57 mesh: a loop outside the group-memory exchanges is not covered'
@@ -2986,7 +3375,658 @@ MESH_MASK_WORDS = {'exec_lo': ('exec', 0), 'exec_hi': ('exec', 32),
 MESH_MASK_SELECT = 's_cselect_b32_mesh'
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins):
+MESH_WAVE_BLOCK = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
+
+
+def mesh_wave_block_error(cause):
+    return Unsupported(MESH_WAVE_BLOCK + ' (wave-load block: ' + cause + ')')
+
+
+def mesh_mask_scalar(name, asm):
+    """Scalar work allowed on a proved wave-uniform path."""
+    if name.startswith(('s_cmp_', 's_bitcmp')):
+        return not re.search(r'\b(exec|vcc|m0|src_(?!scc\b))', asm)
+    return name != 'v_readfirstlane_b32' and mesh_wave_block_scalar(name, asm, explicit_scc=True)
+
+
+def mesh_local_mask_ops(ins, webs, live_at_join):
+    """Admit pure, lane-local producers whose flag cannot be observed."""
+    supported = {'s_cselect_b64', 's_and_b64', 's_or_b64', 's_not_b64'}
+    result = set()
+    for i, masks in webs.items():
+        name, asm = ins[i][2:]
+        _, args, _ = parse(asm)
+        normalized = lane_mask_operands(name, args)
+        writes, reads = lane_mask_positions(name, normalized)
+        carry = (LANE_MASK_CARRY.fullmatch(name) and writes == (1,) and normalized[1] in masks
+                 and all(normalized[j] in masks | {'exec', '0', '-1'} for j in reads))
+        if carry or ((name in supported or name.startswith('v_cmp_')) and lane_mask_instruction(name, args, masks)):
+            if not writes_exec(name, args) and (
+                    'scc' not in scalar_effects(name, asm)[1] or not live_at_join('scc', i + 1)):
+                result.add(i)
+    return result
+
+
+def mesh_mask_region(ins, branch, target, edges):
+    """Recognize the save, else boundary and exact restoration of incoming EXEC."""
+    save, other = branch - 1, edges[branch]
+    name, asm = ins[save][2:]
+    if name != 's_and_saveexec_b64' or not branch < other < target:
+        return None
+    pair = lane_mask_pair(parse(asm)[1][0])
+    if not pair or pair in ('exec', 'vcc') or ins[other][3] != 's_andn2_b64 exec, %s, exec' % pair:
+        return None
+    restores = ('s_or_b64 exec, exec, %s' % pair, 's_mov_b64 exec, %s' % pair)
+    close = next((i for i in range(other + 1, target) if ins[i][3] in restores or (
+        ins[i][2] == 's_and_b64' and parse(ins[i][3])[1][:2] == ['exec', pair])), target)
+    return save, branch, other, close, pair
+
+
+def mesh_multiple_mask_regions(ins, source, target, branches, edges, live_at_join):
+    """Require disjoint regions or nested regions wholly inside a parent's then arm."""
+    fail = 'the voted branch is reached through unproven EXEC control flow'
+    regions = [mesh_mask_region(ins, b, target, edges) for b in branches]
+    if any(region is None for region in regions):
+        raise mesh_wave_block_error(fail)
+    for position, (save, branch, other, close, pair) in enumerate(regions):
+        if any(save < child <= close and not branch < child < end < other
+               for child, _, _, end, _ in regions[position + 1:]):
+            raise mesh_wave_block_error(fail)
+        if any(live_at_join(word, close + 1) for word in scalar_tokens(pair)):
+            raise mesh_wave_block_error('a saved EXEC mask is live after the if/else')
+        if any(scalar_tokens(pair) & scalar_tokens(ins[i][3])
+               for i in range(branch + 1, close) if i != other):
+            raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+        if any(ins[i][2].startswith('s_') and not ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+               for i in range(other + 1, close)):
+            raise mesh_wave_block_error('the else arm has scalar work without a voted EXEC branch')
+    def arm_path(i):
+        return tuple((save, i >= other) for save, _, other, close, _ in regions if save < i <= close)
+
+    boundaries = {i for _, branch, other, close, _ in regions for i in (branch, other, close)}
+    for a, b in edges.items():
+        if a in branches or not (source < a < target or source < b < target):
+            continue
+        if (not source < a < b <= target or b in boundaries or arm_path(a) != arm_path(b)
+                or ins[a][2] not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1')):
+            raise mesh_wave_block_error(fail)
+    return {i for save, _, other, close, _ in regions for i in (save, other, close) if i < target}
+
+
+def prove_mesh_mask_regions(ins, source, target, branches, structural, edges, live_at_join):
+    """Prove mask operands and EXEC writes in a series of wave-coherent regions."""
+    webs = lane_mask_webs(ins)
+    mask_ops = set()
+    for i in range(source + 1, target):
+        name, asm = ins[i][2:]
+        args = parse(asm)[1]
+        masks = webs.get(i, set())
+        if i in structural or (not writes_exec(name, args) and lane_mask_instruction(name, args, masks)):
+            if not lane_mask_instruction(name, args, masks):
+                raise mesh_wave_block_error('a lane mask is also read as a number')
+            if 'scc' in scalar_effects(name, asm)[1] and live_at_join('scc', i + 1):
+                raise mesh_wave_block_error('SCC of a mask operation is read')
+            mask_ops.add(i)
+        elif writes_exec(name, args):
+            raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+        elif name.startswith('v_cndmask_b32') and masks:
+            mask_ops.add(i)
+    return set(branches), mask_ops
+
+
+def mesh_mask_arm(ins, source, target, edges, live_at_join):
+    """Prove one forward if/else, whose else arm ends at the enclosing EXEC reset."""
+    branches = [i for i in range(source + 1, target) if ins[i][2] == 's_cbranch_execz']
+    if ins[target][3] != 's_mov_b64 exec, -1':
+        return None
+    for branch in branches:
+        save, join = branch - 1, edges[branch]
+        _, ops, _ = parse(ins[save][3])
+        if ins[save][2] != 's_and_saveexec_b64' or not branch < join < target:
+            continue
+        dest = lane_mask_pair(ops[0])
+        if dest and dest not in ('exec', 'vcc') and ins[join][3] == 's_andn2_b64 exec, %s, exec' % dest:
+            break
+    else:
+        return None
+    if len(branches) != 1:
+        structural = mesh_multiple_mask_regions(ins, source, target, branches, edges, live_at_join)
+        return prove_mesh_mask_regions(ins, source, target, branches, structural, edges, live_at_join)
+    if any(live_at_join(reg, target + 1) for reg in scalar_tokens(dest)):
+        raise mesh_wave_block_error('a saved EXEC mask is live after the if/else')
+    readers = {}
+    webs = lane_mask_webs(ins, readers=readers)
+    mask_ops = {save, join}
+    for i in range(source + 1, target):
+        name, asm = ins[i][2:]
+        _, args, _ = parse(asm)
+        masks = webs.get(i, set())
+        mask_setup = i < save and lane_mask_instruction(name, args, masks)
+        cmpx_setup = i < save and name.startswith('v_cmpx_') and len(args) == 2
+        vcc_test = i < save and name in MESH_VCC_BRANCHES
+        mask_read = (bool(args) and name.startswith('v_cndmask_b32')
+                     and lane_mask_operands(name, args)[-1] in masks)
+        closure = i == target - 1 and asm == 's_or_b64 exec, exec, %s' % dest
+        if vcc_test and 'vcc' not in masks:
+            raise mesh_wave_block_error('a lane mask is also read as a number')
+        if cmpx_setup or vcc_test or mask_read:
+            mask_ops.add(i)
+        elif i in (save, join) or mask_setup or closure:
+            if not lane_mask_instruction(name, args, masks):
+                raise mesh_wave_block_error('a lane mask is also read as a number')
+            if i < save and writes_exec(name, args) and name not in ('s_mov_b64', 's_and_b64'):
+                raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+            if 'scc' in scalar_effects(name, asm)[1] and live_at_join('scc', i + 1):
+                raise mesh_wave_block_error('SCC of a mask operation is read')
+            mask_ops.add(i)
+        elif writes_exec(name, args) or (save < i < target and scalar_tokens(dest) & scalar_tokens(asm)):
+            raise mesh_wave_block_error('an unproven write to EXEC or its saved mask')
+        if not closure and join < i < target and name.startswith('s_') and not name.startswith(('s_nop', 's_waitcnt', 's_clause')):
+            raise mesh_wave_block_error('the else arm has scalar work without a voted EXEC branch')
+    if any(a != branch and (save < a < target or save < b < target) for a, b in edges.items()):
+        raise mesh_wave_block_error('the voted branch is reached through unproven EXEC control flow')
+    if any(source < a < target and not (a < b <= target) for a, b in edges.items()):
+        return None
+    if any(reader > target for i in mask_ops for reader in readers.get(i, ())):
+        raise mesh_wave_block_error('a lane mask is live after the wave-load block')
+    return {branch}, mask_ops
+
+
+def mesh_coherent_exec(name, args, masks):
+    """Check the exact one-bit transfers that may change EXEC inside a coherent block."""
+    if name.startswith('v_cmpx_'):
+        return not (scalar_tokens(' '.join(args)) & (EXEC_KEYS | VCC_KEYS))
+    if name == 's_and_saveexec_b64':
+        return len(args) == 2 and args[0] in masks - {'vcc'} and args[1] in masks | {'exec'}
+    if args[:1] != ['exec']:
+        return False
+    if name == 's_mov_b64':
+        return len(args) == 2 and args[1] in masks
+    if len(args) != 3:
+        return False
+    if name == 's_and_b64':
+        return (args[1] == 'exec' and args[2] in masks) or (args[2] == 'exec' and args[1] in masks)
+    return ((name == 's_andn2_b64' and args[1] in masks and args[2] == 'exec')
+            or (name == 's_or_b64' and args[1] == 'exec' and args[2] in masks))
+
+
+def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
+    """Prove a wave-uniform PC and exact per-lane EXEC/VCC on each forward edge.
+
+    RDNA 2 Instruction Set Architecture, pp. 20 and 125: EXEC predicates
+    vector work, while SOPP tests the whole EXEC/VCC pair and scalar work
+    ignores EXEC. See Partial Control-Flow Linearization, pp. 543–556, and
+    Convergence And Uniformity, Uniformity of Values and Instructions.
+
+    Each guest wave enters together. Exact mask bits supply every vote, and
+    the emitter checks the other conditions and scalar inputs for uniformity.
+    Every successor therefore receives the whole wave with its scalar state.
+    """
+    if any(source < i < target or source < j < target for i, j in backward):
+        raise mesh_wave_block_error('a backward branch inside the block')
+    for i, j in edges.items():
+        if source < i < target and not i < j <= target:
+            raise mesh_wave_block_error('a branch leaves the block before the closing EXEC reset')
+        if source < j < target and not source < i < target:
+            raise mesh_wave_block_error('a branch from outside lands inside the block')
+
+    numeric_reads = set()
+    webs = lane_mask_webs(ins, numeric_reads=numeric_reads)
+    if any(ins[i][2] in MESH_VCC_BRANCHES and 'vcc' not in webs.get(i, ())
+           for i in range(source + 1, target)):
+        raise mesh_wave_block_error('VCC vote does not read a pure lane mask')
+    for i in sorted(numeric_reads.intersection(range(source + 1, target))):
+        if ins[i][2] in SCALAR_LOADS:
+            raise mesh_wave_block_error('a scalar load address is not wave-uniform')
+        if ins[i][2].startswith(('s_cmp', 's_bitcmp')):
+            raise mesh_wave_block_error('SCC is not proven wave-uniform')
+    votes, mask_ops, uniform = {}, set(), set()
+    for i in range(source + 1, target):
+        name, asm = ins[i][2:]
+        _, args, mods = parse(asm)
+        masks = webs.get(i, set())
+        reads, writes, _ = scalar_effects(name, asm)
+        exec_write = writes_exec(name, args)
+        if re.search(r'\b(?:exec_lo|exec_hi|src_execz)\b', asm) or (
+                exec_write and not mesh_coherent_exec(name, args, masks)):
+            raise mesh_wave_block_error('an unsupported EXEC write or half access (%s)' % name)
+        if name in MESH_EXEC_BRANCHES + MESH_VCC_BRANCHES:
+            word = 'exec' if name in MESH_EXEC_BRANCHES else 'vcc'
+            votes[i] = word, name in ('s_cbranch_execz', 's_cbranch_vccz')
+        elif exec_write or lane_mask_instruction(name, args, masks):
+            if 'scc' in writes and live_at_join('scc', i + 1):
+                raise mesh_wave_block_error('SCC of a mask operation is read')
+            if 'scc' in reads:
+                uniform.add(i)
+            mask_ops.add(i)
+        elif name in MESH_SCC_BRANCHES or name == 's_branch':
+            if 'scc' in reads:
+                uniform.add(i)
+        elif name.startswith(('s_nop', 's_waitcnt', 's_clause')):
+            pass
+        elif name == 'v_readfirstlane_b32' and re.fullmatch(r'v_readfirstlane_b32 s\d+, v\d+', asm):
+            pass  # The emitter proves convergence at the collective.
+        elif name.startswith(('v_', 'buffer_load_')) or lane_predicated_load(name, asm):
+            if (name.startswith(('v_read', 'v_write', 'v_movrel', 'v_permlane', 'v_swap'))
+                    or '_dpp' in name or 'm0' in reads or 'exec' in reads or
+                    (reads & VCC_KEYS and 'vcc' not in masks) or
+                    (writes and not (LANE_MASK_CARRY.fullmatch(name) and masks)) or
+                    set(mods) & {'glc', 'slc', 'tfe', 'lwe'}):
+                raise mesh_wave_block_error('an unsupported vector instruction (%s)' % name)
+            if masks:
+                mask_ops.add(i)
+        elif (mesh_wave_block_scalar(name, asm, explicit_scc=True) and
+              all(reg == 'scc' or re.fullmatch(r's\d+', reg) for reg in reads | writes)):
+            if name not in SCALAR_LOADS:
+                uniform.add(i)
+        else:
+            raise mesh_wave_block_error('an unsupported scalar or memory instruction (%s)' % name)
+    return votes, mask_ops, uniform
+
+
+def mesh_memory_writes(ins):
+    """Check decoded shader memory effects, including scratch and atomics."""
+    return any('_store' in name or '_atomic' in name or name.startswith(('scratch_', 'ds_'))
+               for _, _, name, _ in ins)
+
+
+def mesh_pixel_memory_writes(code, decoded):
+    """A paired pixel stage can alias buffers read by the mesh stage."""
+    try:
+        return mesh_memory_writes(decoded if decoded is not None else decode(code, embedded_pixel=True))
+    except Unsupported:
+        return True
+
+
+def mesh_value(words, token):
+    """Look up a register word or an inline/literal constant."""
+    if token in FLOATS:
+        return ('const', fbits(FLOATS[token]))
+    literal = pc_word(token)
+    return ('const', literal & 0xffffffff) if literal is not None else words.get(token)
+
+
+def mesh_uniform_value(value, uniform):
+    """Constants and numbers proven group-uniform by the forward pass."""
+    return value is not None and (value[0] == 'const' or value in uniform)
+
+
+def mesh_value_postdominators(ins, first, exchange, edges):
+    """Find immediate post-dominators using increasing instruction indices in a DAG."""
+    postdom = {exchange: exchange}
+    for i in range(exchange - 1, first - 1, -1):
+        if i not in edges:
+            postdom[i] = i + 1
+            continue
+        left, right = (i + 1 if ins[i][2] != 's_branch' else edges[i]), edges[i]
+        while left != right:
+            if left < right:
+                left = postdom[left]
+            else:
+                right = postdom[right]
+        postdom[i] = left
+    return postdom
+
+
+def mesh_replicated_mask_word(value, uniform):
+    """A mask word represents one group-uniform bit in every bit position."""
+    return mesh_uniform_value(value, uniform) and (
+        value[0] == 'lane-mask' or value in (('const', 0), ('const', 0xffffffff)))
+
+
+def mesh_value_join(join, paths, uniform, divergent):
+    """Apply the PHI uniformity rule in 'Convergence And Uniformity', Uniformity."""
+    if len(paths) == 1:
+        scalars, vectors, full = paths[0]
+        return scalars.copy(), vectors.copy(), full
+    merged = []
+    mask_phis = {}
+    for bank in (0, 1):
+        words = {}
+        for word in set().union(*(path[bank] for path in paths)):
+            incoming = tuple(path[bank].get(word) for path in paths)
+            choices = set(incoming)
+            if len(choices) == 1:
+                words[word] = incoming[0]
+                continue
+            number = ('phi', join, word)
+            if not divergent and all(mesh_uniform_value(value, uniform) for value in choices):
+                if bank == 0 and all(mesh_replicated_mask_word(value, uniform) for value in choices):
+                    # Give both halves the same identity only if they agree on every incoming edge.
+                    number = mask_phis.setdefault(incoming, ('lane-mask', join, len(mask_phis)))
+                uniform.add(number)
+            words[word] = number
+        merged.append(words)
+    return (*merged, all(path[2] for path in paths))
+
+
+def mesh_uniform_operands(operands, scalars, vectors, uniform):
+    """A numeric source is uniform only if every word it reads is uniform."""
+    for token in operands:
+        reg = reg_range(token)
+        if reg:
+            words = vectors if reg[0] == 'v' else scalars
+            if not all(mesh_uniform_value(words.get(f'{reg[0]}{word}'), uniform)
+                       for word in range(reg[1], reg[2] + 1)):
+                return False
+        elif not mesh_uniform_value(mesh_value(scalars, token), uniform):
+            return False
+    return True
+
+
+def mesh_uniform_lane_mask(token, scalars, uniform):
+    """Both halves must represent the same bit replicated across their lanes."""
+    if token in ('0', '-1'):
+        return True
+    words = mask_words(token, 2)
+    if words is None:
+        return False
+    low, high = (mesh_value(scalars, word) for word in words)
+    return low == high and mesh_replicated_mask_word(low, uniform)
+
+
+def mesh_uniform_vector_sources(name, ops, mods, scalars, vectors, uniform, read_only):
+    """Prove whole-word VALU and buffer loads have the same inputs in every lane."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base == 'v_cndmask_b32':
+        args = lane_mask_operands(name, ops)
+        return (not mods and len(args) == 4 and mesh_uniform_lane_mask(args[3], scalars, uniform)
+                and mesh_uniform_operands(args[1:3], scalars, vectors, uniform))
+    if base.startswith(('buffer_load_', 'tbuffer_load_')):
+        if not read_only or '_d16' in name or any(
+                mod in ('lds', 'd16', 'tfe', 'lwe') for mod in mods):
+            return False
+        return mesh_uniform_operands([('0' if tok == 'off' else tok) for tok in ops[1:]],
+                                     scalars, vectors, uniform)
+    elif (mods or base.startswith(('v_rcp', 'v_rsq', 'v_exp', 'v_log', 'v_sin', 'v_cos')) or
+          base not in VEC_U and base not in VEC_F and base not in VEC_U_TO_F and base != 'v_mov_b32'):
+        return False
+    sources = ops if name.startswith(READ_MODIFY_WRITE) else ops[1:]
+    return mesh_uniform_operands(sources, scalars, vectors, uniform)
+
+
+def mesh_value_mask(i, name, ops, mods, state, next_s, uniform):
+    """Number full-width masks. RDNA 2 ISA p. 20: V_CMP writes EXEC[n] & result."""
+    ss, vs, full = state
+    if name.startswith('v_cmp_') and len(ops) == 3:
+        words = mask_words(lane_mask_operands(name, ops)[0], 2)
+        if words:
+            if (full and not mods and name.endswith(('_e32', '_e64'))
+                    and mesh_uniform_operands(ops[1:], ss, vs, uniform)):
+                number = ('lane-mask', i)
+                uniform.add(number)
+                next_s.update(dict.fromkeys(words, number))
+            else:
+                next_s.update({word: ('def', i, word) for word in words})
+    elif name == 's_mov_b64' and ops[1] in ('0', '-1'):
+        words = mask_words(ops[0], 2)
+        if words:
+            next_s.update(dict.fromkeys(words, mesh_value(ss, ops[1])))
+    elif (name == 's_cselect_b64' and set(ops[1:]) == {'-1', '0'}
+          and mesh_uniform_value(ss.get('scc'), uniform)):
+        words = mask_words(ops[0], 2)
+        if words:
+            number = ('lane-mask', i)
+            uniform.add(number)
+            next_s.update(dict.fromkeys(words, number))
+
+
+def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
+    """Number scalar and vector writes using the RDNA 2 ISA (SMEM p. 51, first-lane read p. 137)."""
+    ss, vs, full = state
+    _, ops, mods = parse(asm)
+    reads, writes, may = scalar_effects(name, asm)
+    alu = name in SCA or name.startswith(('s_cmp_', 's_cmpk_', 's_bitcmp', 's_cselect_'))
+    memory = name in SCALAR_LOADS
+    scalar_uniform = (alu or memory and read_only) and all(
+        mesh_uniform_value(ss.get(word), uniform) for word in reads)
+    if alu and any(token.startswith('src_') and token != 'src_scc' for token in ops):
+        scalar_uniform = False
+    # scalar_effects uses a may-write fallback for unclassified scalar SCC effects.
+    if name in SCC_UNMODELLED or name in SHIFT_ADD or name.startswith('s_cmpk_'):
+        writes = writes | {'scc'}
+    next_s, next_v = ss.copy(), vs.copy()
+    for word in (writes if alu or memory else may):
+        number = ('def', i, word)
+        next_s[word] = number
+        if scalar_uniform and (word == 'scc' or word.startswith('s')):
+            uniform.add(number)
+    if name == 's_mov_b32' and re.fullmatch(r's\d+', ops[0]):
+        next_s[ops[0]] = mesh_value(ss, ops[1]) or next_s[ops[0]]
+    if name == 's_cselect_b32' and ops[0] in next_s:
+        selects[next_s[ops[0]]] = tuple(mesh_value(ss, token) for token in ops[1:])
+    if name == 'v_readfirstlane_b32' and len(ops) == 2 and ops[0] in next_s:
+        source = vs.get(ops[1])
+        if source == ('group-exchange',) and full:
+            next_s[ops[0]] = ('group-index',)
+            uniform.add(('group-index',))
+        elif mesh_uniform_value(source, uniform):
+            next_s[ops[0]] = source
+    mesh_value_mask(i, name, ops, mods, state, next_s, uniform)
+    vector_writes = mesh_vector_writes(name, asm)
+    if vector_writes:
+        vector_uniform = full and mesh_uniform_vector_sources(name, ops, mods, ss, vs, uniform, read_only)
+        for word in vector_writes:
+            token = f'v{word}'
+            number = ('def', i, token)
+            next_v[token] = number
+            if vector_uniform:
+                uniform.add(number)
+    return next_s, next_v, asm == 's_mov_b64 exec, -1' or (full and not writes_exec(name, ops))
+
+
+def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
+    """Number forward paths. RDNA 2 ISA §3.12.2 p. 24: GS user data starts at s8."""
+    if any(first <= i < exchange for i in constant_trips) or any(
+            first <= i < exchange and not i < dest <= exchange for i, dest in edges.items()):
+        return {}, set(), {}
+    before = set().union(*(scalar_effects(*item[2:])[2] for item in ins[:first]))
+    # A relative write could name any entry word or the exchanged VGPR.
+    if any('movrel' in name for _, _, name, _ in ins[:exchange]):
+        return {}, set(), {}
+    entry = {f's{w}': ('entry', f's{w}') if f's{w}' not in before else ('opaque', f's{w}')
+             for w in range(106)}
+    uniform = {entry[f's{w}'] for w in range(8, 40) if entry[f's{w}'][0] == 'entry'}
+    postdom = mesh_value_postdominators(ins, first, exchange, edges)
+    incoming = {first: [(entry, {'v5': ('group-exchange',)}, False)]}
+    at, selects = {}, {}
+    divergent_until = -1
+    for i in range(first, exchange + 1):
+        if i not in incoming:
+            continue
+        state = mesh_value_join(i, incoming.pop(i), uniform, i <= divergent_until)
+        at[i] = state
+        if i == exchange:
+            break
+        name, asm = ins[i][2:]
+        state = mesh_value_step(i, name, asm, state, uniform, selects, read_only)
+        if i in edges:
+            incoming.setdefault(edges[i], []).append(state)
+            if name == 's_branch':
+                continue
+            if not (name in ('s_cbranch_scc0', 's_cbranch_scc1')
+                    and mesh_uniform_value(state[0].get('scc'), uniform)):
+                divergent_until = max(divergent_until, postdom[i])
+        incoming.setdefault(i + 1, []).append(state)
+    return at, uniform, selects
+
+
+def mesh_guard_step(name, asm, active, saves, *, coherent=False):
+    """Return possible lane EXEC states, interpreting only known writes to EXEC."""
+    _, ops, _ = parse(asm)
+    if coherent and name == 's_mov_b64' and ops[1:] == ['exec'] and lane_mask_pair(ops[0]) not in (
+            None, 'exec', 'vcc'):
+        saved = tuple(sorted((dict(saves) | {ops[0]: active}).items()))
+        return [(active, saved)]
+    if not writes_exec(name, ops):
+        return [(active, saves)]
+    if name.startswith('v_cmpx_'):
+        return [(False, saves), (active, saves)]
+    if name == 's_and_saveexec_b64':
+        saved = tuple(sorted((dict(saves) | {ops[0]: active}).items()))
+        return [(False, saved), (active, saved)]
+    held = dict(saves)
+    if name == 's_andn2_b64' and ops[0] == 'exec' and ops[1] in held and ops[2] == 'exec':
+        return [(held[ops[1]] and not active, saves)]
+    if name == 's_or_b64' and ops[:2] == ['exec', 'exec'] and ops[2] in held:
+        return [(active or held[ops[2]], saves)]
+    if name == 's_mov_b64' and ops[0] == 'exec' and ops[1] in held:
+        return [(held[ops[1]], saves)]
+    if name == 's_and_b64' and ops[0] == 'exec' and ops[1] in held:
+        if coherent and ops[2] == 'exec':
+            return [(active and held[ops[1]], saves)]
+        return [(False, saves), (held[ops[1]], saves)]
+    if coherent and name == 's_and_b64' and ops[:2] == ['exec', 'exec'] and ops[2] in held:
+        return [(active and held[ops[2]], saves)]
+    if name == 's_and_b64' and ops[0] == 'exec' and 'exec' in ops[1:]:
+        return [(False, saves), (active, saves)]
+    return []
+
+
+def mesh_guard_vgpr_writes(name, asm):
+    """Return direct VALU or load destinations predicated by this lane's EXEC."""
+    if (not name.startswith(('v_', 'buffer_load_', 'tbuffer_load_', 'image_load'))
+            or name.startswith(('v_cmp', 'v_read', 'v_write', 'v_movrel', 'v_swap'))):
+        return set()
+    _, ops, mods = parse(asm)
+    if not ops or '_sdwa' in name or '_d16' in name or 'd16' in mods:
+        return set()
+    dest = reg_range(ops[0])
+    return set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
+
+
+def mesh_guard_definitions(ins, branch, join, edges, *, coherent=False):
+    """Intersect definitions over every possible trace of an outer-EXEC lane."""
+    paths = {branch + 1: {(True, ()): set()}}
+    for i in range(branch + 1, join):
+        for (active, saves), written in paths.get(i, {}).items():
+            name, asm = ins[i][2:]
+            args = parse(asm)[1]
+            saving = name == 's_and_saveexec_b64' or (coherent and name == 's_mov_b64' and args[1:] == ['exec'])
+            if saves and any(scalar_tokens(pair) & scalar_effects(name, asm)[2]
+                             for pair, _ in saves if not saving or pair != args[0]):
+                return set()
+            states = mesh_guard_step(name, asm, active, saves, coherent=coherent)
+            if not states:
+                return set()
+            if active:
+                written = written | mesh_guard_vgpr_writes(name, asm)
+            successors = [] if name == 's_branch' or (coherent and name == 's_cbranch_execnz' and active) else [i + 1]
+            if i in edges and (name != 's_cbranch_execz' or not active):
+                successors.append(edges[i])
+            for dest in successors:
+                if not i < dest <= join:
+                    return set()
+                incoming = paths.setdefault(dest, {})
+                for state in states:
+                    incoming[state] = incoming[state] & written if state in incoming else written
+                if len(incoming) > 64:
+                    return set()
+    results = paths.get(join, {})
+    return set.intersection(*results.values()) if results else set()
+
+
+def mesh_vector_writes(name, asm):
+    """Possible explicit VGPR clobbers, including lane writes and both swap destinations."""
+    if not name.startswith(('v_', 'buffer_', 'tbuffer_', 'image_', 'scratch_', 'flat_', 'global_')):
+        return set()
+    if name.startswith(('v_movrel', 'v_swaprel')):
+        return set(range(256))
+    if name.startswith(('v_cmp', 'v_read')) or '_store' in name:
+        return set()
+    ops = parse(asm)[1]
+    return mesh_vregs(ops[:2] if name.startswith('v_swap_b32') else ops[:1])
+
+
+def mesh_guard_join(paths):
+    """Keep a tag only when every incoming incomplete definition agrees with it."""
+    tags = {}
+    for word in set().union(*(p[8] for p in paths)):
+        reaching = {p[8].get(word) for p in paths if word in p[0] or word in p[1]}
+        if len(reaching) == 1 and None not in reaching:
+            tags[word] = reaching.pop()
+    return tags
+
+
+def mesh_guard_covers(count, tag, thread, selects):
+    """RDNA 2 ISA pp. 101–102, 160: zero or the same B exports only defining lanes."""
+    bound, defining_thread = tag
+    allowed = {bound, ('const', 0)}
+    return thread == defining_thread and (
+        count in allowed or count in selects and set(selects[count]) <= allowed)
+
+
+def mesh_guard_block(ins, compare, branches, edges, thread, value_at, uniform, *, count_exchange=None,
+                     coherent=False):
+    """Prove prefix-guarded definitions until the EXEC reset or the count exchange."""
+    if thread is None or compare not in value_at or len(branches) != 1:
+        return None
+    name, asm = ins[compare][2:]
+    scalars, vectors, full = value_at[compare]
+    if not full:
+        return None
+    ops = parse(asm)[1]
+    thread_operand = f'v{thread}'
+    if name == 'v_cmpx_gt_u32_e32' and ops[1] == thread_operand:
+        bound = mesh_value(scalars, ops[0])
+    elif name == 'v_cmpx_lt_u32_e32' and ops[0] == thread_operand:
+        bound = vectors.get(ops[1])
+    else:
+        return None
+    if not mesh_uniform_value(bound, uniform):
+        return None
+    branch = branches[0]
+    if any(compare <= source < branch for source in edges):
+        return None
+    close = edges[branch]
+    scalar_compare = None
+    if close != count_exchange:
+        while close in value_at and ins[close][3] != 's_mov_b64 exec, -1':
+            close += 1
+        if close not in value_at:
+            return None
+        if name == 'v_cmpx_gt_u32_e32':
+            scalar_compare = ins[compare][0]
+    definitions = mesh_guard_definitions(ins, branch, close, edges, coherent=coherent)
+    return close, (bound, thread), definitions, scalar_compare
+
+
+def mesh_tag_guard_writes(index, block, pending, tags, uniform_bounds, *, coherent=False):
+    """Publish definitions guaranteed for every lane in this guard."""
+    if block is None or index != block[0]:
+        return
+    _, tag, defined, compare_off = block
+    # EXEC restores can retire the walk's pending writes before the final reset.
+    # In a coherent block the per-lane trace still proves which writes reach it.
+    proved = defined if coherent else pending & defined
+    if proved and compare_off is not None and uniform_bounds is not None:
+        uniform_bounds.add(compare_off)
+    for word in pending - proved:
+        tags.pop(word, None)
+    tags.update(dict.fromkeys(proved, tag))
+
+
+def mesh_mbcnt_high(ins, low, base, token, targets):
+    """Find the matching high half. RDNA 2 ISA p. 184: add the prefix popcount to S1."""
+    high_asm = 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (token, token)
+    for i in range(low + 1, len(ins)):
+        if i in targets:
+            break
+        name, asm = ins[i][2:]
+        if asm == high_asm:
+            return i
+        if (not name.startswith('s_') or name.startswith((
+                's_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_endpgm',
+                's_barrier', 's_sendmsg', 's_trap', 's_movrel'))
+                or writes_exec(name, parse(asm)[1])
+                or scalar_effects(name, asm)[2] & (EXEC_KEYS | {f's{base}'})):
+            break
+    return None
+
+
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_scalars, wave_scalar_joins,
+                  mask_arm_sites=None, standalone_selects=None, pixel_writes=False, count_rewrites=None,
+                  uniform_bounds=None, coherent_sites=None):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -3001,8 +4041,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
       SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
       m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
-    - Code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by one
-      v_cmpx_gt_i32 V, thread; the primitive export likewise with P. thread is the v_mbcnt pair over wave << 6.
+    - Code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by the
+      published vertex count, and primitive indices under the published primitive count.
+      The thread operand is the v_mbcnt pair over wave << 6.
     Each path therefore passes three barriers, each store has one writer (one lane of one wave), and a wait and a
     barrier separate it from every read. The lowering keeps one writer and one barrier: thread 0 stores, all read.
 
@@ -3043,6 +4084,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
     count_entry = count_entry_branch = None
     # header index -> (latch index, trip count). Constant-trip loops are unrolled below.
     constant_trips = {}
+    unproven_back_edges = []
     no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
     exchange_branch_refusal = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
 
@@ -3109,21 +4151,27 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             if target <= off:
                 proven = mesh_constant_trip(ins, dest, i, offsets)
                 if proven is None or dest in constant_trips:
-                    raise Unsupported(MESH_LOOP_REFUSAL)
+                    if coherent_sites is None:
+                        raise Unsupported(MESH_LOOP_REFUSAL)
+                    unproven_back_edges.append((i, dest))
+                    continue
                 constant_trips[dest] = (i, proven[0])
                 continue
-            if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
+            if (name not in ('s_branch', 's_cbranch_execz') + MESH_SCC_BRANCHES + MESH_VCC_BRANCHES
+                    and not (coherent_sites is not None and name == 's_cbranch_execnz')):
                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
             edges[i] = dest
 
     targets = set(edges.values())
     if targets & set(constant_trips):
         raise Unsupported(MESH_LOOP_REFUSAL)
+    mbcnt_targets = targets | constant_trips.keys()
     if count_entry is not None and targets.intersection(range(count_entry, count_at)):
         raise Unsupported(exchange_branch_refusal)
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
+    mask_instructions = set()
     nested_saves, nested_restores = {}, {}  # nested if of a wave block: save index -> restore index, and back
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
@@ -3151,6 +4199,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     pending.append(i + 1)
         return False
 
+    local_mask_ops = (mesh_local_mask_ops(ins, lane_mask_webs(ins), live_at_join)
+                      if standalone_selects is not None else set())
+
     def dead_block_scalar(i, join):
         """Scalar ALU in a skipped block whose results no path reads past the join. Lanes that skip the block per lane
         never read them, and lanes that run it compute the wave-uniform values the guest computes once per wave."""
@@ -3162,10 +4213,12 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
 
     inner_vcc = set()
     inner_execz = set()
+    coherent_votes = {}
+    backward = unproven_back_edges + [(latch, header) for header, (latch, _) in constant_trips.items()]
     load_branches = {}
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
-            if source in inner_execz:
+            if source in inner_execz or source in coherent_votes:
                 continue
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
             if (source == first_post_count_branch and source >= b_end + 2 and target == source + 2
@@ -3281,7 +4334,92 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                              or (extra and ins[i][2].startswith('s_')
                                  and scalar_effects(*ins[i][2:])[0] & VCC_KEYS)
                              for i in scalar))) if failed]
+                    coherent = (coherent_sites is not None and full_reset and (prefix or vector_limit)
+                                and compare > a_end and not entries and ins[target][3] == 's_mov_b64 exec, -1'
+                                and any(ins[i][2] in MESH_EXEC_BRANCHES + MESH_VCC_BRANCHES
+                                        for i in range(source + 1, target)))
+                    if coherent and any(source < i < target or source < j < target for i, j in backward):
+                        raise mesh_wave_block_error('a backward branch inside the block')
+                    arm_refusal = None
+                    if causes and target != count_at and (prefix or vector_limit) and compare > a_end and not entries:
+                        try:
+                            arm = mesh_mask_arm(ins, source, target, edges, live_at_join)
+                        except Unsupported as reason:
+                            if not coherent:
+                                raise
+                            arm_refusal = reason
+                            arm = None
+                        if arm:
+                            voted, mask_ops = arm
+                            mask_vcc = {i for i in mask_ops if ins[i][2] in MESH_VCC_BRANCHES}
+                            proved_inner = inner + sorted(voted | (mask_vcc - vcc_edges))
+                            vector_loads = {i for i in scalar if lane_predicated_load(*ins[i][2:])}
+                            remaining = [i for i in scalar if i not in mask_ops | vector_loads | voted]
+                            if (not any(source < d < target and not source < a < target for a, d in edges.items())
+                                    and all(i in proved_inner for i in edges if source < i < target)
+                                    and all(mesh_mask_scalar(*ins[i][2:]) for i in remaining)
+                                    and not any(live_at_join(reg, target) for reg in VCC_KEYS | {'scc'})):
+                                inner, scalar = proved_inner, remaining
+                                vcc_edges |= mask_vcc
+                                causes.clear()
+                                mask_instructions.update(mask_ops)
+                                scalar_arms.update(voted)
+                                extra.update(voted)
+                                if mask_arm_sites is not None:
+                                    mask_arm_sites.update(ins[i][0] for i in range(source, target))
+                                live = sorted({reg for i in scalar for reg in scalar_effects(*ins[i][2:])[2]
+                                               if re.fullmatch(r's\d+', reg) and live_at_join(reg, target)})
+                                wave_scalars.update(ins[i][0] for i in mask_ops
+                                                    if ins[i][2] == 's_cselect_b64')
+                                wave_scalars.update(ins[i][0] for i in inner if reads_scc(*ins[i][2:]))
+                    if causes and local_mask_ops and not any(source < i < target for i in edges):
+                        remaining = [i for i in scalar if i not in local_mask_ops]
+                        if (set(causes) <= {'a scalar instruction the wave block cannot run once per wave',
+                                            'VCC or SCC live at the join'}
+                                and len(remaining) != len(scalar)
+                                and all(mesh_wave_block_scalar(*ins[i][2:]) for i in remaining)
+                                and not any(reg in VCC_KEYS | {'scc'} and live_at_join(reg, target)
+                                            for i in remaining for reg in scalar_effects(*ins[i][2:])[1])):
+                            scalar = remaining
+                            live = sorted({reg for i in scalar for reg in scalar_effects(*ins[i][2:])[2]
+                                           if re.fullmatch(r's\d+', reg) and live_at_join(reg, target)})
+                            causes.clear()
+                    if causes and not any(i in edges and i not in inner for i in range(source + 1, target)):
+                        memory = {i for i in scalar if lane_predicated_load(*ins[i][2:])}
+                        if memory and causes == ['a scalar instruction the wave block cannot run once per wave'] and all(
+                            mesh_wave_block_scalar(*ins[i][2:], explicit_scc=i in extra) for i in scalar if i not in memory
+                        ):
+                            causes.clear()
+                            scalar = [i for i in scalar if i not in memory]
+                            if mask_arm_sites is not None:
+                                mask_arm_sites.update(ins[i][0] for i in memory)
+                    if causes and coherent:
+                        try:
+                            votes, mask_ops, uniform = mesh_coherent_block(
+                                ins, source, target, edges, backward, live_at_join)
+                        except Unsupported as reason:
+                            # Keep the more specific diagnostic for a recognized legacy arm.
+                            if arm_refusal and 'an unsupported vector instruction' in str(reason):
+                                raise arm_refusal from None
+                            raise
+                        coherent_votes.update(votes)
+                        mask_instructions.update(mask_ops)
+                        wave_scalars.update(ins[i][0] for i in uniform)
+                        sites = {ins[i][0] for i in range(source + 1, target)}
+                        coherent_sites.update(sites)
+                        if not any(d == target and not source <= i < target for i, d in edges.items()):
+                            coherent_sites.add(ins[target][0])
+                        mask_arm_sites.update(sites)
+                        for i in nested:
+                            nested_saves.pop(i, None)
+                            nested_restores.pop(i, None)
+                        # Voted edges carry whole-wave scalar state, so the
+                        # emitter can intersect the actual incoming definitions.
+                        vcc_edges, scalar_arms, extra, live = set(), set(), set(), []
+                        causes.clear()
                     if causes:
+                        if unproven_back_edges:
+                            raise Unsupported(MESH_LOOP_REFUSAL)
                         raise Unsupported(exchange_branch_refusal if target == count_at
                                           else execz_effects + ' (wave-load block: ' + '; '.join(causes) + ')')
                     inner_vcc.update(vcc_edges)
@@ -3308,6 +4446,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
             # s_branch may land at the execz target or past it over instructions without effect (the
             # `s_branch .else` over `.empty: s_nop` of an if/else), so both paths meet with the same state.
+            missing = set()
             for i in range(source + 1, target):
                 name = ins[i][2]
                 if not (no_effect(i) or name == 'exp'
@@ -3315,15 +4454,39 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                             and all(no_effect(k) for k in range(target, edges[i])))
                         or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))
                         or dead_block_scalar(i, target)):
+                    missing.add(i)
+            if missing:
+                allowed, initializers = skipped_lane_mask_writes(
+                    ins, source, target, edges.items(), live_at_join, lane_mask_webs(ins))
+                if not missing <= allowed.keys():
                     raise Unsupported(execz_effects)
+                mask_instructions.update(allowed.keys() | initializers)
+        elif ins[source][2] == 's_cbranch_execnz' and source not in coherent_votes:
+            raise Unsupported('slot 57 mesh: s_cbranch_execnz on a wave-wide condition is not covered')
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
+    if unproven_back_edges:
+        raise Unsupported(MESH_LOOP_REFUSAL)
 
-    saved_masks = set().union(*(scalar_registers(parse(asm)[1][0]) for _, _, name, asm in ins
-                              if name == 's_and_saveexec_b64'))
+    saved_masks = set().union(*(scalar_registers(parse(asm)[1][0]) for i, (_, _, name, asm) in enumerate(ins)
+                              if name == 's_and_saveexec_b64' and i not in mask_instructions))
+    mask_instructions.update(local_mask_ops)
+    if standalone_selects is not None:
+        standalone_selects.update(ins[i][0] for i in local_mask_ops if ins[i][2] == 's_cselect_b64')
     out = list(ins[:first])
     span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
     # State of the walk over the code outside the two exchanges.
+    value_at, uniform_values, count_selects = {}, set(), {}
+    if load_branches or count_entry is not None:
+        read_only = not (pixel_writes or mesh_memory_writes(ins[:start] + ins[a_end:count_at] + ins[b_end:]))
+        value_at, uniform_values, count_selects = mesh_value_numbers(
+            ins, a_end, count_at, edges, constant_trips, read_only)
+    count_words = value_at[count_at][0] if count_at in value_at else {}
+    published = {key: count_words.get(env[key]) for key in ('verts', 'prims')}
+    count_regs = {env[key]: key for key in published}
+    valid_counts = set(count_regs)
+    tags = {}
+    guard_block = None
     stale = set(range(256))   # VGPRs the model does not hold for every lane; no entry VGPR is modelled
     pending = set()           # of those, the ones written only for the lanes of a narrowed exec
     mask = None           # None (all lanes), an output count, or another narrowed mask
@@ -3356,7 +4519,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         if index in targets:
             paths = incoming[index]
             if falls:
-                paths.append((stale, pending, mask, wave_known, thread, base, scc_stale, vcc_compares))
+                paths.append((stale, pending, mask, wave_known, thread, base, scc_stale, vcc_compares,
+                              tags, guard_block, valid_counts))
+            tags = mesh_guard_join(paths)
+            guard_block = paths[0][9] if all(p[9] == paths[0][9] for p in paths) else None
+            valid_counts = set.intersection(*(p[10] for p in paths))
             stale = set().union(*(p[0] for p in paths))
             pending = set().union(*(p[1] for p in paths))
             mask = paths[0][2]
@@ -3376,7 +4543,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             out.append(span(start, start + 1) + ('x2w_mesh_lane0', 'x2w_mesh_lane0 ' + env['lane']))
             out.append(ins[start + 2])
             out.append(span(start + 3, a_end - 1) + ('s_nop', 's_nop 0'))
-            stale |= pending | {5, vreg['a_zero'], vreg['a_zero2']}
+            clobbers = {5, vreg['a_zero'], vreg['a_zero2']}
+            stale |= pending | clobbers
+            tags = {v: tag for v, tag in tags.items() if v not in clobbers}
+            guard_block = None
             pending.clear()
             mask, thread = 'lane0', None
             wave_known = wave_known and sreg['wave'] != a_bits
@@ -3389,7 +4559,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
             out.append(span(count_at, b_end - 2) + (
                 'x2w_mesh_counts', 'x2w_mesh_counts %s, %s, %s' % (env['prims'], env['verts'], env['b_tmp'])))
             out.append(ins[b_end - 1])
-            stale |= pending | {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+            mesh_tag_guard_writes(index, guard_block, pending, tags, uniform_bounds)
+            clobbers = {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+            stale |= pending | clobbers
+            tags = {v: tag for v, tag in tags.items() if v not in clobbers}
+            guard_block = None
             pending.clear()
             mask, scc_stale = None, True
             wave_known = wave_known and sreg['wave'] != sreg['b_tmp']
@@ -3406,7 +4580,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                        and (any(tok in MESH_MASK_WORDS for tok in ops)
                             or bool(scalar_registers(', '.join(ops[1:])) & saved_masks))
                        and not scalar_registers(ops[0]) & (saved_masks | lane))
-        if (name != 's_and_saveexec_b64' and not complement and index not in nested_restores and not mask_select
+        if (index not in mask_instructions and name != 's_and_saveexec_b64' and not complement and index not in nested_restores and not mask_select
                 and scalar_registers(asm) & saved_masks):
             raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
         if index in edges:
@@ -3419,16 +4593,21 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                 if mask != index - 1 or not cmp or int(cmp[2]) != thread:
                     raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
                 wave_limits[off] = int(cmp[1], 0)
-            if index in inner_execz:
+            if index in coherent_votes:
+                wave_votes[off] = coherent_votes[index]
+            elif index in inner_execz:
                 wave_votes[off] = ('exec', True)
             if index in inner_vcc:
-                wave_votes[off] = ('vcc', name.endswith('z'))
-            elif name in MESH_VCC_BRANCHES:
+                # Keep the legacy branch text. The purity proof distinguishes both wave vote conditions.
+                zero = name == 's_cbranch_vccz' if index in mask_instructions else name.endswith('z')
+                wave_votes[off] = ('vcc', zero)
+            elif name in MESH_VCC_BRANCHES and index not in coherent_votes:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                 vcc_branches[off] = vcc_compares
             incoming.setdefault(edges[index], []).append(
-                (stale.copy(), pending.copy(), mask, wave_known, thread, base, scc_stale, vcc_compares))
+                (stale.copy(), pending.copy(), mask, wave_known, thread, base, scc_stale, vcc_compares,
+                 tags.copy(), guard_block, valid_counts.copy()))
             out.append(ins[index])
             falls = name != 's_branch'
             continue
@@ -3458,18 +4637,24 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     writes_s.update(range(r[1], r[2] + 1))
         if 3 in writes_s or writes_s & lane:
             raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
-        if (writes_s and name.startswith('v_') and keep[2] not in ('x2w_mesh_group', 'x2w_mesh_firstlane')
+        if (index not in mask_instructions and writes_s and name.startswith('v_') and keep[2] not in ('x2w_mesh_group', 'x2w_mesh_firstlane')
                 and base_name != 'v_readlane_b32'):
             raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
         # Only the wave index of s3 is modelled.
         if not re.fullmatch(r's_bfe_u32 s\d+, s3, 0x40018', asm) and any(
                 r and r[0] == 's' and r[1] <= 3 <= r[2] for r in map(reg_range, ops)):
             raise Unsupported('slot 57 mesh: s3 is read other than as the wave index')
-        if after and writes_s & {sreg['prims'], sreg['verts']}:
-            raise Unsupported('slot 57 mesh: an output count is written after the count exchange')
+        if after:
+            overwritten = (count_regs.keys() if name.startswith('s_movrel')
+                           else count_regs.keys() & scalar_effects(name, asm)[2])
+            valid_counts -= overwritten
+            if count_rewrites is not None:
+                count_rewrites.update(count_regs[reg] for reg in overwritten)
         if after and re.search(r'\bm0\b', asm):
             raise Unsupported('slot 57 mesh: m0 is used after the allocation request')
         if scc_stale and reads_scc(name, asm):
+            if standalone_selects is not None and off in standalone_selects:
+                raise Unsupported('slot 57 mesh: s_cselect_b64 on a wave mask is not covered')
             raise Unsupported('slot 57 mesh: SCC of the count exchange is read')
         if name.startswith(('s_cmp', 's_bitcmp')):
             scc_stale = False
@@ -3481,9 +4666,22 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         # Saveexec uses a fresh VCC from an adjacent compare. Only the matching complement can read the
         # saved mask. Hardware SCC (whether any bit is set) is not represented by a per-lane boolean.
         if asm == 's_mov_b64 exec, -1':
+            mesh_tag_guard_writes(index, guard_block, pending, tags, uniform_bounds,
+                                  coherent=coherent_sites is not None and off in coherent_sites)
+            guard_block = None
             mask = None
             stale |= pending
             pending.clear()
+        elif index in mask_instructions and writes_exec(name, ops):
+            if mask != 'wave_load':
+                raise mesh_wave_block_error('a mask operation has an unproven incoming EXEC')
+            if not lane_mask_narrows_exec(name, ops):
+                # The complement and other potentially widening writes can reactivate
+                # lanes that did not define registers written under the old EXEC.
+                stale |= pending
+                pending.clear()
+        elif index in mask_instructions:
+            pass
         elif index in nested_saves and mask == 'wave_load':
             mask, scc_stale = ('nest', index), True
         elif index in nested_restores and mask == ('nest', nested_restores[index]):
@@ -3500,10 +4698,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         elif index == count_entry:
             if mask is not None or mesh_vregs(ops) & stale:
                 raise Unsupported(exchange_branch_refusal)
+            guard_block = mesh_guard_block(ins, index, [count_entry_branch], edges, thread, value_at,
+                                          uniform_values, count_exchange=count_at)
             mask = 'count_entry'
         elif index in load_compares:
             if thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
+            if mask is None and (name == 'v_cmpx_lt_u32_e32' or all(
+                    wave_loads[ins[source][0]][1] is not None for source in load_branches[index])):
+                guard_block = mesh_guard_block(
+                    ins, index, load_branches[index], edges, thread, value_at, uniform_values,
+                    coherent=bool(coherent_sites) and any(
+                        ins[source + 1][0] in coherent_sites for source in load_branches[index]))
             for source in load_branches[index]:
                 branch_off = ins[source][0]
                 compare_off, bound, loads, live = wave_loads[branch_off]
@@ -3512,8 +4718,12 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                     wave_votes[branch_off] = ('exec', True)
             mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
-            count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
-            if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
+            operand = ops[0] if ops else None
+            count = count_regs.get(operand) if operand in valid_counts else None
+            signed_or_proven = (base_name == 'v_cmpx_gt_i32' or (
+                base_name == 'v_cmpx_gt_u32' and any(
+                    mesh_guard_covers(published.get(count), tag, thread, count_selects) for tag in tags.values())))
+            if (not signed_or_proven or not after or mask is not None or count is None
                     or thread is None or ops[1:] != ['v%d' % thread]):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
@@ -3539,20 +4749,31 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
         elif base in writes_s:
             base = None
         reads_v = mesh_vregs(ops if base_name.startswith(('v_cmp', 'exp', 'ds_write', 'buffer_store')) else ops[1:])
+        clobbers_v = mesh_vector_writes(name, asm)
         dest = reg_range(ops[0]) if ops and not base_name.startswith(('v_cmp', 'exp', 'buffer_store')) else None
         writes_v = set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
-        if base_name == 'v_mbcnt_lo_u32_b32' and base is not None and ops[1:] == ['-1', 's%d' % base] and mask is None \
-                and index + 1 not in targets \
-                and index + 1 < len(ins) and ins[index + 1][3] == 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (ops[0], ops[0]):
-            thread = dest[1]
-            thread_high = index + 1
-        elif thread in writes_v and index != thread_high:
+        high = (mesh_mbcnt_high(ins, index, base, ops[0], mbcnt_targets)
+                if base_name == 'v_mbcnt_lo_u32_b32' and base is not None
+                and ops[1:] == ['-1', 's%d' % base] and mask is None else None)
+        if high is not None:
+            thread, thread_high = None, high
+        elif index == thread_high:
+            thread, thread_high = dest[1], None
+        elif thread in clobbers_v:
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
         if lane_spill:
             reads_v, writes_v = set(), set()
-        if keep[2] != 'x2w_mesh_group' and reads_v & stale:
+        undefined = reads_v & stale
+        if after:
+            undefined = {word for word in undefined if word not in tags or not
+                         mesh_guard_covers(published.get(mask), tags[word], thread, count_selects)}
+        if keep[2] != 'x2w_mesh_group' and undefined:
+            if mask_arm_sites is not None and off in mask_arm_sites:
+                raise mesh_wave_block_error('a vector input is undefined on the active lanes')
             raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
-                              'left different per wave by an exchange)' % min(reads_v & stale))
+                              'left different per wave by an exchange)' % min(undefined))
+        for word in clobbers_v:
+            tags.pop(word, None)
         if mask is not None:
             pending |= writes_v & stale
         else:
@@ -3703,6 +4924,8 @@ class Stage:
     # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
     # (a class default keeps probes built without __init__ working).
     interp_scanned = False
+    interp_sample_obligations = None
+    round_modes = None
     defined_uniform_s = None
     bad_sgprs = None
     _uniform_written = None
@@ -3734,12 +4957,32 @@ class Stage:
             self.mesh_wave_votes = {}
             self.mesh_wave_scalars = set()
             self.mesh_wave_scalar_joins = {}
+            self.mesh_mask_arm_sites = set()
             # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
             # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
             self.mesh_source_ins = list(self.ins)
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits,
-                                     self.mesh_wave_loads, self.mesh_wave_votes, self.mesh_wave_scalars,
-                                     self.mesh_wave_scalar_joins)
+            self.mesh_standalone_selects = set()
+            self.mesh_count_rewrites = set()
+            self.mesh_uniform_bounds = set()
+            self.mesh_coherent_sites = set()
+            pixel_writes = getattr(pipe, 'mesh_pixel_writes', False)
+            proofs = (self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads,
+                      self.mesh_wave_votes, self.mesh_wave_scalars, self.mesh_wave_scalar_joins,
+                      self.mesh_mask_arm_sites)
+            passes = ((None, None), (self.mesh_standalone_selects, None),
+                      (self.mesh_standalone_selects, self.mesh_coherent_sites))
+            for selects, coherent in passes:
+                try:
+                    self.ins = mesh_skeleton(
+                        self.ins, *proofs, selects, pixel_writes, self.mesh_count_rewrites,
+                        self.mesh_uniform_bounds, coherent)
+                    break
+                except Unsupported as reason:
+                    if coherent is not None or not str(reason).startswith('slot 57 mesh:'):
+                        raise
+                    for proof in proofs + (self.mesh_standalone_selects, self.mesh_count_rewrites,
+                                           self.mesh_uniform_bounds):
+                        proof.clear()
             self.mesh_ballot_regs = set().union(*(scalar_registers(parse(asm)[1][0])
                                                   for _, _, name, asm in self.ins if name == MESH_MASK_SELECT))
         if kind in ('vs', 'ps'):
@@ -3756,6 +4999,7 @@ class Stage:
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
         self.retry_wave_reduction = False
+        self.retry_mask_joins = False
         # Both retries follow a refusal so the original lowering remains byte-identical.
         self.retry_paired_exec = False
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
@@ -3790,11 +5034,13 @@ class Stage:
             try:
                 self.translate()
             except Unsupported as reason:
-                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))):
+                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))
+                        or self.retry_lane_mask_joins(str(reason))):
                     raise
                 continue
             if refusals is not None and any(
-                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason))
+                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason)
+                                       or self.retry_lane_mask_joins(reason))
                     for reason, stage in refusals[first_refusal:]):
                 del refusals[first_refusal:]
                 continue
@@ -3867,6 +5113,17 @@ class Stage:
         self.force_joined.clear()
         return True
 
+    def retry_lane_mask_joins(self, reason):
+        """Keep existing output. Retry an execz live-definition or graphics branch refusal once."""
+        if self.retry_mask_joins or self.kind not in ('cs', 'ps', 'vs') or self.program_is_wave32():
+            return False
+        if 'inside a block s_cbranch_execz skips per lane: definition of ' not in reason and (
+                self.kind != 'ps' or not any(x in reason for x in (
+                    'wave-wide read in a program with a branch', 'wave-uniform control flow'))):
+            return False
+        self.retry_mask_joins = True
+        return True
+
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
@@ -3928,8 +5185,8 @@ class Stage:
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
-        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set (only accepted
-        for at most 32 threads per group, #2274), and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
+        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set,
+        and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
         inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not place (s0-s3 and
         any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
@@ -3945,9 +5202,15 @@ class Stage:
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
         if tg_size is not None:
-            if self.pipe.group[0] * self.pipe.group[1] * self.pipe.group[2] > 32 and self.pipe.wave_size != 32 \
-                    and not wave32_exec_proof(self.ins):
+            wave = self.pipe.wave_size
+            if wave is None:
+                if wave32_exec_proof(self.ins):
+                    wave = 32
+                elif wave64_exec_proof(self.ins):
+                    wave = 64
+            if math.prod(self.pipe.group) > 32 and wave not in (32, 64):
                 raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+            self.tg_size_wave = wave
             self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
@@ -4753,6 +6016,8 @@ class Stage:
         self.execz_counted_loops = {}
         refused, into = {}, {}
         self.execz_scalar_votes = {}
+        pair_masks = lane_mask_webs(self.ins) if getattr(self, 'retry_mask_joins', False) else ()
+        edges = [(k, index[target]) for k, target in jumps if target in index]
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
@@ -4794,6 +6059,10 @@ class Stage:
             # A live definition is still accepted when every read of it from the join on is proven (execz_live_read):
             # the halves whose lanes keep their bit of the word through the block, and where exec is unchanged since
             # the join on every path from it.
+            allowed_pairs = {}
+            if pair_masks and straight and original_join == t:
+                allowed_pairs, _ = skipped_lane_mask_writes(
+                    self.ins, b, t, edges, lambda word, at: word in live_in[at], pair_masks)
             kept = {}
             for i in range(b + 1, t):
                 for word in (effects[i][2] - EXEC_KEYS) & live:
@@ -4829,7 +6098,7 @@ class Stage:
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
-                elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
+                elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks - allowed_pairs.get(i, set())) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
                     # Reserve the fallback for ordinary scalar writes. The vote keeps every lane on the same
                     # control-flow edge, so the existing runtime join selects every word (and SCC) together.
@@ -5208,23 +6477,11 @@ class Stage:
     @staticmethod
     def mask_write_class(base, ops, name, temps, enc=frozenset()):
         """'keep', 'zero' or 'ones' for a write of mask `name` inside an execz block (see phi_mask_ok), else None."""
-        key = 'vcc' if name == 'vcc_lo' else name
-        if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
-            return 'zero'
-        lane = lambda x: ('vcc' if x == 'vcc_lo' else x) in temps | enc   # a lane mask: bit 0 is this lane's bit
-        if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:] and lane(ops[2] if ops[1] == 'exec_lo' else ops[1]):
-            return 'zero'
-        if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
-            return 'zero'
-        if base == 's_orn2_b32' and len(ops) == 3 and ops[2] == 'exec_lo' and lane(ops[1]):
-            return 'ones'
-        if base == 's_andn2_b32' and ops == [name, name, 'exec_lo']:
-            return 'keep'
-        if base == 's_or_b32' and len(ops) == 3 and name in ops[1:]:
-            other = ops[2] if ops[1] == name else ops[1]
-            if other != name and ('vcc' if other == 'vcc_lo' else other) in temps:
-                return 'keep'
-        return None
+        def lane_key(token):
+            return 'vcc' if token == 'vcc_lo' else token
+
+        return skipped_mask_write(base, ops, lambda token: lane_key(token) in temps,
+                                  lambda token: lane_key(token) in temps | enc, width=32)
 
     def per_lane_read(self, i, key):
         """True when instruction i reads mask `key` only as a lane select or carry, or into exec (s_and_saveexec,
@@ -5719,6 +6976,10 @@ class Stage:
         mesh_votes = getattr(self, 'mesh_wave_votes', {})
         wave_scalars = getattr(self, 'mesh_wave_scalars', ())
         wave_scalar_joins = getattr(self, 'mesh_wave_scalar_joins', {})
+        mask_arm_sites = getattr(self, 'mesh_mask_arm_sites', ())
+        coherent_sites = getattr(self, 'mesh_coherent_sites', ())
+        scc_compares = ({off for off, _, name, _ in self.ins if name.startswith(('s_cmp', 's_bitcmp'))}
+                        if coherent_sites else set())
         mesh_reads = {off for off, _, name, _ in self.ins if name == 'x2w_mesh_firstlane'}
         mesh_selects = {off for off, _, name, _ in self.ins if name == MESH_MASK_SELECT}
         wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
@@ -5806,6 +7067,8 @@ class Stage:
                                 any(name == 'v_subrev_f32_dpp' for _, _, name, _ in self.ins)
                                 else set())
         self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
+        if getattr(self, 'kind', None) == 'ps' and any(name in PIXEL_IMAGE_ATOMICS for name in names.values()):
+            self.nonhelper_atomic_sites = self.pixel_nonhelper_atomic_sites(self.spill_cfg)
         self.loads_after_exec_write = set()
         self.loads_after_wide_exec_write = set()
         all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
@@ -5974,6 +7237,9 @@ class Stage:
             materialize = {}
             incoming = {}
             edge_since = {}   # forward branch target -> since_join at each branch to it (None: not tracked)
+            incoming_masks = {}
+            skipped_marks = (set(), set(), set())  # program-order marks suppressed in the current block
+            carried_masks = set()  # edge marks absent from the program-order state
             kept = {}
             self.back_force = {}
             written = set(init_written)
@@ -5999,13 +7265,13 @@ class Stage:
                     self.descriptor_block_first = instruction_index
                 # The relaxed pixel proof tracks a load only within its straight run.
                 if self.firstlane_ps_load_v:
-                    _, operands, _ = parse(asm)
+                    _, operands, modifiers = parse(asm)
                     if (instruction_index == self.descriptor_block_first or writes_exec(name, operands)
                             or scalar_effects(name, asm)[2] & EXEC_KEYS):
                         self.firstlane_ps_load_v.clear()
                     else:
                         base = re.sub(r'_e(32|64)$', '', name)
-                        self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands))
+                        self.firstlane_ps_load_v.difference_update(lds_vgpr_writes(base, operands, modifiers))
                 self.pc = off
                 if retry_wave:
                     self.exec_known = off in self.reduction_entry_exec
@@ -6030,6 +7296,26 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
+                    marks = (self.masks, self.mask_high, self.join_masks)
+                    arriving_masks = incoming_masks.get(off, set())
+                    if falls:
+                        arriving_masks = arriving_masks.union(carried_masks, *marks)
+                    # Start with the program-order marks. An edge that skipped the previous block
+                    # can still carry one of the marks suppressed while lowering that block.
+                    ordered_marks = tuple(current | skipped for current, skipped in zip(marks, skipped_marks))
+                    if off not in back_targets:
+                        skipped_marks = tuple(current - arriving_masks for current in ordered_marks)
+                        marks = tuple(current & arriving_masks for current in ordered_marks)
+                    else:
+                        skipped_marks = (set(), set(), set())
+                        marks = ordered_marks
+                        # An unvisited back edge can carry writes into a later forward edge.
+                        # The printed destination of a wave64 compare may name only the low word.
+                        loop_writes = joined.get(off, ())
+                        arriving_masks = arriving_masks.union(
+                            loop_writes, (r + 1 for r in loop_writes if isinstance(r, int) and r % 2 == 0))
+                    self.masks, self.mask_high, self.join_masks = marks
+                    carried_masks = arriving_masks.difference(*marks)
                     self.heap_index.clear()  # another path into the join may hold a different word
                     self.align4_v.clear()
                     self.align4_s.clear()
@@ -6103,6 +7389,8 @@ class Stage:
                         self.varying_s.difference_update(edge)
                     self.scc_uniform = (self.firstlane_cfg and self.kind == 'ps' and self.uniform_cf
                                         and self.scc_def is not None)
+                    if off in coherent_sites and self.scc_def in uniform_scc_writes:
+                        self.scc_uniform = True
                     self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
@@ -6122,7 +7410,7 @@ class Stage:
                             (v[0] == 'const' and len(v) == 2) or v[0] in ('ud', 'fixed_buffer_word')
                         )
                     }
-                if self.firstlane_cfg and self.uniform_cf:
+                if (self.firstlane_cfg and self.uniform_cf) or off in coherent_sites:
                     if off in targets:
                         paths = firstlane_edges.get(off, [])
                         if falls:
@@ -6130,7 +7418,7 @@ class Stage:
                         if paths:
                             self.firstlane_v = set.intersection(*(v for v, _ in paths))
                             scalar_phi = set.intersection(*(u for _, u in paths))
-                            if self.kind == 'ps':
+                            if self.kind == 'ps' or off in coherent_sites:
                                 # Program order may still hold a write from a sibling arm.
                                 # Only the incoming edges establish a definition at this join.
                                 self.since_join = scalar_phi
@@ -6163,8 +7451,10 @@ class Stage:
                         edge_since.setdefault(b_target, []).append(
                             None if getattr(self, 'since_join', None) is None
                             else self.since_join - self.varying_s - self.masks)
+                        incoming_masks.setdefault(b_target, set()).update(
+                            self.masks | self.mask_high | self.join_masks | carried_masks)
                         scc_in.setdefault(b_target, []).append(self.scc_def)
-                        if self.firstlane_cfg and self.uniform_cf:
+                        if (self.firstlane_cfg and self.uniform_cf) or b_target in coherent_sites:
                             scalar_facts = self.defined_uniform_s if self.since_join is None else self.since_join
                             firstlane_edges.setdefault(b_target, []).append(
                                 (self.firstlane_v.copy(), scalar_facts - self.varying_s - self.masks))
@@ -6201,18 +7491,33 @@ class Stage:
                     base = re.sub(r'_e(32|64)$', '', name)
                     if off in wave_load_compares:
                         bound = wave_load_compares[off]
-                        if not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s:
+                        if (off not in getattr(self, 'mesh_uniform_bounds', ()) and
+                                (not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s)):
                             raise Unsupported(execz_effects)
                         # Capture the bound at the compare, before any intervening SGPR write.
                         self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if off in getattr(self, 'mesh_standalone_selects', ()) and not (
+                            self.scc_verified and self.scc_uniform):
+                        raise Unsupported('slot 57 mesh: s_cselect_b64 on a wave mask is not covered')
                     if off in wave_scalars:
                         reads, _, _ = scalar_effects(name, asm)
+                        if off in mask_arm_sites and name == 's_cselect_b64':
+                            reads = {'scc'}
+                        if off in coherent_sites and 'scc' in reads:
+                            if not (self.scc_verified and self.scc_uniform):
+                                raise mesh_wave_block_error('SCC is not proven wave-uniform')
+                            if (name in MESH_SCC_BRANCHES or name.startswith(('s_cselect', 's_cmov'))) and (
+                                    self.scc_def not in scc_compares):
+                                raise mesh_wave_block_error('SCC is not from a scalar compare')
                         if any(
                             not (self.scc_verified and self.scc_uniform) if reg == 'scc' else
                             not (self.uniform_source(reg) and int(reg[1:]) in self.defined_uniform_s)
                             for reg in reads
                         ):
-                            raise Unsupported(execz_effects + ' (wave-load block: a scalar input is not wave-uniform)')
+                            raise mesh_wave_block_error('a masked arm reads a scalar that is not wave-uniform'
+                                                        if off in mask_arm_sites else 'a scalar input is not wave-uniform')
+                    if off in mask_arm_sites and name in SCALAR_LOADS:
+                        self.check_mesh_mask_load(name, parse(asm)[1])
                     if off in wave_load_sites:
                         offset = smem_offset(parse(asm)[1][2])
                         if not self.uniform_source(offset) or (
@@ -6230,6 +7535,8 @@ class Stage:
                         live_on_skip = wave_loads[off][3] if off in wave_loads else wave_scalar_joins.get(off, ())
                         for dst in live_on_skip:
                             if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
+                                if off in mask_arm_sites:
+                                    raise mesh_wave_block_error('a scalar live after the arm is undefined or non-uniform on the skip path')
                                 raise Unsupported(execz_effects)
                             self.u(dst)
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
@@ -6278,7 +7585,14 @@ class Stage:
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
+                    guarded_load = not self.exec_known and (
+                        (off in mask_arm_sites and lane_predicated_load(name, asm)) or
+                        (off in coherent_sites and name.startswith('buffer_load_')))
+                    if guarded_load:
+                        self.emit('if (exec & 1) {')
                     term = self.one(name, asm)
+                    if guarded_load:
+                        self.emit('}')
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
                     if off in mesh_votes:
@@ -6324,6 +7638,17 @@ class Stage:
                     continue
                 # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
+                if dests:
+                    for skipped in skipped_marks:
+                        skipped.difference_update(dests)
+                    if carried_masks:
+                        # A copy or bitwise operation can forward a mask that only some paths carry.
+                        copies_mask = ((MASK_COPY_SALU_RE.match(name) or name == 's_cselect_b32') and
+                                       bool(carried_masks & scalar_registers(' '.join(parse(asm)[1][1:]))))
+                        if copies_mask:
+                            carried_masks.update(dests)
+                        else:
+                            carried_masks.difference_update(dests)
                 if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
                     # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
                     # value (descriptor_scc_reads follows every path from here to the reader).
@@ -6639,12 +7964,64 @@ class Stage:
         and the second of v_swap_b32), or None."""
         for i in range(before - 1, after, -1):
             _, _, name, asm = self.ins[i]
-            ops = parse(asm)[1]
-            for tok in (ops[:2] if name.startswith('v_swap') else ops[:1]):
+            _, ops, mods = parse(asm)
+            for tok in (ops[:2] if name.startswith('v_swap') else destinations(name, ops, mods)):
                 r = reg_range(tok)
                 if r and r[0] == 'v' and r[1] <= reg <= r[2]:
                     return i
         return None
+
+    def pixel_nonhelper_atomic_sites(self, cfg):
+        """Prove that the atomic's EXEC is a subset of entry EXEC on every incoming path.
+
+        Discards shrink the saved live mask. Whole-quad mode can re-enable those lanes for derivatives.
+        D3D suppresses UAV writes and atomics from discarded and helper invocations (D3D11.3 §16.13).
+        After the shader restores the live mask, the translated EXEC guard also skips those lanes.
+        """
+        bounds, _, successors, _ = cfg
+        incoming = {0: (True, frozenset())}
+        sites = set()
+        pending = [0]
+        while pending:
+            block = pending.pop()
+            exact, saved = incoming[block]
+            lo, hi = bounds[block]
+            for pc, _, name, asm in self.ins[lo:hi]:
+                _, ops, mods = parse(asm)
+                if name in PIXEL_IMAGE_ATOMICS:
+                    (sites.add if exact else sites.discard)(pc)
+                # AND is bounded by either input. ANDN2 is bounded only by its uncomplemented input.
+                limits = []
+                if name == 's_and_b64' and len(ops) == 3:
+                    limits = ops[1:]
+                elif name == 's_andn2_b64' and len(ops) == 3:
+                    limits = ops[1:2]
+                pairs = {reg_range(tok) for tok in limits}
+                if writes_exec(name, ops, mods) or scalar_effects(name, asm)[2] & EXEC_KEYS:
+                    restore = ops[:1] == ['exec'] and (
+                        bool(pairs & saved) or
+                        (name == 's_mov_b64' and len(ops) == 2 and reg_range(ops[1]) in saved))
+                    narrow = self.exec_write_only_narrows(name, ops)
+                    narrow |= ops[:1] == ['exec'] and 'exec' in limits
+                    exact = restore or (exact and narrow)
+                dest = reg_range(ops[0]) if ops else None
+                shrinks_saved = dest in saved and dest in pairs
+                writes = scalar_destinations(name, asm)
+                saved = (frozenset() if 'any' in writes else
+                         frozenset(r for r in saved if not writes.intersection(range(r[1], r[2] + 1))))
+                save_exec = (exact and name == 's_mov_b64' and ops[1:] == ['exec']
+                             and dest and dest[0] == 's' and dest[2] == dest[1] + 1 and dest[2] <= 105)
+                if shrinks_saved or save_exec:
+                    saved |= {dest}
+                if name.startswith(('s_swappc', 's_call')):
+                    exact, saved = False, frozenset()
+            for succ in successors[block]:
+                old_exact, old_saved = incoming.get(succ, (True, saved))
+                merged = (exact and old_exact, saved & old_saved)
+                if incoming.get(succ) != merged:
+                    incoming[succ] = merged
+                    pending.append(succ)
+        return sites
 
     def tid_shift(self, count, source):
         """The uniform expression of `v_lshrrev_b32 vD, count, source` in the entry block of a compute program, or None.
@@ -6733,6 +8110,23 @@ class Stage:
             return False
         return True
 
+    def graphics_skipped_mask_writes(self, branch, target, branches):
+        """Find lane-local pair definitions on a retry of a graphics skip."""
+        if not getattr(self, 'retry_mask_joins', False) or self.kind not in ('ps', 'vs'):
+            return set()
+        index = {off: i for i, (off, *_rest) in enumerate(self.ins)}
+        if target not in index or branch not in index:
+            return set()
+        b, t = index[branch], index[target]
+        if b >= t or self.ins[b][2] != 's_cbranch_execz' or any(dst <= src for src, dst in branches):
+            return set()
+        edges = [(index[src], index[dst]) for src, dst in branches if src in index and dst in index]
+        allowed, _ = skipped_lane_mask_writes(
+            self.ins, b, t, edges, lambda _word, _at: True, lane_mask_webs(self.ins))
+        # Graphics' check only exempts mask writers with no SCC effect. The
+        # existing scalar flow rules still apply to every other instruction.
+        return {self.ins[i][0] for i in allowed}
+
     def skipped_block_vector_only(self, branch, target):
         """Whether the instructions a forward EXEC branch can skip are per-lane vector work only.
 
@@ -6743,8 +8137,11 @@ class Stage:
         reads nothing later)."""
         if target <= branch:
             return False
+        branches = [(off, int(parse(asm)[1][0].split('_')[1], 16)) for off, _, name, asm in self.ins
+                    if name.startswith(('s_cbranch', 's_branch'))] if getattr(self, 'retry_mask_joins', False) else ()
+        masks = self.graphics_skipped_mask_writes(branch, target, branches)
         for off, _n, name, asm in self.ins:
-            if not branch < off < target:
+            if not branch < off < target or off in masks:
                 continue
             if name == 's_endpgm':
                 # A quad that ends reads nothing later, unless later code can turn it back on: an EXEC write after the
@@ -6754,7 +8151,7 @@ class Stage:
                 continue
             if not (self.vector_only_instruction(name, asm)
                     or name.startswith(('image_', 'buffer_', 'tbuffer_', 'global_', 'flat_', 'exp'))
-                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt')):
+                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt', 's_round_mode')):
                 return False
         return True
 
@@ -6967,7 +8364,7 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
-        if writes_exec(name, ops):
+        if writes_exec(name, ops, mods):
             self.exec_generation += 1
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
@@ -7114,14 +8511,14 @@ class Stage:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
         if extra_proof:
-            for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops):
+            for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.firstlane_v.difference_update(range(reg[1], reg[2] + 1))
             self.firstlane_v.update(extra_regs)
             self.firstlane_ps_load_v.update(ps_load_regs)
         if getattr(self, 'entry_exec_proof', None) is not None:
-            for token in (ops[:2] if base == 'v_swap_b32' else ops[:1]):
+            for token in (ops[:2] if base == 'v_swap_b32' else destinations(base, ops, mods)):
                 reg = reg_range(token)
                 if reg and reg[0] == 'v':
                     self.entry_written_v.difference_update(range(reg[1], reg[2] + 1))
@@ -7828,11 +9225,20 @@ class Stage:
                 self.scc_uniform = False  # the hardware SCC result is not modelled
             self.scc_verified = False
             return None
+        if self.round_modes is None:
+            self.round_modes = self.round_mode_flow()
+        mode = self.round_modes.get(pc, 1)  # bit 0: nearest even; bit 1: toward zero
+        if base == 's_round_mode':
+            self.round_mode_immediate(ops, mods)
+            return None
+        if mode & 2:
+            self.check_half_round_mode(base, mode)
         if base == 's_setreg_imm32_b32':
-            # The write itself changes nothing the lowering models, except MODE[1:0] (the binary32 rounding mode):
-            # v_cvt_pk_u8_f32 and the other conversions are lowered for round-to-nearest-even, and the hardware
-            # follows MODE.round (round toward zero truncates). s_round_mode and s_setreg_b32 are refused already.
+            # Keep the existing binary32 check for standalone MODE writes. A second writer of MODE[3:0]
+            # would invalidate the rounding dataflow proved for s_round_mode.
             field = re.fullmatch(r'hwreg\((HW_REG_MODE|1)(?:,\s*(\d+),\s*(\d+))?\)', ops[0].strip()) if ops else None
+            if field and self.round_modes and int(field.group(2) or 0) < 4:
+                raise Unsupported('s_setreg_imm32_b32 writes MODE rounding bits in a program with s_round_mode')
             if field and int(field.group(2) or 0) < 2:   # shortcut: an offset >= 2 cannot reach MODE[1:0]
                 # The immediate is known: the write is harmless when it leaves MODE[1:0] at 0 (nearest even).
                 offset, width = int(field.group(2) or 0), int(field.group(3) or 32)
@@ -7955,6 +9361,8 @@ class Stage:
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
+        if base in PIXEL_IMAGE_ATOMICS and self.kind == 'ps':
+            return self.pixel_image_atomic(base, ops, mods)
         if base in LDS_DUAL_OPS:
             return self.lds_dual(base, ops, mods)
         if base in LDS_ATOMIC_OPS:
@@ -8860,21 +10268,30 @@ class Stage:
             for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
         ]
         if tg_srcs:
-            # Wave-ID bits TG_SIZE[11:6] (mask 0xfc0) are identically 0 for <= 32 threads per group (1 wave).
             if (base == 's_and_b32' and not mods and len(srcs) == 2
                     and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105):
                 other = (srcs[1] if syms[0] == ('tg_size',) and syms[1] != ('tg_size',)
                          else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
                          else None)
-                if other is not None and self.const_u32(other) == 0xfc0:
+                mask = self.const_u32(other) if other is not None else None
+                if mask in (0x3f, 0xfc0):
                     x, y, z = self.pipe.group
-                    if x * y * z <= 32:
+                    threads = x * y * z
+                    wave = self.tg_size_wave
+                    if mask == 0x3f:
+                        if wave not in (32, 64):
+                            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+                        count = (threads + wave - 1) // wave
+                        self.set_s(dst[1], '%du' % count, ('const', count), scc='true')
+                        return None
+                    if threads <= (wave if wave in (32, 64) else 32):
                         self.set_s(dst[1], '0u', ('const', 0), scc='false')
                         return None
-                    # Wave32 waves hold 32 consecutive threads in x-major order: the wave ID is the flat thread index / 32,
-                    # and differs between the waves of one group (so the register is not uniform).
+                    # Only actual group threads enter the per-lane EXEC model, including in the last wave.
+                    # The guest wave ID may differ within the group, independently of the host wave layout.
+                    shift = 5 if wave == 32 else 6
                     flat = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
-                    self.set_s(dst[1], '((%s >> 5u) << 6u)' % flat, scc='$ != 0u', uniform=False)
+                    self.set_s(dst[1], '((%s >> %du) << 6u)' % (flat, shift), scc='$ != 0u', uniform=False)
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
@@ -10664,7 +12081,7 @@ class Stage:
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
-        extended = self.kind != 'cs' and extended_buffer_formats()
+        extended = extended_buffer_formats()
         for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
             if fmt not in DESC_LEGACY_FORMATS:
                 if extended:
@@ -10885,8 +12302,11 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps: only the compute level-zero and explicit-level samples (the runtime binds a TextureCube view for them).
-        cube = dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l') and getattr(self, 'kind', None) == 'cs'
+        stage = getattr(self, 'kind', None)
+        pixel_cube = dim == 'SQ_RSRC_IMG_CUBE' and stage == 'ps' and how in ('sample', 'lz', 'l', 'b')
+        cube = pixel_cube or (dim == 'SQ_RSRC_IMG_CUBE' and stage == 'cs' and how in ('lz', 'l'))
+        if pixel_cube and ('a16' in mods or 'd16' in mods):
+            raise Unsupported('cube sampling with a16 or d16 is unsupported')
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:
@@ -10987,6 +12407,8 @@ class Stage:
                 self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         dynamic_view = desc_key is not None and desc_key[0][0] == 'dynamic_heap'
+        if pixel_cube and dynamic_view:
+            raise Unsupported('cube sampling requires a table TextureCube view')
         if dynamic_view and (integer_srvs or sample_d16 or 'd16' in mods):
             raise Unsupported('dynamic resource heap image with integer or d16 access')
         shared_load = (desc_key is not None and not dynamic_view and getattr(self, 'kind', None) == 'ps'
@@ -11072,6 +12494,7 @@ class Stage:
                 if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
                     raise Unsupported('image_sample_lz d16 destination %s for dmask %#x' % (ops[0], dmask))
             if tex is None:
+                self.check_interp_sample_call(None)
                 self.null_image_read(dst, dmask)
                 return
             heap = self.heap_sampler(ops[3])
@@ -11142,6 +12565,7 @@ class Stage:
                     tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
                 if implicit_bias:
+                    self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             elif len(self.blocks) > 0:
@@ -11153,9 +12577,11 @@ class Stage:
                     self.plain_samples[self.pc] = (None if implicit_bias else call, '%s.Sample(%s, %s)' % (tex, smp, uv))
                     call = 'X2W_PLAIN_SAMPLE<%x>' % self.pc
                 elif implicit_bias:
+                    self.check_interp_sample_call(None)
                     raise Unsupported('image_sample with a sampler LOD bias and no implicit LOD')
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
+        self.check_interp_sample_call(call)
         if tex is None:
             self.null_image_read(dst, dmask, packed='d16' in mods)
             return
@@ -11243,6 +12669,7 @@ class Stage:
             raise Unsupported('%s sampler: %s' % (base, error))
         key = self.descriptor(ops[2])
         if key is None:
+            self.check_interp_sample_call(None)
             return self.null_image_read(reg_range(ops[0]), dmask)
         tex = self.pipe.resource(key, 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
@@ -11255,9 +12682,19 @@ class Stage:
         # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.
         max_lod = (words[1] >> 12) & 0xfff
         if how == 'c' and max_lod:
+            self.check_interp_sample_call(None)
             raise Unsupported('%s with implicit mip selection (sampler MAX_LOD %#x)' % (base, max_lod))
         call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
+        self.check_interp_sample_call(call)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % call)
+
+    def check_interp_sample_call(self, call):
+        obligations = self.interp_sample_obligations
+        if obligations and self.pc in obligations:
+            # The placeholder can resolve to Sample after the walk. Only a call
+            # already known to use an explicit level satisfies the scan.
+            if call is None or not re.match(r'\w+\.(?:SampleLevel|SampleCmpLevelZero|Load)\(', call):
+                raise Unsupported(obligations[self.pc])
 
     def op_image_sample_c(self, ops, mods):
         self.image_compare(ops, mods, 'c')
@@ -11380,14 +12817,12 @@ class Stage:
             return False
 
     def op_image_store(self, ops, mods):
-        """Write the selected channels of a typed image texel.
+        """Write a whole typed image texel, zeroing channels absent from DMASK.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. A partial mask uses a typed UAV load to preserve the other channels. This assumes that
-        each active lane owns its texel, including across groups, for the duration of the read-modify-write.
-        The bound float or normalized view must support typed UAV stores and, for partial masks, loads.
+        registers. The bound float or normalized view must support typed UAV stores.
         The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
         from helper lanes as the hardware drops them for lanes outside exec.
         """
@@ -11426,15 +12861,11 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        # A partial mask writes only the selected channels, in order from consecutive VDATA registers. HLSL's typed
-        # UAV store writes all four, so the other channels are read back and stored unchanged (read-modify-write).
         channels = [i for i in range(4) if mask >> i & 1]
-        if not channels or mask > 0xf or mask < 0 or (d16 and mask != 0xf):
-            raise Unsupported('%s with dmask %s: %s' % (
-                name, masks[0], 'a 16-bit store writes all four channels' if channels and d16 and mask <= 0xf
-                else 'no channel selected or out of range'))
+        if not channels or mask > 0xf or mask < 0:
+            raise Unsupported('%s with dmask %s: no channel selected or out of range' % (name, masks[0]))
         data = reg_range(ops[0])
-        count = 2 if d16 else len(channels)
+        count = (len(channels) + 1) // 2 if d16 else len(channels)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
             raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], {1: 'one', 2: 'two', 3: 'three', 4: 'four'}[count]))
         coords = ops[1]
@@ -11456,12 +12887,15 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
-        if d16:
-            # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
-            rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
-            value = 'float4(%s)' % ', '.join(rgba)
-        else:
-            value = 'asfloat(uint4(%s))' % ', '.join(words)
+        rgba = ['0.0' if d16 else '0u'] * 4
+        for i, channel in enumerate(channels):
+            if d16:
+                # Packed D16 components follow DMASK order, low half first.
+                half = ' & 0xffffu' if i % 2 == 0 else ' >> 16'
+                rgba[channel] = 'f16tof32(%s%s)' % (words[i // 2], half)
+            else:
+                rgba[channel] = words[i]
+        value = ('float4(%s)' if d16 else 'asfloat(uint4(%s))') % ', '.join(rgba)
         if (self.kind == 'ps' and getattr(self.pipe, 'pixel_rw_images', None) is not None
                 and self.is_fixed_table_image(ops[2], key)):
             for earlier in self.pixel_rw_loads.get(key, ()):
@@ -11477,12 +12911,44 @@ class Stage:
             index = 'uint2(%s & 0xffffu, %s >> 16)' % (packed, packed)
         else:
             index = self.u(cs[0]) if address == 1 else 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        if len(channels) == 4 or d16:
-            body = '%s[%s] = %s;' % (image, index, value)
+        body = '%s[%s] = %s;' % (image, index, value)
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
+    def pixel_image_atomic(self, name, ops, mods):
+        # RDNA 2 ISA §8.1.10, §8.2 and §12.16: with GLC clear, VDATA is only a source.
+        if 'glc' in mods:
+            raise Unsupported('%s with glc: returning the previous texel is unsupported' % name)
+        if len(ops) != 3:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        if dims != ['SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s requires dim:SQ_RSRC_IMG_2D' % name)
+        if [m for m in mods if m.startswith('dmask:')] != ['dmask:0x1']:
+            raise Unsupported('%s requires dmask:0x1 for one 32-bit data word' % name)
+        for m in mods:
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'slc', 'unorm')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        data, coords, desc = ops
+        if not re.fullmatch(r'v\d+', data) or int(data[1:]) > 255:
+            raise Unsupported('%s requires one data VGPR' % name)
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
         else:
-            sets = ' '.join('t.%s = asfloat(%s);' % ('xyzw'[c], word) for c, word in zip(channels, words))
-            body = '{ t = %s[%s]; %s %s[%s] = t; }' % (image, index, sets, image, index)
-            self.pipe.uavs[key]['load'] = True  # manifest 'uavload N': the runtime needs typed UAV load for it
+            r = reg_range(coords)
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
+        if len(cs) != 2 or not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
+            raise Unsupported('%s requires two full-width address VGPRs' % name)
+        if self.pc not in self.nonhelper_atomic_sites:
+            raise Unsupported('%s: EXEC may include helper lanes' % name)
+        if self.null_descriptor(desc):
+            self.descriptor(desc)
+            return
+        image = self.pipe.uav(self.descriptor(desc), 'tex2du')
+        index = 'uint2(%s, %s)' % tuple(self.u(c) for c in cs)
+        value = self.u(data)
+        if name == 'image_atomic_sub':
+            value = '0u - ' + value
+        body = 'Interlocked%s(%s[%s], %s);' % (PIXEL_IMAGE_ATOMICS[name], image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp, regs_out=None,
@@ -12240,6 +13706,29 @@ class Stage:
                 raise Unsupported('slot 57 mesh: unsupported mask select destination %s' % dst)
             self.set_s(reg[1], 'mesh_mask', uniform=True)
 
+    def check_mesh_mask_load(self, name, ops):
+        """Prove the load offset and resource are uniform on the voted path."""
+        if len(ops) != 3:
+            raise mesh_wave_block_error('a masked arm has an unsupported scalar load')
+        offset = smem_offset(ops[2])
+        base = reg_range(ops[1])
+        pointer = self.sym.get(base[1]) if base and base[0] == 's' else None
+        if (not self.uniform_source(offset) or
+                (re.fullmatch(r's\d+', offset) and int(offset[1:]) not in self.defined_uniform_s)):
+            raise mesh_wave_block_error('a masked arm reads a scalar that is not wave-uniform')
+        if name.startswith('s_buffer_load'):
+            if (not pointer or pointer[0] != 'desc' or pointer[1][0] == 'dynamic_heap'
+                    or base[2] - base[1] != 3 or any(
+                        self.sym.get(base[1] + i) != desc_word(pointer, pointer[3] + i) for i in range(1, 4)
+                    )):
+                raise mesh_wave_block_error('a masked arm has no proven wave-uniform descriptor')
+            if self.descriptor(ops[1]) in getattr(self.pipe, 'rw_keys', ()):
+                raise mesh_wave_block_error('a masked arm loads from a written buffer')
+        elif (not pointer or pointer[0] != 'ptr' or base[2] - base[1] != 1
+              or (pointer[1][0] == 'root' and self.sym.get(base[2]) != ptr_high_symbol(
+                  pointer[1], pointer[2] if len(pointer) > 2 and isinstance(pointer[2], int) else 0))):
+            raise mesh_wave_block_error('a masked arm reads a scalar that is not wave-uniform')
+
     def check_mesh_collectives(self, sites, branches):
         # A logical wave must reach a collective with all its lanes or none. A lane-only
         # branch is safe before the collective if both paths reconverge there or both miss it.
@@ -12258,6 +13747,8 @@ class Stage:
                 if off in jumps:
                     paths.append(reach[indices[jumps[off]]])
                 if off in self.divergent_branches and paths and (min(paths) != max(paths) or 2 in paths):
+                    if site in getattr(self, 'mesh_mask_arm_sites', ()):
+                        raise mesh_wave_block_error('the voted branch is reached through unproven EXEC control flow')
                     raise Unsupported('slot 57 mesh: a wave collective can be bypassed by part of a wave')
                 reach[i] = paths[0] if paths and min(paths) == max(paths) else 2 if paths else 0
 
@@ -12271,8 +13762,15 @@ class Stage:
             self.set_s(n, 'min(lds[%d], %du)' % (word, MESH_THREADS), uniform=True)
         # Without a vertex no index is valid, so no primitive is.
         self.emit('if (%s == 0u) %s = 0u;' % (self.S(verts), self.S(prims)))
-        self.emit('SetMeshOutputCounts(%s, %s);' % (self.S(verts), self.S(prims)))
-        self.mesh_verts = self.S(verts)
+        vertex_count, primitive_count = self.S(verts), self.S(prims)
+        if 'verts' in getattr(self, 'mesh_count_rewrites', ()):
+            self.emit('mesh_vertex_count = %s;' % vertex_count)
+            vertex_count = 'mesh_vertex_count'
+        if 'prims' in getattr(self, 'mesh_count_rewrites', ()):
+            self.emit('mesh_primitive_count = %s;' % primitive_count)
+            primitive_count = 'mesh_primitive_count'
+        self.emit('SetMeshOutputCounts(%s, %s);' % (vertex_count, primitive_count))
+        self.mesh_verts = vertex_count
         self.sym[temporary] = ('a mesh allocation temporary',)
 
     def mesh_export(self, asm, target, vals, flags):
@@ -12976,108 +14474,541 @@ class Stage:
                 op, ops[1], 'I' if op == 'v_interp_p1ll_f16' else 'J', want))
         return base
 
-    def interp_f16_scan(self):
-        """Whole-program proof for the f16 interpolation pair (no fixed-point analysis: any doubt is a refusal).
+    def instruction_successors(self):
+        """Instruction successors, including proven calculated targets."""
+        index = {off: i for i, (off, *_) in enumerate(self.ins)}
+        calculated = getattr(self, 'calculated_pc', {})
+        for i, (off, _, name, asm) in enumerate(self.ins):
+            target = calculated.get(off)
+            if name.startswith('s_cbranch') or name == 's_branch':
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+            successors = []
+            if i + 1 < len(self.ins) and name not in (
+                    's_branch', 's_setpc_b64', 's_swappc_b64', 's_endpgm'):
+                successors.append(i + 1)
+            if target in index:
+                successors.append(index[target])
+            yield successors
 
-        The lowering reads the rasterizer's interpolant, so it is only faithful if (1) the entry I/J registers are
-        never written (they still hold the entry barycentrics wherever the pair reads them), (2) v_interp_p1ll_f16,
-        which emits nothing, has no consumer but the v_interp_p2_f16 that follows it in the same straight-line run
-        and nothing reads the destination it leaves stale when p2 writes elsewhere, and (3) nothing reads the
-        upper 16 bits of a plain p2 destination: whether gfx10 keeps or clears them is not established by a source
-        (LLVM 15 SIInstrInfo/VOP3Instructions.td model the result as f16 only; the encoding states no
-        high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it, until a p2 with
-        op_sel 0x8 writes the high half of that register (Mesa ACO keeps the other half, see check_encoding).
-        """
+    @staticmethod
+    def round_mode_immediate(ops, mods):
+        # RDNA 2 ISA PDF pp.45, 55, 137: MODE[1:0] is binary32, MODE[3:2] is binary16/binary64.
+        if len(ops) != 1 or mods:
+            raise Unsupported('s_round_mode requires one immediate')
+        try:
+            value = int(ops[0], 0) & 0xf
+        except ValueError:
+            raise Unsupported('s_round_mode requires one immediate') from None
+        if value & 3:
+            raise Unsupported('s_round_mode changes binary32 rounding from nearest even')
+        if value in (4, 8):
+            raise Unsupported('s_round_mode uses directed binary16/binary64 rounding other than toward zero')
+        return 2 if value == 12 else 1
+
+    @staticmethod
+    def check_half_round_mode(base, mode):
+        narrow_name = re.sub(r'_(?:sdwa|dpp)$', '', base)
+        if narrow_name.startswith(('v_cmp', 'v_cvt_pkrtz_')) or narrow_name == 'v_interp_p1ll_f16':
+            return  # p1ll's output is binary32 (RDNA 2 ISA PDF p.188)
+        if narrow_name.startswith('v_cvt_'):
+            narrow_result = re.match(r'v_cvt_(?:pk_)?f(?:16|64)_', narrow_name)
+        else:
+            narrow_result = narrow_name.endswith(('_f16', '_f64'))
+        if narrow_result:
+            if mode == 3:
+                raise Unsupported('%s with mixed binary16/binary64 rounding modes' % base)
+            if base not in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+                raise Unsupported('%s with binary16/binary64 rounding toward zero' % base)
+
+    def round_mode_flow(self):
+        ins = getattr(self, 'ins', ())
+        if not any(name == 's_round_mode' for _, _, name, _ in ins):
+            return {}
+        successors = list(self.instruction_successors())
+        modes = {ins[0][0]: 1}
+        work = [0]
+        while work:
+            i = work.pop()
+            off, _, name, asm = ins[i]
+            mode = modes[off]
+            if name == 's_round_mode':
+                _, ops, mods = parse(asm)
+                mode = self.round_mode_immediate(ops, mods)
+            if name.startswith(('s_setpc', 's_swappc')) and not successors[i]:
+                raise Unsupported('s_round_mode across an unresolved indirect jump')
+            for j in successors[i]:
+                target = ins[j][0]
+                previous = modes.get(target, 0)
+                if mode & ~previous:
+                    modes[target] = previous | mode
+                    work.append(j)
+        return modes
+
+    def red_only_export(self, target):
+        formats = getattr(getattr(self, 'pipe', None), 'rtv_formats', ())
+        return (re.fullmatch(r'mrt[0-7]', target) is not None and int(target[3:]) < len(formats)
+                and formats[int(target[3:])] in (41, 54, 56, 58, 61, 63))
+
+    @staticmethod
+    def interp_write_halves(name, mods):
+        # The f32 p1 lowering emits no value. Its p2 is the modeled whole write.
+        if name.endswith('_dpp') or name.startswith(('v_mac', 'v_fmac', 'v_writelane', 'v_movrel',
+                                                     'v_swap', 'v_pk_', 'v_interp_p1_f32',
+                                                     'v_readlane', 'v_readfirstlane', 'v_cmp')):
+            return 0
+        if name in ('v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+            return 1 if name == 'v_fma_mixlo_f16' else 2
+        if name == 'v_interp_p2_f16':
+            return 2 if INTERP_DST_HIGH in mods else 1
+        if name.endswith('_sdwa'):
+            if 'dst_sel:DWORD' not in mods:
+                if 'dst_unused:UNUSED_PRESERVE' in mods:
+                    if 'dst_sel:WORD_0' in mods:
+                        return 1
+                    if 'dst_sel:WORD_1' in mods:
+                        return 2
+                return 0
+            name = name[:-5]
+        if (name.startswith(('image_load', 'image_sample', 'image_gather4'))
+                or re.fullmatch(r'(?:buffer|global|flat|scratch)_load_dword(?:x[234])?', name)):
+            return 0 if set(mods) & {'d16', 'tfe', 'lwe', 'lds'} else 3
+        if name.startswith('v_cvt_'):
+            return 3 if re.match(r'v_cvt_[fiu](?:32|64)_', name) or name == 'v_cvt_pkrtz_f16_f32' else 0
+        return 3 if name.startswith('v_') and name.endswith(
+            ('_b32', '_i32', '_u32', '_f32', '_b64', '_i64', '_u64', '_f64')) else 0
+
+    @staticmethod
+    def interp_scalar_pair(token):
+        span = reg_range(token)
+        if span and span[0] == 's' and span[2] == span[1] + 1 and span[2] < 106:
+            return frozenset(span[1:])
+
+    @staticmethod
+    def interp_live_pairs(pairs, writes):
+        return frozenset(pair for pair in pairs if not pair & writes and 'any' not in writes)
+
+    def interp_subset_step(self, subsets, effects):
+        """Transfer (subset, superset) facts over simultaneous mask updates."""
+        writes, save, restore, exec_write, bounds, wqm, shrink = effects
+        if not writes and save is None and not exec_write:
+            return subsets
+        # Each old value can bound one or more new values. For example, a shrink
+        # keeps the old value as an upper bound for the new one.
+        exec_sources = tuple(mask for tok in bounds
+                             if (mask := 'exec' if tok == 'exec' else self.interp_scalar_pair(tok)) is not None)
+        if restore is not None:
+            exec_sources = (restore,)
+        elif not exec_write:
+            exec_sources = ('exec',)
+        left = {}
+        right = {}
+        for source in exec_sources:
+            left[source] = {'exec'}
+        if wqm is not None:
+            right[wqm] = {'exec'}
+        elif restore is not None or not exec_write:
+            right[exec_sources[0]] = {'exec'}
+        if save is not None:
+            left.setdefault('exec', set()).add(save)
+            right.setdefault('exec', set()).add(save)
+        if shrink is not None:
+            left.setdefault(shrink, set()).add(shrink)
+
+        def values(mask, replacements):
+            survive = mask != 'exec' and 'any' not in writes and not mask & writes
+            return replacements.get(mask, set()) | ({mask} if survive else set())
+
+        return frozenset((a, b) for old_a, old_b in subsets | {(m, m) for m in left.keys() | right.keys()}
+                         for a in values(old_a, left) for b in values(old_b, right) if a != b)
+
+    def interp_exec_entry_facts(self, successors, effects, indirect):
+        """At each reachable instruction, record EXEC identity and mask subset relations."""
+        empty = frozenset()
+        if not successors:
+            return {}
+        facts = {0: (empty, empty, empty, empty, empty, frozenset({'entry'}))}
+        work = [0]
+        while work:
+            i = work.pop()
+            if i in indirect:
+                return {}  # An unknown incoming edge can invalidate facts at any origin.
+            writes, save, restore, exec_write, bounds, wqm, shrink = effects[i]
+            equal, superset, subsets, live, quad_pairs, flags = facts[i]
+            # Only a copy of entry EXEC can start a live-mask proof. Subsequent
+            # in-place AND/ANDN2 updates preserve it, including across WQM.
+            live = self.interp_live_pairs(live, writes) | ({shrink} if shrink in live else empty)
+            quad_pairs = self.interp_live_pairs(quad_pairs, writes)
+            if save is not None:
+                if 'entry' in flags:
+                    live |= {save}
+                if 'quad' in flags:
+                    quad_pairs |= {save}
+            if exec_write:
+                unchanged = restore in equal
+                entry = unchanged and 'entry' in flags
+                quad = (restore in quad_pairs or (unchanged and 'quad' in flags)
+                        or (wqm == 'exec' and bool(flags & {'entry', 'quad'}))
+                        or ('wqm' in flags and wqm in live))
+                flags -= {'entry', 'quad'}
+                if entry:
+                    flags |= {'entry'}
+                if quad:
+                    flags |= {'quad', 'wqm'}
+
+            equal, superset = (self.interp_live_pairs(pairs, writes) for pairs in (equal, superset))
+            if restore is not None:
+                if restore not in equal:
+                    equal = superset = frozenset({restore})
+                # A proven no-op restore keeps the other aliases of unchanged EXEC.
+            elif exec_write:
+                if 'exec' in bounds:
+                    superset |= equal
+                    if save is not None:
+                        superset |= {save}
+                    equal = empty
+                else:
+                    equal = superset = empty
+            elif save is not None:
+                equal |= {save}
+                superset |= {save}
+
+            transferred = equal, superset, self.interp_subset_step(subsets, effects[i]), live, quad_pairs, flags
+            for j in successors[i]:
+                previous = facts.get(j)
+                merged = (tuple(a & b for a, b in zip(transferred, previous))
+                          if previous is not None else transferred)
+                if merged != previous:
+                    facts[j] = merged
+                    work.append(j)
+        return facts
+
+    @staticmethod
+    def interp_lane_local(name):
+        if name == 'exp' or name.startswith(('image_load', 'image_store', 'image_atomic')):
+            return True
+        if name.startswith(('image_sample', 'image_gather4')):
+            # Implicit LOD and bias can observe coordinates from other lanes in the quad.
+            return re.fullmatch(r'image_(?:sample|gather4)(?:_c)?_l(?:z)?(?:_o)?', name) is not None
+        if name.startswith(('buffer_', 'tbuffer_', 'global_')):
+            return name.split('_', 2)[1] in ('load', 'store', 'atomic')
+        return name.startswith('v_') and not (
+            name.endswith('_dpp') or name.startswith(('v_readlane', 'v_readfirstlane', 'v_writelane',
+                                                      'v_movrel', 'v_permlane')))
+
+    @staticmethod
+    def interp_helper_observer(name, lane_local, exact=False):
+        if name.startswith('v_cmp') or VOP3B_SDST.match(name):
+            return 'uses it to write a lane mask'
+        if name.startswith(INTERP_STORE_PREFIXES) or '_atomic' in name:
+            return None if exact else 'uses it in a memory write with helper lanes enabled'
+        if '_dpp' in name or name.startswith(('v_quad', 'v_wave', 'v_permlane')):
+            return 'reads it across lanes'
+        if lane_local or name == 'image_sample_d' or name.startswith(('flat_load', 'scratch_load')):
+            return None
+        return 'reads it across lanes'
+
+    def interp_helper_scan(self, work, rows, effects, successors, entry_facts, sample_obligations):
+        """Follow differences confined to lanes outside the live mask."""
+        seen = set()
+        while work:
+            state = work.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > 65536:
+                raise Unsupported('v_interp_p1ll_f16 helper-lane taint state budget exceeded')
+            i, taint, identity = state
+            name, _, written, written_halves, lane_local, helper_reads = rows[i]
+            _, _, subsets, live, _, flags = entry_facts[i]
+            _, _, masked, _, _, at_superset, covered = identity
+            sources = taint & helper_reads
+            if sources:
+                # The exact mask must also exclude the original stale lanes.
+                exact = covered and ('entry' in flags or any(a == 'exec' and b in live for a, b in subsets))
+                observer = self.interp_helper_observer(name, lane_local, exact)
+                if observer:
+                    reason = ('v%d may hold a stale v_interp_p1ll_f16 value in helper lanes: %s %s'
+                              % (min(sources), name, observer))
+                    if name in ('image_sample', 'image_sample_c'):
+                        sample_obligations.setdefault(self.ins[i][0], reason)
+                    else:
+                        raise Unsupported(reason)
+                taint |= written
+            elif written_halves == 3 and (at_superset or (
+                    'quad' in flags and any(b == 'exec' and a in live and a in masked for a, b in subsets))):
+                # Lane-local operations keep differences inside the original
+                # EXEC. Whole-quad EXEC containing the covered live mask also
+                # reaches every observable quad, even after the old alias is lost.
+                taint -= written
+            if not taint:
+                continue
+            if name.startswith(('s_setpc', 's_swappc')):
+                raise Unsupported('unmodelled v_interp_p1ll_f16 helper-lane taint across an indirect jump')
+            identity = self.interp_exec_step(identity, effects[i])
+            for j in successors[i]:
+                if j <= i:
+                    raise Unsupported('unmodelled v_interp_p1ll_f16 helper-lane taint across a backward branch')
+                work.append((j, taint, identity))
+
+    def interp_exec_step(self, identity, effects):
+        """Advance EXEC identity and coverage for one omitted half."""
+        same, superset, masked, current, at_same, at_superset, covered = identity
+        # 'masked' pairs may name different subsets of the lanes covered by the write.
+        # Only 'current' records equality with the entire current mask.
+        writes, save, restore, exec_write, bounds, _, shrink = effects
+        # Operands of saveexec describe the mask before it writes D, even when D aliases S.
+        narrows_to_covered = any(covered if token == 'exec' else self.interp_scalar_pair(token) in masked
+                                 for token in bounds)
+        shrinks_covered = shrink in masked
+        same, superset, masked, current = (self.interp_live_pairs(pairs, writes)
+                                           for pairs in (same, superset, masked, current))
+        if shrinks_covered:
+            masked |= {shrink}
+        if save is not None:
+            if at_same:
+                same |= {save}
+            if at_superset:
+                superset |= {save}
+            if covered:
+                masked |= {save}
+            current |= {save}
+        if restore is not None:
+            at_same, at_superset, covered = restore in same, restore in superset, restore in masked
+            if at_same:
+                current = same
+            elif restore not in current:
+                current = frozenset({restore})
+        elif exec_write:
+            at_same = at_superset = False
+            current = frozenset()
+            covered = narrows_to_covered
+        return same, superset, masked, current, at_same, at_superset, covered
+
+    def interp_exec_effects(self, name, asm, ops, exec_write):
+        writes = scalar_destinations(name, asm)
+        save = restore = None
+        if name == 's_mov_b64' and len(ops) == 2:
+            if ops[1] == 'exec':
+                save = self.interp_scalar_pair(ops[0])
+            if ops[0] == 'exec':
+                restore = self.interp_scalar_pair(ops[1])
+        bounds = ()
+        if name.startswith('v_cmpx'):
+            bounds = ('exec',)
+        elif len(ops) == 3 and ops[0] == 'exec':
+            if name == 's_and_b64':
+                bounds = tuple(ops[1:])
+            elif name == 's_andn2_b64':
+                bounds = (ops[1],)
+        elif len(ops) == 2 and name in ('s_and_saveexec_b64', 's_or_saveexec_b64',
+                                       's_andn1_saveexec_b64', 's_andn2_saveexec_b64'):
+            save = self.interp_scalar_pair(ops[0])
+            if name in ('s_and_saveexec_b64', 's_andn1_saveexec_b64'):
+                bounds = ('exec',)
+            elif name == 's_andn2_saveexec_b64':
+                bounds = (ops[1],)
+        wqm = None
+        if name == 's_wqm_b64' and len(ops) == 2 and ops[0] == 'exec':
+            wqm = 'exec' if ops[1] == 'exec' else self.interp_scalar_pair(ops[1])
+        shrink = None
+        if name in ('s_and_b64', 's_andn2_b64') and len(ops) == 3 and ops[0] == ops[1]:
+            shrink = self.interp_scalar_pair(ops[0])
+        return writes, save, restore, exec_write, bounds, wqm, shrink
+
+    def interp_read_halves(self, name, asm, sources, mods):
+        halves = [3] * len(sources)
+        if name in ('v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+            half, high, _ = self.mix_selections(mods)
+            if len(sources) == len(half) == len(high) == 3:
+                halves = [1 << h if f else 3 for f, h in zip(half, high)]
+        elif name.endswith('_sdwa') and not name.startswith(READ_MODIFY_WRITE):
+            for mod in mods:
+                select = re.fullmatch(r'src([01])_sel:(WORD_[01]|BYTE_[0-3])', mod)
+                if select and (src := int(select[1])) < len(sources):
+                    halves[src] = 1 if select[2] in ('WORD_0', 'BYTE_0', 'BYTE_1') else 2
+        elif (name.startswith('v_') and name.endswith(('_f16', '_i16', '_u16'))
+              and not name.startswith(('v_pk_', 'v_dot', 'v_interp_', 'v_sad_', 'v_sat_pk_'))):
+            # A plain 16-bit source reads the low half by default (including
+            # the class mask of v_cmp_class_f16). VOP3 op_sel indexes the
+            # encoded sources, so skip an implicit read of the destination.
+            first = int(name.startswith(READ_MODIFY_WRITE))
+            end = min(2, len(sources)) if name in ('v_mad_i32_i16', 'v_mad_u32_u16') else len(sources)
+            selectors = [m for m in mods if m.startswith('op_sel')]
+            if not selectors:
+                halves[:end] = [1] * end
+            elif len(selectors) == 1:
+                select = re.fullmatch(r'op_sel:\[([01](?:,[01]){0,3})\]', selectors[0])
+                if select:
+                    bits = select[1].split(',')
+                    if len(bits) >= end - first:
+                        halves[first:end] = [1 << int(bit) for bit in bits[:end - first]]
+        elif name == 'exp':
+            target, vals, flags = export_operands(asm)
+            if len(vals) == 4 and 'compr' in flags and self.red_only_export(target):
+                return zip(vals, (1, 1, 3, 3))
+        return zip(sources, halves)
+
+    def interp_f16_scan(self):
+        """Prove uses of omitted partial interpolants and preservation of entry barycentrics."""
         if self.interp_scanned:
             return
-        pair = None
-        targets = set()
+
+        def regs(tokens):
+            result = set()
+            for token in tokens:
+                for register in re.findall(r'\bv(?:\[\d+:\d+\]|\d+\b)', token):
+                    _, lo, hi = reg_range(register)
+                    result.update(range(lo, hi + 1))
+            return result
+
+        successors = list(self.instruction_successors())
+        targets = {j for i, edges in enumerate(successors) for j in edges
+                   if j != i + 1 or self.ins[i][2].startswith(('s_branch', 's_cbranch', 's_setpc'))}
         rows = []
-        for off, _, name, asm in self.ins:
-            n, ops, mods = parse(asm)
-            n = re.sub(r'_e(32|64)$', '', n)
-            rows.append((off, n, ops, mods))
-            target = getattr(self, 'calculated_pc', {}).get(off)
-            if n.startswith('s_cbranch') or n == 's_branch':
-                target = int(ops[0].split('_')[1], 16)
-            if target is not None:
-                # A backward branch needs no refusal of its own: every branch instruction is a boundary below, where
-                # the scan requires that no p1ll result is pending, no p2 result is stale and no destination has an
-                # undefined upper half. Nothing the scan tracks therefore travels along a back edge, and the loop head
-                # (also a boundary, entered with the same empty state) starts clean on every iteration.
-                targets.add(target)
-
-        def regs(tok):
-            r = reg_range(tok)
-            return set(range(r[1], r[2] + 1)) if r and r[0] == 'v' else set()
-
-        pending, stale, high_undefined = {}, set(), set()
-        for off, n, ops, mods in rows:
-            branch_boundary = off in targets or n.startswith('s_cbranch') or n in ('s_branch', 's_setpc_b64')
-            if branch_boundary and pending:
+        barycentrics = {}
+        base = getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0)
+        pending, omitted, exec_effects = {}, [], []
+        empty = frozenset()
+        for i, (_, _, _, asm) in enumerate(self.ins):
+            name, ops, mods = parse(asm)
+            name = re.sub(r'_e(32|64)$', '', name)
+            interp = name in ('v_interp_p1ll_f16', 'v_interp_p2_f16')
+            if interp and (len(ops) != (3 if name == 'v_interp_p1ll_f16' else 4) or
+                           not all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:])):
+                return  # the instruction handler rejects the malformed pair member
+            written = lds_vgpr_writes(name, ops, mods)
+            _, sources = effect_destinations(name, ops, mods)
+            if name == 'exp' or name.startswith(INTERP_STORE_PREFIXES + ('v_swap', 'v_movrel')) or (
+                    '_atomic' in name and not image_atomic_no_return(name, mods)):
+                sources = ops
+            elif name.startswith(READ_MODIFY_WRITE):
+                sources = ops
+            if name == 'v_interp_p2_f16':
+                sources = ops[1:2]  # p1's result is consumed symbolically
+            read = {}
+            for token, halves in self.interp_read_halves(name, asm, sources, mods):
+                for reg in regs([token]):
+                    read[reg] = read.get(reg, 0) | halves
+            # Relative reads may access any VGPR, including ones absent from the printed operands.
+            if name.startswith('v_movrel'):
+                read.update(dict.fromkeys(range(256), 3))
+            exec_write = writes_exec(name, ops, mods)
+            effects = self.interp_exec_effects(name, asm, ops, exec_write)
+            exec_effects.append(effects)
+            # VOPCX writes EXEC implicitly, so both printed operands are sources.
+            helper_reads = regs(ops) if name.startswith('v_cmpx') else read.keys()
+            rows.append((name, read, written, self.interp_write_halves(name, mods),
+                         self.interp_lane_local(name), helper_reads))
+            if interp:
+                self.interp_f16_pair(name, ops)
+            if base is not None and name in ('v_interp_p1_f32', 'v_interp_p2_f32',
+                                             'v_interp_p1ll_f16', 'v_interp_p2_f16'):
+                for reg in regs(ops[1:2]) & {base, base + 1}:
+                    barycentrics.setdefault(reg, []).append(i)
+            if name == 's_endpgm':
+                pending.clear()
+            boundary = i in targets or name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_swappc'))
+            if boundary and pending:
                 raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
                                   'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
-            if branch_boundary and (stale or high_undefined):
-                raise Unsupported('unmodelled v_interp_p2_f16 result across a branch')
-            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
-            # A malformed pair member is refused by its own handler; the scan models only the plain spelling.
-            interp = (n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and len(ops) == (3 if n[10] == '1' else 4) and
-                      all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:]))
-            if n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and not interp:
-                return  # its own handler refuses the program; nothing after it is worth proving
-            written = regs(ops[0]) if ops and not store else set()
-            if interp:
-                read = regs(ops[1])
-                pair = self.interp_f16_pair(n, ops)
-            else:
-                read = set().union(*(regs(o) for o in ops)) if ops else set()
-            low_reader = (n == 'v_cvt_f32_f16' and not mods and len(ops) == 2 and
-                          all(re.fullmatch(r'v\d+', o) for o in ops))
-            for r in sorted(read):
-                if r in pending:
-                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
-                                      'the matching v_interp_p2_f16' % (r, n))
-                if r in stale:
-                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
-                                      'a v_interp_p2_f16 that wrote another register' % (r, n))
-                if r in high_undefined and not (low_reader and r == int(ops[1][1:])):
-                    raise Unsupported('%s reads the upper 16 bits of the v_interp_p2_f16 result v%d: not modelled' %
-                                      (n, r))
-            if n == 'v_interp_p1ll_f16' and interp:
+            if exec_write and pending:
+                raise Unsupported('EXEC changes between v_interp_p1ll_f16 and its v_interp_p2_f16')
+            if name == 'v_interp_p2_f16' and pending.get(int(ops[3][1:])) != (ops[2], 'high' in mods):
+                raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' %
+                                  (ops[3], ops[2]))
+            for reg in sorted((read.keys() | written) & pending.keys()):
+                if name == 'v_interp_p2_f16' and reg == int(ops[3][1:]) and reg not in read:
+                    continue
+                raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
+                                  'the matching v_interp_p2_f16' % (reg, name))
+            if name == 'v_interp_p1ll_f16':
                 pending[int(ops[0][1:])] = (ops[2], 'high' in mods)
-            elif n == 'v_interp_p2_f16' and interp:
-                d, out = int(ops[3][1:]), int(ops[0][1:])
-                if pending.get(d) != (ops[2], 'high' in mods):
-                    raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' %
-                                      (ops[3], ops[2]))
-                del pending[d]
-                if out in pending:
-                    raise Unsupported('v_interp_p2_f16 overwrites the pending v_interp_p1ll_f16 result v%d' % out)
-                stale.discard(out)
-                if out != d:
-                    stale.add(d)
-                if INTERP_DST_HIGH in mods:
-                    # Completes a 16-bit pair: the low half it keeps must be a plain p2 result still waiting for its
-                    # upper half (no other writer is modelled), after which every reader sees defined halves.
-                    if out not in high_undefined:
-                        raise Unsupported('v_interp_p2_f16 op_sel 0x8 into v%d, which holds no v_interp_p2_f16 low '
-                                          'half: the half it keeps is not modelled' % out)
-                    high_undefined.discard(out)
+            elif name == 'v_interp_p2_f16':
+                partial = int(ops[3][1:])
+                del pending[partial]
+                # RDNA 2 ISA PDF p.190: p2 updates one half and preserves the other. If p2 aliases p1ll,
+                # that other half is part of the omitted binary32 result (PDF p.188).
+                halves = 3
+                if partial == int(ops[0][1:]):
+                    halves = 1 if INTERP_DST_HIGH in mods else 2
+                omitted.append((i, partial, halves))
+
+        predecessors = [[] for _ in rows]
+        for i, edges in enumerate(successors):
+            for j in edges:
+                predecessors[j].append(i)
+        indirect = {i for i, (name, *_) in enumerate(rows)
+                    if name.startswith(('s_setpc', 's_swappc')) and not successors[i]}
+        for reg, readers in barycentrics.items():
+            work = [p for i in readers for p in predecessors[i]] + list(indirect)
+            seen = set()
+            while work:
+                i = work.pop()
+                if i in seen:
+                    continue
+                seen.add(i)
+                name, _, written, _, _, _ = rows[i]
+                if reg in written:
+                    raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
+                                      'where interpolation reads them' % (name, reg))
+                work.extend(predecessors[i])
+
+        entry_facts = self.interp_exec_entry_facts(successors, exec_effects, indirect)
+        covered_pairs = {}
+        sample_obligations = {}
+        work, helper_work = [], []
+        for i, reg, halves in omitted:
+            # EXEC cannot change between p1ll and p2. Using facts at p2 also drops pairs
+            # clobbered since p1ll and includes any intervening copies of that same EXEC.
+            equal, superset = entry_facts.get(i, (empty, empty))[:2]
+            identity = equal, superset | equal, empty, equal, True, True, False
+            work.extend((j, reg, half, halves != 3, identity)
+                        for half in (1, 2) if halves & half for j in successors[i])
+        seen = set()
+        while work:
+            state = work.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > 65536:
+                raise Unsupported('v_interp_p1ll_f16 liveness state budget exceeded')
+            i, reg, half, alias, identity = state
+            name, read, written, written_halves, lane_local, _ = rows[i]
+            if read.get(reg, 0) & half and not (identity[-1] and lane_local):
+                if alias:
+                    reason = '%s reads the preserved half of an omitted v_interp_p1ll_f16 result v%d' % (name, reg)
                 else:
-                    high_undefined.add(out)
-            elif low_reader:
-                high_undefined.discard(int(ops[0][1:]))
-                stale.discard(int(ops[0][1:]))
-        # I and J: never written anywhere
-        base = pair if pair is not None else (getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0) or 0)
-        for off, n, ops, mods in rows:
-            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
-            if ops and not store and regs(ops[0]) & {base, base + 1}:
-                raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
-                                  'where v_interp_p1ll_f16 / v_interp_p2_f16 read them' % (n, min(
-                                      regs(ops[0]) & {base, base + 1})))
-            if n == 'v_swap_b32' and len(ops) == 2 and regs(ops[1]) & {base, base + 1}:
-                raise Unsupported('v_swap_b32 writes the entry barycentric registers')
+                    reason = ('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+                              'a v_interp_p2_f16 that wrote another register' % (reg, name))
+                if identity[-1] and name in ('image_sample', 'image_sample_c'):
+                    sample_obligations.setdefault(self.ins[i][0], reason)
+                elif (getattr(self, 'kind', None) == 'ps' and i in entry_facts and identity[2] & entry_facts[i][3]
+                      and name.startswith('v_') and not self.interp_helper_observer(name, lane_local)):
+                    # A write covering the live mask leaves differences only
+                    # in helpers, even if the original EXEC alias was lost.
+                    helper_work.append((i, frozenset({reg}), identity))
+                    continue
+                else:
+                    raise Unsupported(reason)
+            identity = self.interp_exec_step(identity, exec_effects[i])
+            same, superset, masked, current, _, at_superset, _ = identity
+            if reg in written and written_halves & half:
+                if at_superset:
+                    continue
+                if i not in covered_pairs:
+                    _, _, subsets = entry_facts.get(i, (empty, empty, empty))[:3]
+                    writes, _, _, exec_write, _, _, _ = exec_effects[i]
+                    covered_pairs[i] = (empty if exec_write else
+                                        self.interp_live_pairs((a for a, b in subsets if b == 'exec'), writes))
+                identity = same, superset, masked | current | covered_pairs[i], current, False, False, True
+            if name.startswith(('s_setpc', 's_swappc')):
+                raise Unsupported('unmodelled v_interp_p2_f16 result across an indirect jump')
+            for j in successors[i]:
+                if j <= i:
+                    raise Unsupported('unmodelled v_interp_p2_f16 result across a backward branch')
+                work.append((j, reg, half, alias, identity))
+        self.interp_helper_scan(helper_work, rows, exec_effects, successors, entry_facts, sample_obligations)
+        self.interp_sample_obligations = sample_obligations
         self.interp_scanned = True
 
     def op_v_interp_p1ll_f16(self, ops, mods):
@@ -13092,10 +15023,7 @@ class Stage:
         self.interp_p1[int(ops[0][1:])] = (attr, field, high)
 
     def op_v_interp_p2_f16(self, ops, mods):
-        # P1 + J * P20, converted to binary16 into one half of the destination, the other half kept (LLVM: the
-        # result is f16, the high bit selects the attribute half only). The plain form writes the low half; with
-        # op_sel 0x8 (ACO's v_interp_p2_hi_f16) the high half. interp_f16_scan refuses every consumer of a half the
-        # pair has not written, so a half that is never written is never observed.
+        # RDNA 2 ISA PDF p.190: op_sel[3] selects the destination half; the other half is preserved.
         attr, field, high = self.interp_f16('v_interp_p2_f16', ops, mods, 1, 4)
         self.interp_f16_pair('v_interp_p2_f16', ops)
         self.interp_f16_scan()
@@ -13104,9 +15032,11 @@ class Stage:
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
         if INTERP_DST_HIGH in mods:
+            # A low half still belonging to an omitted p1ll is tracked by interp_f16_scan.
             self.set_v(d, '(v%d & 0xffffu) | (f32tof16(i.%s) << 16)' % (d, field))
         else:
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field))
+            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field),
+                       low16_only=d in self.low16_only_v)
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
@@ -13122,12 +15052,8 @@ class Stage:
         self.attrs.setdefault(attr, set()).add(how)
         return attr, component
 
-    def mix(self, ops, mods, dest):
-        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of sources that are binary32 words or binary16 halves.
-
-        Per source (LLVM 15 SelectVOP3PMadMixModsImpl): op_sel_hi set means the source is binary16, and
-        op_sel set picks its high half. abs, then neg, apply after widening. dest is 'f32', 'lo' or 'hi'.
-        """
+    @staticmethod
+    def mix_selections(mods):
         half, hi, clamp = [0, 0, 0], [0, 0, 0], False
         for m in mods:
             if m.startswith('op_sel_hi:['):
@@ -13138,6 +15064,15 @@ class Stage:
                 clamp = True
             else:
                 raise Unsupported('fma_mix modifier %s' % m)
+        return half, hi, clamp
+
+    def mix(self, ops, mods, dest):
+        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of sources that are binary32 words or binary16 halves.
+
+        Per source (LLVM 15 SelectVOP3PMadMixModsImpl): op_sel_hi set means the source is binary16, and
+        op_sel set picks its high half. abs, then neg, apply after widening. dest is 'f32', 'lo' or 'hi'.
+        """
+        half, hi, clamp = self.mix_selections(mods)
 
         def operand(tok, is_half, is_hi):
             if not is_half and is_hi:
@@ -13188,11 +15123,14 @@ class Stage:
             self.set_v(d, 'U(%s)' % expr)
             return
         self.used_v.add(d)
+        convert = 'f16rz' if (self.round_modes or {}).get(getattr(self, 'pc', None)) == 2 else 'f16rn'  # default MODE.FP_ROUND is nearest even
+        if convert == 'f16rz' and getattr(self, 'pipe', None) is not None:
+            self.pipe.uses_f16rz = True
         if dest == 'hi':
-            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
+            self.set_v(d, '(v%d & 0xffffu) | (%s(%s) << 16)' % (d, convert, expr))
         else:
             keep_low16 = d in self.low16_only_v
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr), low16_only=keep_low16)
+            self.set_v(d, '(v%d & 0xffff0000u) | %s(%s)' % (d, convert, expr), low16_only=keep_low16)
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
@@ -13576,6 +15514,21 @@ class Stage:
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             sext = token.startswith('sext(') and token.endswith(')')
+            if typ == 'f16':
+                if sext:
+                    raise Unsupported('%s: sext() on a float source' % base)
+                if selection not in ('WORD_0', 'WORD_1'):
+                    raise Unsupported('%s: f16 SDWA requires WORD_0 or WORD_1' % base)
+                if selection == 'WORD_0' and token in self.F16_INLINE:
+                    half_bits = int.from_bytes(struct.pack('<e', FLOATS[token]), 'little')
+                    sources.append('0x%04xu' % half_bits)
+                    continue
+                reg = reg_range(token)
+                if not (reg and reg[0] in ('s', 'v') and reg[1] == reg[2]) and not (
+                        re.fullmatch(r'-?\d+', token) and -16 <= int(token) <= 64):
+                    raise Unsupported('%s source %s' % (base, token))
+                sources.append(sdwa_source(self.u(token, low16_only=selection == 'WORD_0'), selection, False))
+                continue
             if float_src0 and index == 0:
                 if selection != 'DWORD' or sext:
                     raise Unsupported('%s requires a DWORD float source' % base)
@@ -13739,8 +15692,8 @@ class Stage:
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
             raise Unsupported(base)
-        # binary16: the five ordered relations and neq, which need no NaN test on the source words; no SDWA form.
-        if typ == 'f16' and (sdwa or mods or cond not in ('lt', 'eq', 'le', 'gt', 'ge', 'neq')):
+        # Binary16 supports the five ordered relations and neq.
+        if typ == 'f16' and ((mods and not sdwa) or cond not in ('lt', 'eq', 'le', 'gt', 'ge', 'neq')):
             raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
@@ -13765,8 +15718,9 @@ class Stage:
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
         if sdwa:
-            # f32 sources: DWORD selections only, read as in the e64 form, so {2} tests the registers.
-            x, y = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
+            # f32 sources use DWORD selections, so {2} still tests the registers.
+            selected = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
+            x, y = ('f16tof32(%s)' % half for half in selected) if typ == 'f16' else selected
         elif typ == 'f32':
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':
@@ -13786,7 +15740,14 @@ class Stage:
         ordered = ''
         if '{2}' in table[cond]:
             ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
-        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
+        predicate = table[cond].format(x, y, ordered)
+        if sdwa and typ == 'f16':
+            # Check the selected bits before HLSL's float compare. This keeps
+            # the NaN case even if the compiler simplifies a self-compare.
+            ordered = ' && '.join('(%s & 0x7fffu) <= 0x7c00u' % half for half in selected)
+            predicate = ('!(%s && %s == %s)' % (ordered, x, y) if cond == 'neq'
+                         else '(%s && %s)' % (ordered, predicate))
+        expr = '((%s) ? 1u : 0u)' % predicate
         if not self.exec_known:
             expr = '(exec & %s)' % expr
         if writes_exec or dst in ('exec', 'exec_lo'):
@@ -13905,9 +15866,8 @@ class Stage:
             if mask != 0xF and not name.startswith('mrt'):
                 raise Unsupported('partial compressed export to %s' % name)
             pairs = []
-            # R32_FLOAT uses R only. G cannot contribute to R through blending, and A
-            # is handled separately. Require the explicit format of the primary target.
-            red_only = name == 'mrt0' and tuple(self.pipe.rtv_formats[:1]) == (41,)  # DXGI_FORMAT_R32_FLOAT
+            # G cannot contribute to an R-only target. A can still affect blending.
+            red_only = self.red_only_export(name)
             for c in (0, 2):
                 v = vals[c]
                 r = self.u(v, low16_only=red_only and c == 0) if v != 'off' else None
@@ -14043,7 +16003,10 @@ class Stage:
         out.append('    uint pc = 0;')
         if conditional_discard:
             out.append('    bool wrote_output = false;')
-        wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
+        wave_load_sites = set(getattr(self, 'mesh_wave_loads', {}))
+        wave_load_sites.update(off for off, (word, _) in getattr(self, 'mesh_wave_votes', {}).items()
+                               if word == 'exec' and off in getattr(self, 'mesh_mask_arm_sites', ()))
+        wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in wave_load_sites}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(blocks):
@@ -14204,8 +16167,9 @@ class Stage:
             if pc not in wave_branch:
                 continue
             written = set()
+            masks = self.graphics_skipped_mask_writes(pc, target, branches)
             for off, _n, name, asm in ins:
-                if pc < off < target:
+                if pc < off < target and off not in masks:
                     reads, writes, _may = scalar_effects(name, asm)
                     if reads & {'exec', 'vcc'} or name.startswith('v_cmp'):
                         continue   # mask arithmetic: one bit per thread already, no wave-wide value
@@ -14545,6 +16509,17 @@ class Stage:
 
 
 # 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
+PIXEL_IMAGE_ATOMICS = {
+    'image_atomic_add': 'Add',
+    'image_atomic_sub': 'Add',
+    'image_atomic_umin': 'Min',
+    'image_atomic_umax': 'Max',
+    'image_atomic_and': 'And',
+    'image_atomic_or': 'Or',
+    'image_atomic_xor': 'Xor',
+}
+
+
 MUBUF_ATOMIC_OPS = {
     'buffer_atomic_swap': ('Exchange', False, False, 1),
     'buffer_atomic_cmpswap': ('CompareExchange', False, False, 2),
@@ -14621,6 +16596,22 @@ VEC_F = {
 }
 # v_fma_mix*: precise keeps the sign of a zero result; mad still lets a backend fuse or round the product.
 MIX32 = 'float mix32(float a, float b, float c) { precise float result = mad(a, b, c); return result; }'
+# Truncate the binary32 significand, saturating finite overflow to the largest finite half.
+F16RZ = """uint f16rz(float value) {
+    uint bits = asuint(value), sign = (bits >> 16) & 0x8000u, magnitude = bits & 0x7fffffffu;
+    if (magnitude > 0x7f800000u) return sign | 0x7e00u;
+    if (magnitude == 0x7f800000u) return sign | 0x7c00u;
+    if (magnitude >= 0x47800000u) return sign | 0x7bffu;
+    if (magnitude >= 0x38800000u) return sign | ((magnitude - 0x38000000u) >> 13);
+    if (magnitude < 0x33800000u) return sign;
+    uint shift = 126u - (magnitude >> 23);
+    return sign | (((magnitude & 0x7fffffu) | 0x800000u) >> shift);
+}"""
+# Binary32 to binary16 rounded to nearest even. HLSL f32tof16 truncates (#1723).
+F16RN = ('uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
+         ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
+         ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
+         ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }')
 # 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
 # binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
 # i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
@@ -15213,6 +17204,9 @@ class Pipeline:
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
         self.rect = self.ud(('rect',))
+        if self.vertex_kind == 'ms':
+            self.mesh_pixel_writes = ps_code is not None and mesh_pixel_memory_writes(
+                ps_code, decoded.get('ps') if decoded else None)
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
             self.ps = self._graphics_pixel_stage(ps_code, pixel_refusal)
@@ -15444,11 +17438,7 @@ class Pipeline:
                '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
                '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
                '}',
-               # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
-               'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
-               ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
-               ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
-               ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
+               F16RN,
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
@@ -15501,6 +17491,8 @@ class Pipeline:
                'uint ldu(ByteAddressBuffer b, uint a) { ' +
                unaligned_dword_body('b.Load(a & ~3u)', 'b.Load((a & ~3u) + 4)'),
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds) + len(twins)))]
+        if getattr(self, 'uses_f16rz', False):
+            out.insert(-1, F16RZ)
         if self.uses_dynamic_heap:
             constants = ['uint ud%d;' % i for i in range(len(self.uds) + len(twins))]
             out[-1] = 'cbuffer entry : register(b0) { %s };' % ' '.join(
@@ -15518,7 +17510,7 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex2du': 'RWTexture2D<uint>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -15643,7 +17635,13 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Drop a store whose idx * stride + rec_off needs more than 32 bits. With idx = h * 65536 + l
+                # the high half of idx * stride is (h * stride + ((l * stride) >> 16)) >> 16, exact because
+                # stride <= 0x3fff (checked above); when it is zero the 32-bit product is the whole product.
+                # No integer division: one GPU vendor's Vulkan compiler rejects a pipeline that divides by a
+                # runtime value here.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
@@ -15827,7 +17825,9 @@ class Pipeline:
                 '    } else {',
                 '        if (stride == 0u) return;',
                 '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
-                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                # Same 32-bit overflow test as store_format_d16_x, without an integer division.
+                '        if (((((idx >> 16u) * stride) + (((idx & 0xffffu) * stride) >> 16u)) >> 16u) != 0u',
+                '            || idx * stride > 0xffffffffu - rec_off) return;',
                 '        uint elem_addr = idx * stride + rec_off;',
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
@@ -16078,10 +18078,7 @@ class ComputePipeline(Pipeline):
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
-        self.wave_size = wave_size  # the caller's statement that the program runs as wave32 (32), or None: judged from the program
-        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32 and (
-                wave_size not in (None, 32) or self.group[0] * self.group[1] * self.group[2] % 32):
-            raise Unsupported(TG_SIZE_WAVES_REFUSAL)
+        self.wave_size = wave_size  # caller-supplied guest wave size (32, 64), or None
         user, groups, _ = self.entry
         self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
@@ -16349,12 +18346,14 @@ class MeshPipeline(Pipeline):
                 '    return result;',
                 '}',
             ]
+        counts = ['    uint mesh_%s_count = 0u;' % kind for kind, key in (('vertex', 'verts'), ('primitive', 'prims'))
+                  if key in s.mesh_count_rewrites]
         return '\n'.join(
             self.common() + collectives + mask_collectives + ['struct VSOut {'] + self.interface(False) + [
                 '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
                 'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
                 % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
-            + s.declarations() + ['    ' + line for line in s.entry] + lines
+            + s.declarations() + counts + ['    ' + line for line in s.entry] + lines
             + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
 
 
@@ -16383,10 +18382,10 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     """The runtime key of a device slot 67 compute request (req_<key>.c67, .data, .root, .desc, .sa, .sb): the
-    graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
-    the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
-    state blocks."""
-    key = fnv(b'x2w-startup-shader-28cs')
+    graphics revision followed by "cs" and the enabled feature tag, then each part preceded by its length
+    as a little-endian u64: the code, words 7-8 blob, root signature, 12 description words with their
+    pointers zeroed, and two state blocks."""
+    key = shader_cache_seed(b'x2w-startup-shader-28cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
@@ -17369,7 +19368,8 @@ LIFTED_REASONS = (
     ('rw-buffer', r'used for a load and a store'),
     ('cube', r'image dimension SQ_RSRC_IMG_CUBE'),
     ('tg-size', r'TG_SIZE_EN requires at most \d+ threads per group'),
-    ('dmask', r'image_store with dmask \S+: a typed UAV store writes all four channels'),
+    # Recognize cached refusals from older translators so these stores are retried.
+    ('dmask', r'image_store with dmask \S+: (?:a typed UAV|a 16-bit) store writes all four channels'),
     ('dpp-pixel', r'_dpp requires a straight-line pixel shader with entry EXEC'),
     ('dpp-compute', r'_dpp requires a straight-line compute program with entry EXEC'),
     ('mesh57-wave-load', r'^slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes \(wave-load block:'),
@@ -17379,7 +19379,7 @@ LIFTED_REASONS = (
 )
 PRE_RUN_RETRY_SECONDS = 180.0
 # In the cache: the build that last ran the pre-run retry and the keys it left refused. A lifted family's text is also
-# what this build writes for some cases its lift does not cover (such as TG_SIZE_EN groups outside wave32 coverage),
+# what this build writes for some cases its lift does not cover (such as TG_SIZE_EN groups with unknown wave size),
 # so a newer .fail of a lifted family is retried once per build, not at the head of every run.
 RETRIED_NAME = 'pre_run_retried.txt'
 # The runtime's per-key use lines (tester_pack.key_weights ranks the zip's request files by the same lines).
