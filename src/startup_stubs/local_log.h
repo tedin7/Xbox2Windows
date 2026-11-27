@@ -131,9 +131,48 @@ struct MappedTables {
     MappedCache readable;
 };
 
+// Logs once the largest free block below 2 GB (the hole X2W_LOW_ADDRESSES needs for the title's arena).
+// Walks the address space with VirtualQuery and allocates nothing.
+inline void log_low_address_margin() noexcept
+{
+    static volatile LONG done = 0;
+    if (InterlockedExchange(&done, 1)) return;
+    constexpr std::uintptr_t limit = 0x80000000u;
+    std::uintptr_t at = 0x10000, best = 0, best_at = 0, free_total = 0;
+    unsigned regions = 0;
+    while (at < limit && regions < 100000) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+        const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        auto end = begin + info.RegionSize;
+        if (end > limit) end = limit;
+        if (info.State == MEM_FREE && end > at) {
+            const auto size = end - at;
+            free_total += size;
+            if (size > best) { best = size; best_at = at; }
+        }
+        if (end <= at) break;
+        at = end;
+        ++regions;
+    }
+    logf("x2w-runtime low address space: largest free block below 2 GiB %llu MiB at 0x%llx (%llu MiB free in total, %u regions)",
+         static_cast<unsigned long long>(best >> 20), static_cast<unsigned long long>(best_at),
+         static_cast<unsigned long long>(free_total >> 20), regions);
+}
+
+// The tables are 128 KB per thread. Under X2W_LOW_ADDRESSES that is a new low block, and a startup
+// that makes one before the title's 2 GB arena can leave the arena without its hole (the title then
+// writes through the NULL it got). So startup keeps the allocation-free legacy cache; the first
+// translated draw arms the tables.
+inline volatile LONG mapped_table_armed = 0;
+inline void arm_mapped_table() noexcept
+{
+    if (mapped_cache_enabled()) InterlockedExchange(&mapped_table_armed, 1);
+}
+
 inline MappedTables* mapped_span_tables() noexcept
 {
-    if (!mapped_cache_enabled()) return nullptr;
+    if (!mapped_cache_enabled() || !InterlockedCompareExchange(&mapped_table_armed, 0, 0)) return nullptr;
     static thread_local const std::unique_ptr<MappedTables> tables(new (std::nothrow) MappedTables{});
     return tables.get();
 }
