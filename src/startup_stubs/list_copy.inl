@@ -12,8 +12,14 @@ LONG list_buffer_copies, list_resource_copies, list_resolves, list_copies_refuse
 enum Copy15Phase { copy15_endpoints, copy15_validation, copy15_sync, copy15_title,
                    copy15_probes, copy15_move, copy15_desktop, copy15_bookkeeping, copy15_phase_count };
 
+bool copy15_fast_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_COPY15_FAST");
+    return enabled;
+}
+
 struct Copy15Totals {
-    volatile LONG64 calls{}, slow_locks{};
+    volatile LONG64 calls{}, slow_locks{}, guarded_faults{};
     volatile LONG64 ticks[copy15_phase_count]{}, peak[copy15_phase_count]{};
 } copy15_totals;
 
@@ -22,6 +28,7 @@ struct Copy15Timer {
     u64 start = x2w_phase::now_ticks();
     Copy15Phase phase = copy15_endpoints;
     u64 ticks[copy15_phase_count]{};
+    bool guarded_fault = false;
 
     void enter(Copy15Phase next)
     {
@@ -40,6 +47,7 @@ struct Copy15Timer {
             draw_lock_note_max(copy15_totals.peak[i], static_cast<LONG64>(ticks[i]));
         }
         if (locks.over_one_ms) InterlockedIncrement64(&copy15_totals.slow_locks);
+        if (guarded_fault) InterlockedIncrement64(&copy15_totals.guarded_faults);
         InterlockedIncrement64(&copy15_totals.calls);
     }
 };
@@ -61,16 +69,22 @@ void log_copy15_phases()
         if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
         used += static_cast<std::size_t>(n);
     }
-    log("x2w-d3d12 CopyBufferRegion phases: calls %lld, us per call (max)%s; calls waiting over 1 ms on a lock %lld",
-        static_cast<long long>(calls), text,
-        static_cast<long long>(InterlockedExchange64(&copy15_totals.slow_locks, 0)));
+    const auto slow = static_cast<long long>(InterlockedExchange64(&copy15_totals.slow_locks, 0));
+    if (copy15_fast_enabled()) {
+        log("x2w-d3d12 CopyBufferRegion phases: calls %lld, us per call (max)%s; calls waiting over 1 ms on a lock %lld; guarded-faults %lld",
+            static_cast<long long>(calls), text, slow,
+            static_cast<long long>(InterlockedExchange64(&copy15_totals.guarded_faults, 0)));
+    } else {
+        log("x2w-d3d12 CopyBufferRegion phases: calls %lld, us per call (max)%s; calls waiting over 1 ms on a lock %lld",
+            static_cast<long long>(calls), text, slow);
+    }
 }
 
 // Fixture-only controls. Each process owns its own phase window and mutant.
-thread_local bool copy15_skip_probes;
-extern "C" __declspec(dllexport) void x2w_d3d12_fixture_copy15(BOOL skip_probes)
+thread_local bool copy15_partial_move_mutant;
+extern "C" __declspec(dllexport) void x2w_d3d12_fixture_copy15(BOOL partial_move_mutant)
 {
-    copy15_skip_probes = skip_probes != FALSE;
+    copy15_partial_move_mutant = partial_move_mutant != FALSE;
     log_copy15_phases();
 }
 
@@ -290,6 +304,69 @@ bool copy_source_authoritative(Wrapper* self, const CopyEndpoint& from, u64 offs
     return placed.alias || list_copied_gpu_range(self, from.resource, offset, bytes);
 }
 
+// The x64 base page size applies even inside a large-page allocation.
+constexpr std::uintptr_t copy15_page_mask = 4095;
+
+int copy15_fault_filter(const EXCEPTION_RECORD& fault, std::uintptr_t& guard_page)
+{
+    if (fault.ExceptionCode == EXCEPTION_GUARD_PAGE && fault.NumberParameters >= 2) {
+        guard_page = fault.ExceptionInformation[1] & ~copy15_page_mask;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    return fault.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || fault.ExceptionCode == EXCEPTION_IN_PAGE_ERROR
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool guarded_title_move(unsigned char* to, const unsigned char* from, std::size_t bytes, Copy15Timer& timer)
+{
+    std::uintptr_t guard_page = 0;
+    // Vectored handlers get first chance. A lazy commit or write-tracking handler can
+    // resume the faulting instruction before this frame sees an unhandled fault.
+    __try {
+        if (copy15_partial_move_mutant) {
+            // Model a forward memmove that stores its first block before reading the next.
+            // The fixture uses nonoverlapping ranges and decommits the next source page.
+            const auto first = (std::min)(bytes, 1 + (copy15_page_mask & ~reinterpret_cast<std::uintptr_t>(from)));
+            std::memmove(to, from, first);
+            std::memmove(to + first, from + first, bytes - first);
+            return true;
+        }
+        for (std::size_t at = 0; at < bytes;) {
+            const auto address = reinterpret_cast<std::uintptr_t>(from + at);
+            const auto span = (std::min)(bytes - at, 1 + (copy15_page_mask & ~address));
+            const auto* page = reinterpret_cast<const volatile unsigned char*>(address);
+            (void)page[0];
+            (void)page[span - 1];
+            at += span;
+        }
+        for (std::size_t at = 0; at < bytes;) {
+            const auto address = reinterpret_cast<std::uintptr_t>(to + at);
+            const auto span = (std::min)(bytes - at, 1 + (copy15_page_mask & ~address));
+            auto* page = reinterpret_cast<volatile char*>(address);
+            // Real write accesses without changing the bytes, even with concurrent writers.
+            _InterlockedOr8(page, 0);
+            _InterlockedOr8(page + span - 1, 0);
+            at += span;
+        }
+        // Protects against a bad page anywhere in either range before copying payload.
+        // As with the legacy probes, the backing must stay stable during the copy.
+        timer.enter(copy15_move);
+        std::memmove(to, from, bytes);
+    } __except (copy15_fault_filter(*GetExceptionInformation()->ExceptionRecord, guard_page)) {
+        if (guard_page) {
+            auto* page = reinterpret_cast<void*>(guard_page);
+            MEMORY_BASIC_INFORMATION info{};
+            DWORD previous = 0;
+            if (VirtualQuery(page, &info, sizeof(info)) && info.State == MEM_COMMIT)
+                VirtualProtect(page, copy15_page_mask + 1, info.Protect | PAGE_GUARD, &previous);
+        }
+        x2w_local::forget_mapped_spans();
+        timer.guarded_fault = true;
+        return false;
+    }
+    return true;
+}
+
 // A buffer copy whose source is a placed buffer that does not alias title memory is refused (its desktop copy holds nothing the
 // title wrote). When the title wrote the source with the CPU (no recorded copy wrote it) and the destination is title-backed too,
 // the copy is made in title memory now, which is also when a draw in the same recording snapshots the destination. A source or
@@ -320,9 +397,10 @@ bool copy_in_title_memory(const CopyEndpoint& to, u64 to_offset, const CopyEndpo
     if (to_offset > to_width || bytes > to_width - to_offset || from_offset > from_width || bytes > from_width - from_offset)
         return false;
     timer.enter(copy15_probes);
-    if ((!from_desc || !copy15_skip_probes) &&
-        (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
-         !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes))))
+    if (from_desc)
+        return guarded_title_move(to_memory + to_offset, from_memory + from_offset, static_cast<std::size_t>(bytes), timer);
+    if (!x2w_local::readable(from_memory + from_offset, static_cast<std::size_t>(bytes)) ||
+        !x2w_local::writable(to_memory + to_offset, static_cast<std::size_t>(bytes)))
         return false;
     timer.enter(copy15_move);
     std::memmove(to_memory + to_offset, from_memory + from_offset, static_cast<std::size_t>(bytes));
@@ -335,7 +413,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
 {
     if (!self->own().list_open) return;
     Copy15Timer timer;
-    static const bool fast = x2w_local::env_on("X2W_COPY15_FAST");
+    const bool fast = copy15_fast_enabled();
     const CopyEndpoint to = copy_endpoint(destination, false);
     const CopyEndpoint from = copy_endpoint(source, false);
     timer.enter(copy15_validation);

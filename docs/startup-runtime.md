@@ -751,6 +751,22 @@ These slots have not been seen in a title log yet. Slot 16 is described in [Comm
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
 resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
 
+With `X2W_COPY15_FAST=1` (default off), slot 15 can copy directly between validated title-backed
+buffer ranges when the source uses a desktop stand-in and neither endpoint has newer GPU data.
+Before moving the payload, it reads the endpoints of each source page and checks destination
+page endpoints with byte-preserving writes. The existing vectored handlers can resume lazy
+commits and protection faults. An unresolved memory fault refuses the copy, clears the thread's
+mapped-span cache and increments `guarded-faults` in the phase report. The preflight protects against
+pages already inaccessible at the start of the operation. The backing must stay valid through the move.
+
+The Windows fixtures compare WARP pixels with a CPU reference for both switch settings, a
+decommitted source tail and a lazily committed destination. A control that performs the move
+before checking the whole range must change destination bytes even though the copy is refused.
+
+```powershell
+ctest --preset dev --no-tests=error -V -R '^startup_list_copy15(_draw|_probe_control)?_warp$'
+```
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
