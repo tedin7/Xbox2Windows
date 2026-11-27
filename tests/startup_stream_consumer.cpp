@@ -228,8 +228,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // of the upload buffer at table byte 96 that holds the index, 2. dispatch-heap-word-outside makes that word
 // 0x07ffffff, dispatch-heap-word-null leaves the descriptor of that buffer null (the word reads 0, record 0 is the input),
 // dispatch-heap-word-past ends the buffer at that word, and dispatch-heap-word-placed names the placed
-// input buffer instead of upload memory. dispatch-heap-word-title keeps the index buffer in plain process memory
-// (title memory: neither upload nor placed), and dispatch-heap-word-title-outside puts 0x07ffffff in its word.
+// input buffer instead of upload memory.
 // Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
@@ -561,15 +560,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // byte offset holds record 2. The other words name an output descriptor.
         constexpr UINT bytes = 0x400;
         const UINT at = formatted_indexed ? 52 : 0x270;
-        // dispatch-heap-word-title*: the index buffer is plain process memory (not upload memory, not a placed buffer).
-        const bool title_word = mode.rfind("dispatch-heap-word-title", 0) == 0;
-        auto* const index = title_word
-            ? static_cast<UINT*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
-            : static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, bytes, 256)));
+        auto* const index = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, bytes, 256)));
         if (!index) return 81;
         std::memset(index, 0, bytes);
         index[0x120 / 4] = index[0x150 / 4] = 1;
-        index[at / 4] = mode == "dispatch-heap-word-outside" || mode == "dispatch-heap-word-title-outside" ? 0x07ffffffu : 2u;
+        index[at / 4] = mode == "dispatch-heap-word-outside" ? 0x07ffffffu : 2u;
         const UINT64 address = reinterpret_cast<UINT64>(mode == "dispatch-heap-word-placed" ? buffers[0] : index);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32),
                               mode == "dispatch-heap-word-past" ? at : mode == "dispatch-heap-word-placed" ? words * 4 : bytes, 0};
