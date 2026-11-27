@@ -182,6 +182,83 @@ def pipeline(name):
     code, rsrc, group = program(name)
     return G.ComputePipeline(code, sibling.root_blob(), rsrc, group)
 
+BRANCH_SENTINEL = 0xdecafbad
+
+
+def branch_program(name, mutation=None):
+    p = [raw for _, raw in enc.PREAMBLE_LINES]
+    p += [enc.vop1(1, 3, 0x100), enc.vop2(0x1a, 4, 0x82, 3),
+          enc.ds_single(0x0d, 4, data0=3), enc.sopp(10)]
+    if name == 'execz':
+        p += [enc.v_mov_imm(20, BRANCH_SENTINEL), enc.vopc(0xc4, 0xa0, 0),
+              bytes.fromhex('6a2480be')]
+        inner = []
+        if mutation == 'guest-barrier':
+            inner.append(enc.sopp(10))
+        if mutation == 'ordering':
+            inner.append(enc.ds_single(0x0d, 4, data0=3))
+        inner.append(enc.ds_single(0x36, 4, vdst=20))
+        p += [enc.sopp(8, sum(len(item) for item in inner) // 4), *inner,
+              bytes.fromhex('7e00fe88')]
+        # A second phase after the restore tests convergence of the join.
+        p += [enc.ds_single(0x0d, 4, data0=3), enc.sopp(10),
+              enc.ds_single(0x36, 4, vdst=21)]
+        p += [enc.vop2(0x1a, 13, 0x83, 3), enc.mubuf_store(0x1d, 20, 13)]
+    elif name == 'uniform':
+        p += [enc.vop2(0x25, 5, 0xff, 3, 123), bytes.fromhex('048106bf'),
+              enc.sopp(5, 2), enc.ds_single(0x0d, 4, data0=5), enc.sopp(10),
+              enc.ds_single(0x36, 4, vdst=20), enc.vop2(0x1a, 13, 0x82, 3),
+              enc.mubuf_store(0x1c, 20, 13)]
+    else:
+        raise ValueError(name)
+    p.append(enc.sopp(1))
+    if mutation == 'loop':
+        p.insert(len(enc.PREAMBLE_LINES), enc.sopp(2, 0xffff))
+    rsrc = sibling.USER7 | sibling.TGID_X | (1 << 15)
+    return b''.join(p), rsrc, (64, 1, 1)
+
+
+def branch_pipeline(name, mutation=None):
+    code, rsrc, group = branch_program(name, mutation)
+    return G.ComputePipeline(code, sibling.root_blob(), rsrc, group)
+
+
+def branch_reference(name, root_constant=0, reverse=False):
+    """Simulate each wave in instruction order, synchronizing at guest and planned barriers."""
+    result = [SENTINEL] * WORDS
+    lds = bytearray(512)
+    waves = (1, 0) if reverse else (0, 1)
+    lanes = lambda wave: range(wave * 32, wave * 32 + 32)
+    regs = [BRANCH_SENTINEL] * 64
+    for wave in waves:
+        for lane in lanes(wave):
+            struct.pack_into('<I', lds, lane * 4, lane)
+    if name == 'execz':
+        for wave in waves:
+            for lane in lanes(wave):
+                if lane < 32:
+                    regs[lane], = struct.unpack_from('<I', lds, lane * 4)
+        # Inserted barrier before the second phase; then the guest barrier.
+        for wave in waves:
+            for lane in lanes(wave):
+                struct.pack_into('<I', lds, lane * 4, lane)
+        for wave in waves:
+            for lane in lanes(wave):
+                second, = struct.unpack_from('<I', lds, lane * 4)
+                result[2 * lane:2 * lane + 2] = [regs[lane], second]
+    elif name == 'uniform':
+        if root_constant != 1:
+            for wave in waves:
+                for lane in lanes(wave):
+                    struct.pack_into('<I', lds, lane * 4, lane + 123)
+        for wave in waves:
+            for lane in lanes(wave):
+                result[lane], = struct.unpack_from('<I', lds, lane * 4)
+    else:
+        raise ValueError(name)
+    return result
+
+
 def controls():
     legacy = sibling.translate_case('P').hlsl_cs()
     assert hashlib.sha256(legacy.encode()).hexdigest() == '6f1c8c0cae027dc199d84a4d74774a68c243f205f740fac098524e15109eac70'
@@ -199,7 +276,7 @@ def controls():
     assert '& 0xffu' in shader(unaligned)
     hidden_field = patch(BASE, '100034d904050000', '100034d904050100')
     refused('reserved or unused', lambda: shader(hidden_field))
-    branched = patch(BASE, '100034d904050000', '020084bf100034d904050000')
+    branched = patch(BASE, '100034d904050000', 'ffff82bf100034d904050000')
     refused('straight-line', lambda: shader(branched))
     for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned'):
         text = pipeline(name).hlsl_cs()
@@ -214,6 +291,50 @@ def controls():
     assert simulate('bytes')[0] == 0x83828180
     assert simulate('bytes')[0] != 0x83000000  # lost byte updates
     assert simulate('bounds')[:2] == [0, 1]
+    branch_text = branch_pipeline('execz').hlsl_cs()
+    assert branch_text.count('GroupMemoryBarrierWithGroupSync();') == 3
+    assert 'if (exec & 1)' in branch_text
+    # Every barrier must be outside the per-thread pc dispatch, including the join.
+    stack = []
+    for line in branch_text[branch_text.index('    uint pc = 0;'):].splitlines():
+        if 'GroupMemoryBarrierWithGroupSync();' in line:
+            assert not any(stack), line
+        pc_block = 'if (pc ==' in line
+        for char in line:
+            if char == '{':
+                stack.append(pc_block)
+                pc_block = False
+            elif char == '}' and stack:
+                stack.pop()
+    assert branch_reference('execz')[0:2] == [0, 0]
+    assert branch_reference('execz')[64:66] == [BRANCH_SENTINEL, 32]
+    branch_pipeline('uniform').hlsl_cs()
+    uniform_code, uniform_rsrc, uniform_group = branch_program('uniform')
+    write = enc.ds_single(0x0d, 4, data0=5)
+    read = enc.ds_single(0x36, 4, vdst=20)
+    join_mutant = uniform_code.replace(write + enc.sopp(10) + read, write + read)
+    assert join_mutant != uniform_code
+    join_text = G.ComputePipeline(join_mutant, sibling.root_blob(), uniform_rsrc, uniform_group).hlsl_cs()
+    assert join_text.count('GroupMemoryBarrierWithGroupSync();') == 2
+    first_write = enc.ds_single(0x0d, 4, data0=3)
+    dual_code = uniform_code.replace(first_write, enc.ds_dual(0x0e, 4, data0=3, data1=5, offset1=1))
+    dual_code = dual_code.replace(write, enc.ds_dual(0x0e, 4, data0=5, data1=3, offset1=1))
+    dual_code = dual_code.replace(read, enc.ds_dual(0x38, 4, vdst=20, offset1=1))
+    dual_text = G.ComputePipeline(dual_code, sibling.root_blob(), uniform_rsrc, uniform_group).hlsl_cs()
+    assert dual_text.count('GroupMemoryBarrierWithGroupSync();') == 2
+    nonuniform, nr, ng = branch_program('execz')
+    nonuniform = nonuniform.replace(enc.sopp(8, 2), enc.sopp(5, 2))
+    refused('LDS scalar branch needs proven uniform SCC', lambda: G.ComputePipeline(nonuniform, sibling.root_blob(), nr, ng))
+    missing_restore = nonuniform.replace(enc.sopp(5, 2), enc.sopp(8, 2)).replace(
+        bytes.fromhex('7e00fe88'), enc.sopp(0))
+    refused('LDS ordering point inside per-lane control flow', lambda: G.ComputePipeline(missing_restore, sibling.root_blob(), nr, ng))
+    assert branch_reference('uniform', 0)[0] == 123
+    assert branch_reference('uniform', 1)[0] == 0
+    for name, value in (('execz', 0), ('uniform', 0), ('uniform', 1)):
+        assert branch_reference(name, value) == branch_reference(name, value, reverse=True)
+    refused('LDS barrier inside per-lane control flow', lambda: branch_pipeline('execz', 'guest-barrier'))
+    refused('LDS ordering point inside per-lane control flow', lambda: branch_pipeline('execz', 'ordering'))
+    refused('straight-line', lambda: branch_pipeline('execz', 'loop'))
     # The plan must split all plain/atomic hazards, but not read/read or atomic/atomic.
     assembly = ['ds_write_b32 v4, v3', 'ds_read_b32 v20, v4',
                 'ds_read_b32 v21, v4', 'ds_add_u32 v4, v3',
@@ -263,6 +384,20 @@ def dispatch(dxc, runner, adapter):
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         directory = Path(tmp)
+        for name, root_constant in (('execz', 0), ('uniform', 0), ('uniform', 1)):
+            case_name = '%s_%d' % (name, root_constant)
+            src, cso, case = (directory / (case_name + ext) for ext in ('.hlsl', '.cso', '.case'))
+            src.write_text(branch_pipeline(name).hlsl_cs(), encoding='ascii')
+            subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
+            constants = [root_constant] + [0] * 15
+            case.write_bytes(struct.pack('<I', 1) + struct.pack('<%dI' % WORDS, *branch_reference(name, root_constant)) + struct.pack('<16I', *constants))
+            run = subprocess.run([str(Path(runner).resolve()), adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
+            print(run.stdout, end='')
+            if run.returncode == 77:
+                return 77
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
+            if run.returncode or diagnostics:
+                raise AssertionError('%s: exit %d %s' % (case_name, run.returncode, run.stderr))
         for name in ('transpose', 'same_wave', 'bytes', 'dual_wide', 'bounds', 'unaligned'):
             src, cso, case = (directory / (name + ext) for ext in ('.hlsl', '.cso', '.case'))
             src.write_text(pipeline(name).hlsl_cs(), encoding='ascii')

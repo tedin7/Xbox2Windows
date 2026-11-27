@@ -2161,30 +2161,88 @@ LDS_EXCHANGE_OPS = {
 }
 
 
-def lds_general_plan(ins, group, words):
-    """Plan uniform ordering points for a straight-line compute LDS program."""
+def lds_retry_candidate(ins, has_branches):
+    names = {re.sub(r'_e(32|64)$', '', name) for _, _, name, _ in ins}
+    return bool(names & (LDS_GENERAL_OPS.keys() - LDS_DUAL_OPS.keys()) or
+                has_branches and 's_barrier' in names and names & LDS_DUAL_ATOMIC_OPS)
+
+
+def lds_general_plan(ins, group, words, converged=None, refusal=None):
+    """Plan LDS ordering on a forward-only CFG; convergence maps PCs to always-entered blocks."""
     if not 0 < words <= 8192 or any(n < 1 for n in group):
         return None
-    barriers, pending = set(), set()
-    for i, (_, _, _, asm) in enumerate(ins):
-        name, ops, mods = parse(asm)
+    decoded = [parse(asm) for _, _, _, asm in ins]
+    offsets = {off: i for i, (off, _, _, _) in enumerate(ins)}
+    edges = [[] for _ in ins]
+    branches = False
+    for i, ((off, _, _, _), (name, ops, mods)) in enumerate(zip(ins, decoded)):
         base = name.removesuffix('_e32').removesuffix('_e64')
-        if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc', 's_call', 's_rfe', 's_trap'))
-                or writes_exec(base, ops) or base == 's_endpgm' and i + 1 < len(ins)):
+        if base.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap')):
             return None
+        if base.startswith(('s_branch', 's_cbranch')):
+            if base not in ('s_branch', 's_cbranch_execz', 's_cbranch_scc0', 's_cbranch_scc1'):
+                return None
+            try:
+                target = offsets[int(ops[0].split('_')[1], 16)]
+            except (IndexError, KeyError, ValueError):
+                return None
+            if target <= i:
+                return None
+            edges[i].append(target)
+            branches = True
+        if base == 's_endpgm' and i + 1 < len(ins):
+            return None
+        if i + 1 < len(ins) and base not in ('s_branch', 's_endpgm'):
+            edges[i].append(i + 1)
+        if writes_exec(base, ops):
+            if not branches and converged is None:
+                return None
+            # Only the save/narrow and restore forms recognized by entry_exec_sites.
+            if base not in ('s_and_saveexec_b32', 's_and_saveexec_b64',
+                            's_or_b32', 's_or_b64', 's_mov_b32', 's_mov_b64'):
+                return None
+        if base.startswith('ds_') and ('gds' in mods or
+                base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS):
+            return None
+    if branches and (converged is None or not ins):
+        return None
+    pending = [None] * len(ins)
+    if pending:
+        pending[0] = set()
+    barriers = set()
+    for i, ((off, _, _, _), (name, ops, mods)) in enumerate(zip(ins, decoded)):
+        if pending[i] is None:
+            continue
+        state = pending[i].copy()
+        base = name.removesuffix('_e32').removesuffix('_e64')
         if base == 's_barrier':
             if mods or ops not in ([], ['0'], ['0x0']):
                 return None
-            pending.clear()
-        elif base.startswith('ds_'):
-            if 'gds' in mods or base not in LDS_GENERAL_OPS and base not in LDS_ATOMIC_OPS:
+            if converged is not None and off not in converged:
+                if refusal is not None:
+                    refusal.append('LDS barrier inside per-lane control flow')
                 return None
+            state.clear()
+        elif base.startswith('ds_'):
             kind = 'a' if base in LDS_ATOMIC_OPS else ('w' if LDS_GENERAL_OPS[base][0] else 'r')
-            if ((kind == 'r' and pending & {'w', 'a'}) or (kind == 'w' and pending)
-                    or (kind == 'a' and pending & {'r', 'w'})):
+            if ((kind == 'r' and state & {'w', 'a'}) or (kind == 'w' and state)
+                    or (kind == 'a' and state & {'r', 'w'})):
+                if converged is not None and off not in converged:
+                    if refusal is not None:
+                        refusal.append('LDS ordering point inside per-lane control flow')
+                    return None
                 barriers.add(i)
-                pending.clear()
-            pending.add(kind)
+                state.clear()
+            state.add(kind)
+        for target in edges[i]:
+            if pending[target] is None:
+                pending[target] = state.copy()
+            else:
+                pending[target].update(state)
+    if branches and ins[-1][0] not in converged:
+        if refusal is not None:
+            refusal.append('LDS control flow lacks proven group convergence and entry EXEC')
+        return None
     return barriers
 
 
@@ -5651,9 +5709,12 @@ class Stage:
                         pending.extend(succ[block])
         self.compute_dpp_entry = {}
         if (getattr(self, 'kind', None) == 'cs' and
-                any(name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT
-                    for name in names.values())):
+                (any(name.endswith('_dpp') and name[:-4] in COMPUTE_DPP_FLOAT
+                     for name in names.values()) or
+                 bool(branches) and any(name.startswith('ds_') for name in names.values()))):
             self.compute_dpp_entry = self.compute_dpp_sites(branches, names)
+        if getattr(self, 'kind', None) == 'cs':
+            self.lds_needs_retry = lds_retry_candidate(self.ins, bool(branches))
         self.entry_exec_proof = (self.entry_exec_sites(self.spill_cfg)
                                  if getattr(getattr(self, 'pipe', None), 'retry_entry_exec', False) else None)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
@@ -7676,9 +7737,7 @@ class Stage:
         if (getattr(self, 'kind', None) == 'cs' and (base.startswith('ds_') or base == 's_barrier')
                 and getattr(self, 'ins', None)):
             if not hasattr(self, 'lds_needs_retry'):
-                general_only = LDS_GENERAL_OPS.keys() - LDS_DUAL_OPS.keys()
-                self.lds_needs_retry = any(re.sub(r'_e(32|64)$', '', n) in general_only
-                                           for _, _, n, _ in self.ins)
+                self.lds_needs_retry = lds_retry_candidate(self.ins, getattr(self, 'has_branches', False))
             if self.lds_needs_retry and not hasattr(self, 'lds_error'):
                 self.lds_error = None
                 try:
@@ -7689,15 +7748,23 @@ class Stage:
                 except Unsupported as reason:
                     self.lds_error = str(reason)
                     if getattr(self, 'pipe', None) is not None:
-                        plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words)
+                        reasons = []
+                        sites = self.compute_dpp_entry if self.has_branches else None
+                        plan = lds_general_plan(self.ins, self.pipe.group, self.pipe.lds_words, sites, reasons)
                         if plan is not None:
                             self.lds_error = None
                             self.lds_plan = plan
+                        elif reasons:
+                            self.lds_error = reasons[0]
             plan = getattr(self, 'lds_plan', None)
             if plan is not None:
                 if self.descriptor_instruction_index in plan:
+                    if self.has_branches:
+                        self.compute_dpp_blocks.add(self.compute_dpp_entry[self.pc])
                     self.emit('GroupMemoryBarrierWithGroupSync();')
                 if base == 's_barrier':
+                    if self.has_branches:
+                        self.compute_dpp_blocks.add(self.compute_dpp_entry[self.pc])
                     self._lds_require_alloc(base)
                     self.emit('GroupMemoryBarrierWithGroupSync();')
                     return None
@@ -7715,6 +7782,11 @@ class Stage:
             self.emit('GroupMemoryBarrierWithGroupSync();')
             return None
         if base.startswith('s_cbranch_'):
+            if (getattr(self, 'kind', None) == 'cs' and base in ('s_cbranch_scc0', 's_cbranch_scc1')
+                    and getattr(self, 'has_branches', False)
+                    and getattr(self, 'lds_needs_retry', False)
+                    and not (self.scc_verified and self.scc_uniform)):
+                raise Unsupported('LDS scalar branch needs proven uniform SCC')
             if base[10:].startswith('vcc'):
                 self.read_vcc()
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
