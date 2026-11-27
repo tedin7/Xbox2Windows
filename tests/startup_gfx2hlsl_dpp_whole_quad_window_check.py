@@ -1,4 +1,10 @@
-﻿"""Pixel DPP quad reads after an EXEC window (tools/startup/gfx2hlsl.py, Stage.whole_quad_exec_sites), pure Python.
+﻿"""Pixel DPP quad reads after an EXEC window (tools/startup/gfx2hlsl.py, Stage.whole_quad_exec_sites).
+
+  (no arguments)                          translation controls and refusals, pure Python
+  draw <dxc> <offscreen_check> <warp|hardware>
+                                          also draw the accepted program over a triangle that cuts 2 x 2 quads (so
+                                          helper lanes exist) and compare every pixel with the guest's words; the
+                                          dirty-source mutant must fail there and pass a full-screen draw
 
 A pixel program saves its exact entry mask, turns whole-quad EXEC on and saves that mask too. It then runs a short
 window with the exact mask (the shape compilers emit around a sample that must not run on helper lanes) and restores
@@ -17,7 +23,10 @@ change one instruction each and must be refused: the read takes v3 (written in t
 restore, derives v2 through a VCC compare of v3, overwrites the saved whole-quad mask before the restore, or restores
 the exact mask instead. Rewriting v3 from v2 after the restore makes it clean again and is accepted.
 """
+import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -25,7 +34,7 @@ sys.path.insert(0, str(HERE.parent / 'tools'))
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
-from startup_image_3d_check import VS_WORDS, root_blob  # noqa: E402
+from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, root_blob  # noqa: E402
 
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 
@@ -81,7 +90,98 @@ def check(label, ok, detail=''):
         failures.append(label)
 
 
-def main():
+# ---- draw -------------------------------------------------------------------------------------------------------------
+# The accepted program is drawn as a triangle whose long edge cuts 2 x 2 quads, so helper lanes really exist: pixel (x, y)
+# of the 16 x 16 target is covered when x + y <= 15 (the edge is the line X + Y = 16.25 in pixel units, which passes
+# through no pixel centre). A pixel outside keeps the clear value -1.0 in all four channels.
+WIDTH = HEIGHT = 16
+CLEAR = 0xbf800000
+PARTIAL_VS = """\
+float4 main(uint id : SV_VertexID) : SV_Position
+{
+    return float4(id == 1 ? 1.03125 : -1.0, id == 2 ? -1.03125 : 1.0, 0.0, 1.0);
+}
+"""
+WINDOW_V3 = 1.0  # v3 written in the window; a guest helper lane never writes it and keeps its initial 0
+
+
+def covered(x, y):
+    return x + y <= 15
+
+
+def reference(read_v3=False):
+    """The guest's words: v2 = 16 y + x + 0.5 on every lane of a quad (helper lanes too); the read takes the x ^ 1
+    neighbour's v2 (or, for the mutant, its v3: 1.0 on a covered neighbour, 0 on a helper neighbour)."""
+    out = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            if not covered(x, y):
+                out.extend([CLEAR] * 4)
+                continue
+            own = 16 * y + x + 0.5
+            if read_v3:
+                neighbour = WINDOW_V3 if covered(x ^ 1, y) else 0.0
+            else:
+                neighbour = 16 * y + (x ^ 1) + 0.5
+            out.extend(struct.unpack('<I', struct.pack('<f', neighbour + own)) * 4)
+    return out
+
+
+def check_draw(dxc, renderer, adapter):
+    from startup_image_3d_check import compile_hlsl  # noqa: E402
+    text, reason = translate(base())
+    if text is None:
+        check('the accepted program translates for the draw', False, str(reason))
+        return
+    # The read a translator that accepted a dirty source would emit: the same program reading v3 instead of v2.
+    dirty = text.replace('QuadReadAcrossX(v2)', 'QuadReadAcrossX(v3)')
+    check('the dirty-source mutant changes the HLSL', dirty != text)
+    check('some covered pixel has a helper neighbour (the triangle cuts quads)',
+          any(covered(x, y) and not covered(x ^ 1, y) for y in range(HEIGHT) for x in range(WIDTH)))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        partial = compile_hlsl(dxc, 'dxc', PARTIAL_VS, 'vs_partial', 'vs_6_0', directory)
+        full = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs_full', 'vs_6_0', directory)
+        ps = compile_hlsl(dxc, 'dxc', text, 'ps_clean', 'ps_6_0', directory)
+        bad = compile_hlsl(dxc, 'dxc', dirty, 'ps_dirty', 'ps_6_0', directory)
+        clean_ref = words_file(directory, 'clean', reference())
+        dirty_ref = words_file(directory, 'dirty', reference(read_v3=True))
+        run = draw(renderer, adapter, partial, ps, clean_ref)
+        print('  ' + ' '.join(ln for ln in run.stdout.splitlines()
+                              if ln.startswith(('backend=', 'adapter=', 'driver=', 'debug_errors='))))
+        check('%s: the accepted read matches the guest on all %d pixels, helper neighbours included'
+              % (adapter, WIDTH * HEIGHT), run.returncode == 0 and 'pixels matched' in run.stdout,
+              run.stdout + run.stderr)
+        run = draw(renderer, adapter, partial, bad, dirty_ref)
+        lines = [ln for ln in run.stderr.splitlines() if ln.startswith('pixel mismatch')]
+        check('%s: the dirty-source mutant differs from the guest where a neighbour is a helper lane: %s'
+              % (adapter, ' / '.join(lines)), run.returncode != 0 and bool(lines), run.stdout + run.stderr)
+        # Power control: with every pixel covered there is no helper lane and the same mutant agrees with the guest,
+        # so only the cut quads above detect it.
+        full_ref = words_file(directory, 'full', [w for y in range(HEIGHT) for x in range(WIDTH) for w in
+                                                  struct.unpack('<I', struct.pack('<f', WINDOW_V3 + 16 * y + x + 0.5))
+                                                  * 4])
+        run = draw(renderer, adapter, full, bad, full_ref)
+        check('%s: without helper lanes the mutant is not detected (power control)' % adapter,
+              run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+
+
+def words_file(directory, name, values):
+    path = directory / ('%s.bin' % name)
+    path.write_bytes(struct.pack('<%dI' % len(values), *values))
+    return path
+
+
+def draw(renderer, adapter, vs, ps, expected):
+    run = subprocess.run([renderer, adapter, '--startup-pixel-words', str(vs), str(ps), str(WIDTH), str(HEIGHT),
+                          str(expected)], capture_output=True, text=True)
+    if run.returncode == 77:
+        print(run.stdout + run.stderr)
+        sys.exit(1 if failures else 77)
+    return run
+
+
+def controls():
     text, reason = translate(base())
     check('a quad read of a register the window did not write translates', text is not None, str(reason))
     if text is not None:
@@ -110,6 +210,16 @@ def main():
     for label, code in refused:
         text, reason = translate(code)
         check('refused: %s' % label, text is None and reason is not None and 'v_add_f32_dpp' in reason, str(reason))
+
+
+def main():
+    if len(sys.argv) == 1:
+        controls()
+    elif sys.argv[1] == 'draw' and len(sys.argv) >= 5:
+        controls()
+        check_draw(*sys.argv[2:5])
+    else:
+        raise SystemExit(__doc__)
     if failures:
         print('FAIL')
         for label in failures:
