@@ -292,6 +292,16 @@ def translate_case(name, code=None, rsrc2=None, group=None):
                              default_rsrc2 if rsrc2 is None else rsrc2, local if group is None else group)
 
 
+
+def legacy_check_case(name, code=None, rsrc2=None, group=None):
+    # These refusal controls exercise the legacy proof independently of the general retry.
+    _, words, default_rsrc2, local, _groups = CASES[name]
+    raw = words if code is None else code
+    resource = default_rsrc2 if rsrc2 is None else rsrc2
+    G.check_lds_exchange(G.decode(G.strip_header(raw)), local if group is None else group,
+                         ((resource >> 15) & 0x1ff) * 128)
+    return translate_case(name, code=code, rsrc2=rsrc2, group=group)
+
 def check_strided_layouts():
     def scan(source):
         ins = [(i * 4, 4, asm.split()[0], asm) for i, asm in enumerate(source.splitlines())]
@@ -319,9 +329,9 @@ def check_controls():
     assert mutate(hlsl, 'qwords-overlap')
     for code in (WORDS_OVERLAP, WORDS_UNPROVEN):
         refused('LDS exchange needs one bounded qword per local X ID',
-                lambda: translate_case('two-qwords', code=code).hlsl_cs())
+                lambda: legacy_check_case('two-qwords', code=code).hlsl_cs())
     refused('LDS exchange needs one bounded qword per local X ID',
-            lambda: translate_case('two-qwords', rsrc2=USER7 | TGID_X | (1 << 15)).hlsl_cs())
+            lambda: legacy_check_case('two-qwords', rsrc2=USER7 | TGID_X | (1 << 15)).hlsl_cs())
     # Positive HLSL lowering: declarations, single-eval alias-safe index, barrier, and all 4 dwords.
     hlsl_q = translate_case('Q').hlsl_cs()
     assert 'groupshared uint lds[256];' in hlsl_q, hlsl_q
@@ -372,12 +382,12 @@ def check_controls():
     # Case Q: offset:16 + 32*16 = 528 exceeds 1 unit (512B), fits at 2 units and at 32 KiB.
     # Case B: offset:0 + 64*16 = 1024 exact fit at 2 units; offset:4 (1028B) refuses at 2 units.
     base = USER7 | TGID_X
-    refused('one bounded quad-dword', lambda: translate_case('Q', rsrc2=base | (1 << 15)))
-    refused('allocation', lambda: translate_case('Q', rsrc2=base | (0 << 15)))
-    refused('allocation', lambda: translate_case('Q', rsrc2=base | (65 << 15)))
+    refused('one bounded quad-dword', lambda: legacy_check_case('Q', rsrc2=base | (1 << 15)))
+    refused('allocation', lambda: legacy_check_case('Q', rsrc2=base | (0 << 15)))
+    refused('allocation', lambda: legacy_check_case('Q', rsrc2=base | (65 << 15)))
     assert 'groupshared uint lds[8192];' in translate_case('Q', rsrc2=base | (64 << 15)).hlsl_cs()
     refused('one bounded quad-dword',
-            lambda: translate_case('B', code=patch(WORDS_B, '00007cdb04050000', '04007cdb04050000')))
+            lambda: legacy_check_case('B', code=patch(WORDS_B, '00007cdb04050000', '04007cdb04050000')))
 
     # Mask alignment and +12/+16 boundary checks on ds_read_b128.
     mask_1f0 = 'ff121236f0010000'
@@ -386,27 +396,27 @@ def check_controls():
     mask_1fc = 'ff121236fc010000'
     ok_1c = translate_case('Q', code=patch(WORDS_Q, mask_1f0, mask_1c)).hlsl_cs()
     assert 'v9 = 0x0000001cu & v9;' in ok_1c, ok_1c
-    refused('aligned', lambda: translate_case('Q', code=patch(WORDS_Q, mask_1f0, mask_1e)))
-    refused('initialized span', lambda: translate_case('Q', code=patch(WORDS_Q, mask_1f0, mask_1fc)))
+    refused('aligned', lambda: legacy_check_case('Q', code=patch(WORDS_Q, mask_1f0, mask_1e)))
+    refused('initialized span', lambda: legacy_check_case('Q', code=patch(WORDS_Q, mask_1f0, mask_1fc)))
 
     # Broadcast upper boundary: B fills [0, 1024), so offset:1008 reads [1008, 1024) (valid), offset:1012 overflows.
     bcast_b = '5002fcdb1100000d'
     ok_1008 = translate_case('B', code=patch(WORDS_B, bcast_b, 'f003fcdb1100000d')).hlsl_cs()
     assert 'a = (v17 + 1008u) >> 2;' in ok_1008, ok_1008
-    refused('initialized span', lambda: translate_case('B', code=patch(WORDS_B, bcast_b, 'f403fcdb1100000d')))
+    refused('initialized span', lambda: legacy_check_case('B', code=patch(WORDS_B, bcast_b, 'f403fcdb1100000d')))
 
     # Mixed-width boundary checks:
     # - Case R fills [16, 144) via ds_write_b32; ds_read_b128 with mask 0x70 + offset:16 covers [16, 144).
     #   Mask 0x74 reaches [16, 148) -> refused.
-    refused('initialized span', lambda: translate_case('R', code=patch(WORDS_R, 'ff12123670000000', 'ff12123674000000')))
+    refused('initialized span', lambda: legacy_check_case('R', code=patch(WORDS_R, 'ff12123670000000', 'ff12123674000000')))
     # - Case M fills [0, 512) via ds_write_b128; ds_read_b64 at offset:504 fits, offset:508 refuses.
     bcast_m64 = '2801d8d91100000d'
     assert 'a = (v17 + 504u) >> 2;' in translate_case('M', code=patch(WORDS_M, bcast_m64, 'f801d8d91100000d')).hlsl_cs()
-    refused('initialized span', lambda: translate_case('M', code=patch(WORDS_M, bcast_m64, 'fc01d8d91100000d')))
+    refused('initialized span', lambda: legacy_check_case('M', code=patch(WORDS_M, bcast_m64, 'fc01d8d91100000d')))
     # - Case M with ds_read2_b32 inside [0, 512) succeeds; out-of-span offset1 refuses.
     ok_read2 = translate_case('M', code=patch(WORDS_M, bcast_m64, '047fdcd81100000d')).hlsl_cs()  # offset0:4 (16), offset1:127 (508)
     assert 'v13 = lds[(a + 16u) >> 2];\n    v14 = lds[(a + 508u) >> 2];' in ok_read2, ok_read2
-    refused('initialized span', lambda: translate_case('M', code=patch(WORDS_M, bcast_m64, '0480dcd81100000d')))
+    refused('initialized span', lambda: legacy_check_case('M', code=patch(WORDS_M, bcast_m64, '0480dcd81100000d')))
 
     # Additional mixed b64 fill -> b128 read positive + out-of-span refusal.
     b64_to_b128 = [
@@ -433,25 +443,25 @@ def check_controls():
     wait = '7fc08cbf'
     barrier = '00008abf'
     nop = '000080bf'
-    refused('one bounded quad-dword', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '12007cdb04050000')))  # write offset:18
-    refused('one bounded quad-dword', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '11007cdb04050000')))  # write offset:17
-    refused('aligned', lambda: translate_case('Q', code=patch(WORDS_Q, read_q, '1200fcdb09000009')))                 # read offset:18
-    refused('initialized span', lambda: translate_case('Q', code=patch(WORDS_Q, read_q, '0c00fcdb09000009')))        # before span (offset:12)
-    refused('one bounded quad-dword', lambda: translate_case('Q', code=patch(WORDS_Q, '84000834', '83000834')))      # shift 3 instead of 4
-    refused('one bounded quad-dword', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, store_q + store_q)))  # double fill
-    refused('completed fill', lambda: translate_case('Q', code=patch(WORDS_Q, wait + barrier, nop + barrier)))
-    refused('after the fill barrier', lambda: translate_case('Q', code=patch(WORDS_Q, barrier, nop)))
-    refused('one barrier', lambda: translate_case('Q', code=patch(WORDS_Q, barrier, barrier + barrier)))
-    refused('completed LGKM wait', lambda: translate_case('Q', code=patch(WORDS_Q, read_q + wait, read_q + nop)))
-    refused('optional byte offset', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '10007edb04050000')))  # write GDS
-    refused('optional byte offset', lambda: translate_case('Q', code=patch(WORDS_Q, read_q, '1000fedb09000009')))   # read GDS
+    refused('one bounded quad-dword', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, '12007cdb04050000')))  # write offset:18
+    refused('one bounded quad-dword', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, '11007cdb04050000')))  # write offset:17
+    refused('aligned', lambda: legacy_check_case('Q', code=patch(WORDS_Q, read_q, '1200fcdb09000009')))                 # read offset:18
+    refused('initialized span', lambda: legacy_check_case('Q', code=patch(WORDS_Q, read_q, '0c00fcdb09000009')))        # before span (offset:12)
+    refused('one bounded quad-dword', lambda: legacy_check_case('Q', code=patch(WORDS_Q, '84000834', '83000834')))      # shift 3 instead of 4
+    refused('one bounded quad-dword', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, store_q + store_q)))  # double fill
+    refused('completed fill', lambda: legacy_check_case('Q', code=patch(WORDS_Q, wait + barrier, nop + barrier)))
+    refused('after the fill barrier', lambda: legacy_check_case('Q', code=patch(WORDS_Q, barrier, nop)))
+    refused('one barrier', lambda: legacy_check_case('Q', code=patch(WORDS_Q, barrier, barrier + barrier)))
+    refused('completed LGKM wait', lambda: legacy_check_case('Q', code=patch(WORDS_Q, read_q + wait, read_q + nop)))
+    refused('optional byte offset', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, '10007edb04050000')))  # write GDS
+    refused('optional byte offset', lambda: legacy_check_case('Q', code=patch(WORDS_Q, read_q, '1000fedb09000009')))   # read GDS
     refused('literal or literal-masked',
-            lambda: translate_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', '0403127e')))                        # unbounded v_mov v9, v4
+            lambda: legacy_check_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', '0403127e')))                        # unbounded v_mov v9, v4
     refused('after the fill barrier',
-            lambda: translate_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', nop)))                               # non-producer s_nop before read
-    refused('entry EXEC', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '8003febe' + store_q)))
-    refused('straight-line', lambda: translate_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
-    refused('1D group', lambda: translate_case('Q', group=(16, 2, 1)))
+            lambda: legacy_check_case('Q', code=patch(WORDS_Q, 'ff121236f0010000', nop)))                               # non-producer s_nop before read
+    refused('entry EXEC', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, '8003febe' + store_q)))
+    refused('straight-line', lambda: legacy_check_case('Q', code=patch(WORDS_Q, store_q, '020084bf' + store_q)))
+    refused('1D group', lambda: legacy_check_case('Q', group=(16, 2, 1)))
     refused('completed read', lambda: G.check_lds_exchange(b64_to_b128[:4] + [b64_to_b128[-1]], (4, 1, 1), 128))
     refused('does not cover', lambda: G.check_lds_exchange([
         (0, 4, 'v_lshlrev_b32', 'v_lshlrev_b32 v4, 4, v0'),

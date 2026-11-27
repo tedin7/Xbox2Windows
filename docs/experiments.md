@@ -2,6 +2,8 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+[General compute LDS lowering](experiments/compute-lds-general.md) documents the straight-line retry and its readback fixture.
+
 [Indexed indirect draws from title memory](experiments/indirect-index-shadow.md) documents the opt-in index staging path and its WARP fixture.
 
 [Startup pixel image atomics](experiments/startup-pixel-image-atomics.md) documents the unsigned UAV readback and runtime format checks.
