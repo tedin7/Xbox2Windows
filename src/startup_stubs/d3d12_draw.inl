@@ -158,7 +158,7 @@ bool sampled_state_stages_enabled()
     return enabled;
 }
 
-constexpr auto all_sampled_stages =
+const D3D12_RESOURCE_STATES all_sampled_stages =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 struct Translation {
@@ -592,10 +592,10 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             }
             matched_rtv = true;
         } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1" && line != "x2w-manifest 2" &&
-                   line != "x2w-manifest 3") {
+                   line != "x2w-manifest 3" && line != "x2w-manifest 4") {
             // Version 2 adds `uav` lines. Each one is bound (a pixel-stage tex2d store) or refused by name below,
             // so a translation whose stores would be silently skipped is never drawn (#1723).
-            // Version 3 adds table-word reads and mandatory texture choices.
+            // Version 3 adds table-word reads and mandatory texture choices. Version 4 adds cube SRVs.
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
         } else if (const int fields = std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y); fields >= 2) {
@@ -614,11 +614,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             } else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
-            const bool cube = !std::strcmp(kind, "texcube");
-            if (cube && !sampled_state_stages_enabled()) return;
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
-                                     cube ? 5 : 0;
+                                     !std::strcmp(kind, "texcube") ? 5 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (sampled_state_stages_enabled() && line.compare(0, 9, "srvstage ") == 0) {
@@ -3185,6 +3183,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const x2w_startup::drop_mips::BindHint drop_hint(drop_use, drop_view);
                 texture = sampled_address_texture(resource);
             }
+            bool wrong_cube = false;
+            if (texture && srv.kind == 5) {
+                wrong_cube = record.slot != 18 || record.desc_bytes < 40 ||
+                    title_view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE ||
+                    !cube_srv_resource(texture->GetDesc());
+                if (wrong_cube) {
+                    static LONG refused_cube;
+                    if (first_calls(refused_cube, 8)) {
+                        const char* reason = title_view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY
+                            ? "cube arrays are unsupported" : "a cube shader needs a TextureCube view of at least six square 2D faces";
+                        log("x2w-draw   %016llx srv %u: %s; binding null", tr->key, i, reason);
+                    }
+                    texture = nullptr;  // Keep the typed null descriptor initialized above.
+                }
+            }
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
@@ -3215,7 +3228,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (pass.bound_targets[t] == tex) return true;
                 return pass.bound_depth == tex && pass.depth_view_writable;
             };
-            if (indirect && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
+            if (indirect && !wrong_cube && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
@@ -3223,21 +3236,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) {
-                if (!stage_states) require_state(self, texture, sampled_state(self, texture));
+                if (!stage_states) {
+                    auto state = sampled_state(self, texture);
+                    if (srv.kind == 5) state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    require_state(self, texture, state);
+                }
                 if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
             }
-            const bool had_texture = texture != nullptr;
-            bool mismatched = false;
+            const bool had_texture = texture != nullptr || wrong_cube;
+            bool mismatched = wrong_cube;
             static LONG shown;
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             const bool wrong_1d_resource = texture && srv.kind == 4 &&
                 (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
-            // A default SRV for a six-slice resource is an array, so a cube always needs an explicit view.
-            const bool missing_cube_desc = srv.kind == 5 && record.desc_bytes < 40;
-            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) ||
-                            wrong_1d_resource || missing_cube_desc)) {
+            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
                 texture = nullptr;
@@ -3248,7 +3262,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2D.MipLevels = 1;
                 if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
             }
-            if (!texture && (indirect || srv.pointer_choice)) {
+            if (!texture && ((indirect && !wrong_cube) || srv.pointer_choice)) {
                 if (indirect)
                     indirect->set_refusal("translated draw could not bind its sampled texture",
                                           indirect_refusal_code::sampled_texture_unbindable);
