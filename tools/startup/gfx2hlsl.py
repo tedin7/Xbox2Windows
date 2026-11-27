@@ -5137,7 +5137,7 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
-                    incoming_heap_indices = self.heap_index if self.kind in ('vs', 'ps') else {}
+                    incoming_heap_indices = self.heap_index if getattr(self, 'kind', None) in ('vs', 'ps') else {}
                     self.heap_index = {}  # another path into the join may hold a different word
                     self.align4_v.clear()
                     self.align4_s.clear()
@@ -7795,7 +7795,7 @@ class Stage:
         is named when it is a root constant word (the dispatch knows it) or a word an s_buffer_load wrote (see
         op_s_buffer_load_dword). A root constant word times a literal plus a literal ('rc') is the byte offset such a
         load may read the index word at: the same for every thread of the dispatch."""
-        if self.kind in ('vs', 'ps'):
+        if getattr(self, 'kind', None) in ('vs', 'ps'):
             self.mark_texture_heap_index(base, d, srcs, syms)
             if self.heap_index.get(d, (None,))[0] in ('texture_index', 'texture_byte_offset'):
                 return
@@ -8162,9 +8162,9 @@ class Stage:
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
                     if hasattr(self, 'heap_index'):
-                        if self.kind == 'cs':
+                        if getattr(self, 'kind', None) == 'cs':
                             self.heap_index[dst[1] + i] = ('heap_index_word',)
-                        elif self.kind in ('vs', 'ps') and self.pipe.root['params'][p[1][1]]['type'] == 2:
+                        elif getattr(self, 'kind', None) in ('vs', 'ps') and self.pipe.root['params'][p[1][1]]['type'] == 2:
                             self.heap_index[dst[1] + i] = ('texture_index',)
                 return
             # A compute or vertex raw-store conversion must distinguish loads through different high words
@@ -8220,7 +8220,7 @@ class Stage:
 
     def dynamic_heap_record(self, dst, base, token, imm, count, refusal):
         r = reg_range(token)
-        if count == 8 and self.kind in ('vs', 'ps') and getattr(self.pipe, 'supports_dynamic_texture_heap', False):
+        if count == 8 and getattr(self, 'kind', None) in ('vs', 'ps') and getattr(self.pipe, 'supports_dynamic_texture_heap', False):
             mark = self.heap_index.get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
             lane = getattr(self, 'texture_waterfall_loads', {}).get(self.pc)
             if (dst[2] > 105 or imm or len(self.sym[base[1]]) != 2
