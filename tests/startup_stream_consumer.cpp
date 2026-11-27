@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <cstdio>
@@ -737,6 +738,154 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     return 0;
 }
 
+// Slot 67 compute fixture: 32 translated descriptors per dispatch, with a bank change at the old wrap.
+static int dispatch_descriptor_ring(IDXGIAdapter* adapter, void* device)
+{
+    static constexpr UINT first_bank = (1u << 18) / 32;
+    static constexpr UINT first_batch = first_bank + 1;
+    static constexpr UINT count = first_batch + 128;
+    static constexpr UINT bank_words = (count + 3u) & ~3u;
+    static constexpr UINT64 bytes = count * sizeof(UINT);
+    static constexpr UINT64 input_bytes = 2 * bank_words * sizeof(UINT);
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    const auto ok = [](StreamWord hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); };
+    const auto expected = [](UINT bank, UINT i) { return (bank ? 0x42000000u : 0x17000000u) + i; };
+    struct Debug {
+        ComPtr<ID3D12InfoQueue1> queue;
+        std::atomic<unsigned> errors{0};
+        DWORD cookie = 0;
+        bool registered = false;
+        ~Debug() { if (registered) queue->UnregisterMessageCallback(cookie); }
+        static void WINAPI message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+                                   D3D12_MESSAGE_ID, LPCSTR text, void* context)
+        {
+            if (severity <= D3D12_MESSAGE_SEVERITY_ERROR && ++static_cast<Debug*>(context)->errors <= 12)
+                std::printf("debug layer: %.300s\n", text);
+        }
+    } debug;
+
+    ComPtr<ID3D12Device> desktop;
+    if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop)))) return 80;
+    debug.registered = SUCCEEDED(desktop.As(&debug.queue)) &&
+        SUCCEEDED(debug.queue->RegisterMessageCallback(Debug::message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, &debug, &debug.cookie));
+    if (!debug.registered) {
+        std::puts("no debug layer");
+        return 81;
+    }
+
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, input_bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* input = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+    desc.Width += bytes;
+    void* upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    desc.Width = bytes;
+    void* readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void* output = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON);
+    void* mapped = nullptr;
+    if (!input || !upload || !output || !readback || !ok(invoke(upload, 8, 0, 0, word(&mapped))) || !mapped)
+        return 82;
+    for (UINT bank = 0; bank < 2; ++bank)
+        for (UINT i = 0; i < count; ++i)
+            static_cast<UINT*>(mapped)[bank * bank_words + i] = expected(bank, i);
+    for (UINT i = 0; i < count; ++i) static_cast<UINT*>(mapped)[2 * bank_words + i] = 0xc5c5c5c5u;
+    invoke(upload, 9, 0, 0);
+
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    void *heap = nullptr, *queue = nullptr, *alloc = nullptr, *late_alloc = nullptr, *list = nullptr;
+    void *gate = nullptr, *done = nullptr;
+    if (!ok(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&heap))) ||
+        !ok(invoke(device, 8, word(&queue_desc), word(&__uuidof(ID3D12CommandQueue)), word(&queue))) ||
+        !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&alloc))) ||
+        !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&late_alloc))) ||
+        !ok(invoke(device, 73, word(list_desc), word(alloc), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&list))) ||
+        !ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&gate))) ||
+        !ok(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&done))))
+        return 83;
+
+    const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
+    if (!cpu || !gpu) return 84;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                                      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    // Create the views at aligned handles, then pack their tokens into the guest table.
+    const auto staging = StreamWord{32} * desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    srv.Buffer = {0, count, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    invoke(device, 18, word(input), word(&srv), cpu);
+    srv.Buffer.FirstElement = bank_words;
+    invoke(device, 18, word(input), word(&srv), cpu + staging);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+    uav.Buffer.NumElements = count;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    invoke(device, 19, word(output), 0, word(&uav), cpu + 2 * staging);
+    std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<const void*>(cpu + 2 * staging), 32);
+    const UINT unfilled[4]{1, 0, 0, 0};
+    std::memcpy(reinterpret_cast<void*>(cpu + 96), unfilled, sizeof(unfilled));
+
+    const auto bind = [&] {
+        invoke(list, 32, 1, word(&heap));
+        invoke(list, 25, word(slot67_pipeline));
+        invoke(list, 33, word(slot67_root));
+        invoke(list, 35, 1, gpu);
+    };
+    const auto record = [&](UINT begin, UINT end) {
+        for (UINT i = begin; i < end; ++i) {
+            invoke(list, 37, 0, i, 0);
+            invoke(list, 14, 1, 1, 1);
+        }
+    };
+
+    const auto started = GetTickCount64();
+    if (!ok(invoke(list, 139, word(alloc)))) return 85;
+    invoke(list, 15, word(input), 0, word(upload), 0, input_bytes);
+    invoke(list, 15, word(output), 0, word(upload), input_bytes, bytes);
+    bind();
+    record(0, first_bank);
+    std::memcpy(reinterpret_cast<void*>(cpu), reinterpret_cast<const void*>(cpu + staging), 32);
+    record(first_bank, first_batch);
+    if (!ok(invoke(list, 9)) || !ok(invoke(queue, 17, word(gate), 1))) return 86;
+    invoke(queue, 10, 1, word(&list));
+
+    // Detach the submitted recording, then reset its title allocator while the queue fence is pending.
+    bool late = ok(invoke(list, 139, word(late_alloc))) && ok(invoke(alloc, 8));
+    if (late) {
+        bind();
+        record(first_batch, count);
+        invoke(list, 15, word(readback), 0, word(output), 0, bytes);
+        late = ok(invoke(list, 9));
+        if (late) invoke(queue, 10, 1, word(&list));
+    }
+    if (!ok(invoke(gate, 10, 1)) || !ok(invoke(queue, 14, word(done), 1))) return 87;
+    for (const auto deadline = GetTickCount64() + 60000; invoke(done, 8) < 1;) {
+        if (GetTickCount64() >= deadline) {
+            std::puts("descriptor ring queue fence timed out");
+            return 88;
+        }
+        Sleep(1);
+    }
+    if (desktop->GetDeviceRemovedReason() != S_OK || debug.errors.load() || !late) return 89;
+    mapped = nullptr;
+    if (!ok(invoke(readback, 8, 0, 0, word(&mapped))) || !mapped) return 90;
+    const auto* results = static_cast<const UINT*>(mapped);
+    bool match = true;
+    for (UINT i = 0; i < count; ++i) {
+        const UINT reference = expected(i >= first_bank, i);
+        if (results[i] == reference) continue;
+        std::printf("descriptor ring: word %u read %08x, expected %08x\n", i, results[i], reference);
+        match = false;
+        break;
+    }
+    invoke(readback, 9, 0, 0);
+    if (!match) return 91;
+    std::printf("PASS: %u dispatches, %u translated descriptors, %llu ms\n",
+                count, 32 * count, GetTickCount64() - started);
+    return 0;
+}
+
 // The image store program of startup_compute_image_store_d16_check.py through the stand-in's own list: a committed
 // 32x8 RGBA16_FLOAT texture (device slot 127) filled with sentinel halves by CopyTextureRegion (list slot 16), an
 // unordered access view of it (device slot 19) whose token the stand-in writes into the title heap at table byte 64,
@@ -1125,6 +1274,8 @@ int main(int argc, char** argv)
             }
         }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
+        if (std::strcmp(argv[8], "dispatch-descriptor-ring") == 0)
+            return dispatch_descriptor_ring(adapter.Get(), device);
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
         if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
             if (int rc = dispatch_slot67(adapter.Get(), device, nolock_retry ? "dispatch-nolock-burst" : "dispatch")) return rc;

@@ -694,6 +694,21 @@ target_link_libraries(startup_view_desc PRIVATE d3d12 dxgi d3dcompiler)
 add_test(NAME startup_view_desc COMMAND startup_view_desc)
 add_test(NAME startup_view_desc_warp COMMAND startup_view_desc warp)
 set_tests_properties(startup_view_desc_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_executable(startup_subresource_states tests/startup_subresource_states_check.cpp)
+target_include_directories(startup_subresource_states PRIVATE src)
+target_compile_features(startup_subresource_states PRIVATE cxx_std_17)
+add_test(NAME startup_subresource_states COMMAND startup_subresource_states)
+
+add_executable(startup_gpu_validation_level_check tests/startup_gpu_validation_level_check.cpp)
+target_include_directories(startup_gpu_validation_level_check PRIVATE src)
+target_compile_features(startup_gpu_validation_level_check PRIVATE cxx_std_17)
+add_test(NAME startup_gpu_validation_level_check COMMAND startup_gpu_validation_level_check)
+
+
+add_executable(startup_descriptor_ring_segments tests/startup_descriptor_ring_segments_check.cpp)
+target_include_directories(startup_descriptor_ring_segments PRIVATE src)
+target_compile_features(startup_descriptor_ring_segments PRIVATE cxx_std_17)
+add_test(NAME startup_descriptor_ring_segments COMMAND startup_descriptor_ring_segments)
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_srv_wrapper_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_srv_wrapper_check.py")
@@ -1858,6 +1873,16 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_root_${backend} startup_indirect_translated_root_control_${backend}
         PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME startup_indirect_translated_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-refusal-census)
+    foreach(mode IN ITEMS render-target-read stencil-target-read depth-target-feedback depth-target-read)
+        string(REPLACE "-" "_" test_case "${mode}")
+        set(test_name startup_draw_${test_case}_${backend})
+        add_test(NAME ${test_name} COMMAND startup_indirect_draw_indexed ${backend} ${mode})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_DEBUG=2")
+        if(backend STREQUAL "hardware")
+            set_tests_properties(${test_name} PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+    endforeach()
     add_test(NAME startup_indirect_translated_targets_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-targets)
     add_test(NAME startup_indirect_other_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} indirect-other-refusal-census)
     add_test(NAME startup_indirect_copy_provenance_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance)
@@ -2044,12 +2069,25 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+add_executable(startup_gpu_validation tests/startup_gpu_validation.cpp)
+target_compile_features(startup_gpu_validation PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_validation PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    foreach(case IN ITEMS hazard clean)
+        add_test(NAME startup_gpu_validation_${case}_${backend} COMMAND startup_gpu_validation ${backend} ${case})
+        set_tests_properties(startup_gpu_validation_${case}_${backend} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=2")
+    endforeach()
+endforeach()
+set_tests_properties(startup_gpu_validation_hazard_hardware startup_gpu_validation_clean_hardware
+    PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(startup_debug_noise_device tests/startup_debug_noise_device.cpp)
 target_compile_features(startup_debug_noise_device PRIVATE cxx_std_17)
 target_link_libraries(startup_debug_noise_device PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_debug_noise_device_${backend} COMMAND startup_debug_noise_device ${backend})
-    set_tests_properties(startup_debug_noise_device_${backend} PROPERTIES TIMEOUT 60
+    set_tests_properties(startup_debug_noise_device_${backend} PROPERTIES TIMEOUT 120
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
 endforeach()
 set_tests_properties(startup_debug_noise_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
@@ -2780,7 +2818,7 @@ add_test(NAME dispatch_phases_single_lock_control COMMAND dispatch_phases_check 
 set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
-# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/dsv_planes.h), debug layer on.
+# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/subresource_states.h), debug layer on.
 add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
 target_include_directories(dsv_planes_check PRIVATE src)
 target_compile_features(dsv_planes_check PRIVATE cxx_std_17)
@@ -5340,6 +5378,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_descriptor_ring_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_descriptor_ring_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_descriptor_ring_${adapter} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(adapter STREQUAL "hardware")
+            set_tests_properties(startup_descriptor_ring_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})

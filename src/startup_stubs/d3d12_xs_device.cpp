@@ -48,6 +48,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/d3d12_replay_slots.h"
 #include "startup_stubs/list_upload_pages.h"
+#include "startup_stubs/descriptor_ring_segments.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/sysmem_create.h"
 #include "startup_stubs/upload_reservation.h"
@@ -65,7 +66,7 @@
 #include "startup_stubs/target_draw_census.h"
 #include "startup_stubs/gpu_time_probe.h"
 #include "startup_stubs/dispatch_phases.h"
-#include "startup_stubs/dsv_planes.h"
+#include "startup_stubs/subresource_states.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
@@ -105,6 +106,8 @@
 #include "null_texture_view.h"
 #include "clear_value_format.h"
 #include "debug_drain_budget.h"
+#include "debug_level.h"
+#include "resource_map_counts.h"
 #include "descriptor_heap_rules.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
@@ -227,6 +230,7 @@ struct alignas(16) WrapperOwn {
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
+    UINT descriptor_run_heap, descriptor_run_next, descriptor_run_remaining; // allocator_lock
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
@@ -511,7 +515,7 @@ void log_sysmem_fallback(const void* address, const D3D12_RESOURCE_DESC& desc, c
         desc.MipLevels, desc.Format, desc.SampleDesc.Count);
 }
 
-// X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
+// X2W_D3D12_DEBUG=1 or 2: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
 ID3D12InfoQueue* info_queue;
 ID3D12Device* removal_device;
@@ -1276,9 +1280,23 @@ bool lazy_texture_desc(const Wrapper* w, D3D12_RESOURCE_DESC& out)
 }
 ID3D12Resource* materialize_lazy_texture(Wrapper* w);
 bool retire_unmaterialized_lazy_texture(Wrapper* w);
+
+SRWLOCK resource_map_lock = SRWLOCK_INIT;
+x2w_startup::ResourceMapCounts<Wrapper*> resource_maps;
+
+void forget_resource_maps(Wrapper* w)
+{
+    AcquireSRWLockExclusive(&resource_map_lock);
+    resource_maps.forget(w);
+    ReleaseSRWLockExclusive(&resource_map_lock);
+}
+
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
+    // A resource may be released while mapped (persistent mapping): its map counts end with it, with no Unmap.
+    // Only the last release takes the lock, so the hot Release path stays lock-free.
+    if (!refs && self->own().kind == resource_kind) forget_resource_maps(self);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
@@ -1712,6 +1730,21 @@ struct ComputeInputSnapshot {
     std::vector<std::pair<ID3D12Fence*, UINT64>> submits;
 };
 
+constexpr UINT draw_heap_size = 1u << 18;
+constexpr UINT draw_segment_size = 512;
+constexpr UINT draw_heap_limit = 4;
+using DrawSegments = x2w_startup::DescriptorRingSegments<draw_heap_size / draw_segment_size>;
+struct DrawHeap {
+    ID3D12DescriptorHeap* heap = nullptr;
+    DrawSegments segments;
+};
+struct DrawSegmentHold {
+    UINT heap;
+    DrawSegments::Run run;
+};
+std::array<DrawHeap, draw_heap_limit> draw_heaps;
+UINT draw_heap_count; // Growth under draw_lock, then allocator_lock.
+
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
 // stands for a pool of desktop allocators. A list records on the pool's current one. In render
@@ -1735,6 +1768,7 @@ struct DesktopAllocator {
     // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
     // queue that ran it has passed its fence (the allocator is reused only when idle).
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
+    std::vector<DrawSegmentHold> descriptor_runs; // Released on idle Reset, like scratches.
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1874,7 +1908,7 @@ void release_upload_recording(Wrapper* list)
     retire_list_arena(list);
     detach_gpu_mirror_recording(list);
     // A destroyed list holds no recording any more: its allocator becomes reusable once the GPU passes its submits.
-    if (const auto found = list_recordings.find(list); upload_page_reuse() && found != list_recordings.end()) {
+    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
         if (found->second) --found->second->lists;
         list_recordings.erase(found);
     }
@@ -1899,6 +1933,13 @@ bool allocator_idle(const DesktopAllocator* allocator)
     for (const auto& submit : allocator->submits)
         if (submit.first->GetCompletedValue() < submit.second) return false;
     return true;
+}
+
+// allocator_lock held, after successful Reset of an idle desktop allocator.
+void release_draw_segments(DesktopAllocator& allocator)
+{
+    for (const auto& hold : allocator.descriptor_runs) draw_heaps[hold.heap].segments.release(hold.run);
+    allocator.descriptor_runs.clear();
 }
 
 // allocator_lock held. A recording retains its descriptor snapshots behind the same fences as its upload pages.
@@ -2069,6 +2110,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             recycle_arenas(*next);
             next->indexed_validation.clear();
             next->scratches.clear();
+            release_draw_segments(*next);
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -2275,6 +2317,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                     recycle_arenas(*spare);
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
+                    release_draw_segments(*spare);
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -2322,6 +2365,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (compute_title_inputs_enabled()) compute_input_recordings.erase(self);
             retire_list_arena(self);
             state.list_scratch = nullptr;
+            state.descriptor_run_remaining = 0;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -3662,7 +3706,7 @@ struct Pass {
     UINT root_heap_flags = 0;
     ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
-    std::vector<x2w_dsv::Planes> mixed;  // depth stencil resources whose two planes this list moved separately (dsv_planes.h)
+    std::vector<x2w_substates::Split> split;
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
@@ -3696,8 +3740,10 @@ struct Pass {
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
+    x2w_substates::Range bound_target_ranges[8]{};
     ID3D12Resource* bound_depth = nullptr;
-    bool heap_set = false;
+    x2w_substates::DepthBinding bound_depth_view;
+    ID3D12DescriptorHeap* bound_view_heap = nullptr;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
@@ -3811,22 +3857,40 @@ bool placed_gpu_written(Wrapper* buffer, u64 offset, u64 bytes)
     ReleaseSRWLockShared(&placed_gpu_writes_lock);
     return written;
 }
+auto find_split(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.split.begin(), pass.split.end(),
+                        [resource](const auto& known) { return known.resource == resource; });
+}
+
+auto find_state(Pass& pass, ID3D12Resource* resource)
+{
+    return std::find_if(pass.states.begin(), pass.states.end(),
+                        [resource](const auto& known) { return known.first == resource; });
+}
+
+x2w_substates::Split& split_state(Pass& pass, ID3D12Resource* resource)
+{
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) return *split;
+    const auto known = find_state(pass, resource);
+    const auto state = known == pass.states.end() ? D3D12_RESOURCE_STATE_COMMON : known->second;
+    pass.split.push_back(x2w_substates::make_split(resource, x2w_substates::whole(resource->GetDesc()), state));
+    if (known != pass.states.end()) pass.states.erase(known);
+    return pass.split.back();
+}
+
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
     Pass& pass = pass_of(self);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
-    for (auto it = pass.mixed.begin(); it != pass.mixed.end(); ++it) {
-        if (it->resource != resource) continue;
-        // Sampling the read-only depth plane keeps it in DEPTH_READ with the shader-resource bits; the stencil plane stays.
-        if ((state & D3D12_RESOURCE_STATE_DEPTH_READ) && (it->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)) {
-            x2w_dsv::move_plane(list, *it, 0, state);
-            return;
-        }
-        // Anything else wants one state for the whole resource: bring both planes back to COMMON first.
-        x2w_dsv::release(list, *it);
-        pass.mixed.erase(it);
-        break;
+    const auto split = find_split(pass, resource);
+    if (split != pass.split.end()) {
+        x2w_substates::move_all(list, *split, state);
+        pass.split.erase(split);
+        pass.states.emplace_back(resource, state);
+        return;
     }
     for (auto& known : pass.states) {
         if (known.first != resource) continue;
@@ -3839,17 +3903,86 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
     transition(list, resource, D3D12_RESOURCE_STATE_COMMON, state);
     pass.states.emplace_back(resource, state);
 }
-// State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
+// Preserve the whole-resource read state for a depth resource no longer bound as a DSV.
 D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 {
-    for (const auto& planes : pass_of(self).mixed)
-        if (planes.resource == resource && (planes.state[0] & D3D12_RESOURCE_STATE_DEPTH_READ))
+    auto& pass = pass_of(self);
+    if (pass.bound_depth != resource) {
+        const auto known = find_state(pass, resource);
+        const auto split = find_split(pass, resource);
+        if ((known != pass.states.end() && (known->second & D3D12_RESOURCE_STATE_DEPTH_READ)) ||
+            (split != pass.split.end() && split->planes == 2 && (split->state[0] & D3D12_RESOURCE_STATE_DEPTH_READ)))
             return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    for (const auto& known : pass_of(self).states)
-        if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
-            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
     return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
+bool require_read(Wrapper* self, ID3D12Resource* resource, const x2w_substates::Range& read,
+                  D3D12_RESOURCE_STATES read_state)
+{
+    auto& pass = pass_of(self);
+    bool bound = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        if (pass.bound_targets[i] != resource) continue;
+        bound = true;
+        // Enhanced Barriers, No Self Copy: one subresource cannot combine read and write access.
+        if (x2w_substates::overlaps(read, pass.bound_target_ranges[i])) return false;
+    }
+    if (pass.bound_depth == resource) {
+        if (x2w_substates::writable_overlap(pass.bound_depth_view, read)) return false;
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        const auto known = find_state(pass, resource);
+        const auto full = x2w_substates::whole(resource->GetDesc());
+        // Keep the existing whole-resource barrier for a single fully covered read-only plane.
+        if (full.mips == 1 && full.slices == 1 && full.planes == 1 && known != pass.states.end()) {
+            require_state(self, resource, D3D12_RESOURCE_STATE_DEPTH_READ | read_state);
+        } else {
+            auto& split = split_state(pass, resource);
+            x2w_substates::move_each(list, split, read, [&](UINT index, D3D12_RESOURCE_STATES) {
+                return x2w_substates::sampled_state(split, index, pass.bound_depth_view, read_state);
+            });
+        }
+    } else if (bound) {
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        x2w_substates::move(list, split_state(pass, resource), read, read_state);
+    } else {
+        require_state(self, resource, read_state);
+    }
+    return true;
+}
+
+void restore_bound_targets(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pass)
+{
+    bool moved = false;
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        auto* resource = pass.bound_targets[i];
+        const auto known = find_state(pass, resource);
+        if (known != pass.states.end() && known->second == D3D12_RESOURCE_STATE_RENDER_TARGET) continue;
+        if (resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            moved = true;
+        } else {
+            moved |= x2w_substates::move(list, split_state(pass, resource), pass.bound_target_ranges[i],
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
+    if (auto* resource = pass.bound_depth) {
+        const auto& depth = pass.bound_depth_view;
+        const auto known = find_state(pass, resource);
+        using x2w_substates::attachment_state;
+        if (known == pass.states.end() ||
+            attachment_state(depth.states[0], known->second) != known->second ||
+            (depth.range.planes == 2 && attachment_state(depth.states[1], known->second) != known->second)) {
+            auto& split = split_state(pass, resource);
+            for (UINT p = 0; p < depth.range.planes; ++p)
+                moved |= x2w_substates::move_each(list, split, x2w_substates::plane(depth.range, p),
+                    [&](UINT, D3D12_RESOURCE_STATES from) { return attachment_state(depth.states[p], from); });
+        }
+    }
+    static LONG restored;
+    if (moved && first_calls(restored, 6))
+        log("x2w-draw bound target moved back to its bind state before the draw");
+}
+
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 
 #include "startup_stubs/d3d12_replay_dump.inl"
@@ -3879,9 +4012,18 @@ void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().dis
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     for (const auto& known : pass.states)
-        transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
-    for (auto& planes : pass.mixed) x2w_dsv::release(static_cast<ID3D12GraphicsCommandList*>(self->own().real), planes);
+        transition(list, known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    for (auto& split : pass.split) {
+        if (split.planes == 2) {
+            // Keep the two barrier batches used to close a mixed DSV.
+            for (UINT plane = 0; plane < split.planes; ++plane)
+                x2w_substates::move(list, split, {0, split.mips, 0, split.slices, plane, 1}, D3D12_RESOURCE_STATE_COMMON);
+        } else {
+            x2w_substates::move_all(list, split, D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
     pass = Pass{};
 }
 
@@ -3896,7 +4038,7 @@ void retire_drop_recording(Wrapper* list)
     if (!release_retired_enabled()) return;
     if (list->own().pass) {
         pass_of(list).states.clear();
-        pass_of(list).mixed.clear();
+        pass_of(list).split.clear();
     }
     retire_discard_holds(list);
 }
@@ -4792,6 +4934,7 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 // other kind is wrong_kind; a handle with no record falls back to the creation-time map (render targets only).
 struct ResolvedView {
     ID3D12Resource* resource = nullptr;
+    x2w_substates::Range range{};
     UINT dsv_flags = 0;
     bool wrong_kind = false;
     bool skipped = false;
@@ -4813,6 +4956,7 @@ ResolvedView resolve_view(u64 handle, int slot)
     }
     if (!known) {
         if (slot == 20 || slot == 21) out.resource = view_target(handle, slot);
+        if (out.resource) out.range = x2w_substates::whole(out.resource->GetDesc());
         return out;
     }
     if (static_cast<int>(record.slot) != slot) {
@@ -4824,13 +4968,22 @@ ResolvedView resolve_view(u64 handle, int slot)
         return out;
     }
     out.resource = record.resource ? reinterpret_cast<ID3D12Resource*>(unwrap(record.resource)) : nullptr;
-    if (slot == 21 && record.desc_bytes >= 12) std::memcpy(&out.dsv_flags, record.desc + 8, 4);
+    if (slot == 20 && out.resource) {
+        D3D12_RENDER_TARGET_VIEW_DESC desc{};
+        if (record.desc_bytes == sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+        out.range = x2w_substates::rtv(out.resource->GetDesc(), record.desc_bytes ? &desc : nullptr);
+    }
+    if (slot == 21 && out.resource) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC desc{};
+        if (record.desc_bytes == sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+        out.dsv_flags = desc.Flags;
+        out.range = x2w_substates::dsv(out.resource->GetDesc(), record.desc_bytes ? &desc : nullptr);
+    }
     return out;
 }
 bool format_has_stencil(DXGI_FORMAT format)
 {
-    return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
-           format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
+    return x2w_substates::plane_count(format) == 2;
 }
 // Every depth clear's value and fate, and what a decoded GREATER depth test meets (depth_clear_census.h).
 x2w_depth_census::DepthClearCensus& depth_clear_census()
@@ -5013,7 +5166,7 @@ void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64
     // The clear needs the GPU descriptor's own heap bound; the next translated draw binds its heaps again.
     ID3D12DescriptorHeap* bound[] = {view_heap};
     list->SetDescriptorHeaps(1, bound);
-    pass_of(self).heap_set = false;
+    pass_of(self).bound_view_heap = nullptr;
     const D3D12_GPU_DESCRIPTOR_HANDLE gpu{desktop_gpu};
     const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
     replay_dump::note(self, target);
@@ -5064,7 +5217,9 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     std::fill_n(pass.bound_targets, 8, nullptr);
+    std::fill_n(pass.bound_target_ranges, 8, x2w_substates::Range{});
     pass.bound_depth = nullptr;
+    pass.bound_depth_view = {};
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list) return;
     static LONG refused, unresolved_logged;
@@ -5086,6 +5241,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
+    x2w_substates::Range ranges[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
         const u64 step = u64{i} * stride;
@@ -5108,15 +5264,15 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                     view.skipped ? "holds a skipped view" : "holds no view");
             return;
         }
+        ranges[i] = view.range;
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    bool mixed_planes = false;  // a view with one read-only plane: dsv_state is the depth plane's, the stencil plane gets the other
-    D3D12_RESOURCE_STATES stencil_plane_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    x2w_substates::DepthBinding depth_view;
+    bool mixed_planes = false;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
         if (!resolved) {
@@ -5136,17 +5292,12 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
                 return;
             }
             dsv_format = view_format_of(resolved, dsv_target);
-            const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
-            // A format without a stencil plane has no second plane to disagree with.
-            const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
-            if (read_depth != read_stencil) {
-                // Each plane gets its own state (dsv_planes.h); the desktop view keeps the title's flags.
-                mixed_planes = true;
+            depth_view = x2w_substates::bind_depth(view.range, view.dsv_flags);
+            mixed_planes = view.range.planes == 2 && depth_view.states[0] != depth_view.states[1];
+            if (mixed_planes) {
                 InterlockedIncrement(&render_target_mixed_dsv[view.dsv_flags & 3]);
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets: depth stencil view with one read-only plane (flags 0x%x) bound with per-plane states", view.dsv_flags);
-                stencil_plane_state = read_stencil ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
-            if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
         }
@@ -5162,26 +5313,24 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         if (i == 0) pass.target0 = targets[i];
     }
     if (dsv_target && mixed_planes) {
-        // A whole-resource state it was in is dropped to COMMON first; then each plane moves to its own state.
-        for (auto it = pass.states.begin(); it != pass.states.end(); ++it)
-            if (it->first == dsv_target) {
-                transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), dsv_target, it->second, D3D12_RESOURCE_STATE_COMMON);
-                pass.states.erase(it);
-                break;
-            }
-        auto found = std::find_if(pass.mixed.begin(), pass.mixed.end(), [&](const x2w_dsv::Planes& p) { return p.resource == dsv_target; });
-        if (found == pass.mixed.end()) {
-            pass.mixed.push_back(x2w_dsv::planes_of(dsv_target));
-            found = pass.mixed.end() - 1;
+        // Retain the existing COMMON-to-plane transitions on a mixed bind.
+        const auto known = find_state(pass, dsv_target);
+        if (known != pass.states.end()) {
+            transition(list, dsv_target, known->second, D3D12_RESOURCE_STATE_COMMON);
+            known->second = D3D12_RESOURCE_STATE_COMMON;
         }
-        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 0, dsv_state);
-        x2w_dsv::move_plane(static_cast<ID3D12GraphicsCommandList*>(self->own().real), *found, 1, stencil_plane_state);
+        auto& split = split_state(pass, dsv_target);
+        const auto full = x2w_substates::whole(dsv_target->GetDesc());
+        for (UINT p = 0; p < full.planes; ++p)
+            x2w_substates::move(list, split, x2w_substates::plane(full, p), depth_view.states[p]);
     } else if (dsv_target) {
-        require_state(self, dsv_target, dsv_state);
+        require_state(self, dsv_target, depth_view.states[0]);
     }
     pass.target_count = count;
     std::copy_n(targets, 8, pass.bound_targets);
+    std::copy_n(ranges, 8, pass.bound_target_ranges);
     pass.bound_depth = dsv_target;
+    pass.bound_depth_view = depth_view;
     pass.dsv_format = dsv_format;
     const auto inspect = [](ID3D12Resource* resource, DXGI_FORMAT format, auto& surface) {
         const auto desc = resource->GetDesc();
@@ -5194,7 +5343,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.depth_surface = {};
     if (dsv_target) pass.targets_single_sample &= inspect(dsv_target, dsv_format, pass.depth_surface);
     debug_present::note_bound(targets, pass.target_surfaces, count, dsv_target, pass.depth_surface);
-    pass.depth_view_writable = dsv_target && dsv_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    pass.depth_view_writable = dsv_target && depth_view.states[0] == D3D12_RESOURCE_STATE_DEPTH_WRITE;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
     InterlockedIncrement(&render_target_binds);
@@ -5705,8 +5854,6 @@ void* __stdcall queue_get_desc(void* a, void* b)
 // Resource slot 8, desktop Map(subresource, readRange, data). On the console a resource's memory is
 // title-visible: for a resource placed at a title address or backed by a hook allocation, the mapped
 // pointer is that memory (subresource offsets inside it are not modeled). Others map on desktop.
-SRWLOCK resource_map_lock = SRWLOCK_INIT;
-std::unordered_map<Wrapper*, std::unordered_map<UINT, std::uint64_t>> resource_maps;
 HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANGE* range, void** data)
 {
     HRESULT hr = S_OK;
@@ -5721,7 +5868,7 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
              (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
         AcquireSRWLockExclusive(&resource_map_lock);
         hr = !real ? E_FAIL : cpu_hidden ? E_INVALIDARG : real->Map(subresource, range, &mapped);
-        if (SUCCEEDED(hr)) ++resource_maps[self][subresource];
+        if (SUCCEEDED(hr)) resource_maps.record_map(self, subresource);
         ReleaseSRWLockExclusive(&resource_map_lock);
     }
     if (data) *data = SUCCEEDED(hr) ? mapped : nullptr;
@@ -5735,15 +5882,8 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
 void __stdcall resource_unmap(Wrapper* self, UINT subresource, const D3D12_RANGE* range)
 {
     AcquireSRWLockExclusive(&resource_map_lock);
-    auto wrapper = resource_maps.find(self);
-    if (!self->own().title_memory && self->own().real && wrapper != resource_maps.end()) {
-        auto entry = wrapper->second.find(subresource);
-        if (entry != wrapper->second.end() && x2w_startup::consume_map_count(entry->second)) {
-            static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
-            if (!entry->second) wrapper->second.erase(entry);
-            if (wrapper->second.empty()) resource_maps.erase(wrapper);
-        }
-    }
+    if (!self->own().title_memory && self->own().real && resource_maps.consume_map(self, subresource))
+        static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
     ReleaseSRWLockExclusive(&resource_map_lock);
 }
 
@@ -6006,8 +6146,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
-        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 :
+            N == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC);
+        const u64 description = N == 20 || N == 21 ? args[1] : raw[described];
+        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(description),
                   described_bytes, title_dest, args[D], materialized);
     };
     Wrapper* const lazy_wrapper = (N >= 18 && N <= 21) ? as_wrapper(reinterpret_cast<const void*>(a)) : nullptr;
@@ -7144,6 +7286,8 @@ void evict_lazy_texture(Wrapper* v, Wrapper* by, ID3D12Device* device)
         InterlockedIncrement64(&lazy_evict_kept);
         return;
     }
+    // Slot 133 textures map title memory even if the desktop backing is recreated.
+    forget_resource_maps(v);
     null_lazy_views(v, device);
     const LONG64 total = InterlockedIncrement64(&lazy_evicted);
     if (total <= 8 || total % 1000 == 0)
@@ -7661,6 +7805,7 @@ void drain_retired_resources()
         InterlockedIncrement64(&lazy_evict_freed);
     }
     for (const RetiredDrop& drop : dropped) {
+        forget_resource_maps(drop.wrapper);
         if (drop.wrapper->own().title_memory) {
             const u64 address = reinterpret_cast<u64>(drop.wrapper->own().title_memory);
             {
@@ -7984,7 +8129,10 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
         }
     }
     if (Wrapper* l = as_wrapper(list); l && l->own().kind == list_kind) {
-        if (l->own().pass) out->list_states = static_cast<unsigned>(pass_of(l).states.size());
+        if (l->own().pass) {
+            const auto& pass = pass_of(l);
+            out->list_states = static_cast<unsigned>(pass.states.size() + pass.split.size());
+        }
         AcquireSRWLockShared(&retire_lock);
         if (const auto found = retire_list_holds.find(l); found != retire_list_holds.end())
             out->list_holds = static_cast<unsigned>(found->second.size());
@@ -7997,6 +8145,14 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_lazy_texture_count()
 {
     std::lock_guard lock(lazy_texture_mutex);
     return static_cast<unsigned>(lazy_textures().size());
+}
+
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_resource_map_count()
+{
+    AcquireSRWLockShared(&resource_map_lock);
+    const auto count = resource_maps.size();
+    ReleaseSRWLockShared(&resource_map_lock);
+    return count;
 }
 
 // Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a
@@ -9717,16 +9873,37 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     hex_text(parameters, 0x40, block, sizeof(block));
     if (!out) return E_POINTER;
     *out = nullptr;
-    const bool debug = [] {
-        char value[4]{};
-        return GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value)) && value[0] == '1';
-    }();
-    if (debug) {
+    using x2w_startup::DebugLevel;
+    char value[4]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value));
+    const auto debug_level = x2w_startup::d3d12_debug_level(length < sizeof(value) ? value[0] : '\0');
+    const bool debug = debug_level != DebugLevel::off;
+    const auto enable_debug_layer = [](bool gpu_validation) {
         ID3D12Debug* layer = nullptr;
         const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&layer));
         if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
+        if (gpu_validation) {
+            ID3D12Debug1* layer1 = nullptr;
+            const HRESULT gbv_hr = layer ? layer->QueryInterface(IID_PPV_ARGS(&layer1)) : debug_hr;
+            if (SUCCEEDED(gbv_hr)) {
+                layer1->SetEnableGPUBasedValidation(TRUE);
+                layer1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+                layer1->Release();
+                log("x2w-d3d12 GPU-based validation: enabled");
+            } else {
+                log("x2w-d3d12 GPU-based validation: unavailable (0x%08lx)", static_cast<unsigned long>(gbv_hr));
+            }
+        }
+        if (layer) layer->Release();
+    };
+    if (debug_level == DebugLevel::gpu_validation) {
+        // Changing GBV after creating the desktop device causes device removal.
+        static const bool configured = (enable_debug_layer(true), true);
+        (void)configured;
+    } else if (debug) {
+        enable_debug_layer(false);
     }
     ID3D12Device* device = nullptr;
     const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)

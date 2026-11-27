@@ -1504,24 +1504,93 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     return pipeline;
 }
 
-// Private shader-visible heap for the translated draws' tables, used as a ring.
-constexpr UINT draw_heap_size = 1u << 18;
-ID3D12DescriptorHeap* draw_heap;
 Wrapper* draw_heap_device;
 UINT draw_heap_increment;
-volatile LONG draw_heap_cursor;
 
+// draw_lock and allocator_lock held.
+bool create_draw_heap(Wrapper* device)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    auto& heap = draw_heaps[draw_heap_count].heap;
+    if (FAILED(device_of(device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)))) return false;
+    ++draw_heap_count;
+    return true;
+}
+
+// draw_lock held. The translated pipelines and heaps are scoped to the startup device.
 bool ensure_draw_heap(Wrapper* device)
 {
-    // The translated pipeline and upload ring are scoped to the current
-    // startup render device. A list from another device cannot use this heap.
     if (!device || device != the_device) return false;
-    if (draw_heap) return device == draw_heap_device;
-    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
+    if (draw_heap_count) return device == draw_heap_device;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const bool created = create_draw_heap(device);
+    ReleaseSRWLockExclusive(&allocator_lock);
+    if (!created) return false;
     draw_heap_device = device;
-    draw_heap_increment = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    draw_heap_increment = device_of(device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
+}
+
+// allocator_lock held. Attach each run before exposing descriptors from it.
+const char* reserve_draw_segments(Wrapper* self, UINT views)
+{
+    static LONG missing_recording, oversized, heap_full, create_failed, retain_failed;
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (!state.list_open || found == list_recordings.end() || !found->second) {
+        if (first_calls(missing_recording, 1)) log("x2w-draw descriptor ring: no tracked recording");
+        return "no tracked descriptor recording";
+    }
+    if (views > draw_heap_size) {
+        if (first_calls(oversized, 1)) log("x2w-draw descriptor ring: table too large (%u descriptors)", views);
+        return "descriptor table too large";
+    }
+    const UINT segments = (views + draw_segment_size - 1) / draw_segment_size;
+    for (UINT i = 0; ; ++i) {
+        if (i == draw_heap_count) {
+            if (i == draw_heap_limit) {
+                if (first_calls(heap_full, 4))
+                    log("x2w-draw descriptor ring full (%u heaps, all segments held by unfinished recordings)", i);
+                return "descriptor ring full";
+            }
+            if (!create_draw_heap(state.list_device)) {
+                if (first_calls(create_failed, 4)) log("x2w-draw descriptor ring: heap creation failed");
+                return "descriptor ring heap creation failed";
+            }
+        }
+        auto& pool = draw_heaps[i].segments;
+        if (const auto run = pool.acquire(segments)) {
+            try {
+                found->second->descriptor_runs.push_back({i, *run});
+            } catch (const std::bad_alloc&) {
+                pool.release(*run);
+                if (first_calls(retain_failed, 4)) log("x2w-draw descriptor ring: could not retain run");
+                return "could not retain descriptor run";
+            }
+            state.descriptor_run_heap = i;
+            state.descriptor_run_next = run->first * draw_segment_size;
+            state.descriptor_run_remaining = run->count * draw_segment_size;
+            return nullptr;
+        }
+    }
+}
+
+// draw_lock held. List reset clears the cursor; only allocator reset releases its runs.
+const char* allocate_draw_table(Wrapper* self, UINT views, ID3D12DescriptorHeap*& heap, UINT& first)
+{
+    if (!views) return nullptr;
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const char* reason = views > state.descriptor_run_remaining ? reserve_draw_segments(self, views) : nullptr;
+    if (!reason) {
+        heap = draw_heaps[state.descriptor_run_heap].heap;
+        first = state.descriptor_run_next;
+        state.descriptor_run_next += views;
+        state.descriptor_run_remaining -= views;
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return reason;
 }
 
 // A recorded table is immutable. Keep it alive until its submission completes,
@@ -3562,6 +3631,8 @@ static const char* const not_drawn_names[] = {
     "targets_not_bound",
     "unsupported_topology",
     "rect_draw_unsupported",
+    "sampled_target_overlap",
+    "descriptor_ring_unavailable",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
 constexpr int buffer_copy_failed_site = 15;
@@ -3574,7 +3645,9 @@ constexpr int no_pipeline_set_site = 21;
 constexpr int targets_not_bound_site = 22;
 constexpr int unsupported_topology_site = 23;
 constexpr int rect_draw_unsupported_site = 24;
-static_assert(not_drawn_sites == 25, "the not-drawn site numbers are fixed");
+constexpr int sampled_target_overlap_site = 25;
+constexpr int descriptor_ring_unavailable_site = 26;
+static_assert(not_drawn_sites == 27, "the not-drawn site numbers are fixed");
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -4004,7 +4077,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT srv_count = n + tr->integer_srvs.descriptors();
     const UINT views = srv_count + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
-    ID3D12DescriptorHeap* view_heap = draw_heap;
+    ID3D12DescriptorHeap* view_heap = draw_heaps[0].heap;
     UINT first = 0;
     if (tr->dynamic_heap) {
         if (!indirect) {
@@ -4019,12 +4092,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             draw_lock_release_exclusive();
             return not_drawn(pass, list, not_drawn_key, dynamic_resource_heap_unavailable_site);
         }
-    } else {
-        first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(views))) % draw_heap_size;
-        if (first + views > draw_heap_size) {
-            first = 0;
-            InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
-        }
+    } else if (allocate_draw_table(self, views, view_heap, first)) {
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, descriptor_ring_unavailable_site);
     }
     std::uint32_t strides[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
@@ -4090,6 +4160,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     static const bool zero_missing_buffer = x2w_local::env_on("X2W_DRAW_NULL_ZERO");
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
     std::uint32_t values[32] = {};
+    const auto refuse_target_overlap = [&](UINT i) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-draw %016llx srv %u: texture is also a written target of this draw (mip/slice/plane overlap); draw refused", tr->key, i);
+        if (indirect)
+            indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
+                                  indirect_refusal_code::sampled_texture_mismatch);
+        draw_lock_release_exclusive();
+        return not_drawn(pass, list, not_drawn_key, indirect ? 9 : sampled_target_overlap_site);
+    };
+
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -4194,32 +4275,23 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     desc = fallback_desc;
                 }
             }
-            const auto aliases_writable_target = [&](ID3D12Resource* tex) {
-                if (!tex) return false;
-                for (UINT t = 0; t < pass.target_count; ++t)
-                    if (pass.bound_targets[t] == tex) return true;
-                return pass.bound_depth == tex && pass.depth_view_writable;
-            };
-            if (indirect && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
+            if (indirect && (!texture || record.slot != 18)) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
                 return not_drawn(pass, list, not_drawn_key, 9);
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
-            if (texture) {
-                require_state(self, texture, sampled_state(self, texture));
-                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
-            }
-            const bool had_texture = texture != nullptr;
+            auto* const sampled = texture;
+            const bool had_texture = sampled != nullptr;
             bool mismatched = false;
             static LONG shown;
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             auto* view = described ? &desc : nullptr;
-            if (texture) {
-                const auto real_desc = texture->GetDesc();
+            if (sampled) {
+                const auto real_desc = sampled->GetDesc();
                 // A single-slice array view and its plain form name the same texels: take the type the shader declares.
                 const bool cube = srv.kind == 5;
                 const bool wrong_cube_view = cube && !x2w_startup::matches_draw_cube_srv(real_desc, view,
@@ -4246,6 +4318,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                         texture = nullptr;
                     }
                 }
+                const auto read = x2w_substates::srv(real_desc, view);
+                if (!require_read(self, sampled, read, sampled_state(self, sampled)))
+                    return refuse_target_overlap(i);
+                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
             }
             if (indirect && !texture) {
                 indirect->set_refusal("translated draw could not bind its sampled texture",
@@ -4319,8 +4395,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 draw_lock_release_exclusive();
                 return not_drawn(pass, list, not_drawn_key, 11);
             }
-            if (!view.upload)
-                require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (!view.upload && !require_read(self, view.resource, x2w_substates::whole(view.resource->GetDesc()),
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                return refuse_target_overlap(i);
             strides[i] = view.stride;
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
@@ -4461,7 +4538,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
-            require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (!require_read(self, placed.alias, x2w_substates::whole(placed.alias->GetDesc()),
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                return refuse_target_overlap(i);
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
         }
@@ -4486,7 +4565,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw   %016llx srv %u range 0x%llx (%zu bytes) is in a placed buffer without title backing; no recorded copy wrote it (span %llu)",
                     tr->key, i, address, bytes, span);
             if (written) {
-                require_state(self, native, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                if (!require_read(self, native, x2w_substates::whole(native->GetDesc()),
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                    return refuse_target_overlap(i);
                 buffer_view(dest, native, inside, span);
                 static LONG bound_from_copy;
                 if (first_calls(bound_from_copy, 8))
@@ -4729,9 +4810,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
     if (!tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
-    if (tr->dynamic_heap || !pass.heap_set || pass.bound_sampler_heap != samplers) {
+    if (tr->dynamic_heap || pass.bound_view_heap != view_heap || pass.bound_sampler_heap != samplers) {
         x2w_startup::bind_translated_heaps(list, view_heap, samplers);
-        pass.heap_set = !tr->dynamic_heap;
+        pass.bound_view_heap = tr->dynamic_heap ? nullptr : view_heap;
         pass.bound_sampler_heap = samplers;
     }
     if (tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
@@ -4779,6 +4860,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             list->IASetIndexBuffer(&view);
             follow_inputs();
             const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
+            restore_bound_targets(self, list, pass);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
             red_producer_draw_after(self, red_samples);
             drawn = true;
@@ -4786,6 +4868,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     } else {
         follow_inputs();
         const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
+        restore_bound_targets(self, list, pass);
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         red_producer_draw_after(self, red_samples);
         drawn = true;

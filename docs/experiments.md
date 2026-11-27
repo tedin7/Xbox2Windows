@@ -12608,6 +12608,8 @@ $env:X2W_D3D12_DEBUG = '1'
 ctest --preset dev --no-tests=error -R '^startup_xg_bc7_draw_' -V
 ```
 
+Before device creation, set `X2W_D3D12_DEBUG=1` for the debug layer or `X2W_D3D12_DEBUG=2` to also enable slower GPU-based validation.
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
