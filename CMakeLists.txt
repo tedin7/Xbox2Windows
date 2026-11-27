@@ -1353,6 +1353,29 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
 
+if(MSVC)
+    enable_language(ASM_MASM)
+    add_executable(x2w_replay src/replay/x2w_replay.cpp src/replay/replay_invoke.asm)
+    target_compile_features(x2w_replay PRIVATE cxx_std_17)
+    # Apply the recording's settings before loading the stand-in.
+    target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp psapi)
+    target_link_options(x2w_replay PRIVATE /DELAYLOAD:d3d12_xs.dll)
+    if(EXISTS "${INTAKE_PYTHON}")
+        add_test(NAME startup_replay_pages_play COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_replay_pages_play_check.py" "$<TARGET_FILE:x2w_replay>")
+        set_tests_properties(startup_replay_pages_play PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+endif()
+
+add_executable(startup_replay_pages tests/startup_replay_pages.cpp)
+target_compile_features(startup_replay_pages PRIVATE cxx_std_17)
+add_test(NAME startup_replay_pages COMMAND startup_replay_pages)
+set_tests_properties(startup_replay_pages PROPERTIES TIMEOUT 60)
+foreach(mutant drop-map drop-page corrupt)
+    add_test(NAME startup_replay_pages_mutant_${mutant} COMMAND startup_replay_pages ${mutant})
+    set_tests_properties(startup_replay_pages_mutant_${mutant} PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+endforeach()
+
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
