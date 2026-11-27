@@ -180,7 +180,6 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     from.pResource = real_src;
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyTextureRegion(&to, x, y, z, &from, box ? box : nullptr);
     replay_dump::note_copy(self, real_dst);
-    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource) mark_gpu_written(self, {real_dst, dst_wrapper});
     retire_hold(self, dst_wrapper);
     retire_hold(self, src_wrapper);
     InterlockedIncrement(&list_copy_texture_forwarded);
