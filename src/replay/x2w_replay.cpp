@@ -3,7 +3,9 @@
 // the stand-in, its translator and any fix run for real.
 //
 // usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] [--threads N|recorded]
-//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]
+//                   [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--pace on]
+// The title's frame-event waits (device slot 80) are played without their timeout, so they do not sleep to the title's
+// frame interval (a loading prefix spends most of its time there); --pace on keeps the recorded timeout.
 // --dump writes replayed title memory to dump.bin before applying trailing recorded pages.
 // Writes <out dir>\stderr.txt (the stand-in's log), present_<nnnn>.png (X2W_PRESENT_PICTURES), replay_summary.json, and
 // one "x2w-replay score ..." line on stdout. Exit: 0 played to the end, 2 bad arguments or file, 3 a title range of the
@@ -63,6 +65,7 @@ enum Kind : std::uint16_t { device_kind = 0, queue_kind = 1, fence_kind = 2, des
 constexpr std::uint16_t device_create_descriptor_heap = 14, device_increment_size = 15;
 constexpr std::uint16_t heap_cpu_start = 9, heap_gpu_start = 10, fence_completed = 8, queue_present = 32;
 constexpr std::uint16_t resource_map = 8, resource_get_desc = 10, resource_gpu_address = 11;
+constexpr std::uint16_t frame_event_wait = 80;  // device slot 80: (type, timeout, reserved, flags, out token)
 constexpr std::uint32_t rcx_arg = 15;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
 constexpr int top_slots = 16;
 
@@ -71,6 +74,7 @@ struct Options {
     bool hardware = false;
     double max_seconds = 0;
     u64 dump_address = 0, dump_bytes = 0;
+    bool pace = false;  // --pace on
 };
 
 struct HeapInfo {
@@ -102,6 +106,10 @@ struct Player {
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
     u64 frame_waits = 0, barrier_noops = 0, upload_ranges = 0, slot_result_mismatches = 0;
+    // Frame-event waits (device slot 80): played without their timeout unless pace; the seconds spent inside them.
+    bool pace = false;
+    u64 unpaced_waits = 0, event_waits = 0;
+    double event_wait_seconds = 0;
     // The prefix: the calls before the window's first present (Recording::window_seq), how many were played, how long.
     u64 window_seq = ~0ull, prefix_calls = 0, prefix_played = 0;
     double prefix_seconds = 0;
@@ -577,6 +585,14 @@ bool play(Player& p, const Recording& r, const Step& step)
         }
     }
     const auto* layout = p.use_slot_layouts ? x2w_replay_slots::find(c.kind, c.slot) : nullptr;
+    // The frame-event wait sleeps until the title's next frame time when it has a timeout: the replay does not wait for
+    // a frame clock (the token it returns still counts up).
+    const bool event_wait = c.kind == device_kind && c.slot == frame_event_wait;
+    if (event_wait && !p.pace && a[1]) {
+        a[1] = 0;
+        ++p.unpaced_waits;
+    }
+    const auto wait_started = event_wait ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wait = layout && c.kind == device_kind && c.slot == 80;
     const bool barrier_noop = layout && c.kind == x2w_replay_slots::list && c.slot == 146;
     constexpr int token_arg = 4;
@@ -607,6 +623,10 @@ bool play(Player& p, const Recording& r, const Step& step)
     } else if (!guarded_slot(call.self, rcx, c.slot, a, call.ret)) {
         ++p.faults;
         return skip(p, c, "fault in the stand-in");
+    }
+    if (event_wait) {
+        ++p.event_waits;
+        p.event_wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_started).count();
     }
     note_failed_here(p, step, call.ret);
     if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
@@ -719,6 +739,7 @@ bool parse(int argc, wchar_t** argv, Options& o)
         const std::wstring name = argv[i], value = argv[i + 1];
         if (name == L"--adapter" && (value == L"warp" || value == L"hardware")) o.hardware = value == L"hardware";
         else if (name == L"--max-seconds") o.max_seconds = _wtof(value.c_str());
+        else if (name == L"--pace" && value == L"on") o.pace = true;
         else if (name == L"--dump") {
             if (!parse_dump(value, o)) return false;
         }
@@ -800,9 +821,11 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.*f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"shared_argument_bytes\": %llu, \"peak_private_bytes\": %llu, \"stopped_at_max_seconds\": %s, ",
+                        "\"shared_argument_bytes\": %llu, \"peak_private_bytes\": %llu, \"stopped_at_max_seconds\": %s, "
+                        "\"frame_event_waits\": {\"calls\": %llu, \"not_paced\": %llu, \"wall_s\": %.3f}, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, timing ? 9 : 3, wall, fps,
-                     p.arena_bytes, p.shared_bytes, peak_private_bytes(), stopped ? "true" : "false");
+                     p.arena_bytes, p.shared_bytes, peak_private_bytes(), stopped ? "true" : "false", p.event_waits,
+                     p.unpaced_waits, p.event_wait_seconds);
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
@@ -981,6 +1004,7 @@ int run(const Options& o)
     const auto elapsed = [&] { return std::chrono::duration<double>(ReplayClock::now() - started).count(); };
     bool stopped = false;
     p.window_seq = r.window_seq;
+    p.pace = o.pace;
     bool in_prefix = true;
     const auto end_prefix = [&](u64 calls) {
         in_prefix = false;
@@ -1031,6 +1055,8 @@ int run(const Options& o)
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
+    say("x2w-replay: frame waits not paced: %llu of %llu (%.3f s inside them)%s", static_cast<unsigned long long>(p.unpaced_waits),
+        static_cast<unsigned long long>(p.event_waits), p.event_wait_seconds, p.pace ? ", --pace on" : "");
     say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",
         static_cast<unsigned long long>(peak_private_bytes() >> 20), r.steps.size(), sizeof(StepRef));
     print_skip_census(p);
@@ -1048,7 +1074,7 @@ int wmain(int argc, wchar_t** argv)
     x2w_replay::Options options;
     if (!x2w_replay::parse(argc, argv, options)) {
         std::fprintf(stderr, "usage: x2w_replay <recording.x2wr> <out dir> [--adapter warp|hardware] [--mode tester|fixed] "
-                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES]\n");
+                             "[--threads N|recorded] [--from-present K] [--max-seconds S] [--dump HEX_ADDRESS:BYTES] [--pace on]\n");
         return 2;
     }
     return x2w_replay::run(options);

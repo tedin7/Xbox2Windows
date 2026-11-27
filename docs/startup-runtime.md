@@ -2024,6 +2024,11 @@ in `wall_s`. Step time includes argument relocation, page writes before the call
 and output processing. Time spent checking a skipped call is charged to its recorded slot. The wall clock also
 includes reporting overhead and any page writes after the last call.
 
+The title's frame-event waits (device slot 80) sleep to its frame interval (device slot 78, 33.3 ms by default) when
+they have a timeout; the player plays them without it, so a long prefix does not take as long as the recorded run.
+`--pace on` keeps the recorded timeouts. `x2w-replay: frame waits not paced: N of M (S s inside them)` and
+`frame_event_waits` in `replay_summary.json` give the counts.
+
 Per call: recorded wrappers become the replay's (learned from `OUTP`, only where the played call wrote the argument: a stack
 word past the slot's own arguments may point at the same variable), argument memory is copied into the replayer's
 memory with the pointers between the copies rewritten, words naming a wrapper or a descriptor handle are rewritten (a

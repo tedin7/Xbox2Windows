@@ -281,6 +281,36 @@ def check_null_views(scene, player, backend, env, directory, vs, ps, root):
     return 0
 
 
+def check_paced(scene, player, backend, env, directory, vs, ps, root):
+    """A scene that waits for a 100 ms frame clock before every frame (device slots 78 and 80) replays to the same
+    pictures without sleeping in those waits, and with --pace on it sleeps in them again."""
+    recorded_dir, recording = directory / "paced_recorded", directory / "paced.x2wr"
+    recorded_dir.mkdir()
+    code, text = run([scene, vs, ps, root, backend, PRESENTS],
+                     dict(env, X2W_TEST_REPLAY_PACED="1", X2W_REPLAY_RECORD="all", X2W_REPLAY_RECORD_FILE=str(recording),
+                          X2W_PRESENT_PICTURES=str(recorded_dir)))
+    assert code == 0, text[-3000:]
+    recorded = pictures(recorded_dir)
+    out = directory / "unpaced"
+    _score, rendered = replay(player, recording, out, backend, env)
+    assert rendered == recorded, "the unpaced replay differs from the recorded scene"
+    waits = json.loads((out / "replay_summary.json").read_text())["frame_event_waits"]
+    assert waits["calls"] == waits["not_paced"] == PRESENTS and waits["wall_s"] < 0.1 * PRESENTS * 0.1, waits
+    paced = directory / "paced"
+    code, text = run([player, recording, paced, "--adapter", backend, "--pace", "on"],
+                     {k: v for k, v in env.items() if not k.startswith("X2W_")})
+    assert code == 0, text[-3000:]
+    assert pictures(paced) == recorded, "the paced replay differs from the recorded scene"
+    slept = json.loads((paced / "replay_summary.json").read_text())["frame_event_waits"]
+    # Each wait sleeps up to the 100 ms interval minus the frame's own work.
+    assert slept["calls"] == PRESENTS and slept["not_paced"] == 0 and slept["wall_s"] > 0.3, slept
+    log = (out / "stderr.txt").read_text(errors="replace")
+    assert "x2w-replay: frame waits not paced: %d of %d" % (PRESENTS, PRESENTS) in log, log[-2000:]
+    print("paced: %d frame waits replayed in %.3f s without pacing, %.3f s with --pace on, pictures equal"
+          % (PRESENTS, waits["wall_s"], slept["wall_s"]))
+    return 0
+
+
 def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     """The target placed by device slot 133 at a title address (no desktop heap) in frame 0, a window opened mid-run
     (f6,6): the file carries the placement's description, IID and output, and presents 7-12 replay equal. The same
@@ -349,6 +379,8 @@ def main(scene, player, backend, mode=None):
             return check_slot_layouts(scene, player, backend, env, directory, vs, ps, root)
         if mode == "null-views":
             return check_null_views(scene, player, backend, env, directory, vs, ps, root)
+        if mode == "paced":
+            return check_paced(scene, player, backend, env, directory, vs, ps, root)
 
         recorded_dir, recording = directory / "recorded", directory / "run.x2wr"
         recorded_dir.mkdir()
