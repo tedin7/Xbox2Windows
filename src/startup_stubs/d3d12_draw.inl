@@ -2173,6 +2173,9 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool placed_1d = resource->own().tiled_address_srv && original &&
                            original->console.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     const bool tiled_address = resource->own().tiled_address_srv && !placed_1d;
+    // Desktop address arrays use the plain footprint loop and the title's 64 KiB slice stride.
+    const bool desktop_array = tiled_address && original && slot70_desktop_arrays_enabled() &&
+                               x2w_startup::desktop_address_array(original->console);
     const bool console = tiled_address && original && console_layout_srv(original->console);
     const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
@@ -2225,10 +2228,8 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     ReleaseSRWLockShared(&written_lock);
     if (placed_1d && written.bc7_width) return false;
     const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
-    // Any other texture slot 70 publishes holds its texels in the console layout its description names
-    // (gfx10_layout.h, address_texture.h).
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
-    const bool tiled = tiled_bc7 || tiled_address || tiled_chain;
+    const bool tiled = tiled_bc7 || (tiled_address && !desktop_array) || tiled_chain;
     std::optional<x2w_startup::gfx10::Layout> console_layout;
     if (console) console_layout.emplace(original->console);
     const auto generation = written.generation;
@@ -2253,7 +2254,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     // (small_texture_4k.h); its rows must be the footprint's rows, level by level. Address-only textures
     // (single-element, or a console layout named in Layout) are tiled and keep their own paths.
     x2w_startup::SmallTexturePlan compact;
-    const bool is_compact = original && !tiled && x2w_startup::small_texture_4k_plan(original->console, compact);
+    const bool is_compact = original && !tiled && !desktop_array && x2w_startup::small_texture_4k_plan(original->console, compact);
     if (is_compact) {
         bool rows_match = compact.levels == plan.count;
         for (UINT i = 0; rows_match && i < plan.count; ++i)
@@ -2277,7 +2278,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
-        if (console || placed_1d) return false;
+        if (console || placed_1d || desktop_array) return false;
         state.done = true;
         state.staged = false;
         state.generation = generation;
@@ -4080,7 +4081,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const bool wrong_1d_resource = texture && srv.kind == 4 &&
                 (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
             const bool wrong_cube_view = texture && srv.kind == 5 &&
-                !x2w_startup::matches_draw_cube_srv(texture->GetDesc(), record.desc_bytes >= 40 ? &desc : nullptr);
+                !x2w_startup::matches_draw_cube_srv(texture->GetDesc(), record.desc_bytes >= 40 ? &desc : nullptr,
+                    slot70_desktop_arrays_enabled() && resource && resource->own().tiled_address_srv);
             if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource || wrong_cube_view)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);

@@ -2,12 +2,7 @@
 
 // Textures a title publishes by address (device slot 70): a resource description, a view and the
 // address of the texels, with no resource object behind them. This header decides, without a
-// device, which of those descriptions the startup renderer reads from the address: a sampled-only,
-// two-dimensional, single-sample texture whose Layout field holds a console swizzle mode that
-// gfx10_layout.h addresses. Its texels are in that console layout.
-// Everything else is refused here: the desktop's unknown layout and the console's linear mode (the
-// extent of such rows is not established), other dimensions, multisampled textures, textures that
-// are also targets, formats without a known element size and swizzle modes without an equation.
+// device, which descriptions can be read as console-swizzled textures or desktop-footprint arrays.
 
 #include "startup_stubs/gfx10_layout.h"
 
@@ -19,7 +14,7 @@ inline bool address_depth_format(DXGI_FORMAT format)
            format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM;
 }
 
-inline bool console_address_texture(const D3D12_RESOURCE_DESC& r)
+inline bool address_texture_flags_supported(const D3D12_RESOURCE_DESC& r)
 {
     // Each flag is cast on its own: with MinGW-w64 headers the flag enum's operator| is not constexpr.
     constexpr UINT incompatible_flags = static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
@@ -27,7 +22,12 @@ inline bool console_address_texture(const D3D12_RESOURCE_DESC& r)
                                        static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
                                        static_cast<UINT>(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) |
                                        static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
-    if (!gfx10::supports(r) || r.SampleDesc.Quality || (static_cast<UINT>(r.Flags) & incompatible_flags) ||
+    return !(static_cast<UINT>(r.Flags) & incompatible_flags);
+}
+
+inline bool console_address_texture(const D3D12_RESOURCE_DESC& r)
+{
+    if (!gfx10::supports(r) || r.SampleDesc.Quality || !address_texture_flags_supported(r) ||
         r.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
         !((std::max)(r.Width, UINT64{r.Height}) >> (r.MipLevels - 1)) ||
         (r.Alignment && r.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
@@ -70,8 +70,24 @@ inline bool address_component_mapping(UINT mapping)
     return true;
 }
 
+inline bool desktop_address_array(const D3D12_RESOURCE_DESC& r)
+{
+    const auto element = gfx10::element_of(r.Format);
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+           r.DepthOrArraySize >= 2 && r.DepthOrArraySize <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION &&
+           r.Width && r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           r.Height && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           r.MipLevels && r.MipLevels <= gfx10::max_mips &&
+           ((std::max)(r.Width, UINT64{r.Height}) >> (r.MipLevels - 1)) &&
+           r.SampleDesc.Count == 1 && !r.SampleDesc.Quality &&
+           (!r.Alignment || r.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) &&
+           address_texture_flags_supported(r) && element.bytes && element.texels == 1 &&
+           address_view_format(r.Format, r.Format);
+}
+
 // A two-dimensional or array view that stays inside the texture and reads its texels as stored.
-inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v,
+                              bool allow_cubes = false)
 {
     if (!address_view_format(r.Format, v.Format) || !address_component_mapping(v.Shader4ComponentMapping))
         return false;
@@ -90,6 +106,20 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
                mips_fit(v.Texture2DArray.MostDetailedMip, v.Texture2DArray.MipLevels) &&
                inside(v.Texture2DArray.FirstArraySlice, v.Texture2DArray.ArraySize, r.DepthOrArraySize) &&
                !v.Texture2DArray.PlaneSlice && v.Texture2DArray.ResourceMinLODClamp == 0.0f;
+    if (allow_cubes && r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        v.Format == r.Format && v.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING) {
+        if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+            const auto& cube = v.TextureCube;
+            return r.DepthOrArraySize >= 6 && mips_fit(cube.MostDetailedMip, cube.MipLevels) &&
+                   cube.ResourceMinLODClamp == 0.0f;
+        }
+        if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) {
+            const auto& array = v.TextureCubeArray;
+            return array.First2DArrayFace < r.DepthOrArraySize && array.NumCubes &&
+                   array.NumCubes <= (r.DepthOrArraySize - array.First2DArrayFace) / 6u &&
+                   mips_fit(array.MostDetailedMip, array.MipLevels) && array.ResourceMinLODClamp == 0.0f;
+        }
+    }
     if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
         return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                mips_fit(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels) &&

@@ -116,6 +116,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | [Persistent mirror for large raw graphics bindings](docs/experiments/startup-gpu-mirror.md) | `ctest --preset release --no-tests=error -R '^startup_gpu_mirror_warp$' -V` |
 | [Sample a texture by address in a translated draw](docs/startup-runtime.md#textures-published-by-address-device-slot-70) | `ctest --preset release --no-tests=error -R '^startup_address_console_' -V` |
 | [Publish a placed 1D texture or array SRV by address](docs/experiments.md#publish-a-placed-r8-texture-srv-by-its-title-address) with `X2W_PLACED_SRV_1D=1` | `ctest --preset release --no-tests=error -R '^startup_address_srv_warp$' -V` |
+| Publish desktop-footprint colour arrays and cube SRVs by address with `X2W_SLOT70_DESKTOP_ARRAYS=1` | `ctest --preset dev --no-tests=error -R '^(startup_address_srv_desktop_arrays_warp|startup_gfx10_layout)$' -V` |
 | [Desktop audio render sink and its three-case fixture (WASAPI)](docs/experiments.md#desktop-audio-render-sink) | `ctest --preset release --no-tests=error -R '^startup_audio_output$' -V` |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.

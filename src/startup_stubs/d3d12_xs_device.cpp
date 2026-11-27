@@ -5153,6 +5153,11 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
+bool slot70_desktop_arrays_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_SLOT70_DESKTOP_ARRAYS");
+    return enabled;
+}
 #include "startup_stubs/d3d12_draw.inl"
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"

@@ -271,10 +271,69 @@ def check_cube(directory, consumer, backend):
     return 0
 
 
+DESKTOP_ARRAY_SHADER = """Texture2DArray<float4> layers : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint2 pixel = (uint2)p.xy;
+    return layers.Load(int4(pixel.x & 1, pixel.y & 1, pixel.x % 6, 0));
+}
+"""
+
+
+def desktop_array_reference(x, y, array_view, enabled):
+    if not enabled:
+        return bytes(4)
+    if array_view:
+        return bytes((31 + 13 * (6 + x % 6), 53 + 61 * (y % 2), 197 - 73 * (x % 2), 255))
+    return bytes(((19 if y < 2 else 31) + 13 * (x % 6), 53, 197, 255))
+
+
+def check_desktop_arrays(directory, consumer, backend):
+    for array_view in (False, True):
+        case = "array" if array_view else "cube"
+        work = directory / case
+        work.mkdir()
+        modes = {"X2W_TEST_DESKTOP_ARRAY_SRVS": "1", "X2W_TEST_FULL_TARGET": "1"}
+        if array_view:
+            modes["X2W_TEST_DESKTOP_ARRAY_SLICES"] = "1"
+            shader, binding = DESKTOP_ARRAY_SHADER, "srv 0 tex2da table 0 0\nsrvuse 0 texel"
+        else:
+            shader, binding = CUBE_SHADER, "srv 0 texcube table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0"
+        env, args, output = prepare_draw_cache(work, consumer, shader, modes, binding)
+        if not array_view:
+            env.pop("X2W_TEST_DESKTOP_ARRAY_SLICES", None)
+        for enabled in ((True,) if array_view else (False, True)):
+            env.pop("X2W_SLOT70_DESKTOP_ARRAYS", None)
+            if enabled:
+                env["X2W_SLOT70_DESKTOP_ARRAYS"] = "1"
+            output.unlink(missing_ok=True)
+            result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
+            print(result.stdout, end="")
+            if result.returncode == 77:
+                return 77
+            if result.returncode:
+                raise RuntimeError(f"{case}: consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+            reasons = re.findall(r"Device::slot70 [^\n]*reason=(\w+)", result.stderr)
+            count = 0 if array_view else 2 if enabled else 4
+            assert reasons == ["unsupported_description"] * count, (case, enabled, reasons, result.stderr[-5000:])
+            actual = output.read_bytes()
+            assert len(actual) == 8 * 4 * 4, f"expected 32 RGBA8 pixels, got {len(actual)} bytes"
+            for y in range(4):
+                for x in range(8):
+                    expected = desktop_array_reference(x, y, array_view, enabled)
+                    at = 4 * (y * 8 + x)
+                    rgba = actual[at:at + 4]
+                    assert rgba == expected, (
+                        f"{case} switch={enabled} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
+                    )
+    print(f"{backend}: desktop array cube faces and slices 6–11 match the CPU reference; refusal controls passed")
+    print("Mutant: unrounded footprint stride makes cube faces 1 through 5 read zero padding.")
+    return 0
+
+
 if __name__ == "__main__":
     consumer, backend, *mode = sys.argv[1:]
-    if mode and mode != ["cube"]:
-        raise SystemExit("expected consumer backend [cube]")
+    checks = {(): check, ("cube",): check_cube, ("desktop-arrays",): check_desktop_arrays}
+    if tuple(mode) not in checks:
+        raise SystemExit("expected consumer backend [cube|desktop-arrays]")
     with tempfile.TemporaryDirectory() as temporary:
-        run = check_cube if mode == ["cube"] else check
-        sys.exit(run(Path(temporary), consumer, backend))
+        sys.exit(checks[tuple(mode)](Path(temporary), consumer, backend))
