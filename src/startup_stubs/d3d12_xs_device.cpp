@@ -32,6 +32,7 @@
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/integer_texture_srvs.h"
 #include "startup_stubs/pixel_uav_support.h"
+#include "startup_stubs/compute_output_view_check.h"
 #include "startup_stubs/formatted_buffer.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"

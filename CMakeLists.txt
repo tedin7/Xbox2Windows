@@ -2799,6 +2799,11 @@ target_compile_features(startup_d16_image_format_check PRIVATE cxx_std_17)
 add_test(NAME startup_d16_image_format COMMAND startup_d16_image_format_check)
 add_test(NAME startup_d16_image_format_accept_uint_control COMMAND startup_d16_image_format_check --mutate accept-uint)
 set_tests_properties(startup_d16_image_format_accept_uint_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_compute_output_view tests/startup_compute_output_view_check.cpp)
+target_include_directories(startup_compute_output_view PRIVATE src)
+target_compile_features(startup_compute_output_view PRIVATE cxx_std_17)
+add_test(NAME startup_compute_output_view COMMAND startup_compute_output_view)
+
 # Typed UAV support a pixel image store needs; a partial-dmask store also needs typed load ('uavload N').
 add_executable(startup_pixel_uav_support_check tests/startup_pixel_uav_support_check.cpp)
 target_include_directories(startup_pixel_uav_support_check PRIVATE src)
