@@ -79,7 +79,7 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     rd.Format = format;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    const D3D12_CLEAR_VALUE clear{format, {-1.0f, -1.0f, -1.0f, -1.0f}};
+    D3D12_CLEAR_VALUE clear{format, {-1.0f, -1.0f, -1.0f, -1.0f}};
     if (format == DXGI_FORMAT_R16_UNORM) clear.Color[0] = 1.0f;
     const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
