@@ -249,8 +249,12 @@ def lines(name):
 def check_controls():
     # A calculated jump is a branch: the decoy's s23 = 2 sits between the jump and its target, so s23 is joined there.
     assert '        v0 = s23;' in lines('CALC') and not any('v0 = 0x00000002u' in l for l in lines('CALC'))
-    # The same for a descriptor word: refused, not read as the decoy's constant.
-    refused('DESC_CALC', 'numeric use of s16 holding joined at a branch target')
+    # The same for a descriptor word: not read as the decoy's constant. The join first refuses, then the retry
+    # assigns the word from its entry value on the jump edge, so the read sees the word.
+    desc = translate('DESC_CALC')
+    index = desc.uds.index(('descword', 0, 0))
+    shown = desc.hlsl_ps().splitlines()
+    assert '        s16 = ud%d;' % index in shown and '        v0 = s16;' in shown and '        v0 = 0x00000003u;' not in shown
     # Straight-line code keeps folding: a constant read with no join between keeps its literal.
     straight = G.Pipeline(VS_WORDS, bytes.fromhex('810397be' '1702007e' + EXPORT_WORDS), root_blob()).hlsl_ps()
     assert '    v0 = 0x00000001u;' in straight.splitlines(), straight
@@ -265,7 +269,11 @@ def check_controls():
     # A symbol with no run-time value on one path refuses the read: a descriptor reloaded on one path, and a
     # descriptor word overwritten by a constant on one path.
     refused('DESC_LOAD', "holds ('joined at a branch target',)")
-    refused('DESC_WORD', 'numeric use of s16 holding joined at a branch target')
+    # Both arms bring a known scalar (the descriptor word and the constant 3): after the refusal the retry makes
+    # the join a run-time choice, each edge assigning its own value.
+    word = translate('DESC_WORD')
+    shown = word.hlsl_ps().splitlines()
+    assert '        s16 = ud%d;' % word.uds.index(('descword', 0, 0)) in shown and '        v0 = s16;' in shown, shown
     # A path that leaves the loop's textual range and comes back (T -> X -> Y -> T) writes s23 = 5: s23 is joined at
     # the loop header T (+0xc), worked out over the blocks rather than the textual range, and read at run time there.
     stage = G.Stage.__new__(G.Stage)
