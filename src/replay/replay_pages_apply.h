@@ -73,7 +73,9 @@ inline std::unordered_map<u64, u64> used_heap_ends(const Recording& r)
 {
     constexpr u64 width_at = 16, desc_bytes = 56;  // D3D12_RESOURCE_DESC::Width, sizeof(D3D12_RESOURCE_DESC)
     std::unordered_map<u64, u64> ends;
-    for (const Step& step : r.steps) {
+    Step step;
+    for (const StepRef& ref : r.placed_steps) {
+        r.load(ref, step);
         const HeapPlacement& placed = step.placement;
         if (!placed.id) continue;
         u64 width = placed.bytes - placed.offset;
@@ -104,8 +106,11 @@ inline bool reserve_page_ranges(const Recording& r, std::string& problem)
         if (m.bytes) state.map_spans.push_back(aligned(m.address, m.bytes));
     merge_spans(state.map_spans);
     std::vector<ReservedSpan> wanted = state.map_spans;
-    for (const Step& step : r.steps)
-        if (step.descriptor_bytes) wanted.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
+    Step step;
+    for (const StepRef& ref : r.backed_steps) {
+        r.load(ref, step);
+        wanted.push_back(aligned(step.descriptor_address, step.descriptor_bytes));
+    }
     // Reserve whole recorded allocations, even when only interior pages were captured. A heap's allocation ends where
     // its placements end: OpenExistingHeapFromAddress takes the whole allocation, and on WARP every opened byte counts
     // against the adapter's memory budget. The rest of the recorded heap is a separate allocation.

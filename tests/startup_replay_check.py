@@ -141,12 +141,12 @@ def check_timing(summary, recording, progress):
     assert calls <= summary["played"] and presents <= summary["presents"], progress
 
 
-def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False):
+def replay(player, recording, out, backend, env, presents=PRESENTS, timing=False, extra=()):
     # No X2W_ setting: the stand-in's settings (XENV) and its shader cache (SHDR) come from the recording.
     env = {k: v for k, v in env.items() if not k.startswith("X2W_")}
     if timing:
         env["X2W_REPLAY_TIMING"] = "1"
-    code, text = run([player, recording, out, "--adapter", backend], env)
+    code, text = run([player, recording, out, "--adapter", backend, *extra], env)
     if code:
         log = (out / "stderr.txt").read_text(errors="replace")[-3000:] if (out / "stderr.txt").exists() else ""
         raise AssertionError("x2w_replay exit %d on %s (%d bytes)\n%s\n%s" % (code, recording.name, recording.stat().st_size,
@@ -321,7 +321,20 @@ def check_placed_window(scene, player, backend, env, directory, vs, ps, root):
     assert not differ, "placed-target window replay differs at %s\n%s" % (
         differ, explain(whole[differ[0]], played.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
                         directory / "placed_replayed" / "stderr.txt"))
-    print("replay: slot-133 target made before window f6,6 replays presents 7-12 equal")
+    # --prefix-fast draws: the draws of frames 1-6 are left out; every frame clears and draws its own picture, so the
+    # window is the same.
+    normal = json.loads((directory / "placed_replayed" / "replay_summary.json").read_text())["prefix"]
+    _score, fast = replay(player, recording, directory / "placed_fast", backend, env, presents=6,
+                          extra=("--prefix-fast", "draws"))
+    prefix = json.loads((directory / "placed_fast" / "replay_summary.json").read_text())["prefix"]
+    assert not normal["fast"] and normal["draws_left_out"] == 0 and normal["lists"] > 0, normal
+    assert prefix["fast"] and prefix["draws_left_out"] > 0 and prefix["lists"] == normal["lists"], (prefix, normal)
+    differ = [b for a, b in pairs if fast.get(a) != whole[b]]
+    assert not differ, "--prefix-fast window replay differs at %s\n%s" % (
+        differ, explain(whole[differ[0]], fast.get("present_%04d.png" % (int(differ[0][8:12]) - 6), ((0, 0), b"")),
+                        directory / "placed_fast" / "stderr.txt"))
+    print("replay: slot-133 target made before window f6,6 replays presents 7-12 equal, also with --prefix-fast draws "
+          "(%d prefix draws left out)" % prefix["draws_left_out"])
 
 
 def main(scene, player, backend, mode=None):
