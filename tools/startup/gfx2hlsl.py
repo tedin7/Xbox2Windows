@@ -11473,11 +11473,24 @@ class Stage:
         return n, sreg, lane, vector_op is not None
 
     def wave64_proven(self):
-        """The pipeline says wave64, or the program's own 64-bit exec forms prove it (graphics stages carry no register)."""
-        wave = getattr(getattr(self, 'pipe', None), 'wave_size', None)
+        """The pipeline says wave64, or the program's own 64-bit exec forms prove it (graphics stages carry no register).
+        With X2W_GFX_ASSUME_WAVE64=1 a vertex or pixel stage that proves neither size counts as wave64 too (3,451 of the
+        3,452 stage programs of one recording that name a size were wave64); that is logged once per pipeline. A stage
+        whose code shows a wave32 exec form is never assumed, and says so loudly."""
+        pipe = getattr(self, 'pipe', None)
+        wave = getattr(pipe, 'wave_size', None)
         if wave is not None:
             return wave == 64
-        return wave64_exec_proof(getattr(self, 'ins', ()))
+        ins = getattr(self, 'ins', ())
+        if wave64_exec_proof(ins):
+            return True
+        if getattr(self, 'kind', None) not in ('vs', 'ps') or not assume_wave64_enabled():
+            return False
+        if wave32_exec_proof(ins):
+            note_wave_assumption(pipe, 'WAVE32 CODE under X2W_GFX_ASSUME_WAVE64: the stage is not assumed wave64')
+            return False
+        note_wave_assumption(pipe, 'assumed wave64 (no exec form proves a wave size; X2W_GFX_ASSUME_WAVE64=1)')
+        return True
 
     def require_spill_lanes_apart(self, n, name):
         """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
@@ -14729,6 +14742,23 @@ def wave32_exec_proof(ins):
     return wave32 and not wave64
 
 
+def assume_wave64_enabled():
+    """X2W_GFX_ASSUME_WAVE64=1 (default off): see Stage.wave64_proven. Read at each use so a test can flip it."""
+    return os.environ.get('X2W_GFX_ASSUME_WAVE64') == '1'
+
+
+_WAVE_NOTES = set()
+_REQUEST_KEY = None  # the key translate_request is working on, for the log lines
+
+
+def note_wave_assumption(pipe, text):
+    """One stderr line per pipeline and text: the assumption, or the wave32 code that contradicts it."""
+    label = 'request %016x' % _REQUEST_KEY if isinstance(_REQUEST_KEY, int) else 'pipeline %x' % id(pipe)
+    if (label, text) not in _WAVE_NOTES:
+        _WAVE_NOTES.add((label, text))
+        print('x2w-gfx2hlsl %s: %s' % (label, text), file=sys.stderr)
+
+
 def wave64_exec_proof(ins):
     """True when the program names the 64-bit exec pair in a scalar instruction and no wave32 exec write. A compiler emits
     the 64-bit forms (s_mov_b64 exec, s_and_saveexec_b64, ...) only for wave64 (RDNA 2 ISA, SOP1/SOP2 _B64 forms); the
@@ -15656,6 +15686,8 @@ def translate_mesh57(out_dir, key):
 
 def translate_request(out_dir, key):
     """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
+    global _REQUEST_KEY
+    _REQUEST_KEY = key
     if is_compute_request(out_dir, key):
         return translate_compute(out_dir, key)
     if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):

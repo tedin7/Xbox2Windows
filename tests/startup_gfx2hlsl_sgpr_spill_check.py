@@ -18,6 +18,9 @@ into the packed screen position in v0. One reload follows a second write to the 
 keeps the first value, mixes lanes of one VGPR, or mixes VGPRs at one lane reads a different image. The reference
 is written here with integers from the slot rule: the last value written to (VGPR, lane).
 """
+import contextlib
+import io
+import os
 import re
 import struct
 import subprocess
@@ -89,6 +92,28 @@ def _wave64_words():
 
 
 W64_WORDS = _wave64_words()
+# The same program with no exec form: it proves no wave size, so it needs X2W_GFX_ASSUME_WAVE64=1 to translate.
+ASSUMED_TEXT = W64_TEXT.split('\n', 1)[1]
+ASSUMED_WORDS = W64_WORDS[4:]
+
+
+@contextlib.contextmanager
+def assume_wave64(value):
+    """Set (or clear) X2W_GFX_ASSUME_WAVE64 for the block and hand back what the translator wrote to stderr."""
+    old = os.environ.get('X2W_GFX_ASSUME_WAVE64')
+    if value is None:
+        os.environ.pop('X2W_GFX_ASSUME_WAVE64', None)
+    else:
+        os.environ['X2W_GFX_ASSUME_WAVE64'] = value
+    log = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(log):
+            yield log
+    finally:
+        if old is None:
+            os.environ.pop('X2W_GFX_ASSUME_WAVE64', None)
+        else:
+            os.environ['X2W_GFX_ASSUME_WAVE64'] = old
 failures = []
 
 
@@ -231,6 +256,36 @@ def controls():
           not G.wave64_exec_proof(G.decode(FIXTURE_WORDS)))
     check('wave64 fixture is proven wave64', G.wave64_exec_proof(G.decode(W64_WORDS)))
 
+    # 4c. X2W_GFX_ASSUME_WAVE64=1 (default off): a vertex or pixel stage with no exec form counts as wave64; code with a
+    # wave32 exec form never does, and says so.
+    with assume_wave64(None):
+        check('default: lanes 8 and 40 with no exec form are refused', 'one slot in wave32' in (refused(pair) or ''))
+    with assume_wave64('0'):
+        check('switch 0: lanes 8 and 40 with no exec form are refused', 'one slot in wave32' in (refused(pair) or ''))
+    with assume_wave64('1') as log:
+        check('switch on: lanes 8 and 40 with no exec form are accepted', refused(pair) is None, str(refused(pair)))
+        check('switch on: a vertex stage is accepted too', refused(pair, kind='vs') is None)
+        check('switch on: a compute stage still needs the proof', 'one slot in wave32' in (refused(pair, kind='cs') or ''))
+        check('switch on: the program is logged as assumed wave64', 'assumed wave64' in log.getvalue(), log.getvalue())
+    with assume_wave64('1') as log:
+        reason = refused(['s_and_saveexec_b32 s20, s21'] + pair)
+        check('switch on: wave32 exec code is not assumed (%s)' % reason, 'one slot in wave32' in (reason or ''))
+        check('switch on: wave32 code under the switch is logged loudly', 'WAVE32 CODE' in log.getvalue(), log.getvalue())
+    with assume_wave64('1'):
+        slots = lambda words: [ln for ln in pipeline(words).hlsl_ps().splitlines() if 'sp1' in ln or 'v1 =' in ln]  # noqa: E731
+        check('switch on: the assumed fixture keeps lanes 8 and 40 as the proven one does',
+              slots(ASSUMED_WORDS) == slots(W64_WORDS) and any('sp10_40' in ln for ln in slots(ASSUMED_WORDS)))
+    with assume_wave64(None):
+        reason = None
+        try:
+            pipeline(ASSUMED_WORDS).hlsl_ps()
+        except G.Unsupported as err:
+            reason = str(err)
+        check('switch off: the assumed fixture is refused (%s)' % reason, 'one slot in wave32' in (reason or ''))
+    check('the assumed fixture decodes to its source',
+          [G.re.sub(r'_e(32|64)\b', '', a) for _, _, _, a in G.decode(ASSUMED_WORDS)] ==
+          [G.re.sub(r'_e(32|64)\b', '', w) for w in ASSUMED_TEXT.splitlines()])
+
     # 5. The reload keeps the constant the write stored, so later scalar folding sees the same word.
     stage = Probe(['v_writelane_b32 v10, 7, 3', 'v_readlane_b32 s1, v10, 3'])
     for _, _, name, asm in stage.ins:
@@ -320,6 +375,19 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 run = draw(renderer, adapter, vs, bad, good64)
                 check('%s %s wave64 mutation "%s" fails against the reference' % (adapter, stage_name, label),
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+            # The same program with no exec form: only the opt-in switch makes it wave64 (translation refused without it).
+            with assume_wave64('1'):
+                text_assumed = pipeline(ASSUMED_WORDS).hlsl_ps()
+            good_assumed = words_file(directory, 'good_assumed', image(ASSUMED_TEXT))
+            ps_assumed = compile_hlsl(compiler, stage_name, text_assumed, 'psa_' + stage_name, profile_ps, directory)
+            run = draw(renderer, adapter, vs, ps_assumed, good_assumed)
+            check('%s %s assumed wave64 (switch on): all %d pixels equal the slot reference' % (adapter, stage_name, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout, run.stdout + run.stderr)
+            bad = compile_hlsl(compiler, stage_name, mutate(text_assumed, r'v2 = 0x40400000u', 'v2 = 0x40200000u'),
+                               'bada_' + stage_name, profile_ps, directory)
+            run = draw(renderer, adapter, vs, bad, good_assumed)
+            check('%s %s assumed wave64 mutation "lane 40 reads lane 8" fails against the reference' % (adapter, stage_name),
+                  run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
 
 
 def main():
