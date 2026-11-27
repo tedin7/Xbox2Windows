@@ -3652,6 +3652,10 @@ class Stage:
         # A third retry, only after a refusal "numeric use of sN holding joined at a branch target": a join whose
         # incoming values are all known scalars becomes a run-time phi (see phi_capable).
         self.retry_join_phi = False
+        # A fourth retry, only after a pixel quad read refused for want of a whole-quad proof: the copy of EXEC saved
+        # before s_wqm becomes the guest's exact entry mask (IsHelperLane, shader model 6.6) instead of the host's 1.
+        self.retry_helper_exec = False
+        helper_original = None
         self.phi_regs = {}        # branch target -> registers whose join is lowered as a phi (from the previous pass)
         self.phi_new = {}
         self.force_joined = {}    # branch target -> register -> 'run' | 'refuse'
@@ -3677,15 +3681,25 @@ class Stage:
             self.bad_sgprs = set()
             self._uniform_written = set()
             self.phi_new = {}
+            self.uses_helper_lane = False
             self.setup_entry()
             try:
                 self.translate()
             except Unsupported as reason:
-                if not (self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason))):
-                    raise
-                continue
+                if self.retry_reduction_exec(str(reason)) or self.retry_join(str(reason)):
+                    continue
+                if self.retry_helper(str(reason)):
+                    helper_original = reason
+                    continue
+                if (self.retry_helper_exec and helper_original is not None
+                        and self.WHOLE_QUAD_REFUSAL.search(str(reason))):
+                    # The exact-entry-EXEC pass met the same kind of refusal: report the ordinary translation's. A
+                    # refusal of another kind means the quad reads now passed, and names what blocks next.
+                    raise helper_original
+                raise
             if refusals is not None and any(
-                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason))
+                    stage == kind and (self.retry_reduction_exec(reason) or self.retry_join(reason)
+                                       or self.retry_helper(reason))
                     for reason, stage in refusals[first_refusal:]):
                 del refusals[first_refusal:]
                 continue
@@ -3705,6 +3719,50 @@ class Stage:
                 break
             if refusals is not None:
                 del refusals[first_refusal:]
+
+    # The refusals a quad read gets when no whole-quad proof reaches it (dpp_broadcast, the quad swaps, the flow proof).
+    WHOLE_QUAD_REFUSAL = re.compile(r'v_\w+_dpp (requires a straight-line pixel shader with entry EXEC|outside the entry '
+                                    r'prefix of a pixel stage|quad read at \+0x[0-9a-f]+ in a program with branches: '
+                                    r'the EXEC write|requires whole-quad EXEC \(s_wqm of exec first\)|without s_wqm '
+                                    r'exec, exec proving whole-quad activity)')
+
+    def retry_helper(self, reason):
+        """Translate again with the exact entry EXEC, once, after a whole-quad refusal of a pixel quad read in a
+        program that saves EXEC before its s_wqm (otherwise there is no entry mask to make exact)."""
+        if (self.kind != 'ps' or self.retry_helper_exec or not self.WHOLE_QUAD_REFUSAL.match(reason)
+                or not self.saves_entry_exec()):
+            return False
+        self.retry_helper_exec = True
+        self.force_joined.clear()
+        return True
+
+    def saves_entry_exec(self):
+        """Whether the program copies EXEC into a scalar register before its first s_wqm exec, exec."""
+        return bool(self.helper_exec_copies())
+
+    def helper_exec_copies(self):
+        """Offsets of the plain copies of EXEC (s_mov sN, exec) that run once, at the entry mask: before the first
+        s_wqm and before any branch or branch target, so no path reaches them a second time (a loop head) or after
+        EXEC changed. The helper retry gives exactly these the guest's bit."""
+        cached = getattr(self, '_helper_exec_copies', None)
+        if cached is not None and cached[0] is self.ins:
+            return cached[1]
+        targets = set()
+        for _off, _n, name, asm in self.ins:
+            if name == 's_branch' or name.startswith('s_cbranch'):
+                label = (parse(asm)[1] or [''])[0]
+                if label.startswith('label_0x'):
+                    targets.add(int(label[8:], 16))
+        copies = set()
+        for off, _n, name, asm in self.ins:
+            ops = parse(asm)[1]
+            if (name.startswith('s_wqm') or name == 's_branch' or name.startswith('s_cbranch') or off in targets
+                    or writes_exec(name, ops)):
+                break
+            if name in ('s_mov_b32', 's_mov_b64') and ops[1:2] in (['exec'], ['exec_lo']):
+                copies.add(off)
+        self._helper_exec_copies = (self.ins, copies)
+        return copies
 
     JOINED_NUMERIC = re.compile(r'numeric use of s\d+ holding joined at a branch target')
 
@@ -5536,6 +5594,10 @@ class Stage:
         # dirty register, and a narrowed write keeps a dirty old value in its inactive lanes. Facts intersect at joins,
         # dirty registers unite; both only move toward refusal, so the loop ends.
         whole, exact, window = {'exec', 'lexact', 'window'}, {'lexact', 'window'}, {'window'}
+        # With the exact entry EXEC (retry_helper_exec) a copy of EXEC taken before s_wqm holds the guest's bit on every
+        # host thread, so it is clean and a restore of it narrows lane-exactly.
+        helper = getattr(self, 'retry_helper_exec', False) and getattr(self, 'kind', None) == 'ps'
+        helper_copies = self.helper_exec_copies() if helper else set()
         before = {0: {'entry'}}
         dirty_before = {0: frozenset()}
         pending = {0}
@@ -5557,6 +5619,9 @@ class Stage:
                     continue
                 # Operands read before this instruction's own writes: an EXEC write reads them as they were.
                 sources_clean = dirty.isdisjoint(lane_reads)
+                # Only the plain copy the helper retry emits as IsHelperLane is the guest's bit; any other use of EXEC
+                # before s_wqm (s_and with it, a count of it) still reads the host's 1 on helper lanes.
+                helper_copy = (helper and off in helper_copies)
                 if lane_writes:
                     # A vector result written before s_wqm or in a window may differ on helper lanes (the guest skips
                     # its off lanes, the host thread runs). A scalar result written in a window too: a block that an
@@ -5565,7 +5630,8 @@ class Stage:
                     # (the exact entry mask, a count of it) differs on helper lanes.
                     if ((vector and 'lexact' not in facts) or not facts & {'entry', 'lexact'}
                             or not sources_clean or cross
-                            or ('lexact' not in facts and not reads.isdisjoint(EXEC_KEYS))):
+                            or ('lexact' not in facts and not (helper_copy and 'entry' in facts)
+                                and not reads.isdisjoint(EXEC_KEYS))):
                         dirty |= lane_writes
                     elif not (vector and 'exec' not in facts):
                         # A narrowed vector write keeps the old value in its inactive lanes: a dirty one stays.
@@ -5579,10 +5645,18 @@ class Stage:
                 if not exec_write:
                     continue
                 facts -= {'entry'} | whole
-                if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1]:
-                    if previous & {'entry', 'exec'}:
+                if name.startswith('s_wqm'):
+                    if not mods and name == 's_wqm_' + width and ops[0] in full_exec and ops[1:] == ops[:1] and (
+                            previous & {'entry', 'exec'}):
                         facts |= whole
                         continue
+                    # Any other s_wqm is a no-op on the host while the guest turns on the lanes of every touched
+                    # quad: from here a lane's EXEC bit and its writes may differ from the guest's.
+                    if 'window' in previous:
+                        facts |= window
+                        continue
+                    facts.clear()
+                    continue
                 if not mods and 'exec' in previous:
                     if name == narrow and ops[0] in full_exec and (
                             set(ops[1:]) <= full_exec | constants and set(ops[1:]) & full_exec):
@@ -9046,6 +9120,22 @@ class Stage:
                 self.set_s(d, '0x%08xu' % value, ('const', value))
                 self.masks.discard(d)
                 return None
+        if (base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known
+                and getattr(self, 'retry_helper_exec', False) and self.pc in self.helper_exec_copies()):
+            # The guest's entry EXEC leaves helper lanes off, the host starts every thread with exec = 1: give the copy
+            # the guest's bit. It is not the host's EXEC, so a restore of it makes EXEC unknown and guards the writes.
+            # It differs per lane, so no scalar branch may treat it as uniform.
+            self.set_s(d, '(IsHelperLane() ? 0u : 1u)')
+            self.sym.pop(d, None)
+            self.masks.add(d)
+            self.uses_helper_lane = True
+            if self.tracks_uniformity():
+                self.varying_s.add(d)
+            if pair:
+                self.sym.pop(d + 1, None)
+                if self.tracks_uniformity():
+                    self.varying_s.add(d + 1)
+            return None
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
@@ -15862,7 +15952,7 @@ class Pipeline:
 
     def ps_profile(self):
         """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
-        if self.uses_dynamic_heap:
+        if self.uses_dynamic_heap or getattr(self.ps, 'uses_helper_lane', False):
             return 'ps_6_6'
         return 'ps_6_0' if self.ps.needs_sm6 else 'ps_5_1'
 
@@ -16579,7 +16669,9 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
     dynamic_heap = getattr(pipe, 'uses_dynamic_heap', False)
-    if dynamic_heap:
+    # IsHelperLane (the exact entry EXEC of a pixel stage, Stage.retry_helper_exec) is shader model 6.6 too.
+    model_6_6 = dynamic_heap or getattr(getattr(pipe, 'ps', None), 'uses_helper_lane', False)
+    if model_6_6:
         compile_enabled = check and os.environ.get('X2W_FXC') != ''
         fxc = ''
     else:
@@ -16592,7 +16684,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     manifest_path = name + '.txt'
     write_manifest = True
     # A quad intrinsic exists from shader model 6.0 only, and a pipeline does not mix DXBC and DXIL stages.
-    sm6 = dynamic_heap or any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
+    sm6 = model_6_6 or any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
     if compile_enabled and sm6:
         compiler = find_dxc()
         if compiler is None:
@@ -16600,7 +16692,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             message = 'dxc not found (X2W_DXC=%s): %s' % (os.environ.get('X2W_DXC', '<unset>'), feature)
             write_graphics_failure(base + '.fail', message)
             return message
-        model = '6_6' if dynamic_heap else '6_0'
+        model = '6_6' if model_6_6 else '6_0'
         profiles = (('vs', 'vs_' + model), ('ps', 'ps_' + model))
     else:
         compiler, profiles = fxc, (('vs', 'vs_5_1'), ('ps', 'ps_5_1'))

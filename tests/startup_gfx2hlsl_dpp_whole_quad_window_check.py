@@ -54,6 +54,7 @@ COPY_V3_TO_V2 = '0303047e'   # v_mov_b32_e32 v2, v3
 COPY_V2_TO_V3 = '0203067e'   # v_mov_b32_e32 v3, v2
 VCC_FROM_V3 = '8806887d' '02030402'  # v_cmp_gt_u32_e32 vcc_lo, 8, v3 ; v_cndmask_b32_e32 v2, v2, v1, vcc_lo
 CLOBBER_SAVED = '800384be'   # s_mov_b32 s4, 0
+AND_VCC_INTO_S6 = '7e6a8687'  # s_and_b64 s[6:7], exec, vcc (before s_wqm)
 COMPARE_INTO_SAVED = '0400c4d4' '88020200'  # v_cmp_gt_u32_e64 s[4:5], 8, v1
 SWAP_V2_V3 = '03cb047e'      # v_swap_b32 v2, v3
 SELECT_BY_EXACT = '020001d5' '01051a00'  # v_cndmask_b32_e64 v2, v1, v2, s[6:7]
@@ -108,11 +109,25 @@ def base(read=READ_V2, after_restore='', before_restore='', restore=RESTORE, bra
     return program(SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, guard, window, after_restore, read, EXPORT)
 
 
-def translate(code):
+def pipeline(code):
     try:
-        return G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
+        pipe = G.Pipeline(VS_WORDS, code, root_blob(), ps_hw_inputs=PACKED)
+        pipe.hlsl_ps()
+        return pipe, None
     except G.Unsupported as reason:
         return None, str(reason)
+
+
+def translate(code, helper=True):
+    """The pixel HLSL, or None and the refusal. helper=False disables the exact-entry-EXEC retry (Stage.retry_helper)."""
+    saved = G.Stage.retry_helper
+    if not helper:
+        G.Stage.retry_helper = lambda self, reason: False
+    try:
+        pipe, reason = pipeline(code)
+        return (pipe.hlsl_ps() if pipe else None), reason
+    finally:
+        G.Stage.retry_helper = saved
 
 
 def check(label, ok, detail=''):
@@ -134,6 +149,16 @@ float4 main(uint id : SV_VertexID) : SV_Position
 }
 """
 WINDOW_V3 = 1.0  # v3 written in the window; a guest helper lane never writes it and keeps its initial 0
+ONE = 0x3f800000
+# Hand-written, not translated: each lane's IsHelperLane and its X and Y neighbours' (SM 6.6).
+HELPER_PROBE_PS = """\
+float4 main(float4 pos : SV_Position) : SV_Target0
+{
+    uint own = IsHelperLane() ? 1u : 0u;
+    return float4(own, QuadReadAcrossX(own), QuadReadAcrossY(own), 0);
+}
+"""
+skips = []
 
 
 def covered(x, y):
@@ -195,6 +220,43 @@ def check_draw(dxc, renderer, adapter):
         run = draw(renderer, adapter, full, bad, full_ref)
         check('%s: without helper lanes the mutant is not detected (power control)' % adapter,
               run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+        # The helper retry: the read of v3, written in the exact-entry window, compiled with IsHelperLane (ps_6_6). A guest
+        # helper lane never writes v3 there, and with the exact entry mask the host's helper thread does not either.
+        helper_pipe, reason = pipeline(base(read=READ_V3))
+        # Capability: the adapter's IsHelperLane must agree with coverage, read on each lane and across the quad.
+        probe = compile_hlsl(dxc, 'dxc', HELPER_PROBE_PS, 'ps_helper_probe', 'ps_6_6', directory)
+        probe_ref = words_file(directory, 'helper_probe', [
+            w for y in range(HEIGHT) for x in range(WIDTH) for w in (
+                [0, ONE if not covered(x ^ 1, y) else 0, ONE if not covered(x, y ^ 1) else 0, 0] if covered(x, y)
+                else [CLEAR] * 4)])
+        run = draw(renderer, adapter, partial, probe, probe_ref)
+        if run.returncode != 0:
+            lines = [ln for ln in run.stderr.splitlines() if 'pixel' in ln]
+            print('%s: SKIP the exact-entry-mask draw: the adapter\'s IsHelperLane disagrees with coverage (%s)'
+                  % (adapter, ' / '.join(lines)))
+            skips.append(adapter)
+            helper_pipe = False
+        if helper_pipe is False:
+            pass
+        elif helper_pipe is None:
+            check('the helper retry translates the window read for the draw', False, str(reason))
+        else:
+            exact = helper_pipe.hlsl_ps()
+            hook = 'IsHelperLane() ? 0u : 1u'
+            check('the helper-retry HLSL holds the exact entry mask once', exact.count(hook) == 1, exact)
+            ps = compile_hlsl(dxc, 'dxc', exact, 'ps_exact', 'ps_6_6', directory)
+            run = draw(renderer, adapter, partial, ps, dirty_ref)
+            check('%s: with the exact entry mask the window read matches the guest on the cut quads' % adapter,
+                  run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
+            # Mutant: the hook without IsHelperLane (every thread's copy 1, as before the retry).
+            hookless = compile_hlsl(dxc, 'dxc', exact.replace(hook, '1u'), 'ps_hookless', 'ps_6_6', directory)
+            run = draw(renderer, adapter, partial, hookless, dirty_ref)
+            check('%s: the hook without IsHelperLane differs from the guest where a neighbour is a helper lane'
+                  % adapter, run.returncode != 0 and any(ln.startswith('pixel mismatch') for ln in run.stderr.splitlines()),
+                  run.stdout + run.stderr)
+            run = draw(renderer, adapter, full, hookless, full_ref)
+            check('%s: without helper lanes the hookless mutant is not detected (power control)' % adapter,
+                  run.returncode == 0 and 'pixels matched' in run.stdout, run.stdout + run.stderr)
         # The other forms the proof now admits after a window, over the cut quads: an integer quad swap and a broadcast.
         def bits(value):
             return struct.unpack('<I', struct.pack('<f', value))[0]
@@ -289,21 +351,56 @@ def controls():
     text, reason = translate(narrowed())
     check('a register written under a v_cmpx narrowing (lane-exact) is read after the restore', text is not None,
           str(reason))
-    refused = (
+    # A register the exact-entry window wrote differs on helper lanes while the host starts every thread with EXEC 1:
+    # the proof refuses these reads. The helper retry gives the copy of EXEC taken before s_wqm the guest's bit
+    # (IsHelperLane, shader model 6.6), after which the same reads are lane-exact and translate.
+    helper_reads = (
         ('a register written under a narrowing by the exact entry mask', narrowed(narrow=AND_EXACT)),
         ('the read takes a register written in the window', base(read=READ_V3)),
         ('a window register copied after the restore', base(after_restore=COPY_V3_TO_V2)),
         ('a VCC compare of a window register selects the source', base(after_restore=VCC_FROM_V3)),
+        ('a swap moves a window register into the read register', base(after_restore=SWAP_V2_V3)),
+        ('the exact entry mask selects the source', base(after_restore=SELECT_BY_EXACT)),
+        ('straight-line: the read takes a register written in the window', base(read=READ_V3, branch=False)),
+    )
+    # Still wrong with the exact entry mask: EXEC at the read is not whole-quad, or the window mask is not a plain copy
+    # of the entry EXEC (only that copy becomes IsHelperLane), or a later s_wqm (a no-op on the host) re-enables the
+    # guest's helper lanes after the window.
+    entry_and = program(AND_VCC_INTO_S6, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST,
+                        skip(EXACT + WINDOW_WRITE + RESTORE), EXACT + WINDOW_WRITE + RESTORE, READ_V3, EXPORT)
+    second_wqm = program(SAVE_EXACT, WQM, SAVE_WHOLE, POSITION, UNIFORM_TEST, skip(EXACT + WQM + WINDOW_WRITE),
+                         EXACT + WQM + WINDOW_WRITE, READ_V3, EXPORT)
+    refused = (
+        ('the window mask is EXEC and VCC taken before s_wqm, not a plain copy', entry_and),
+        ('a second s_wqm inside the window', second_wqm),
         ('the saved whole-quad mask is overwritten before the restore', base(before_restore=CLOBBER_SAVED)),
         ('the restore takes the exact entry mask', base(restore=EXACT)),
         ('a VALU compare overwrites the saved whole-quad mask', base(before_restore=COMPARE_INTO_SAVED)),
-        ('a swap moves a window register into the read register', base(after_restore=SWAP_V2_V3)),
-        ('the exact entry mask selects the source (helper lanes differ)', base(after_restore=SELECT_BY_EXACT)),
-        ('straight-line: the read takes a register written in the window', base(read=READ_V3, branch=False)),
     )
+    for label, code in helper_reads + refused:
+        text, reason = translate(code, helper=False)
+        check('refused without the helper retry: %s' % label,
+              text is None and reason is not None and 'v_add_f32_dpp' in reason, str(reason))
+    for label, code in helper_reads:
+        pipe, reason = pipeline(code)
+        text = pipe.hlsl_ps() if pipe else None
+        check('the helper retry translates: %s' % label, text is not None, str(reason))
+        if text is not None:
+            check('  ... with the exact entry mask and shader model 6.6',
+                  'IsHelperLane() ? 0u : 1u' in text and pipe.ps_profile() == 'ps_6_6', pipe.ps_profile())
     for label, code in refused:
         text, reason = translate(code)
-        check('refused: %s' % label, text is None and reason is not None and 'v_add_f32_dpp' in reason, str(reason))
+        check('refused with the helper retry too: %s' % label,
+              text is None and reason is not None and 'v_add_f32_dpp' in reason, str(reason))
+    # A program the proof accepts without the retry is translated exactly as before: same text, shader model 6.0.
+    for label, code in (('the clean read', base()), ('the narrowed write', narrowed()),
+                        ('the straight-line read', base(branch=False)), ('the select broadcast',
+                                                                        bytes.fromhex(SELECT_PROGRAM))):
+        pipe, reason = pipeline(code)
+        plain, _ = translate(code, helper=False)
+        check('no helper retry for %s: identical HLSL, ps_6_0' % label,
+              pipe is not None and pipe.hlsl_ps() == plain and pipe.ps_profile() == 'ps_6_0'
+              and 'IsHelperLane' not in plain, str(reason))
 
 
 def main():
@@ -314,6 +411,8 @@ def main():
         check_draw(*sys.argv[2:5])
     else:
         raise SystemExit(__doc__)
+    if skips:
+        print('SKIPPED (capability): the exact-entry-mask draw on %s' % ', '.join(skips))
     if failures:
         print('FAIL')
         for label in failures:
