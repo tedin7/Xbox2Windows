@@ -173,6 +173,42 @@ float4 main(float4 position : SV_Position) : SV_Target {{
     return 0
 
 
+def check_pressure(directory, consumer, backend):
+    def color(code):
+        return bytes((17 * (code & 15), 17 * ((code >> 4) & 15), 85 * (code >> 8), 255))
+
+    reference = [b"".join(color(8 * frame + x) for x in range(8)) * 4 for frame in range(40)]
+    for enabled in (True, False):
+        folder = directory / ("overflow" if enabled else "switch_off")
+        folder.mkdir()
+        log = folder / "trap.log"
+        # Eight 512-byte reservations fit only when the 2 KiB ring can grow.
+        last = draw_texture(folder, consumer, backend, HLSL, {
+            "X2W_TEST_FRAME_COPY": "ring-pressure", "X2W_TRAP_LOG": str(log),
+            "X2W_TEST_UPLOAD_RING_MAX_KIB": "2",
+            "X2W_UPLOAD_RING_OVERFLOW": "1" if enabled else "0",
+            "X2W_BIGBIND_ONCE": "0", "X2W_BIG_COPY_REUSE": "0",
+        }, binding="srv 0 buf table 0 0")
+        if last is None:
+            return 77
+        frames = [(folder / f"pixels.{frame}").read_bytes() for frame in range(39)] + [last]
+        for frame, (pixels, wanted) in enumerate(zip(frames, reference), 1):
+            expected = wanted if enabled else (wanted[:16] + BLUE * 4) * 4
+            if pixels != expected:
+                raise AssertionError(f"{folder.name} frame {frame}: actual {pixels.hex()} expected {expected.hex()}")
+        report = log.read_text(errors="replace")
+        pressure = re.findall(r"upload ring pressure frames: (\d+)", report)
+        ring = re.findall(r"upload ring: .* in (\d+) reservations, refusals (\d+), "
+                          r"chunks (\d+) \(\d+ MiB\), chunks recycled (\d+)", report)
+        expected_ring = [("320", "0", "2", "78")] if enabled else [("160", "160", "1", "39")]
+        if ring != expected_ring or pressure != (["40"] if enabled else []):
+            raise AssertionError(f"{folder.name}: ring counters {ring}, pressure frames {pressure}")
+        if ("buffer copy failed" in report) != (not enabled):
+            raise AssertionError(f"{folder.name}: unexpected buffer-copy diagnostics")
+    print(f"{backend} ring-pressure: 1280 pixels exact across 40 frames; switch-off control missed 640 pixels")
+    return 0
+
+
 def check_mirror(directory, consumer, backend):
     shader = """ByteAddressBuffer constants : register(t0);
 float4 main(float4 p : SV_Position) : SV_Target {
@@ -224,5 +260,6 @@ float4 main(float4 p : SV_Position) : SV_Target {
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temporary:
         consumer, backend = sys.argv[1:3]
-        check_mode = {"once": check_once, "mirror": check_mirror}[sys.argv[3]] if len(sys.argv) > 3 else check
+        check_mode = {"once": check_once, "mirror": check_mirror,
+                      "pressure": check_pressure}[sys.argv[3]] if len(sys.argv) > 3 else check
         sys.exit(check_mode(Path(temporary), consumer, backend))

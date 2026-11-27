@@ -1995,7 +1995,8 @@ bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D
     }
     const auto slice = reserve_upload_ring(self, bytes);
     if (!slice.mapped) return false;
-    // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
+    // Overflow slices use the same recording holds and generation checks as regular slices.
+    // Cache insertion and snapshot allocation are optional. Fill the reserved slice directly if they fail.
     const unsigned char* source = title;
     try {
         std::vector<unsigned char> content(title, title + bytes);
