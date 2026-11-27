@@ -1,14 +1,19 @@
-"""Offline slot-57 serial fallback, refusal and artifact compatibility checks."""
+"""Slot-57 serial fallback checks and D3D12 readback against CPU references."""
 
 import os
+import re
+import struct
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
 
-from startup_mesh57_loop_check import DATA_DEP
-from startup_mesh57_skeleton_check import G, GROUP_MESH, HEAP_MESH, HEAP_SETUP, MESH, PIXEL, heap_root, request, refusal_head
+from startup_mesh57_loop_check import DATA_DEP, rasterise as loop_rasterise
+from startup_mesh57_skeleton_check import (
+    G, GROUP_MESH, HEAP_MESH, HEAP_SETUP, MESH, PIXEL, SIDE, assemble, buffer, code,
+    geometry, heap_root, rasterise, refusal_head, request, root,
+)
 
 
 # Separate allocation block for wave 0, followed by a partial-EXEC lane read.
@@ -25,6 +30,33 @@ SERIAL_MESH = (
     ' f8000941 00000000'  # exp target_20 v0, off, off, off
     ' bf810000'           # s_endpgm
 ).split()
+
+
+# Keep the two LDS exchanges and the global thread IDs from the skeleton.
+# After the vertex count comparison only lanes 32..43 may export positions.
+# Read their first active thread and use its lane number to choose vertex red.
+UPPER_EXEC_ASM = """s_mov_b32 exec_lo, 0
+s_and_b32 exec_hi, exec_hi, 0xfff
+v_readfirstlane_b32 s25, v0
+s_and_b32 s25, s25, 63
+s_cmp_eq_i32 s25, 32
+s_cselect_b32 s25, 1.0, 0
+"""
+_mask_at = MESH.index('7d280016') + 1
+_red_at = MESH.index('f80008cf')
+UPPER_EXEC_MESH = (
+    MESH[:_mask_at] + 'befe0380 877fff7f 00000fff 7e320500 8719bf19 bf00a019 851980f2'.split()
+    + MESH[_mask_at:_red_at] + ['7e280219'] + MESH[_red_at:]
+)
+
+
+def binary(mc):
+    source = Path(__file__).with_name('startup_mesh57_skeleton.s').read_text()
+    source = replace_once(source, 'v_cmpx_gt_i32 s22, v0\n', 'v_cmpx_gt_i32 s22, v0\n' + UPPER_EXEC_ASM)
+    source = replace_once(source, 'exp pos0 ', 'v_mov_b32 v20, s25\nexp pos0 ')
+    words = assemble(mc, source)
+    assert words == UPPER_EXEC_MESH, words
+    print('upper EXEC fixture matches llvm-mc')
 
 
 def run(mesh, mode=None, pixel=(), *, artifacts=False, root_blob=None, stubs=False):
@@ -192,7 +224,155 @@ def compile_mesh(dxc, hlsl):
                         str(shader)], check=True)
 
 
-def main():
+def replace_once(source, old, new):
+    assert source.count(old) == 1, old
+    return source.replace(old, new)
+
+
+def check_upper_exec():
+    from mesh_waveloop import proof_family
+
+    status, _ = run(UPPER_EXEC_MESH, '0', PIXEL)
+    assert status.startswith('unsupported: ') and proof_family(G, status.removeprefix('unsupported: ')), status
+    status, output = run(UPPER_EXEC_MESH, '1', PIXEL, artifacts=True)
+    assert status == 'ok', status
+    source = output['ms57.hlsl']
+    assert source.startswith(b'// x2w_serial_wave 1\n')
+    assert source.count(b'SetMeshOutputCounts(') == 1
+    return source
+
+
+def upper_exec_case():
+    points, colours, indices = geometry()
+    # The second LDS exchange publishes these group counts to both waves.
+    counts = (len(indices), 108)
+    prims, verts = counts
+    threads, red = [], []
+    for wave in range(2):
+        wave_threads = [wave * 64 + lane for lane in range(64)]
+        exec_mask = sum(1 << lane for lane in range(32, 44) if wave_threads[lane] < verts)
+        first_lane = (exec_mask & -exec_mask).bit_length() - 1
+        threads.append([thread for lane, thread in enumerate(wave_threads) if exec_mask & (1 << lane)])
+        red.append(255 if first_lane == 32 else 0)
+
+    # Alternate wave ownership, preserving each triangle's original buffer slots.
+    triangles = [tuple(threads[t % 2][slot] for slot in triangle) for t, triangle in enumerate(indices)]
+    expected_colours = [(red[0], *colour[1:]) for colour in colours]
+    assert red[0] == red[1] == 255
+    image = rasterise(points, expected_colours, triangles, verts, prims)
+    for wave in range(2):
+        without_wave = [triangle if t % 2 != wave else (0, 0, 0) for t, triangle in enumerate(triangles)]
+        assert image != rasterise(points, expected_colours, without_wave, verts, prims)
+    assert image != rasterise(points, [(0, *c[1:]) for c in colours], triangles, verts, prims)
+    return counts, triangles, image
+
+
+def serial_shaders(directory, mesh, dxc, *, proof_accepted=False):
+    mode = 'force' if proof_accepted else '1'
+    if proof_accepted:
+        status, _ = run(mesh, '0', PIXEL)
+        assert status == 'ok', status
+    elif mesh == DATA_DEP:
+        status, _ = run(mesh, '0', PIXEL)
+        assert status == 'unsupported: ' + G.MESH_LOOP_REFUSAL, status
+    # Case B's proof-family refusal is checked by check_upper_exec.
+    with patch.dict(os.environ, {'X2W_DXC': dxc, 'X2W_MESH_WAVELOOP': mode}):
+        for key in ('X2W_FXC', 'X2W_MESH_WAVELOOP_STUBS', 'X2W_PLACEHOLDER_PS'):
+            os.environ.pop(key, None)
+        key, status = request(directory, mesh)
+    assert status == 'ok', status
+    base = directory / ('%016x' % key)
+    source = base.with_suffix('.ms57.hlsl').read_text()
+    assert source.startswith('// x2w_serial_wave 1\n')
+    return base.with_suffix('.ms57.cso'), base.with_suffix('.ps57.cso'), source
+
+
+def compile_variant(directory, dxc, label, source):
+    shader = directory / (label + '.hlsl')
+    bytecode = shader.with_suffix('.cso')
+    shader.write_text(source)
+    subprocess.run([dxc, '-Gis', '-T', 'ms_6_5', '-E', 'main', '-Fo', bytecode, shader], check=True)
+    return bytecode
+
+
+def draw_case(directory, renderer, adapter, label, shaders, counts, triangles, image, *,
+              groups=1, mismatch=False):
+    points, colours, _ = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    # This root signature places the count constants at the same offsets for all cases.
+    uds = G.MeshPipeline(code(MESH), code(PIXEL), root()).uds
+    constants = bytearray(1024)
+    for slot, count in enumerate(counts):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+    case = directory / (label + '.bin')
+    case.write_bytes(bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+                     + b''.join(map(bytes, image)))
+
+    command = [renderer, adapter, '--mesh-indexed' if groups == 1 else '--mesh-indexed-groups', *shaders, case]
+    if groups != 1:
+        command.append(str(groups))
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 77:
+        print(result.stdout + result.stderr)
+        raise SystemExit(77)
+    readback = re.search(rf'^pixels={SIDE * SIDE} mismatches=(\d+)$', result.stdout, re.MULTILINE)
+    diagnostic = f'{label}: exit {result.returncode}\n{result.stdout}{result.stderr}'
+    assert readback, diagnostic
+    errors = int(readback[1])
+    assert 0 <= errors <= SIDE * SIDE and bool(errors) == mismatch, diagnostic
+    assert result.returncode == int(mismatch), diagnostic
+    if mismatch:
+        assert 'Draw reference mismatch' in result.stderr, diagnostic
+    print(f'{label}: {readback[0]}')
+
+
+def draw(dxc, renderer, adapter):
+    check_upper_exec()
+    points, colours, indices = geometry()
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+
+        # DATA_DEP uses s16 both as the trip bound and as the primitive count.
+        trip_colours = [(255, *colour[1:]) for colour in colours]
+        image = loop_rasterise(points, trip_colours, indices, 12, 4)
+        ms, ps, source = serial_shaders(directory, DATA_DEP, dxc)
+        draw_case(directory, renderer, adapter, 'loop-four', (ms, ps), (4, 12), indices, image)
+        draw_case(directory, renderer, adapter, 'loop-three', (ms, ps), (3, 12), indices, image, mismatch=True)
+        # The fixture writes zero to red when the equality fails.
+        short_image = loop_rasterise(points, [(0, *colour[1:]) for colour in colours], indices, 12, 3)
+        draw_case(directory, renderer, adapter, 'loop-three-reference', (ms, ps), (3, 12), indices, short_image)
+        fuel = replace_once(source, 'fuel = 65536u;', 'fuel = 1u;')
+        mutant = compile_variant(directory, dxc, 'loop-low-fuel', fuel)
+        draw_case(directory, renderer, adapter, 'loop-low-fuel', (mutant, ps), (4, 12), indices, image, mismatch=True)
+
+        counts, triangles, image = upper_exec_case()
+        ms, ps, source = serial_shaders(directory, UPPER_EXEC_MESH, dxc)
+        draw_case(directory, renderer, adapter, 'upper-exec', (ms, ps), counts, triangles, image)
+        order = 'for (uint wave_id = 0u; wave_id < 2u && !error; ++wave_id) {'
+        reverse = replace_once(source, order, 'for (uint turn = 0u; turn < 2u && !error; ++turn) {\n'
+                                             '            uint wave_id = 1u - turn;')
+        reversed_ms = compile_variant(directory, dxc, 'reverse-order', reverse)
+        draw_case(directory, renderer, adapter, 'reverse-order', (reversed_ms, ps), counts, triangles, image)
+        # With wave 1 first, losing its yield at the count barrier lets it read
+        # LDS before wave 0 publishes. Reversing a correct schedule is harmless.
+        bypass = replace_once(reverse, 'block_pc = 42u; yielded = true;', 'block_pc = 42u;')
+        mutant = compile_variant(directory, dxc, 'early-count-read', bypass)
+        draw_case(directory, renderer, adapter, 'early-count-read', (mutant, ps), counts, triangles, image,
+                  mismatch=True)
+        bad_mask = replace_once(source, '((l < 32u ? lo : hi) >> (l & 31u)) & 1u',
+                                '(lo >> (l & 31u)) & 1u')
+        mutant = compile_variant(directory, dxc, 'low-mask-only', bad_mask)
+        draw_case(directory, renderer, adapter, 'low-mask-only', (mutant, ps), counts, triangles, image,
+                  mismatch=True)
+
+        image = rasterise(points, colours, indices, len(points), len(indices))
+        for label, mesh, prims, groups in (('group-force', GROUP_MESH, 2, 2), ('mesh-force', MESH, 4, 1)):
+            ms, ps, _ = serial_shaders(directory, mesh, dxc, proof_accepted=True)
+            draw_case(directory, renderer, adapter, label, (ms, ps), (prims, len(points)), indices, image,
+                      groups=groups)
+
+
+def offline(dxc=None):
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
     translated, output = run(SERIAL_MESH, artifacts=True)
@@ -234,12 +414,26 @@ def main():
     check_stub_cascade()
     check_carry_masks_use_partial_exec()
     check_level_zero_mesh_gather()
-    if len(sys.argv) == 2:
-        check_export_rewrite(sys.argv[1])
-        check_vcc_numeric_alias_compiles(sys.argv[1])
-    elif len(sys.argv) > 2:
-        raise SystemExit('usage: startup_mesh57_waveloop_check.py [dxc]')
+    source = check_upper_exec()
+    upper_exec_case()
+    if dxc:
+        check_export_rewrite(dxc)
+        check_vcc_numeric_alias_compiles(dxc)
+        compile_mesh(dxc, source)
     print('ok')
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) == 4 and args[0] == 'draw':
+        draw(*args[1:])
+    elif len(args) == 2 and args[0] == 'binary':
+        binary(args[1])
+    elif len(args) <= 1 and args not in (['draw'], ['binary']):
+        offline(*args)
+    else:
+        raise SystemExit('usage: startup_mesh57_waveloop_check.py [dxc | binary <llvm-mc> | '
+                         'draw <dxc> <renderer> <adapter>]')
 
 
 if __name__ == '__main__':
