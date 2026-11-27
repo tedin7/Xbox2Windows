@@ -9752,7 +9752,7 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods, *, dynamic=False):
+    def buffer_address(self, ops, mods, *, dynamic=False, heap_format=False):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -9770,7 +9770,7 @@ class Stage:
             key, buf = None, 'embedded_vs_load'
         else:
             key = self.descriptor(ops[2])
-            buf = None if key is None or (dynamic and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
+            buf = None if key is None or ((dynamic or heap_format) and key[0][0] == 'dynamic_heap') else self.pipe.resource(key, 'buf')
         soffset = None
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -9781,7 +9781,7 @@ class Stage:
             soffset = self.S(sreg[1])
         idxen, offen = 'idxen' in mods, 'offen' in mods
         terms = []
-        if idxen and buf is None and key is not None:
+        if idxen and buf is None and key is not None and not (heap_format and key[0][0] == 'dynamic_heap'):
             raise Unsupported('indexed load through a dynamic resource heap descriptor')
         if idxen and offen:
             if key in self.pipe.modified:
@@ -9789,7 +9789,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
                 raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
-            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
             terms.append('%s * %s' % (self.u('v%d' % r[1]), stride))
             terms.append(self.u('v%d' % r[2]))
         elif idxen:
@@ -9798,7 +9798,7 @@ class Stage:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
-            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else '0u'
+            stride = 'ud%d' % self.pipe.ud(('stride', self.srv_index(key))) if buf else ('info.x' if heap_format and key else '0u')
             terms.append('%s * %s' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
@@ -10419,7 +10419,7 @@ class Stage:
         Compute also accepts proven heap records. A view token needs a decoded format before dispatch, while
         an unknown format in a native heap record returns zero in every destination.
         """
-        buf, address = self.buffer_address(ops, mods)
+        buf, address = self.buffer_address(ops, mods, heap_format=True)
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != count or dst[2] > 255:
             raise Unsupported('formatted buffer load destination %s for %d components' % (ops[0], count))
@@ -10431,20 +10431,34 @@ class Stage:
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
         source = first[1][0] if first and first[0] in ('desc', 'ptr') else None
+        dynamic = source == 'dynamic_heap'
         heap = source == 'resheap' and getattr(self, 'kind', None) == 'cs'
-        if source not in (None, 'table') and not heap:
+        if source not in (None, 'table') and not heap and not dynamic:
             raise Unsupported('formatted buffer load requires a hardware table descriptor (source: %s)' % source)
         if (not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc'
                 or not names_one_value(first) or any(
                     self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
-        if not heap and self.past_entry and not self.formatted_descriptor_from_block(r, first):
+        if dynamic and (len(first[1]) != 2 or first[2] != 0 or (first[1], first[2]) in self.pipe.modified or (first[1], first[2]) in self.pipe.other_modified):
+            raise Unsupported('dynamic resource heap views require a raw buffer load')
+        if not heap and not dynamic and self.past_entry and not self.formatted_descriptor_from_block(r, first):
             raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
-        word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
+        if dynamic:
+            # RDNA 2 ISA, sections 8.1.2 and 8.1.8: MUBUF obtains FORMAT and
+            # DST_SEL from the resource descriptor. Section 8.1.5 defines the
+            # indexed address using its stride.
+            self.pipe.uses_dynamic_heap = True
+            self.pipe.uses_dynamic_heap_formats = True
+            index = first[1][1]
+            self.emit('{ uint2 info = x2w_heap_info(%s);' % index)
+            self.emit('ByteAddressBuffer hb = ResourceDescriptorHeap[NonUniformResourceIndex(%s < heap_count ? %s : 0u)];' % (index, index))
+            buf, word3 = 'hb', 'info.y'
+        else:
+            word3 = 'ud%d' % self.pipe.ud(('descword3', self.srv_index(self.descriptor(ops[2]))))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
         self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
-        extended = self.kind != 'cs' and extended_buffer_formats()
+        extended = (dynamic or self.kind != 'cs') and extended_buffer_formats()
         for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
             if fmt not in DESC_LEGACY_FORMATS:
                 if extended:
@@ -10456,7 +10470,7 @@ class Stage:
             if fmt in DESC_ONE_INTEGER:
                 body.append('one = 1u;')
             self.emit('case %du: %s break;' % (code, ' '.join(body)))
-        if heap:
+        if heap or dynamic:
             self.emit('default: one = 0u; break; }')
         else:
             self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
@@ -10465,6 +10479,8 @@ class Stage:
             self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
                        % (sel, sel, sel, sel, sel))
         self.emit('}')
+        if dynamic:
+            self.emit('}')
 
     def op_buffer_load_format_x(self, ops, mods):
         self.mubuf_format(ops, mods, 1)
@@ -14877,6 +14893,7 @@ class PixelImageConflict(Unsupported):
 class Pipeline:
     vertex_kind = 'vs'
     uses_dynamic_heap = False
+    uses_dynamic_heap_formats = False
     uses_pack16_rne = False
     uses_gather_2d_lod = False
     uses_cube_dir = False
@@ -15272,6 +15289,12 @@ class Pipeline:
                     '    if (index >= heap_count) return 0u;',
                     '    ByteAddressBuffer buffer = ResourceDescriptorHeap[NonUniformResourceIndex(index)];',
                     '    return buffer.Load(address);',
+                    '}']
+        if self.uses_dynamic_heap_formats:
+            out += ['uint2 x2w_heap_info(uint index) {',
+                    '    if (index >= heap_count) return uint2(0u, 0u);',
+                    '    ByteAddressBuffer info = ResourceDescriptorHeap[heap_count];',
+                    '    return info.Load2(index * 8u);',
                     '}']
         for r, reg, entry in twins:
             kind = {'tex1d': 'Texture1D', 'tex2d': 'Texture2D', 'tex2da': 'Texture2DArray', 'tex3d': 'Texture3D'}[r['kind']]
@@ -15719,6 +15742,8 @@ class Pipeline:
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+        if self.uses_dynamic_heap_formats:
+            lines.append('dynamic_heap_formats')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         lines.extend(self.integer_srv_manifest())
@@ -15984,6 +16009,8 @@ class ComputePipeline(Pipeline):
         lines = ['x2w-manifest 2', 'stage cs', 'group %d %d %d' % self.group, 'ud %d' % len(self.uds)]
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
+        if self.uses_dynamic_heap_formats:
+            lines.append('dynamic_heap_formats')
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
         lines.extend(self.integer_srv_manifest())
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
