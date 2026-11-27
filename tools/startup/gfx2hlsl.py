@@ -3498,10 +3498,14 @@ class Stage:
                 todo.append((block + 1, state))
 
     def clear_low16(self, n):
-        if (self.low16_generation is not None and self.low16_generation.get(n) == self.exec_generation
-                and n not in self.pinned_low16_v):
+        if not isinstance(self.low16_only_v, set) or n in self.pinned_low16_v:
+            return
+        generation = (self.low16_generation or {}).get(n)
+        # The entry-mask rule still applies; an unchanged mask generation now also qualifies.
+        if self.exec_known or generation == self.exec_generation:
             self.low16_only_v.discard(n)
-            del self.low16_generation[n]
+            if generation is not None:
+                del self.low16_generation[n]
 
     def set_v(self, n, expr, *, low16_only=False, align4=False, ignore_exec=False):
         if getattr(self, 'interp_p1', None):
