@@ -28,6 +28,7 @@ static void* create_present_queue(void* guest)
 //            the second draw is a later frame: a copy kept from the first frame must still show the title's new bytes
 //   once     four draws of a 16 MiB binding per frame, with a rewrite between frames
 //   once-mirror  two draws and a readback per frame for three separately submitted 32 MiB snapshots
+//   once-ring-full  four draws per frame from a binding with a zero tail, using a restricted upload ring
 //   once-keys  one frame, two views of the SAME address: 64 KiB and 16 MiB. The words sit at the start (zero) and at the last 16
 //            bytes of the 16 MiB (red), so a draw through the 64 KiB view reads zero (the tail is past its end) and a draw through
 //            the 16 MiB view reads red. Draws alternate small, large, small, large: a cache keyed by address alone would hand
@@ -39,7 +40,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
     const bool big = !std::strncmp(mode, "big-", 4);
     const bool keys = !std::strcmp(mode, "once-keys");
     const bool mirror = !std::strcmp(mode, "once-mirror");
-    const bool once = mirror || keys || !std::strcmp(mode, "once");
+    const bool ring_full = !std::strcmp(mode, "once-ring-full");
+    const bool once = mirror || keys || ring_full || !std::strcmp(mode, "once");
     const bool changed = !std::strcmp(mode + (big ? 4 : 0), "changed");
     if (!once && !changed && std::strcmp(mode + (big ? 4 : 0), "same")) return 2;
 
@@ -65,6 +67,8 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
     const UINT large_bytes = (mirror ? 32u : 16u) << 20;
     float* large = nullptr;
     const UINT large_words = large_bytes / sizeof(float);
+    constexpr UINT head_word = 9;
+    const UINT tail_word = (large_bytes - 4352) / sizeof(float) - 1;
     if (once) {
         large = static_cast<float*>(VirtualAlloc(nullptr, large_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!large) return 45;
@@ -73,6 +77,9 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
             for (UINT block = 0; block < large_bytes / block_bytes; ++block)
                 large[block * (block_bytes / sizeof(float)) + 1] = static_cast<float>(block + 1);
             large[large_words - 1] = 1.0f;  // Alpha and the nonzero tail in every frame.
+        } else if (ring_full) {
+            large[head_word] = 0.0f;
+            large[tail_word] = 1.0f;
         } else {
             if (!keys) std::memcpy(large, constants, 4 * sizeof(float));
             std::memcpy(large + large_words - 4, constants, 4 * sizeof(float));
@@ -160,9 +167,18 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, StreamTarget& target, 
             }
             invoke(queue, 32, 0, 0, 0);
             if (frame == 0) {
-                large[0] = large[large_words - 4] = 0.0f;
-                large[2] = large[large_words - 2] = 1.0f;
+                if (ring_full) {
+                    large[head_word] = 1.0f;
+                    large[tail_word] = -1.0f;
+                } else {
+                    large[0] = large[large_words - 4] = 0.0f;
+                    large[2] = large[large_words - 2] = 1.0f;
+                }
             }
+        }
+        if (ring_full) {
+            // Advance to the normal render totals report with empty frames.
+            for (UINT frame = 2; frame < 300; ++frame) invoke(queue, 32, 0, 0, 0);
         }
         VirtualFree(large, 0, MEM_RELEASE);
         return 0;

@@ -10,17 +10,19 @@ inline constexpr std::uint64_t max_upload_ring_bytes = 256ull << 20;
 // Each allocation except possibly the final remainder is at least the initial size.
 inline constexpr unsigned max_upload_chunks = max_upload_ring_bytes / initial_upload_chunk_bytes;
 using UploadChunkMask = std::uint32_t;
+inline constexpr unsigned max_large_upload_buffers = 32;
 static_assert(max_upload_chunks <= 32);
+static_assert(max_large_upload_buffers <= 32);
 
 template <class Fence>
 struct UploadQueue {
     Fence* fence = nullptr;
     std::uint64_t value = 0;
-    std::array<std::uint64_t, max_upload_chunks> last_use{};
+    std::array<std::uint64_t, max_upload_chunks + max_large_upload_buffers> last_use{};
 
-    void submitted(UploadChunkMask chunks, bool signaled)
+    void submitted(UploadChunkMask chunks, bool signaled, unsigned first = 0)
     {
-        for (unsigned i = 0; chunks; ++i, chunks >>= 1) {
+        for (unsigned i = first; chunks; ++i, chunks >>= 1) {
             if ((chunks & 1) && last_use[i] != UINT64_MAX)
                 last_use[i] = signaled ? value : UINT64_MAX;
         }
@@ -65,6 +67,7 @@ struct UploadReservation {
     std::uint64_t offset = 0;
     ID3D12Resource* resource = nullptr;
     std::uint64_t generation = 0;
+    bool dedicated = false;
 };
 
 // Caller holds the lock. A successful reservation owns previously unused bytes.
@@ -76,13 +79,13 @@ inline UploadReservation reserve_upload_chunk(UploadRingChunk& chunk, std::uint6
     return {chunk.mapped + start, start, chunk.resource, chunk.generation};
 }
 
-// Called only after the unused tails and the capacity budget have been tried.
+// Rewind only after all CPU holds and GPU uses have ended.
 template <class Queues>
-UploadReservation reuse_upload_chunk(UploadRingChunk& chunk, unsigned index, std::uint64_t rounded, const Queues& queues)
+UploadReservation reuse_upload_chunk(UploadRingChunk& chunk, unsigned fence_index, std::uint64_t rounded, const Queues& queues)
 {
     if (rounded > chunk.capacity || chunk.recordings) return {};
     for (const auto& queue : queues)
-        if (!queue.second.completed(index)) return {};
+        if (!queue.second.completed(fence_index)) return {};
     chunk.used = 0;
     ++chunk.generation;
     return reserve_upload_chunk(chunk, rounded);
