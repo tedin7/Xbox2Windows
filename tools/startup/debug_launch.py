@@ -240,12 +240,10 @@ def main():
     k32.ResumeThread(wt.HANDLE(pi.hThread))
     if opts.get("--console", "1") == "1":
         # Live debug console in its own window: follows this run's logs (live_view.py).
-        import subprocess
-        try:
-            subprocess.Popen([sys.executable, "-B", os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_view.py"),
-                              logdir, cwd], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
-        except OSError as error:
-            builtins.print(f"live console not started: {error}")
+        # Minimized and not activated by default, so it does not cover the game or show in window screenshots
+        # (X2W_LIVE_LOG=normal: in front as before, off: no window; tools/startup/live_log.py).
+        import live_log
+        live_log.start(os.path.dirname(os.path.abspath(__file__)), logdir, cwd)
 
     modules = {}  # base -> name
     main_base = None
