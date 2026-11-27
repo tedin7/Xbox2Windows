@@ -7791,10 +7791,14 @@ class Stage:
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
         kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
-        # Cube maps support explicit levels. The draw binder's cube view is opt-in.
-        cube = (dim == 'SQ_RSRC_IMG_CUBE' and how in ('lz', 'l')
-                and (getattr(self, 'kind', None) == 'cs'
-                     or (type(self.pipe) is Pipeline and os.environ.get('X2W_SAMPLED_STATE_STAGES') == '1')))
+        stage = getattr(self, 'kind', None)
+        graphics = stage in ('ps', 'vs')
+        if graphics and dim == 'SQ_RSRC_IMG_CUBE' and how == 'd':
+            raise Unsupported('image_sample_d on a cube image: face-space gradients are unsupported')
+        # Cube arrays share the same instruction dimension. The draw binder rejects array SRVs.
+        cube = dim == 'SQ_RSRC_IMG_CUBE' and (
+            (stage == 'cs' and how in ('lz', 'l')) or
+            (graphics and how in ('sample', 'lz', 'l', 'b')))
         if cube:
             kinds[dim] = 'texcube'
         if dim not in kinds:
@@ -7904,6 +7908,8 @@ class Stage:
             keys = [(source, at + 4 * word) for source, at in locations]
         else:
             keys = [self.descriptor(ops[2])]
+        if graphics and cube and any(key[0][0] != 'table' for key in keys):
+            raise Unsupported('a graphics cube sample requires a descriptor table')
         textures = [self.texture_srv(key, kinds[dim]) for key in keys]
         desc_key, tex = keys[0], textures[0]
         if choice:
@@ -11919,6 +11925,9 @@ class Pipeline:
         table_words = any(source[0] == 'tableword' for source in self.uds)
         choice_views = any(r.get('pointer_choice') for r in self.resources.values())
         version = 3 if table_words or choice_views else 2 if self.stored_images() else 1
+        # Older draw readers reject unknown versions and would otherwise interpret texcube as a buffer.
+        if any(r['kind'] == 'texcube' for r in self.resources.values()):
+            version = 4
         lines = ['x2w-manifest %d' % version, 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))

@@ -202,6 +202,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 
 bool copy_vertex_sample_texture(void* device, void* list, bool cube, void*& texture)
 {
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     const UINT height = cube ? 2 : 1;

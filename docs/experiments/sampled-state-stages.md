@@ -4,9 +4,9 @@ Set `X2W_SAMPLED_STATE_STAGES=1` before starting the shim to select the
 shader-resource state from the draw's manifest. The translator writes a
 `srvstage` entry for each sampled texture. The binder combines the stages
 across views of the same desktop resource. Older manifests without stage
-entries use both shader-resource bits when the switch is on. Set the same
-switch during offline translation to allow explicit-level cube samples in
-vertex or pixel shaders. The cube binder requires an explicit cube view.
+entries use both shader-resource bits when the switch is on. Cube samples in
+vertex and pixel shaders need no switch (manifest version 4); the cube binder
+requires an explicit cube view.
 
 ```powershell
 ctest --preset dev --no-tests=error -V -R '^(startup_sampled_state_stages_warp|startup_compute_cube_warp)$'

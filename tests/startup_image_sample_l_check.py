@@ -252,12 +252,11 @@ def controls():
     refused('offset', 'image_sample_l_o')
     refused('compare', 'image_sample_c_l')
     refused('gather', 'image_gather4_l')
-    with patch.dict(os.environ, X2W_SAMPLED_STATE_STAGES='0'):
-        refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
-    with patch.dict(os.environ, X2W_SAMPLED_STATE_STAGES='1'):
-        cube = G.Pipeline(VS_WORDS, WORDS['cube'], root_blob(flags=0))
-        assert 'TextureCube<float4>' in cube.hlsl_ps()
-        assert 'srv 0 texcube table 0 0\nsrvstage 0 pixel' in cube.manifest()
+    cube = G.Pipeline(VS_WORDS, WORDS['cube'], root_blob(flags=0))
+    source = cube.hlsl_ps()
+    assert 'TextureCube<float4> r0' in source
+    assert 'SampleLevel(q0, x2w_cube_dir(F(v0), F(v1), F(v2)), F(v3))' in source
+    assert 'srv 0 texcube table 0 0\nsrvstage 0 pixel' in cube.manifest()
     refused('unorm', 'image_sample_l modifier unorm')
     refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
@@ -273,7 +272,7 @@ def controls():
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):
