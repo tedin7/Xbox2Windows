@@ -9604,6 +9604,9 @@ class Stage:
             selection = fields.get('src%d_sel' % index)
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            if base == 'v_cvt_f16_f32' and selection == 'DWORD' and not sext:
+                sources.append(self.u_src(token))
+                continue
             low16 = selection in ('BYTE_0', 'BYTE_1', 'WORD_0') or (
                 selection == 'DWORD' and not sext and base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1'))
             sources.append(sdwa_source(self.u(token, low16_only=low16), selection, sext))

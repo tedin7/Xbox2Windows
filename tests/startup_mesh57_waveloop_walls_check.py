@@ -68,8 +68,25 @@ def check_runtime_scalar_join():
     assert 'numeric use of s20 holding a value joined across wave-loop blocks' in status, status
 
 
+def check_sdwa_float_source_modifiers():
+    prefix, suffix = SERIAL_MESH[:8], SERIAL_MESH[8:]
+    for control, negative in [('00261500', False), ('00361500', True)]:
+        # v_cvt_f16_f32_sdwa v0, |v0| or -|v0|, writing the high half.
+        status, output = run(prefix + ['7e0014f9', control] + suffix, 'force', artifacts=True)
+        assert status == 'ok', status
+        value = '(v0[((wb + l) & 127u)] & 0x7fffffffu)'
+        if negative:
+            value = '(%s ^ 0x80000000u)' % value
+        line, = [line for line in output['ms57.hlsl'].decode().splitlines() if 'f32tof16(F(' in line]
+        assert 'f32tof16(F(%s))' % value in line, line
+        assert 'asuint(v0[((wb + l) & 127u)]) & 0xffffu' in line, line
+    status, _ = run(prefix + ['7e0014f9', '00241500'] + suffix, 'force')  # src0_sel:WORD_0
+    assert "operand '|v0|'" in status, status
+
+
 if __name__ == '__main__':
     check_descriptor_shift_add()
     check_exec_zero_non_rejoining_exit()
     check_descriptor_pair_moves_through_vcc()
     check_runtime_scalar_join()
+    check_sdwa_float_source_modifiers()
