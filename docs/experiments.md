@@ -15907,6 +15907,30 @@ guarded block and take the latch until the counter reaches 4. The translator rep
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
+### Scalar run before the EXEC restore at a compute exit target (#2645 T3)
+
+The 104-byte gfx1013 fixture `EXIT_RUN_*` in `tests/startup_gfx2hlsl_compute_check.py` narrows
+EXEC to lanes with `tid.x < 6` before a guarded block. Inside it, `s_andn2_b32` removes the
+breaking lanes from a saved EXEC mask and `s_cbranch_scc0` tests that mask. The staying path
+installs the same mask into EXEC before its vector work. Both paths reach a scalar descriptor
+load and wait, followed by `s_mov_b32 exec_lo, s21` to restore EXEC.
+
+For groups of up to 32 threads (`x * y * z <= 32`; larger workgroups are rejected and left for
+follow-up work), the translator accepts this straight exit when the staying path's vector work is
+lane-local and predicated off for exiting lanes. The shared run allows scalar ALU, loads and waits
+with regular SGPRs. It must reach a restore from an unchanged copy of EXEC, and the two paths must
+agree on the run's inputs and any scalar state used afterward.
+The wave and singleton traces both produce `[9, 9, 9, KEY^3, KEY^4, KEY^5, KEY^6, KEY^7]`.
+With three threads, the whole wave also takes the exit and both traces produce `[9, 9, 9]`.
+
+The wrong remask and a bypassed scalar write produce different values for lane 0 and are
+refused. Additional controls cover unsafe scalar effects, incoming EXEC and live SCC, clobbered
+and missing restores, invalid targets, and control flow or vector work in the run. The T2 loop
+keeps its backward-latch diagnostic. Removing its latch still leaves two different remasks and
+scalar counter work on the staying path, outside this proof. Run
+`python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
