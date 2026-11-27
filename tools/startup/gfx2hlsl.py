@@ -1358,6 +1358,8 @@ def embedded_buffer_proof(code, ins):
     loads = set()
     offset = size = flags = None
     carry_live = False
+    scc_stale = branched = False  # the elided add overwrote SCC; a branch after the read splits the paths
+    valid = set(regs)  # window words still holding the elided value
     end = 0
     for pc, n, name, asm in ins:
         if pc != end:  # No ignored encoding failures or gaps in the executable prefix.
@@ -1373,15 +1375,24 @@ def embedded_buffer_proof(code, ins):
             # any of its words, since every other access to those words is checked below.
             label = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
             target = int(label[1], 16) if label else -1
-            if None in (offset, size, flags) or target <= pc or target not in pcs:
+            if pc < read:
+                # Control flow before GETPC must have rejoined by it: a target past the read could skip the setup.
+                if target > read or target not in pcs:
+                    return None
+            elif None in (offset, size, flags) or target <= pc or target not in pcs:
                 return None
+            else:
+                branched = True
             carry_live = False
         if pc == read:
             continue
+        if pc < read:
+            continue  # Ordinary code before the read; the GETPC overwrites the address pair and nothing is kept.
         refs = scalar_registers(asm) & regs
         imm = pc_word(ops[-1]) if ops else None
         if (pc > read and refs and not mods and name in ('s_mov_b32', 's_movk_i32')
-                and len(ops) == 2 and imm is not None):
+                and len(ops) == 2 and imm is not None and None in (size, flags)
+                and ops[0] in ('s%d' % (low + 2), 's%d' % (low + 3))):
             word = sopk_imm(ops[1], True) if name == 's_movk_i32' else imm & 0xffffffff
             if ops[0] == 's%d' % (low + 2) and size is None:
                 size = word
@@ -1392,23 +1403,35 @@ def embedded_buffer_proof(code, ins):
         elif (pc > read and name == 's_add_u32' and not mods and offset is None and len(ops) == 3
               and ops[:2] == ['s%d' % low] * 2 and imm is not None and imm >= 0):
             offset = read + length + imm
-            carry_live = True
+            carry_live = scc_stale = True
         elif (carry_live and name == 's_addc_u32'
               and not mods and ops[:2] == ['s%d' % (low + 1)] * 2 and len(ops) == 3 and imm == 0):
             carry_live = False
         else:
             # An address-derived SCC cannot escape. Only SCC-preserving
             # instructions may intervene between the low add and its carry.
-            if offset is not None and reads_scc(name, asm):
+            if offset is not None and scc_stale and reads_scc(name, asm):
                 return None
             if carry_live and not name.startswith(('v_', 's_mov_', 's_movk_', 's_waitcnt', 's_nop')):
                 carry_live = False
             if refs:
-                if (name != 'buffer_load_dword' or len(ops) != 4 or reg_range(ops[2]) != desc
-                        or scalar_registers(' '.join(ops[:2] + ops[3:] + mods)) & regs
-                        or 'idxen' in mods or None in (offset, size, flags)):
-                    return None
-                loads.add(pc)
+                if name == 'buffer_load_dword' and len(ops) == 4 and reg_range(ops[2]) == desc:
+                    if (scalar_registers(' '.join(ops[:2] + ops[3:] + mods)) & regs or 'idxen' in mods
+                            or None in (offset, size, flags) or not regs <= valid):
+                        return None
+                    loads.add(pc)
+                else:
+                    # Any other use must not see an elided word. A straight-line rewrite of the window ends its
+                    # elision (the new value is an ordinary definition on every path); anything else is refused.
+                    reads, writes, _ = scalar_effects(name, asm)
+                    if scalar_registers(' '.join(reads)) & valid:
+                        return None
+                    killed = scalar_registers(' '.join(writes)) & regs
+                    if killed and (branched or None in (offset, size, flags)):
+                        return None
+                    valid -= killed
+            if scc_stale and not branched and 'scc' in scalar_effects(name, asm)[1]:
+                scc_stale = False
             continue
         setup[pc] = None
 
