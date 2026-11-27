@@ -11,9 +11,10 @@ enum class NullCause : int {
     texture_wrapper,     // the view's resource is missing or is not a resource wrapper
     dimension_mismatch,  // the view dimension does not match the shader
     ring_full,           // the guest memory was readable but the frame copy found no upload ring space (the draw is refused)
+    integer_view_filtered,  // a typed manifest has no integer load binding for this texture
 };
-constexpr int null_cause_count = 6;
-constexpr const char* null_cause_names[null_cause_count] = {"entry", "buffer", "token", "wrapper", "dimension", "ring_full"};
+constexpr int null_cause_count = 7;
+constexpr const char* null_cause_names[null_cause_count] = {"entry", "buffer", "token", "wrapper", "dimension", "ring_full", "integer_view_filtered"};
 
 struct BindingFacts {
     bool texture = false;

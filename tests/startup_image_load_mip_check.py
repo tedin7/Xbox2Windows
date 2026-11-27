@@ -1,11 +1,17 @@
 """Check explicit mip operands in source-built gfx1013 texture loads."""
 import argparse
+import os
 from pathlib import Path
 import re
+import struct
 import subprocess
+import sys
 import tempfile
+from unittest.mock import patch
 
 from startup_image_3d_check import G, VS_WORDS, assemble, root_blob
+from startup_stream_check import container
+from startup_stream_draw_check import vertex, vop1, vop2
 
 
 PREFIX = """\
@@ -149,11 +155,153 @@ def draw(dxc, renderer, adapter):
     return 0
 
 
+IDENTIFIERS = (0, 1, 0x00ffffff, 0x01000001, 0xffffffff)
+FLOAT_BITS = struct.unpack('<5I', struct.pack('<5f', 0, 1, -2.5, 0.125, 65536))
+
+
+DIMENSIONS = {'1d': 0, '2d': 1, '3d': 2, '2da': 5}
+
+
+def identifier_pixel(filtered=False, dim='2d', explicit_mip=False):
+    # The load draws across five columns. Split the packed position before
+    # fetching red, then export the register bits to MRT0.
+    words = [0xf40c0404, 0xfa000000]
+    if filtered:
+        words += [0xbe980480, 0xbe9a0480, vop1(1, 2, 128), vop1(1, 3, 128)]
+    else:
+        words += [vop2(0x1b, 2, 255, 0), 0xffff, vop2(0x16, 3, 144, 0)]
+    if dim in ('3d', '2da'):
+        words += [vop1(1, 4, 128)]
+    # Three coordinates use NSA so the implicit-mip form has exactly three address operands.
+    nsa = dim in ('3d', '2da')
+    opcode = 0x27 if filtered else int(explicit_mip)
+    words += [0xbf8cc07f, 0xf0000100 | DIMENSIONS[dim] << 3 | (2 if nsa else 0) | opcode << 18,
+              0x00040902 | ((6 << 21) if filtered else 0)]
+    if nsa:
+        words += [0x0403]
+    words += [0xbf8c3f70,
+              0xf8000001, 9, vop1(1, 10, 128), 0xf800181f, 0x0a0a0a0a, 0xbf810000]
+    return words
+
+
+def check_integer_sources():
+    def pipe(words):
+        return G.Pipeline(VS_WORDS, struct.pack(f'<{len(words)}I', *words), root_blob(), rtv_formats=(42, 28))
+
+    with patch.dict(os.environ, X2W_INTEGER_TEXTURE_SRVS='0'):
+        legacy = pipe(identifier_pixel())
+        legacy_hlsl = legacy.hlsl_ps()
+        assert 'srvint' not in legacy.manifest() and '_is_integer' not in legacy_hlsl
+        sample_hlsl = pipe(identifier_pixel(filtered=True)).hlsl_ps()
+
+    with patch.dict(os.environ, X2W_INTEGER_TEXTURE_SRVS='1'):
+        for dim, shape in zip(DIMENSIONS, ('1D', '2D', '3D', '2DArray')):
+            typed = pipe(identifier_pixel(dim=dim))
+            hlsl = typed.hlsl_ps()
+            assert f'Texture{shape}<uint4> r0_uint : register(t1);' in hlsl
+            assert f'Texture{shape}<int4> r0_sint : register(t2);' in hlsl
+            assert 'i.pos.x' in hlsl and f'srv 0 tex{dim} table 0 0' in typed.manifest()
+            assert 'srvint 0 1 4' in typed.manifest()
+            for mutant in ('inverted', 'swapped registers'):
+                assert typed_mutant(hlsl, mutant) != hlsl
+        filtered = pipe(identifier_pixel(filtered=True))
+        assert filtered.hlsl_ps() == sample_hlsl and 'srvint' not in filtered.manifest()
+        assert 'srvtypes 1' in filtered.manifest()
+    print('Typed SRV lowering: four dimensions, UINT and SINT declarations, filtered HLSL unchanged')
+
+
+def typed_mutant(source, kind):
+    if kind == 'inverted':
+        assert '_is_integer != 0u' in source
+        return source.replace('_is_integer != 0u', '_is_integer == 0u')
+    float_decl = re.search(r'(Texture\w+)<float4> (r\d+) : register\(t(\d+)\);', source)
+    assert float_decl
+    twin_decl = re.search(float_decl[1] + r'<uint4> ' + float_decl[2] + r'_uint : register\(t(\d+)\);', source)
+    assert twin_decl
+    return (source.replace(float_decl[0], float_decl[0].replace(f't{float_decl[3]}', f't{twin_decl[1]}'))
+                  .replace(twin_decl[0], twin_decl[0].replace(f't{twin_decl[1]}', f't{float_decl[3]}')))
+
+
+def debug_errors(result):
+    return re.findall(r'x2w-d3d12-debug[^\n]*sev=[01]\b', result.stderr)
+
+
+def identifier_draw(dxc, consumer, adapter):
+    with tempfile.TemporaryDirectory() as temporary:
+        work = Path(temporary)
+        vs, ps, root, pixels = (work / name for name in ('vs', 'ps', 'root', 'pixels'))
+        vs.write_bytes(vertex())
+        cases = [(dim, False, True, dim, False) for dim in DIMENSIONS]
+        cases += [('1d-mip', False, True, '1d', True), ('filtered', True, True, '2d', False),
+                  ('legacy', False, False, '2d', False)]
+        for name, filtered, typed, dim, explicit_mip in cases:
+            cache = work / name
+            cache.mkdir()
+            ps.write_bytes(container(0, identifier_pixel(filtered, dim, explicit_mip)))
+            env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
+                       X2W_D3D12_DEBUG='1', X2W_TEST_DEBUG_LAYER='1', X2W_FXC='', X2W_SHADER_CACHE=str(cache),
+                       X2W_INTEGER_TEXTURE_SRVS='1' if typed else '0', X2W_TEST_IDENTIFIER_DIMENSION=dim)
+            if filtered:
+                env['X2W_TEST_IDENTIFIER_FILTERED'] = '1'
+            args = [consumer, vs, ps, root, adapter, pixels, '42']
+
+            def run(fmt):
+                result = subprocess.run(args, env=dict(env, X2W_TEST_IDENTIFIER_SRV=fmt),
+                                        capture_output=True, text=True)
+                if result.returncode == 77:
+                    raise SystemExit(77)
+                assert result.returncode == 0, result.stderr
+                assert 'x2w-d3d12 debug layer: 0x00000000' in result.stderr, result.stderr
+                raw = pixels.read_bytes()
+                assert len(raw) == 40, len(raw)
+                return struct.unpack_from('<5I', raw), result
+
+            run('float')
+            req, = cache.glob('req_*.rtv')
+            key = req.stem[4:]
+            subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], env=env, check=True)
+            lines = (cache / f'{key}.txt').read_text().splitlines()
+            assert ('srvtypes 1' in lines) == typed
+            assert any(line.startswith('srvint ') for line in lines) == (typed and not filtered)
+            for stage in ('vs', 'ps'):
+                stem = cache / f'{key}.{stage}'
+                subprocess.run([dxc, '-T', f'{stage}_6_0', '-E', 'main', '-Fo', f'{stem}.cso', f'{stem}.hlsl'],
+                               check=True)
+            if filtered:
+                actual, result = run('uint')
+                assert actual == (0,) * 5 and not debug_errors(result), (actual, result.stderr)
+                assert '-> drawn;' in result.stderr and result.stderr.count('srv 0: integer_view_filtered') == 1, result.stderr
+                continue
+
+            actual, result = run('float')
+            assert actual == FLOAT_BITS and not debug_errors(result), (actual, result.stderr)
+            if not typed:
+                continue
+            for fmt in ('uint', 'sint'):
+                actual, result = run(fmt)
+                assert actual == IDENTIFIERS and not debug_errors(result), (fmt, actual, result.stderr)
+            source = Path(f'{stem}.hlsl').read_text()
+            mutant = work / 'mutant.hlsl'
+            for kind in ('inverted', 'swapped registers'):
+                mutant.write_text(typed_mutant(source, kind), encoding='ascii')
+                subprocess.run([dxc, '-T', 'ps_6_0', '-E', 'main', '-Fo', f'{stem}.cso', mutant], check=True)
+                actual, result = run('uint')
+                assert '-> drawn;' in result.stderr, result.stderr
+                assert actual != IDENTIFIERS or debug_errors(result), (kind, actual, result.stderr)
+    print(f'Identifier RTV on {adapter}: all four dimensions match UINT, SINT and FLOAT readback. '
+          'Both mutants rejected in each dimension, filtered null and legacy bindings checked.')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--llvm-mc', help='reassemble the synthetic fixtures')
     parser.add_argument('--draw', nargs=3, metavar=('DXC', 'RENDERER', 'ADAPTER'))
+    parser.add_argument('--consumer', help='wrapped draw fixture for typed SRVs')
     args = parser.parse_args()
     check(args.llvm_mc)
+    check_integer_sources()
     if args.draw:
-        raise SystemExit(draw(*args.draw))
+        result = draw(*args.draw)
+        if not result and args.consumer:
+            identifier_draw(args.draw[0], args.consumer, args.draw[2])
+        raise SystemExit(result)

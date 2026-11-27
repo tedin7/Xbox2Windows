@@ -67,19 +67,22 @@ bool float_uav_format(DXGI_FORMAT format)
     }
 }
 
-bool integer_uav_format(DXGI_FORMAT format)
+// Entry selector for a typed integer texture load. Signed formats have their own
+// HLSL return type, including the sign extension of components narrower than 32 bits.
+UINT integer_view_type(DXGI_FORMAT format)
 {
     switch (format) {
-    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
-    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UINT:
-    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT:
-    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT:
-    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT:
-    case DXGI_FORMAT_R8_SINT:
-        return true;
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_X24_TYPELESS_G8_UINT: case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        return 1;
+    case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT:
+        return 2;
     default:
-        return false;
+        return 0;
     }
 }
 
@@ -117,7 +120,7 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
         if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
     }
-    if (integer_uav_format(format)) return "integer format for a float view";
+    if (integer_view_type(format)) return "integer format for a float view";
     if (srgb_uav_format(format)) return "sRGB format";
     if (!float_uav_format(format)) return "format is not a float colour format";
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
@@ -157,6 +160,7 @@ struct Translation {
     KeyUse use;                              // when a draw first and last used this pipeline key
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
+    x2w_startup::IntegerTextureSrvs integer_srvs;
     std::vector<x2w_startup::drop_mips::Use> srv_use;  // manifest 'srvuse N sample|texel|lod': what the shader does with SRV N; absent = unknown
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
@@ -409,6 +413,28 @@ void count_null_binding(x2w_local::NullCause cause)
     InterlockedIncrement(&null_by_cause[static_cast<int>(cause)]);
 }
 x2w_startup::NullInputCensus null_input_census;
+void count_filtered_integer_srv(x2w_startup::IntegerTextureSrvs& srvs, u64 key, UINT input)
+{
+    if (srvs.filtered_logged) return;
+    count_null_binding(x2w_local::NullCause::integer_view_filtered);
+    srvs.filtered_logged = true;
+    log("x2w-draw %016llx srv %u: integer_view_filtered", key, input);
+}
+
+void bind_typed_texture_srv(ID3D12Resource* texture, const D3D12_SHADER_RESOURCE_VIEW_DESC* view,
+                            D3D12_SRV_DIMENSION dimension, UINT integer,
+                            D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE twin, UINT increment)
+{
+    auto* device = device_of(the_device);
+    const auto null_float = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
+    const auto null_uint = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_UINT);
+    const auto null_sint = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_SINT);
+    device->CreateShaderResourceView(integer ? nullptr : texture, integer || !texture ? &null_float : view, dest);
+    device->CreateShaderResourceView(integer == 1 ? texture : nullptr, integer == 1 ? view : &null_uint, twin);
+    twin.ptr += increment;
+    device->CreateShaderResourceView(integer == 2 ? texture : nullptr, integer == 2 ? view : &null_sint, twin);
+}
+
 LONG frame_number;
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
@@ -608,6 +634,10 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (line == "srvtypes 1") {
+            tr.integer_srvs.typed = true;
+        } else if (line.compare(0, 7, "srvint ") == 0) {
+            if (!tr.integer_srvs.read_twin(line)) return;
         } else if (std::sscanf(line.c_str(), "srvuse %d %15s", &i, kind) == 2) {
             if (i >= 0 && i < 32) {
                 if (tr.srv_use.size() <= static_cast<std::size_t>(i)) tr.srv_use.resize(static_cast<std::size_t>(i) + 1);
@@ -657,6 +687,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     if ((!tr.dynamic_heap && tr.uds.empty()) || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if (!tr.integer_srvs.valid(static_cast<UINT>(tr.srvs.size()), static_cast<UINT>(tr.uds.size()),
+                              [&](UINT i) { return tr.srvs[i].kind != 0; })) return;
+    const UINT twins = static_cast<UINT>(tr.integer_srvs.twins.size());
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
@@ -664,8 +697,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     }
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + (tr.dynamic_heap ? 1u : 0u),
-        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
+    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()) + twins + (tr.dynamic_heap ? 1u : 0u),
+        static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
         return;
@@ -3350,7 +3383,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         red_producers().follow_inputs(pass, sampled_textures, sampled_count, tr->key);
     };
     const UINT n = static_cast<UINT>(tr->srvs.size());
-    const UINT views = n + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
+    const UINT srv_count = n + tr->integer_srvs.descriptors();
+    const UINT views = srv_count + static_cast<UINT>(tr->uavs.size());  // the SRVs, then the UAVs, in one table
     phases.to(1);
     ID3D12DescriptorHeap* view_heap = draw_heap;
     UINT first = 0;
@@ -3436,6 +3470,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT indexed_vertices = UINT_MAX;
     bool has_null_input = false;
     const LONG binding_frame = InterlockedCompareExchange(&frame_number, 0, 0);
+    std::uint32_t values[32] = {};
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -3598,7 +3633,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 (dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY))
                 desc.Texture2D.MipLevels = x2w_startup::drop_mips::view_mip_levels(desc.Texture2D.MipLevels,
                                                                                     resource->own().drop_levels);
-            device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            const auto* view = record.desc_bytes >= 40 ? &desc : nullptr;
+            const UINT integer = texture ? integer_view_type(view ? view->Format : texture->GetDesc().Format) : 0;
+            if (const auto* twin = tr->integer_srvs.find(i)) {
+                values[twin->entry] = integer;
+                const D3D12_CPU_DESCRIPTOR_HANDLE twin_dest{
+                    dest.ptr + SIZE_T{twin->reg - i} * draw_heap_increment};
+                bind_typed_texture_srv(texture, view, dimension, integer, dest, twin_dest, draw_heap_increment);
+            } else if (integer && tr->integer_srvs.typed && !tr->d16_srvs.requires_exact(i)) {
+                count_filtered_integer_srv(tr->integer_srvs, tr->key, i);
+                texture = nullptr;
+                const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
+                device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
+            } else {
+                device_of(the_device)->CreateShaderResourceView(texture, texture ? view : &desc, dest);
+            }
             if (trace_inputs && texture && sampled_count < 32) sampled_textures[sampled_count++] = texture;
             continue;
         }
@@ -3923,7 +3972,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     phases.to(3);
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
+        const D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + srv_count + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
@@ -3940,7 +3989,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
-    std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
         values[i] = ud.kind == Translation::rect ? (rect && !indexed_rect ? 1u : 0u)
@@ -3994,8 +4042,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         pass.bound_sampler_heap = samplers;
     }
     if (tr->dynamic_heap) list->SetGraphicsRootSignature(tr->root);
-    if (!tr->uds.empty()) list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    if (tr->dynamic_heap) list->SetGraphicsRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()));
+    if (!tr->uds.empty() || !tr->integer_srvs.twins.empty()) list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size() + tr->integer_srvs.twins.size()), values, 0);
+    if (tr->dynamic_heap) list->SetGraphicsRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size() + tr->integer_srvs.twins.size()));
     if (views) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(views), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

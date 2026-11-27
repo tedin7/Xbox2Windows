@@ -342,3 +342,50 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     invoke(list, 25, arg(pso));
     return 0;
 }
+
+bool bind_identifier_fixture(void* device, void* list, StreamWord cpu, DXGI_FORMAT format, D3D12_SRV_DIMENSION dimension)
+{
+    static constexpr UINT width = 5;
+    static constexpr UINT ids[width]{0u, 1u, 0x00ffffffu, 0x01000001u, 0xffffffffu};
+    static constexpr float floats[width]{0.0f, 1.0f, -2.5f, 0.125f, 65536.0f};
+    const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
+        const D3D12_HEAP_PROPERTIES heap{type};
+        void* resource = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 27, arg(&heap), D3D12_HEAP_FLAG_NONE,
+                arg(&desc), state, 0, arg(&__uuidof(ID3D12Resource)), arg(&resource))))) return static_cast<void*>(nullptr);
+        return resource;
+    };
+    const auto resource_dimension = dimension == D3D12_SRV_DIMENSION_TEXTURE1D ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+        dimension == D3D12_SRV_DIMENSION_TEXTURE3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const UINT16 slices = dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY ? 2 : 1;
+    const D3D12_RESOURCE_DESC image_desc{resource_dimension, 0, width, 1, slices, 1, format, {1, 0}};
+    const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    void* image = make(D3D12_HEAP_TYPE_DEFAULT, image_desc, D3D12_RESOURCE_STATE_COMMON);
+    void* upload = make(D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped = nullptr;
+    if (!image || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, arg(&mapped)))) || !mapped)
+        return false;
+    std::memcpy(mapped, format == DXGI_FORMAT_R32_FLOAT ? static_cast<const void*>(floats) : ids, sizeof(ids));
+    invoke(upload, 9, 0, 0);
+    D3D12_TEXTURE_COPY_LOCATION dest{static_cast<ID3D12Resource*>(image), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION src{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    src.PlacedFootprint = {0, {format, width, 1, 1, 256}};
+    invoke(list, 16, arg(&dest), 0, 0, 0, arg(&src), 0);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{format, dimension,
+                                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Texture2D.MipLevels = 1;
+    if (dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) srv.Texture2DArray.ArraySize = slices;
+    invoke(device, 18, arg(image), arg(&srv), cpu);
+    return true;
+}
+
+D3D12_SRV_DIMENSION identifier_fixture_dimension()
+{
+    char text[8]{};
+    GetEnvironmentVariableA("X2W_TEST_IDENTIFIER_DIMENSION", text, sizeof(text));
+    if (std::strcmp(text, "1d") == 0) return D3D12_SRV_DIMENSION_TEXTURE1D;
+    if (std::strcmp(text, "2da") == 0) return D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    if (std::strcmp(text, "3d") == 0) return D3D12_SRV_DIMENSION_TEXTURE3D;
+    return D3D12_SRV_DIMENSION_TEXTURE2D;
+}

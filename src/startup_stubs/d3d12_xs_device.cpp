@@ -30,6 +30,7 @@
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
+#include "startup_stubs/integer_texture_srvs.h"
 #include "startup_stubs/pixel_uav_support.h"
 #include "startup_stubs/formatted_buffer.h"
 #include "startup_stubs/heap_indexed_root.h"
