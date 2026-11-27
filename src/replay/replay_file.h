@@ -43,10 +43,21 @@ struct Output {
     u64 value;  // the wrapper the argument's memory held after the call
 };
 
+// A read-only run of records inside one of the Recording's pools (no allocation per call).
+template <class T>
+struct Span {
+    const T* first = nullptr;
+    std::size_t count = 0;
+    const T* begin() const { return first; }
+    const T* end() const { return first + count; }
+    std::size_t size() const { return count; }
+    const T& operator[](std::size_t i) const { return first[i]; }
+};
+
 struct Step {
     CallRecord call;
-    std::vector<ArgMemory> memory;  // in the order written: a parent before what it points at
-    std::vector<Output> outputs;
+    Span<ArgMemory> memory;  // in the order written: a parent before what it points at
+    Span<Output> outputs;
     const unsigned char* descriptor_arrays = nullptr;  // DARR payload, validated against the CALL counts
 };
 
@@ -75,6 +86,8 @@ struct Recording {
     std::uint32_t version = 0;
     u64 frequency = 0;
     std::vector<Step> steps;  // sorted by seq
+    std::vector<ArgMemory> memory_pool;  // every step's ARGM records, one run per step (Step::memory)
+    std::vector<Output> output_pool;     // every step's OUTP records (Step::outputs)
     std::unordered_map<u64, Blob> blobs;
     std::vector<std::string> settings;
     std::vector<ShaderFile> shader_files;  // SHDR
@@ -103,7 +116,25 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
     if (!out.mapping) return "cannot map the recording";
     out.base = static_cast<const unsigned char*>(MapViewOfFile(out.mapping, FILE_MAP_READ, 0, 0, 0));
     if (!out.base) return "cannot map the recording";
+    // The step a seq belongs to. ARGM, OUTP and DARR follow their CALL, so the last step answers almost always; the map is
+    // built only when it does not (15M calls would hold about 1 GB of it).
     std::unordered_map<u64, std::size_t> by_seq;
+    std::size_t indexed = 0;
+    auto step_of = [&](u64 seq, std::size_t& index) {
+        if (!out.steps.empty() && out.steps.back().call.seq == seq) {
+            index = out.steps.size() - 1;
+            return true;
+        }
+        for (; indexed < out.steps.size(); ++indexed) by_seq[out.steps[indexed].call.seq] = indexed;
+        const auto found = by_seq.find(seq);
+        if (found == by_seq.end()) return false;
+        index = found->second;
+        return true;
+    };
+    struct PendingMemory { std::size_t step; ArgMemory memory; };
+    struct PendingOutput { std::size_t step; Output output; };
+    std::vector<PendingMemory> pending_memory;
+    std::vector<PendingOutput> pending_output;
     for (u64 at = 0; at < out.size;) {
         if (out.size - at < 16) return "cut chunk head at " + std::to_string(at);
         char tag[5]{};
@@ -134,7 +165,6 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
                 std::memcpy(&step.call, h, 24 + 7 * 8);
                 std::memcpy(&step.call.ret, h + 24 + 7 * 8, call_v2_bytes - 24 - 7 * 8);
             }
-            by_seq[step.call.seq] = out.steps.size();
             out.steps.push_back(step);
         } else if (name == "ARGM" && header_bytes >= 40) {
             u64 seq;
@@ -146,15 +176,15 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&m.bytes, h + 24, 8);
             std::memcpy(&m.hash, h + 32, 8);
             if (out.version == 2 && (m.arg & 0xffu) == 7) m.arg = (m.arg & ~0xffu) | 15u;  // format 2's rcx index
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "ARGM before its CALL at " + std::to_string(at);
-            out.steps[found->second].memory.push_back(m);
+            std::size_t index;
+            if (!step_of(seq, index)) return "ARGM before its CALL at " + std::to_string(at);
+            pending_memory.push_back({index, m});
         } else if (name == "DARR" && header_bytes == 8) {
             u64 seq;
             std::memcpy(&seq, h, 8);
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "DARR before its CALL at " + std::to_string(at);
-            Step& step = out.steps[found->second];
+            std::size_t index;
+            if (!step_of(seq, index)) return "DARR before its CALL at " + std::to_string(at);
+            Step& step = out.steps[index];
             if (step.call.kind != 0 || step.call.slot != 23 || step.descriptor_arrays)
                 return "invalid DARR call at " + std::to_string(at);
             const auto& args = step.call.args;
@@ -170,9 +200,9 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
             std::memcpy(&seq, h, 8);
             std::memcpy(&o.arg, h + 8, 4);
             std::memcpy(&o.value, h + 16, 8);
-            const auto found = by_seq.find(seq);
-            if (found == by_seq.end()) return "OUTP before its CALL at " + std::to_string(at);
-            out.steps[found->second].outputs.push_back(o);
+            std::size_t index;
+            if (!step_of(seq, index)) return "OUTP before its CALL at " + std::to_string(at);
+            pending_output.push_back({index, o});
         } else if (name == "BLOB" && header_bytes >= 16) {
             u64 hash, bytes;
             std::memcpy(&hash, h, 8);
@@ -207,6 +237,27 @@ inline std::string read_recording(const wchar_t* path, Recording& out)
         at = data_at + data_bytes;
     }
     if (!out.version) return "no XREC header";
+    // One run per step, in the order written: count, prefix sums, then place (stable, linear).
+    std::vector<std::size_t> start(out.steps.size() + 1, 0);
+    out.memory_pool.resize(pending_memory.size());
+    for (const auto& item : pending_memory) ++start[item.step + 1];
+    for (std::size_t i = 0; i < out.steps.size(); ++i) start[i + 1] += start[i];
+    {
+        std::vector<std::size_t> fill(start.begin(), start.end() - 1);
+        for (const auto& item : pending_memory) out.memory_pool[fill[item.step]++] = item.memory;
+        for (std::size_t i = 0; i < out.steps.size(); ++i) out.steps[i].memory = {out.memory_pool.data() + start[i], start[i + 1] - start[i]};
+    }
+    std::fill(start.begin(), start.end(), 0);
+    out.output_pool.resize(pending_output.size());
+    for (const auto& item : pending_output) ++start[item.step + 1];
+    for (std::size_t i = 0; i < out.steps.size(); ++i) start[i + 1] += start[i];
+    {
+        std::vector<std::size_t> fill(start.begin(), start.end() - 1);
+        for (const auto& item : pending_output) out.output_pool[fill[item.step]++] = item.output;
+        for (std::size_t i = 0; i < out.steps.size(); ++i) out.steps[i].outputs = {out.output_pool.data() + start[i], start[i + 1] - start[i]};
+    }
+    std::vector<PendingMemory>().swap(pending_memory);
+    std::vector<PendingOutput>().swap(pending_output);
     std::sort(out.steps.begin(), out.steps.end(), [](const Step& a, const Step& b) { return a.call.seq < b.call.seq; });
     std::stable_sort(out.maps.begin(), out.maps.end(), [](const PageMap& a, const PageMap& b) { return a.seq < b.seq; });
     return {};
