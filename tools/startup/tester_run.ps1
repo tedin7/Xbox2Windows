@@ -479,7 +479,7 @@ if ($recordDir) {
     $recordReport | Add-Member -NotePropertyName max_mib -NotePropertyValue $RecordMaxMiB -Force
     Write-Host ("tester_run: recording: {0} files, {1:N1} MB in {2} (cap {3} MiB){4}" -f $recordReport.files, ($recordReport.bytes / 1MB), $recordDir, $RecordMaxMiB,
         $(if ($recordReport.files -eq 0) { " - NOTHING was recorded (this build has no recorder, or the window was never reached)" } else { "" }))
-    if ($recordReport.unusable) { Write-Host ("tester_run: recording UNUSABLE: {0} (the cap stopped it BEFORE the window opened): it is not uploaded; send the report zip only." -f $recordReport.unusable) }
+    if ($recordReport.unusable) { Write-Host ("tester_run: recording UNUSABLE: {0} (the cap stopped it BEFORE the window opened): it is not sent; send the report zip only." -f $recordReport.unusable) }
 }
 $scanClock = [System.Diagnostics.Stopwatch]::StartNew()
 $changedFiles = @()

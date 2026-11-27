@@ -233,6 +233,15 @@ struct ArgumentCapture {
 
     void arg(unsigned i, u64 bytes) { memory(i, call.args[i], bytes); }
 
+    // The committed readable start of [address, address + wanted), within the call's remaining budget.
+    std::vector<unsigned char> prefix(std::uint32_t arg, u64 address, std::size_t wanted, unsigned depth)
+    {
+        if (address < 0x10000 || address >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(address)))
+            return {};
+        const std::size_t bytes = committed_readable_prefix(address, (std::min)(wanted, remaining));
+        return bytes ? memory(arg, address, bytes, depth) : std::vector<unsigned char>{};
+    }
+
     void output(unsigned i)
     {
         if (FAILED(static_cast<HRESULT>(call.ret))) return;
@@ -303,6 +312,48 @@ void record_stream(ArgumentCapture& capture, unsigned arg)
     }
 }
 
+// Device slots without a declared layout (pipeline descriptions of slots 57 and 67, command signatures, derived
+// pipelines, footprints, residency arrays): every pointer argument as a readable window, sized by the word after it
+// when that is a plausible size, the pointers in its first words one level further, and the wrapper it holds (OUTP).
+// The player needs that memory and the created objects. Device calls are rare, and the call budget bounds them.
+constexpr std::size_t generic_window_bytes = 0x100;
+constexpr std::size_t generic_scan_bytes = 0x400;
+constexpr u64 generic_hint_limit = 4u << 20;
+constexpr std::uint32_t generic_followed_args = 7;  // later words are mostly the caller's stack: a short look only
+
+void generic_memory(ArgumentCapture& capture, std::uint32_t arg, u64 address, u64 hint, unsigned depth)
+{
+    const std::size_t wanted = hint > generic_window_bytes && hint <= generic_hint_limit
+        ? static_cast<std::size_t>(hint) : generic_window_bytes;
+    const auto copy = capture.prefix(arg, address, wanted, depth);
+    if (!depth || copy.empty()) return;
+    const std::size_t scan = (std::min)(copy.size(), generic_scan_bytes) / 8;
+    for (std::size_t i = 0; i < scan; ++i) {
+        u64 value = 0, next = 0;
+        std::memcpy(&value, copy.data() + 8 * i, 8);
+        if (value < 0x10000 || value >= 0x7fffffffffffull || (value & 3)) continue;
+        if (i + 1 < scan) std::memcpy(&next, copy.data() + 8 * (i + 1), 8);
+        generic_memory(capture, (arg & 0xffu) | 0x100u * static_cast<std::uint32_t>(i + 1), value, next, depth - 1);
+    }
+}
+
+void record_generic(ArgumentCapture& capture)
+{
+    const Call& call = capture.call;
+    for (std::uint32_t i = 0; i < call_args; ++i) {
+        const u64 value = call.args[i];
+        if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
+        u64 held = 0;
+        if (readable_range(value, sizeof(held)) && copy_readable(value, &held, sizeof(held)) &&
+            as_wrapper(reinterpret_cast<const void*>(held))) {
+            struct { u64 seq; std::uint32_t arg, pad; u64 value; } out{call.seq, i, 0, held};
+            append_chunk(capture.buffer.bytes, "OUTP", &out, sizeof(out), nullptr, 0);
+        }
+        const bool followed = i < generic_followed_args;
+        generic_memory(capture, i, value, followed && i + 1 < generic_followed_args ? call.args[i + 1] : 0, followed ? 2 : 0);
+    }
+}
+
 void record_arguments(ArgumentCapture& capture)
 {
     const Call& call = capture.call;
@@ -352,6 +403,11 @@ void record_arguments(ArgumentCapture& capture)
             break;
         case 36: capture.create(2); break;
         case 39: capture.arg(0, sizeof(D3D12_QUERY_HEAP_DESC)); capture.create(1); break;
+        case 15:  // descriptor increment size: no memory
+        case 23:  // CopyDescriptors: the exact DARR arrays only
+        case 24:  // CopyDescriptorsSimple: CPU handles, which the player translates
+            break;
+        default: record_generic(capture); break;
         }
         break;
     case list_kind:
@@ -386,6 +442,8 @@ void record_arguments(ArgumentCapture& capture)
             !as_wrapper(reinterpret_cast<const void*>(call.object))) capture.memory(rcx_arg, call.object, sizeof(u64));
         break;
     case resource_kind:
+        // Map(subresource, read range, out CPU address) and Unmap(subresource, written range): null ranges stay null.
+        if ((call.slot == 8 || call.slot == 9) && call.args[1]) capture.arg(1, sizeof(D3D12_RANGE));
         if (call.slot == 8) capture.arg(2, sizeof(void*));  // Map's output CPU address
         break;
     }
