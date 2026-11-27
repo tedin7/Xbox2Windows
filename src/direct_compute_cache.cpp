@@ -127,7 +127,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_sampler)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_typed_srv)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -319,7 +319,9 @@ NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, u
     identity += container ? "/container/cs_6_6" : "/slot67/cs_6_6";
     word(identity, container ? 0 : entry);
     if (heap_view != HeapViewContract::none)
-        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
+        identity += heap_view == HeapViewContract::raw_buffer    ? "/heap-view/raw_buffer"
+                    : heap_view == HeapViewContract::typed_dword ? "/heap-view/typed_dword"
+                                                                 : "/heap-view/other";
     if (container) {
         packed = read_compute_container(input);
         identity += shader_digest(packed.bytes) + shader_digest(packed.root);
