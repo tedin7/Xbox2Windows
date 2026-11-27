@@ -1439,6 +1439,9 @@ add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJE
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
 # X2W_DEPTH_STATE draw fixture (#1999, item A): slot 57 pipelines with depth-stencil register words.
+add_executable(startup_debug_present tests/startup_debug_present.cpp)
+target_compile_features(startup_debug_present PRIVATE cxx_std_17)
+target_link_libraries(startup_debug_present PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_executable(startup_slot57_depth tests/startup_slot57_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_slot57_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_slot57_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -5266,6 +5269,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
             "$<TARGET_FILE:startup_stream_rasterizer>" "${backend}" ignore)
         set_tests_properties(startup_stream_rasterizer_ignore_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77 WILL_FAIL TRUE)
+        # X2W_DEBUG_PRESENT_TARGET: the production selection, copy and conversion against hand-computed pixels. The wrong-target
+        # control checks the depth setting against the colour picture and must fail.
+        add_test(NAME startup_debug_present_${backend} COMMAND startup_debug_present ${backend})
+        add_test(NAME startup_debug_present_wrong_target_${backend} COMMAND startup_debug_present ${backend} wrong-target)
+        set_tests_properties(startup_debug_present_${backend} startup_debug_present_wrong_target_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_debug_present_wrong_target_${backend} PROPERTIES WILL_FAIL TRUE)
         add_test(NAME startup_slot57_depth_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot57_depth_check.py"
             "$<TARGET_FILE:startup_slot57_depth>" "${backend}")

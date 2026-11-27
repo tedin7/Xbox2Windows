@@ -4052,3 +4052,27 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+## Debug present
+
+`X2W_DEBUG_PRESENT_TARGET` (opt-in, default off) shows an intermediate target where the black picture would be. At every title
+Present the surface the title presents is overwritten, before the picture signature, `X2W_PRESENT_PICTURES`, the capture and the
+output window read it, with a picture of the chosen target of the last frame. The setting is one of:
+
+- `depth`: the biggest depth buffer a pass bound, as grey. The clear value is the more common of exactly 0 and exactly 1;
+  0 means reversed Z. The background is black, the nearest geometry 255, the farthest 40 (D32, D32S8, D24S8, D16).
+- `largest-rt`: the biggest colour target a pass bound, tone-mapped to 8 bits (`x / (1 + x)`, then a 2.2 gamma for floating
+  point formats; normalised formats are shown as they are).
+- `rt:<W>x<H>:<fmt>`: the colour target, or depth buffer, of exactly that size and DXGI format number, for example
+  `rt:2560x1440:10`.
+
+Targets are noticed where a pass binds them (OMSetRenderTargets), so a target that was only cleared shows too; the last
+biggest one wins. The picture is stretched to the presented surface. It also works in the replay: the player runs the same
+runtime. The copy waits on the presenting queue, so the setting costs a GPU round trip per present. The log has one line per
+chosen target, `x2w-render debug present: showing depth 2560x1440 fmt 20`, and the first refusals
+(`frame picture left as the title made it: ...`). Formats not read (MSAA, block-compressed, others) leave the picture alone.
+
+On Windows, run `ctest --preset dev --no-tests=error -R '^startup_debug_present' -V`. The WARP fixture binds a depth buffer and a
+half-float colour target with known shapes and compares the presented 32x32 surface with hand-computed pixels for each setting,
+for a reversed-Z buffer and for a setting that matches nothing. The wrong-target control checks the depth setting against the
+colour picture and must fail.
