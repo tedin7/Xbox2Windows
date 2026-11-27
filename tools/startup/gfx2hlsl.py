@@ -6776,11 +6776,24 @@ class Stage:
         ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
         return self.lower(base, asm, ops, [])
 
+    @staticmethod
+    def exec_write_only_narrows(name, ops):
+        """The instruction leaves EXEC a subset of what it was: AND or AND-NOT of EXEC with a mask, or the same through
+        a save-exec. A lane that is active afterwards was active before, so a VGPR a lane wrote earlier is still the
+        value it wrote and an expression recomputed from scalars still names it."""
+        if name.startswith('v_cmpx'):
+            return True  # VOPC with EXEC as the destination: exec = exec & compare result
+        if name in ('s_and_saveexec_b64', 's_and_saveexec_b32'):
+            return len(ops) == 2
+        if name in ('s_and_b64', 's_and_b32', 's_andn2_b64', 's_andn2_b32') and len(ops) == 3:
+            return ops[0] in ('exec', 'exec_lo') and ops[1] == ops[0]
+        return False
+
     def forget_writes(self, name, ops, drop_since=True):
         """Before an instruction runs: an EXEC write ends every recomputable expression, and an SGPR write ends the
         expressions that read it and (when drop_since is set) that SGPR's since-join mark (set_s marks it again when it proves the new value).
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
-        if writes_exec(name, ops):
+        if writes_exec(name, ops) and not self.exec_write_only_narrows(name, ops):
             self.uniform_expr.clear()
             if getattr(self, 'entry_exec_proof', None) is not None:
                 self.uniform_v.clear()

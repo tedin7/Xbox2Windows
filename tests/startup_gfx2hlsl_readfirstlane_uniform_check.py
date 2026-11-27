@@ -29,6 +29,9 @@ class Pipe:
     def uav(self, key, kind='raw'):
         return 'w0'
 
+    def sampler(self, words, lod_limits=False):
+        return 'smp0'
+
     def stored_images(self):
         return self.uavs
 
@@ -166,7 +169,7 @@ REFUSED = [
      ('s_mov_b32 s2, vcc_lo', 's_add_u32 s3, s2, 1', 'v_mov_b32_e32 v7, s3', READ)),
     ('mask through scalar condition',
      ('s_cmp_eq_u32 vcc_lo, 0', 's_cselect_b32 s2, 0, 1', 'v_mov_b32_e32 v7, s2', READ)),
-    ('non-listed overwrite', ('v_mov_b32_e32 v7, s2', 'v_add_f32_e64 v7, s2, 1.0', READ)),
+    ('non-listed overwrite', ('v_mov_b32_e32 v7, s2', 'v_sin_f32_e32 v7, s2', READ)),
     ('SDWA overwrite', ('v_mov_b32_e32 v7, s2',
                         'v_cvt_f32_ubyte0_sdwa v7, s2 src0_sel:DWORD dst_sel:DWORD', READ)),
     ('interpolant overwrite', ('v_mov_b32_e32 v7, s2', 'v_interp_mov_f32 v7, p0, attr0.x', READ)),
@@ -210,6 +213,17 @@ check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7
 # (tests/startup_gfx2hlsl_readfirstlane_recompute_check.py covers that rule).
 got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
 check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
+# An EXEC write that only narrows the mask (a compare into EXEC) leaves every lane that is still active a lane that
+# ran the definition, so the read past it recomputes from the scalars. A write that can widen the mask still refuses.
+got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
+check('read after a compare into EXEC recomputed', isinstance(got, list) and 's9 = s2;' in got, repr(got))
+got = run(MOVE, 's_cbranch_scc0 label_0014', 's_or_b32 exec_lo, exec_lo, s3', READ, 's_endpgm', 's_endpgm')
+check('read after an EXEC write that can widen refused', got == REFUSAL, repr(got))
+original_narrows = G.Stage.exec_write_only_narrows
+G.Stage.exec_write_only_narrows = staticmethod(lambda name, ops: False)
+got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
+G.Stage.exec_write_only_narrows = original_narrows
+check('mutant: without the narrowing rule the read after a compare into EXEC is refused', got == REFUSAL, repr(got))
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',
@@ -343,7 +357,7 @@ for label, instructions, read, kind, known in (
         ('image_load_mip with uniform coordinates',
          IMG_COORDS + ('v_mov_b32_e32 v4, 0', 'image_load_mip v7, v[2:4], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D'),
          7, 'cs', True),
-        ('image_load in a graphics stage', IMG_COORDS + (IMG_LOAD,), 7, 'ps', True),
+        ('image_load in a stage kind with no proof', IMG_COORDS + (IMG_LOAD,), 7, 'gs', True),
         ('image_load without a stage kind', IMG_COORDS + (IMG_LOAD,), 7, None, True),
         ('image_load with unknown exec', IMG_COORDS + (IMG_LOAD,), 7, 'cs', False),
         ('image_load read after a branch target',
@@ -495,6 +509,37 @@ longest = max(map(len, stage.uniform_expr.values()), default=0)
 check('long doubling chain keeps a bounded recompute expression', longest <= 2 * G.UNIFORM_EXPR_LIMIT, str(longest))
 got = run(MOVE, *[DOUBLE] * 22, READ, kind='cs', group=(64, 1, 1))
 check('entry-block read of a long doubling chain copies the VGPR', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
+
+# A pixel stage reading the first lane of a level-zero sample of a fixed table texture: coordinates built only from
+# scalars, a sampler held in scalars that the program set, no image store. Every lane then reads the same texel.
+SAMPLER = ('s_mov_b32 s8, 0x92', 's_mov_b32 s9, 0', 's_mov_b32 s10, 0', 's_mov_b32 s11, 0x14500000')
+SAMPLE = 'image_sample_lz v7, v7, s[16:23], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_1D'
+TEXEL = 'image_load v8, v6, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm a16'
+for label, instructions in (
+        ('level-zero sample of a uniform coordinate', (MOVE, *SAMPLER, SAMPLE, 'v_med3_f32 v7, v7, s2, s3')),
+        ('arithmetic on a uniform texel feeding a sample',
+         ('v_mov_b32_e32 v6, 0', TEXEL, 'v_max_f32_e32 v8, 0x358637bd, v8', 'v_subrev_f32_e32 v7, s2, v8', *SAMPLER,
+          SAMPLE, 'v_min_f32_e32 v7, s3, v7')),
+        ('float add of two uniform values', (MOVE, 'v_add_f32_e32 v7, s3, v7'))):
+    for kind in ('ps',):
+        got = run(*instructions, READ, kind=kind)
+        check(f'{label} accepted in a {kind} stage', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
+for label, instructions in (
+        ('sample of a per-lane coordinate', (*SAMPLER, 'image_sample_lz v7, v0, s[16:23], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_1D')),
+        ('sample with a sampler loaded as a descriptor', (MOVE, 'image_sample_lz v7, v7, s[16:23], s[4:7] dmask:0x1 dim:SQ_RSRC_IMG_1D')),
+        ('implicit-level sample', (MOVE, *SAMPLER, 'image_sample v7, v7, s[16:23], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_1D')),
+        ('sample with a bias', (MOVE, 'v_mov_b32_e32 v8, s2', *SAMPLER,
+                                'image_sample_b v7, [v8, v7], s[16:23], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_1D')),
+        ('texel at a per-lane coordinate', ('image_load v7, v0, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm a16',))):
+    got = run(*instructions, READ, kind='ps')
+    check(f'{label} refused in a pixel stage', got == REFUSAL or (isinstance(got, str) and got != ''), repr(got)[:200])
+got = run(MOVE, *SAMPLER, SAMPLE, READ, kind='ps')
+check('control: a read of a sample result is accepted only with the proof', isinstance(got, list), repr(got)[:200])
+original_sample = G.Stage.uniform_image_sample_regs
+G.Stage.uniform_image_sample_regs = lambda self, base, ops, mods: ()
+got = run(MOVE, *SAMPLER, SAMPLE, READ, kind='ps')
+G.Stage.uniform_image_sample_regs = original_sample
+check('mutant: without the sample proof the first-lane read is refused', got == REFUSAL, repr(got)[:200])
 
 check_translation()
 check_whole_quad_translation()
