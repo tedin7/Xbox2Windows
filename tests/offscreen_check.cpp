@@ -1591,19 +1591,19 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
 OperationResult run_startup_placeholder_pixels(const OperationContext& ctx)
 {
     static constexpr UINT extent = 8, pixel_count = extent * extent;
-    std::uint32_t colors[pixel_count]{}, integers[pixel_count]{};
+    std::uint32_t colors[pixel_count * 4]{}, integers[pixel_count]{};
     const bool mixed = std::string_view(ctx.argv[5]) == "mixed";
     if (!mixed && std::string_view(ctx.argv[5]) != "color")
         return {OutcomeKind::fail, "expected color or mixed render targets"};
     const char* ps = std::string_view(ctx.argv[4]) == "-" ? nullptr : ctx.argv[4];
     check_startup_flat_param(ctx.device, ctx.argv[3], ps, colors, extent, extent,
-                            D3D12_CULL_MODE_NONE, FALSE, 3, nullptr, 4, {}, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true,
+                            D3D12_CULL_MODE_NONE, FALSE, 3, nullptr, 4, {}, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, false,
                              mixed ? integers : nullptr);
     std::ofstream out(ctx.argv[6], std::ios::binary);
     out.write(reinterpret_cast<const char*>(colors), sizeof(colors));
     if (mixed) out.write(reinterpret_cast<const char*>(integers), sizeof(integers));
     out.close();
-    return out ? OperationResult{OutcomeKind::pass, nullptr} : OperationResult{OutcomeKind::fail, "write RGBA8 readback"};
+    return out ? OperationResult{OutcomeKind::pass, nullptr} : OperationResult{OutcomeKind::fail, "write placeholder target readback"};
 }
 
 // --startup-pixel-dump <vs.cso> <ps.cso> <width> <height> <out.bin>: the draw of --startup-pixel-words, but the

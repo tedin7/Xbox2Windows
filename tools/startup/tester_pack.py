@@ -356,7 +356,7 @@ def seed_line(result):
 RESULTS_NAME = "shader_results.txt"
 KEY_RE = re.compile(r"(?:^|[^0-9a-f])([0-9a-f]{16})(?:[^0-9a-f]|$)")
 # request file extension -> kind; result marker: ready file suffix per kind, `.fail` for a refusal
-REQUEST_KINDS = {".a": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
+REQUEST_KINDS = {".a": "graphics", ".rtv": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
 READY_SUFFIXES = {"graphics": (".txt",), "compute": (".txt",), "mesh57": (".ms57.txt",), "mesh86": (".mesh86.txt",)}
 REASON_CHARS = 200         # per key; the translator's own message, first line only
 COMPILER_CODE_RE = re.compile(r"\b(?:error|warning)\s+[A-Z]\d{3,5}\b")

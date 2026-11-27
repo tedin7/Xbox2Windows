@@ -618,16 +618,25 @@ def native_instructions(code):
 def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
     out, off = [], 0
     saw_getpc = False
+    saw_end = unreadable_tail = False
     while off + 4 <= len(code):
         try:
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
         if exports_only:
-            if name == 'word_0x00000000' and out and out[-1][2] == 's_endpgm' and not any(code[off:]):
-                break  # word-aligned zero fill after the program
             if off + n > len(code) or asm.startswith('.long') or '<truncated>' in asm:
-                raise Unsupported('unreadable instruction in placeholder pixel program')
+                if not saw_end:
+                    raise Unsupported('unreadable instruction in placeholder pixel program')
+                unreadable_tail = True
+                out.append((off, n, name, asm))
+                off += n
+                continue
+            if name == 's_endpgm':
+                # An unreadable word between exits belongs to the program, not its data tail.
+                if unreadable_tail:
+                    raise Unsupported('unreadable instruction in placeholder pixel program')
+                saw_end = True
             if name != 'exp':
                 out.append((off, n, name, asm))
                 off += n
@@ -647,6 +656,8 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
                     return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
+    if exports_only and any(name == 'exp' for _, _, name, _ in out[last + 1:]):
+        raise Unsupported('placeholder export after final program end')
     # A bounded stream can end in a back edge after the last exit. Keep the tail
     # when a preceding direct branch enters it; raw captures may have dead words there.
     if last + 1 < len(out) and out[-1][2] == 's_branch' and out[-1][0] + out[-1][1] == len(code):
@@ -655,8 +666,6 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
                and tail_start <= off + 4 + 4 * struct.unpack_from('<h', code, off)[0] <= out[-1][0]
                for off, _, name, _ in out[:last]):
             return out
-    if exports_only and any(name == 'exp' for _, _, name, _ in out[last + 1:]):
-        raise Unsupported('placeholder export after final program end')
     return out[:last + 1]
 
 
@@ -13435,6 +13444,7 @@ def unaligned_dword_body(low, high):
 
 PLACEHOLDER_PS_PREFIX = 'placeholder ps '
 PLACEHOLDER_DRAWN = ' (placeholder drawn)'
+PLACEHOLDER_ATTEMPT = 'x2w-placeholder-attempt'
 
 
 def placeholder_ps_enabled():
@@ -13476,10 +13486,14 @@ def pixel_export_targets(code):
         if (len(vals) != 4 or any(not re.fullmatch(r'off|v[0-9]+', v) for v in vals)
                 or any(f.startswith('en:') for f in flags)):
             raise Unsupported('unreadable placeholder pixel export')
+        if target != 'null' and not re.fullmatch(r'mrt[0-7z]', target):
+            raise Unsupported('unreadable placeholder pixel export target')
+        # The null terminator has no channels; a depth-only MRTZ uses just its first channel.
+        if 'off' in vals and not (target == 'null' and vals == ['off'] * 4
+                                  or target == 'mrtz' and vals[1:] == ['off'] * 3 and vals[0] != 'off'):
+            raise Unsupported('unreadable placeholder pixel export')
         if target == 'null':
             continue
-        if not re.fullmatch(r'mrt[0-7z]', target):
-            raise Unsupported('unreadable placeholder pixel export target')
         if target != 'mrtz':
             targets.add(target)
         elif vals[0] != 'off':
@@ -14892,6 +14906,13 @@ def is_placeholder_failure(path):
     return False
 
 
+def needs_placeholder_attempt(path):
+    if placeholder_ps_enabled():
+        with suppress(OSError), open(path, encoding='utf-8', errors='replace') as failure:
+            return PLACEHOLDER_ATTEMPT not in failure.read().splitlines()
+    return False
+
+
 def discard_stale_placeholder(manifest):
     rgb = placeholder_manifest_rgb(manifest)
     if rgb is not None and rgb != placeholder_rgb_text():
@@ -14900,7 +14921,7 @@ def discard_stale_placeholder(manifest):
 
 
 def write_graphics_failure(path, reason):
-    write_failure(path, reason, context='x2w-placeholder-attempt' if placeholder_ps_enabled() else None)
+    write_failure(path, reason, context=PLACEHOLDER_ATTEMPT if placeholder_ps_enabled() else None)
 
 
 def publish_placeholder_failure(name, stage, compile_enabled, bytecode_suffixes):
@@ -15756,9 +15777,11 @@ def old_failures(out_dir, since_translator, families=LIFTED_REASONS, final=froze
         except OSError:
             continue
         lifted = lifted_family(reason, families) is not None
-        if newer and (not lifted or key in final):
+        compute = is_compute_request(out_dir, key)
+        placeholder_retry = not compute and (reason.rstrip().endswith(PLACEHOLDER_DRAWN)
+                                             or needs_placeholder_attempt(fail))
+        if not placeholder_retry and newer and (not lifted or key in final):
             continue
-        compute = os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
         rows.append((not weights.get(key, 0), -weights.get(key, 0), not lifted, compute, order, key, lifted))
     return [(key, lifted) for _u, _w, _l, _c, _o, key, lifted in sorted(rows)]
 
@@ -15875,10 +15898,10 @@ def retry_lifted(out_dir, seconds=PRE_RUN_RETRY_SECONDS, jobs=None, families=LIF
     rows = old_failures(out_dir, stamp, families, already, weights)
     keys = [key for key, _lifted in rows]
     results = retry_batch(out_dir, keys, jobs, clock, start, seconds)
-    clear_successful_failures(out_dir, results)
+    successes = clear_successful_failures(out_dir, results)
     if results:
-        note_retried(out_dir, stamp, already | {key for key, result in results.items() if result != 'ok'})
-    ok = sum(1 for result in results.values() if result == 'ok')
+        note_retried(out_dir, stamp, already | (results.keys() - successes))
+    ok = len(successes)
     return RetryReport(len(keys), ok, len(results) - ok, len(keys) - len(results), clock() - start,
                        sum(1 for _key, lifted in rows if lifted), sum(1 for key in keys if (weights or {}).get(key)))
 
@@ -15909,10 +15932,15 @@ def retry_batch(out_dir, keys, jobs, clock, start, seconds):
 
 
 def clear_successful_failures(out_dir, results):
+    """Clear stale failures and return the keys whose retry fully translated."""
+    successes = set()
     for key, result in results.items():
-        if result == 'ok':
+        failure = os.path.join(out_dir, '%016x.fail' % key)
+        if result == 'ok' and not is_placeholder_failure(failure):
             with suppress(OSError):
-                os.remove(os.path.join(out_dir, '%016x.fail' % key))
+                os.remove(failure)
+            successes.add(key)
+    return successes
 
 
 FAMILY_PROBES = 8
@@ -15924,16 +15952,23 @@ def retry_families(out_dir, seconds, jobs, clock, weights):
     version = translator_version()
     force = os.environ.get('X2W_RETRY_FAILED') == '1'
     groups = {}
+    placeholder_retries = []
     keys = sorted(set(pending_keys(out_dir, False)), key=lambda key: (-weights.get(key, 0), key))
     lifted = 0
     for key in keys:
+        fail = os.path.join(out_dir, '%016x.fail' % key)
         try:
-            reason, family, written_by = read_failure(os.path.join(out_dir, '%016x.fail' % key))
+            reason, family, written_by = read_failure(fail)
         except OSError:
             continue
-        if not force and written_by == version:
+        # Probe results cannot predict whether another request in the family has usable positions.
+        if not is_compute_request(out_dir, key) and (reason.rstrip().endswith(PLACEHOLDER_DRAWN)
+                                                    or needs_placeholder_attempt(fail)):
+            placeholder_retries.append(key)
+        elif force or written_by != version:
+            groups.setdefault(family, []).append(key)
+        else:
             continue
-        groups.setdefault(family, []).append(key)
         lifted += lifted_family(reason) is not None
 
     # Interleave families so an expensive graphics family cannot occupy every probe slot.
@@ -15951,18 +15986,22 @@ def retry_families(out_dir, seconds, jobs, clock, weights):
                 atomic_retry_text(cursor_path, family + '\n')
             break
 
-    passing_families = {family for family, key in probes if results.get(key) == 'ok'}
+    successes = clear_successful_failures(out_dir, results)
+    passing_families = {family for family, key in probes if key in successes}
     incomplete = {family for family, key in probes if key not in results}
-    rest = sorted((key for family in passing_families - incomplete for key in groups[family][FAMILY_PROBES:]),
-                  key=lambda key: (-weights.get(key, 0), key))
+    rest = placeholder_retries + [key for family in passing_families - incomplete
+                                  for key in groups[family][FAMILY_PROBES:]]
     skipped = sum(max(0, len(groups[family]) - FAMILY_PROBES)
                   for family in groups.keys() - passing_families - incomplete)
-    results.update(retry_batch(out_dir, rest, jobs, clock, start, seconds))
-    clear_successful_failures(out_dir, results)
-    total = sum(map(len, groups.values()))
-    ok = sum(result == 'ok' for result in results.values())
+    rest.sort(key=lambda key: (-weights.get(key, 0), key))
+    remaining_results = retry_batch(out_dir, rest, jobs, clock, start, seconds)
+    successes.update(clear_successful_failures(out_dir, remaining_results))
+    results.update(remaining_results)
+    total = len(placeholder_retries) + sum(map(len, groups.values()))
+    ok = len(successes)
     return RetryReport(total, ok, len(results) - ok, total - len(results) - skipped, clock() - start, lifted,
-                       sum(bool(weights.get(key)) for group in groups.values() for key in group), skipped)
+                       sum(bool(weights.get(key)) for key in placeholder_retries)
+                       + sum(bool(weights.get(key)) for group in groups.values() for key in group), skipped)
 
 
 def translate_one(out_dir, key):
@@ -16223,11 +16262,9 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         if placeholder:
             keys.append(key)
             continue
-        if not compute and rgb is not None and failure_name in failures:
-            with suppress(OSError), open(fail, encoding='utf-8', errors='replace') as failure:
-                if 'x2w-placeholder-attempt' not in failure.read().splitlines():
-                    keys.append(key)
-                    continue
+        if not compute and rgb is not None and failure_name in failures and needs_placeholder_attempt(fail):
+            keys.append(key)
+            continue
         # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
         # still published without its recorded description is checked even with an older .fail, which a success on
         # the manifest-only path leaves in place.

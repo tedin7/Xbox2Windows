@@ -989,6 +989,8 @@ with a child process.
 Set `X2W_PLACEHOLDER_PS=1` in the environment of the translator and runtime to mark
 draws whose pixel shader was refused. The vertex or primitive stage must translate,
 and the translator must be able to read the pixel program's export targets.
+Non-instruction data after the final program end does not prevent publication.
+An export after that end still prevents publication.
 The placeholder writes each declared color target. Set `X2W_PLACEHOLDER_RGB=0,255,0`
 for green, or leave it unset for magenta. The RGB values are bytes and alpha is one.
 Integer targets receive `(1, 2, 3, 1)`. A depth export passes through the
@@ -996,9 +998,11 @@ rasterized depth. The placeholder discards no fragments.
 
 The manifest records `placeholder ps <reason>`. The cache report keeps the
 refusal under its original key with ` (placeholder drawn)` appended. A cache scan
-revisits existing refusals when the mode is enabled and refreshes cached
-placeholders when their color changes. Windows coverage uses 8×8 WARP readback
-with one color target and with mixed float and integer targets.
+revisits existing graphics refusals once when the mode is enabled, refreshes
+cached placeholders when their color changes, and withdraws them when the mode
+is disabled. The synthetic Windows test uses 8×8 WARP readback with one float
+target and with mixed float and integer targets. Run it with
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_placeholder_ps(_warp)?$'`.
 
 ### Compute pipeline requests
 
