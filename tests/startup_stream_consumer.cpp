@@ -356,6 +356,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     Slot67Indirect record;
     if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind(list);
+    if (mode.rfind("dispatch-texel-", 0) == 0) {
+        const auto format = mode == "dispatch-texel-float" ? DXGI_FORMAT_R32_FLOAT :
+                            mode == "dispatch-texel-sint" ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
+        if (!bind_identifier_fixture(device, list, cpu + 64, format, identifier_fixture_dimension())) return 80;
+    }
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const UINT width = mode == "dispatch-sampled-2x1" ? 2 : 1;
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
@@ -872,7 +877,7 @@ int main(int argc, char** argv)
     void* pso = nullptr;
     const bool hardware = (draw && std::strcmp(argv[4], "hardware") == 0) ||
                           GetEnvironmentVariableW(L"X2W_TEST_DISPATCH_HARDWARE", nullptr, 0) != 0;
-    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
+    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_IDENTIFIER_SRV", nullptr, 0) != 0 || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0 ||

@@ -499,9 +499,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamMrtFormat mrt{};
     const bool typed = stream_mrt_format(format, mrt);
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
+    char identifier_format[8]{};
+    const bool identifiers = GetEnvironmentVariableA("X2W_TEST_IDENTIFIER_SRV", identifier_format, sizeof(identifier_format)) != 0;
     const bool single = typed;
     const bool legacy = !single;
-    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT width = identifiers ? 5 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
@@ -639,6 +641,21 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_VOLUME_SRV", nullptr, 0)) {
         extern int draw_volume_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_volume_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (identifiers) {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        void* heap = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heap)))))
+            return 42;
+        const auto input_format = std::strcmp(identifier_format, "float") == 0 ? DXGI_FORMAT_R32_FLOAT :
+                                  std::strcmp(identifier_format, "sint") == 0 ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
+        if (!bind_identifier_fixture(guest, list, invoke(heap, 9), input_format, identifier_fixture_dimension())) return 42;
+        invoke(list, 32, 1, arg(&heap));
+        invoke(list, 36, 0, invoke(heap, 10));
+        invoke(list, 12, 3, 1);
+        if (GetEnvironmentVariableW(L"X2W_TEST_IDENTIFIER_FILTERED", nullptr, 0)) invoke(list, 12, 3, 1);
     } else if (GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0)) {
         extern int draw_d16_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_d16_srvs(desktop.Get(), guest, list)) return result;

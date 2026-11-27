@@ -8705,10 +8705,10 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        # A 1D image has one coordinate. sample_lz and sample_l carry the explicit level in the next
-        # address dword, so their address is x then level; Texture1D.SampleLevel takes the location as a
-        # float, which is what the `one` branch below builds. Anything else stays refused by name.
-        if one:
+        integer_srvs = getattr(self.pipe, 'integer_texture_srvs', False)
+        # The legacy 1D path models only sampling. Typed SRVs also use the generic load
+        # path below, whose Texture1D address has one coordinate and a mip index.
+        if one and not (integer_srvs and how in ('load', 'load_mip')):
             expected = {'sample': 1, 'lz': 1, 'l': 2}.get(how)
             if expected is None or len(cs) != expected or not dmask:
                 raise Unsupported('unverified 1D image %s address or modifiers' % how)
@@ -8796,7 +8796,7 @@ class Stage:
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
-            axes = 3 if three else 2
+            axes = 1 if one else 3 if three else 2
             packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
             packed_d16 = how in ('load', 'load_mip') and 'd16' in mods
             allowed = ('unorm', 'glc', 'slc', 'dlc')
@@ -8825,7 +8825,14 @@ class Stage:
             else:
                 address = [self.u(c) for c in cs[:axes]]
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
-            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
+            location = 'int%d(%s)' % (axes + 1, ', '.join(address + [mip]))
+            call = '%s.Load(%s)' % (tex, location)
+            if integer_srvs and not packed_d16:
+                res = self.pipe.resources[desc_key]
+                res['integer_load'] = True
+                call = ('asfloat(%(tex)s_is_integer == 2u ? asuint(%(tex)s_sint.Load(%(loc)s)) : '
+                        '%(tex)s_is_integer != 0u ? %(tex)s_uint.Load(%(loc)s) : asuint(%(float)s))') % {
+                            'tex': tex, 'loc': location, 'float': call}
         else:
             packed_2d = False
             if not one and how in ('sample', 'lz'):
@@ -12371,6 +12378,7 @@ class Pipeline:
     uses_sad = ()
     uses_store_format_xyzw = False
     srv_formats = ()
+    integer_texture_srvs = False
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
     def _init_pixel_context(self, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
@@ -12410,6 +12418,7 @@ class Pipeline:
         self.uses_store_d16_x = False
         self.uses_sad = set()
         self.uses_store_format_xyzw = False
+        self.integer_texture_srvs = os.environ.get('X2W_INTEGER_TEXTURE_SRVS') == '1'
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -12534,8 +12543,22 @@ class Pipeline:
                                        ' '.join('0x%x' % w for w in key[prefixed:])))
         return lines
 
+    def integer_srv_bindings(self):
+        inputs = [r for r in self.resources.values() if r.get('integer_load')]
+        if len(self.uds) + len(inputs) > 32:
+            raise Unsupported('integer texture loads exceed the 32 entry values')
+        for ordinal, res in enumerate(inputs):
+            yield res, len(self.resources) + 2 * ordinal, len(self.uds) + ordinal
+
+    def integer_srv_manifest(self):
+        if self.integer_texture_srvs and any(r['kind'] != 'buf' for r in self.resources.values()):
+            yield 'srvtypes 1'
+            for res, reg, entry in self.integer_srv_bindings():
+                yield 'srvint %d %d %d' % (res['index'], reg, entry)
+
     def common(self):
         import pixel_aot
+        twins = list(self.integer_srv_bindings())
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)', FLOAT_MINMAX,
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                # Match pixel_aot: round the product before adding and flush denormals to signed zero.
@@ -12646,9 +12669,9 @@ class Pipeline:
                ' uint sh = (32u - w) & 31u; return sg != 0u ? asuint(asint(e << sh) >> sh) : e; }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
-               'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
+               'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds) + len(twins)))]
         if self.uses_dynamic_heap:
-            constants = ['uint ud%d;' % i for i in range(len(self.uds))]
+            constants = ['uint ud%d;' % i for i in range(len(self.uds) + len(twins))]
             out[-1] = 'cbuffer entry : register(b0) { %s };' % ' '.join(
                 constants + ['uint heap_count;'])
             out += ['uint x2w_heap_load(uint index, uint address) {',
@@ -12656,6 +12679,11 @@ class Pipeline:
                     '    ByteAddressBuffer buffer = ResourceDescriptorHeap[NonUniformResourceIndex(index)];',
                     '    return buffer.Load(address);',
                     '}']
+        for r, reg, entry in twins:
+            kind = {'tex1d': 'Texture1D', 'tex2d': 'Texture2D', 'tex2da': 'Texture2DArray', 'tex3d': 'Texture3D'}[r['kind']]
+            out.append('%s<uint4> r%d_uint : register(t%d);' % (kind, r['index'], reg))
+            out.append('%s<int4> r%d_sint : register(t%d);' % (kind, r['index'], reg + 1))
+            out.append('#define r%d_is_integer ud%d' % (r['index'], entry))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
@@ -13051,6 +13079,7 @@ class Pipeline:
             lines.append('dynamic_heap')
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
+        lines.extend(self.integer_srv_manifest())
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             source, off = key
             where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0), 'vbtab': 'vb %d' % ((off or 0) // 16),
@@ -13146,6 +13175,7 @@ class ComputePipeline(Pipeline):
         self.uses_sad = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
+        self.integer_texture_srvs = os.environ.get('X2W_INTEGER_TEXTURE_SRVS') == '1'
         self.rw_keys = set()
         self.retry_entry_exec = False
         self.retry_firstlane = False
@@ -13218,7 +13248,7 @@ class ComputePipeline(Pipeline):
         return {key: r for key, r in self.uavs.items() if r['kind'] != 'raw'}
 
     def common(self):
-        out = [line for line in super().common() if self.uds or self.uses_dynamic_heap or not line.startswith('cbuffer entry')]
+        out = [line for line in super().common() if self.uds or self.uses_dynamic_heap or any(self.integer_srv_bindings()) or not line.startswith("cbuffer entry")]
         for r in self.uavs.values():
             if r['kind'] == 'raw':
                 out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
@@ -13274,6 +13304,7 @@ class ComputePipeline(Pipeline):
         if self.uses_dynamic_heap:
             lines.append('dynamic_heap')
         lines += ['udsrc %d %s' % (i, ' '.join(str(x) for x in source)) for i, source in enumerate(self.uds)]
+        lines.extend(self.integer_srv_manifest())
         for (source, off), r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             if source[0] == 'table':
                 where = 'table %d %d' % (source[1], off or 0)
@@ -13315,6 +13346,7 @@ class MeshPixelStage(Pipeline):
         from mesh_param_link import MAX_PARAM, validate_linkage
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, None,
                                  ps_attr_map, srv_formats)
+        self.integer_texture_srvs = False  # the mesh runtime has a separate manifest and binding ABI
         clean_params = []
         for p in mesh_params:
             if type(p) is not int or not 0 <= p <= MAX_PARAM:
@@ -13341,7 +13373,7 @@ class MeshPixelStage(Pipeline):
             raise Unsupported(str(error)) from None
 
     def common(self):
-        return [line for line in super().common() if self.uds or self.uses_dynamic_heap or not line.startswith('cbuffer entry')]
+        return [line for line in super().common() if self.uds or self.uses_dynamic_heap or not line.startswith("cbuffer entry")]
 
     def linkage(self, *, distance_vectors=0):
         from mesh_param_link import validate_linkage

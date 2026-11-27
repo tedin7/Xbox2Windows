@@ -28,7 +28,7 @@ struct ComputeTranslation {
         // An output texture of another shape than 2D: 1 = Texture1D, 3 = Texture3D (a 3D view keeps the caller's W range).
         int dimension = 0;
         bool root_view = false;
-        bool cube = false;  // an input texture sampled as a TextureCube (`srv <i> texcube table <param> <byte>`)
+        D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
         bool load = false;  // typed UAV load for a partial image store
     };
     u64 key = 0;
@@ -36,6 +36,7 @@ struct ComputeTranslation {
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
     bool dynamic_heap = false;
+    x2w_startup::IntegerTextureSrvs integer_srvs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -155,8 +156,24 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             return ComputeTranslation::root_constant;
         };
         if (line == "dynamic_heap") { tr.dynamic_heap = true; continue; }
+        const auto input_dimension = [&] {
+            return !std::strcmp(name, "tex2d") ? D3D12_SRV_DIMENSION_TEXTURE2D :
+                !std::strcmp(name, "texcube") ? D3D12_SRV_DIMENSION_TEXTURECUBE :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex1d") ? D3D12_SRV_DIMENSION_TEXTURE1D :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex2da") ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+                tr.integer_srvs.typed && !std::strcmp(name, "tex3d") ? D3D12_SRV_DIMENSION_TEXTURE3D :
+                D3D12_SRV_DIMENSION_UNKNOWN;
+        };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
+        if (line == "srvtypes 1") {
+            tr.integer_srvs.typed = true;
+            continue;
+        }
+        if (line.compare(0, 7, "srvint ") == 0) {
+            if (!tr.integer_srvs.read_twin(line)) return "invalid srvint";
+            continue;
+        }
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
             tr.uds.push_back({a, b});
         else if (std::sscanf(line.c_str(), "udsrc %u %15s %d%n", &i, name, &a, &used) == 3 && whole() && i == tr.uds.size() &&
@@ -204,11 +221,10 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
         else if (std::sscanf(line.c_str(), "uavload %u%n", &i, &used) == 1 && whole() &&
                  i < tr.uavs.size() && tr.uavs[i].texture && !tr.uavs[i].load)
             tr.uavs[i].load = true;
-        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+        else if (std::sscanf(line.c_str(), "srv %u %15s table %d %d%n", &i, name, &a, &b, &used) == 4 &&
+                 whole() && i == tr.srvs.size() && input_dimension() != D3D12_SRV_DIMENSION_UNKNOWN) {
             tr.srvs.push_back({a, b, true});
-        else if (std::sscanf(line.c_str(), "srv %u texcube table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size()) {
-            tr.srvs.push_back({a, b, true});
-            tr.srvs.back().cube = true;
+            tr.srvs.back().srv_dimension = input_dimension();
         }
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
         // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
@@ -237,12 +253,17 @@ const char* load_compute_translation(ComputeTranslation& tr, ComputeManifest* pr
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
             return "an entry value names a descriptor that is not a buffer input or output";
     }
+    if (!tr.integer_srvs.valid(static_cast<UINT>(tr.srvs.size()), static_cast<UINT>(tr.uds.size()),
+                              [&](UINT i) { return tr.srvs[i].texture && tr.srvs[i].srv_dimension != D3D12_SRV_DIMENSION_TEXTURECUBE; }))
+        return "invalid srvint mapping";
+    const UINT twins = static_cast<UINT>(tr.integer_srvs.twins.size());
+    const UINT entries = static_cast<UINT>(tr.uds.size()) + twins;
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
-    const UINT constants = (std::max)(1u, static_cast<UINT>(tr.uds.size()) + (tr.dynamic_heap ? 1u : 0u));
+    const UINT constants = (std::max)(1u, entries + (tr.dynamic_heap ? 1u : 0u));
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), constants,
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap)))
+            static_cast<UINT>(tr.srvs.size()) + tr.integer_srvs.descriptors(), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.dynamic_heap)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -416,13 +437,28 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
-                else if (slot.cube && (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURECUBE &&
+                         (!described || desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE))
                     reason = "an input texture view is not a cube map";
-                else if (slot.cube && (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURECUBE &&
+                         (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 6))
                     reason = "a cube map view's texture is not six 2D faces";
-                else if (!slot.cube && (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-                                                  : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                         (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                                    : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1))
                     reason = "an input texture view is not 2D";
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D &&
+                         (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || resource.DepthOrArraySize != 1 ||
+                          (described && desc.ViewDimension != slot.srv_dimension)))
+                    reason = "an input texture view is not 1D";
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE3D &&
+                         (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+                          (described && desc.ViewDimension != slot.srv_dimension)))
+                    reason = "an input texture view is not 3D";
+                else if (slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY &&
+                         (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                          (described ? desc.ViewDimension != slot.srv_dimension : resource.DepthOrArraySize <= 1)))
+                    reason = "an input texture view is not a 2D array";
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
                 views[i] = {texture, 0, 0, true, true, described};
@@ -593,7 +629,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     if (!reason && tr->dynamic_heap) {
         if (dispatch.signature) reason = "translated indirect Dispatch requires fixed-table raw buffers";
         else {
-            view_heap = snapshot_buffer_heap(self, static_cast<UINT>(count), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            view_heap = snapshot_buffer_heap(self, static_cast<UINT>(count) + tr->integer_srvs.descriptors(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 [&](ID3D12Resource* resource) {
                     for (std::size_t i = inputs; i < count; ++i)
                         if (views[i].resource == resource) return true;
@@ -618,7 +654,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return reason;
     }
-    const UINT n = static_cast<UINT>(count);
+    const UINT twins = static_cast<UINT>(tr->integer_srvs.twins.size());
+    const UINT extra_srvs = tr->integer_srvs.descriptors();
+    const UINT n = static_cast<UINT>(count) + extra_srvs;
     if (!tr->dynamic_heap) {
         first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
         if (first + n > draw_heap_size) {
@@ -629,13 +667,26 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     D3D12_CPU_DESCRIPTOR_HANDLE dest{view_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     phases.to(4);
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
+        if (i == inputs) dest.ptr += SIZE_T{extra_srvs} * draw_heap_increment;
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            device_of(the_device)->CreateShaderResourceView(view.resource,
-                view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
+            const auto* desc = view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr;
+            const auto dimension = tr->srvs[i].srv_dimension;
+            const UINT integer = integer_view_type(desc ? desc->Format : view.resource->GetDesc().Format);
+            if (const auto* twin = tr->integer_srvs.find(static_cast<UINT>(i))) {
+                values[twin->entry] = integer;
+                const D3D12_CPU_DESCRIPTOR_HANDLE twin_dest{dest.ptr + (twin->reg - i) * draw_heap_increment};
+                bind_typed_texture_srv(view.resource, desc, dimension, integer, dest, twin_dest, draw_heap_increment);
+            } else if (integer && tr->integer_srvs.typed) {
+                count_filtered_integer_srv(tr->integer_srvs, tr->key, static_cast<UINT>(i));
+                const auto null_view = x2w_startup::null_texture_srv(dimension, DXGI_FORMAT_R32_FLOAT);
+                device_of(the_device)->CreateShaderResourceView(nullptr, &null_view, dest);
+            } else {
+                device_of(the_device)->CreateShaderResourceView(view.resource, desc, dest);
+            }
             if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
         }
@@ -665,8 +716,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());
-    if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()));
+    const UINT entries_now = static_cast<UINT>(tr->uds.size()) + twins;
+    if (entries_now) list->SetComputeRoot32BitConstants(0, entries_now, values, 0);
+    if (tr->dynamic_heap) list->SetComputeRoot32BitConstant(0, first, static_cast<UINT>(tr->uds.size()) + twins);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{view_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (dispatch.signature) {
         require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);

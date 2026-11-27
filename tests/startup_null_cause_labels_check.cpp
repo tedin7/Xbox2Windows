@@ -10,7 +10,7 @@ namespace {
 using x2w_local::BindingFacts;
 int failures, cases;
 
-const char* const labels[] = {"entry", "buffer", "token", "wrapper", "dimension", "ring_full"};
+const char* const labels[] = {"entry", "buffer", "token", "wrapper", "dimension", "ring_full", "integer_view_filtered"};
 
 // Facts as the texture binding builds them: from a table, with a readable entry carrying a known
 // view token for a resource wrapper of the shader's dimension.
@@ -103,11 +103,11 @@ int main(int argc, char** argv)
     }
     const int entry = 0, buffer = swapped ? 2 : 1, token = swapped ? 1 : 2, wrapper = 3, dimension = 4, ring_full = 5;
 
-    if (x2w_local::null_cause_count != 6) {
-        std::printf("FAIL: %d causes, expected 6\n", x2w_local::null_cause_count);
+    if (x2w_local::null_cause_count != 7) {
+        std::printf("FAIL: %d causes, expected 7\n", x2w_local::null_cause_count);
         return 1;
     }
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < x2w_local::null_cause_count; ++i) {
         ++cases;
         if (std::strcmp(x2w_local::null_cause_names[i], labels[i]) != 0) {
             std::printf("FAIL: slot %d named \"%s\", expected \"%s\"\n", i, x2w_local::null_cause_names[i], labels[i]);
@@ -158,12 +158,13 @@ int main(int argc, char** argv)
         {texture(), 3}, {table_buffer(true), 2}, {unreadable, 1}, {table_buffer(false), 2},
         {unknown, 4},   {no_wrapper, 8},         {mismatch, 16}, {ring_buffer, 32},
     };
-    long total = 0, by_slot[6] = {};
+    long total = 64, by_slot[x2w_local::null_cause_count] = {};
+    by_slot[static_cast<int>(x2w_local::NullCause::integer_view_filtered)] = 64;
     for (const Binding& b : frame) {
         const int slot = slot_of(b.facts);
         if (slot == static_cast<int>(x2w_local::NullCause::none)) continue;
-        if (slot < 0 || slot >= 6) {
-            std::printf("FAIL: a null binding in slot %d, outside the six printed\n", slot);
+        if (slot < 0 || slot >= x2w_local::null_cause_count) {
+            std::printf("FAIL: a null binding in slot %d, outside the printed causes\n", slot);
             return 1;
         }
         total += b.times;
@@ -172,13 +173,13 @@ int main(int argc, char** argv)
     // The device's format string, with the slots in the order it passes them.
     char line[200];
     x2w_startup::format_null_binding_totals(line, sizeof(line), total, by_slot);
-    const char* const expected = swapped ? "null bindings 63 (entry 1, buffer 4, token 2, wrapper 8, dimension 16, ring_full 32)"
-                                         : "null bindings 63 (entry 1, buffer 2, token 4, wrapper 8, dimension 16, ring_full 32)";
+    const char* const expected = swapped ? "null bindings 127 (entry 1, buffer 4, token 2, wrapper 8, dimension 16, ring_full 32, integer_view_filtered 64)"
+                                         : "null bindings 127 (entry 1, buffer 2, token 4, wrapper 8, dimension 16, ring_full 32, integer_view_filtered 64)";
     same_text("totals line", line, expected);
     // The same counts labelled from the header's names.
     const char* const* n = x2w_local::null_cause_names;
-    std::snprintf(line, sizeof(line), "null bindings %ld (%s %ld, %s %ld, %s %ld, %s %ld, %s %ld, %s %ld)", total, n[0], by_slot[0],
-                  n[1], by_slot[1], n[2], by_slot[2], n[3], by_slot[3], n[4], by_slot[4], n[5], by_slot[5]);
+    std::snprintf(line, sizeof(line), "null bindings %ld (%s %ld, %s %ld, %s %ld, %s %ld, %s %ld, %s %ld, %s %ld)", total, n[0], by_slot[0],
+                  n[1], by_slot[1], n[2], by_slot[2], n[3], by_slot[3], n[4], by_slot[4], n[5], by_slot[5], n[6], by_slot[6]);
     same_text("totals line from the header's names", line, expected);
 
     census_rows();

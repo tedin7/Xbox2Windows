@@ -11,8 +11,8 @@ namespace x2w_startup {
 
 inline void format_null_binding_totals(char* out, std::size_t size, long total, const long* counts)
 {
-    std::snprintf(out, size, "null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld)",
-                  total, counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]);
+    std::snprintf(out, size, "null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld, integer_view_filtered %ld)",
+                  total, counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
 }
 
 struct NullInputCensus {

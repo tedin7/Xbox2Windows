@@ -38,6 +38,8 @@ from startup_compute_dispatch_check import lines
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
+from startup_image_load_mip_check import DIMENSIONS, FLOAT_BITS, IDENTIFIERS, debug_errors, typed_mutant
+from startup_stream_draw_check import vop1, vop2
 
 
 def run(directory, consumer, env, mode, layout):
@@ -53,9 +55,9 @@ def run(directory, consumer, env, mode, layout):
     return list(struct.unpack(layout, out.read_bytes())), result
 
 
-def translate(cache, dxc, key):
+def translate(cache, dxc, key, *, integer_srvs=False):
     out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
-                         text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
+                         text=True, env=dict(os.environ, X2W_DXC=dxc, X2W_INTEGER_TEXTURE_SRVS='1' if integer_srvs else '0')).stdout
     assert f'{key:016x}: ok' in out, out
 
 
@@ -235,7 +237,12 @@ def filtered(directory, consumer, dxc, env):
     got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
     assert got == [C.SENTINEL] * C.WORDS, 'a Dispatch without a translation wrote the output'
     key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
-    translate(cache, dxc, key)
+    translate(cache, dxc, key, integer_srvs=True)
+
+    got, result = run(directory, consumer, env, 'dispatch-texel-uint', layout)
+    assert got == plain and lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
+    assert result.stderr.count('srv 1: integer_view_filtered') == 1, result.stderr[-3000:]
+    clean(result)
 
     got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
     assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
@@ -263,6 +270,60 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+
+def identifier_code(dim='2d', explicit_mip=False):
+    # Keep the fixture's linear dispatch index and buffer offset, then load
+    # texel x = index & 7, y = 0. The last three x values are out of bounds.
+    prefix = C.WORDS_A[:C.WORDS_A.index(bytes.fromhex('001030e0'))]
+    store = bytearray(C.WORDS_A[C.STORE_A:])
+    store[5] = 15
+    nsa = dim in ('3d', '2da')
+    words = [0xf40c0605, 0xfa000040, vop2(0x1b, 12, 135, 3), vop1(1, 13, 128), vop1(1, 14, 128),
+             0xbf8cc07f, 0xf0000100 | DIMENSIONS[dim] << 3 | (2 if nsa else 0) | int(explicit_mip) << 18, 0x00060f0c]
+    if nsa:
+        words += [0x0e0d]
+    return prefix + struct.pack(f'<{len(words) + 1}I', *words, 0xbf8c3f70) + store
+
+
+def identifier_load(directory, consumer, dxc, env, dim, explicit_mip=False):
+    cache, base = prepare(directory)
+    env = dict(base, **env, X2W_TEST_DEBUG_LAYER='1', X2W_TEST_IDENTIFIER_DIMENSION=dim)
+    root = directory / 'compute_root'
+    root.write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(root)
+    _, _, rsrc2, group, _ = C.CASES['A']
+    (directory / 'program').write_bytes(identifier_code(dim, explicit_mip))
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    layout = '<%dI' % C.WORDS
+    written = 24 * 3 * 2 * 2
+    untouched = [C.SENTINEL] * C.WORDS
+
+    def expected(texels):
+        return list((*texels, 0, 0, 0)) * (written // 8) + untouched[written:]
+
+    got, result = run(directory, consumer, env, 'dispatch-texel-uint', layout)
+    assert got == untouched
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key, integer_srvs=True)
+    stem = cache / f'{key:016x}.cs'
+    for suffix, texels in (('uint', IDENTIFIERS), ('sint', IDENTIFIERS), ('float', FLOAT_BITS)):
+        got, result = run(directory, consumer, env, f'dispatch-texel-{suffix}', layout)
+        assert clean(result) == 'enabled, no error message'
+        assert lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
+        assert got == expected(texels), (suffix, got[:16], result.stderr[-3000:])
+
+    source = Path(f'{stem}.hlsl').read_text()
+    mutant = directory / 'mutant.hlsl'
+    for kind in ('inverted', 'swapped registers'):
+        mutant.write_text(typed_mutant(source, kind), encoding='ascii')
+        subprocess.run([dxc, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', f'{stem}.cso', mutant], check=True)
+        got, result = run(directory, consumer, env, 'dispatch-texel-uint', layout)
+        assert lines(result, 'Dispatch(3, 2, 2) translated'), result.stderr[-3000:]
+        assert got != expected(IDENTIFIERS) or debug_errors(result), (kind, got[:16], result.stderr[-3000:])
+    print(f'Integer texture dispatch {dim}: UINT, SINT and FLOAT matched the CPU, both mutants rejected')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
@@ -271,6 +332,9 @@ def main(consumer, dxc, adapter):
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        for dim in DIMENSIONS:
+            identifier_load(Path(temporary) / f'identifier-{dim}', consumer, dxc, env, dim)
+        identifier_load(Path(temporary) / 'identifier-1d-mip', consumer, dxc, env, '1d', explicit_mip=True)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 

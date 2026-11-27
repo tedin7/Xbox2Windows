@@ -1979,7 +1979,7 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
         !contains(base, row + "2 (buffer) cause ring_full calls 1 frames 0..0 target format 11 depth format 55 bytes 4") ||
         !contains(base, "(4x2 format 28): draws 2, with a null input 1 frames 0..0") ||
         !contains(base, "(4x2 format 11): draws 4, with a null input 1 frames 0..0") ||
-        !contains(base, "null bindings 3 (entry 0, buffer 1, token 1, wrapper 0, dimension 0, ring_full 1)")) {
+        !contains(base, "null bindings 3 (entry 0, buffer 1, token 1, wrapper 0, dimension 0, ring_full 1, integer_view_filtered 0)")) {
         std::fprintf(stderr, "unexpected baseline null census:\n%s", base.c_str());
         return 1;
     }
