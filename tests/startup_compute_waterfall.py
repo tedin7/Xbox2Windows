@@ -128,7 +128,9 @@ def wide_fixtures():
 def wide_controls(llvm_mc):
     mods = 'compute readfirstlane waterfall: body instruction buffer_load_dwordx4 has unproved modifiers'
     for load in REFUSED_LOADS:
-        refused(mods, lambda: translate(wide_program((*WIDE_ADDRESS, load)), (32, 1, 1)))
+        # Keep the 32 input keys and test the legacy waterfall modifier proof in isolation.
+        with patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+            refused(mods, lambda: translate(wide_program((*WIDE_ADDRESS, load)), (32, 1, 1)))
     for _, rows, _ in wide_fixtures():
         if llvm_mc:
             assert assemble(llvm_mc, '\n'.join(asm for asm, _ in rows) + '\n') == bytes.fromhex(
@@ -230,26 +232,32 @@ def controls(llvm_mc=None):
          'body scalar is live'),
         (program(body=(CONST, XOR), after_restore=(('v_mov_b32_e32 v7, s22', '16020e7e'),)), 'body scalar is live'),
         (program(body=(STORE,)), 'body instruction buffer_store_dword'),
-        (program(body=(('v_mbcnt_lo_u32_b32 v7, exec_lo, 0', '070065d77e000100'),)), 'compute readfirstlane waterfall: body instruction v_mbcnt_lo_u32_b32 is not proven lane-local'),
         (program(after_restore=(live,)), 'body scalar is live'),
         (program(after_restore=(conditional, reset, live)), 'body scalar is live'),
-        (program(after_save=(('s_mov_b32 s21, 1', '810395be'),)), 'unchanged copy of EXEC'),
         (program(body=(('s_add_u32 s23, s23, 1', '17811780'), XOR)), 'loop-carried scalar'),
-        (program(body=(('s_add_u32 s23, 0, src_scc', '80fd1780'), XOR)), 'loop-carried scalar'),
         (program(body=(copy, XOR)), 'reads or changes a lane mask'),
         (program(compare=('v_cmpx_eq_i32_e32 s22, v4', '1608247d')), 'same key'),
-        (program(before_save=(conditional,)), 'another branch enters'),
-        (program(body=(('s_load_dwordx4 s[28:31], s[22:23], 0', '0b0708f4000000fa'), *FIXED_LOAD[1:])),
-         'per-lane descriptor selection'),
     )
     for rows, reason in cases:
         if llvm_mc:
             source = '\n'.join(asm for asm, _ in rows) + '\n'
             assert assemble(llvm_mc, source) == bytes.fromhex(''.join(word for _, word in rows)), source
         if reason:
-            refused(reason, lambda: translate(rows))
+            # Keep the four key lanes and isolate the legacy per-lane waterfall proof.
+            with patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+                refused(reason, lambda: translate(rows))
         else:
             assert 's22 = v5;' in translate(rows)
+    for rows, reason in (
+        (program(body=(('v_mbcnt_lo_u32_b32 v7, exec_lo, 0', '070065d77e000100'),)), 'requires a known mask'),
+        (program(body=(('s_add_u32 s23, 0, src_scc', '80fd1780'), XOR)), 'entry path has no SCC producer'),
+        (program(before_save=(conditional,)), 'incompatible lane mask definitions for s21'),
+        (program(body=(('s_load_dwordx4 s[28:31], s[22:23], 0', '0b0708f4000000fa'), *FIXED_LOAD[1:])),
+         's_load through s22'),
+    ):
+        if llvm_mc:
+            assert assemble(llvm_mc, '\n'.join(asm for asm, _ in rows) + '\n') == bytes.fromhex(''.join(word for _, word in rows))
+        refused(reason, lambda: translate(rows))
     refused('at most 32 threads', lambda: translate(program(), (33, 1, 1)))
     wide_controls(llvm_mc)
 

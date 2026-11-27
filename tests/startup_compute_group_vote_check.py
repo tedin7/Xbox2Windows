@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import startup_compute_readfirstlane_narrow_check as narrow
 import startup_compute_waterfall as waterfall
 from compute_load_format_check import check_references
 from startup_gfx2hlsl_compute_check import G, SENTINEL, USER7, WORDS, refused, root_blob
@@ -17,7 +18,7 @@ EXECZ = 'inside a block s_cbranch_execz skips per lane: '
 READFIRST = 'v_readfirstlane_b32 requires a proven uniform source'
 WATERFALL = 'compute readfirstlane waterfall:'
 BRANCHES = {
-    's_branch': 0xbf82, 's_cbranch_scc1': 0xbf85, 's_cbranch_vccz': 0xbf86,
+    's_branch': 0xbf82, 's_cbranch_scc0': 0xbf84, 's_cbranch_scc1': 0xbf85, 's_cbranch_vccz': 0xbf86,
     's_cbranch_vccnz': 0xbf87, 's_cbranch_execz': 0xbf88, 's_cbranch_execnz': 0xbf89,
 }
 SET_3 = ('s_mov_b32 s20, 3', '830394be')
@@ -32,6 +33,10 @@ INIT_COUNT = ('s_mov_b32 s24, 0', '800398be')
 INC_COUNT = ('s_add_u32 s24, s24, 1', '18811880')
 CMP_VCC = ('v_cmp_eq_i32_e32 vcc_lo, 7, v5', '870a047d')
 NARROW_ABOVE = ('v_cmpx_lt_u32_e32 s4, v0', '0400a27d')
+EXEC_ONE = ('s_mov_b32 exec_lo, 1', '8103febe')
+REMAINING_ONE = ('s_mov_b32 s21, 1', '810395be')
+EXEC_HIGH_PAIR = (('s_mov_b32 s30, 0', '80039ebe'), ('s_mov_b32 s31, 1', '81039fbe'),
+                  ('s_mov_b64 exec, s[30:31]', '1e04febe'))
 
 
 def encode(rows):
@@ -73,6 +78,40 @@ def programs():
     # Read after a different narrowing, so the result must change between an empty mask and a nonzero first lane.
     yield 'first-active', 32, (*prefix[:-1], NARROW_ABOVE, waterfall.HEAD,
                               restore, USE_FIRST, *ending), READFIRST, False
+    rows = narrow.program(after_cmpx=(EXEC_ONE,))
+    i = rows.index(narrow.BRANCH[1])
+    rows = (*rows[:i], ('s_cbranch_scc0', '@load'), rows[i + 1], 'load', *rows[i + 2:])
+    assert encode(rows) == bytes.fromhex(''.join(code for _, code in narrow.program(after_cmpx=(EXEC_ONE,))))
+    yield 'exec-constant', 32, rows, READFIRST, False
+    i = rows.index(EXEC_ONE)
+    # Reconstruct the flat lane in v0 before using it for buffer offsets and compare inputs.
+    mbcnt = (('v_mbcnt_lo_u32_b32 v0, -1, 0', '000065d7c1000100'),
+             ('v_mbcnt_hi_u32_b32 v0, -1, v0', '000066d7c1000200'))
+    entry = ('v_readfirstlane_b32 s22, v0', '00052c7e')  # Force the retry before MBCNT, whose legacy path is wave32.
+    yield 'exec-constant-pair', 64, (entry, *mbcnt, *rows[:i - 2], SAVE64, rows[i - 1], *EXEC_HIGH_PAIR,
+                                    *rows[i + 1:-3], RESTORE64, *ending), READFIRST, False
+    rows = waterfall.program(after_save=(REMAINING_ONE,))
+    i, j = rows.index(waterfall.HEAD), rows.index(waterfall.CLOSE) + 1
+    loop = (*rows[:i], 'head', *rows[i:j], ('s_cbranch_scc1', '@head'), *rows[j + 1:])
+    assert encode(loop) == bytes.fromhex(''.join(code for _, code in rows))
+    yield 'waterfall-constant', 32, loop, WATERFALL + ' remaining mask is not an unchanged copy of EXEC', False
+    # The VCC and SGPR phis both combine EXEC with a scalar word. The two selects make each bit observable.
+    yield 'mask-word-phi', 32, (*prefix, SET_3, ('s_mov_b32 vcc_lo, 0', '8003eabe'),
+                               ('s_and_b32 s24, s4, exec_lo', '047e1887'),
+                               ('s_cbranch_execz', '@join'), SET_40,
+                               ('s_and_b32 vcc_lo, s4, exec_lo', '047e6a87'),
+                               ('s_and_b32 s24, s24, exec_lo', '187e1887'), 'join', restore,
+                               ('v_cndmask_b32_e32 v7, s20, v7, vcc_lo', '140e0e02'),
+                               ('v_cndmask_b32_e64 v8, 0, 64, s24', '080001d580806100'),
+                               ('v_add_nc_u32_e32 v7, v8, v7', '080f0e4a'), *ending), EXECZ + 'definition of s20', False
+
+
+def fixture_group(label, width):
+    if label in ('exec-constant', 'waterfall-constant'):
+        return (4, 1, 1)
+    if label == 'exec-constant-pair':
+        return (8, 4, 2)
+    return (width, 1, 1)
 
 
 def interpret(rows, active_count, keys, lanes):
@@ -88,11 +127,19 @@ def interpret(rows, active_count, keys, lanes):
     vgpr = {lane: {'v0': lane} for lane in lanes}
     sgpr = {'s4': active_count, 's6': 0}
     output = {}
-    exec_mask, vcc, scc = lanes.copy(), set(), False
+    entry_mask = sum(1 << lane for lane in lanes)
+    exec_mask, vcc, scc = entry_mask, 0, False
 
     def value(token, lane=None):
-        if token in ('exec', 'exec_lo'):
-            return exec_mask.copy()
+        if token == 'exec':
+            return exec_mask
+        if token == 'exec_lo':
+            return exec_mask & 0xffffffff
+        if token in ('vcc', 'vcc_lo'):
+            return vcc
+        if token.startswith('s['):
+            lo, hi = token[2:-1].split(':')
+            return sgpr['s' + lo] | (sgpr['s' + hi] << 32)
         if token.startswith('s'):
             return sgpr[token]
         if token.startswith('v'):
@@ -104,44 +151,62 @@ def interpret(rows, active_count, keys, lanes):
         asm, encoding = instructions[pc]
         pc += 1
         op, _, operands = asm.partition(' ')
-        op = op.removesuffix('_e32')
-        dst, src0, src1, *_ = operands.split(', ') + [None] * 3
+        op = op.removesuffix('_e32').removesuffix('_e64')
+        dst, src0, src1, mask, *_ = operands.split(', ') + [None] * 4
         if op in BRANCHES:
             take = {'s_branch': True, 's_cbranch_execz': not exec_mask, 's_cbranch_execnz': bool(exec_mask),
-                    's_cbranch_vccz': not vcc, 's_cbranch_vccnz': bool(vcc), 's_cbranch_scc1': scc}[op]
+                    's_cbranch_vccz': not vcc, 's_cbranch_vccnz': bool(vcc),
+                    's_cbranch_scc0': not scc, 's_cbranch_scc1': scc}[op]
             if take:
                 pc = labels[encoding[1:]]
         elif op == 's_endpgm':
             return output
-        elif op in ('s_load_dwordx8', 's_waitcnt'):
+        elif op in ('s_load_dwordx8', 's_waitcnt', 's_nop'):
             continue  # the fixture binds its input and output directly below
         elif op in ('s_mov_b32', 's_mov_b64'):
             word = value(src0)
-            if dst in ('exec', 'exec_lo'):
-                exec_mask = word.copy()
+            if dst == 'exec':
+                exec_mask = word & entry_mask
+            elif dst == 'exec_lo':
+                exec_mask = ((exec_mask & ~0xffffffff) | (word & 0xffffffff)) & entry_mask
+            elif dst == 'vcc_lo':
+                vcc = word & 0xffffffff
+            elif dst.startswith('s['):
+                lo, hi = dst[2:-1].split(':')
+                sgpr['s' + lo], sgpr['s' + hi] = word & 0xffffffff, (word >> 32) & 0xffffffff
             else:
-                sgpr[dst] = word
+                sgpr[dst] = word & 0xffffffff
         elif op == 's_add_u32':
             total = value(src0) + value(src1)
             sgpr[dst], scc = total & 0xffffffff, total > 0xffffffff
+        elif op == 's_and_b32':
+            word = value(src0) & value(src1)
+            if dst == 'vcc_lo':
+                vcc = word
+            else:
+                sgpr[dst] = word
+            scc = bool(word)
         elif op == 's_cmp_eq_u32':
             scc = value(dst) == value(src0)
         elif op == 's_andn2_wrexec_b32':
-            exec_mask = value(src0) - exec_mask
-            sgpr[dst], scc = exec_mask.copy(), bool(exec_mask)
+            low = value(src0) & ~exec_mask & entry_mask & 0xffffffff
+            sgpr[dst], scc = low, bool(low)
+            exec_mask = (exec_mask & ~0xffffffff) | low
         elif op == 'v_readfirstlane_b32':
-            sgpr[dst] = value(src0, min(exec_mask, default=0))
+            sgpr[dst] = value(src0, (exec_mask & -exec_mask).bit_length() - 1 if exec_mask else min(lanes))
         elif op in ('v_cmpx_gt_u32', 'v_cmpx_lt_u32', 'v_cmpx_eq_i32'):
             lhs, rhs = dst, src0
-            exec_mask = {lane for lane in exec_mask if {
+            exec_mask = sum(1 << lane for lane in lanes if exec_mask & (1 << lane) and {
                 'v_cmpx_gt_u32': value(lhs, lane) > value(rhs, lane),
                 'v_cmpx_lt_u32': value(lhs, lane) < value(rhs, lane),
                 'v_cmpx_eq_i32': value(lhs, lane) == value(rhs, lane),
-            }[op]}
+            }[op])
         elif op == 'v_cmp_eq_i32':
-            vcc = {lane for lane in exec_mask if value(src0, lane) == value(src1, lane)}
+            vcc = sum(1 << lane for lane in lanes if exec_mask & (1 << lane) and value(src0, lane) == value(src1, lane))
         else:
-            for lane in exec_mask:
+            for lane in sorted(lanes):
+                if not exec_mask & (1 << lane):
+                    continue
                 if op == 'buffer_store_dword':
                     output[value(src0, lane) // 4] = value(dst, lane)
                     continue
@@ -153,6 +218,14 @@ def interpret(rows, active_count, keys, lanes):
                     word = value(src1, lane) << value(src0, lane)
                 elif op == 'v_add_nc_u32':
                     word = value(src0, lane) + value(src1, lane)
+                elif op == 'v_xor_b32':
+                    word = value(src0, lane) ^ value(src1, lane)
+                elif op == 'v_cndmask_b32':
+                    word = value(src1 if value(mask) & (1 << lane) else src0, lane)
+                elif op in ('v_mbcnt_lo_u32_b32', 'v_mbcnt_hi_u32_b32'):
+                    start = 32 if '_hi_' in op else 0
+                    below = ((1 << lane) - 1) >> start
+                    word = (value(src0, lane) & below & 0xffffffff).bit_count() + value(src1, lane)
                 else:
                     raise AssertionError(asm)
                 vgpr[lane][dst] = word & 0xffffffff
@@ -165,15 +238,31 @@ def translate(rows, width=None, group=(32, 1, 1), refusals=None):
 
 
 def reference_cases(label, width, rows, mutate):
-    keys = ([7, 12, 7, 5, 12, 7, 18, 5] * 8)[:width]
-    for count in ((0, 5, 32) if width == 32 else (0, 5, 32, 37, 64)):
-        result = interpret(rows, count, keys, range(width))
-        expected = [result[i] for i in range(width)]
+    x, y, z = fixture_group(label, width)
+    threads = x * y * z
+    keys = ([7, 12, 7, 5, 12, 7, 18, 5] * 8)[:threads]
+    counts = (0, 5, 32) if width == 32 else (0, 5, 32, 37, 64)
+    if label == 'exec-constant':
+        counts = (0, 4)
+    if label == 'waterfall-constant':
+        keys, counts = [64, 32, 128, 96], (4,)
+    for count in counts:
+        result = interpret(rows, count, keys, range(threads))
+        expected = [result[i] for i in range(threads)]
         if label in ('s_cbranch_scc1', 's_cbranch_execnz'):
             assert expected == [len(set(keys[:count]))] * width, (label, count, expected)
         if label == 'first-active':
             selected = count + 1 if count + 1 < width else 0
             assert expected == [13 + keys[selected]] * width, (count, expected)
+        if label == 'exec-constant':
+            assert expected == [20, 13, 13, 13], (count, expected)
+        if label == 'exec-constant-pair':
+            assert expected == [20 if lane == 32 else 13 for lane in range(64)], (count, expected)
+        if label == 'waterfall-constant':
+            assert expected == [81, 13, 13, 13], expected
+        if label == 'mask-word-phi':
+            assert expected == [77 if lane < count and count & (1 << lane) else 40 if count else 3
+                                for lane in range(width)], (count, expected)
         mismatch = None
         if mutate:
             for lane, correct in enumerate(expected):
@@ -191,9 +280,38 @@ def lane_mutant(hlsl):
     return hlsl
 
 
+def mask_operand_controls(rows):
+    # Keep the read of EXEC=1 that selects the retry, then exercise the other mask consumers.
+    i = rows.index(narrow.USE)
+    select = ('v_cndmask_b32_e64 v5, 3, v0, s24', '050001d583006200')
+    probes = (
+        ('s_mov_b32 s24, s4', '040398be'), select,
+        ('v_add_co_ci_u32_e64 v7, s0, v5, v7, s24', '070028d5050f6200'),
+        ('s_mov_b32 vcc_lo, 2', '8203eabe'), ('s_cbranch_vccz', '@after_vcc'), narrow.BRANCH[-1], 'after_vcc',
+        ('s_and_b32 s24, vcc_lo, 2', '6a821887'), select,
+        ('s_mov_b32 s28, 2', '82039cbe'), ('s_and_saveexec_b32 s28, s28', '1c3c9cbe'),
+        ('s_cselect_b32 exec_lo, 2, 4', '82847e85'), ('s_or_b32 exec_lo, exec_lo, 2', '7e827e88'),
+    )
+    group = (4, 1, 1)
+    pipe = translate((*rows[:i], *probes, *rows[i:]), 32, group)
+    assert pipe.retry_group_vote
+    hlsl = pipe.hlsl_cs()
+    for snippet in (
+        '((s24 >> lane) & 1u) & 1) ? v0', 'a = a + (((s24 >> lane) & 1u) & 1u);',
+        'vcc = (((0x00000002u >> lane) & 1u)) & 1;', '!x2w_wave_any(lane, (vcc & 1u) != 0u)',
+        's24 = (vcc & ((0x00000002u >> lane) & 1u)) & 1u;', '(s24 & 1) ? v0',
+        'w = ((0x00000002u >> lane) & 1u);\n        s28 = exec;\n        exec = (exec & w) & 1;',
+        'exec = (scc ? ((0x00000002u >> lane) & 1u) : ((0x00000004u >> lane) & 1u)) & 1;',
+        'exec = (exec | ((0x00000002u >> lane) & 1u)) & 1; scc = x2w_wave_any(lane, exec != 0u);',
+    ):
+        assert snippet in hlsl, snippet
+    data_read = ('v_mov_b32_e32 v7, s24', '18020e7e')
+    refused('data operand s24 is a lane mask', lambda: translate((*rows[:i], *probes, data_read, *rows[i:]), 32, group))
+
+
 def controls():
     for label, width, rows, legacy_reason, mutate in programs():
-        group = (width, 1, 1)
+        group = fixture_group(label, width)
         with patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
             refused(legacy_reason, lambda: translate(rows, width, group))
             legacy_census = []
@@ -209,9 +327,9 @@ def controls():
         assert (counted.hlsl_cs(), counted.manifest()) == (hlsl, pipe.manifest()), label
         assert not re.search(r'\bWave\w*\(', hlsl), label
         main = hlsl.split('void main', 1)[1]
-        assert f'uint lane = tid.x + {width}u * (tid.y + 1u * tid.z);' in main, label
-        needs_first = waterfall.HEAD in rows
-        needs_any = label != 'first-active'
+        assert f'uint lane = tid.x + {group[0]}u * (tid.y + {group[1]}u * tid.z);' in main, label
+        needs_first = any(row[0].startswith('v_readfirstlane_b32') for row in rows if isinstance(row, tuple))
+        needs_any = label not in ('first-active', 'exec-constant', 'exec-constant-pair')
         assert ('x2w_wave_first(lane,' in main) == needs_first, label
         assert ('x2w_wave_any(lane,' in main) == needs_any, label
         assert not re.search(r'if \(exec & 1\).*x2w_wave_first', main), label
@@ -227,6 +345,20 @@ def controls():
             hlsl_2d = translate(rows, group=(8, 8, 1)).hlsl_cs()
             assert 'uint lane = tid.x + 8u * (tid.y + 8u * tid.z);' in hlsl_2d
             refused(legacy_reason, lambda: translate(rows, 32, group))
+        if label == 'exec-constant':
+            assert 'exec = (((0x00000001u >> lane) & 1u)) & 1;' in main
+            mask_operand_controls(rows)
+        if label == 'exec-constant-pair':
+            assert 'lane < 32u ? ((0x00000000u >> (lane & 31u)) & 1u)' in main
+            assert ': ((0x00000001u >> (lane & 31u)) & 1u)' in main
+            assert 'countbits(0xffffffffu & (lane < 32u ?' in main
+            assert 'countbits(0xffffffffu & ((1u << (max(lane, 32u) - 32u)) - 1u))' in main
+        if label == 'waterfall-constant':
+            assert '((s21 >> lane) & 1u) & ~exec' in main
+            assert 's21 = (lane < 32u ? (exec << (lane & 31u)) : 0u);' in main
+        if label == 'mask-word-phi':
+            assert 'vcc = (((ud0 >> lane) & 1u) & exec) & 1;' in main
+            assert 's24 = (((ud0 >> lane) & 1u) & exec) & 1u;' in main
         cases = list(reference_cases(label, width, rows, mutate))
         if mutate:
             assert any(diagnostic for _, _, _, diagnostic in cases), label
@@ -261,18 +393,18 @@ def controls():
         retry.assert_not_called()
     assert not pipe.retry_group_vote and 'x2w_wave_' not in pipe.hlsl_cs()
     assert (pipe.hlsl_cs(), pipe.manifest()) == (original.hlsl_cs(), original.manifest())
-    print('Eight group-vote fixtures, wave-size and divergent SCC refusal controls passed')
+    print('Twelve group-vote fixtures, wave-size and divergent SCC refusal controls passed')
 
 
 def dispatch(directory, dxc, runner, adapter):
     force_mutant = os.environ.get('X2W_TEST_GROUP_VOTE_MUTANT') == 'lane'
     for label, width, rows, _, mutate in programs():
-        hlsl = translate(rows, width, (width, 1, 1)).hlsl_cs()
+        hlsl = translate(rows, width, fixture_group(label, width)).hlsl_cs()
         cases, mutations = [], []
         for count, keys, expected, diagnostic in reference_cases(label, width, rows, mutate):
             case = directory / f'{label}-{count}.case'
-            words = [1, *expected, *([SENTINEL] * (WORDS - width)), count, *([0] * 15),
-                     *keys, *([0] * (WORDS - width))]
+            words = [1, *expected, *([SENTINEL] * (WORDS - len(expected))), count, *([0] * 15),
+                     *keys, *([0] * (WORDS - len(keys)))]
             case.write_bytes(struct.pack('<%dI' % len(words), *words))
             cases.append((case, f'active={count}', None))
             if diagnostic:

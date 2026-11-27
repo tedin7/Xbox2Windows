@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import startup_compute_waterfall as waterfall
 from compute_load_format_check import check_references
@@ -96,10 +97,16 @@ def controls(llvm_mc=None):
         (after_restore(clobber=(clobber,)), REFUSAL),
         (after_restore(value=VARYING), REFUSAL),
         (after_restore(move_before=True, clobber=(VARYING,)), REFUSAL),
-        (after_restore(wide=True, clobber=(high_clobber,)), REFUSAL),
-        (in_waterfall(body=(BFE, key_table, *BODY[3:])), 'per-lane descriptor selection'),
         (in_waterfall(writable=True), 'requires a read-only descriptor'),
         (in_waterfall(after_restore=(leak,)), 'body scalar is live at the loop exit'),
+    ):
+        code = bytecode(rows, llvm_mc)
+        # These fixtures use the four thread IDs as buffer offsets and waterfall keys.
+        with patch.object(waterfall.G.ComputePipeline, 'retry_group_vote_for', return_value=False):
+            refused(reason, lambda: translate(code).hlsl_cs())
+    for rows, reason in (
+        (after_restore(wide=True, clobber=(high_clobber,)), 'unproven lane mask operand s[26:27]'),
+        (in_waterfall(body=(BFE, key_table, *BODY[3:])), 's_load through s22'),
     ):
         code = bytecode(rows, llvm_mc)
         refused(reason, lambda: translate(code).hlsl_cs())
