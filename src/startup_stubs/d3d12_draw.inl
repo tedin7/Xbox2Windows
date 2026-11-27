@@ -677,7 +677,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             static const char* prefixes[] = {"x2w-manifest ", "key ", "ud ", "udsrc ", "srv ",
                 "srvtypes ", "srvint ", "srvuse ", "d16srv ", "uav ", "uavload ", "smp ", "smpc ", "smpl ",
                 "smpheap ", "params ", "targets ", "ps ", "wmask ", "placeholder "};
-            bool known = line == "dynamic_heap";
+            bool known = line == "dynamic_heap" || line == "dynamic_heap_formats";
             for (const char* prefix : prefixes)
                 if (line.compare(0, std::strlen(prefix), prefix) == 0) { known = true; break; }
             if (!known) {
@@ -4165,13 +4165,23 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     ID3D12DescriptorHeap* view_heap = draw_heap;
     UINT first = 0, heap_count = 0;
     if (tr->dynamic_heap) {
-        if (!indirect) {
+        if (!indirect || mesh) {
+            bool aliases_indirect_argument = false;
             view_heap = snapshot_buffer_heap(self, views, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, [&](ID3D12Resource* resource) {
+                    if (indirect && resource == indirect->argument) {
+                        aliases_indirect_argument = true;
+                        return true;
+                    }
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
                 }, tr->dynamic_heap_formats, heap_count);
+            if (aliases_indirect_argument) {
+                indirect->set_refusal("translated mesh heap aliases the indirect argument buffer",
+                                      indirect_refusal_code::unsupported_resource_or_entry);
+                view_heap = nullptr;
+            }
             first = heap_count + 1;
         } else view_heap = nullptr;
         if (!view_heap) {
