@@ -224,6 +224,26 @@ G.Stage.exec_write_only_narrows = staticmethod(lambda name, ops: False)
 got = run(MOVE, 's_cbranch_scc0 label_0014', 'v_cmpx_lt_f32_e32 v0, v1', READ, 's_endpgm', 's_endpgm')
 G.Stage.exec_write_only_narrows = original_narrows
 check('mutant: without the narrowing rule the read after a compare into EXEC is refused', got == REFUSAL, repr(got))
+# EXEC returned to a copy taken earlier: what was defined before the copy was run by every lane that comes back, what
+# was defined under the narrowed mask was not.
+RESTORE = ('v_mov_b32_e32 v7, s2', 's_mov_b32 s8, exec_lo', 's_cbranch_scc0 label_0020', 'v_cmpx_lt_f32_e32 v0, v1',
+           'v_mov_b32_e32 v6, s3', 's_mov_b32 exec_lo, s8')
+got = run(*RESTORE, 'v_readfirstlane_b32 s9, v7', 's_endpgm', 's_endpgm')
+check('read of a value defined before the saved copy accepted after the restore',
+      isinstance(got, list) and 's9 = s2;' in got, repr(got))
+got = run(*RESTORE, 'v_readfirstlane_b32 s9, v6', 's_endpgm', 's_endpgm')
+check('read of a value defined under the narrowed mask refused after the restore', got == REFUSAL, repr(got))
+got = run(RESTORE[0], 's_mov_b32 s8, exec_lo', 's_mov_b32 s8, 0', 's_cbranch_scc0 label_001c', 'v_cmpx_lt_f32_e32 v0, v1',
+          'v_mov_b32_e32 v6, s3', 's_mov_b32 exec_lo, s8', 'v_readfirstlane_b32 s9, v7', 's_endpgm', 's_endpgm')
+check('restore from an overwritten copy refused', got == REFUSAL, repr(got))
+got = run('v_mov_b32_e32 v7, s2', 's_cbranch_scc0 label_0014', 's_mov_b32 s8, exec_lo', 'v_cmpx_lt_f32_e32 v0, v1',
+          's_mov_b32 exec_lo, s8', 'v_readfirstlane_b32 s9, v7', 's_endpgm', 's_endpgm')
+check('restore from a copy that a branch can skip refused', got == REFUSAL, repr(got))
+original_restore = G.Stage.exec_restore_copy
+G.Stage.exec_restore_copy = lambda self, name, ops: None
+got = run(*RESTORE, 'v_readfirstlane_b32 s9, v7', 's_endpgm', 's_endpgm')
+G.Stage.exec_restore_copy = original_restore
+check('mutant: without the restore rule the read after the restore is refused', got == REFUSAL, repr(got))
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',

@@ -6808,7 +6808,7 @@ class Stage:
                     break
                 if name.startswith(('s_branch', 's_cbranch')):
                     ops = parse(asm)[1]
-                    label = re.fullmatch(r'label_0x([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
+                    label = re.fullmatch(r'label_(?:0x)?([0-9a-f]+)', ops[0]) if len(ops) == 1 else None
                     if not label:
                         edges = None
                         break
