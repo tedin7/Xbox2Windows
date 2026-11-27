@@ -1,10 +1,7 @@
 // Desktop readback for flat parameters in tools/startup/gfx2hlsl.py (v_interp_mov_f32, #1259).
 //
-// Draws one pixel with a translated vertex and pixel stage and returns the four 32-bit words of
-// the colour. The entry constants (cbuffer entry : register(b0)) are visible to both stages, because
-// the translated vertex stage reads ud0, the rectangle-list switch; they are all 0 here (plain
-// triangles) unless the caller passes four words. The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
-// exported.
+// Draws a full-screen triangle and returns four words per R32G32B32A32_FLOAT pixel.
+// The caller can supply b0 entry constants and bind raw input words at t0.
 #include "desktop_gpu.h"
 
 #include <cstdint>
@@ -19,8 +16,6 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
-constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
-
 std::vector<char> read_blob(const char* path)
 {
     std::ifstream file(path, std::ios::binary);
@@ -34,18 +29,22 @@ std::vector<char> read_blob(const char* path)
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width, UINT height,
                               D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
-                              const std::uint32_t* constants)
+                              const std::uint32_t* constants, UINT constant_count,
+                              const std::vector<std::uint32_t>& raw_srv)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
 
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.Constants = {0, 0, entry_constants};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, constant_count};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor = {0, 0};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 1;
-    rs.pParameters = &param;
+    rs.NumParameters = raw_srv.empty() ? 1 : 2;
+    rs.pParameters = params;
     ComPtr<ID3DBlob> signature, errors;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)))
         throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer())
@@ -97,8 +96,19 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     auto* list = commands.list.Get();
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
-    const std::uint32_t zeros[entry_constants] = {0, 0, 0, 0};
-    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants ? constants : zeros, 0);
+    const std::vector<std::uint32_t> zeros(constants ? 0 : constant_count);
+    list->SetGraphicsRoot32BitConstants(0, constant_count, constants ? constants : zeros.data(), 0);
+    ComPtr<ID3D12Resource> source;
+    if (!raw_srv.empty()) {
+        const auto size = raw_srv.size() * sizeof(raw_srv[0]);
+        source = make_buffer(device, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        const D3D12_RANGE no_read{0, 0};
+        void* mapped = nullptr;
+        check(source->Map(0, &no_read, &mapped), "Map pixel buffer input");
+        std::memcpy(mapped, raw_srv.data(), size);
+        source->Unmap(0, nullptr);
+        list->SetGraphicsRootShaderResourceView(1, source->GetGPUVirtualAddress());
+    }
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);

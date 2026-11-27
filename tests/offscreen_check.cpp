@@ -1489,10 +1489,13 @@ bool validate_raster_args(int argc, char** argv)
            (winding == "cw" || winding == "ccw");
 }
 
+static std::vector<std::uint32_t> parse_hex_words(std::string_view text);
+
 // --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
 // width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
 // row by row. Reports the first differing pixel and the number of differing pixels.
+// --startup-pixel-buffer-words appends comma-separated hex words for b0 and the raw t0 buffer.
 OperationResult run_startup_pixel_words(const OperationContext& ctx)
 {
     const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
@@ -1508,6 +1511,13 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
                           mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
                                 cull, winding == "ccw", 6);
+    } else if (std::string_view(ctx.argv[2]) == "--startup-pixel-buffer-words") {
+        const auto entry = parse_hex_words(ctx.argv[8]);
+        const auto buffer = parse_hex_words(ctx.argv[9]);
+        if (entry.empty() || entry.size() > 32 || buffer.empty())
+            return {OutcomeKind::fail, "expected 1..32 entry constants and a nonempty buffer"};
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
+                                D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer);
     } else {
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
     }
@@ -1752,6 +1762,7 @@ const OperationSpec kOperations[] = {
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).

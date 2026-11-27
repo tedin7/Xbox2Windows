@@ -1,9 +1,10 @@
-"""Check v_readfirstlane_b32 lowering in straight-line code and entry blocks, without shader machine code."""
+"""Check v_readfirstlane_b32 lowering in entry blocks and forward pixel flow."""
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from startup_firstlane_pixel_fixture import check_translation as check_pixel_translation  # noqa: E402
 
 failures = []
 
@@ -495,5 +496,6 @@ check('long doubling chain keeps a bounded recompute expression', longest <= 2 *
 got = run(MOVE, *[DOUBLE] * 22, READ, kind='cs', group=(64, 1, 1))
 check('entry-block read of a long doubling chain copies the VGPR', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
 
+check_pixel_translation()
 print('Readfirstlane uniformity checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)
