@@ -1123,7 +1123,7 @@ def check_paired_draws(dxc, renderer, adapter, directory):
             ('cmpx and nand', False, True)]:
         negative = paired_program(nested, missing=True, cmpx_nand=cmpx_nand)[1]
         for mutant in (False, True):
-            tag = 'paired_%d_mutant_%d' % (nested, mutant)
+            tag = 'paired_%d_cmpx_%d_mutant_%d' % (nested, cmpx_nand, mutant)
             text, reason = masked_unfolded_mutant(negative) if mutant else translate(negative)
             if text is None:
                 check(tag + ' translates', False, str(reason))

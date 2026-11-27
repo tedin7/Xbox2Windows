@@ -6115,11 +6115,11 @@ class Stage:
         wave = getattr(self.pipe, 'wave_size', None)
         if not bounds or not (wave == 32 or wave is None and wave32_exec_proof(self.ins)):
             return set()
+        # A 64-bit scalar op (address pairs, s_bfm_b64) only makes its destination words N in transfer() below:
+        # it never yields G, and writes_exec catches a 64-bit EXEC write. vcc_hi is plain data in wave32.
         for _, _, name, asm in self.ins:
             _, ops, _ = parse(asm)
-            if (name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe'))
-                    or name.startswith('s_') and re.search(r'_(?:b|u|i)64(?:_|$)', name)
-                    or ops and ops[0] in ('exec_hi', 'vcc_hi')):
+            if name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe')) or ops and ops[0] == 'exec_hi':
                 return set()
 
         # RDNA 2 ISA 3.9: VOPC clears inactive lanes; after widening those
