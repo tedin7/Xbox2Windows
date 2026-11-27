@@ -132,6 +132,23 @@ def vertex_copy(arm):
     return HEAD + assemble(SETUP + [COND, 'join'] + arm) + COPY_V8 + EXPORTS
 
 
+# A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
+# picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
+# index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
+#   s_mov_b32 s11, 0 / v_mov_b32 v11, 0 / s_mov_b32 s30, exec_lo / v_cmpx_eq_i32 0, v0 / s_cbranch_execz skip /
+#   s_mov_b32 s12, 1 / skip: s_mov_b32 exec_lo, s30 / s_and_b32 s12, s8, 0x7fffffff / s_cmp_eq_u32 s9, 0 /
+#   s_cbranch_scc1 other / s_mov_b32 s12, s14 / s_branch join / other: s_lshl_b32 s12, s12, 5 /
+#   s_load_dwordx4 s[16:19], s[10:11], s12 / s_waitcnt lgkmcnt(0) / buffer_load_dword v8, v11, s[16:19], 0 offen /
+#   s_waitcnt vmcnt(0) / join: v_mov_b32 v6, v8 / v7, v8 / v9, v8
+ELSE_ARM = bytes.fromhex(
+    '80038bbe8002167e7e039ebe8000247d010088bf81038cbe1e03febe08ff0c87ffffff7f098006bf020085bf0e038cbe070082bf'
+    '0c850c8f050408f4000000187fc08cbf001030e00b080480703f8cbf08030c7e08030e7e0803127e')
+ELSE_VS = HEAD + ELSE_ARM + EXPORTS
+# The same, with the index register written from the undefined register before the branch (s_and replaced).
+ELSE_VARYING_VS = HEAD + bytes.fromhex(
+    '80038bbe8002167e7e039ebe8000247d010088bf81038cbe1e03febe0e038cbe098006bf020085bf0e038cbe070082bf'
+    '0c850c8f050408f4000000187fc08cbf001030e00b080480703f8cbf08030c7e08030e7e0803127e') + EXPORTS
+
 REFUSAL = "s_load with a register offset through ('resheap',)"
 
 
@@ -195,6 +212,7 @@ def main(dxc=None):
            and '[loop] for' in loop_source)
     print('heap record in a branch: controls matched')
     rewrite_controls()
+    else_arm_controls()
 
 
 def rewrite_controls():
@@ -210,10 +228,18 @@ def rewrite_controls():
     print('heap record rewrite: controls matched')
 
 
-def draw(offscreen, vs, ps, offset, reference, count, negative=False):
-    """One draw of the vertex stage that reads heap record `offset` (ud1) when ud2 is 2."""
+def else_arm_controls():
+    pipe, vs_source, _ = translate(ELSE_VS)
+    expect('else arm translates', 'dynamic_heap\n' in pipe.manifest() and 'x2w_heap_load(' in vs_source)
+    reason = refusal(ELSE_VARYING_VS)
+    expect('else arm: index varying before the branch refused', reason == REFUSAL, str(reason))
+    print('heap record in an else arm: controls matched')
+
+
+def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2):
+    """One draw of the vertex stage that reads the heap record named by `offset` (ud1) when ud2 is `cond`."""
     entry = [0] * count + [2]
-    entry[1], entry[2] = offset, 2
+    entry[1], entry[2] = offset, cond
     as_hex = lambda words: ','.join('%08x' % word for word in words)
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
                              as_hex([reference] * 4)], capture_output=True, text=True)
@@ -234,17 +260,18 @@ def mutate(source, old, new):
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
-    for label, arm in (('branch', ARM), ('rewrite', REWRITE_ARM)):
-        pipe, vs_source, ps_source = translate(vertex_copy(arm))
+    for label, words, cond, unit in (('branch', vertex_copy(ARM), 2, 32), ('rewrite', vertex_copy(REWRITE_ARM), 2, 32),
+                                     ('else arm', ELSE_VS, 0, 1)):
+        pipe, vs_source, ps_source = translate(words)
         count = len(pipe.uds)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             vs = compile_shader(dxc, directory, 'vs_6_6', vs_source)
             ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
-            draw(offscreen, vs, ps, 0, 0x3fa00000, count)
-            draw(offscreen, vs, ps, 32, 0x40200000, count)
+            draw(offscreen, vs, ps, 0, 0x3fa00000, count, cond=cond)
+            draw(offscreen, vs, ps, 32 // unit, 0x40200000, count, cond=cond)
             wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(vs_source, ') >> 5;', ') >> 6;'))
-            draw(offscreen, wrong, ps, 32, 0x40200000, count, negative=True)
+            draw(offscreen, wrong, ps, 32 // unit, 0x40200000, count, negative=True, cond=cond)
         print('heap record %s: readback and mutant matched' % label)
 
 
