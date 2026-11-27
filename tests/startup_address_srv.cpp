@@ -351,8 +351,8 @@ int draw_desktop_array_srvs(void* guest, void* list)
 {
     constexpr std::size_t slice_stride = 64 * 1024;
     constexpr auto color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    alignas(4096) static std::array<unsigned char, 6 * slice_stride> small{};
-    alignas(4096) static std::array<unsigned char, 12 * slice_stride> large{};
+    alignas(4096) static std::array<unsigned char, 6 * slice_stride> cube_small{};
+    alignas(4096) static std::array<unsigned char, 12 * slice_stride> cube_large{};
     const auto fill = [slice_stride](unsigned char* data, UINT slices, UINT side, UINT red) {
         for (UINT slice = 0; slice < slices; ++slice)
             for (UINT y = 0; y < side; ++y)
@@ -365,8 +365,8 @@ int draw_desktop_array_srvs(void* guest, void* list)
                                 color, sizeof(color));
                 }
     };
-    fill(small.data(), 6, 1, 19);
-    fill(large.data(), 12, 2, 31);
+    fill(cube_small.data(), 6, 1, 19);
+    fill(cube_large.data(), 12, 2, 31);
 
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
@@ -377,7 +377,7 @@ int draw_desktop_array_srvs(void* guest, void* list)
     binding.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     binding.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
     binding.view.TextureCube.MipLevels = 1;
-    binding.address = ptr(large.data());
+    binding.address = ptr(cube_large.data());
 
     const auto draw = [&](LONG top, LONG bottom) {
         invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
@@ -393,7 +393,7 @@ int draw_desktop_array_srvs(void* guest, void* list)
         draw(2, 4);
         shape.Width = shape.Height = 1;
         shape.DepthOrArraySize = 6;
-        binding.address = ptr(small.data());
+        binding.address = ptr(cube_small.data());
         draw(0, 2);
 
         const void* slot = reinterpret_cast<const void*>(cpu);
