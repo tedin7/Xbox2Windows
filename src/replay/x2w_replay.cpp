@@ -70,6 +70,7 @@ constexpr std::uint16_t device_create_descriptor_heap = 14, device_increment_siz
 constexpr std::uint16_t heap_cpu_start = 9, heap_gpu_start = 10, fence_completed = 8, queue_present = 32;
 constexpr std::uint16_t resource_map = 8, resource_get_desc = 10, resource_gpu_address = 11;
 constexpr std::uint16_t frame_event_wait = 80;  // device slot 80: (type, timeout, reserved, flags, out token)
+constexpr std::uint16_t queue_timestamp_frequency = 18;
 constexpr std::uint32_t rcx_arg = 15;  // ARGM argument of rcx when rcx is not an object (a struct-return buffer)
 constexpr int top_slots = 16;
 
@@ -470,6 +471,14 @@ bool guarded_slot(u64 object, u64 rcx, std::uint16_t slot, const u64 (&a)[call_a
 }
 
 // Plays one call. false: skipped (counted in the census).
+// The argument a slot writes its result through: a wrapper output (x2w_replay_slots::output_arg), or a value the stand-in
+// writes for the caller (command queue slot 18, GetTimestampFrequency).
+int written_arg(const CallRecord& c)
+{
+    if (c.kind == queue_kind && c.slot == queue_timestamp_frequency) return 0;
+    return x2w_replay_slots::output_arg(c.kind, c.slot);
+}
+
 bool play(Player& p, const Recording& r, const Step& step)
 {
     current_step = &step;
@@ -525,7 +534,7 @@ bool play(Player& p, const Recording& r, const Step& step)
     }
     // An out pointer the file does not hold (older files dropped it when the call failed) is the recorded process's
     // stack address: the stand-in would write through it. It gets a zeroed buffer of the player's own.
-    if (const int out = x2w_replay_slots::output_arg(c.kind, c.slot);
+    if (const int out = written_arg(c);
         out >= 0 && out < call_args && !call.top[out] && c.args[out] && a[out] == c.args[out] && !page_replay().reserved(a[out])) {
         auto scratch = std::make_unique<unsigned char[]>(16);
         std::memset(scratch.get(), 0, 16);

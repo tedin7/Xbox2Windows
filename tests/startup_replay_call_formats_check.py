@@ -74,6 +74,19 @@ def pre_install_device():
         data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 0x101, 0, leaf, 4096, 0x1EAF))
         if seq == 10:
             data += chunk(b"BLOB", struct.pack("<QQ", 0x1EAF, 4096), bytes(range(256)) * 16)
+    # A command queue made in the file (device slot 8), then its GetTimestampFrequency (queue slot 18) whose out pointer the
+    # file does not hold: the stand-in writes the frequency into a buffer of the player's own, not through that address.
+    desc_at, iid_at, queue_out, queue = 0x7253F500, 0x7253F540, 0x7253F560, 0x7777
+    queue_iid = bytes.fromhex("a670c80e7e5d224c8cfc5baae07616ed")  # IID_ID3D12CommandQueue
+    data += chunk(b"CALL", CALL[3].pack(12, 1, 0, 8, DEVICE, desc_at, iid_at, queue_out, *([0] * 8), 0, 0.0, 0, 0))
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 12, 0, 0, desc_at, 16, 0xD35C))
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 12, 1, 0, iid_at, 16, 0x11D))
+    data += chunk(b"ARGM", struct.pack("<QIIQQQ", 12, 2, 0, queue_out, 8, 0x0007))
+    data += chunk(b"OUTP", struct.pack("<QIIQ", 12, 2, 0, queue))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0xD35C, 16), bytes(16))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x11D, 16), queue_iid)
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x0007, 8), bytes(8))
+    data += chunk(b"CALL", CALL[3].pack(13, 1, 1, 18, queue, 0xBAD00000000, *([0] * 10), 0, 0.0, 0, 0))
     return data
 
 
@@ -142,10 +155,11 @@ def main(player):
         code, text, out = play(player, directory, "pre-install", pre_install_device())
         assert code == 0, (code, text[-2500:])
         summary = json.loads((out / "replay_summary.json").read_text())
-        assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (11, 7, 2, 1), summary
+        assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (13, 9, 2, 1), summary
         # Copies: the riid of seq 5 (seq 6 is skipped first) and both 16-byte structs, plus the 4 KiB leaf once: the
-        # second call shares it.
-        assert (summary["argument_bytes"], summary["shared_argument_bytes"]) == (3 * 16 + 4096, 4096), summary
+        # second call shares it; the queue's description, IID and out pointer.
+        assert (summary["argument_bytes"], summary["shared_argument_bytes"]) == (3 * 16 + 4096 + 40, 4096), summary
+        assert "fault in the stand-in" not in text, text[-2500:]
         assert summary["peak_private_bytes"] > 0, summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
         for line in ("x2w-replay: skip census: ", "skip census 0:0 recorded failure: 1",
