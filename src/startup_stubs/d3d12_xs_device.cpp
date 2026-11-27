@@ -8599,11 +8599,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         char null_totals[200];
         x2w_startup::format_null_binding_totals(null_totals, sizeof(null_totals), null_total, null_causes);
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, %s, approximated shaders %ld, "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_totals, approximated_translations,
             formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],

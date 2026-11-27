@@ -357,6 +357,9 @@ RESULTS_NAME = "shader_results.txt"
 KEY_RE = re.compile(r"(?:^|[^0-9a-f])([0-9a-f]{16})(?:[^0-9a-f]|$)")
 # request file extension -> kind; result marker: ready file suffix per kind, `.fail` for a refusal
 REQUEST_KINDS = {".a": "graphics", ".rtv": "graphics", ".c67": "compute", ".m57": "mesh57", ".m86": "mesh86"}
+APPROX_LOG_RE = re.compile(
+    r"x2w-gfx approx: key ([0-9a-f]{16}) stage (?:vs|ms|ps|cs)(?:\+(?:vs|ms|ps|cs))*"
+    r" lifted [0-9]+ readfirstlane, [0-9]+ reductions")
 READY_SUFFIXES = {"graphics": (".txt",), "compute": (".txt",), "mesh57": (".ms57.txt",), "mesh86": (".mesh86.txt",)}
 REASON_CHARS = 200         # per key; the translator's own message, first line only
 COMPILER_CODE_RE = re.compile(r"\b(?:error|warning)\s+[A-Z]\d{3,5}\b")
@@ -387,7 +390,8 @@ def normal_reason(reason):
 
 def cache_results(cache_dir):
     """[(key, kind, status, reason)] for every request key in a shader cache folder, sorted by kind and key. Status is
-    `ok` (the ready marker is published), `refused` (a `.fail` file: its first line is the reason) or `pending`."""
+    `ok` (published manifest), `approximated` (published diagnostic result), `refused` (first line of its `.fail`),
+    or `pending`."""
     found, by_key = {}, {}
     if not os.path.isdir(cache_dir):
         return []
@@ -402,12 +406,23 @@ def cache_results(cache_dir):
     rows = []
     for key, kind in found.items():
         status, reason = "pending", ""
+        if key + ".approx.txt" in by_key[key]:
+            try:
+                with open(os.path.join(cache_dir, key + ".approx.txt"), encoding="ascii") as handle:
+                    marker = handle.readline().strip()
+                match = APPROX_LOG_RE.fullmatch(marker)
+                if match and any(os.path.isfile(os.path.join(cache_dir, match[1] + suffix))
+                                 for suffix in READY_SUFFIXES[kind]):
+                    rows.append((key, kind, "approximated", marker))
+                    continue
+            except (OSError, UnicodeError):
+                pass
         for name in by_key[key]:
             if name.endswith(".fail"):
                 with open(os.path.join(cache_dir, name), "r", encoding="utf-8", errors="replace") as handle:
                     status, reason = "refused", clean_reason(handle.read(4096))
                 break
-            if name.endswith(READY_SUFFIXES[kind]) and not name.endswith(".fail"):
+            if not name.endswith(".approx.txt") and name.endswith(READY_SUFFIXES[kind]):
                 status = "ok"
         rows.append((key, kind, status, reason))
     return sorted(rows, key=lambda row: (row[1], row[0]))
@@ -436,7 +451,22 @@ def key_use(logdir):
     return found
 
 
-def format_results(rows, use=None):
+def loaded_approximations(logdir):
+    """The runtime can encounter a cached diagnostic result more than once."""
+    found = {}
+    try:
+        with open(os.path.join(logdir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                marker = line.rstrip()
+                match = APPROX_LOG_RE.fullmatch(marker)
+                if match:
+                    found[match[1]] = marker
+    except OSError:
+        pass
+    return found
+
+
+def format_results(rows, use=None, loaded=None):
     """Text for the zip: totals, the refusals ranked by normalized reason, the refused keys used latest, then one line per
     key. use is key_use(): a key a draw or Dispatch used carries first=, last= (seconds since the process started) and uses=."""
     use = use or {}
@@ -445,10 +475,13 @@ def format_results(rows, use=None):
         kinds[kind] = kinds.get(kind, 0) + 1
     count = lambda status: sum(1 for row in rows if row[2] == status)
     lines = ["# shader cache results: the translator's own messages, first line of each .fail, no shader code",
-             "keys %d (%s): ok %d, refused %d, pending %d" % (
+             "keys %d (%s): ok %d, refused %d, pending %d, approximated %d" % (
                  len(rows), ", ".join("%s %d" % item for item in sorted(kinds.items())) or "none",
-                 count("ok"), count("refused"), count("pending")),
-             "", "## refusals by reason (registers and numbers normalized)"]
+                 count("ok"), count("refused"), count("pending"), count("approximated"))]
+    if loaded:
+        lines.append("approximated shaders loaded %d" % len(loaded))
+        lines.extend(loaded[key] for key in sorted(loaded))
+    lines += ["", "## refusals by reason (registers and numbers normalized)"]
     ranked = {}
     for _, kind, status, reason in rows:
         if status == "refused":
@@ -927,7 +960,7 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
     if cache_dir:  # the result of every request key of the shader cache, text only (cache_results)
         rows = cache_results(cache_dir)
         manifest["cache_keys"] = len(rows)
-        add(RESULTS_NAME, format_results(rows, key_use(logdir)).encode("utf-8"))
+        add(RESULTS_NAME, format_results(rows, key_use(logdir), loaded_approximations(logdir)).encode("utf-8"))
     if map_file:  # function table of our own d3d12_xs.dll, so analyze_run can name d3d12_xs.dll+0xNNNN
         with open(map_file, encoding="utf-8", errors="replace") as handle:
             symbol_rows = parse_symbols(handle.read())

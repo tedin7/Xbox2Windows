@@ -470,7 +470,7 @@ def check_cache_results():
         assert rows["2000000000000003"] == ("compute", "refused", "dxc cs compile failed (error X3004)"), rows["2000000000000003"]
 
         text = T.format_results(T.cache_results(str(cache)))
-        assert text.splitlines()[1] == "keys 12 (compute 3, graphics 5, mesh57 2, mesh86 2): ok 3, refused 6, pending 3", text.splitlines()[1]
+        assert text.splitlines()[1] == "keys 12 (compute 3, graphics 5, mesh57 2, mesh86 2): ok 3, refused 6, pending 3, approximated 0", text.splitlines()[1]
         assert b"secret_shader_body" not in text.encode() and "DXBC" not in text and "ISA" not in text
         # the two cvt refusals differ only in registers and constants: one wall, counted twice, first in the ranking
         ranking = text.split("## keys")[0].splitlines()
