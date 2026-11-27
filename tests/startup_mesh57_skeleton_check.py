@@ -48,13 +48,13 @@ import gfx2hlsl as G  # noqa: E402
 MESH = (
     'bfa00003 befe0481 be84047e 8706ff03 0f000000 bf850007 2c0a0a87 7e0c0280 d8340008 00000506'
     ' bfa3ffe3 bf8a0000 bf820004 bf8a0000 7e0c0280 d8d80008 05000006 befe04c1 9386ff03 00040018'
-    ' 8f078606 d7650000 00000ec1 d7660000 000200c1 bf8cc07f 7e180505 f4080405 fa000000 be8d0308'
-    ' be8e0309 bf8a0000 bf008006 bf840010 befe0404 bf880007 7e02020d 7e040280 7e06020e d8340000'
-    ' 00000102 d8340004 00000302 befe04c1 bfa3ffe3 bf8a0000 8f048c0d 887c0e04 bf900009 bf82000d'
-    ' bf8a0000 befe0404 bf880009 7e040280 d8d80000 01000002 d8d80004 03000002 bf8cc17f 7e1a0501'
-    ' bf8cc07f 7e1c0503 befe04c1 7d28000e 3608008f 34080884 e0381000 80041004 e03810c0 80041404'
-    ' bf8c3f70 f80008cf 13121110 f800020f 17161514 befe04c1 7d28000d 3608008f 34080882 e0301180'
-    ' 80041804 bf8c3f70 f8000941 00000018 bf810000').split()
+    ' 8f078606 d7650000 00000ec1 d7660000 000200c1 bf8cc07f 7e280505 f4080209 fa000000 be950310'
+    ' be960311 bf8a0000 bf008006 bf840010 befe0404 bf880007 7e020215 7e040280 7e060216 d8340000'
+    ' 00000102 d8340004 00000302 befe04c1 bfa3ffe3 bf8a0000 8f048c15 887c1604 bf900009 bf82000d'
+    ' bf8a0000 befe0404 bf880009 7e040280 d8d80000 01000002 d8d80004 03000002 bf8cc17f 7e2a0501'
+    ' bf8cc07f 7e2c0503 befe04c1 7d280016 3608008f 34080884 e0381000 80021004 e03810c0 80021404'
+    ' bf8c3f70 f80008cf 13121110 f800020f 17161514 befe04c1 7d280015 3608008f 34080882 e0301180'
+    ' 80021804 bf8c3f70 f8000941 00000018 bf810000').split()
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
@@ -102,11 +102,11 @@ DEPTH_PIXEL_MUTANTS = (
 )
 
 # Overwrite red after the raw colour load; green, blue and alpha still come from its other three words.
-COLOUR_LOAD = 'buffer_load_dwordx4 v[20:23], v4, s[16:19], 0 offen offset:192'
-FORMAT_LOAD = 'buffer_load_format_x v20, v4, s[16:19], 0 offen offset:192'
+COLOUR_LOAD = 'buffer_load_dwordx4 v[20:23], v4, s[8:11], 0 offen offset:192'
+FORMAT_LOAD = 'buffer_load_format_x v20, v4, s[8:11], 0 offen offset:192'
 AFTER_COLOUR_LOAD = MESH.index('e03810c0') + 2
-FORMATTED_MESH = MESH[:AFTER_COLOUR_LOAD] + ['e00010c0', '80041404'] + MESH[AFTER_COLOUR_LOAD:]
-REWRITTEN_FORMAT = FORMATTED_MESH[:AFTER_COLOUR_LOAD] + ['be930380'] + FORMATTED_MESH[AFTER_COLOUR_LOAD:]  # s_mov_b32 s19, 0
+FORMATTED_MESH = MESH[:AFTER_COLOUR_LOAD] + ['e00010c0', '80021404'] + MESH[AFTER_COLOUR_LOAD:]
+REWRITTEN_FORMAT = FORMATTED_MESH[:AFTER_COLOUR_LOAD] + ['be8b0380'] + FORMATTED_MESH[AFTER_COLOUR_LOAD:]  # s_mov_b32 s11, 0
 
 
 def code(words):
@@ -135,13 +135,13 @@ def vertex_red(words):
     """Run words after the count exchange and use the resulting v7 as vertex red."""
     wait = MESH.index('bf8c3f70')
     mesh = MESH[:wait + 1] + ['7e280307'] + MESH[wait + 1:]  # v_mov_b32 v20, v7
-    at = mesh.index('7d28000e')
+    at = mesh.index('7d280016')
     return mesh[:at] + words.split() + mesh[at:]
 
 
-MASKED_IF_ELSE = '7e0e02f0 7d880086 be94246a bf880002 7e0e02f2 bf820001 bf800000 8afe7e14 7e0e0280 befe04c1'
-# The same if/else with s_add_u32 s50, s13, 1 in the then arm. No path reads s50 after the join.
-MASKED_DEAD_SCALAR = '7e0e02f0 7d880086 be94246a bf880003 7e0e02f2 8032810d bf820001 bf800000 8afe7e14 7e0e0280 befe04c1'
+MASKED_IF_ELSE = '7e0e02f0 7d880086 be8c246a bf880002 7e0e02f2 bf820001 bf800000 8afe7e0c 7e0e0280 befe04c1'
+# The same if/else with s_add_u32 s50, s21, 1 in the then arm. No path reads s50 after the join.
+MASKED_DEAD_SCALAR = '7e0e02f0 7d880086 be8c246a bf880003 7e0e02f2 80328115 bf820001 bf800000 8afe7e0c 7e0e0280 befe04c1'
 
 
 def masked_vertex_red(words=MASKED_IF_ELSE):
@@ -153,12 +153,12 @@ def masked_vertex_red(words=MASKED_IF_ELSE):
 # The first six threads select the shift for their entire guest wave. The second wave keeps 64/255.
 SHIFT_ASM = """s_mov_b32 s40, 0x3e808081
 v_cmp_gt_u32_e32 vcc, 6, v0
-s_and_saveexec_b64 s[20:21], vcc
+s_and_saveexec_b64 s[12:13], vcc
 s_cbranch_execz 2
 s_lshl_b32 s40, 0x1fc00000, 1
 s_mov_b64 exec, -1
 v_mov_b32 v7, s40"""
-SHIFT_WORDS = 'bea803ff 3e808081 7d880086 be94246a bf880002 8f2881ff 1fc00000 befe04c1 7e0e0228'
+SHIFT_WORDS = 'bea803ff 3e808081 7d880086 be8c246a bf880002 8f2881ff 1fc00000 befe04c1 7e0e0228'
 SHIFT_MESH = vertex_red(SHIFT_WORDS)
 
 
@@ -187,8 +187,8 @@ BRANCH_CASES = (
      vertex_red('7e0e0280 ' + VCC_COMPARE + ' bf008080 bf850002 d406006a 0001e028 bf860001 7e0e02f2'),
      lambda lane: 0),
     # v7 starts at 0.5. The then arm writes 1.0 for tid < 6, the else arm writes 0.0 for the remaining lanes.
-    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[20:21], vcc; s_cbranch_execz .empty
-    # v_mov v7, 1.0; s_branch .else; .empty: s_nop; .else: s_andn2_b64 exec, s[20:21], exec
+    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[12:13], vcc; s_cbranch_execz .empty
+    # v_mov v7, 1.0; s_branch .else; .empty: s_nop; .else: s_andn2_b64 exec, s[12:13], exec
     # v_mov v7, 0; s_mov_b64 exec, -1
     ('lane-masked if/else', masked_vertex_red(), lambda lane: 255 if lane < 6 else 0),
     ('lane-masked if/else with a dead scalar write', masked_vertex_red(MASKED_DEAD_SCALAR),
@@ -196,7 +196,7 @@ BRANCH_CASES = (
 )
 
 COUNT = [i for i, word in enumerate(MESH) if word == 'bf8a0000'][2]
-POST_COUNT = MESH.index('7d28000e')
+POST_COUNT = MESH.index('7d280016')
 GROUP_END = MESH.index('05000006') + 1
 PRIMITIVE_EXPORT = MESH.index('f8000941')
 
@@ -208,18 +208,18 @@ s_mov_b64 exec, -1
 v_cmpx_gt_u32_e32 s42, v0
 s_mov_b32 s42, 0
 s_cbranch_execz 4
-s_buffer_load_dword s40, s[16:19], s41 offset:0x1e0
+s_buffer_load_dword s40, s[8:11], s41 offset:0x1e0
 v_mov_b32 v7, 1.0
 s_waitcnt lgkmcnt(0)
 s_mov_b64 exec, -1"""
 WAVE_LOAD_PREFIX = 'bea803ff 3e808081 8f298806 beaa0386 7e0e0280 befe04c1 7da8002a beaa0380'
-WAVE_LOAD_BODY = 'f4200a08 520001e0 7e0e02f2 bf8cc07f'
+WAVE_LOAD_BODY = 'f4200a04 520001e0 7e0e02f2 bf8cc07f'
 
 
 def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e280228 7e2a0307'):
     """Insert the scalar load before the count exchange and export its value as vertex red."""
     body = body.split()
-    before = MESH.index('be8d0308')
+    before = MESH.index('be950310')
     wait = MESH.index('bf8c3f70')
     return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + ['befe04c1']
             + MESH[before:wait + 1] + exports.split() + MESH[wait + 1:])
@@ -232,7 +232,7 @@ MASK_FRONT = 'bf068006'                       # s_cmp_eq_u32 s6, 0
 MASK_RIGHT = 'd4c6002e 00010100'              # v_cmp_ge_u32_e64 s[46:47], v0, 0
 MASK_LEFT = '7d860080 d4c6002e 00010d00 87ae2e6a'
 MASK_SAVE = 'beae082e beae242e'               # not and aliased and_saveexec
-MASK_LOAD = 'f4080c05 fa000000 bf8cc07f f4200a18 520001e0'  # table dwordx4, then scalar buffer load
+MASK_LOAD = 'f4080c09 fa000000 bf8cc07f f4200a18 520001e0'  # table dwordx4, then scalar buffer load
 MASK_ELSE = '8afe7e2e 7e0e02ff 3e800000'      # complement, v_mov_b32 v7, 0.25
 
 
@@ -262,8 +262,8 @@ MASK_CASES = (
     ('S4 closure', lane_mask_mesh(otherwise=MASK_ELSE + ' 88fe2e7e')),
 )
 
-COHERENT_THEN = 'f4200a08 520001e0 bf8cc07f 7e0e0228'  # s40 = buffer[480 + 4*wave], v7 = s40
-COHERENT_ELSE = 'f4200f08 520001e8 bf8cc07f 7e0e023c'  # s60 = buffer[488 + 4*wave], v7 = s60
+COHERENT_THEN = 'f4200a04 520001e0 bf8cc07f 7e0e0228'  # s40 = buffer[480 + 4*wave], v7 = s40
+COHERENT_ELSE = 'f4200f04 520001e8 bf8cc07f 7e0e023c'  # s60 = buffer[488 + 4*wave], v7 = s60
 
 
 def coherent_words(parts):
@@ -290,7 +290,7 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
     then = [COHERENT_THEN]
     at_else = ['8afe7e34', (0xbf88, 'join')]  # exec = s[52:53] & ~exec; skip empty else
     otherwise = [COHERENT_ELSE]
-    join = ['80288028', 'f4200bc8 520001e0 bf8cc07f', 'befe0434']
+    join = ['80288028', 'f4200bc4 520001e0 bf8cc07f', 'befe0434']
     if control == 'backward':
         then.append((0xbf82, 'head'))
     elif control == 'constant-trip':
@@ -346,8 +346,8 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
         body = [*before, (0xbf88, 'else'), *then, 'else:', *at_else, *otherwise, 'join:', *join]
     prefix = MASK_PREFIX
     if positions:
-        prefix = prefix.replace('beaa03ff 00000080', 'be8e0309').replace(' beaa0380', '')
-        prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da8000e')
+        prefix = prefix.replace('beaa03ff 00000080', 'be960311').replace(' beaa0380', '')
+        prefix = prefix.replace('befe04c1 7da8002a', 'befe04c1 3608008f 34080884 7da80016')
     exports = '7e280228 7e2a0307'
     if live_mask:
         prefix += ' bebe0480'  # s[62:63] = 0 on the outer skip
@@ -359,7 +359,7 @@ def coherent_mesh(shape, *, full=False, control=None, positions=False, nonzero=F
         setup = ['bebe0480 bf06803e', (0xbf84, 'threshold'), 'bf800000', 'threshold:']
     mesh = wave_load_mesh(prefix, coherent_words([*setup, threshold, *body]), exports=exports)
     if positions:
-        mesh.pop(mesh.index('be8e0309', mesh.index('be8d0308')))  # count is already set by the prefix
+        mesh.pop(mesh.index('be960311', mesh.index('be950310')))  # count is already set by the prefix
         mesh = mutate('13121110', '35343332', mesh=mesh)
     if control == 'outside entry':
         at = mesh.index('befe04c1', mesh.index('beaa03ff'))  # full reset immediately before the prefix
@@ -382,22 +382,22 @@ COHERENT_CONTROLS = (
 )
 
 MASK_MEMORY = (
-    ('tbuffer', wave_load_mesh(body='f4200a08 520001e0 e8b001e8 80040700 bf8c007f')),
-    ('image', wave_load_mesh(body='f4200a08 520001e0 f40c0e05 fa000020 bf8cc07f '
+    ('tbuffer', wave_load_mesh(body='f4200a04 520001e0 e8b001e8 80020700 bf8c007f')),
+    ('image', wave_load_mesh(body='f4200a04 520001e0 f40c0e09 fa000020 bf8cc07f '
                             '7e640280 7e660280 f0000108 000e0732 bf8c0f70')),
 )
 
 # Post-count, scalar-load-free skips use the same proof as the compute phi.
 MASK_GENERIC = (
-    ('generic live', vertex_red('beae0480 7d880086 be94246a bf880002 d4c4002e 00020086 '
+    ('generic live', vertex_red('beae0480 7d880086 be8c246a bf880002 d4c4002e 00020086 '
                                 'befe04c1 d5010007 00b9e480')),
-    ('generic dead', vertex_red('7e0e0280 7d880086 be94246a bf880003 d4c4002e 00020086 '
+    ('generic dead', vertex_red('7e0e0280 7d880086 be8c246a bf880003 d4c4002e 00020086 '
                                 '7e0e02f2 befe04c1')),
 )
 
 MASK_CONTROLS = (
     ('c1 numeric read', lane_mask_mesh(setup='beb6102e'), 'a lane mask is also read as a number'),
-    ('c2 unproven base', lane_mask_mesh(load=MASK_LOAD.replace('f4080c05', 'f4080c1b')),
+    ('c2 unproven base', lane_mask_mesh(load=MASK_LOAD.replace('f4080c09', 'f4080c1b')),
      'a masked arm reads a scalar that is not wave-uniform'),
     ('c3 undefined skip value', lane_mask_mesh(prefix=' '.join(MASK_PREFIX.split()[2:])),
      'a scalar live after the arm is undefined or non-uniform on the skip path'),
@@ -412,7 +412,7 @@ MASK_CONTROLS = (
 
 COHERENT_LEGACY_CASES = (
     ('c6 enclosing lane skip', lane_mask_mesh(front='bf880001 bf800000 ' + MASK_FRONT), 2),
-    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d88 fa0001e0'), 1),
+    ('c7 scalar else', lane_mask_mesh(otherwise=MASK_ELSE + ' f4200d84 fa0001e0'), 1),
 )
 
 
@@ -471,31 +471,31 @@ ROUND2_REFUSED = (
 # Both arms load each lane's position, including the high lanes of the first
 # guest wave. These VGPRs have no definition outside the prefix guard.
 GUARDED_POSITION_SETUP = (
-    ('select', 'beaa0309 bf068008 850e2a80'),
-    ('same', 'be8e0309'),
-    ('unsigned export', 'beaa0309 bf068008 850e2a80'),
-    ('plus one', 'beaa0309 800e812a'),
-    ('different SGPR', 'beaa0308 be8e0309'),
-    ('rewritten bound', 'beaa0309 bf068008 850e2a80'),
-    ('one arm', 'beaa0309 bf068008 850e2a80'),
-    ('wave index', 'beaa0306 be8e032a'),
+    ('select', 'beaa0311 bf068010 85162a80'),
+    ('same', 'be960311'),
+    ('unsigned export', 'beaa0311 bf068010 85162a80'),
+    ('plus one', 'beaa0311 8016812a'),
+    ('different SGPR', 'beaa0310 be960311'),
+    ('rewritten bound', 'beaa0311 bf068010 85162a80'),
+    ('one arm', 'beaa0311 bf068010 85162a80'),
+    ('wave index', 'beaa0306 be96032a'),
 )
-GUARDED_POSITION_LOAD = 'e0381000 80043204 bf8c3f70'
+GUARDED_POSITION_LOAD = 'e0381000 80023204 bf8c3f70'
 
 
 def guarded_position_mesh(case, setup):
     prefix = MASK_PREFIX.replace('beaa03ff 00000080', setup).replace(' beaa0380', '')
     prefix = prefix.replace('befe04c1', 'befe04c1 3608008f 34080884')  # v4 = (thread & 15) * 16
     if case == 'same':
-        prefix = prefix.replace('7da8002a', '7da8000e')
+        prefix = prefix.replace('7da8002a', '7da80016')
     otherwise = MASK_ELSE if case == 'one arm' else MASK_ELSE + ' ' + GUARDED_POSITION_LOAD
     mesh = lane_mask_mesh(prefix=prefix, value=GUARDED_POSITION_LOAD, otherwise=otherwise, exports='')
-    count_copy = mesh.index('be8e0309', mesh.index('be8d0308'))
+    count_copy = mesh.index('be960311', mesh.index('be950310'))
     mesh.pop(count_copy)
     if case == 'rewritten bound':
-        mesh[count_copy:count_copy] = ['beaa0384', 'be8e032a']  # V reads the replacement B, s42 = 4
+        mesh[count_copy:count_copy] = ['beaa0384', 'be96032a']  # V reads the replacement B, s42 = 4
     if case == 'unsigned export':
-        mesh = mutate('7d28000e', '7da8000e', mesh=mesh)
+        mesh = mutate('7d280016', '7da80016', mesh=mesh)
     return mutate('13121110', '35343332', mesh=mesh)  # position uses v[50:53]
 
 
@@ -506,23 +506,23 @@ GUARDED_REFUSAL = ('unsupported: slot 57 mesh: v50 is read where it is not defin
 
 def count_guard_mesh(case='select'):
     """Two paths to a scalar buffer offset, then separately guarded positions and primitive indices."""
-    before = MESH.index('be8d0308')
-    prefix = 'bf0c8008'.split()                    # s_bitcmp0_b32 s8, 0
-    scalar = ['8f298409']                         # s_lshl_b32 s41, s9, 4 (s9 is the supplied group index)
-    vector = '7e020209 e00021c0 80040101 bf8c3f70 7e520501'.split()
-    # v_mov v1, s9; buffer_load_format_x v1, v1, s[16:19], 0 idxen offset:448;
+    before = MESH.index('be950310')
+    prefix = 'bf0c8010'.split()                    # s_bitcmp0_b32 s16, 0
+    scalar = ['8f298411']                         # s_lshl_b32 s41, s17, 4 (s17 is the supplied group index)
+    vector = '7e020211 e00021c0 80020101 bf8c3f70 7e520501'.split()
+    # v_mov v1, s17; buffer_load_format_x v1, v1, s[8:11], 0 idxen offset:448;
     # s_waitcnt vmcnt(0); v_readfirstlane s41, v1
     if case == 'narrowed first lane':
         # Initialize v1 for all lanes, then overwrite it under a lane predicate.
         # The reset restores full EXEC, but that does not prove v1 uniform.
-        vector = '7e020280 7d860086 bea4246a 7e020209 befe04c1'.split() + vector[1:]
+        vector = '7e020280 7d860086 bea4246a 7e020211 befe04c1'.split() + vector[1:]
     if case == 'different VCC arms':
         prefix = ['7d860086']                     # v_cmp_gt_u32 vcc, 6, v0
     branch_op = 0xbf86 if case == 'different VCC arms' else 0xbf84
     prefix += [branch(branch_op, 0, len(scalar) + 2)] + scalar + [branch(0xbf82, 0, len(vector) + 1)] + vector
     # Descriptor reload and scalar buffer read. P is the next byte, B is the low six bits.
-    table = 'f4080405 fa000000 bf8cc07f'.split()
-    bounds = 'f4240a88 520001d0 bf8cc07f 93abff2a 00080008 872abf2a 802a812a 802b812b'.split()
+    table = 'f4080209 fa000000 bf8cc07f'.split()
+    bounds = 'f4240a84 520001d0 bf8cc07f 93abff2a 00080008 872abf2a 802a812a 802b812b'.split()
     if case == 'wave address':
         bounds[1] = '0c0001d0'                   # use s6 (wave index) as the offset
     if case == 'wave bound':
@@ -530,49 +530,49 @@ def count_guard_mesh(case='select'):
     if case == 'system bound':
         bounds += ['beaa0302']                    # s_mov_b32 s42, s2
     if case == 'memory store':
-        bounds += 'e0701000 80040000'.split()    # buffer_store_dword v0, v0, s[16:19], 0 offen
+        bounds += 'e0701000 80020000'.split()    # buffer_store_dword v0, v0, s[8:11], 0 offen
     # Address calculation for the position block; s42 = B and s43 = P.
-    # As in the guest, the output counts s13 and s14 are selected after the narrowing.
-    limit = '3608008f 34080884 befe04c1 7da8002a 83ac2b2a bf00802c 850d2b80 850e2a80'.split()
+    # As in the guest, the output counts s21 and s22 are selected after the narrowing.
+    limit = '3608008f 34080884 befe04c1 7da8002a 83ac2b2a bf00802c 85152b80 85162a80'.split()
     if case == 'same':
-        limit[-1] = 'be8e032a'                    # s_mov_b32 s14, s42
+        limit[-1] = 'be96032a'                    # s_mov_b32 s22, s42
     if case == 'plus one':
-        limit[-1] = '800e812a'                    # s_add_u32 s14, s42, 1
+        limit[-1] = '8016812a'                    # s_add_u32 s22, s42, 1
     if case == 'different SGPR':
-        limit[-1] = 'be8e0309'                    # s_mov_b32 s14, s9
+        limit[-1] = 'be960311'                    # s_mov_b32 s22, s17
     # An inner scalar if/else with an EXEC-predicated position load in each arm.
     left = GUARDED_POSITION_LOAD.split()
     right = ['bf800000'] if case == 'one arm' else GUARDED_POSITION_LOAD.split()
-    positions = ('f4200a08 fa0001e0 bf8cc07f bf0c8008'.split()
+    positions = ('f4200a04 fa0001e0 bf8cc07f bf0c8010'.split()
                  + [branch(0xbf84, 0, len(left) + 2)] + left
                  + [branch(0xbf82, 0, len(right) + 1)] + right)
     if case in ('bound overwritten in block', 'count overwritten in block'):
-        positions += ['beaa0384' if case == 'bound overwritten in block' else 'be8e0384']
+        positions += ['beaa0384' if case == 'bound overwritten in block' else 'be960384']
     if case == 'bound overwritten in block':
         # Make the count observe the post-join ID of B.
-        limit[-1] = 'be8e0380'
+        limit[-1] = 'be960380'
     position_block = limit + [branch(0xbf88, 0, len(positions) + 1)] + positions + ['befe04c1']
     if case == 'bound overwritten in block':
-        position_block += ['be8e032a']
+        position_block += ['be96032a']
     # Load three separate indices per primitive. P is at most two in the draw.
-    prim_load = 'f4200a08 fa0001e0 bf8cc07f 34080084 e03c1180 80043604 bf8c3f70'.split()
+    prim_load = 'f4200a04 fa0001e0 bf8cc07f 34080084 e03c1180 80023604 bf8c3f70'.split()
     if case == 'different guard rewrites position':
         prim_load += GUARDED_POSITION_LOAD.split()
     primitive_block = ['7da8002b', branch(0xbf88, 0, len(prim_load) + 1)] + prim_load + ['befe04c1']
     exchange = MESH[before + 2:POST_COUNT]
-    pos = ('7da8000e' if case == 'unsigned export' else '7d28000e').split() + (
-        '3608008f 34080884 e03810c0 80041404 bf8c3f70 f80008cf 35343332 f800020f 17161514 befe04c1'.split())
+    pos = ('7da80016' if case == 'unsigned export' else '7d280016').split() + (
+        '3608008f 34080884 e03810c0 80021404 bf8c3f70 f80008cf 35343332 f800020f 17161514 befe04c1'.split())
     # After narrowing by P, replace V by V - 1, clamp each index, then pack the triplet.
-    clamp = ('7d28000d 800ec10e 266c6c0e 266e6e0e 2670700e 346e6e8a 34707094'
+    clamp = ('7d280015 8016c116 266c6c16 266e6e16 26707016 346e6e8a 34707094'
              ' 386c6d37 386c6d38 f8000941 00000036 bf810000').split()
     if case == 'compare overwritten count':
-        pos.insert(0, '800ec10e')
+        pos.insert(0, '8016c116')
     if case == 'rewrite under the same mask':
-        pos.insert(1, '800ec10e')
+        pos.insert(1, '8016c116')
     if case == 'rewrite primitive count':
-        clamp.insert(1, '800dc10d')               # s_add_u32 s13, s13, -1
+        clamp.insert(1, '8015c115')               # s_add_u32 s21, s21, -1
     if case == 'keep count':
-        clamp[1] = '802cc10e'                     # write V - 1 to s44 instead
+        clamp[1] = '802cc116'                     # write V - 1 to s44 instead
         clamp[2:5] = [word[:-2] + '2c' for word in clamp[2:5]]
     return MESH[:before] + prefix + table + bounds + position_block + primitive_block + exchange + pos + clamp
 
@@ -582,8 +582,8 @@ def count_entry_guard_mesh(case='scalar bound'):
     mesh = count_guard_mesh()
     at = mesh.index('7da8002b')
     exchange = mesh.index('bf8a0000', at)
-    # v_lshlrev_b32 v4, 4, v0; buffer_load_dwordx3 v[54:56], v4, s[16:19], 0 offen offset:384.
-    body = '34080084 e03c1180 80043604 bf8c3f70'.split()
+    # v_lshlrev_b32 v4, 4, v0; buffer_load_dwordx3 v[54:56], v4, s[8:11], 0 offen offset:384.
+    body = '34080084 e03c1180 80023604 bf8c3f70'.split()
     compare = '7da27d00' if case == 'vector bound' else '7da8002b'
     mesh[at:exchange] = [compare, branch(0xbf88, 0, len(body) + 1)] + body
     end_bounds = mesh.index('802b812b') + 1
@@ -594,9 +594,9 @@ def count_entry_guard_mesh(case='scalar bound'):
     elif case == 'wave bound':
         mesh.insert(end_bounds, '80ab062b')  # s_sub_u32 s43, s43, s6
     elif case == 'different count':
-        mesh = mutate('850d2b80', '850d0980', mesh=mesh)  # s_cselect_b32 s13, 0, s9
+        mesh = mutate('85152b80', '85151180', mesh=mesh)  # s_cselect_b32 s21, 0, s17
     elif case == 'exchange clobber':
-        mesh = mutate('7e02020d', '7e6c020d', mesh=mesh)  # v_mov_b32 v54, s13
+        mesh = mutate('7e020215', '7e6c0215', mesh=mesh)  # v_mov_b32 v54, s21
         mesh = mutate('00000102', '00003602', mesh=mesh)  # ds_write_b32 v2, v54
     return mesh
 
@@ -606,7 +606,7 @@ def vector_count_guard_mesh(case='select mask'):
     mesh = count_guard_mesh()
     low = mesh.index('d7650000')
     high = mesh.index('d7660000')
-    # s_bitcmp0_b32 s8, 0; mbcnt_lo; s_cmp_eq_u32 src_scc, 0;
+    # s_bitcmp0_b32 s16, 0; mbcnt_lo; s_cmp_eq_u32 src_scc, 0;
     # s_cselect_b64 vcc, -1, 0; s_waitcnt lgkmcnt(0); mbcnt_hi.
     gap = 'bf0680fd 85ea80c1 bf8cc07f'.split()
     clear = {'thread clobber': '7e000280', 'EXEC clobber': 'befe04c1', 'base clobber': 'be870380'}
@@ -615,11 +615,11 @@ def vector_count_guard_mesh(case='select mask'):
     if case == 'branch in gap':
         gap.insert(0, 'bf840001')  # s_cbranch_scc0 to the VCC select
     if case != 'adjacent pair':
-        mesh[low:high] = ['bf0c8008'] + mesh[low:high] + gap
-    first = mesh.index('f4240a88')
-    end = mesh.index('850e2a80') + 1
+        mesh[low:high] = ['bf0c8010'] + mesh[low:high] + gap
+    first = mesh.index('f4240a84')
+    end = mesh.index('85162a80') + 1
     # v9 holds the joined scalar offset. The clear-bit arm adds four bytes.
-    mask = 'bf0c8008 85ba80c1'
+    mask = 'bf0c8010 85ba80c1'
     if case == 'uniform compare mask':
         mask = 'd4c4003a 00010081'  # v_cmp_gt_u32_e64 s[58:59], 1, 0
     if case == 'per-lane compare mask':
@@ -628,17 +628,17 @@ def vector_count_guard_mesh(case='select mask'):
         mask = 'beba04c1'           # s_mov_b64 s[58:59], -1
     address = ('7e120229 4e1412c4 ' + mask + ' d5010009 00ea1509').split()
     # Load B-1 and P-1 in one read, extract seven bits of B-1, and add one to each.
-    loads = 'e03411d0 80043009 bf8c3f70 367860ff 0000007f 4a787881 4a7a6281'.split()
+    loads = 'e03411d0 80023009 bf8c3f70 367860ff 0000007f 4a787881 4a7a6281'.split()
     # Scale B on the set-bit arm, forming a VGPR phi at the join.
-    adjust = 'bf0c8008 bf850002 d569003c 00027809'.split()
+    adjust = 'bf0c8010 bf850002 d569003c 00027811'.split()
     if case == 'thread bound':
         adjust += ['7e780300']      # v_mov_b32_e32 v60, v0
     if case == 'narrowed bound':
         adjust += '7d860086 bea4246a 4a787881 befe04c1'.split()
-    # v_readfirstlane s14, v60; v_readfirstlane s13, v61; preserve raw P in s43.
+    # v_readfirstlane s22, v60; v_readfirstlane s21, v61; preserve raw P in s43.
     # After narrowing by thread < v60, choose either zero or the first-lane counts.
-    narrow = ('7e1c053c 7e1a053d beab030d 3608008f 34080884 befe04c1 7da27900 '
-              '83ac0d0e bf00802c 850d0d80 850e0e80').split()
+    narrow = ('7e2c053c 7e2a053d beab0315 3608008f 34080884 befe04c1 7da27900 '
+              '83ac1516 bf00802c 85151580 85161680').split()
     mesh[first:end] = address + loads + adjust + narrow
     return mesh
 
@@ -646,8 +646,8 @@ def vector_count_guard_mesh(case='select mask'):
 def rewritten_guarded_position():
     """Overwriting v50 under the primitive mask invalidates its older position definition."""
     mesh = GUARDED_POSITIONS['select']
-    at = mesh.index('7d28000e')
-    return mesh[:at] + '7d28000d 7e640280 befe04c1'.split() + mesh[at:]
+    at = mesh.index('7d280016')
+    return mesh[:at] + '7d280015 7e640280 befe04c1'.split() + mesh[at:]
 
 
 WAVE_LOAD_MESH = wave_load_mesh()
@@ -661,13 +661,13 @@ WAVE_LOAD_REFUSALS = (
     # The block writes s43, which the join reads, but s43 has no value before the block for an empty wave to keep.
     ('second live scalar write without an old value',
      wave_load_mesh(body=WAVE_LOAD_BODY + ' beab0386', exports='7e280228 7e2a022b')),
-    ('buffer store', wave_load_mesh(body=WAVE_LOAD_BODY + ' f4600a08 520001e0')),
-    ('buffer atomic', wave_load_mesh(body=WAVE_LOAD_BODY + ' e0c81000 80040700')),
+    ('buffer store', wave_load_mesh(body=WAVE_LOAD_BODY + ' f4600a04 520001e0')),
+    ('buffer atomic', wave_load_mesh(body=WAVE_LOAD_BODY + ' e0c81000 80020700')),
 )
 # Blocks that #2660 refused and that the wave block accepts: every scalar instruction of the block runs once for a
 # wave with an active lane, so further scalar loads and writes, live or dead after the join, follow the guest.
 WAVE_LOAD_ACCEPTED = (
-    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4240a08'))),
+    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a04', 'f4240a04'))),
     ('dead scalar result', wave_load_mesh(exports='7e2a0307')),
     # With the adjacent reset replaced by s_nop, the reset that closes the group-index exchange still reaches the
     # compare: nothing between them reads or writes EXEC or VCC, and no branch enters that range.
@@ -677,7 +677,7 @@ WAVE_LOAD_ACCEPTED = (
 WAVE_LOAD_OTHER_REFUSALS = (
     ('unmodelled EXEC write before the compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'befe0404')),
      'slot 57 mesh: s_mov_b64 on a wave mask is not covered'),
-    ('ordinary SMEM load with a register offset', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05')),
+    ('ordinary SMEM load with a register offset', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a04', 'f4000a09')),
      "s_load with a register offset through ('table', 1)"),
 )
 
@@ -691,17 +691,17 @@ s_mov_b64 exec, -1
 v_cmpx_gt_u32_e32 s42, v0
 s_mov_b32 s42, 0
 s_cbranch_execz 7
-s_buffer_load_dword s43, s[16:19], s41 offset:0x1e0
+s_buffer_load_dword s43, s[8:11], s41 offset:0x1e0
 s_waitcnt lgkmcnt(0)
 s_cmp_eq_u32 s43, 0
 s_cbranch_scc1 1
 s_mov_b32 s40, s43
 v_mov_b32 v7, 1.0
 s_mov_b64 exec, -1"""
-NEST_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880007', 'f4200ac8', '520001e0', 'bf8cc07f', 'bf06802b', 'bf850001', 'bea8032b', '7e0e02f2', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880007', 'f4200ac4', '520001e0', 'bf8cc07f', 'bf06802b', 'bf850001', 'bea8032b', '7e0e02f2', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
 NEST_ACCEPTED = (('inner forward SCC branch in the wave block', NEST_SCC_MESH),)
 # The inner SCC comes from a lane mask (s_and_b64 of a per-lane compare's VCC): one lane's bit, not the wave's, so refused.
-NEST_MASK_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d840083', '87ac6a6a', 'bf850001', 'bea80380', '7e0e02f2', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_MASK_SCC_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac4', '520001e0', 'bf8cc07f', '7d840083', '87ac6a6a', 'bf850001', 'bea80380', '7e0e02f2', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
 NEST_MASK = ('inner SCC from a lane mask', NEST_MASK_SCC_MESH, 'slot 57 mesh: s_and_b64 on a wave mask is not covered')
 # The inner branch goes backwards (to the s_cmp): a loop, refused with the loop text.
 NEST_LOOP = ('inner backward branch', [w if w != 'bf850001' else 'bf85fffe' for w in NEST_SCC_MESH],
@@ -725,7 +725,7 @@ s_mov_b64 exec, -1
 v_cmpx_gt_u32_e32 s42, v0
 s_mov_b32 s42, 0
 s_cbranch_execz 8
-s_buffer_load_dword s43, s[16:19], s41 offset:0x1e0
+s_buffer_load_dword s43, s[8:11], s41 offset:0x1e0
 s_waitcnt lgkmcnt(0)
 v_cmp_gt_u32_e32 vcc, 3, v0
 s_and_saveexec_b64 s[44:45], vcc
@@ -733,14 +733,14 @@ s_cbranch_execz 1
 v_mov_b32 v7, 1.0
 s_or_b64 exec, exec, s[44:45]
 s_mov_b64 exec, -1"""
-NEST_EXECZ_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
+NEST_EXECZ_MESH = ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac4', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']
 NEST_EXECZ_ACCEPTED = (('nested if (compare, saveexec, execz, restore) in the wave block', NEST_EXECZ_MESH),)
 # Same block with one thing wrong each; every one is refused (assembled with llvm-mc from the same text with the change).
 NEST_EXECZ_REFUSALS = (
-    ('nested restore of another register pair', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2e7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
-    ('a scalar write in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'bea8032b', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
-    ('a nested saveexec without its compare', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac8', '520001e0', 'bf8cc07f', 'bf800000', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
-    ('EXEC written in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e180505', 'f4080405', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac8', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'befe04c1', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be8d0308', 'be8e0309', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e02020d', '7e040280', '7e06020e', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c0d', '887c0e04', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e1a0501', 'bf8cc07f', '7e1c0503', 'befe04c1', '7d28000e', '3608008f', '34080884', 'e0381000', '80041004', 'e03810c0', '80041404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d28000d', '3608008f', '34080882', 'e0301180', '80041804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('nested restore of another register pair', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac4', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880001', '7e0e02f2', '88fe2e7e', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('a scalar write in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac4', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'bea8032b', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('a nested saveexec without its compare', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880008', 'f4200ac4', '520001e0', 'bf8cc07f', 'bf800000', 'beac246a', 'bf880001', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
+    ('EXEC written in the nested body', ['bfa00003', 'befe0481', 'be84047e', '8706ff03', '0f000000', 'bf850007', '2c0a0a87', '7e0c0280', 'd8340008', '00000506', 'bfa3ffe3', 'bf8a0000', 'bf820004', 'bf8a0000', '7e0c0280', 'd8d80008', '05000006', 'befe04c1', '9386ff03', '00040018', '8f078606', 'd7650000', '00000ec1', 'd7660000', '000200c1', 'bf8cc07f', '7e280505', 'f4080209', 'fa000000', 'bea803ff', '3e808081', '8f298806', 'beaa0386', '7e0e0280', 'befe04c1', '7da8002a', 'beaa0380', 'bf880009', 'f4200ac4', '520001e0', 'bf8cc07f', '7d880083', 'beac246a', 'bf880002', 'befe04c1', '7e0e02f2', '88fe2c7e', 'befe04c1', 'be950310', 'be960311', 'bf8a0000', 'bf008006', 'bf840010', 'befe0404', 'bf880007', '7e020215', '7e040280', '7e060216', 'd8340000', '00000102', 'd8340004', '00000302', 'befe04c1', 'bfa3ffe3', 'bf8a0000', '8f048c15', '887c1604', 'bf900009', 'bf82000d', 'bf8a0000', 'befe0404', 'bf880009', '7e040280', 'd8d80000', '01000002', 'd8d80004', '03000002', 'bf8cc17f', '7e2a0501', 'bf8cc07f', '7e2c0503', 'befe04c1', '7d280016', '3608008f', '34080884', 'e0381000', '80021004', 'e03810c0', '80021404', 'bf8c3f70', '7e280228', '7e2a0307', 'f80008cf', '13121110', 'f800020f', '17161514', 'befe04c1', '7d280015', '3608008f', '34080882', 'e0301180', '80021804', 'bf8c3f70', 'f8000941', '00000018', 'bf810000']),
 )
 
 # Two scalar buffer loads (the second at an offset computed in the block), a dead table load, a dead per-lane VCC compare and a scalar
@@ -755,17 +755,17 @@ s_mov_b32 s43, 0
 v_cmpx_gt_u32_e32 s42, v0
 s_mov_b32 s42, 0
 s_cbranch_execz 11
-s_buffer_load_dword s44, s[16:19], s41 offset:0x1e4
-s_load_dwordx4 s[48:51], s[10:11], 0x0
+s_buffer_load_dword s44, s[8:11], s41 offset:0x1e4
+s_load_dwordx4 s[48:51], s[18:19], 0x0
 s_add_u32 s45, s41, 4
 s_waitcnt lgkmcnt(0)
-s_buffer_load_dword s40, s[16:19], s45 offset:0x1dc
+s_buffer_load_dword s40, s[8:11], s45 offset:0x1dc
 v_cmp_class_f32_e32 vcc, -1, v7
 v_mov_b32 v7, 1.0
 s_waitcnt lgkmcnt(0)
 s_mov_b64 exec, -1"""
 WAVE_BLOCK_PREFIX = WAVE_LOAD_PREFIX.replace('befe04c1 7da8002a', 'befe04c1 beab0380 7da8002a')
-WAVE_BLOCK_BODY = 'f4200b08 520001e4 f4080c05 fa000000 802d8429 bf8cc07f f4200a08 5a0001dc 7d100ec1 7e0e02f2 bf8cc07f'
+WAVE_BLOCK_BODY = 'f4200b04 520001e4 f4080c09 fa000000 802d8429 bf8cc07f f4200a04 5a0001dc 7d100ec1 7e0e02f2 bf8cc07f'
 WAVE_BLOCK_MESH = wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY)
 WAVE_LOAD_OTHER_REFUSALS += (
     ('unmodelled EXEC write within the reset range',
@@ -788,7 +788,7 @@ WAVE_BLOCK_REFUSALS = (
 # must reach a provoking thread outside EXEC when the wave takes the fall-through.
 INNER_VCC_ASM = NEST_SCC_ASM.replace('s_cmp_eq_u32 s43, 0\ns_cbranch_scc1 1',
                                      'v_cmp_gt_u32_e32 vcc, s43, v0\ns_cbranch_vccz 1')
-INNER_VCC_MESH = wave_load_mesh(body='f4200ac8 520001e0 bf8cc07f 7d88002b bf860001 bea8032b 7e0e02f2')
+INNER_VCC_MESH = wave_load_mesh(body='f4200ac4 520001e0 bf8cc07f 7d88002b bf860001 bea8032b 7e0e02f2')
 
 # The second bound alone would let wave 1 load from beyond the SRV. Keep the
 # earlier EXEC narrowing to threads 0..2 when applying this bound.
@@ -818,7 +818,7 @@ def count_entry_red(*extra_words):
     return MESH[:COUNT] + [
         '7e0e0280',  # v_mov_b32_e32 v7, 0
         'befe04c1',  # s_mov_b64 exec, -1
-        '7da8000d',  # v_cmpx_gt_u32_e32 s13, v0 (the proven thread index)
+        '7da80015',  # v_cmpx_gt_u32_e32 s21, v0 (the proven thread index)
         branch(0xbf88, COUNT + 3, COUNT + 5 + len(extra_words)),  # s_cbranch_execz to the first count barrier
         '7e0e02f2',  # v_mov_b32_e32 v7, 1.0
     ] + list(extra_words) + MESH[COUNT:wait + 1] + [
@@ -827,9 +827,9 @@ def count_entry_red(*extra_words):
 
 
 COUNT_ENTRY = count_entry_red()
-COUNT_ENTRY_LT = mutate('7da8000d', '7da2000d', mesh=COUNT_ENTRY)
+COUNT_ENTRY_LT = mutate('7da80015', '7da20015', mesh=COUNT_ENTRY)
 # v_mov_b32_e32 v8, 4 before the reset, then v_cmpx_lt_u32_e32 v8, v0.
-COUNT_ENTRY_VGPRS = mutate('7da8000d', '7da20108', mesh=COUNT_ENTRY)
+COUNT_ENTRY_VGPRS = mutate('7da80015', '7da20108', mesh=COUNT_ENTRY)
 COUNT_ENTRY_VGPRS = COUNT_ENTRY_VGPRS[:COUNT + 1] + ['7e100284'] + COUNT_ENTRY_VGPRS[COUNT + 1:]
 DEAD_SCALAR = '87288080'  # s_and_b32 s40, 0, 0
 COUNT_ENTRY_SCALAR = count_entry_red(DEAD_SCALAR)
@@ -839,7 +839,7 @@ COUNT_ENTRY_CASES = (
     ('EXEC-zero branch to the count exchange after LT with two VGPRs', COUNT_ENTRY_VGPRS,
      lambda lane: 255 if lane > 4 else 0),
     ('EXEC compare with a defined VGPR other than the thread index',
-     mutate('7da8000d', '7da80e0d', mesh=COUNT_ENTRY), lambda lane: 255),  # s13 > v7 (4 > 0)
+     mutate('7da80015', '7da80e15', mesh=COUNT_ENTRY), lambda lane: 255),  # s21 > v7 (4 > 0)
     ('EXEC-zero branch to the count exchange over dead scalar ALU', COUNT_ENTRY_SCALAR,
      lambda lane: 255 if lane < 4 else 0),
 )
@@ -850,7 +850,7 @@ def joined_vertex_masks():
     pos = MESH.index('f80008cf')
     # Move the vertex narrowing after the loads so the join cannot make any export operands stale.
     return MESH[:POST_COUNT] + MESH[POST_COUNT + 1:pos] + [
-        '7d28000e',  # v_cmpx_gt_i32 s14, v0
+        '7d280016',  # v_cmpx_gt_i32 s22, v0
         'bf008080',  # s_cmp_eq_i32 0, 0
         'bf850001',  # s_cbranch_scc1 .pos (first incoming mask is the vertex count)
         'befe04c1',  # s_mov_b64 exec, -1 (fallthrough reaches .pos with all lanes)
@@ -860,7 +860,7 @@ def joined_vertex_masks():
 # Fixture body encodings are gfx1013 wave64. The existing synthetic shell supplies the two exchanges
 # and the count-guarded exports. Every variant adds a loaded displacement to the exported X coordinate.
 def scalar_position_mesh(shape, control=None):
-    body = ['f4240b88', 'fa0001e0',  # s_buffer_load_dwordx2 s[46:47], s[16:19], 0x1e0
+    body = ['f4240b84', 'fa0001e0',  # s_buffer_load_dwordx2 s[46:47], s[8:11], 0x1e0
             'bf8cc07f']             # s_waitcnt lgkmcnt(0)
     step = ['bf07802e',             # s_cmp_lg_u32 s46, 0
             '8f30fd2e',             # s_lshl_b32 s48, s46, src_scc
@@ -874,7 +874,7 @@ def scalar_position_mesh(shape, control=None):
     if control == 'unguarded export':
         step.extend(('f80008cf', '13121110'))
     if control == 'unguarded store':
-        step.extend(('e0701000', '80040700'))
+        step.extend(('e0701000', '80020700'))
     if shape == 2:
         # Compare only the narrowed lanes against the second loaded dword.
         step[0:0] = ['7d84002f', 'bf86%04x' % len(step)]
@@ -931,7 +931,7 @@ REFUSALS = (
     ('formatted load with descriptor word 3 overwritten', REWRITTEN_FORMAT,
      'formatted buffer load through a descriptor whose words were rewritten'),
     # The request must carry the two stored counts, in this order.
-    ('a request that publishes another count', mutate('887c0e04', '887c0d04'),
+    ('a request that publishes another count', mutate('887c1604', '887c1504'),
      'slot 57 mesh count exchange: instruction 15 of the accepted shape (s_or_b32) is absent'),
     ('no barrier between the count store and the reads', mutate('bf8a0000', 'bf800000', 3),
      'slot 57 mesh count exchange: instruction 13 of the accepted shape (s_barrier) is absent'),
@@ -952,7 +952,7 @@ REFUSALS = (
     ('an EXEC compare with an undefined first VGPR operand',
      mutate('7da20108', '7da20101', mesh=COUNT_ENTRY_VGPRS), EXCHANGE_BRANCH_REFUSAL),
     ('an EXEC compare with an unmodelled entry VGPR',
-     mutate('7da8000d', '7da8020d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+     mutate('7da80015', '7da80215', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
     ('no EXEC reset before the compare',
      mutate('befe04c1', 'bf800000', 1, mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
     ('an EXEC-nonzero branch to the count exchange',
@@ -965,9 +965,9 @@ REFUSALS = (
     ('scalar ALU writing VCC in the count-entry block',
      count_entry_red('876a8080'), EXCHANGE_BRANCH_REFUSAL),  # s_and_b32 vcc_lo, 0, 0
     ('a scalar load in the count-entry block',
-     count_entry_red('f4000a05', 'fa000000'), EXCHANGE_BRANCH_REFUSAL),  # s_load_dword s40, s[10:11], 0
+     count_entry_red('f4000a09', 'fa000000'), EXCHANGE_BRANCH_REFUSAL),  # s_load_dword s40, s[18:19], 0
     ('a v_cmpx in the skipped block',
-     mutate('7e0e02f2', '7da8000d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+     mutate('7e0e02f2', '7da80015', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
     ('an EXEC-zero branch over the count exchange',
      mutate('bf880001', branch(0xbf88, COUNT + 3, POST_COUNT + 5), mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
     ('an EXEC-zero branch past the start of the count exchange',
@@ -982,13 +982,13 @@ REFUSALS = (
     ('a branch over the count exchange',
      mutate('bf8cc07f', branch(0xbf82, MESH.index('bf8cc07f'), POST_COUNT)),
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
-    ('an indirect branch', mutate('bf8c3f70', 'be802014'),
+    ('an indirect branch', mutate('bf8c3f70', 'be80200c'),
      'slot 57 mesh: indirect control flow (s_setpc_b64) is not covered'),
-    # s_call_b64 s[20:21], 2 replaces s_waitcnt vmcnt(0) and targets the parameter export.
-    ('a call after the count exchange', mutate('bf8c3f70', 'bb140002'),
+    # s_call_b64 s[12:13], 2 replaces s_waitcnt vmcnt(0) and targets the parameter export.
+    ('a call after the count exchange', mutate('bf8c3f70', 'bb0c0002'),
      'slot 57 mesh: indirect control flow (s_call_b64) is not covered'),
-    # s_swappc_b64 s[20:21], s[22:23] replaces s_waitcnt vmcnt(0).
-    ('a PC swap after the count exchange', mutate('bf8c3f70', 'be942116'),
+    # s_swappc_b64 s[12:13], s[14:15] replaces s_waitcnt vmcnt(0).
+    ('a PC swap after the count exchange', mutate('bf8c3f70', 'be8c210e'),
      'slot 57 mesh: indirect control flow (s_swappc_b64) is not covered'),
     # s_cbranch_execnz .join replaces s_cbranch_scc1 .join and keeps its forward target.
     ('an EXEC-nonzero branch after the count exchange', mutate('bf850001', 'bf890001', mesh=BRANCH_CASES[0][1]),
@@ -1007,10 +1007,10 @@ REFUSALS = (
      MESH[:POST_COUNT] + ['bea803f0', 'bf008080', 'bf850001', 'bea803f2'] + VCC_COMPARE.split()[1:]
      + ['bf860001', 'bf800000'] + MESH[POST_COUNT:],
      'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
-    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[20:21], vcc narrows EXEC; the uniform compare then writes VCC
+    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[12:13], vcc narrows EXEC; the uniform compare then writes VCC
     # only for the narrowed lanes; s_mov_b64 exec, -1 restores the full mask before s_cbranch_vccz skips s_nop.
     ('a VCC compare under a narrowed EXEC before the branch',
-     MESH[:POST_COUNT] + ['7d880086', 'be94246a'] + VCC_COMPARE.split() + ['befe04c1', 'bf860001', 'bf800000']
+     MESH[:POST_COUNT] + ['7d880086', 'be8c246a'] + VCC_COMPARE.split() + ['befe04c1', 'bf860001', 'bf800000']
      + MESH[POST_COUNT:],
      'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
     # Set uniform VCC, then keep the v_cmpx_gt_i32 that narrows EXEC before s_cbranch_vccz skips s_nop.
@@ -1027,8 +1027,8 @@ REFUSALS = (
     # s_endpgm before the vertex count compare, with the original final s_endpgm still present.
     ('an early program end', MESH[:POST_COUNT] + ['bf810000'] + MESH[POST_COUNT:],
      'slot 57 mesh: an early s_endpgm is not covered'),
-    # s_or_b64 exec, exec, s[20:21] replaces the full EXEC reset after the else arm.
-    ('a saved EXEC read after the masked if/else', mutate('befe04c1', '89fe7e14', 3, mesh=masked_vertex_red()),
+    # s_or_b64 exec, exec, s[12:13] replaces the full EXEC reset after the else arm.
+    ('a saved EXEC read after the masked if/else', mutate('befe04c1', '89fe7e0c', 3, mesh=masked_vertex_red()),
      'slot 57 mesh: an unproven use of a saved EXEC mask is not covered'),
     # s_branch .join leaves the fallthrough v_mov without an incoming edge.
     ('untargeted code after an unconditional forward branch',
@@ -1061,25 +1061,25 @@ REFUSALS = (
     ('a branch in an EXEC-zero range that jumps past a scalar write at the target',
      mutate('bf800000', 'bea80381', mesh=masked_vertex_red()),
      'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
-    ('a position export under the primitive count', mutate('7d28000e', '7d28000d'),
+    ('a position export under the primitive count', mutate('7d280016', '7d280015'),
      'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
     # v_mov_b32 v7, v1: v1 holds the stored count in wave 0 and the read one elsewhere.
     ('a read of a register the exchange leaves different per wave', mutate('bf8c3f70', '7e0e0301'),
      'slot 57 mesh: v1 is read where it is not defined for every lane (an entry value, or left different per wave '
      'by an exchange)'),
-    # v_mov_b32 v7, v10; s_mov_b32 s20, s25; s_mov_b32 s20, s3: entry values the model does not define.
+    # v_mov_b32 v7, v10; s_mov_b32 s12, s25; s_mov_b32 s12, s3: entry values the model does not define.
     ('a read of an entry VGPR', mutate('bf8c3f70', '7e0e030a'),
      'slot 57 mesh: v10 is read where it is not defined for every lane (an entry value, or left different per wave '
      'by an exchange)'),
-    ('a read of an entry SGPR', mutate('bf8c3f70', 'be940319'),
+    ('a read of an entry SGPR', mutate('bf8c3f70', 'be8c0319'),
      'numeric use of s25 holding an entry value the mesh model does not define'),
-    ('a read of s3 other than the wave index', mutate('bf8c3f70', 'be940303'),
+    ('a read of s3 other than the wave index', mutate('bf8c3f70', 'be8c0303'),
      'slot 57 mesh: s3 is read other than as the wave index'),
     # s_and_b32 s4, s3, 0xf000000: wave 0 would restore a zero mask and store no count.
     ('a wave test that overwrites the saved lane-0 mask', mutate('8706ff03', '8704ff03'),
      'slot 57 mesh count exchange: registers of the accepted shape overlap'),
-    # s_mov_b32 s6, s8 after the thread index is derived: the count compare no longer tells the waves apart.
-    ('a count compare of a register rewritten after the wave index', mutate('bf8cc07f', 'be860308'),
+    # s_mov_b32 s6, s16 after the thread index is derived: the count compare no longer tells the waves apart.
+    ('a count compare of a register rewritten after the wave index', mutate('bf8cc07f', 'be860310'),
      'slot 57 mesh count exchange: the compared register is not the wave index'),
 )
 
@@ -1193,7 +1193,7 @@ def count_entry_guard_controls(tmp):
         if result == 'ok':
             source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
             steps = ('if (exec & 1) v54 = r0.Load(', 'SetMeshOutputCounts(',
-                     'o.pos = ', 'int(s13) > int(v0)', 'if (exec & 1) v54 = min(s14, v54);')
+                     'o.pos = ', 'int(s21) > int(v0)', 'if (exec & 1) v54 = min(s22, v54);')
             offsets = [source.find(step) for step in steps]
             expect('primitive load before exchange and count-masked clamp after the position export',
                    offsets == sorted(set(offsets)) and offsets[0] >= 0, True)
@@ -1209,8 +1209,8 @@ def count_guard_controls(tmp):
         if result != 'ok':
             continue
         source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
-        vert = 's14' if label == 'keep count' else 'mesh_vertex_count'
-        prim = 'mesh_primitive_count' if label == 'rewrite primitive count' else 's13'
+        vert = 's22' if label == 'keep count' else 'mesh_vertex_count'
+        prim = 'mesh_primitive_count' if label == 'rewrite primitive count' else 's21'
         expect(label + ' allocates using the published counts', f'SetMeshOutputCounts({vert}, {prim});' in source, True)
         expect(label + ' clamps using the published vertex count', f'max({vert}, 1u) - 1u' in source, True)
         if label == 'select':
@@ -1222,8 +1222,8 @@ def count_guard_controls(tmp):
            COUNT_COMPARE_REFUSAL)
 
     # Isolate the count-write rule with the old fully-defined output shape.
-    at = MESH.index('7d28000d') + 1
-    key, result = request(tmp, MESH[:at] + ['800ec10e'] + MESH[at:])
+    at = MESH.index('7d280015') + 1
+    key, result = request(tmp, MESH[:at] + ['8016c116'] + MESH[at:])
     expect('count rewrite in the old output shape', result, 'ok')
     if result == 'ok':
         source = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
@@ -1335,8 +1335,49 @@ def coherent_controls(tmp):
            'vcc' in G.lane_mask_webs(mutant).get(vote, ()), True)
 
 
+def mesh_root_layout_controls():
+    # Read platform user data before the descriptor load overwrites s8.
+    platform = MESH.copy()
+    platform.insert(platform.index('7e280505'), '80188108')  # s_add_u32 s24, s8, 1
+    try:
+        G.MeshPipeline(code(platform), code(PIXEL), root())
+    except G.Unsupported as refusal:
+        expect('platform user data is undefined', str(refusal),
+               'numeric use of s8 holding an entry value the mesh model does not define')
+    else:
+        expect('platform user data is undefined', 'accepted', 'refused')
+
+    def layout_root(two_tables):
+        params = [(0, 0, 0)] * (2 if two_tables else 1) + [(3, 0, 0), (1, 0, 0)]
+        params[-1] = (1, 0, 24 + 12 * len(params))
+        rts0 = (struct.pack('<6I', 2, len(params), 24, 0, 0, 0x400)
+                + b''.join(struct.pack('<3I', *p) for p in params) + struct.pack('<3I', 0, 0, 1))
+        return (b'DXBC' + bytes(16) + struct.pack('<4I', 1, 44 + len(rts0), 1, 36)
+                + b'RTS0' + struct.pack('<I', len(rts0)) + rts0)
+
+    mesh = MESH.copy()
+    at = mesh.index('7e280505')
+    mesh[at:at + 1] = [
+        '7e3c0505',  # v_readfirstlane_b32 s30, v5
+        'be920311',  # s_mov_b32 s18, s17 (second table pointer)
+        'be930380',  # s_mov_b32 s19, 0 (pointer high word)
+    ]
+    mesh = [{'be950310': 'be950314',  # s_mov_b32 s21, s20 (root constant)
+             'be960311': 'be960314'}.get(word, word) for word in mesh]  # s_mov_b32 s22, s20
+    pipe = G.MeshPipeline(code(mesh), code(PIXEL), layout_root(True))
+    expect('packed root constant', ('rootconst', 3, 0) in pipe.uds, True)
+    expect('second table binding', 'srv 0 buf table 1 0' in pipe.manifest().splitlines(), True)
+    try:
+        G.MeshPipeline(code(mesh), code(PIXEL), layout_root(False))
+    except G.Unsupported as refusal:
+        expect('shorter root changes binding', str(refusal), 'numeric use of s21 holding ptr')
+    else:
+        expect('shorter root changes binding', 'accepted', 'refused')
+
+
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
+    mesh_root_layout_controls()
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, MESH)
         expect('the fixture translates', result, 'ok')
@@ -1349,9 +1390,9 @@ def controls():
                ['params 1', 'targets 0'])
         text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
         body = [line.strip() for line in text[text.index('void main('):].splitlines()]
-        want = ['if (tid == 0u) { lds[0] = s13; lds[1] = s14; }', 'GroupMemoryBarrierWithGroupSync();',
-                's13 = min(lds[0], 128u);', 's14 = min(lds[1], 128u);', 'if (s14 == 0u) s13 = 0u;',
-                'SetMeshOutputCounts(s14, s13);']
+        want = ['if (tid == 0u) { lds[0] = s21; lds[1] = s22; }', 'GroupMemoryBarrierWithGroupSync();',
+                's21 = min(lds[0], 128u);', 's22 = min(lds[1], 128u);', 'if (s22 == 0u) s21 = 0u;',
+                'SetMeshOutputCounts(s22, s21);']
         at = body.index(want[0]) if want[0] in body else 0
         expect('one store, one barrier, clamped counts, then the allocation', body[at:at + len(want)], want)
         expect('one barrier', text.count('GroupMemoryBarrier'), 1)
@@ -1522,13 +1563,13 @@ v_cndmask_b32_e64 v7, 0, 1.0, vcc
            assemble(mc, 'v_cmp_gt_u32_e64 s[60:61], 64, v0\ns_and_b64 exec, s[54:55], s[60:61]'),
            'd4c4003c 000200c0 87fe3c36'.split())
     expect('guarded position load words', assemble(mc, """
-buffer_load_dwordx4 v[50:53], v4, s[16:19], 0 offen
+buffer_load_dwordx4 v[50:53], v4, s[8:11], 0 offen
 s_waitcnt vmcnt(0)
 """), GUARDED_POSITION_LOAD.split())
     expect('guarded position select words', assemble(mc, """
-s_mov_b32 s42, s9
-s_cmp_eq_u32 s8, 0
-s_cselect_b32 s14, 0, s42
+s_mov_b32 s42, s17
+s_cmp_eq_u32 s16, 0
+s_cselect_b32 s22, 0, s42
 """), dict(GUARDED_POSITION_SETUP)['select'].split())
     source = """
 s_mov_b32 s40, 0x3e808081
@@ -1548,7 +1589,7 @@ v_cmp_ge_u32_e64 s[46:47], v0, 0
 s_not_b64 s[46:47], s[46:47]
 s_and_saveexec_b64 s[46:47], s[46:47]
 s_cbranch_execz 7
-s_load_dwordx4 s[48:51], s[10:11], 0
+s_load_dwordx4 s[48:51], s[18:19], 0
 s_waitcnt lgkmcnt(0)
 s_buffer_load_dword s40, s[48:51], s41 offset:0x1e0
 s_waitcnt lgkmcnt(0)
@@ -1564,8 +1605,8 @@ v_mov_b32 v7, 0.25
              's_andn2_b64 exec, s[52:53], exec', 'beb4047e 7da80032 8afe7e34'),
             ('S6 narrowing and restore', 's_and_b64 exec, s[46:47], exec\ns_and_saveexec_b64 s[54:55], vcc\n'
              's_and_saveexec_b64 s[56:57], vcc\ns_mov_b64 exec, s[52:53]', '87fe7e2e beb6246a beb8246a befe0434'),
-            ('tbuffer', 'tbuffer_load_format_x v7, off, s[16:19], 0 format:[BUF_FMT_32_FLOAT] offset:488',
-             'e8b001e8 80040700'),
+            ('tbuffer', 'tbuffer_load_format_x v7, off, s[8:11], 0 format:[BUF_FMT_32_FLOAT] offset:488',
+             'e8b001e8 80020700'),
             ('image', 'image_load v7, v[50:51], s[56:63] dmask:0x1 dim:SQ_RSRC_IMG_2D',
              'f0000108 000e0732'),
             ('S1b SCC', 's_cmp_eq_u32 src_scc, 1', 'bf0681fd'),
@@ -1575,31 +1616,35 @@ v_mov_b32 v7, 0.25
 
 
 def binary(mc):
+    expect('root layout control words', assemble(mc, 's_add_u32 s24, s8, 1\n'
+           'v_readfirstlane_b32 s30, v5\ns_mov_b32 s18, s17\ns_mov_b32 s19, 0\n'
+           's_mov_b32 s21, s20\ns_mov_b32 s22, s20'),
+           '80188108 7e3c0505 be920311 be930380 be950314 be960314'.split())
     lane_mask_binary(mc)
     mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
     expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
     expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
            FORMATTED_MESH)
     expect('rewritten descriptor words match llvm-mc',
-           assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\ns_mov_b32 s19, 0\n' + FORMAT_LOAD)), REWRITTEN_FORMAT)
+           assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\ns_mov_b32 s11, 0\n' + FORMAT_LOAD)), REWRITTEN_FORMAT)
     expect('pixel words match llvm-mc', assemble(mc, PIXEL_ASM), PIXEL)
-    shift = mesh.replace('v_cmpx_gt_i32 s14, v0', SHIFT_ASM + '\nv_cmpx_gt_i32 s14, v0')
+    shift = mesh.replace('v_cmpx_gt_i32 s22, v0', SHIFT_ASM + '\nv_cmpx_gt_i32 s22, v0')
     shift = shift.replace('exp pos0', 'v_mov_b32 v20, v7\nexp pos0')
     expect('scalar shift mesh words match llvm-mc', assemble(mc, shift), SHIFT_MESH)
-    wave_load = mesh.replace('s_mov_b32 s13, s8', WAVE_LOAD_ASM + '\ns_mov_b32 s13, s8')
+    wave_load = mesh.replace('s_mov_b32 s21, s16', WAVE_LOAD_ASM + '\ns_mov_b32 s21, s16')
     wave_load = wave_load.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('pre-exchange wave load words match llvm-mc', assemble(mc, wave_load), WAVE_LOAD_MESH)
-    wave_block = mesh.replace('s_mov_b32 s13, s8', WAVE_BLOCK_ASM + '\ns_mov_b32 s13, s8')
+    wave_block = mesh.replace('s_mov_b32 s21, s16', WAVE_BLOCK_ASM + '\ns_mov_b32 s21, s16')
     wave_block = wave_block.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('pre-exchange wave block words match llvm-mc', assemble(mc, wave_block), WAVE_BLOCK_MESH)
-    nest = mesh.replace('s_mov_b32 s13, s8', NEST_SCC_ASM + '\ns_mov_b32 s13, s8')
+    nest = mesh.replace('s_mov_b32 s21, s16', NEST_SCC_ASM + '\ns_mov_b32 s21, s16')
     nest = nest.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('nested wave block words match llvm-mc', assemble(mc, nest), NEST_SCC_MESH)
-    nest_execz = mesh.replace('s_mov_b32 s13, s8', NEST_EXECZ_ASM + '\ns_mov_b32 s13, s8')
+    nest_execz = mesh.replace('s_mov_b32 s21, s16', NEST_EXECZ_ASM + '\ns_mov_b32 s21, s16')
     nest_execz = nest_execz.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('nested if wave block words match llvm-mc', assemble(mc, nest_execz), NEST_EXECZ_MESH)
     for label, assembly, words in WAVE_COLLECTIVES:
-        fixture = mesh.replace('s_mov_b32 s13, s8', assembly + '\ns_mov_b32 s13, s8')
+        fixture = mesh.replace('s_mov_b32 s21, s16', assembly + '\ns_mov_b32 s21, s16')
         fixture = fixture.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
         expect(label + ' words match llvm-mc', assemble(mc, fixture), words)
 
@@ -1858,9 +1903,9 @@ def guarded_position_reference():
 
 def widen_position_count(source):
     """Widen the export predicate and its allocation together by one vertex."""
-    old = 's14 = min(lds[1], 128u);'
+    old = 's22 = min(lds[1], 128u);'
     assert source.count(old) == 1
-    return source.replace(old, 's14 = min(lds[1] + 1u, 128u);')
+    return source.replace(old, 's22 = min(lds[1] + 1u, 128u);')
 
 
 def draw_guarded_positions(tmp, dxc, renderer, adapter):
@@ -1904,15 +1949,15 @@ def count_guard_reference(bit, *, vector_bound=False):
     struct.pack_into('<3I', data, 384, *triangles[0])
     # The set-bit arm obtains byte offset 0 from the indexed R32_FLOAT load.
     if vector_bound:
-        # s9 = 2. The clear-bit arm selects (2 << 4) + 4 as the offset.
-        # The set-bit arm loads B = 5 at offset 0, then scales it by s9.
+        # s17 = 2. The clear-bit arm selects (2 << 4) + 4 as the offset.
+        # The set-bit arm loads B = 5 at offset 0, then scales it by s17.
         struct.pack_into('<I', data, 456, 0)
         struct.pack_into('<2I', data, 464, 4, 0)
         struct.pack_into('<2I', data, 500, 8, 0)
         raw_v, raw_p = struct.unpack_from('<2I', data, 464 if bit else 500)
         verts, prims = ((raw_v & 127) + 1) * (2 if bit else 1), raw_p + 1
     else:
-        # s9 = 1. The clear-bit arm computes 16, and both fields come from one word.
+        # s17 = 1. The clear-bit arm computes 16, and both fields come from one word.
         struct.pack_into('<I', data, 452, 0)
         struct.pack_into('<2I', data, 464, 9, 0)
         struct.pack_into('<2I', data, 480, 8, 0)
@@ -1925,7 +1970,7 @@ def count_guard_reference(bit, *, vector_bound=False):
 
 def clamp_with_rewritten_count(source):
     """m3 substitutes the decremented SGPR for the published vertex count in the exporter."""
-    old, new = 'max(mesh_vertex_count, 1u) - 1u', 'max(s14, 1u) - 1u'
+    old, new = 'max(mesh_vertex_count, 1u) - 1u', 'max(s22, 1u) - 1u'
     assert source.count(old) == 1
     return source.replace(old, new)
 

@@ -67,7 +67,7 @@ The existing `mesh_skeleton` already handles the group-index/count exchange, the
 and the fixed user-SGPR layout. Keep it. The mesh stage must model one thread per output lane and
 must not reuse the pixel helper-lane rules blindly.
 
-Requirements: user SGPRs start at s16; the root layout is s16 tables, a root descriptor pair, root
+Requirements: GS user data starts at s8 and the root starts at s16; the root layout is tables, a root descriptor pair, root
 constants, then heap bases; a program with one fewer table shifts by one. `s_bitcmp0_b32 s20, 28`
 tests a packed root-constant field, not a hardware system value. Resource-heap records are indexed
 as `(rootconst & 0x3ff) << 5` and loaded with `s_load_dwordx4` from the 32-bit heap base.

@@ -3449,7 +3449,7 @@ def mesh_value_step(i, name, asm, state, uniform, selects, read_only):
 
 
 def mesh_value_numbers(ins, first, exchange, edges, constant_trips, read_only):
-    """Number forward paths. RDNA 2 ISA §3.12.2 p. 24: GS user data starts at s8."""
+    """Number forward paths. GS user data starts at s8; the root starts at s16."""
     if any(first <= i < exchange for i in constant_trips) or any(
             first <= i < exchange and not i < dest <= exchange for i, dest in edges.items()):
         return {}, set(), {}
@@ -4757,10 +4757,11 @@ class Stage:
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
-        # Graphics root parameters start at s8. For compute, s4 is an inference, not a documented layout: the only
-        # in-repo evidence is a local compute-record scan whose table bindings used s4 or s5 (docs/experiments.md).
-        # s0-s3 are not modelled.
-        reg = 4 if self.kind == 'cs' else 8
+        # Mesh uses GS waves: eight system SGPRs precede user data ("RDNA 2" Instruction Set Architecture,
+        # §3.12.2, pp. 23–24; "RDNA3" Instruction Set Architecture (2023-02), §3.5.3.2, Table 9, pp. 28–29).
+        # Eight platform words precede the graphics root.
+        # Compute s4 is inferred from a local record scan (docs/experiments.md); compute s0–s3 are not modelled.
+        reg = 4 if self.kind == 'cs' else 16 if self.kind == 'ms' else 8
         for index, p in enumerate(root['params']):
             if p['type'] == 0:
                 self.sym[reg] = ('ptr', ('table', index))
