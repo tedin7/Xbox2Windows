@@ -238,7 +238,7 @@ class ControlFlow:
         return before
 
 
-def meet(states, exec_zero=()):
+def meet(G, states, exec_zero=()):
     keys = set().union(*(state.keys() for state in states))
     result = {}
     for key in keys:
@@ -254,7 +254,11 @@ def meet(states, exec_zero=()):
             result[key] = first
         elif STUB_RESULT in values:
             result[key] = STUB_RESULT
-        elif any(value is not None and (value[0] != 'const' or len(value) != 2) for value in values):
+        # Definedness checks for missing writes separately. A fixed-buffer
+        # load and a plain scalar write both leave the value in the SGPR.
+        # Entry user data, by contrast, is read directly from the cbuffer.
+        elif any(value is not None and (value[0] == 'ud' or not G.run_time_symbol(value))
+                 for value in values):
             result[key] = JOINED
     return result
 
@@ -328,7 +332,7 @@ def translate_serial(G, ms, ps, root, pixel_refusal):
             exec_zero = {i for i, p in enumerate(predecessors) if (p, start) in self.cfg.exec_zero_edges}
             if start == 0:
                 states.append(self.entry_symbols)
-            return meet(states, exec_zero) if states else {}
+            return meet(G, states, exec_zero) if states else {}
 
         def op_x2w_serial_block(self, ops, mods):
             if self.current_block is not None:

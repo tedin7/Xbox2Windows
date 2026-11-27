@@ -50,7 +50,26 @@ def check_descriptor_pair_moves_through_vcc():
     assert 'mask word s106 holds desc' in status, status
 
 
+def check_runtime_scalar_join():
+    prefix = SERIAL_MESH[:8] + [
+        'f4081909', 'fa000000',  # s_load_dwordx4 s[100:103], s[18:19], 0
+        'bf850003',              # s_cbranch_scc1 to the other assignment
+        'f4200532', 'fa000000',  # s_buffer_load_dword s20, s[100:103], 0
+        'bf820001',              # s_branch to the use
+    ]
+    suffix = ['7e000214'] + SERIAL_MESH[8:]  # v_mov_b32 v0, s20
+    status, output = run(prefix + ['be940381'] + suffix, 'force', artifacts=True)  # s_mov_b32 s20, 1
+    assert status == 'ok', status
+    hlsl = output['ms57.hlsl'].decode()
+    assert any('s20 = ' in line and '.Load(' in line for line in hlsl.splitlines()), hlsl
+    assert 's20 = 0x00000001u;' in hlsl, hlsl
+    assert 'v0[((wb + l) & 127u)] = s20;' in hlsl, hlsl
+    status, _ = run(prefix + ['be940366'] + suffix, 'force')  # s_mov_b32 s20, s102
+    assert 'numeric use of s20 holding a value joined across wave-loop blocks' in status, status
+
+
 if __name__ == '__main__':
     check_descriptor_shift_add()
     check_exec_zero_non_rejoining_exit()
     check_descriptor_pair_moves_through_vcc()
+    check_runtime_scalar_join()
