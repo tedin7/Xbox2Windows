@@ -381,6 +381,10 @@ inline bool draw_lock_stats_line(char* out, std::size_t size)
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+// The same refusals by what the draw could not decode: index = DXGI format of a typed view (255 holds any larger value),
+// or the hardware FORMAT code of a descriptor the title wrote itself (127 holds any larger value). Printed with the causes.
+LONG formatted_refused_by_view_format[256];
+LONG formatted_refused_by_hardware_code[128];
 LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 constexpr std::size_t zero_tail_scan_budget = 256u << 10;  // bytes looked at per binding under draw_lock; past it the committed range is copied whole
 // Time of the buffer-binding steps under draw_lock, by size class: [0] bindings under 64 KiB, [1] 64 KiB and larger.
@@ -3151,6 +3155,8 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0,
                             FormattedViewDetails view = {}) {
         InterlockedIncrement(&formatted_draws_refused);
+        if (view.present) InterlockedIncrement(&formatted_refused_by_view_format[view.format < 255 ? view.format : 255]);
+        else if (detail) InterlockedIncrement(&formatted_refused_by_hardware_code[detail < 127 ? detail : 127]);
         if (view.present) {
             // The caller holds draw_lock exclusively. Log the first view refusal per pipeline and slot.
             static std::unordered_map<u64, std::uint32_t> seen;
@@ -3291,7 +3297,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
 // Why draw_translated returned false: one counter per refusal site, the first few per site logged, all printed with the totals.
 static const char* const not_drawn_names[] = {
     "state_not_ready",
-    "translation_or_d16_or_formatted_not_ready",
+    "translation_not_ready",
     "missing_guest_root",
     "live_compute_pipeline",
     "writable_texture_indirect",
@@ -3308,11 +3314,20 @@ static const char* const not_drawn_names[] = {
     "buffer_copy_failed",
     "index_data_unavailable",
     "dynamic_resource_heap_unavailable",
+    // The old site 1 ("translation_or_d16_or_formatted_not_ready") split by which gate failed, so one tester run
+    // says which part dominates. Appended: the sites above are addressed by number.
+    "d16_srv_not_ready",
+    "formatted_buffer_not_ready",
+    "descriptor_entry_word_not_ready",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
-constexpr int buffer_copy_failed_site = not_drawn_sites - 3;
-constexpr int index_data_unavailable_site = not_drawn_sites - 2;
-constexpr int dynamic_resource_heap_unavailable_site = not_drawn_sites - 1;
+constexpr int buffer_copy_failed_site = 15;
+constexpr int index_data_unavailable_site = 16;
+constexpr int dynamic_resource_heap_unavailable_site = 17;
+constexpr int d16_srv_not_ready_site = 18;
+constexpr int formatted_buffer_not_ready_site = 19;
+constexpr int descriptor_entry_word_not_ready_site = 20;
+static_assert(not_drawn_sites == 21, "the not-drawn site numbers are fixed");
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -3427,11 +3442,23 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_not_drawn_keys_report(cha
 }
 void log_not_drawn_causes()
 {
-    char text[768];
+    char text[1536];
     int used = snprintf(text, sizeof(text), "x2w-render not drawn by cause:");
     for (int i = 0; i < not_drawn_sites && used > 0 && used < static_cast<int>(sizeof(text)) - 80; ++i)
         if (not_drawn_counts[i]) used += snprintf(text + used, sizeof(text) - used, " %s %ld,", not_drawn_names[i], not_drawn_counts[i]);
     log("%s", text);
+    // Which format the formatted-load refusals were about, so one tester run names the one to add next.
+    char formats[512];
+    int format_used = snprintf(formats, sizeof(formats), "x2w-render formatted-load refusals by format:");
+    for (int i = 0; i < 256 && format_used > 0 && format_used < static_cast<int>(sizeof(formats)) - 48; ++i)
+        if (formatted_refused_by_view_format[i])
+            format_used += snprintf(formats + format_used, sizeof(formats) - format_used, " view DXGI %d x%ld,", i,
+                                    formatted_refused_by_view_format[i]);
+    for (int i = 0; i < 128 && format_used > 0 && format_used < static_cast<int>(sizeof(formats)) - 48; ++i)
+        if (formatted_refused_by_hardware_code[i])
+            format_used += snprintf(formats + format_used, sizeof(formats) - format_used, " hardware FORMAT %d x%ld,", i,
+                                    formatted_refused_by_hardware_code[i]);
+    if (formatted_draws_refused) log("%s", formats);
     // Passes whose depth view has one plane read-only (list_targets binds them with per-plane states; they were refused before).
     if (render_target_mixed_dsv[1] || render_target_mixed_dsv[2])
         log("x2w-render OMSetRenderTargets with a depth view with one read-only plane: depth read-only %ld, stencil read-only %ld",
@@ -3483,13 +3510,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                      : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
                                                      : indirect_refusal_code::formatted_buffer_not_ready;
         draw_lock_release_exclusive();
-        return not_drawn(pass, list, not_drawn_key, 1);
+        return not_drawn(pass, list, not_drawn_key,
+                         !translation_ok ? 1 : !d16_ok ? d16_srv_not_ready_site : formatted_buffer_not_ready_site);
     }
     std::uint32_t descriptor_words[32] = {};
     if (!read_descriptor_entry_words(*tr, pass, descriptor_words)) {
         if (indirect) indirect->set_refusal("descriptor entry word unavailable", indirect_refusal_code::descriptor_word_not_ready);
         draw_lock_release_exclusive();
-        return not_drawn(pass, list, not_drawn_key, 1);
+        return not_drawn(pass, list, not_drawn_key, descriptor_entry_word_not_ready_site);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
