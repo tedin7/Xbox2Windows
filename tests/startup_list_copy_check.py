@@ -23,9 +23,7 @@ def verify_phases(log, expected, *, check_speed=False):
         raise AssertionError(f"phase windows {windows}, expected {expected}")
     if check_speed:
         _, probes, slow, _ = matches[0]
-        # Loose bounds: the gate runs several builds at once, so a preempted copy can look slow.
-        # Taking the draw lock would stall every copy in the ten held batches (about 1000 of 2000).
-        if float(probes) >= 50 or int(slow) > 100:
+        if float(probes) >= 5 or int(slow):
             raise AssertionError(f"page probes averaged {probes} us with {slow} slow lock waits")
 
 
