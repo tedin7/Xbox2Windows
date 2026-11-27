@@ -2805,11 +2805,10 @@ bool plain_compute_input_readable(u64 address, u64 bytes)
     for (u64 checked = 0; checked < bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         const u64 at = address + checked;
-        const auto* pointer = reinterpret_cast<const void*>(at);
-        const bool queried = x2w_local::mapped_cache_enabled()
-            ? x2w_local::query_readable_mapped_span(pointer, &info)
-            : VirtualQuery(pointer, &info, sizeof(info)) != 0;
-        if (!queried || info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        // Always a fresh query: the snapshot copies title memory right after this check with no touch,
+        // so a cached span that was decommitted since would fault there.
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) ||
+            info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
             return false;
         checked += reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize - at;
     }
