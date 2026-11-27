@@ -7,8 +7,9 @@ struct ID3D12Resource;
 
 inline constexpr std::uint64_t initial_upload_chunk_bytes = 16ull << 20;
 inline constexpr std::uint64_t max_upload_ring_bytes = 256ull << 20;
-// Each allocation except possibly the final remainder is at least the initial size.
-inline constexpr unsigned max_upload_chunks = max_upload_ring_bytes / initial_upload_chunk_bytes;
+// Each pool grows in chunks of at least the initial size, except for its final remainder.
+inline constexpr unsigned max_regular_upload_chunks = max_upload_ring_bytes / initial_upload_chunk_bytes;
+inline constexpr unsigned max_upload_chunks = 2 * max_regular_upload_chunks;
 using UploadChunkMask = std::uint32_t;
 inline constexpr unsigned max_large_upload_buffers = 32;
 static_assert(max_upload_chunks <= 32);
@@ -45,6 +46,7 @@ struct UploadRingChunk {
     std::uint64_t used = 0;
     std::uint64_t generation = 0;
     unsigned recordings = 0;
+    bool overflow = false;
 
     void hold(UploadChunkMask& recording, unsigned index)
     {
