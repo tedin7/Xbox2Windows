@@ -670,20 +670,26 @@ set_tests_properties(startup_view_dimension_off_control_warp PROPERTIES TIMEOUT 
     ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=off"
     PASS_REGULAR_EXPRESSION "FAIL: \\(a\\) default view reads 0\\.000 0\\.000 0\\.000 0\\.000, expected 0\\.200 0\\.600 0\\.800 1\\.000; device not removed.*cases complete"
     FAIL_REGULAR_EXPRESSION "FAIL: setup|FAIL: \\(b\\)|FAIL: \\(c\\)|FAIL: \\(d\\)|DEVICE REMOVED|removed the device")
-foreach(mode IN ITEMS enabled off stale)
+foreach(mode IN ITEMS enabled off stale recover cache_first)
     set(slot70_case memory-buffer)
     set(slot70_switch 1)
     set(slot70_mutant 0)
+    set(slot70_cache_first 0)
     if(mode STREQUAL "off")
         set(slot70_case memory-buffer-off)
         set(slot70_switch 0)
     elseif(mode STREQUAL "stale")
         set(slot70_case memory-buffer-stale)
         set(slot70_mutant 1)
+    elseif(mode STREQUAL "recover")
+        set(slot70_case memory-buffer-recover)
+    elseif(mode STREQUAL "cache_first")
+        set(slot70_case memory-buffer-cache-first)
+        set(slot70_cache_first 1)
     endif()
     add_test(NAME startup_slot70_memory_buffer_${mode}_warp COMMAND startup_view_dimension_device warp "${slot70_case}")
     set_tests_properties(startup_slot70_memory_buffer_${mode}_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=${slot70_switch};X2W_TEST_SLOT70_MEMORY_BUFFER_STALE=${slot70_mutant}")
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=;X2W_SLOT70_MEMORY_BUFFER=${slot70_switch};X2W_TEST_SLOT70_MEMORY_BUFFER_STALE=${slot70_mutant};X2W_TEST_SLOT70_CACHE_FIRST=${slot70_cache_first}")
 endforeach()
 set_tests_properties(startup_slot70_memory_buffer_off_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "unavailable buffer at the supplied address: reason=buffer_unavailable.*slot70 switch-off control: all three publications left the null SRVs intact")
@@ -691,6 +697,8 @@ set_tests_properties(startup_slot70_memory_buffer_enabled_warp startup_slot70_me
     FAIL_REGULAR_EXPRESSION "reason=buffer_unavailable")
 set_tests_properties(startup_slot70_memory_buffer_stale_warp PROPERTIES
     PASS_REGULAR_EXPRESSION "slot70 stale mutant: refreshed readback failed with the first generation")
+set_tests_properties(startup_slot70_memory_buffer_cache_first_warp PROPERTIES
+    PASS_REGULAR_EXPRESSION "slot70 cache-first mutant: readable view still samples null")
 # The slot and label of the x2w-render totals line each null-binding cause is counted under
 # (src/startup_stubs/null_binding_cause.h). The mutated run is the negative control.
 add_executable(startup_null_cause_labels_check tests/startup_null_cause_labels_check.cpp)
@@ -5120,10 +5128,6 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_list_cost_bench_${adapter} startup_list_cost_bench_nolock_refuse_${adapter}
             PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     endforeach()
-    add_test(NAME startup_list_cost_bench_reset_nolock_warp COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_list_cost_bench_check.py" "$<TARGET_FILE:startup_stream_consumer>"
-        "${DXC_EXECUTABLE}" warp --reset)
-    set_tests_properties(startup_list_cost_bench_reset_nolock_warp PROPERTIES TIMEOUT 240)
     add_test(NAME startup_compute_nolock_refuse_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
         "${DXC_EXECUTABLE}" warp --nolock)

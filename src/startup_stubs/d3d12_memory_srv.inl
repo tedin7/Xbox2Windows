@@ -437,64 +437,75 @@ std::vector<MemoryBufferSnapshot> memory_buffer_snapshots;
 u64 memory_buffer_snapshot_charge;
 
 Wrapper* snapshot_memory_buffer(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& requested,
-                                const D3D12_SHADER_RESOURCE_VIEW_DESC& view, u64 bytes) try
+                                const D3D12_SHADER_RESOURCE_VIEW_DESC& view, u64 bytes)
 {
+    auto& counts = memory_srv_switch_census;
+    const auto failed = [&](x2w_startup::MemorySrvSwitchCensus::Count& reason) -> Wrapper* {
+        ++counts.attempts;
+        ++reason;
+        return nullptr;
+    };
     constexpr u64 max_view_bytes = 1ull << 20;
     constexpr u64 budget = 128ull << 20;
     if (view.Format != DXGI_FORMAT_UNKNOWN || view.Buffer.FirstElement != 0 ||
         view.Buffer.NumElements != 1 || view.Buffer.StructureByteStride != requested.Width ||
-        !bytes || bytes > max_view_bytes || bytes > UINT64_MAX - address)
-        return nullptr;
+        !bytes || bytes > UINT64_MAX - address)
+        return failed(counts.view_does_not_fit);
+    if (bytes > max_view_bytes) return failed(counts.over_limit);
     const auto placed = placed_buffer_range(device, address, bytes);
-    if (placed.owner || placed.reject || address_resource_overlap(address, bytes)) return nullptr;
+    if (placed.owner || placed.reject || address_resource_overlap(address, bytes)) return failed(counts.view_does_not_fit);
 
     const auto* source = reinterpret_cast<const void*>(address);
-    if (!x2w_local::readable(source, static_cast<std::size_t>(bytes))) return nullptr;
+    if (!x2w_local::readable(source, static_cast<std::size_t>(bytes))) return failed(counts.not_readable);
     std::lock_guard lock(unplaced_buffer_mutex);
-    std::vector<unsigned char> snapshot(static_cast<std::size_t>(bytes));
-    if (!x2w_local::guarded_memcpy(snapshot.data(), source, snapshot.size(), true)) return nullptr;
+    try {
+        std::vector<unsigned char> snapshot(static_cast<std::size_t>(bytes));
+        if (!x2w_local::guarded_memcpy(snapshot.data(), source, snapshot.size(), true)) return failed(counts.not_readable);
 
-    static const bool stale_mutant = x2w_local::env_on("X2W_TEST_SLOT70_MEMORY_BUFFER_STALE");
-    for (const auto& entry : memory_buffer_snapshots) {
-        if (entry.device == device && entry.address == address && entry.bytes.size() == snapshot.size() &&
-            (stale_mutant || entry.bytes == snapshot))
-            return entry.wrapper;
+        static const bool stale_mutant = x2w_local::env_on("X2W_TEST_SLOT70_MEMORY_BUFFER_STALE");
+        for (const auto& entry : memory_buffer_snapshots) {
+            if (entry.device == device && entry.address == address && entry.bytes.size() == snapshot.size() &&
+                (stale_mutant || entry.bytes == snapshot))
+                return entry.wrapper;
+        }
+
+        auto* desktop = device_of(device);
+        D3D12_RESOURCE_DESC desc = requested;
+        desc.Alignment = 0;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto allocation = desktop->GetResourceAllocationInfo(0, 1, &desc);
+        if (!allocation.SizeInBytes || allocation.SizeInBytes > budget - memory_buffer_snapshot_charge ||
+            bytes > budget - memory_buffer_snapshot_charge - allocation.SizeInBytes)
+            return failed(counts.allocation);
+        const u64 charge = allocation.SizeInBytes + bytes;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                        D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+        x2w_startup::ComPtr<ID3D12Resource> resource;
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource))))
+            return failed(counts.allocation);
+        void* mapped = nullptr;
+        const D3D12_RANGE no_reads{};
+        if (FAILED(resource->Map(0, &no_reads, &mapped))) return failed(counts.allocation);
+        std::memcpy(mapped, snapshot.data(), snapshot.size());
+        const D3D12_RANGE written{0, snapshot.size()};
+        resource->Unmap(0, &written);
+
+        auto& entry = memory_buffer_snapshots.emplace_back(
+            MemoryBufferSnapshot{device, address, charge, std::move(snapshot), resource, nullptr});
+        entry.wrapper = wrap(resource.Get(), resource_kind);
+        if (!entry.wrapper) {
+            memory_buffer_snapshots.pop_back();
+            return failed(counts.allocation);
+        }
+        memory_buffer_snapshot_charge += charge;
+        entry.wrapper->own().budget = x2w_budget::committed(desktop, resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
+        ++counts.attempts;
+        counts.bytes += bytes;
+        return entry.wrapper;
+    } catch (const std::bad_alloc&) {
+        return failed(counts.allocation);
     }
-
-    auto* desktop = device_of(device);
-    D3D12_RESOURCE_DESC desc = requested;
-    desc.Alignment = 0;
-    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    const auto allocation = desktop->GetResourceAllocationInfo(0, 1, &desc);
-    if (!allocation.SizeInBytes || allocation.SizeInBytes > budget - memory_buffer_snapshot_charge ||
-        bytes > budget - memory_buffer_snapshot_charge - allocation.SizeInBytes)
-        return nullptr;
-    const u64 charge = allocation.SizeInBytes + bytes;
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                                    D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-    x2w_startup::ComPtr<ID3D12Resource> resource;
-    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource))))
-        return nullptr;
-    void* mapped = nullptr;
-    const D3D12_RANGE no_reads{};
-    if (FAILED(resource->Map(0, &no_reads, &mapped))) return nullptr;
-    std::memcpy(mapped, snapshot.data(), snapshot.size());
-    const D3D12_RANGE written{0, snapshot.size()};
-    resource->Unmap(0, &written);
-
-    auto& entry = memory_buffer_snapshots.emplace_back(
-        MemoryBufferSnapshot{device, address, charge, std::move(snapshot), resource, nullptr});
-    entry.wrapper = wrap(resource.Get(), resource_kind);
-    if (!entry.wrapper) {
-        memory_buffer_snapshots.pop_back();
-        return nullptr;
-    }
-    memory_buffer_snapshot_charge += charge;
-    entry.wrapper->own().budget = x2w_budget::committed(desktop, resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
-    return entry.wrapper;
-} catch (const std::bad_alloc&) {
-    return nullptr;
 }
 
 void clear_unplaced_buffers(Wrapper* device)
@@ -846,13 +857,19 @@ const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12
 
 // Publish a plain CPU footprint, distinct from the tiled address sources below.
 Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& title,
-                                   D3D12_SHADER_RESOURCE_VIEW_DESC& view, const char*& refusal)
+                                   D3D12_SHADER_RESOURCE_VIEW_DESC& view, const char*& refusal,
+                                   const char*& detail)
 {
     refusal = "unsupported_desktop_format";
     constexpr UINT gpu_writes = static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
                                 static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) |
                                 static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || (title.Flags & gpu_writes) ||
+    if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+        detail = "unsupported 1D source layout (no console footprint mapping)";
+        return nullptr;
+    }
+    detail = "unsupported 1D resource shape or flags";
+    if ((title.Flags & gpu_writes) ||
         title.Width > D3D12_REQ_TEXTURE1D_U_DIMENSION ||
         title.DepthOrArraySize > D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION)
         return nullptr;
@@ -865,8 +882,10 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     view.Format = desc.Format;
     // No 2D stand-in: a translated draw binds a null view when a Texture1D shader meets a non-1D desktop resource
     // (wrong_1d_resource in draw_translated), so a 2D fallback would only turn a refusal into a black draw.
+    detail = "desktop format lacks single-plane 1D shader view support";
     if (!desktop_address_view_supported(device, desc, view)) return nullptr;
 
+    detail = "unavailable 1D texture at the supplied base and layout";
     auto* const desktop = device_of(device);
     const x2w_startup::SliceFootprints plan(desktop, desc, desc.MipLevels);
     if (!plan.size || plan.size == UINT64_MAX) return nullptr;
@@ -906,6 +925,7 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     note_resource(resource, &title, bytes);
     tiled_srv_textures.emplace(resource, TiledAddressTexture{device, resource, title, {}});
     tiled_srv_addresses.emplace(address, resource);
+    ++memory_srv_switch_census.one_d_published;
     x2w_startup::note_placement_change();
     return resource;
 }
@@ -1056,13 +1076,32 @@ void log_layout0_texture(const char* reason, const D3D12_RESOURCE_DESC* resource
         nonzero_rows[1], nonzero_rows[2], nonzero_rows[3]);
 }
 
+void note_alias_texture_unreadable(Wrapper* device, u64 address, const char* reason)
+{
+    if (!slot70_texture_alias_enabled() || std::strcmp(reason, "texture_unreadable")) return;
+    note_lock_acquire(false);
+    resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
+        const auto& info = resource_infos().at(wrapper);
+        const auto base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        if (info.texture_alias_device != device || address < base || address - base >= info.texture_alias_bytes ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+            return false;
+        ++memory_srv_switch_census.alias_unreadable;
+        return true;
+    });
+    ReleaseSRWLockShared(&note_lock);
+}
+
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                        const MemoryShaderResourceView* input, u64 destination)
 {
     const bool within_limit = first_calls(refused, 8);
-    const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
+    const auto* shape = x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr;
+    const bool new_shape = memory_srv_census.note(reason, shape);
+    if (shape && shape->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled())
+        ++memory_srv_switch_census.one_d_refused[x2w_startup::memory_srv_reason_index(reason)];
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
     log_layout0_texture(reason, resource, input);
 }
@@ -1071,6 +1110,8 @@ void refuse_memory_srv(LONG& refused, const char* what, const char* reason, cons
 // distinct destination descriptors.
 void note_memory_srv_write(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
 {
+    if (resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled())
+        ++memory_srv_switch_census.one_d_bound;
     const u64 ordinal = memory_srv_writes.note(destination);
     if (!ordinal) return;
     char resource_text[224], view_text[256];
@@ -1177,8 +1218,10 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             note_memory_srv_write(resource, input, destination);
         } else {
-            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout",
-                              texture_unavailable_reason(self, input->address, *resource, true), resource, input, destination);
+            const char* reason = texture_unavailable_reason(self, input->address, *resource, true);
+            note_alias_texture_unreadable(self, input->address, reason);
+            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", reason, resource, input,
+                              destination);
         }
         return;
     }
@@ -1201,9 +1244,14 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                 buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes, &refusal_proof);
         }
         static const bool shadow_enabled = x2w_local::env_on("X2W_SLOT70_MEMORY_BUFFER");
-        if (!buffer && shadow_enabled) {
+        // The cached proof covers the regular buffer lookup, not the smaller snapshot range.
+        static const bool cache_first_mutant = shadow_enabled && x2w_local::env_on("X2W_TEST_SLOT70_CACHE_FIRST");
+        if (shadow_enabled && cached_refusal && cache_first_mutant) ++memory_srv_switch_census.cached_skip;
+        if (!buffer && shadow_enabled && !(cached_refusal && cache_first_mutant)) {
+            if (cached_refusal) ++memory_srv_switch_census.cached_rechecks;
             if (auto* shadow = snapshot_memory_buffer(self, input->address, *resource, input->view, span_bytes)) {
                 view_slot<18, 2>(self, reinterpret_cast<u64>(shadow), reinterpret_cast<u64>(&input->view), destination, 0);
+                ++memory_srv_switch_census.bound;
                 note_memory_srv_write(resource, input, destination);
                 return;
             }
@@ -1249,11 +1297,12 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture && resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && placed_1d_texture_enabled()) {
         auto view = input->view;
         const char* refusal = nullptr;
-        texture = publish_placed_1d_texture(self, input->address, *resource, view, refusal);
+        const char* detail = nullptr;
+        texture = publish_placed_1d_texture(self, input->address, *resource, view, refusal, detail);
         log_address_kind(texture ? "published placed 1D texture" : refusal, *resource, input->view, input->address);
         if (!texture) {
-            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", refusal, resource, input,
-                              destination);
+            note_alias_texture_unreadable(self, input->address, refusal);
+            refuse_memory_srv(refused, detail, refusal, resource, input, destination);
             return;
         }
         view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&view), destination, 0);
@@ -1277,6 +1326,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                     log_address_kind("published overlapping subresources", *resource, input->view, input->address);
                     view_slot<18, 2>(self, reinterpret_cast<u64>(owner), reinterpret_cast<u64>(&adjusted), destination, 0);
                     note_memory_srv_write(resource, input, destination);
+                    ++memory_srv_switch_census.alias_resolved;
                     release(owner);
                     return;
                 }
@@ -1295,8 +1345,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) outcome = held ? held : unavailable;
     log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
-        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : unavailable,
-                          resource, input, destination);
+        note_alias_texture_unreadable(self, input->address, outcome);
+        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", outcome, resource, input,
+                          destination);
         return;
     }
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
