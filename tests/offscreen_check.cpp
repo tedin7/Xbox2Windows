@@ -1505,7 +1505,8 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
     if (!file || file.peek() != std::char_traits<char>::eof())
         return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
     std::vector<std::uint32_t> pixels(expected.size());
-    if (std::string_view(ctx.argv[2]) == "--raster-reference") {
+    const std::string_view operation = ctx.argv[2];
+    if (operation == "--raster-reference") {
         const std::string_view mode = ctx.argv[8], winding = ctx.argv[9];
         const auto cull = mode == "none" ? D3D12_CULL_MODE_NONE :
                           mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
@@ -1519,7 +1520,9 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
                                 D3D12_CULL_MODE_NONE, FALSE, 3, entry.data(), UINT(entry.size()), buffer);
     } else {
-        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+        const UINT instances = operation == "--startup-instanced-pixel-words" ? UINT(width) : 1;
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
+                                D3D12_CULL_MODE_NONE, FALSE, 3, nullptr, 4, {}, instances);
     }
     unsigned long differing = 0;
     for (unsigned long y = 0; y < height; ++y) {
@@ -1763,6 +1766,7 @@ const OperationSpec kOperations[] = {
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
