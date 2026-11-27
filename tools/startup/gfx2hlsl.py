@@ -1712,6 +1712,126 @@ def calculated_pc_proof(ins, kind):
 
 
 
+
+def vertex_image_getpc_proof(code, ins):
+    """Prove a single GETPC table base and its direct vector carry uses.
+
+    The returned vector pairs still require a separate offset and load proof.
+    No values are elided by this function.
+    """
+    def refuse(reason):
+        raise Unsupported('vertex program image: ' + reason)
+
+    if not ins or len(code) % 4:
+        refuse('invalid image extent')
+    ends = [pc + size for pc, size, _, _ in ins]
+    if ins[0][0] != 0 or any(a != b[0] for a, b in zip(ends, ins[1:])):
+        refuse('instruction boundaries are incomplete')
+    reads = [i for i, (_, _, name, _) in enumerate(ins) if name == 's_getpc_b64']
+    if len(reads) != 1:
+        refuse('expected exactly one GETPC')
+    i = reads[0]
+    pc, size, _, asm = ins[i]
+    _, ops, mods = parse(asm)
+    low = pc_pair(ops[0]) if len(ops) == 1 and not mods and size == 4 else None
+    if low is None or i + 2 >= len(ins):
+        refuse('invalid GETPC pair')
+    add_pc, add_size, add_name, add_asm = ins[i + 1]
+    hi_pc, hi_size, hi_name, hi_asm = ins[i + 2]
+    _, add_ops, add_mods = parse(add_asm)
+    _, hi_ops, hi_mods = parse(hi_asm)
+    offset = pc_word(add_ops[2]) if len(add_ops) == 3 else None
+    if (add_pc != pc + 4 or add_size != 8 or add_name != 's_add_u32'
+            or add_mods or add_ops[:2] != ['s%d' % low] * 2 or offset is None
+            or offset < 0 or code[add_pc + 1] != 0xff
+            or hi_pc != add_pc + 8 or hi_size != 4 or hi_name != 's_addc_u32'
+            or hi_mods or hi_ops != ['s%d' % (low + 1), 's%d' % (low + 1), '0']):
+        refuse('GETPC requires literal low add and zero high carry')
+    start = pc + size + offset
+    if start % 4 or start < ends[-1] or start >= len(code):
+        refuse('table start is outside the data tail')
+    table = tuple(word for word, in struct.iter_unpack('<I', code[start:]))
+    pair = {'s%d' % low, 's%d' % (low + 1)}
+    low_reg, high_reg = 's%d' % low, 's%d' % (low + 1)
+    vector_pairs = {}
+    pcs = {row[0]: row for row in ins}
+    # Only the matching low and high add may read either address word.
+    for j, (off, n, name, line) in enumerate(ins):
+        if off <= hi_pc:
+            continue
+        if 'movrel' in name or 'swaprel' in name:
+            refuse('indirect register access after GETPC')
+        _, args, flags = parse(line)
+        reads_s, _, may_s = scalar_effects(name, line)
+        if pair & may_s:
+            refuse('GETPC pair is overwritten')
+        if not pair & reads_s:
+            continue
+        base = re.sub(r'_e(32|64)$', '', name)
+        if (base != 'v_add_co_u32' or flags or len(args) != 4 or args[1] not in ('vcc', 'vcc_lo')
+                or args[2:].count(low_reg) != 1 or high_reg in args[2:] or j + 1 >= len(ins)):
+            # The second half is checked with its preceding low half below.
+            if off in vector_pairs.values():
+                continue
+            refuse('GETPC pair escapes the vector carry chain')
+        next_pc, _, next_name, next_line = ins[j + 1]
+        _, next_ops, next_mods = parse(next_line)
+        next_base = re.sub(r'_e(32|64)$', '', next_name)
+        if (next_base != 'v_add_co_ci_u32' or next_mods or len(next_ops) != 5
+                or next_ops[1] != args[1] or next_ops[4] != args[1]
+                or next_ops[2:4].count(high_reg) != 1 or low_reg in next_ops[2:4]):
+            refuse('GETPC vector carry is incomplete')
+        vector_pairs[off] = next_pc
+    if not vector_pairs:
+        refuse('GETPC pair has no vector carry chain')
+
+    # Track setup dominance and the SCC produced by the erased scalar adds.
+    # A second path into the high add or a read of an unmaterialized SCC is unsafe.
+    pending, seen = [(0, 0, False)], set()
+    while pending:
+        off, phase, stale_scc = pending.pop()
+        if (off, phase, stale_scc) in seen:
+            continue
+        seen.add((off, phase, stale_scc))
+        if off not in pcs:
+            refuse('branch target is outside executable instructions')
+        _, n, name, line = pcs[off]
+        _, args, _ = parse(line)
+        if off == pc:
+            if phase:
+                refuse('GETPC executes more than once')
+            phase = 1
+        elif off == add_pc:
+            if phase != 1:
+                refuse('GETPC low add is not dominated by GETPC')
+            phase, stale_scc = 2, True
+        elif off == hi_pc:
+            if phase != 2:
+                refuse('GETPC high add is not dominated by low add')
+            phase, stale_scc = 3, True
+        elif off in vector_pairs or off in vector_pairs.values():
+            if phase != 3:
+                refuse('GETPC use is not dominated by setup')
+        else:
+            reads_s, writes_s, _ = scalar_effects(name, line)
+            if stale_scc and 'scc' in reads_s:
+                refuse('GETPC carry SCC escapes')
+            if 'scc' in writes_s:
+                stale_scc = False
+        successors = []
+        if name == 's_branch' or name.startswith('s_cbranch_'):
+            target = re.fullmatch(r'label_0x([0-9a-f]+)', args[0]) if len(args) == 1 else None
+            if not target:
+                refuse('unsupported branch')
+            successors.append(int(target.group(1), 16))
+        elif name.startswith(('s_setpc', 's_swappc', 's_call', 's_rfe', 's_trap', 's_endpgm_')):
+            refuse('unsupported control transfer')
+        if name not in ('s_branch', 's_endpgm'):
+            successors.append(off + n)
+        pending.extend((target, phase, stale_scc) for target in successors)
+    return start, table, (pc, add_pc, hi_pc), vector_pairs
+
+
 def vertex_image_range_facts(ins):
     """Bounds immediately before decoded instructions; discard unmodelled joins.
 
