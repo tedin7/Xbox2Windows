@@ -3,6 +3,8 @@
   (no arguments)                       translation controls and mutations, pure Python
   binary <llvm-mc>                     reassemble the fixture sources and compare them with the words below
   compile <dxc>                        compile the translated pair with DXC vs_6_0 / ps_6_0 (no rendering)
+  draw_exec_halves <dxc> <offscreen_check> <warp|hardware>
+                                       draw the restored-EXEC, half-write and wide-write fixtures
   draw_flow <dxc> <offscreen_check> <warp|hardware>
                                        draw the varying, branching pair and mixed-FMA fixture and its mutants
   draw <dxc> <offscreen_check> <warp|hardware>
@@ -373,6 +375,7 @@ def controls():
     assert 'hparam0_lo' in translate(PS_WORDS, F32_VS_WORDS).hlsl_ps()
     barycentric_controls(expected)
     flow_controls()
+    extended_flow_controls()
     assert len(set(flow_reference(8, 4)[::4])) == 8
     loop_controls(expected)
     plain_controls(expected)
@@ -554,6 +557,122 @@ def flow_controls():
     refused('mixed modes at a binary16 producer', mixed, 'mixed binary16/binary64 rounding modes')
     reset = translate(M0 + ROUND_ZERO + words(0xbfa40000) + mix_words(16, 17, opcode=0x21) + END).hlsl_ps()
     assert 'f32tof16(mix32(' in reset and 'f16rz' not in reset, reset
+
+
+def save_exec(dst, source=128):
+    return words(0xbe802400 | dst << 16 | source)
+
+
+def restore_exec(src):
+    return words(0xbefe0400 | src)
+
+
+def compr_export(slot, first, second):
+    return words(0xf8001c0f | slot << 4, first | second << 8)
+
+
+def half_exec_fixture(*, slot=0, restore=True, nonlocal_read=False, alpha_stale=False):
+    p1, p2 = interp_words(0, 20, 0, high=True)
+    compare = words(0x7c020000 | 21 << 9 | 255, 0x3fc00000)  # 1.5 < v21
+    cvt = words(0x7e001700 | 21 << 17 | 20)  # v_cvt_f32_f16 v21, v20
+    mixlo = words(0xcc210000, 276 | 240 << 9 | 128 << 18 | 1 << 27)  # half(v20) * 0.5
+    readlane = words(0xd760001e, 256 | 128 << 9) if nonlocal_read else b''
+    return (M0 + p1 + p2 + cvt + compare + save_exec(20, 106) + mixlo + save_exec(22)
+            + (restore_exec(22) if restore else b'') + readlane
+            + mov(28, 0) + compr_export(slot, 0, 0 if alpha_stale else 28) + END)
+
+
+def restored_exec_fixture(*, clobber=b'', wide=False):
+    saved = words(0xbe94047e)  # s_mov_b64 s[20:21], exec
+    p1, p2 = interp_words(12, 20, 0)
+    if wide:
+        p1_hi, p2_hi = interp_words(13, 21, 1)
+        p1 += p1_hi
+        p2 += p2_hi
+        # Shift the quadword 0x1fe000001fc00000 left once. Consume both destination words.
+        replace = (mov(16, 0x1fc00000) + mov(17, 0x1fe00000)
+                   + words(0xd6ff000c, 129 | 272 << 9))
+        export = export_words(12, 13, 12, 13)
+    else:
+        replace = mov(12, 0x3f800000)
+        export = export_words(12, 12, 12, 12)
+    return (M0 + saved + restore_exec(20) + p1 + p2 + save_exec(24) + clobber
+            + restore_exec(20) + replace + restore_exec(24) + export + END)
+
+
+def scan_decoded(*instructions):
+    """Probe scan effects that do not need descriptor setup or shader lowering."""
+    stage = G.Stage.__new__(G.Stage)
+    stage.ins = [(4 * i, 4, G.parse(asm)[0], asm) for i, asm in enumerate(instructions)]
+    stage.interp_f16_scan()
+
+
+def extended_flow_controls():
+    vertex = varying_vertex_words()
+    for fmt in (41, 54, 56, 58, 61, 63):
+        for slot, formats in ((0, (fmt,)), (1, (10, fmt))):
+            ps = translate(half_exec_fixture(slot=slot), vertex, rtv_formats=formats).hlsl_ps()
+            assert 'o.mrt%d = float4(f16tof32(v0), f16tof32(v0 >> 16)' % slot in ps
+    translate(half_exec_fixture(restore=False), vertex, rtv_formats=(61,))
+    refused('inactive lanes are visible to readlane', half_exec_fixture(restore=False, nonlocal_read=True),
+            'v_readlane_b32 reads it after', vs_words=vertex, rtv_formats=(61,))
+
+    for wide in (False, True):
+        translate(restored_exec_fixture(wide=wide), vertex)
+    for clobber in (words(0xbe940380), words(0xbe950380)):
+        refused('copy loses identity when either saved SGPR is overwritten',
+                restored_exec_fixture(clobber=clobber), 'reads it after', vs_words=vertex)
+
+    pair = ('v_interp_p1ll_f16 v12, v0, attr0.x', 'v_interp_p2_f16 v20, v1, attr0.x, v12')
+    use = 'v_add_co_ci_u32 v30, vcc_lo, v12, v13, vcc_lo'
+    for op in ('v_lshlrev_b64', 'v_ashrrev_i64', 'v_add_f64', 'v_mul_lo_u64'):
+        scan_decoded(*pair, op + ' v[12:13], v[16:17], v[18:19]', use)
+    for op in ('image_load v[11:12], [v8, v9], s[32:39]',
+               'image_sample v[12:13], v[8:9], s[32:39], s[40:43]',
+               'image_gather4 v[10:13], v[8:9], s[32:39], s[40:43]'):
+        scan_decoded(*pair, op, use)
+        for flag in ('d16', 'tfe', 'lwe'):
+            try:
+                scan_decoded(*pair, op + ' ' + flag, use)
+            except G.Unsupported as error:
+                assert 'reads it after' in str(error), error
+            else:
+                raise AssertionError('partial image destination treated as whole: ' + op + ' ' + flag)
+
+    low = 'v_fma_mixlo_f16 v12, v20, 1.0, 0'
+    high = 'v_fma_mixhi_f16 v12, v20, 1.0, 0'
+    scan_decoded(*pair, low, 'v_cvt_f32_f16 v30, v12')
+    scan_decoded(*pair, high, 'v_cvt_f32_f16_sdwa v30, v12 src0_sel:WORD_1')
+    scan_decoded(*pair, low, 'v_fma_mix_f32 v30, v12, 1.0, 0 op_sel_hi:[1,0,0]')
+    scan_decoded(*pair, high, 'v_fma_mix_f32 v30, v12, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]')
+    for word, byte in ((0, 1), (1, 3)):
+        scan_decoded(*pair, 'v_mov_b32_sdwa v12, v20 dst_sel:WORD_%d dst_unused:UNUSED_PRESERVE' % word,
+                     'v_mov_b32_sdwa v30, v12 src0_sel:BYTE_%d' % byte)
+    def refuses_read(label, *instructions):
+        try:
+            scan_decoded(*instructions)
+        except G.Unsupported as error:
+            assert 'reads it after' in str(error), (label, error)
+        else:
+            raise AssertionError(label)
+
+    for write, read in (
+            ('', 'v_cvt_f32_f16 v30, v12'),
+            (' ' + G.INTERP_DST_HIGH, 'v_cvt_f32_f16_sdwa v30, v12 src0_sel:WORD_1')):
+        scan_decoded(*pair, 'v_interp_p1ll_f16 v22, v0, attr0.y',
+                     'v_interp_p2_f16 v12, v1, attr0.y, v22' + write, read)
+    refuses_read('image address list reads an omitted register', *pair,
+                 'image_load v30, [v8, v12], s[32:39]')
+    refuses_read('low-half writer killed the high half', *pair, low, use)
+    for fmt in (10, 65):  # RGBA16_FLOAT and A8_UNORM
+        refused('RGBA or alpha target needs the other half', half_exec_fixture(), 'reads it after',
+                vs_words=vertex, rtv_formats=(fmt,))
+    refused('alpha can reach blending on R-only targets', half_exec_fixture(alpha_stale=True),
+            'reads it after', vs_words=vertex, rtv_formats=(61,))
+    refuses_read('overlapping scalar load left a stale EXEC identity',
+                 's_mov_b64 exec, s[20:21]', 's_mov_b64 s[24:25], exec', *pair,
+                 's_load_dwordx4 s[18:21], s[8:9], 0', 's_mov_b64 exec, s[20:21]', 'v_mov_b32 v12, v20',
+                 's_mov_b64 exec, s[24:25]', use)
 
 
 def f32(x):
@@ -831,6 +950,44 @@ def check_flow_draw(dxc, renderer, adapter):
             print(name, diagnostic, flush=True)
 
 
+def check_extended_flow_draw(dxc, renderer, adapter):
+    width, height = 8, 4
+    vertex = varying_vertex_words()
+    # First four columns are inactive. Active columns export half(1 + (x + 0.5)/8) * 0.5.
+    # This is an exact dyadic value, so the reference can quantize it to UNORM directly.
+    red = [0xffff if x < 4 else round((17 + 2 * x) * 65535 / 32) for x in range(width)]
+    red_words = [word for value in red * height for word in (value, 0, 0, 0)]
+    rgba = '--startup-pixel-words'
+    cases = (
+        ('masked_r16', half_exec_fixture(), (56,), red_words, '--startup-r16-unorm', False),
+        ('missing_restore', half_exec_fixture(restore=False), (56,), red_words, '--startup-r16-unorm', True),
+        ('same_exec', restored_exec_fixture(), (), [0x3f800000] * (width * height * 4), rgba, False),
+        ('wide', restored_exec_fixture(wide=True), (),
+         [0x3f800000, 0x3fc00000] * (width * height * 2), rgba, False),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        for name, code, formats, reference, operation, mismatch in cases:
+            pipe = translate(code, vertex, rtv_formats=formats)
+            vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), name + '_vs', 'vs_6_0', directory)
+            ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), name + '_ps', 'ps_6_0', directory)
+            expected = directory / (name + '.bin')
+            expected.write_bytes(words(*reference))
+            args = [operation, vs, ps, width, height, expected]
+            if formats:
+                args.append('0')  # Unused root constant for the existing R16_UNORM operation.
+            run = gpu_case_runner.run(renderer, adapter, args)
+            diagnostic = run.stdout + run.stderr
+            if run.returncode == 77 and name == 'masked_r16':
+                print(diagnostic, flush=True)
+                raise SystemExit(77)
+            if mismatch:
+                assert run.returncode == 1 and 'pixel mismatch' in diagnostic, (name, diagnostic)
+            else:
+                assert run.returncode == 0 and 'all 32 pixels matched' in diagnostic, (name, diagnostic)
+            print(name, diagnostic, flush=True)
+
+
 def main():
     if len(sys.argv) == 1:
         controls()
@@ -846,6 +1003,8 @@ def main():
         check_draw(*args)
     elif mode == 'draw_flow':
         check_flow_draw(*args)
+    elif mode == 'draw_exec_halves':
+        check_extended_flow_draw(*args)
     else:
         raise SystemExit(__doc__)
 
