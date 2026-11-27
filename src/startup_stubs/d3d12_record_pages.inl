@@ -280,6 +280,14 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
     page_flush_target();
     ++page_scans;
     QueryPerformanceCounter(&t1);
+    // The base image can take many seconds (20 s on a tester's title): a window counted in seconds starts counting after
+    // it, or it closes before a second frame is recorded.
+    if (everything && placed && end_s < 1e300) {
+        const double took = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(frequency.QuadPart);
+        end_s += took;
+        log("x2w-replay record: the base image took %.3f s: the window now ends at %.3f s (was %.3f s)", took, end_s,
+            end_s - took);
+    }
     if (everything || page_scans % 20 == 0) {
         const x2w_replay::PageStats& s = page_writer->stats();
         u64 total = 0;
