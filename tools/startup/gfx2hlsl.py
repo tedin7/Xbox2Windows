@@ -15423,6 +15423,25 @@ class Stage:
             raise Unsupported('%s source %s' % (base, tok))
         return 'f16tof32(0x%04xu)' % int(tok, 0)
 
+    def _compare64_source(self, base, token):
+        # AMD RDNA 2 ISA, section 6.2.1: inline integers are sign-extended to 64 bits.
+        reg = reg_range(token)
+        if reg:
+            if reg[0] not in ('s', 'v') or reg[2] != reg[1] + 1:
+                raise Unsupported('%s source %s: expected register pair' % (base, token))
+            if reg[0] == 's' and any(i in self.masks for i in range(reg[1], reg[2] + 1)):
+                raise Unsupported('%s source %s is a lane mask' % (base, token))
+            return tuple(self.u('%s%d' % (reg[0], i)) for i in (reg[1], reg[2]))
+        try:
+            value = int(token, 0)
+        except ValueError:
+            raise Unsupported('%s source %s' % (base, token))
+        inline = re.fullmatch(r'-?[0-9]+', token) and -16 <= value <= 64
+        if not inline and (value < 0 or value > 0x7fffffff):
+            raise Unsupported('%s source %s: ambiguous 64-bit literal' % (base, token))
+        hi = 0xffffffff if inline and value < 0 else 0
+        return ('0x%08xu' % (value & 0xffffffff), '0x%08xu' % hi)
+
     def compare(self, base, ops, mods=()):
         # A comparison reads its two operands directly, so a modifier that arrives here is one this
         # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
@@ -15509,13 +15528,15 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|f16|u32|i32|i16|u16)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|f16|u32|i32|i16|u16|i64|u64)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
         # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
         # are not lowered here (tools/pixel_aot.py has its own lowering of them).
         if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
+        if typ in ('i64', 'u64') and (sdwa or cond not in ('f', 'lt', 'eq', 'le', 'gt', 'ne', 'lg', 'ge', 't')):
             raise Unsupported(base)
         # Binary16 supports the five ordered relations and neq.
         if typ == 'f16' and ((mods and not sdwa) or cond not in ('lt', 'eq', 'le', 'gt', 'ge', 'neq')):
@@ -15538,11 +15559,23 @@ class Stage:
             raise Unsupported(base)
         if sdwa:
             self.check_compare_sdwa_destination(base, writes_exec, ops)
+        if typ in ('i64', 'u64') and len(ops) not in (2, 3):
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
         if len(ops) == 3:
             dst, a, b = ops
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
-        if sdwa:
+        if typ in ('i64', 'u64'):
+            al, ah = self._compare64_source(base, a)
+            bl, bh = self._compare64_source(base, b)
+            hi_a, hi_b = (('asint(%s)' % ah, 'asint(%s)' % bh) if typ == 'i64' else (ah, bh))
+            eq = '(%s == %s && %s == %s)' % (ah, bh, al, bl)
+            lt = '(%s < %s || (%s == %s && %s < %s))' % (hi_a, hi_b, ah, bh, al, bl)
+            gt = '(%s > %s || (%s == %s && %s > %s))' % (hi_a, hi_b, ah, bh, al, bl)
+            predicate64 = {'f': 'false', 't': 'true', 'eq': eq, 'ne': '!' + eq, 'lg': '!' + eq,
+                           'lt': lt, 'le': '!' + gt, 'gt': gt, 'ge': '!' + lt}[cond]
+            x, y = al + ' ' + ah, bl + ' ' + bh
+        elif sdwa:
             # f32 sources use DWORD selections, so {2} still tests the registers.
             selected = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
             x, y = ('f16tof32(%s)' % half for half in selected) if typ == 'f16' else selected
@@ -15563,9 +15596,9 @@ class Stage:
                 tok = tok[1:-1]
             return self.u(tok)
         ordered = ''
-        if '{2}' in table[cond]:
+        if typ not in ('i64', 'u64') and '{2}' in table[cond]:
             ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
-        predicate = table[cond].format(x, y, ordered)
+        predicate = predicate64 if typ in ('i64', 'u64') else table[cond].format(x, y, ordered)
         if sdwa and typ == 'f16':
             # Check the selected bits before HLSL's float compare. This keeps
             # the NaN case even if the compiler simplifies a self-compare.
