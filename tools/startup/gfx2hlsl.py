@@ -15501,8 +15501,7 @@ def read_ps_inputs(path, key):
     return int(masks['ena'], 16), int(masks['addr'], 16)
 
 
-MESH57_REVISION_BYTES = b'x2w-startup-mesh-57-3'  # a bytes literal: tools/startup/shader_cache_revision.py reads it
-MESH57_REVISION = MESH57_REVISION_BYTES.decode('ascii')
+MESH57_REVISION = 'x2w-startup-mesh-57-3'
 
 
 def mesh57_result_line(key, mesh_digest, pixel_digest):
@@ -15510,7 +15509,7 @@ def mesh57_result_line(key, mesh_digest, pixel_digest):
 
 
 def mesh57_key(ms, ps, root):
-    value = shader_cache_seed(MESH57_REVISION_BYTES)
+    value = shader_cache_seed(MESH57_REVISION.encode('ascii'))
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value
