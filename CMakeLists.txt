@@ -4133,6 +4133,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_pk_int16_check.py" draw-unorm "${DXC_EXECUTABLE}"
         "$<TARGET_FILE:offscreen_check>" warp)
     set_tests_properties(startup_gfx2hlsl_cvt_pknorm_u16_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_gfx2hlsl_cvt_pknorm_i16_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_pk_int16_check.py" draw-snorm "${DXC_EXECUTABLE}"
+        "$<TARGET_FILE:offscreen_check>" warp)
+    set_tests_properties(startup_gfx2hlsl_cvt_pknorm_i16_warp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # gfx2hlsl RDNA 2 scalar null operand (code 125) and Stage.scalar destination guards (#2618, #1723, #2463):
     # 32-bit null-destination SCC updates, null source (0u), explicit Unsupported refusals replacing TypeError, and
     # WARP/hardware draws + root-constant buffer readbacks with negative controls.
