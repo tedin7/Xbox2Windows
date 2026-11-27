@@ -304,6 +304,10 @@ LONG stop_after_lazy_commit_failure(const EXCEPTION_RECORD& record, ULONG_PTR ch
                         static_cast<unsigned long long>(record.ExceptionInformation[1]), access,
                         static_cast<unsigned long long>(chunk), static_cast<unsigned long long>(bytes), error,
                         used, peak, limit, system_used, system_limit, lazy_commit_exit_code);
+        InterlockedExchange(&lazy_commit_failure_reported, 2);
+    } else {
+        // Another thread is writing the line: let it finish (at most 2 s) so the stop does not cut it off.
+        for (int i = 0; i < 200 && InterlockedCompareExchange(&lazy_commit_failure_reported, 2, 2) != 2; ++i) Sleep(10);
     }
     TerminateProcess(GetCurrentProcess(), lazy_commit_exit_code);
     return EXCEPTION_CONTINUE_SEARCH;
