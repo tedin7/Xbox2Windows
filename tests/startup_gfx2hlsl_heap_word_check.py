@@ -24,7 +24,7 @@ instruction used here and compares the words.
 import argparse
 
 import startup_gfx2hlsl_heap_record_check as H
-from startup_gfx2hlsl_compute_check import G, assemble, refused
+from startup_gfx2hlsl_compute_check import G, assemble, refused, root_blob
 
 TABLE = 's_load_dwordx4 s[28:31], s[12:13], 0x60'
 SCALE, ADD = 's_mulk_i32 s6, 0x150', 's_add_u32 s6, s6, 0x120'
@@ -150,6 +150,92 @@ def check_binary(llvm_mc):
     print('heap word fixture: %d instructions reassembled to the recorded words' % len(ENCODED))
 
 
+RAW_WORDS = bytes.fromhex(
+    '800387be '  # s_mov_b32 s7, 0
+    '030308f4000000fa '  # s_load_dwordx4 s[12:15], s[6:7], 0
+    '030608f4100000fa '  # s_load_dwordx4 s[24:27], s[6:7], 16
+    '7fc08cbf '  # s_waitcnt lgkmcnt(0)
+    '0e891e93 '  # s_mul_i32 s30, s14, 9
+    '0c8012bf '  # s_cmp_eq_u64 s[12:13], 0
+    '81801f85 '  # s_cselect_b32 s31, 1, 0
+    '1e020e7e '  # v_mov_b32 v7, s30
+    '1f02107e '  # v_mov_b32 v8, s31
+    '83000c34 '  # v_lshlrev_b32 v6, 3, v0
+    '001074e006070680 '  # buffer_store_dwordx2 v[7:8], v6, s[24:27], 0 offen
+    '000081bf '  # s_endpgm
+)
+
+
+PAIR_WORDS = bytes.fromhex(
+    '070394be '  # s_mov_b32 s20, s7
+    '800395be '  # s_mov_b32 s21, 0
+    '800389be '  # s_mov_b32 s9, 0
+    '06851c8f '  # s_lshl_b32 s28, s6, 5
+    '040810f400000038 '  # s_load_dwordx16 s[32:47], s[8:9], s28
+    '0a0608f4100000fa '  # s_load_dwordx4 s[24:27], s[20:21], 16
+    '7fc08cbf '  # s_waitcnt lgkmcnt(0)
+    '800390be '  # s_mov_b32 s16, 0
+    '800391be '  # s_mov_b32 s17, 0
+    '800392be '  # s_mov_b32 s18, 0
+    '800393be '  # s_mov_b32 s19, 0
+    'f002187e '  # v_mov_b32 v12, 0.5
+    'f0021a7e '  # v_mov_b32 v13, 0.5
+    '08019cf00c078800 '  # image_sample_lz v7, v[12:13], s[32:39], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    '08019cf00c088a00 '  # image_sample_lz v8, v[12:13], s[40:47], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    '703f8cbf '  # s_waitcnt vmcnt(0)
+    '83000c34 '  # v_lshlrev_b32 v6, 3, v0
+    '001074e006070680 '  # buffer_store_dwordx2 v[7:8], v6, s[24:27], 0 offen
+    '000081bf '  # s_endpgm
+)
+
+
+# The second sample uses the sampler immediately after the image. The remainder of
+# the wide read includes another sampler to serve as the wrong-offset control.
+MIXED_WORDS = bytes.fromhex(
+    '070394be '  # s_mov_b32 s20, s7
+    '800395be '  # s_mov_b32 s21, 0
+    '800389be '  # s_mov_b32 s9, 0
+    '06851c8f '  # s_lshl_b32 s28, s6, 5
+    '040810f400000038 '  # s_load_dwordx16 s[32:47], s[8:9], s28
+    '0a0608f4100000fa '  # s_load_dwordx4 s[24:27], s[20:21], 16
+    '7fc08cbf '  # s_waitcnt lgkmcnt(0)
+    '800390be '  # s_mov_b32 s16, 0
+    '800391be '  # s_mov_b32 s17, 0
+    '800392be '  # s_mov_b32 s18, 0
+    '800393be '  # s_mov_b32 s19, 0
+    'ff02187e0000c03f '  # v_mov_b32 v12, 0x3fc00000
+    'f0021a7e '  # v_mov_b32 v13, 0.5
+    '08019cf00c078800 '  # image_sample_lz v7, v[12:13], s[32:39], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    '08019cf00c084801 '  # image_sample_lz v8, v[12:13], s[32:39], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    '703f8cbf '  # s_waitcnt vmcnt(0)
+    '83000c34 '  # v_lshlrev_b32 v6, 3, v0
+    '001074e006070680 '  # buffer_store_dwordx2 v[7:8], v6, s[24:27], 0 offen
+    '000081bf '  # s_endpgm
+)
+
+
+def check_raw_descriptor_values():
+    def lower(code):
+        return G.ComputePipeline(code, root_blob(), 7 << 1, (8, 1, 1))
+
+    pipe = lower(RAW_WORDS)
+    assert 'udsrc 2 desc_word table 1 0 2' in pipe.manifest()
+    assert 'udsrc 3 desc_null table 1 0 0' in pipe.manifest()
+    assert 'u0.Store2' in pipe.hlsl_cs()
+    address_read = RAW_WORDS.replace(bytes.fromhex('0e891e93'), bytes.fromhex('0c891e93'))
+    assert address_read != RAW_WORDS
+    refused('numeric use of a descriptor address word', lambda: lower(address_read))
+
+    pipe = G.ComputePipeline(PAIR_WORDS, H.root_blob(), 9 << 1, (8, 1, 1))
+    assert 'srv 0 tex2d heap record 0 2 -1 0 0 0 0' in pipe.manifest()
+    assert 'srv 1 tex2d heap record 0 2 -1 0 0 0 32' in pipe.manifest()
+    assert 'r0.SampleLevel' in pipe.hlsl_cs() and 'r1.SampleLevel' in pipe.hlsl_cs()
+
+    pipe = G.ComputePipeline(MIXED_WORDS, H.root_blob(), 9 << 1, (8, 1, 1))
+    assert 'smprecord 0 heap record 0 2 -1 0 0 0 32' in pipe.manifest()
+    assert 'r0.SampleLevel(qr[0]' in pipe.hlsl_cs()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--llvm-mc')
@@ -158,4 +244,5 @@ if __name__ == '__main__':
         check_binary(args.llvm_mc)
     forms = check_lowering()
     count = check_refusals()
+    check_raw_descriptor_values()
     print('startup_gfx2hlsl_heap_word: PASS (manifest and HLSL exact; %d more forms; %d refused controls)' % (forms, count))
