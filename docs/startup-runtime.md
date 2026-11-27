@@ -2011,7 +2011,8 @@ argument words (136 bytes; version 2 held seven and put rcx's memory at `ARGM` 7
 Float argument values and device creation are not recorded.
 When a present ends the recording, a finisher thread writes the `SHDR` files and `XEND`, so the title's presents go
 on meanwhile; a later stop waits for it, and if the process exits first the file ends at its last whole chunk followed by
-`XEND`.
+`XEND`. The same holds when the exit finds the file lock held by a thread that is gone: the file is cut back to its last
+whole chunk (kept up to date after every written buffer) and closed with `XEND`.
 
 `X2W_REPLAY_PAGES_AT_SUBMIT=1` scans registered title-memory pages before `ExecuteCommandLists` inside the recording
 window. Use `X2W_REPLAY_RECORD=all` for a workload without Present. The first submit can initialize the page store.

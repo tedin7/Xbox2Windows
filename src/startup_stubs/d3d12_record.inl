@@ -89,6 +89,7 @@ struct ThreadBuffer {
 std::vector<ThreadBuffer*>& thread_buffers() { static std::vector<ThreadBuffer*> v; return v; }
 std::unordered_set<u64>& stored_blobs() { static std::unordered_set<u64> s; return s; }  // blob_lock
 
+u64 volatile whole_bytes;  // the file size after the last whole chunk: where a recording cut off at exit is closed
 void write_raw(const void* data, std::size_t bytes)
 {
     DWORD written = 0;
@@ -116,6 +117,7 @@ void append_chunk(std::vector<unsigned char>& out, const char* tag, const void* 
 void drain(ThreadBuffer& b)
 {
     write_raw(b.bytes.data(), b.bytes.size());
+    if (b.bytes.size()) whole_bytes = bytes_written;  // a buffer holds whole chunks
     b.bytes.clear();
 }
 
@@ -727,7 +729,6 @@ void flush_all(bool at_exit)
 // its bytes, so a replay on another machine has the translations this run had. Files over 16 MiB, and the files after
 // 512 MiB in total, are left out (counted in the log). At process exit (DllMain, loader lock held) it stops after 5 s
 // so a large cache cannot hold the exit up. file_lock held. whole_bytes is the file size after the last whole chunk.
-u64 volatile whole_bytes;
 void write_shader_cache(bool at_exit)
 {
     // X2W_REPLAY_SHADERS=0: no SHDR chunks (the cache travels another way, e.g. with a tester run's mail parts).
@@ -807,9 +808,14 @@ void write_end_and_close()
 HANDLE finished = nullptr;
 bool stopped_in_prefix;
 
+void close_cut_file();
+
 void finish_file(bool at_exit)
 {
-    if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
+    if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) {
+        close_cut_file();  // a thread that is gone holds the lock: the file still ends with its XEND
+        return;
+    }
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
     const bool in_prefix = stopped_in_prefix;
     whole_bytes = bytes_written;
@@ -851,6 +857,18 @@ DWORD WINAPI finisher(void*)
     return 0;
 }
 
+// The process is ending and the thread that was writing the file is gone, maybe in the middle of a chunk: the file is cut
+// back to its last whole chunk and closed with its end chunk.
+void close_cut_file()
+{
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER at;
+    at.QuadPart = static_cast<LONGLONG>(whole_bytes);
+    if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return;
+    bytes_written = whole_bytes;
+    write_end_and_close();
+}
+
 void wait_finisher(bool at_exit)
 {
     if (!finished || WaitForSingleObject(finished, 0) == WAIT_OBJECT_0) return;
@@ -859,12 +877,7 @@ void wait_finisher(bool at_exit)
         return;
     }
     // The process is ending and its other threads are gone, the finisher with whatever lock it held.
-    if (file == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER at;
-    at.QuadPart = static_cast<LONGLONG>(whole_bytes);
-    if (!SetFilePointerEx(file, at, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return;
-    bytes_written = whole_bytes;
-    write_end_and_close();
+    close_cut_file();
 }
 
 void stop(bool at_exit, bool from_present)
@@ -1059,6 +1072,7 @@ void install()
         append_chunk(head, "XENV", nullptr, 0, settings.data(), settings.size());
     }
     write_raw(head.data(), head.size());
+    whole_bytes = bytes_written;
     scan_submit_pages = x2w_local::env_on("X2W_REPLAY_PAGES_AT_SUBMIT");
     char ranges[8]{}, pages[8]{};
     extra_title_pages = GetEnvironmentVariableA("X2W_REPLAY_TITLE_RANGES", ranges, sizeof(ranges)) == 1 && ranges[0] == '1' &&
@@ -1084,6 +1098,7 @@ extern "C" void x2w_d3d12_replay_record_object(int kind, const void* wrapper)
     append_chunk(chunk, "XOBJ", &header, sizeof(header), nullptr, 0);
     AcquireSRWLockExclusive(&file_lock);
     write_raw(chunk.data(), chunk.size());
+    whole_bytes = bytes_written;
     ReleaseSRWLockExclusive(&file_lock);
 }
 
