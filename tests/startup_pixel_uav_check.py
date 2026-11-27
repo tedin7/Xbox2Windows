@@ -169,7 +169,7 @@ class Program:
         publish.pop('X2W_TEST_DEBUG_LAYER', None)
         subprocess.run([consumer, self.vs, self.ps, self.root], env=publish, check=True)
         subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', self.cache], env=publish, check=True)
-        self.manifest, = (path for path in self.cache.glob('*.txt') if path.name != 'revision.txt')
+        self.manifest, = (path for path in self.cache.glob('*.txt') if path.name not in ('revision.txt', 'x2w_key_seed.txt'))
         lines = self.manifest.read_text(encoding='ascii').splitlines()
         assert lines[0] == 'x2w-manifest 2' and ('uav 0 %s table 0 0' % kind) in lines, lines
         if load or stale:
