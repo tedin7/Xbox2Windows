@@ -193,13 +193,16 @@ requires a vote. [SIMT execution model](https://doi.org/10.1007/978-3-642-28869-
 Karrenberg and Hack (CGO 2011) use lane masks, blends at joins and scalar
 uniform values in the reverse translation direction. [Whole-Function Vectorization](https://compilers.cs.uni-saarland.de/papers/karrenberg_wfv.pdf)
 
-Phase 2 also exercises the path-sensitive guard proof in step 6. The mesh
-walk retains definitions covered by `thread < B` when every active path
-writes them. After the count exchange, the same thread can read them under
-`thread < V` when `V` comes from zero or the same stable group-uniform
-bound. The count clamp can only reduce the required lanes. The scalar arms
-remain real wave-voted branches, following the distinction between uniform
-branches and predicates in Moll and Hack (PLDI 2018). [Partial Control-Flow Linearization](https://compilers.cs.uni-saarland.de/papers/moll_parlin_pldi18.pdf)
+Phase 2 numbers group-uniform values through forward SCC branches and
+read-only loads. VGPR bounds and their first-lane copies share a value
+number. The mesh walk tags a register when every lane with
+`thread < B` defines it before the full EXEC reset or the count exchange.
+The tag covers an export under zero or the same published bound. A later
+VGPR write or exchange clobber invalidates its tag. A count SGPR can be
+reused after publication while index clamping keeps the published vertex
+count. See the
+[slot 57 wave block](startup-mesh57-wave-block.md#group-uniform-values-and-guarded-exports)
+and [Partial Control-Flow Linearization, §3](https://doi.org/10.1145/3192366.3192413).
 
 ### Phase 3: `v_readfirstlane` and waterfalls
 
