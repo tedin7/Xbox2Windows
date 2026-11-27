@@ -4146,7 +4146,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 }
             }
-            if (indirect && (!texture || record.slot != 18 || (pass.bound_depth == texture && pass.depth_view_writable))) {
+            if (indirect && (!texture || record.slot != 18)) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 draw_lock_release_exclusive();
@@ -4161,8 +4161,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             auto* view = record.desc_bytes >= sizeof(desc) ? &desc : nullptr;
-            if (texture) {
-                const auto real_desc = texture->GetDesc();
+            if (sampled) {
+                const auto real_desc = sampled->GetDesc();
                 if ((view && view->ViewDimension != dimension) ||
                     (!view && srv_check::default_dimension(real_desc) != dimension)) {
                     log_srv_refusal(srv_check::Refusal::dimension);
@@ -4177,9 +4177,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                         texture = nullptr;
                     }
                 }
-            }
-            if (sampled) {
-                const auto read = x2w_substates::srv(sampled->GetDesc(), view);
+                const auto read = x2w_substates::srv(real_desc, view);
                 if (!require_read(self, sampled, read, sampled_state(self, sampled)))
                     return refuse_target_overlap(i);
                 if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
@@ -4716,7 +4714,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             list->IASetIndexBuffer(&view);
             follow_inputs();
             const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
-            restore_bound_targets(list, pass);
+            restore_bound_targets(self, list, pass);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
             red_producer_draw_after(self, red_samples);
             drawn = true;
@@ -4724,7 +4722,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     } else {
         follow_inputs();
         const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
-        restore_bound_targets(list, pass);
+        restore_bound_targets(self, list, pass);
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         red_producer_draw_after(self, red_samples);
         drawn = true;

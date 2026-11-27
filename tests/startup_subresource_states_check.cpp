@@ -107,6 +107,8 @@ bool view_ranges()
     EXPECT(same(srv(desc, &read), Range{2, 4, 0, 1, 0, 1}));
     EXPECT(same(rtv(desc, &target), Range{2, 1, 0, 1, 0, 1}));
     EXPECT(overlaps(srv(desc, &read), rtv(desc, &target)));
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    EXPECT(same(whole(desc), Range{0, 1, 0, 1, 0, 1}));
     return true;
 }
 
@@ -152,9 +154,127 @@ bool transitions()
     EXPECT(!move_all(&list, split, common) && list.calls == 2);
     return true;
 }
+bool depth_ranges()
+{
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 8, 3, 2,
+                             DXGI_FORMAT_R24G8_TYPELESS, {1, 0}};
+    const Range full{0, 2, 0, 3, 0, 2};
+    EXPECT(same(whole(desc), full));
+    EXPECT(same(srv(desc, nullptr), full));
+    EXPECT(same(dsv(desc, nullptr), Range{0, 1, 0, 3, 0, 2}));
+    EXPECT(plane_count(DXGI_FORMAT_D24_UNORM_S8_UINT) == 2);
+    EXPECT(plane_count(DXGI_FORMAT_R32G8X24_TYPELESS) == 2);
+    EXPECT(plane_count(DXGI_FORMAT_D32_FLOAT_S8X24_UINT) == 2);
+    EXPECT(plane_count(DXGI_FORMAT_D32_FLOAT) == 1);
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.ViewDimension = D3D12_DSV_DIMENSION_UNKNOWN;
+    EXPECT(same(dsv(desc, &view), full));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1D;
+    view.Texture1D = {1};
+    EXPECT(same(dsv(desc, &view), Range{1, 1, 0, 1, 0, 2}));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
+    view.Texture1DArray = {1, 1, 2};
+    EXPECT(same(dsv(desc, &view), Range{1, 1, 1, 2, 0, 2}));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    view.Texture2D = {1};
+    EXPECT(same(dsv(desc, &view), Range{1, 1, 0, 1, 0, 2}));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray = {1, 2, 9};
+    EXPECT(same(dsv(desc, &view), Range{1, 1, 2, 1, 0, 2}));
+    view.Texture2DArray.ArraySize = 0;
+    EXPECT(same(dsv(desc, &view), full));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+    EXPECT(same(dsv(desc, &view), Range{0, 1, 0, 1, 0, 2}));
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+    view.Texture2DMSArray = {1, 2};
+    EXPECT(same(dsv(desc, &view), Range{0, 1, 1, 2, 0, 2}));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sampled{};
+    sampled.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    sampled.Texture2DArray = {1, 1, 1, 2, 1, 0};
+    sampled.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    EXPECT(same(srv(desc, &sampled), Range{1, 1, 1, 2, 0, 1}));
+    sampled.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    EXPECT(same(srv(desc, &sampled), Range{1, 1, 1, 2, 1, 1}));
+    sampled.Format = DXGI_FORMAT_UNKNOWN;
+    EXPECT(same(srv(desc, &sampled), Range{1, 1, 1, 2, 1, 1}));
+    sampled.Texture2DArray.PlaneSlice = 2;
+    EXPECT(same(srv(desc, &sampled), full));
+    desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    sampled.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    sampled.Texture2DMSArray = {1, 2};
+    sampled.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    EXPECT(same(srv(desc, &sampled), Range{0, 1, 1, 2, 0, 1}));
+    sampled.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    EXPECT(same(srv(desc, &sampled), Range{0, 1, 1, 2, 1, 1}));
+
+    D3D12_RENDER_TARGET_VIEW_DESC color{};
+    color.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    color.Texture2D = {1, 1};
+    EXPECT(same(rtv(desc, &color), Range{1, 1, 0, 1, 1, 1}));
+    return true;
+}
+
+bool depth_transitions()
+{
+    static constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
+    static constexpr auto depth_write = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    static constexpr auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ;
+    static const auto shader_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    EXPECT(attachment_state(depth_read, shader_read) == (depth_read | shader_read));
+    EXPECT(attachment_state(depth_read, depth_write) == depth_read);
+    EXPECT(attachment_state(depth_write, shader_read) == depth_write);
+    EXPECT(attachment_state(D3D12_RESOURCE_STATE_RENDER_TARGET, shader_read) == D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const Range full{0, 2, 0, 3, 0, 2};
+    const Range only_bound{1, 1, 1, 2, 0, 2};
+    const auto depth = plane(only_bound, 0);
+    const auto stencil = plane(only_bound, 1);
+    const auto mixed = bind_depth(only_bound, D3D12_DSV_FLAG_READ_ONLY_STENCIL);
+    EXPECT(writable_overlap(mixed, depth));
+    EXPECT(writable_overlap(mixed, full));
+    EXPECT(!writable_overlap(mixed, stencil));
+    EXPECT(!writable_overlap(mixed, Range{0, 1, 1, 2, 0, 1}));
+    const auto inverse = bind_depth(only_bound, D3D12_DSV_FLAG_READ_ONLY_DEPTH);
+    EXPECT(!writable_overlap(inverse, depth));
+    EXPECT(writable_overlap(inverse, stencil));
+    EXPECT(writable_overlap(bind_depth(only_bound, D3D12_DSV_FLAG_NONE), full));
+    EXPECT(!writable_overlap(bind_depth(only_bound, D3D12_DSV_FLAG_READ_ONLY_DEPTH |
+                                                    D3D12_DSV_FLAG_READ_ONLY_STENCIL), full));
+    Recorder list;
+    auto split = make_split(nullptr, full, common);
+    EXPECT(move(&list, split, depth, depth_write));
+    EXPECT(list.calls == 1 && list.barriers.size() == 2);
+    EXPECT(list.barriers[0].Transition.Subresource == 3 && list.barriers[1].Transition.Subresource == 5);
+    EXPECT(move(&list, split, stencil, depth_read));
+    EXPECT(list.calls == 2 && list.barriers.size() == 2);
+    EXPECT(list.barriers[0].Transition.Subresource == 9 && list.barriers[1].Transition.Subresource == 11);
+    const auto read_stencil = [&](UINT index, D3D12_RESOURCE_STATES) {
+        return sampled_state(split, index, mixed, shader_read);
+    };
+    EXPECT(sampled_state(split, 3, inverse, shader_read) == (depth_read | shader_read));
+    EXPECT(move_each(&list, split, plane(full, 1), read_stencil));
+    EXPECT(list.calls == 3 && list.barriers.size() == 6);
+    for (UINT i = 0; i < 6; ++i) {
+        const auto& t = list.barriers[i].Transition;
+        const bool bound = i == 3 || i == 5;
+        EXPECT(t.Subresource == 6 + i &&
+               t.StateBefore == (bound ? depth_read : common) &&
+               t.StateAfter == (bound ? depth_read | shader_read : shader_read));
+    }
+    EXPECT(split.state[3] == depth_write && split.state[5] == depth_write);
+    EXPECT(!move_each(&list, split, plane(full, 1), read_stencil));
+    EXPECT(move_all(&list, split, common));
+    EXPECT(list.calls == 4 && list.barriers.size() == 8);
+    D3D12_RESOURCE_STATES after{};
+    EXPECT(uniform(split, &after) && after == common);
+    return true;
+}
+
 }  // namespace
 
 int main()
 {
-    return view_ranges() && transitions() ? 0 : 1;
+    return view_ranges() && transitions() && depth_ranges() && depth_transitions() ? 0 : 1;
 }

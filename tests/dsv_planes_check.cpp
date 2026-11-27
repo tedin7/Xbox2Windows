@@ -1,4 +1,4 @@
-// Per-plane states for a depth stencil view with one read-only plane (src/startup_stubs/dsv_planes.h).
+// Per-plane states for a depth stencil view with one read-only plane (src/startup_stubs/subresource_states.h).
 // 1. The barrier plan, recorded without a device: depth plane in DEPTH_READ, stencil plane in DEPTH_WRITE, then the stencil
 //    plane alone to COPY_SOURCE, then both back to COMMON; one barrier per subresource of the plane (two mips, three slices:
 //    the subresource numbers), none for a plane already in the state, never a whole-resource barrier.
@@ -6,7 +6,7 @@
 //    read back (0x5A); with the debug layer available (Graphics Tools) any error fails the run.
 //   dsv_planes_check <warp|hardware>                  both parts
 //   dsv_planes_check <warp|hardware> --mutate whole   the plan moves the whole resource instead; part 1 must fail
-#include "startup_stubs/dsv_planes.h"
+#include "startup_stubs/subresource_states.h"
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -20,6 +20,7 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+using namespace x2w_substates;
 
 void require(bool ok, const char* what)
 {
@@ -62,25 +63,31 @@ void barrier_plan(bool whole)
     D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 3, 2, DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
     auto* fake = reinterpret_cast<ID3D12Resource*>(static_cast<uintptr_t>(0x1000));
-    x2w_dsv::Planes planes = x2w_dsv::planes_of(fake, desc);
+    const auto full = whole(desc);
+    auto planes = make_split(fake, full, D3D12_RESOURCE_STATE_COMMON);
     require(planes.mips == 2 && planes.slices == 3, "mips and slices come from the description");
-    require(x2w_dsv::subresource(planes, 0, 1, 2) == 5 && x2w_dsv::subresource(planes, 1, 0, 0) == 6 && x2w_dsv::subresource(planes, 1, 1, 2) == 11,
+    UINT last_depth = 0, first_stencil = 0, last_stencil = 0;
+    visit(planes, {1, 1, 2, 1, 0, 1}, [&](UINT index) { last_depth = index; });
+    visit(planes, {0, 1, 0, 1, 1, 1}, [&](UINT index) { first_stencil = index; });
+    visit(planes, {1, 1, 2, 1, 1, 1}, [&](UINT index) { last_stencil = index; });
+    require(last_depth == 5 && first_stencil == 6 && last_stencil == 11,
             "subresource = mip + slice * mips + plane * mips * slices");
     RecordingList list;
     list.whole = whole;
     constexpr auto common = D3D12_RESOURCE_STATE_COMMON, read = D3D12_RESOURCE_STATE_DEPTH_READ, write = D3D12_RESOURCE_STATE_DEPTH_WRITE,
                    copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    x2w_dsv::bind(&list, planes, read, write);
+    move(&list, planes, plane(full, 0), read);
+    move(&list, planes, plane(full, 1), write);
     require(list.barriers.size() == 12, "binding moves both planes: 6 + 6 subresource barriers");
     require(count_plane(list, 0, common, read) == 6 && count_plane(list, 1, common, write) == 6, "depth plane to DEPTH_READ, stencil plane to DEPTH_WRITE");
     list.barriers.clear();
-    x2w_dsv::move_plane(&list, planes, 1, write);
+    move(&list, planes, plane(full, 1), write);
     require(list.barriers.empty(), "a plane already in the state costs no barrier");
-    x2w_dsv::move_plane(&list, planes, 1, copy);
+    move(&list, planes, plane(full, 1), copy);
     require(list.barriers.size() == 6 && count_plane(list, 1, write, copy) == 6, "only the stencil plane moves to COPY_SOURCE");
-    require(planes.state[0] == read && planes.state[1] == copy, "the planes track their own states");
+    require(planes.state[0] == read && planes.state[6] == copy, "the planes track their own states");
     list.barriers.clear();
-    x2w_dsv::release(&list, planes);
+    move_all(&list, planes, common);
     require(list.barriers.size() == 12 && count_plane(list, 0, read, common) == 6 && count_plane(list, 1, copy, common) == 6, "release returns each plane from its own state");
     for (const auto& b : list.barriers)
         require(b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, "never a whole-resource barrier for planes in different states");
@@ -131,9 +138,10 @@ int main(int argc, char** argv)
     device->CreateDepthStencilView(depth.Get(), &view, heap->GetCPUDescriptorHandleForHeapStart());
 
     // Footprint of the stencil plane, mip 0, slice 0.
-    x2w_dsv::Planes planes = x2w_dsv::planes_of(depth.Get());
+    const auto full = whole(desc);
+    auto planes = make_split(depth.Get(), full, D3D12_RESOURCE_STATE_COMMON);
     require(planes.mips == mips && planes.slices == slices, "the planes know the resource's mips and slices");
-    const UINT stencil_sub = x2w_dsv::subresource(planes, 1, 0, 0);
+    const UINT stencil_sub = full.mips * full.slices;
     require(stencil_sub == mips * slices, "stencil plane, mip 0, slice 0 comes after every depth subresource");
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
@@ -155,11 +163,12 @@ int main(int argc, char** argv)
     check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)), "list");
 
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
-    x2w_dsv::bind(list.Get(), planes, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    move(list.Get(), planes, plane(full, 0), D3D12_RESOURCE_STATE_DEPTH_READ);
+    move(list.Get(), planes, plane(full, 1), D3D12_RESOURCE_STATE_DEPTH_WRITE);
     list->OMSetRenderTargets(0, nullptr, FALSE, &handle);
     list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0x5A, 0, nullptr);
     // Copy the cleared stencil plane out: only that plane changes state, the depth plane stays in DEPTH_READ.
-    x2w_dsv::move_plane(list.Get(), planes, 1, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    move(list.Get(), planes, plane(full, 1), D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
     dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -168,8 +177,8 @@ int main(int argc, char** argv)
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = stencil_sub;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    require(planes.state[0] == D3D12_RESOURCE_STATE_DEPTH_READ && planes.state[1] == D3D12_RESOURCE_STATE_COPY_SOURCE, "the planes track their own states");
-    x2w_dsv::release(list.Get(), planes);
+    require(planes.state[0] == D3D12_RESOURCE_STATE_DEPTH_READ && planes.state[stencil_sub] == D3D12_RESOURCE_STATE_COPY_SOURCE, "the planes track their own states");
+    move_all(list.Get(), planes, D3D12_RESOURCE_STATE_COMMON);
     check(list->Close(), "close");
     ID3D12CommandList* lists[] = {list.Get()};
     queue->ExecuteCommandLists(1, lists);

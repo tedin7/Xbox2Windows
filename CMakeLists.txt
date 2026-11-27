@@ -1866,9 +1866,16 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_root_${backend} startup_indirect_translated_root_control_${backend}
         PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME startup_indirect_translated_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-refusal-census)
-    add_test(NAME startup_draw_render_target_read_${backend} COMMAND startup_indirect_draw_indexed ${backend} render-target-read)
-    set_tests_properties(startup_draw_render_target_read_${backend} PROPERTIES TIMEOUT 120
-        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_DEBUG=2")
+    foreach(mode IN ITEMS render-target-read stencil-target-read depth-target-feedback depth-target-read)
+        string(REPLACE "-" "_" test_case "${mode}")
+        set(test_name startup_draw_${test_case}_${backend})
+        add_test(NAME ${test_name} COMMAND startup_indirect_draw_indexed ${backend} ${mode})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 120
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_DEBUG=2")
+        if(backend STREQUAL "hardware")
+            set_tests_properties(${test_name} PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+    endforeach()
     add_test(NAME startup_indirect_translated_targets_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-targets)
     add_test(NAME startup_indirect_other_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} indirect-other-refusal-census)
     add_test(NAME startup_indirect_copy_provenance_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance)
@@ -1904,7 +1911,6 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_indexed_alias_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_alias_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
-set_tests_properties(startup_draw_render_target_read_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware
     startup_indirect_rectlist_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)
@@ -2772,7 +2778,7 @@ add_test(NAME dispatch_phases_single_lock_control COMMAND dispatch_phases_check 
 set_tests_properties(dispatch_phases_single_lock_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(dispatch_phases dispatch_phases_single_lock_control PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
-# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/dsv_planes.h), debug layer on.
+# A depth stencil view with one read-only plane: per-plane states (src/startup_stubs/subresource_states.h), debug layer on.
 add_executable(dsv_planes_check tests/dsv_planes_check.cpp)
 target_include_directories(dsv_planes_check PRIVATE src)
 target_compile_features(dsv_planes_check PRIVATE cxx_std_17)

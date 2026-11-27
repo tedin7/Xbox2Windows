@@ -245,6 +245,20 @@ float4 translated_pixel() : SV_Target {
     return translated_texture.Load(int3(0, 0, 0));
 }
 
+Texture2D<uint4> translated_stencil : register(t1);
+
+float write_depth_from_stencil() : SV_Depth {
+    return translated_stencil.Load(int3(0, 0, 0)).g / 256.0;
+}
+
+float write_depth_from_depth() : SV_Depth {
+    return translated_texture.Load(int3(0, 0, 0)).r * 0.5;
+}
+
+float4 color_from_depth() : SV_Target {
+    return float4(translated_texture.Load(int3(0, 0, 0)).r, 0, 0, 1);
+}
+
 float4 translated_buffer_pixel() : SV_Target {
     uint value = translated_buffer.Load(ud2);
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
@@ -333,6 +347,35 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
+std::uint64_t fixture_shader_key(D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps, ID3DBlob* root)
+{
+    static constexpr char revision[] = "x2w-startup-shader-28";
+    std::uint64_t key = 1469598103934665603ull;
+    const auto add = [&key](const void* data, std::size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) key = (key ^ p[i]) * 1099511628211ull;
+    };
+    add(revision, sizeof(revision) - 1);
+    add(vs.pShaderBytecode, vs.BytecodeLength);
+    add(ps.pShaderBytecode, ps.BytecodeLength);
+    add(root->GetBufferPointer(), root->GetBufferSize());
+    return key;
+}
+
+auto fixture_shader_files(std::uint64_t key)
+{
+    char stem[32];
+    std::snprintf(stem, sizeof(stem), "%016llx", static_cast<unsigned long long>(key));
+    char directory[MAX_PATH];
+    const DWORD size = GetEnvironmentVariableA("X2W_SHADER_CACHE", directory, MAX_PATH);
+    check(size && size < MAX_PATH ? S_OK : E_FAIL, "find fixture cache");
+    return [prefix = std::string(directory) + "\\" + stem](const char* suffix, const void* bytes, std::size_t count) {
+        std::ofstream file(prefix + suffix, std::ios::binary | std::ios::trunc);
+        file.write(static_cast<const char*>(bytes), count);
+        check(file.good() ? S_OK : E_FAIL, "write fixture cache");
+    };
+}
+
 enum class TableSample { texture, buffer, buffer_tail, null_census, starvation_source };
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
@@ -340,34 +383,15 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
                                     UINT descriptor_stride = 0, std::uint64_t* key_out = nullptr, bool publish = true)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205, 0xe0000206, 0xe0000207};
     static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
     auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
-    std::uint64_t key = 1469598103934665603ull;
-    const auto add = [&key](const void* data, std::size_t bytes) {
-        const auto* p = static_cast<const unsigned char*>(data);
-        for (std::size_t i = 0; i < bytes; ++i) key = (key ^ p[i]) * 1099511628211ull;
-    };
-    add(revision, sizeof(revision) - 1);
-    add(&vertex_id, sizeof(vertex_id));
-    add(&pixel_id, sizeof(pixel_id));
-    add(root_blob->GetBufferPointer(), root_blob->GetBufferSize());
+    const auto key = fixture_shader_key({&vertex_id, sizeof(vertex_id)}, {&pixel_id, sizeof(pixel_id)}, root_blob);
     if (key_out) *key_out = key;
-    char stem[32];
-    std::snprintf(stem, sizeof(stem), "%016llx", static_cast<unsigned long long>(key));
-    char directory[MAX_PATH];
-    const DWORD size = GetEnvironmentVariableA("X2W_SHADER_CACHE", directory, MAX_PATH);
-    check(size && size < MAX_PATH ? S_OK : E_FAIL, "find fixture cache");
-    const std::string prefix = std::string(directory) + "\\" + stem;
-    const auto write = [&](const char* suffix, const void* bytes, std::size_t count) {
-        std::ofstream file(prefix + suffix, std::ios::binary | std::ios::trunc);
-        file.write(static_cast<const char*>(bytes), count);
-        check(file.good() ? S_OK : E_FAIL, "write fixture cache");
-    };
     if (publish) {
+        const auto write = fixture_shader_files(key);
         const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
         const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel", "null_census_pixel", "starvation_source_pixel"};
         const bool empty_input = sample == TableSample::null_census &&
@@ -1938,6 +1962,17 @@ public:
         wait();
     }
 
+    ComputeCommands commands()
+    {
+        return ComputeCommands(device, native_queue.Get(), nullptr);
+    }
+
+    void drain_validation()
+    {
+        auto empty = commands();
+        submit_native(empty.list.Get());
+    }
+
     void submit_native(ID3D12GraphicsCommandList* list)
     {
         check(list->Close(), "close native target read list");
@@ -1962,7 +1997,7 @@ public:
         UINT64 bytes = 0;
         device->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, nullptr, nullptr, &bytes);
         const auto buffer = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        auto copy = commands();
         to(copy.list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION src{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         src.SubresourceIndex = subresource;
@@ -2074,7 +2109,7 @@ bool check_render_target_read(TargetReadFixture& fixture)
     device->CreateRenderTargetView(native.Get(), &rtv, clear1);
     rtv.Texture2D.MipSlice = 0;
     device->CreateRenderTargetView(native.Get(), &rtv, clear0);
-    ComputeCommands clear(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto clear = fixture.commands();
     transition(clear.list.Get(), native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const float sampled[]{0, 1, 0, 1};
     const float initial[]{0, 0, 1, 1};
@@ -2093,9 +2128,118 @@ bool check_render_target_read(TargetReadFixture& fixture)
     fixture.draw(list.Get(), pso.Get(), mip1.Get(), viewport, {0, 0, 2, 2});
     fixture.submit_guest(list.Get());
 
-    // The native readback list also drains GPU validation messages after the draw fence.
     const bool pixels = fixture.readback(native.Get(), 1, 0xff00ff00u);
     return fixture.overlap_refused() && pixels;
+}
+
+enum class DepthReadCase { stencil, feedback, depth };
+
+ComPtr<IUnknown> depth_read_pipeline(TargetReadFixture& fixture, DepthReadCase mode)
+{
+    const auto vs = compile("translated_vertex", "vs_5_1");
+    const char* entry = mode == DepthReadCase::stencil ? "write_depth_from_stencil" :
+                        mode == DepthReadCase::feedback ? "write_depth_from_depth" : "color_from_depth";
+    const auto ps = compile(entry, "ps_5_1");
+    const D3D12_SHADER_BYTECODE vertex{vs->GetBufferPointer(), vs->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE pixel{ps->GetBufferPointer(), ps->GetBufferSize()};
+    const auto key = fixture_shader_key(vertex, pixel, fixture.root_blob.Get());
+    auto files = fixture_shader_files(key);
+    files(".vs.cso", vertex.pShaderBytecode, vertex.BytecodeLength);
+    files(".ps.cso", pixel.pShaderBytecode, pixel.BytecodeLength);
+    const std::string manifest = "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
+    const std::string typed = mode == DepthReadCase::stencil ? manifest + "srvint 0 1 1\n" : manifest;
+    files(".txt", typed.data(), typed.size());
+
+    struct {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> format;
+    } stream;
+    stream.root.value = fixture.root.Get();
+    stream.vs.value = vertex;
+    stream.ps.value = pixel;
+    stream.format.value = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    auto& depth = stream.depth.value;
+    depth.DepthEnable = TRUE;
+    depth.DepthWriteMask = mode == DepthReadCase::depth ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+    depth.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    depth.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depth.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    depth.FrontFace = depth.BackFace = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS
+    };
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    ComPtr<IUnknown> pso;
+    check(slot<Create>(fixture.guest, 86)(fixture.guest, &desc, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void**>(pso.GetAddressOf())), "create translated planar depth pipeline");
+    return pso;
+}
+
+bool check_depth_target_read(TargetReadFixture& fixture, DepthReadCase mode)
+{
+    auto* const device = fixture.device;
+    auto* const guest = fixture.guest;
+    const auto pso = depth_read_pipeline(fixture, mode);
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 2, 1, 1,
+                                   DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                   D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+    const auto texture = resource(guest, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    const auto native = native_object<ID3D12Resource>(device, guest, texture.Get());
+    const auto dsv_heap = fixture.heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv{fixture.handle(dsv_heap.Get(), 9)};
+    D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    view.Flags = mode == DepthReadCase::depth ? D3D12_DSV_FLAG_READ_ONLY_DEPTH : D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+    guest->CreateDepthStencilView(texture.Get(), &view, dsv);
+    const bool stencil_read = mode == DepthReadCase::stencil;
+    const auto views = fixture.srv(texture.Get(), stencil_read ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                                   0, stencil_read ? 1u : 0u);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC clear_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+    ComPtr<ID3D12DescriptorHeap> clear_heap;
+    check(device->CreateDescriptorHeap(&clear_desc, IID_PPV_ARGS(&clear_heap)), "create depth clear heap");
+    const auto clear_handle = clear_heap->GetCPUDescriptorHandleForHeapStart();
+    view.Flags = D3D12_DSV_FLAG_NONE;
+    device->CreateDepthStencilView(native.Get(), &view, clear_handle);
+    auto clear = fixture.commands();
+    transition(clear.list.Get(), native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    clear.list->ClearDepthStencilView(clear_handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.75f, 64, 0, nullptr);
+    transition(clear.list.Get(), native.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
+    fixture.submit_native(clear.list.Get());
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create depth read allocator");
+    const auto list = begin_guest_list(guest, allocator.Get());
+    ComPtr<ID3D12Resource> color;
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+    if (mode == DepthReadCase::depth) {
+        auto color_desc = desc;
+        color_desc.Format = format;
+        color_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        color = resource(device, color_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        rtv_heap = fixture.heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        rtv.ptr = fixture.handle(rtv_heap.Get(), 9);
+        guest->CreateRenderTargetView(color.Get(), nullptr, rtv);
+        const float zero[]{0, 0, 0, 0};
+        slot<void (WINAPI*)(IUnknown*, SIZE_T, const float*, UINT, const D3D12_RECT*)>(list.Get(), 52)(
+            list.Get(), rtv.ptr, zero, 0, nullptr);
+    }
+    fixture.targets(list.Get(), rtv.ptr ? &rtv : nullptr, &dsv);
+    fixture.draw(list.Get(), pso.Get(), views.Get(), {0, 0, 2, 2, 0, 1}, {0, 0, 2, 2});
+    fixture.submit_guest(list.Get());
+
+    // Planar Depth Stencil, Planar Layout for Staging From Buffer: D24 occupies the low 24 bits.
+    const bool depth_ok = fixture.readback(native.Get(), 0, stencil_read ? 0x00400000u : 0x00bfffffu, 0x00ffffffu);
+    if (mode == DepthReadCase::feedback)
+        return fixture.overlap_refused() && depth_ok;
+    if (mode == DepthReadCase::depth)
+        return fixture.readback(color.Get(), 0, 0xff0000bfu) && depth_ok;
+    return depth_ok;
 }
 
 // Direct translated draws exercise null descriptors that the indirect path refuses.
@@ -2574,7 +2718,13 @@ int check_null_input_draws(ID3D12Device* device, ID3D12Device* guest, ID3D12Info
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
-    const bool target_read = argc == 3 && std::strcmp(argv[2], "render-target-read") == 0;
+    const std::string_view scenario = argc == 3 ? argv[2] : "";
+    const bool target_read = scenario == "render-target-read";
+    std::optional<DepthReadCase> depth_read;
+    if (scenario == "stencil-target-read") depth_read = DepthReadCase::stencil;
+    if (scenario == "depth-target-feedback") depth_read = DepthReadCase::feedback;
+    if (scenario == "depth-target-read") depth_read = DepthReadCase::depth;
+    const bool target_read_fixture = target_read || depth_read.has_value();
     const bool null_census = argc == 3 && std::strcmp(argv[2], "null-census") == 0;
     const bool lease_writer = argc == 3 && std::strcmp(argv[2], "mesh-lease-writer") == 0;
     const bool skip_argument_wait = argc == 3 && std::strcmp(argv[2], "mesh-xmem-arguments-skip-wait") == 0;
@@ -2636,7 +2786,7 @@ int main(int argc, char** argv) try
     const bool translated = root_fix || copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if (target_read || (translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    if (target_read_fixture || (translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
@@ -2649,9 +2799,9 @@ int main(int argc, char** argv) try
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
     const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
-    if (!target_read && debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
+    if (!target_read_fixture && debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
     if (debug) debug->EnableDebugLayer();
-    if (target_read) {
+    if (target_read_fixture) {
         ComPtr<ID3D12Debug1> validation;
         if (!debug || FAILED(debug.As(&validation))) {
             std::fputs("no debug layer\n", stderr);
@@ -2715,7 +2865,7 @@ int main(int argc, char** argv) try
     }
     const std::array<unsigned char, 64> parameters{};
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
-    if (target_read) {
+    if (target_read_fixture) {
         ComPtr<ID3D12Device> desktop;
         check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)), "open desktop target read device");
         TargetReadDebug debug_messages;
@@ -2724,10 +2874,11 @@ int main(int argc, char** argv) try
             return 1;
         }
         TargetReadFixture fixture(desktop.Get(), guest.Get(), argv[2]);
-        const bool pixels = check_render_target_read(fixture);
+        const bool pixels = depth_read ? check_depth_target_read(fixture, *depth_read) : check_render_target_read(fixture);
+        fixture.drain_validation();
         const auto errors = debug_messages.errors.load();
         const auto removed = desktop->GetDeviceRemovedReason();
-        std::printf("render target read: debug errors %u, device status 0x%08lx\n", errors, static_cast<unsigned long>(removed));
+        std::printf("%s: debug errors %u, device status 0x%08lx\n", argv[2], errors, static_cast<unsigned long>(removed));
         return pixels && errors == 0 && removed == S_OK ? 0 : 1;
     }
     if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
