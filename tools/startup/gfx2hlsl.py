@@ -615,7 +615,7 @@ def native_instructions(code):
     return out
 
 
-def decode(code, refusals=None, *, embedded_vertex=False):
+def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False):
     out, off = [], 0
     saw_getpc = False
     while off + 4 <= len(code):
@@ -623,6 +623,15 @@ def decode(code, refusals=None, *, embedded_vertex=False):
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
+        if exports_only:
+            if name == 'word_0x00000000' and out and out[-1][2] == 's_endpgm' and not any(code[off:]):
+                break  # word-aligned zero fill after the program
+            if off + n > len(code) or asm.startswith('.long') or '<truncated>' in asm:
+                raise Unsupported('unreadable instruction in placeholder pixel program')
+            if name != 'exp':
+                out.append((off, n, name, asm))
+                off += n
+                continue
         try:
             asm = check_encoding(code, off, n, name, asm)
         except Unsupported as reason:
@@ -638,7 +647,19 @@ def decode(code, refusals=None, *, embedded_vertex=False):
                     return out
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
+    if exports_only and any(name == 'exp' for _, _, name, _ in out[last + 1:]):
+        raise Unsupported('placeholder export after final program end')
     return out[:last + 1]
+
+
+def export_operands(asm):
+    # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
+    # an explicit en:0x.. flag. As in pixel_aot, such a mask is refused rather than guessed.
+    m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm| en:0x[0-9a-f]+)*)', asm)
+    if not m:
+        raise Unsupported('export form %r' % asm)
+    target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
+    return target, vals, flags
 
 
 def split_top(text, sep=','):
@@ -11990,12 +12011,7 @@ class Stage:
             self.masks.add(d)
 
     def export(self, asm):
-        # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
-        # an explicit en:0x.. flag. As in pixel_aot, such a mask is refused rather than guessed.
-        m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm| en:0x[0-9a-f]+)*)', asm)
-        if not m:
-            raise Unsupported('export form %r' % asm)
-        target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
+        target, vals, flags = export_operands(asm)
         if getattr(self, 'kind', None) == 'ms' and not getattr(self, 'in_mesh_export', False):
             return self.mesh_export(asm, target, vals, flags)
         if any(f.startswith('en:') for f in flags):
@@ -12970,6 +12986,91 @@ def unaligned_dword_body(low, high):
             'return (lo >> k) | (%s << (32 - k)); }' % (low, high))
 
 
+PLACEHOLDER_PS_PREFIX = 'placeholder ps '
+PLACEHOLDER_DRAWN = ' (placeholder drawn)'
+
+
+def placeholder_ps_enabled():
+    return os.environ.get('X2W_PLACEHOLDER_PS') == '1'
+
+
+def placeholder_rgb():
+    rgb = os.environ.get('X2W_PLACEHOLDER_RGB', '255,0,255').split(',')
+    if len(rgb) == 3 and all(re.fullmatch(r'[0-9]{1,3}', c.strip()) and int(c) <= 255 for c in rgb):
+        return tuple(int(c) for c in rgb)
+    return 255, 0, 255
+
+
+def placeholder_manifest_rgb(path):
+    with suppress(OSError), open(path, encoding='utf-8', errors='replace') as result:
+        for line in result:
+            if line.startswith('placeholder rgb '):
+                return line.strip()[16:]
+    return None
+
+
+def placeholder_rgb_text():
+    return '%d,%d,%d' % placeholder_rgb() if placeholder_ps_enabled() else None
+
+
+def pixel_export_targets(code):
+    """Read the output signature without lowering the shader body."""
+    raw = strip_header(code)
+    if len(raw) % 4:
+        raise Unsupported('unaligned placeholder pixel program')
+    ins = decode(raw, exports_only=True)
+    if not ins or ins[-1][2] != 's_endpgm':
+        raise Unsupported('placeholder pixel program has no end')
+    targets = set()
+    for _, _, name, asm in ins:
+        if name != 'exp':
+            continue
+        target, vals, flags = export_operands(asm)
+        if (len(vals) != 4 or any(not re.fullmatch(r'off|v[0-9]+', v) for v in vals)
+                or any(f.startswith('en:') for f in flags)):
+            raise Unsupported('unreadable placeholder pixel export')
+        if target == 'null':
+            continue
+        if not re.fullmatch(r'mrt[0-7z]', target):
+            raise Unsupported('unreadable placeholder pixel export target')
+        if target != 'mrtz':
+            targets.add(target)
+        elif vals[0] != 'off':
+            targets.add('depth')
+    return targets
+
+
+class PlaceholderPixelStage:
+    attrs = {}
+    f16_plain = {}
+    write_masks = {}
+    needs_sm6 = False
+
+    def __init__(self, pipe, code, reason):
+        self.exports = pixel_export_targets(code)
+        self.reason = fail_reason(reason).splitlines()[0]
+        self.rgb = placeholder_rgb()
+        self.kinds = {name: pipe.mrt_kind(int(name[3:])) for name in sorted(self.exports) if name.startswith('mrt')}
+
+    def hlsl(self):
+        depth = 'depth' in self.exports
+        if not self.exports:
+            return 'void main() {}\n'
+        arg = 'float4 pos : SV_Position' if depth else ''
+        fields, values = [], []
+        if depth:
+            fields.append('    float depth : SV_Depth;')
+            values.append('    o.depth = pos.z;')
+        color = 'float4(%d.0/255.0, %d.0/255.0, %d.0/255.0, 1.0)' % self.rgb
+        for name, kind in self.kinds.items():
+            vector = {'uint': 'uint4', 'int': 'int4'}.get(kind, 'float4')
+            fields.append('    %s %s : SV_Target%s;' % (vector, name, name[3:]))
+            value = color if vector == 'float4' else '%s(1, 2, 3, 1)' % vector
+            values.append('    o.%s = %s;' % (name, value))
+        return '\n'.join(['struct PSOut {'] + fields + ['};', 'PSOut main(%s) {' % arg, '    PSOut o;']
+                         + values + ['    return o;', '}']) + '\n'
+
+
 class Pipeline:
     vertex_kind = 'vs'
     uses_dynamic_heap = False
@@ -13048,14 +13149,32 @@ class Pipeline:
             del refusals[before:]
         return Stage(self, 'ps', code, refusals=refusals, decoded=decoded)
 
+    def _graphics_pixel_stage(self, code, pixel_refusal):
+        if code is None:
+            return None
+        if not placeholder_ps_enabled():
+            return self._build_pixel_stage(code)
+        state = deepcopy(self.__dict__, {id(self.vs): self.vs})
+        try:
+            if pixel_refusal is not None:
+                raise pixel_refusal
+            return self._build_pixel_stage(code)
+        except Unsupported as reason:
+            self.__dict__.clear()
+            self.__dict__.update(state)
+            try:
+                return PlaceholderPixelStage(self, code, reason)
+            except Unsupported:
+                raise reason from None
+
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
+                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), *, pixel_refusal=None):
         self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
                                  ps_attr_map, srv_formats)
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
-            self.ps = self._build_pixel_stage(ps_code) if ps_code is not None else None
+            self.ps = self._graphics_pixel_stage(ps_code, pixel_refusal)
         else:
             decoded = {} if decoded is None else decoded
             self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
@@ -13691,6 +13810,8 @@ class Pipeline:
 
     def hlsl_ps(self):
         s = self.ps
+        if isinstance(s, PlaceholderPixelStage):
+            return s.hlsl()
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         depth = 'depth' in s.exports
         quad = QUAD_ANY_HLSL if getattr(s, 'uses_quad_vote', False) else []
@@ -13741,6 +13862,9 @@ class Pipeline:
         if self.ps is None:
             lines.append('ps none')
             return '\n'.join(lines) + '\n'
+        if isinstance(self.ps, PlaceholderPixelStage):
+            lines.append(PLACEHOLDER_PS_PREFIX + self.ps.reason)
+            lines.append('placeholder rgb %d,%d,%d' % self.ps.rgb)
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         # 'wmask <target> <mask>': the export leaves the channels outside the mask unwritten, so the
         # runtime keeps them out of that target's RenderTargetWriteMask. Full masks are not written.
@@ -14283,6 +14407,32 @@ def has_complete_mesh57_bytecode(path):
         return False
 
 
+def is_placeholder_failure(path):
+    with suppress(OSError), open(path, encoding='utf-8', errors='replace') as failure:
+        return failure.readline().rstrip().endswith(PLACEHOLDER_DRAWN)
+    return False
+
+
+def discard_stale_placeholder(manifest):
+    rgb = placeholder_manifest_rgb(manifest)
+    if rgb is not None and rgb != placeholder_rgb_text():
+        with suppress(FileNotFoundError):
+            os.remove(manifest)
+
+
+def write_graphics_failure(path, reason):
+    write_failure(path, reason, context='x2w-placeholder-attempt' if placeholder_ps_enabled() else None)
+
+
+def publish_placeholder_failure(name, stage, compile_enabled, bytecode_suffixes):
+    if not compile_enabled:
+        # Source-only publication cannot mark older bytecode as a placeholder.
+        for suffix in bytecode_suffixes:
+            with suppress(FileNotFoundError):
+                os.remove(name + suffix)
+    write_graphics_failure(name + '.fail', stage.reason + PLACEHOLDER_DRAWN)
+
+
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
                  ps_attr_map=None, ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
@@ -14290,6 +14440,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
+    discard_stale_placeholder(name + '.txt')
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
                         ps_hw_inputs=ps_hw_inputs)
@@ -14298,7 +14449,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
             manifest += rtv_request + '\n'
     except Unsupported as reason:
         reason = fail_reason(reason)
-        write_failure(name + '.fail', reason)
+        write_graphics_failure(name + '.fail', reason)
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
@@ -14312,7 +14463,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         compile_enabled = bool(fxc)
     if fxc is None:
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
-        write_failure(name + '.fail', message)
+        write_graphics_failure(name + '.fail', message)
         return message
     manifest_path = name + '.txt'
     write_manifest = True
@@ -14323,7 +14474,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         if compiler is None:
             feature = 'resource heap indexing needs shader model 6.6' if dynamic_heap else 'a DPP quad read needs shader model 6.0'
             message = 'dxc not found (X2W_DXC=%s): %s' % (os.environ.get('X2W_DXC', '<unset>'), feature)
-            write_failure(name + '.fail', message)
+            write_graphics_failure(name + '.fail', message)
             return message
         model = '6_6' if dynamic_heap else '6_0'
         profiles = (('vs', 'vs_' + model), ('ps', 'ps_' + model))
@@ -14342,7 +14493,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
-                    write_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
+                    write_graphics_failure(name + '.fail', 'fxc %s: %s' % (stage, detail[-2000:]))
                     return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
             with suppress(FileNotFoundError, UnicodeError):
                 with open(manifest_path) as existing:
@@ -14353,6 +14504,9 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
                     os.remove(manifest_path)
             for stage in ('vs', 'ps'):
                 os.replace(os.path.join(staging, stage + '.cso'), name + '.%s.cso' % stage)
+    placeholder = isinstance(getattr(pipe, 'ps', None), PlaceholderPixelStage)
+    if placeholder:
+        publish_placeholder_failure(name, pipe.ps, compile_enabled, ('.vs.cso', '.ps.cso'))
     if write_manifest:
         temporary = '%s.%d.tmp' % (manifest_path, os.getpid())
         try:
@@ -14362,7 +14516,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         finally:
             with suppress(FileNotFoundError):
                 os.remove(temporary)
-    if fxc:
+    if not placeholder and (fxc or is_placeholder_failure(name + '.fail')):
         with suppress(FileNotFoundError):
             os.remove(name + '.fail')
     return 'ok'
@@ -14383,7 +14537,17 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
 
     def classify_stage(blob):
         if refusals is None:
-            return classify(blob)
+            try:
+                return classify(blob)
+            except Unsupported:
+                if placeholder_ps_enabled():
+                    try:
+                        pixel_export_targets(blob)
+                    except Unsupported:
+                        pass
+                    else:
+                        return 'ps'
+                raise
         ins = decode(strip_header(blob), refusals, embedded_vertex=True)
         kind = classify_decoded(ins)
         decoded[kind] = ins
@@ -14555,11 +14719,23 @@ def kill_exit_block(pixel):
     return bool(entries) and all(zero_exec(i) for i in entries)
 
 
+def validate_mesh57_pixel(ps):
+    pixel = decode(strip_header(ps))
+    targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
+    null_only = targets == {'null'}
+    if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
+        raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
+    if 'null' in targets and not null_only and not kill_exit_block(pixel):
+        raise Unsupported('slot 57 pixel stage mixes the null export with another export')
+
+
 def translate_mesh57(out_dir, key):
     """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
 
     Writes <key>.ms57.hlsl and the compiled .ms57.cso, their .ps57 counterparts if present, and <key>.ms57.txt (last).
     No runtime path loads these names yet."""
+    name = os.path.join(out_dir, '%016x' % key)
+    discard_stale_placeholder(name + '.ms57.txt')
     source = os.path.join(out_dir, 'req_%016x' % key)
     ms, ps, root = (open(source + ext, 'rb').read() for ext in ('.m57', '.ps57', '.root'))
     if mesh57_key(ms, ps, root) != key:
@@ -14571,26 +14747,23 @@ def translate_mesh57(out_dir, key):
         op == 's_sendmsg' and assembly == 's_sendmsg 0x9' for _, _, op, assembly in mesh
     ) or not any(target.startswith('pos') for target in exports) or 'target_20' not in exports:
         raise Unsupported('slot 57 mesh stage has no verified allocation and primitive export')
+    pixel_refusal = None
     if ps:
-        pixel = decode(strip_header(ps))
-        # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
-        targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
-        null_only = targets == {'null'}
-        if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
-            raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-        # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
-        # A colour stage may also hold the null export as the early exit of a kill (kill_exit_block).
-        if 'null' in targets and not null_only and not kill_exit_block(pixel):
-            raise Unsupported('slot 57 pixel stage mixes the null export with another export')
-    pipe = MeshPipeline(ms, ps or None, root)
+        try:
+            validate_mesh57_pixel(ps)
+        except Unsupported as reason:
+            if not placeholder_ps_enabled():
+                raise
+            pixel_refusal = reason  # The placeholder derives its signature after mesh translation.
+    pipe = MeshPipeline(ms, ps or None, root, pixel_refusal=pixel_refusal)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:
         sources.append(('ps', 'ps_6_0', pipe.hlsl_ps()))
     manifest = pipe.manifest()
-    name = os.path.join(out_dir, '%016x' % key)
     for stage, _, hlsl in sources:
         open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
-    if os.environ.get('X2W_FXC') != '':
+    compile_enabled = os.environ.get('X2W_FXC') != ''
+    if compile_enabled:
         compiler = find_dxc()
         if compiler is None:
             raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
@@ -14607,12 +14780,16 @@ def translate_mesh57(out_dir, key):
                     raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
             for stage, _, _ in sources:
                 os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
+    placeholder = isinstance(pipe.ps, PlaceholderPixelStage)
+    if placeholder:
+        publish_placeholder_failure(name, pipe.ps, compile_enabled, ('.ms57.cso', '.ps57.cso'))
     temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
     with open(temporary, 'w') as result:
         result.write(manifest)
     os.replace(temporary, name + '.ms57.txt')
-    with suppress(FileNotFoundError):
-        os.remove(name + '.fail')
+    if not placeholder:
+        with suppress(FileNotFoundError):
+            os.remove(name + '.fail')
     return 'ok'
 
 
@@ -14624,7 +14801,7 @@ def translate_request(out_dir, key):
         try:
             return translate_mesh57(out_dir, key)
         except (Unsupported, OSError, UnicodeError, struct.error) as reason:
-            write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
+            write_graphics_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
             return 'unsupported: %s' % reason
     try:
         try:
@@ -14641,10 +14818,10 @@ def translate_request(out_dir, key):
                 os.remove(os.path.join(out_dir, '%016x.txt' % key))
             raise
     except (Unsupported, OSError, UnicodeError) as reason:
-        write_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
+        write_graphics_failure(os.path.join(out_dir, '%016x.fail' % key), str(reason))
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
-        write_failure(os.path.join(out_dir, '%016x.fail' % key), 'stages %s' % sorted(kinds))
+        write_graphics_failure(os.path.join(out_dir, '%016x.fail' % key), 'stages %s' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
                           vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
@@ -15040,14 +15217,15 @@ def refusal_family(reason):
 FAILURE_METADATA = re.compile(r'x2w-refusal-v1 ([0-9a-f]{64}) ([a-z0-9-]+)')
 
 
-def write_failure(path, reason, *, version=None):
+def write_failure(path, reason, *, version=None, context=None):
+    detail = reason + '\n' + (context + '\n' if context else '')
     if not family_retry_enabled():
         with open(path, 'w') as handle:
-            handle.write(reason + '\n')
+            handle.write(detail)
         return
     family = refusal_family(reason.split('\n', 1)[0])
     version = version or translator_version()
-    atomic_retry_text(path, '%s\nx2w-refusal-v1 %s %s\n' % (reason, version, family))
+    atomic_retry_text(path, '%sx2w-refusal-v1 %s %s\n' % (detail, version, family))
 
 
 def atomic_retry_text(path, content):
@@ -15522,13 +15700,17 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
     keys = []
     version = since_translator if isinstance(since_translator, str) and not skip_failed else None
     manifest_only = os.environ.get('X2W_FXC') == ''
-    for name in sorted(os.listdir(out_dir)):
+    names = sorted(os.listdir(out_dir))
+    failures = {name for name in names if name.endswith('.fail')}
+    rgb = placeholder_rgb_text()
+    for name in names:
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
         if not m:
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
         mesh = m.group(2) == 'm57'
+        compute = m.group(2) == 'c67'
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
         manifest = result + ('.ms57.txt' if mesh else '.txt')
@@ -15545,6 +15727,12 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
             # A result translated with a description recorded it (dependency_record). With that description gone,
             # the result is checked again and withdrawn; a legacy request without a record is not read again.
             lost = described is None and os.path.isfile(result + '.psdep')
+        failure_name = '%016x.fail' % key
+        fail = os.path.join(out_dir, failure_name)
+        placeholder = not compute and failure_name in failures and is_placeholder_failure(fail)
+        if placeholder and placeholder_manifest_rgb(manifest) != rgb:
+            keys.append(key)
+            continue
         if os.path.isfile(manifest) and not lost and not (
                 described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
@@ -15553,7 +15741,14 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
                 with suppress(OSError), open(manifest, 'rb') as published:
                     if b'ps none' in published.read().splitlines():
                         continue
-        fail = os.path.join(out_dir, '%016x.fail' % key)
+        if placeholder:
+            keys.append(key)
+            continue
+        if not compute and rgb is not None and failure_name in failures:
+            with suppress(OSError), open(fail, encoding='utf-8', errors='replace') as failure:
+                if 'x2w-placeholder-attempt' not in failure.read().splitlines():
+                    keys.append(key)
+                    continue
         # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
         # still published without its recorded description is checked even with an older .fail, which a success on
         # the manifest-only path leaves in place.

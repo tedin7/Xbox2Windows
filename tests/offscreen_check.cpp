@@ -1555,6 +1555,24 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// Fixed 8x8 RGBA8 fixture. A "-" pixel path records the clear without issuing a draw.
+OperationResult run_startup_placeholder_pixels(const OperationContext& ctx)
+{
+    static constexpr UINT extent = 8, pixel_count = extent * extent;
+    std::uint32_t colors[pixel_count]{}, integers[pixel_count]{};
+    const bool mixed = std::string_view(ctx.argv[5]) == "mixed";
+    if (!mixed && std::string_view(ctx.argv[5]) != "color")
+        return {OutcomeKind::fail, "expected color or mixed render targets"};
+    const char* ps = std::string_view(ctx.argv[4]) == "-" ? nullptr : ctx.argv[4];
+    check_startup_flat_param(ctx.device, ctx.argv[3], ps, colors, extent, extent,
+                            D3D12_CULL_MODE_NONE, FALSE, 3, nullptr, 4, {}, 1, true, mixed ? integers : nullptr);
+    std::ofstream out(ctx.argv[6], std::ios::binary);
+    out.write(reinterpret_cast<const char*>(colors), sizeof(colors));
+    if (mixed) out.write(reinterpret_cast<const char*>(integers), sizeof(integers));
+    out.close();
+    return out ? OperationResult{OutcomeKind::pass, nullptr} : OperationResult{OutcomeKind::fail, "write RGBA8 readback"};
+}
+
 // --startup-pixel-dump <vs.cso> <ps.cso> <width> <height> <out.bin>: the draw of --startup-pixel-words, but the
 // readback is written to the file (width * height * 4 little-endian words, row by row) for the caller to check.
 // Gated on wave operations: the caller's pixel stage reads its own lane and wave (tests that need a reference
@@ -1775,6 +1793,7 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-dynamic-heap", 7, 7, nullptr, kGateSm66DynamicHeap, run_startup_entry_words},
+    {"--startup-placeholder-pixels", 7, 7, nullptr, kNoGate, run_startup_placeholder_pixels},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-pixel-buffer-words", 10, 10, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--startup-instanced-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},

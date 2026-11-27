@@ -165,6 +165,7 @@ struct Translation {
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
     bool dynamic_heap = false;
+    std::string placeholder_ps;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     x2w_startup::D16ImageSrvs d16_srvs;         // manifest 'd16srv': texture views that must match proven D16 formats (#2023)
@@ -607,6 +608,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             // so a translation whose stores would be silently skipped is never drawn (#1723).
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
+        } else if (line.compare(0, 15, "placeholder ps ") == 0) {
+            char enabled[2]{};
+            if (GetEnvironmentVariableA("X2W_PLACEHOLDER_PS", enabled, sizeof(enabled)) != 1 || enabled[0] != '1')
+                return;
+            tr.placeholder_ps = line.substr(15);
         } else if (line == "dynamic_heap") {
             tr.dynamic_heap = true;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
@@ -695,6 +701,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     tr.state = 1;
+    if (!tr.placeholder_ps.empty())
+        log("x2w-draw pipeline %016llx placeholder ps: %s", tr.key, tr.placeholder_ps.c_str());
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",

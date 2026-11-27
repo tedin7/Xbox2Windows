@@ -38,7 +38,8 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
                               UINT vertices = 3, const std::uint32_t* constants = nullptr,
-                              UINT constant_count = 4, const std::vector<std::uint32_t>& raw_srv = {}, UINT instances = 1);
+                              UINT constant_count = 4, const std::vector<std::uint32_t>& raw_srv = {}, UINT instances = 1,
+                              bool rgba8 = false, std::uint32_t* uint_words = nullptr);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width = 1, UINT height = 1, bool dynamic_heap = false);
