@@ -63,7 +63,7 @@ void barrier_plan(bool whole)
     D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 3, 2, DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
     auto* fake = reinterpret_cast<ID3D12Resource*>(static_cast<uintptr_t>(0x1000));
-    const auto full = whole(desc);
+    const auto full = x2w_substates::whole(desc);
     auto planes = make_split(fake, full, D3D12_RESOURCE_STATE_COMMON);
     require(planes.mips == 2 && planes.slices == 3, "mips and slices come from the description");
     UINT last_depth = 0, first_stencil = 0, last_stencil = 0;
@@ -138,7 +138,7 @@ int main(int argc, char** argv)
     device->CreateDepthStencilView(depth.Get(), &view, heap->GetCPUDescriptorHandleForHeapStart());
 
     // Footprint of the stencil plane, mip 0, slice 0.
-    const auto full = whole(desc);
+    const auto full = x2w_substates::whole(desc);
     auto planes = make_split(depth.Get(), full, D3D12_RESOURCE_STATE_COMMON);
     require(planes.mips == mips && planes.slices == slices, "the planes know the resource's mips and slices");
     const UINT stencil_sub = full.mips * full.slices;
