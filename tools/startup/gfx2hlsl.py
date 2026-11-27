@@ -5710,6 +5710,7 @@ class Stage:
             self.fetched = False
             self.uniform_v = set()
             self.firstlane_v = set()
+            self.firstlane_masks = set()
             self.firstlane_ps_load_v = set()
             firstlane_edges = {}
             self.entry_written_v = set()  # uniform VGPRs written with entry EXEC, up to the next join or VGPR write
@@ -6747,13 +6748,21 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        masks = getattr(self, 'firstlane_masks', None)
+        cfg = getattr(self, 'spill_cfg', None)
+        if masks and cfg and any(self.ins[lo][0] == self.pc for lo, _ in cfg[0]):
+            masks.clear()
         if writes_exec(name, ops):
             self.exec_generation += 1
         image = getattr(self, 'image_proof', None)
         if image and (self.pc in image.lowered or self.pc in image.loads):
+            if masks is not None:
+                masks.clear()
             return self.lower_image_instruction(image, name, asm, ops, mods)
         pixel_table = getattr(self, 'pixel_table', None)
         if pixel_table and self.pc == pixel_table[1]:
+            if masks is not None:
+                masks.clear()
             _, _, first, words = pixel_table
             for reg, word in enumerate(words, first):
                 self.set_s(reg, '0x%08xu' % word, ('const', word))
@@ -6844,10 +6853,38 @@ class Stage:
         extra_proof = getattr(self, 'firstlane_cfg', False) and self.uniform_cf
         extra_regs = ()
         ps_load_regs = ()
+        # AMD RDNA 2 ISA guide, 3.9 VCC, p.19: compares produce a lane mask. Equal inputs give equal active bits.
+        # Keep these facts within one basic block, and invalidate them on any overlapping scalar write.
+        masks = getattr(self, 'firstlane_masks', None)
+        mask_enabled = (masks is not None and self.kind == 'ps' and self.firstlane_cfg
+                        and any(op == 'buffer_store_format_xyzw' for _, _, op, _ in self.ins))
+        def mask_key(token):
+            if token in ('vcc', 'vcc_lo'):
+                return 'vcc'
+            reg = reg_range(token)
+            if reg and reg[0] == 's' and reg[2] - reg[1] in (0, 1):
+                return 's%d' % reg[1]
+            return None
+        next_mask = None
         entry_proof = (extra_proof and self.uniform_entry_exec()
                        and (self.firstlane_ps_exec is None or self.pc in self.firstlane_ps_exec))
         pixel_full = extra_proof and self.pc in getattr(self, 'firstlane_ps_full_exec', ())
+        if mask_enabled and entry_proof:
+            if (base.startswith('v_cmp_') and not mods and len(ops) == 3
+                    and mask_key(ops[0]) is not None
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
+            elif (base == 's_or_b64' and not mods and len(ops) == 3
+                  and mask_key(ops[0]) is not None
+                  and all(mask_key(tok) in masks for tok in ops[1:])):
+                next_mask = mask_key(ops[0])
         if entry_proof or pixel_full:
+            if (entry_proof and mask_enabled and base == 'v_cndmask_b32' and not mods
+                    and len(ops) in (3, 4) and mask_key(ops[3] if len(ops) == 4 else 'vcc') in masks
+                    and all(self.firstlane_source(tok, base) for tok in ops[1:3])):
+                dest = reg_range(ops[0])
+                if dest and dest[0] == 'v' and dest[1] == dest[2]:
+                    extra_regs = (dest[1],)
             # Table-driven VALU operations use only their explicit operands and, for the
             # accumulator forms, the old destination. No lane selectors or mask operands.
             if entry_proof and (base in VEC_U or base in VEC_F or base in VEC_U_TO_F or base in UNIFORM_VALU):
@@ -6893,6 +6930,21 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if mask_enabled:
+            _, _, written_masks = scalar_effects(name, asm)
+            if writes_exec(name, ops) or 'any' in scalar_destinations(name, asm):
+                masks.clear()
+            else:
+                for key in tuple(masks):
+                    if key == 'vcc':
+                        overlaps = bool({'vcc', 'vcc_hi'} & written_masks)
+                    else:
+                        reg = int(key[1:])
+                        overlaps = bool({'s%d' % reg, 's%d' % (reg + 1)} & written_masks)
+                    if overlaps:
+                        masks.discard(key)
+            if next_mask is not None:
+                masks.add(next_mask)
         if extra_proof:
             for token in ops[:2] if base == 'v_swap_b32' else destinations(base, ops):
                 reg = reg_range(token)

@@ -34,7 +34,7 @@ def load_desc(dest, offset, opcode):
     return words(0xf4000000 | opcode << 18 | dest << 6 | 4, 0xfa000000 | offset)
 
 
-def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=False, fixed=True, firstlane=True, real_shape=False, nonuniform=False, nonconstant=False, stores=True, spaced=False, index_change=None):
+def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=False, fixed=True, firstlane=True, real_shape=False, nonuniform=False, nonconstant=False, stores=True, spaced=False, index_change=None, mask_case=None):
     def mov(dest, src):
         if isinstance(src, int) and src > 64:
             return words(0x7e000000 | dest << 17 | 1 << 9 | 255, src)
@@ -78,6 +78,24 @@ def program(indices=(0, 1), *, sample=0x27, varying=False, texel_x=0, offen=Fals
     code += words(0x7e000000 | (23 << 17) | (1 << 9) | 242)  # v23 = 1.0
     for reg in range(4):
         code += mov(24 + reg, f's{9 + reg}')
+    if mask_case:
+        # Compare uniform values, select, combine two lane masks, then select via both masks.
+        def cmp_vcc(vector):
+            return words(0x7c000000 | 2 << 17 | vector << 9 | 128)
+        def vop3(op, dest, src0, src1, src2=0):
+            return words(0xd4000000 | op << 16 | dest,
+                         src0 | src1 << 9 | src2 << 18)
+        code += cmp_vcc(0 if mask_case == 'varying' else 20)
+        if mask_case == 'clobber':
+            code += words(*sop1('s_mov_b64', 'vcc_lo', 0))
+        if mask_case == 'branch':
+            code += words(*sopp('s_branch', 0))
+        code += vop3(0x101, 20, 256 + 20, 128, 106)
+        code += vop3(2, 70, 128, 256 + (0 if mask_case == 'or_varying' else 21))
+        code += words(0x80000000 | 0x11 << 23 | 106 << 16 | 106 << 8 | 70)
+        code += vop3(2, 70, 128, 256 + 21)
+        code += vop3(0x101, 21, 256 + 21, 128, 70)
+        code += vop3(0x101, 22, 256 + 22, 128, 106)
     if nonuniform:
         code += mov(20, 'v0')
     for position, (index, data) in enumerate(zip(indices, (20, 24) if stores else ())):
@@ -109,6 +127,8 @@ def translate(**options):
 def controls():
     pipeline = translate()
     assert translate(real_shape=True).hlsl_ps().count('store_format_xyzw(u0,') == 2
+    masked = translate(real_shape=True, mask_case='uniform')
+    assert masked.hlsl_ps().count('store_format_xyzw(u0,') == 2
     spaced = translate(real_shape=True, spaced=True)
     assert spaced.hlsl_ps().count('store_format_xyzw(u0,') == 2
     assert translate(spaced=True, indices=(0x1234, 1)).hlsl_ps().count('store_format_xyzw(u0,') == 2
@@ -156,6 +176,10 @@ def controls():
     for options, fragment in (
         ({'spaced': True, 'indices': (0, 0)}, STORE + ' pixel stores have overlapping indices'),
         ({'indices': (0, 0)}, STORE + ' pixel stores have overlapping indices'),
+        ({'mask_case': 'or_varying'}, STORE + ' data not proven wave-uniform'),
+        ({'mask_case': 'varying'}, STORE + ' data not proven wave-uniform'),
+        ({'mask_case': 'clobber'}, STORE + ' data not proven wave-uniform'),
+        ({'mask_case': 'branch'}, STORE + ' data not proven wave-uniform'),
         ({'nonuniform': True}, STORE + ' data not proven wave-uniform'),
         ({'spaced': True, 'index_change': 'swap'}, STORE + ' index not proven constant in the same basic block'),
         ({'spaced': True, 'index_change': 'sdwa'}, STORE + ' index not proven constant in the same basic block'),
