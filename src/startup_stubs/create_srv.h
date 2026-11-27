@@ -2,16 +2,18 @@
 #pragma once
 
 #include "startup_stubs/view_desc_check.h"
+#include "startup_stubs/console_format_log.h"
 
 #include <windows.h>
 
 #include <array>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
 namespace x2w_startup {
 
-using SrvLog = void (*)(const char*, ...);
+using SrvLog = FormatLog;
 
 struct SrvCreation {
     const char* site = nullptr;
@@ -122,6 +124,61 @@ inline view_desc::Refusal validate_srv(ID3D12Device* device, D3D12_SHADER_RESOUR
     return srv_format_supported(device, format, dimension) ? Refusal::none : Refusal::format;
 }
 
+inline void srv_census_debug_log(const char* format, ...)
+{
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    OutputDebugStringA(line);
+    OutputDebugStringA("\n");
+}
+
+inline INT64 srv_plane_slice(const D3D12_SHADER_RESOURCE_VIEW_DESC* view)
+{
+    if (view && view->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+        return static_cast<INT64>(view->Texture2D.PlaneSlice);
+    if (view && view->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+        return static_cast<INT64>(view->Texture2DArray.PlaneSlice);
+    return -1;
+}
+
+inline void log_srv_census(const D3D12_RESOURCE_DESC& backing, DXGI_FORMAT format,
+                           INT64 requested_plane, INT64 used_plane, SrvLog log)
+{
+    using Key = std::tuple<decltype(resource_size(backing)), DXGI_FORMAT, DXGI_FORMAT, INT64, INT64>;
+    struct Entry {
+        Key key{};
+        UINT64 count = 0;
+    };
+    static std::array<Entry, 64> entries{};
+    static std::size_t used = 0;
+    static UINT64 overflow = 0;
+    static SRWLOCK lock = SRWLOCK_INIT;
+
+    const Key key{resource_size(backing), backing.Format, format, requested_plane, used_plane};
+    AcquireSRWLockExclusive(&lock);
+    std::size_t index = 0;
+    while (index < used && entries[index].key != key) ++index;
+    if (index == used && used < entries.size()) entries[used++].key = key;
+    const bool full = index == entries.size();
+    const UINT64 count = full ? ++overflow : ++entries[index].count;
+    ReleaseSRWLockExclusive(&lock);
+
+    if (!log_at_power_of_two(count)) return;
+    if (full) {
+        log("x2w-d3d12 SRV census overflow count=%llu", static_cast<unsigned long long>(count));
+        return;
+    }
+    log("x2w-d3d12 SRV census size=%llux%ux%u resource_format=%u view_format=%u "
+        "plane_requested=%lld plane_used=%lld count=%llu",
+        static_cast<unsigned long long>(backing.Width), backing.Height, static_cast<UINT>(backing.DepthOrArraySize),
+        static_cast<UINT>(backing.Format), static_cast<UINT>(format),
+        static_cast<long long>(requested_plane), static_cast<long long>(used_plane),
+        static_cast<unsigned long long>(count));
+}
+
 // True if the requested view was written (possibly repaired). A refusal always overwrites the destination.
 inline bool x2w_create_srv(ID3D12Device* device, ID3D12Resource* resource,
                            const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest,
@@ -172,6 +229,17 @@ inline bool x2w_create_srv(ID3D12Device* device, ID3D12Resource* resource,
         refusal = Refusal::dimension;
     }
 
+    if (resource) {
+        const auto family = format_family(backing.Format);
+        if (family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS ||
+            has_console_format_remap(resource)) {
+            // A refused view writes a null descriptor, so no resource plane is used.
+            const bool accepted = refusal == Refusal::none;
+            const auto format = desc ? (accepted ? checked.Format : desc->Format) : backing.Format;
+            const INT64 used_plane = accepted ? (desc ? srv_plane_slice(&checked) : 0) : -1;
+            log_srv_census(backing, format, srv_plane_slice(desc), used_plane, log ? log : srv_census_debug_log);
+        }
+    }
     if (refusal != Refusal::none) {
         srv_diagnostic(site, "refused (writing null)", view_desc::refusal_field_name(refusal), 0, 0, log);
         auto format = desc ? desc->Format : backing.Format;

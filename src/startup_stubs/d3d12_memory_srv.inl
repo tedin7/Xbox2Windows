@@ -1034,6 +1034,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         return nullptr;
     if (!sampled.desktop) {
         const auto desc = sanitized(sampled.desc);
+        x2w_startup::log_console_format("memory-srv", -1, sampled.desc, nullptr, nullptr, log);
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         const HRESULT hr = device_of(sampled.device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sampled.desktop));
@@ -1044,6 +1045,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         }
         x2w_budget::committed(device_of(sampled.device), sampled.desktop.Get(), D3D12_HEAP_TYPE_DEFAULT);
         x2w_startup::mark_packed_stand_in(sampled.desktop.Get(), desktop_format(sampled.desc.Format));
+        x2w_startup::mark_console_format(sampled.desktop.Get(), sampled.desc.Format);
     }
     return sampled.desktop.Get();
 }

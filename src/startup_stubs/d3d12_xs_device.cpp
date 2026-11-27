@@ -856,12 +856,7 @@ __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d,
 // up to ALLOW_SIMULTANEOUS_ACCESS (0x3f); dropped bits are logged once per value.
 DXGI_FORMAT desktop_format(DXGI_FORMAT format)
 {
-    const DXGI_FORMAT mapped = x2w_startup::desktop_format(format);
-    if (mapped != format) {
-        static LONG calls;
-        if (first_calls(calls, 6)) log("x2w-d3d12 console format %u -> desktop format %u", format, mapped);
-    }
-    return mapped;
+    return x2w_startup::desktop_format(format);
 }
 
 constexpr UINT desktop_resource_flags = 0x3f;
@@ -969,15 +964,20 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     D3D12_RESOURCE_DESC desc_copy{};
     D3D12_CLEAR_VALUE clear_copy{};
     DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT original_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
         const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]);
-        requested_format = desktop_format(desc.Format);
+        original_format = desc.Format;
+        requested_format = desktop_format(original_format);
         desc_copy = sanitized(desc);
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
         if constexpr (K == device_kind && (N == 27 || N == 29 || N == 30)) {
             constexpr int clear_index = N == 30 ? 2 : 4;
-            args[clear_index] = reinterpret_cast<u64>(x2w_startup::desktop_clear_value(
-                reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[clear_index]), desc.Format, desc_copy.Format, clear_copy));
+            const auto* clear = reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[clear_index]);
+            const auto* mapped_clear = x2w_startup::desktop_clear_value(clear, desc.Format, desc_copy.Format, clear_copy);
+            args[clear_index] = reinterpret_cast<u64>(mapped_clear);
+            constexpr const char* path = N == 27 ? "committed" : N == 29 ? "placed" : "reserved";
+            x2w_startup::log_console_format(path, N, desc, clear, mapped_clear, log);
         }
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], args[4], args[5],
@@ -988,8 +988,11 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
-        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
-            x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
+        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN) {
+            auto* resource = static_cast<ID3D12Resource*>(*out);
+            x2w_startup::mark_packed_stand_in(resource, requested_format);
+            x2w_startup::mark_console_format(resource, original_format);
+        }
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
         if (!child) {
             static_cast<IUnknown*>(*out)->Release();
@@ -1155,6 +1158,7 @@ struct LazyTextureRecord {
     Wrapper* device{};
     D3D12_RESOURCE_DESC desc{};
     DXGI_FORMAT desktop_format{};
+    DXGI_FORMAT original_format{};
 };
 std::mutex lazy_texture_mutex;  // lock order: draw_lock -> lazy_texture_mutex -> note_lock -> retire_lock
 // Publications of a lazy texture in progress and finished, so a guest descriptor copy can tell whether its native copy may
@@ -6259,7 +6263,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             bool stored = false;
             try {
                 std::lock_guard lock(lazy_texture_mutex);
-                lazy_textures().emplace(w, LazyTextureRecord{self, texture, requested_format});
+                lazy_textures().emplace(w, LazyTextureRecord{self, texture, requested_format, desc->Format});
                 stored = true;
             } catch (const std::bad_alloc&) {
                 stored = false;
@@ -6273,6 +6277,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             }
             w->own().title_memory = address;
             w->own().lazy_slot133_texture = true;
+            x2w_startup::log_console_format("placed-title-memory-lazy", 133, *desc,
+                                            static_cast<const D3D12_CLEAR_VALUE*>(clear), nullptr, log);
             note_slot133_texture(self, w, desc);
             retire_set_class(w, props, D3D12_HEAP_FLAG_NONE, texture, address, /*allow_title_memory=*/true);
             static LONG lazy_created;
@@ -6286,8 +6292,9 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             return S_OK;
         }
         D3D12_CLEAR_VALUE clear_copy{};
-        const auto* clear_value = x2w_startup::desktop_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
-                                                                  desc->Format, texture.Format, clear_copy);
+        const auto* requested_clear = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        const auto* clear_value = x2w_startup::desktop_clear_value(requested_clear, desc->Format, texture.Format, clear_copy);
+        x2w_startup::log_console_format("placed-title-memory", 133, *desc, requested_clear, clear_value, log);
         ID3D12Resource* created = nullptr;
         // On E_OUTOFMEMORY of the default heap, X2W_D3D12_SYSMEM_FALLBACK=1 creates the texture once more in system memory.
         bool in_system_memory = false;
@@ -6312,6 +6319,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         }
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
+        x2w_startup::mark_console_format(created, desc->Format);
         Wrapper* w = wrap(created, resource_kind);
         if (!w) {
             created->Release();
@@ -6693,6 +6701,7 @@ ID3D12Resource* materialize_lazy_texture(Wrapper* w)
                     create_desc.MipLevels, dropped);
         }
 
+        x2w_startup::mark_console_format(created, record.original_format);
         replay_dump_tag(w, created);
         publish.begin();  // before the real resource is visible to a descriptor copy
         if (release_retired_enabled()) {
@@ -8011,6 +8020,7 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
                                                                                     : D3D12_RESOURCE_STATE_COMMON;
     D3D12_CLEAR_VALUE clear_copy{};
     const auto* clear_value = x2w_startup::desktop_clear_value(clear, desc->Format, copy.Format, clear_copy);
+    x2w_startup::log_console_format("committed", slot, *desc, clear, clear_value, log);
     HRESULT hr = kind_for(*iid) == resource_kind
         ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear_value, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
@@ -8028,6 +8038,7 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
+    x2w_startup::mark_console_format(resource, desc->Format);
     Wrapper* w = wrap(resource, resource_kind);
     if (!w) {
         // The title-memory block is not returned here. __XMemAllocationHooks__ is documented as
