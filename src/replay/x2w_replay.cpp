@@ -40,6 +40,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -91,6 +92,11 @@ struct Player {
     u64 scratch_outputs = 0;  // out pointers the file did not hold, given a buffer of the player's own
     std::map<std::string, u64> skips;  // "kind:slot reason" -> calls skipped (the census printed at the end)
     u64 skip_lines = 0, faults = 0;
+    // Nested leaf copies of share_min_bytes or more that translation left unchanged, by blob hash: one copy serves
+    // every call that names the same bytes (pipeline code and data repeat across thousands of creations).
+    std::unordered_map<u64, const unsigned char*> shared;
+    u64 shared_bytes = 0, failed_creates = 0;
+    std::unordered_set<u64> failed_objects;  // recorded outputs of creations that failed here
     u64 mapped = 0, gpu_addresses = 0, title_memory_args = 0;
     mutable u64 page_translated = 0;  // pages written at a translated address (a heap's CPU memory, a Map pointer)
     bool use_slot_layouts = false;
@@ -194,6 +200,8 @@ u64 recorded_word(const Recording& r, const Step& step, std::uint32_t arg)
     return 0;
 }
 
+constexpr u64 share_min_bytes = 4096;
+
 // The argument memory of one call, copied into the replay's arena. Fills the copy of each top-level argument
 // (top[0..10]: the register and stack arguments after rcx; top[15]: rcx when it is not an object).
 void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_slots], std::vector<unsigned char*>& copies)
@@ -212,15 +220,29 @@ void relocate(Player& p, const Recording& r, const Step& step, u64 (&top)[top_sl
             ++p.missing_blob;
             continue;
         }
+        // A nested leaf (depth 0: no copy points below it, nothing patches it) is input the stand-in only reads.
+        const bool shareable = m.arg >= 0x100 && m.depth == 0 && m.bytes >= share_min_bytes;
+        if (shareable) {
+            if (const auto shared = p.shared.find(m.hash); shared != p.shared.end()) {
+                copies[i] = const_cast<unsigned char*>(shared->second);
+                p.shared_bytes += m.bytes;
+                continue;
+            }
+        }
         auto copy = std::make_unique<unsigned char[]>(static_cast<std::size_t>(m.bytes) + 8);
         std::memcpy(copy.get(), blob->second.data, static_cast<std::size_t>(m.bytes));
         // Words naming a recorded wrapper, descriptor handle, mapped or GPU address name the replay's.
+        bool translated = false;
         for (u64 at = 0; at + 8 <= m.bytes; at += 8) {
             u64 word;
             std::memcpy(&word, copy.get() + at, 8);
             const u64 now = p.translate(word);
-            if (now != word) std::memcpy(copy.get() + at, &now, 8);
+            if (now != word) {
+                std::memcpy(copy.get() + at, &now, 8);
+                translated = true;
+            }
         }
+        if (shareable && !translated) p.shared.emplace(m.hash, copy.get());
         copies[i] = copy.get();
         p.arena_bytes += m.bytes;
         p.arena.push_back(std::move(copy));
@@ -380,11 +402,34 @@ bool skip(Player& p, const CallRecord& c, const char* reason)
 
 // A creation or QueryInterface recorded as a success that fails here: played, and counted in the census, because every
 // later call on its result will be an unknown object.
-void note_failed_here(Player& p, const CallRecord& c, u64 ret)
+// The process's commit charge against its limit, the argument copies and the title ranges: a creation that fails
+// with E_OUTOFMEMORY on a long file says whether the host ran out.
+void say_commit(const Player& p, const char* when)
 {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof(m);
+    if (!GlobalMemoryStatusEx(&m)) return;
+    u64 title = 0;
+    for (const ReservedSpan& s : page_replay().spans) title += s.end - s.base;
+    say("x2w-replay: commit %s: %llu of %llu MiB used, argument copies %llu MiB (%llu MiB shared), title ranges %llu MiB",
+        when, static_cast<unsigned long long>((m.ullTotalPageFile - m.ullAvailPageFile) >> 20),
+        static_cast<unsigned long long>(m.ullTotalPageFile >> 20), static_cast<unsigned long long>(p.arena_bytes >> 20),
+        static_cast<unsigned long long>(p.shared_bytes >> 20), static_cast<unsigned long long>(title >> 20));
+}
+
+void note_failed_here(Player& p, const Step& step, u64 ret)
+{
+    const CallRecord& c = step.call;
     if (x2w_replay_slots::output_arg(c.kind, c.slot) < 0 || FAILED(static_cast<HRESULT>(c.ret)) ||
         SUCCEEDED(static_cast<HRESULT>(ret)))
         return;
+    for (const Output& output : step.outputs) p.failed_objects.insert(output.value);
+    if (++p.failed_creates == 1 || p.failed_creates % 500 == 0) {
+        char when[64];
+        std::snprintf(when, sizeof(when), "at failed create %llu (hr 0x%08lx)", static_cast<unsigned long long>(p.failed_creates),
+                      static_cast<unsigned long>(ret));
+        say_commit(p, when);
+    }
     char key[96];
     std::snprintf(key, sizeof(key), "%u:%u failed here (recorded ok)", c.kind, c.slot);
     if (++p.skips[key] <= 2 && ++p.skip_lines <= 64)
@@ -425,7 +470,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         if (++p.adopted <= 8) say("replay: adopted pre-install wrapper %u 0x%llx", c.kind, static_cast<unsigned long long>(c.object));
     } else {
         ++p.unknown_object;
-        return skip(p, c, "unknown object");
+        return skip(p, c, p.failed_objects.count(c.object) ? "dependent of failed create" : "unknown object");
     }
     // A creation or QueryInterface that failed when recorded made nothing: the out pointer may be the title's stack and
     // the inputs may not be in the file. Nothing later can name its result, so it is not played.
@@ -449,6 +494,8 @@ bool play(Player& p, const Recording& r, const Step& step)
     for (int i = 0; i < call_args; ++i) {
         const u64 raw = c.args[i];
         if (call.top[i] || !raw || a[i] != raw || page_replay().reserved(raw) || p.descriptor_backing(raw)) continue;
+        // An object whose creation failed here: the stand-in would take the recorded address for a wrapper.
+        if (p.failed_objects.count(raw)) return skip(p, c, "argument from a failed create");
         if (x2w_replay_slots::declared_input(c.kind, c.slot, i)) {
             ++p.missing_blob;
             static const char* const reasons[call_args] = {
@@ -557,7 +604,7 @@ bool play(Player& p, const Recording& r, const Step& step)
         ++p.faults;
         return skip(p, c, "fault in the stand-in");
     }
-    note_failed_here(p, c, call.ret);
+    note_failed_here(p, step, call.ret);
     if (step.descriptor_bytes && SUCCEEDED(static_cast<HRESULT>(call.ret))) {
         p.descriptor_backings.push_back({step.descriptor_address, step.descriptor_address + step.descriptor_bytes});
         merge_spans(p.descriptor_backings);
@@ -740,9 +787,9 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
     if (std::FILE* f = _wfopen(path.c_str(), L"w")) {
         std::fprintf(f, "{\"version\": %u, \"calls\": %zu, \"played\": %llu, \"unknown_object\": %llu, \"missing_blob\": %llu, "
                         "\"fence_timeouts\": %llu, \"presents\": %llu, \"wall_s\": %.*f, \"fps\": %.2f, \"argument_bytes\": %llu, "
-                        "\"stopped_at_max_seconds\": %s, ",
+                        "\"shared_argument_bytes\": %llu, \"stopped_at_max_seconds\": %s, ",
                      r.version, r.steps.size(), p.played, p.unknown_object, p.missing_blob, p.fence_timeouts, p.presents, timing ? 9 : 3, wall, fps,
-                     p.arena_bytes, stopped ? "true" : "false");
+                     p.arena_bytes, p.shared_bytes, stopped ? "true" : "false");
         const PageReplay& pages = page_replay();
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
@@ -949,6 +996,7 @@ int run(const Options& o)
     say("x2w-replay: played %llu of %zu calls (%llu on objects never created, %llu without their memory), %llu presents, "
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
+    say_commit(p, "at the end");
     print_skip_census(p);
     write_summary(o, p, r, wall, stopped, timing ? &*timing : nullptr);
     if (stopped) return 5;

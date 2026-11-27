@@ -56,6 +56,19 @@ def pre_install_device():
     data += chunk(b"CALL", CALL[3].pack(7, 1, 0, 57, DEVICE, 0x7FF6C51306B8, riid, out, *([0] * 8), 0, 0.0, 0, 0))
     # A call on a resource no OUTP named: skipped.
     data += chunk(b"CALL", CALL[3].pack(8, 1, 7, 8, 0x9999, *([0] * 11), 0, 0.0, 0, 0))
+    # The QueryInterface at seq 5 succeeded when recorded (its OUTP names 0xABC0) but fails here (the IID is unknown):
+    # a call on that object is a dependent of a failed create, not an unknown object.
+    data += chunk(b"OUTP", struct.pack("<QIIQ", 5, 1, 0, 0xABC0))
+    data += chunk(b"CALL", CALL[3].pack(9, 1, 7, 8, 0xABC0, *([0] * 11), 0, 0.0, 0, 0))
+    # Two calls whose argument points at a 16-byte struct whose first word points at the same 4 KiB of bytes: the
+    # nested leaf is copied once and shared.
+    top, leaf = 0x7253F700, 0x7253E000
+    for seq in (10, 11):
+        data += chunk(b"CALL", CALL[3].pack(seq, 1, 0, 15, DEVICE, 2, top, *([0] * 9), 32, 0.0, 0, 0))
+        data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 1, 1, top, 16, 0x70F))
+        data += chunk(b"ARGM", struct.pack("<QIIQQQ", seq, 0x101, 0, leaf, 4096, 0x1EAF))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x70F, 16), struct.pack("<QQ", leaf, 0))
+    data += chunk(b"BLOB", struct.pack("<QQ", 0x1EAF, 4096), bytes(range(256)) * 16)
     return data
 
 
@@ -100,10 +113,14 @@ def main(player):
         code, text, out = play(player, directory, "pre-install", pre_install_device())
         assert code == 0, (code, text[-2500:])
         summary = json.loads((out / "replay_summary.json").read_text())
-        assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (8, 5, 1, 1), summary
+        assert (summary["calls"], summary["played"], summary["unknown_object"], summary["missing_blob"]) == (11, 7, 2, 1), summary
+        # Copies: the riid of seq 5 (seq 6 is skipped first) and both 16-byte structs, plus the 4 KiB leaf once: the
+        # second call shares it.
+        assert (summary["argument_bytes"], summary["shared_argument_bytes"]) == (3 * 16 + 4096, 4096), summary
         assert "replay: adopted pre-install wrapper 0 0x5678" in text, text[-2500:]
         for line in ("x2w-replay: skip census: ", "skip census 0:0 recorded failure: 1",
-                     "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1"):
+                     "skip census 0:57 argument 0 not in the file: 1", "skip census 7:8 unknown object: 1",
+                     "skip census 7:8 dependent of failed create: 1", "x2w-replay: commit at failed create 1 "):
             assert line in text, (line, text[-2500:])
     return 0
 
