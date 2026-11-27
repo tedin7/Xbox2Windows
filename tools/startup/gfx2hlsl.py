@@ -4542,6 +4542,11 @@ class Stage:
     def group_has_high_lanes(self):
         return math.prod(self.pipe.group) > 32
 
+    def check_group_mask_word(self, name, word, first_lane=0):
+        lanes = max(0, math.prod(self.pipe.group) - first_lane)
+        if word is None or word >> lanes:
+            raise Unsupported('group vote: %s uses a whole-word mask value in a partial wave' % name)
+
     def group_mask_bit(self, name, tok, pair, *, implicit_pair=False):
         """Project a whole scalar word (or pair) onto this thread's guest lane."""
         error = 'group vote: %s uses an unproven lane mask operand %s' % (name, tok)
@@ -4578,13 +4583,18 @@ class Stage:
             high = self.S(hi) if pair and high_lanes else '0u'
         else:
             low = self.u(tok)
-            high = '0u'
+            high_word = 0
             if pair:
                 # The unsigned literal is zero-extended. Negative inline integers extend their sign.
                 if tok in FLOATS or (tok != 'null' and not re.fullmatch(r'-?(?:0x[\da-f]+|\d+)', tok)):
                     raise Unsupported(error)
                 if tok != 'null' and -16 <= int(tok, 0) < 0:
-                    high = '0xffffffffu'
+                    high_word = 0xffffffff
+            high = '0xffffffffu' if high_word else '0u'
+            if not self.group_full_wave:
+                self.check_group_mask_word(name, None if tok == '-1' else self.const_u32(tok))
+                if pair:
+                    self.check_group_mask_word(name, high_word, 32)
         if pair and high_lanes:
             return '(lane < 32u ? ((%s >> (lane & 31u)) & 1u) : ((%s >> (lane & 31u)) & 1u))' % (low, high)
         if low in ('0x00000000u', '0xffffffffu'):
@@ -4944,6 +4954,12 @@ class Stage:
 
         Any write ends n's life as a lane mask; a caller that writes a mask marks n again after this call.
         The uniformity of expr is judged first, while a source that is n itself still has its old mark."""
+        if self.group_vote and not self.group_full_wave:
+            key = self.pc, n
+            if sym and sym[0] == 'const' and len(sym) == 2:
+                self.group_mask_constants[key] = sym[1] & 0xffffffff
+            else:
+                self.group_mask_constants.pop(key, None)
         scc_dependency = False
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
@@ -6226,6 +6242,9 @@ class Stage:
         refused = {}
         if self.group_vote:
             self.execz_counted_loops = self.waterfall_reads = {}
+            threads = math.prod(self.pipe.group)
+            self.group_full_wave = ((threads == 32 and self.program_is_wave32())
+                                    or (threads == 64 and self.wave64_proven()))
         elif getattr(self, 'kind', None) == 'cs':  # probes skip __init__
             refused = self.execz_refusals()
         # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
@@ -6365,6 +6384,7 @@ class Stage:
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             if self.group_vote:
                 self.group_mask_reads, self.group_mask_defs = {}, {}
+                self.group_mask_constants = {}  # (defining PC, SGPR) -> known whole word
                 self.group_positioned_masks = set()  # mask SGPRs that store their bit at its guest word position
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
@@ -8185,6 +8205,8 @@ class Stage:
     def check_group_mask_joins(self):
         """Verify each read's representation across forward joins and loop back edges."""
         words = {'s%d' % n for defs in self.group_mask_defs.values() for n in defs}
+        if not self.group_full_wave:
+            words.update('s%d' % n for reads in self.group_mask_reads.values() for n in reads)
         if not words:
             return
         successors = lane_mask_cfg(self.ins)
@@ -8205,18 +8227,27 @@ class Stage:
             'word_high': {'word', 'positioned_high'}, 'positioned_high': {'word', 'positioned_high'},
             'bit': {'bit'}, 'high': {'high'}, 'data': {'word'},
         }
+        partial_words = []
         for i, (pc, _, name, _) in enumerate(self.ins):
             if incoming[i] is None:
                 continue
             for tok, role in sorted(reads[i].items()):
                 n = int(tok[1:])
-                reps = {self.group_mask_defs.get(self.ins[j][0], {}).get(n, 'word') if j >= 0 else 'word'
-                        for j in incoming[i][tok]}
-                if reps <= compatible[role]:
+                defs = {self.ins[j][0] if j >= 0 else None for j in incoming[i][tok]}
+                reps = {at: self.group_mask_defs.get(at, {}).get(n, 'word') for at in defs}
+                if set(reps.values()) <= compatible[role]:
+                    if not self.group_full_wave and role not in ('data', 'bit', 'high'):
+                        # Positioned mask definitions already contain only the thread's own bit. Whole
+                        # words reaching the same read must also have no bits for unlaunched lanes.
+                        first_lane = 32 if role.endswith('_high') else 0
+                        partial_words.extend((name, self.group_mask_constants.get((at, n)), first_lane)
+                                             for at, rep in reps.items() if rep == 'word')
                     continue
                 if role == 'data':
                     raise Unsupported('%s data operand %s is a lane mask' % (name, tok))
                 raise Unsupported('group vote: %s has incompatible lane mask definitions for %s' % (name, tok))
+        for name, word, first_lane in partial_words:
+            self.check_group_mask_word(name, word, first_lane)
 
     def lower_image_instruction(self, proof, name, asm, ops, mods):
         pc = self.pc

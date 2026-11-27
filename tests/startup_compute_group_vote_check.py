@@ -37,6 +37,10 @@ EXEC_ONE = ('s_mov_b32 exec_lo, 1', '8103febe')
 REMAINING_ONE = ('s_mov_b32 s21, 1', '810395be')
 EXEC_HIGH_PAIR = (('s_mov_b32 s30, 0', '80039ebe'), ('s_mov_b32 s31, 1', '81039fbe'),
                   ('s_mov_b64 exec, s[30:31]', '1e04febe'))
+VCC_WORD = ('s_mov_b32 vcc_lo, s4', '0403eabe')
+VCC_PAIR = (EXEC_HIGH_PAIR[0], ('s_mov_b32 s31, s4', '04039fbe'),
+            ('s_mov_b64 vcc, s[30:31]', '1e04eabe'))
+PARTIAL_MASK = 'uses a whole-word mask value in a partial wave'
 
 
 def encode(rows):
@@ -104,6 +108,18 @@ def programs():
                                ('v_cndmask_b32_e32 v7, s20, v7, vcc_lo', '140e0e02'),
                                ('v_cndmask_b32_e64 v8, 0, 64, s24', '080001d580806100'),
                                ('v_add_nc_u32_e32 v7, v8, v7', '080f0e4a'), *ending), EXECZ + 'definition of s20', False
+    yield 'vcc-word32', 32, (*prefix, SET_3, ('s_cbranch_execz', '@vote'), SET_40,
+                            'vote', VCC_WORD, ('s_cbranch_vccnz', '@set'), SET_3,
+                            'set', waterfall.HEAD, restore, USE_FIRST, BIAS, *ending), EXECZ + 'definition of s20', False
+    yield 'vcc-word64', 64, (*prefix[:8], ('v_readfirstlane_b32 s22, v0', '00052c7e'), SET_3,
+                            *VCC_PAIR, ('s_cbranch_vccz', '@set'), ('s_mov_b32 s22, 7', '870396be'),
+                            'set', USE_FIRST, BIAS, *ending), READFIRST, False
+
+
+VCC_WORD_CASES = {
+    'vcc-word32': (20, ((0, 28), (0x80000000, 65))),
+    'vcc-word64': (48, ((0, 16), (0x00010000, 23), (0x80000000, 23))),
+}
 
 
 def fixture_group(label, width):
@@ -135,8 +151,10 @@ def interpret(rows, active_count, keys, lanes):
             return exec_mask
         if token == 'exec_lo':
             return exec_mask & 0xffffffff
-        if token in ('vcc', 'vcc_lo'):
+        if token == 'vcc':
             return vcc
+        if token == 'vcc_lo':
+            return vcc & 0xffffffff
         if token.startswith('s['):
             lo, hi = token[2:-1].split(':')
             return sgpr['s' + lo] | (sgpr['s' + hi] << 32)
@@ -169,8 +187,10 @@ def interpret(rows, active_count, keys, lanes):
                 exec_mask = word & entry_mask
             elif dst == 'exec_lo':
                 exec_mask = ((exec_mask & ~0xffffffff) | (word & 0xffffffff)) & entry_mask
+            elif dst == 'vcc':
+                vcc = word & 0xffffffffffffffff
             elif dst == 'vcc_lo':
-                vcc = word & 0xffffffff
+                vcc = (vcc & ~0xffffffff) | (word & 0xffffffff)
             elif dst.startswith('s['):
                 lo, hi = dst[2:-1].split(':')
                 sgpr['s' + lo], sgpr['s' + hi] = word & 0xffffffff, (word >> 32) & 0xffffffff
@@ -246,6 +266,10 @@ def reference_cases(label, width, rows, mutate):
         counts = (0, 4)
     if label == 'waterfall-constant':
         keys, counts = [64, 32, 128, 96], (4,)
+    vcc_cases = dict(VCC_WORD_CASES[label][1]) if label in VCC_WORD_CASES else {}
+    if vcc_cases:
+        counts = vcc_cases
+        keys[0] = 12
     for count in counts:
         result = interpret(rows, count, keys, range(threads))
         expected = [result[i] for i in range(threads)]
@@ -263,6 +287,8 @@ def reference_cases(label, width, rows, mutate):
         if label == 'mask-word-phi':
             assert expected == [77 if lane < count and count & (1 << lane) else 40 if count else 3
                                 for lane in range(width)], (count, expected)
+        if vcc_cases:
+            assert expected == [vcc_cases[count]] * width, (label, count, expected)
         mismatch = None
         if mutate:
             for lane, correct in enumerate(expected):
@@ -292,7 +318,7 @@ def mask_operand_controls(rows):
         ('s_mov_b32 s28, 2', '82039cbe'), ('s_and_saveexec_b32 s28, s28', '1c3c9cbe'),
         ('s_cselect_b32 exec_lo, 2, 4', '82847e85'), ('s_or_b32 exec_lo, exec_lo, 2', '7e827e88'),
     )
-    group = (4, 1, 1)
+    group = (32, 1, 1)
     pipe = translate((*rows[:i], *probes, *rows[i:]), 32, group)
     assert pipe.retry_group_vote
     hlsl = pipe.hlsl_cs()
@@ -309,7 +335,44 @@ def mask_operand_controls(rows):
     refused('data operand s24 is a lane mask', lambda: translate((*rows[:i], *probes, data_read, *rows[i:]), 32, group))
 
 
+def partial_mask_controls():
+    partial_refusals = {}
+    for label, width, rows, _, _ in programs():
+        if label not in VCC_WORD_CASES:
+            continue
+        threads, cases = VCC_WORD_CASES[label]
+        keys = [12] + [7] * (threads - 1)
+        for count, expected in cases:
+            assert interpret(rows, count, keys, range(threads)) == dict.fromkeys(range(threads), expected)
+        census = []
+        assert translate(rows, width, (threads, 1, 1), refusals=census).retry_group_vote
+        partial_refusals[label] = census
+    assert all(any(PARTIAL_MASK in reason for reason, _ in census)
+               for census in partial_refusals.values()), partial_refusals
+
+    wave32, wave64 = [rows for label, _, rows, _, _ in programs() if label in VCC_WORD_CASES]
+    group32, group64 = ((VCC_WORD_CASES[label][0], 1, 1) for label in ('vcc-word32', 'vcc-word64'))
+    for literal, code, fits in ((0x80000, 'ff03eabe00000800', True),
+                                (0x100000, 'ff03eabe00001000', False), (-1, 'c103eabe', False)):
+        rows = tuple(('s_mov_b32 vcc_lo, %d' % literal, code) if row == VCC_WORD else row for row in wave32)
+        if fits:
+            assert translate(rows, 32, group32).retry_group_vote
+        else:
+            refused(PARTIAL_MASK, lambda: translate(rows, 32, group32))
+    for literal, code, fits in ((0x8000, 'ff039fbe00800000', True),
+                                (0x10000, 'ff039fbe00000100', False)):
+        rows = tuple(('s_mov_b32 s31, %d' % literal, code) if row == VCC_PAIR[1] else row for row in wave64)
+        if fits:
+            assert translate(rows, 64, group64).retry_group_vote
+        else:
+            refused(PARTIAL_MASK, lambda: translate(rows, 64, group64))
+    for threads in (20, 32):
+        refused(PARTIAL_MASK, lambda: translate(wave64, group=(threads, 1, 1)))
+    assert translate(wave32).retry_group_vote  # The EXEC write proves wave32.
+
+
 def controls():
+    partial_mask_controls()
     for label, width, rows, legacy_reason, mutate in programs():
         group = fixture_group(label, width)
         with patch.object(G.ComputePipeline, 'retry_group_vote_for', return_value=False):
@@ -393,7 +456,7 @@ def controls():
         retry.assert_not_called()
     assert not pipe.retry_group_vote and 'x2w_wave_' not in pipe.hlsl_cs()
     assert (pipe.hlsl_cs(), pipe.manifest()) == (original.hlsl_cs(), original.manifest())
-    print('Twelve group-vote fixtures, wave-size and divergent SCC refusal controls passed')
+    print('Fourteen group-vote fixtures, partial-wave, wave-size and divergent SCC refusal controls passed')
 
 
 def dispatch(directory, dxc, runner, adapter):
