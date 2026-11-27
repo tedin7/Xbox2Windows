@@ -560,7 +560,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             if (!data) return 81;
             *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
             const UINT64 address = reinterpret_cast<UINT64>(data);
-            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            if ((slot == 2 && mode.find("-selected-swizzled") != std::string::npos) ||
+                (slot == 3 && mode.find("-unrelated-swizzled") != std::string::npos))
+                raw[1] |= 1u << 31;
             std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
         }
     }

@@ -3160,8 +3160,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
 // records in the same shader-visible heap, since D3D12 binds only one CBV/SRV/UAV heap at a time.
 template <typename Writable>
 ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RESOURCE_STATES state,
-                                          Writable writable, UINT& count, const char*& reason,
-                                          std::uint32_t* refusal_words = nullptr)
+                                          Writable writable, UINT& count)
 {
     const auto source = pass_of(self).title_view_heap;
     constexpr UINT record_bytes = 32;
@@ -3186,11 +3185,7 @@ ID3D12DescriptorHeap* snapshot_buffer_heap(Wrapper* self, UINT tables, D3D12_RES
             IndirectBufferView view;
             if (entry && (readable_heap || x2w_local::readable(entry, sizeof(words)))) {
                 std::memcpy(words, entry, sizeof(words));
-                // The shader can select a mirrored record at execution time.
-                if ((reason = refuse_native_buffer_addressing(words))) {
-                    if (refusal_words) std::memcpy(refusal_words, words, sizeof(words));
-                    return nullptr;
-                }
+                // The heap can contain unrelated records. An unmappable entry gets a null SRV.
                 if (words[0] || words[1] || words[2] || words[3])
                     view = indirect_table_buffer(self, words);
             }
@@ -3844,13 +3839,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     UINT first = 0;
     if (tr->dynamic_heap) {
         if (!indirect) {
-            const char* reason = nullptr;
             view_heap = snapshot_buffer_heap(self, views, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, [&](ID3D12Resource* resource) {
                     for (std::size_t i = 0; i < tr->uavs.size(); ++i)
                         if (uav_bindings[i].resource == resource) return true;
                     return false;
-                }, first, reason);
+                }, first);
         } else view_heap = nullptr;
         if (!view_heap) {
             draw_lock_release_exclusive();

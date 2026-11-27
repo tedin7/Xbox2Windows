@@ -813,8 +813,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     for (std::size_t i = inputs; i < count; ++i)
                         if (views[i].resource == resource) return true;
                     return false;
-                }, first, reason, words);
-            if (!view_heap && !reason) reason = "the dynamic resource heap could not be bound";
+                }, first);
+            if (!view_heap) reason = "the dynamic resource heap could not be bound";
         }
     }
     timer.valued();
