@@ -85,7 +85,7 @@ def reference():
 def evaluate(ps):
     """Evaluate the translated pixel text: `vN = expr;` over f32tof16, f16tof32, U and the interpolated param0."""
     regs = {}
-    env = {'f32tof16': f16_bits, 'U': f32_bits, 'regs': regs,
+    env = {'f16rn': f16_bits, 'U': f32_bits, 'regs': regs,
            'f16tof32': lambda w: struct.unpack('<e', struct.pack('<H', w & 0xffff))[0]}
     for line in ps.splitlines():
         m = re.fullmatch(r'    (v\d+) = (.*);', line)
@@ -135,7 +135,7 @@ def controls():
     assert got == expected, ('translated words', [hex(w) for w in got], [hex(w) for w in expected])
     print('op_sel 0x8 pair: %s' % ','.join('%08x' % w for w in got))
 
-    hi_line = '    v8 = (v8 & 0xffffu) | (f32tof16(i.param0.z) << 16);'
+    hi_line = '    v8 = (v8 & 0xffffu) | (f16rn(i.param0.z) << 16);'
     assert hi_line in ps.splitlines(), ps
     # Negative control 1: the op_sel bit cleared on both (p2 writes the low half again), and a lowering that writes
     # the low half instead of the high half.
@@ -146,10 +146,10 @@ def controls():
     initial_high = struct.pack('<4I', 0x7e1002ff, 0x3c000000, 0x7e1202ff, 0xc4000000)
     preserved_high = evaluate(translate(initial_high + bit_off))
     assert preserved_high == tuple(f32_bits(v) for v in (0.5, 1.0, 3.0, -4.0)), preserved_high
-    low_write = ps.replace(hi_line, '    v8 = (v8 & 0xffff0000u) | f32tof16(i.param0.z);')
+    low_write = ps.replace(hi_line, '    v8 = (v8 & 0xffff0000u) | f16rn(i.param0.z);')
     assert evaluate(low_write) != expected, 'a low-half write is not detected'
     # Negative control 2: the lowering clearing the other half instead of keeping it.
-    assert evaluate(ps.replace(hi_line, '    v8 = (f32tof16(i.param0.z) << 16);')) != expected, 'a clearing write is not detected'
+    assert evaluate(ps.replace(hi_line, '    v8 = (f16rn(i.param0.z) << 16);')) != expected, 'a clearing write is not detected'
     print('negative controls: low-half write and clearing write differ from the reference')
 
     # Negative control 3: every other op_sel pattern is refused, on p2 and on p1ll (bit 14 alone is the lowered one).

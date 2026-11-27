@@ -4094,6 +4094,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Compute translator: integer inequality lane guards.
     add_test(NAME compute_alu_cmp_ne_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/compute_alu_cmp_ne_check.py")
+    add_test(NAME startup_gfx2hlsl_cvt_f16_round_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_f16_round_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_cvt_f16_round_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_f16_round_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_cvt_f16_round_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_gfx2hlsl_cvt_alu_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py")
     # Compute translator: scalar pair population count.
