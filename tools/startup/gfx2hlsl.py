@@ -1458,6 +1458,9 @@ LDS_EXCHANGE_OPS = {
 }
 
 
+D3D12_TGSM_WORDS = 8192
+
+
 def check_lds_exchange(ins, group, words):
     """Prove a race-free LDS fill (or two disjoint dword fills), one uniform barrier, then reads of initialized dwords.
 
@@ -1472,7 +1475,7 @@ def check_lds_exchange(ins, group, words):
         raise Unsupported('LDS exchange needs a 1D group (the group is %dx%dx%d)' % tuple(group))
     if words == 0:
         raise Unsupported('LDS exchange needs a nonzero LDS allocation (COMPUTE_PGM_RSRC2 allocates 0 bytes)')
-    if not 0 < words <= 8192:
+    if not 0 < words <= D3D12_TGSM_WORDS:
         raise Unsupported('LDS exchange needs an allocation of at most 32 KiB (COMPUTE_PGM_RSRC2 allocates %d KiB)' % (words * 4 // 1024))
     fill_spans = []
     published = False
@@ -7539,7 +7542,7 @@ class Stage:
         if getattr(self, 'pipe', None) is None:
             raise Unsupported('%s needs pipeline metadata' % base)
         words = self.pipe.lds_words
-        if not 0 < words <= 8192:
+        if not 0 < words <= D3D12_TGSM_WORDS:
             raise Unsupported('%s needs a nonzero LDS allocation of at most 32 KiB' % base)
         self.uses_lds = True
         return words * 4
@@ -12430,7 +12433,8 @@ class ComputePipeline(Pipeline):
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
-    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None):
+    def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None, wave_size=None,
+                 *, dispatch_lds_bytes=None):
         from compute_store_aot import checked_group, entry_registers
         try:
             tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
@@ -12452,8 +12456,14 @@ class ComputePipeline(Pipeline):
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
-        # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
-        self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
+        # Keep existing in-range program allocations so a sidecar cannot change their generated HLSL.
+        self.lds_words = program_lds_words(rsrc2)
+        if not 0 < self.lds_words <= D3D12_TGSM_WORDS and dispatch_lds_bytes is not None:
+            if type(dispatch_lds_bytes) is not int or dispatch_lds_bytes <= 0 or dispatch_lds_bytes % 4:
+                raise Unsupported('dispatch LDS size must be a positive whole number of dwords')
+            if dispatch_lds_bytes > D3D12_TGSM_WORDS * 4:
+                raise Unsupported('dispatch LDS size exceeds 32 KiB (%d bytes)' % dispatch_lds_bytes)
+            self.lds_words = dispatch_lds_bytes // 4
         self.rw_keys = set()
         self.retry_entry_exec = False
         self.retry_firstlane = False
@@ -12748,6 +12758,11 @@ def compute_entry(state_a):
     return words[6], (words[3] & 0xffff, words[3] >> 16, words[4] & 0xffff)
 
 
+def program_lds_words(rsrc2):
+    """gfx10 COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE is in units of 128 dwords."""
+    return ((rsrc2 >> 15) & 0x1ff) * 128
+
+
 def load_compute_request(out_dir, key, refusals=None):
     """The ComputePipeline of a slot 67 request, after checking the files against .desc and the key."""
     name = os.path.join(out_dir, 'req_%016x' % key)
@@ -12770,7 +12785,21 @@ def load_compute_request(out_dir, key, refusals=None):
     if S_ENDPGM not in struct.unpack('<%dI' % (len(code) // 4), code):
         raise Unsupported('compute code without s_endpgm')
     rsrc2, group = compute_entry(parts['.sa'])
-    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals)
+    dispatch_lds_bytes = None
+    if not 0 < program_lds_words(rsrc2) <= D3D12_TGSM_WORDS:
+        try:
+            with open(name + '.lds', 'rb') as allocation:
+                size = allocation.read(5)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise Unsupported('unreadable dispatch LDS size') from None
+        else:
+            if len(size) != 4:
+                raise Unsupported('dispatch LDS size must be one little-endian uint32 byte count')
+            dispatch_lds_bytes, = struct.unpack('<I', size)
+    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals,
+                           dispatch_lds_bytes=dispatch_lds_bytes)
 
 
 def compute_refusals(out_dir, key):
@@ -14180,6 +14209,9 @@ def pending_keys(out_dir, skip_failed, since_translator=None):
         # the manifest-only path leaves in place.
         recheck = lost and os.path.isfile(manifest)
         inputs = max(os.path.getmtime(os.path.join(out_dir, name)), described or 0)
+        if m.group(2) == 'c67':
+            with suppress(OSError):
+                inputs = max(inputs, os.path.getmtime(os.path.join(out_dir, 'req_%016x.lds' % key)))
         cutoff = inputs if skip_failed or version else (
             None if since_translator is None else max(inputs, since_translator))
         if cutoff is not None and not recheck:

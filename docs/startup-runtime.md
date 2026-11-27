@@ -950,6 +950,20 @@ It interprets none of these parts and still creates a placeholder. With `X2W_D3D
 | `req_<key>.root` | the serialized root signature |
 | `req_<key>.c67` | the program code (at most 1 MiB); written last, as the ready marker |
 
+An allocation-aware request producer can atomically publish an optional
+`req_<key>.lds` sidecar with one little-endian uint32 byte count. The translator
+uses that count when the program allocation is zero or above 32 KiB. The
+count must be positive, dword-aligned and at most 32 KiB. The result manifest
+still identifies one shader per request key, so a producer must supply the
+same allocation for every dispatch using that key. A sidecar published after
+a refusal makes the request eligible for translation again. The current
+command-list dispatch path supplies group counts only.
+
+`startup_compute_lds_size` covers a zero program allocation with a 1 KiB
+sidecar and a 40 KiB program allocation with a 24 KiB sidecar. Each WARP case
+compares the shader output with a CPU peer-exchange reference. Its same-lane
+control must produce a readback mismatch.
+
 The `.c67` extension keeps these requests apart from draft #1954, which uses `req_<key>.cs` for desktop DXIL
 containers created at device slot 62.
 
