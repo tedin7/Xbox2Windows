@@ -4498,11 +4498,8 @@ class Stage:
                     changed.add(k)
                     new[k] = None
                     if k >= 2:
-                        if name.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
-                            tainted &= ~(1 << (k - 2))
-                        else:
-                            # An unproved scalar write can be a whole word, not this invocation's mask bit.
-                            tainted |= 1 << (k - 2)
+                        # Any write replaces the prior constant; recognized constant writes mark it again below.
+                        tainted &= ~(1 << (k - 2))
             def constant(tok):
                 aliases = {'s104': 0, 's105': 1, 's106': 2, 'vcc_lo': 2, 's107': 3, 'vcc_hi': 3}
                 if tok in aliases:
