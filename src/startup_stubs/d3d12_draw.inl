@@ -242,14 +242,6 @@ inline void draw_lock_note_max(volatile LONG64& max, LONG64 value)
         seen = before;
     }
 }
-// Opt-in thread-local measurement keeps concurrent draws out of fixture Reset counts.
-thread_local LONG64 fixture_draw_lock_calls = -1;
-extern "C" __declspec(dllexport) LONG64 x2w_d3d12_thread_draw_lock_calls()
-{
-    if (fixture_draw_lock_calls < 0) fixture_draw_lock_calls = 0;
-    return fixture_draw_lock_calls;
-}
-
 inline void draw_lock_acquire_exclusive()
 {
     LARGE_INTEGER start, end, frequency;
@@ -258,7 +250,6 @@ inline void draw_lock_acquire_exclusive()
     QueryPerformanceCounter(&end);
     QueryPerformanceFrequency(&frequency);
     draw_lock_held_since = end.QuadPart;
-    if (fixture_draw_lock_calls >= 0) ++fixture_draw_lock_calls;
     const LONG64 waited = end.QuadPart - start.QuadPart;
     x2w_phase::LockWaitScope::note(waited);
     InterlockedIncrement64(&draw_lock_stats.wait_calls);
@@ -1354,52 +1345,6 @@ bool ensure_draw_heap(Wrapper* device)
 // including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
 std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
-bool reset_nolock()
-{
-    static const bool on = x2w_local::env_on("X2W_RESET_NOLOCK");
-    return on;
-}
-
-constexpr GUID sampler_recording_key{0xd2bd7241, 0x8d91, 0x4246, {0x8a, 0xdb, 0x6f, 0xf4, 0x64, 0x1c, 0x26, 0x55}};
-constexpr GUID address_recording_key{0x081243d2, 0x89a8, 0x47be, {0xa9, 0x08, 0x13, 0x80, 0xeb, 0xc6, 0x3d, 0xff}};
-
-// The native list owns this attachment. GetPrivateData takes a COM reference,
-// so detaching it on Reset cannot invalidate a reader. Recording and submission
-// already serialize vector access under draw_lock. Reset only detaches.
-struct SamplerRecording final : IUnknown {
-    std::vector<DrawSamplerHeap> heaps;
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
-    {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
-        *out = static_cast<IUnknown*>(this);
-        AddRef();
-        return S_OK;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override
-    {
-        const ULONG left = InterlockedDecrement(&refs);
-        if (!left) delete this;
-        return left;
-    }
-
-private:
-    LONG refs = 1;
-};
-
-x2w_startup::ComPtr<SamplerRecording> sampler_recording(ID3D12CommandList* list)
-{
-    IUnknown* data = nullptr;
-    UINT size = sizeof(data);
-    x2w_startup::ComPtr<SamplerRecording> recording;
-    if (SUCCEEDED(list->GetPrivateData(sampler_recording_key, &size, &data)))
-        recording.Attach(static_cast<SamplerRecording*>(data));
-    return recording;
-}
-
 struct SubmittedDrawSamplerHeaps {
     x2w_startup::ComPtr<ID3D12Fence> fence;
     std::vector<DrawSamplerHeap> heaps;
@@ -1408,10 +1353,6 @@ std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
 void discard_draw_sampler_heaps(ID3D12CommandList* list)
 {
-    if (reset_nolock()) {
-        list->SetPrivateData(sampler_recording_key, 0, nullptr);
-        return;
-    }
     draw_lock_acquire_exclusive();
     recorded_draw_sampler_heaps.erase(list);
     draw_lock_release_exclusive();
@@ -1428,11 +1369,6 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
         }), submitted_draw_sampler_heaps.end());
     SubmittedDrawSamplerHeaps batch;
     for (auto* list : lists) {
-        if (reset_nolock()) {
-            const auto recording = sampler_recording(list);
-            if (recording) batch.heaps.insert(batch.heaps.end(), recording->heaps.begin(), recording->heaps.end());
-            continue;
-        }
         auto it = recorded_draw_sampler_heaps.find(list);
         if (it == recorded_draw_sampler_heaps.end()) continue;
         for (const auto& heap : it->second) batch.heaps.push_back(heap);
@@ -1501,13 +1437,6 @@ bool address_uploads_from_ring()
 
 void discard_address_uploads(ID3D12CommandList* list)
 {
-    const bool local = reset_nolock();
-    if (local) {
-        // A list without recorded uploads has no shared texture state to roll back.
-        BYTE recorded = 0;
-        UINT size = sizeof(recorded);
-        if (list->GetPrivateData(address_recording_key, &size, &recorded) == DXGI_ERROR_NOT_FOUND) return;
-    }
     draw_lock_acquire_exclusive();
     const auto recorded = recorded_address_uploads.find(list);
     if (recorded != recorded_address_uploads.end()) {
@@ -1520,7 +1449,6 @@ void discard_address_uploads(ID3D12CommandList* list)
         }
         recorded_address_uploads.erase(recorded);
     }
-    if (local) list->SetPrivateData(address_recording_key, 0, nullptr);
     draw_lock_release_exclusive();
 }
 
@@ -1623,21 +1551,7 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    if (reset_nolock()) {
-        auto recording = sampler_recording(list);
-        if (!recording) {
-            recording.Attach(new (std::nothrow) SamplerRecording);
-            if (!recording || FAILED(list->SetPrivateDataInterface(sampler_recording_key, recording.Get())))
-                return false;
-        }
-        try {
-            recording->heaps.push_back(heap);
-        } catch (const std::bad_alloc&) {
-            return false;
-        }
-    } else {
-        recorded_draw_sampler_heaps[list].push_back(heap);
-    }
+    recorded_draw_sampler_heaps[list].push_back(heap);
     pass.sampler_heap = std::move(heap);
     pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
     return true;
@@ -2204,10 +2118,6 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         bytes *= slices;
         if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
         // Store the owning reference before issuing any D3D12 commands that name the buffer.
-        if (reset_nolock()) {
-            const BYTE recorded = 1;
-            if (FAILED(list->SetPrivateData(address_recording_key, sizeof(recorded), &recorded))) return false;
-        }
         try {
             recorded_address_uploads[list].push_back({owned.resource, texture, ++address_upload_revision});
         } catch (const std::bad_alloc&) {
