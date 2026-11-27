@@ -3,6 +3,8 @@
   (no arguments)                       emitted-HLSL rounding, decoder, SRV format and odd-dmask controls
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
   decode <libLLVM>                     disassemble the MIMG words with LLVM's C API and compare with disasm_rdna2.py
+  odd-draw <dxc> <offscreen_check> warp
+                                       check three odd-tail shaders on an RGBA16F input, with GPU readback controls
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw four
                                        pixel fixtures (level-zero 2D A/B, explicit-mip 2D C and explicit-mip
@@ -19,7 +21,7 @@ toward zero on WARP (lowering 31,740 of the 65,536 R16_UNORM values by 1 ULP), w
 still double-rounds R16_UNORM at 0xffaf (0x3bfe vs 0x3bfd) and 0xffef (0x3c00 vs 0x3bff). gfx2hlsl.py therefore emits
 both integer binary32-to-binary16 RNE (pack16_rne) and exact UNORM16 ratio-to-half (pack16_unorm16) selected per SRV
 via 'udsrc <ud> d16unorm16 <index>', restricts 'd16srv <index> exact' to the 14 independently GPU-verified exact
-formats, and refuses whole-word reads of odd-dmask destination VGPRs unless consumed through a low-16-bit operation.
+formats, and refuses upper-half uses of odd-dmask tails. Plain VGPR copies retain the restriction until only defined bits are read.
 """
 from fractions import Fraction
 import re
@@ -828,6 +830,11 @@ def check_odd_dmask_consumers():
     odd_mip_3 = 'image_load_mip v[6:7], v[0:2], s[16:23] dmask:0x7 dim:SQ_RSRC_IMG_2D d16'
 
     accepted_sequences = (
+        (odd_1, 'v_mov_b32_e32 v12, v4'),
+        (odd_1, 'v_mov_b32_e32 v12, v4', 'v_lshlrev_b32_e32 v13, 16, v12',
+         'v_lshrrev_b32_e32 v13, 16, v13'),
+        (odd_1, 'v_mov_b32_e32 v12, v4', 'v_and_b32_e32 v12, 0xffff, v12',
+         'v_cmp_eq_u32_e32 vcc_lo, 0, v12', 'v_cndmask_b32_e32 v13, 0, v12, vcc_lo'),
         (odd_1, 'v_cvt_f32_f16_e32 v4, v4', 'v_add_f32_e32 v4, 1.0, v4'),
         (odd_1, 'v_cvt_f32_ubyte0_e32 v4, v4', 'v_mul_f32_e32 v4, 2.0, v4'),
         (odd_1, 'v_cvt_f32_ubyte1_e32 v4, v4', 'v_mul_f32_e32 v4, 2.0, v4'),
@@ -851,7 +858,9 @@ def check_odd_dmask_consumers():
     refused_sequences = (
         ('v4 add', (odd_1, 'v_add_nc_u32_e32 v5, 1, v4'), 'whole-word read of v4'),
         ('v4 shift16', (odd_1, 'v_lshrrev_b32_e32 v5, 16, v4'), 'whole-word read of v4'),
-        ('v4 mov', (odd_1, 'v_mov_b32_e32 v5, v4'), 'whole-word read of v4'),
+        ('v4 copy then add',
+         (odd_1, 'v_mov_b32_e32 v5, v4', 'v_add_nc_u32_e32 v8, 3, v5'),
+         'upper half used by v_add_nc_u32_e32 v8, 3, v5'),
         ('v4 swap', (odd_1, 'v_swap_b32_e32 v4, v5'), 'whole-word read of v4'),
         ('v4 float add', (odd_1, 'v_add_f32_e32 v5, 1.0, v4'), 'whole-word read of v4'),
         ('v4 ubyte2', (odd_1, 'v_cvt_f32_ubyte2_e32 v5, v4'), 'whole-word read of v4'),
@@ -931,7 +940,17 @@ def check_odd_dmask_consumers():
     ]
     expect_refused(lambda: translate_ins(loop_ins), 'whole-word read of v4', 'backward loop odd d16 leak')
 
-    print(f'odd-dmask consumers: {len(accepted_sequences)} low-16-bit paths accepted; {len(refused_sequences) + 2} whole-word/control-flow leaks refused')
+    loop_copy_ins = [
+        (0, 4, 'v_mov_b32_e32', 'v_mov_b32_e32 v10, v4'),
+        (4, 4, 'v_add_nc_u32_e32', 'v_add_nc_u32_e32 v11, 3, v10'),
+        (8, 8, 'image_load', odd_1),
+        (16, 4, 's_cbranch_scc1', 's_cbranch_scc1 label_0000'),
+        (20, 4, 's_endpgm', 's_endpgm'),
+    ]
+    expect_refused(lambda: translate_ins(loop_copy_ins), 'upper half used by v_add_nc_u32_e32 v11, 3, v10',
+                   'backward loop with odd d16 copy')
+
+    print(f'odd-dmask consumers: {len(accepted_sequences)} low-16-bit paths accepted; {len(refused_sequences) + 3} whole-word/control-flow leaks refused')
 
 
 def check_refusals():
@@ -1014,6 +1033,7 @@ def controls():
     check_decoder_and_masks()
     check_srv_format_controls()
     check_odd_dmask_consumers()
+    check_odd_tail_programs()
     check_refusals()
 
 
@@ -1140,6 +1160,113 @@ def mutate_hlsl_d(source, mutant):
     return mutated
 
 
+
+def odd_tail_program(components, *, unsafe=False, red_only=False):
+    # A fullscreen pixel reads its own texel. VOP1 encodings follow the public ISA.
+    def vop1(op, dst, src):
+        return 0x7e000000 | (dst << 17) | (op << 9) | (256 + src)
+
+    first = 20
+    tail = first + components // 2
+    load = encode_mimg(IMG_LOAD, dmask=(1 << components) - 1, vaddr=8, vdata=first, d16=1)
+    instructions = [0xbf8c3f70, vop1(1, 31, tail)]  # s_waitcnt vmcnt(0); v_mov_b32
+    copied = 31
+    if components == 1:
+        instructions.append(vop1(1, 27, copied))
+        copied = 27
+    if unsafe:
+        instructions.append((0x25 << 25) | (29 << 17) | (copied << 9) | 131)  # v_add_nc_u32 with 3
+    elif not red_only:
+        instructions.append(vop1(0x0b, 29, copied))  # v_cvt_f32_f16
+    output = 0xf8001c03 if red_only else 0xf800180f  # exp mrt0, RG compressed or RGBA
+    # For the three-channel load, also put the copied tail above the first
+    # component, then unpack that half as integer bits into output G.
+    if components == 3 and not red_only and not unsafe:
+        instructions.extend((
+            *struct.unpack('<II', encode_v_and_low16(first)),
+            (0x1a << 25) | (25 << 17) | (copied << 9) | 144,  # v_lshlrev_b32 v25, 16, v31
+            (0x1c << 25) | (25 << 17) | (25 << 9) | (256 + first),  # v_or_b32 v25, v20, v25
+            (0x16 << 25) | (25 << 17) | (25 << 9) | 144,  # v_lshrrev_b32 v25, 16, v25
+        ))
+    payload = copied if red_only else 29 * 0x01010101
+    if components == 3 and not red_only and not unsafe:
+        payload = (payload & ~0xff00) | (25 << 8)
+    instructions.extend((output, payload, 0xbf810000))
+    return PRE_WORDS + load + struct.pack(f'<{len(instructions)}I', *instructions)
+
+
+def odd_tail_hlsl(components, **options):
+    rtv = (41,) if options.get('red_only') else UINT_RTV
+    return G.Pipeline(VS_WORDS, odd_tail_program(components, **options), root_blob(),
+                      ps_hw_inputs=PACKED_INPUT, rtv_formats=rtv).hlsl_ps()
+
+
+def odd_tail_variants(components, *, red_only=False):
+    hlsl = odd_tail_hlsl(components, red_only=red_only)
+    tail = 20 + components // 2
+    # Keep the valid half for poison, and replace the entire result with a neighbour for the failing mutant.
+    channel = 'z' if components == 3 else 'x'
+    pattern = rf'(v{tail} = )(pack16_d16\(([^;,]+)\.{channel}, (ud\d+)\))(;)'
+    match = re.search(pattern, hlsl)
+    assert match, hlsl
+    tex, mode = match[3], match[4]
+    neighbour = f'pack16_d16({tex}.y, {mode})'
+    variants = {
+        'reference': hlsl,
+        'poison_upper': hlsl[:match.start(2)] + f'({match[2]} | ({neighbour} << 16))' + hlsl[match.end(2):],
+        'wrong_component': hlsl[:match.start(2)] + neighbour + hlsl[match.end(2):],
+    }
+    return variants
+
+
+def odd_tail_words(base, components, red_only):
+    words = []
+    for i in range(WIDTH * HEIGHT):
+        half = base + i
+        f32 = f32_bits_from_f16_bits(half)
+        if red_only:
+            words.extend((f32, 0, 0, 0))
+        else:
+            words.extend((f32, half if components == 3 else f32, f32, f32))
+    return words
+
+
+ODD_TAIL_CASES = ((3, False), (1, False), (3, True))
+
+
+def check_odd_tail_programs():
+    for components, red_only in ODD_TAIL_CASES:
+        odd_tail_variants(components, red_only=red_only)
+    expect_refused(lambda: odd_tail_hlsl(1, unsafe=True),
+                   'upper half used by v_add_nc_u32_e32 v29, 3, v27', 'integer addition after two copies')
+    expect_refused(
+        lambda: G.Pipeline(VS_WORDS, odd_tail_program(3, red_only=True), root_blob(),
+                           ps_hw_inputs=PACKED_INPUT, rtv_formats=(2,)).hlsl_ps(),
+        'upper half used by exp mrt0', 'same compressed export to RGBA32_FLOAT')
+
+
+def check_odd_tail_draw(dxc, renderer, adapter):
+    check_odd_tail_programs()
+    out_dir = HERE.parent / 'out'
+    out_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='image-load-d16-odd-', dir=out_dir) as tmp:
+        directory = Path(tmp)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs', 'vs_6_0', directory)
+        for components, red_only in ODD_TAIL_CASES:
+            base = 0x4400 if components == 3 else 0x3800
+            expected = odd_tail_words(base, components, red_only)
+            mode = 'rgba16f_r32f' if red_only else 'rgba16f'
+            for variant, source in odd_tail_variants(components, red_only=red_only).items():
+                tag = f'odd_{components}_{red_only}_{variant}'
+                ps = compile_hlsl(dxc, 'dxc', source, tag, 'ps_6_0', directory)
+                run = run_d16_draw(renderer, adapter, mode, vs, ps, expected, directory, tag)
+                if variant == 'wrong_component':
+                    assert run.returncode == 1 and '16 of 16 pixels differ' in run.stderr, (run.stdout, run.stderr)
+                    wrong = odd_tail_words(0xc000, components, red_only)
+                    run = run_d16_draw(renderer, adapter, mode, vs, ps, wrong, directory, tag + '_mutated_model')
+                assert run.returncode == 0, (run.stdout, run.stderr)
+                print(f'{tag}: readback matched expected outcome', flush=True)
+
 def run_d16_draw(renderer, adapter, tex_mode, vs, ps, words, directory, tag):
     expected_path = directory / f'{tag}.bin'
     expected_path.write_bytes(struct.pack('<64I', *words))
@@ -1248,6 +1375,8 @@ def main():
         check_binary(args[0])
     elif mode == 'decode' and len(args) == 1:
         check_decode(args[0])
+    elif mode == 'odd-draw' and len(args) == 3:
+        check_odd_tail_draw(*args)
     elif mode == 'draw' and len(args) in (3, 4):
         controls()
         check_draw(*args)

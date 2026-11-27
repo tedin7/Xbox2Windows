@@ -221,8 +221,10 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 //                     exact fractions, double-rounding discriminators (0xffaf, 0xffef) and RNE-vs-RTZ codes;
 //   depth16 == false: DXGI_FORMAT_R32G32B32A32_FLOAT covering four distinct channels per texel, halfway ties
 //                     to even, 1-ULP midpoint neighbours, subnormals, signed zero, overflow and quiet NaNs.
+//   half_float:      DXGI_FORMAT_R16G16B16A16_FLOAT with exactly representable finite values.
+//   red_only:        DXGI_FORMAT_R32_FLOAT target. Read R into each pixel's first output word.
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64], bool array, bool sampled)
+                                  bool depth16, std::uint32_t words[64], bool array, bool sampled, bool half_float, bool red_only)
 {
     constexpr UINT width = 8, height = 2, d16_mips = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
@@ -279,7 +281,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_UINT;
+    pd.RTVFormats[0] = red_only ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image_load d16 PSO");
@@ -292,7 +294,8 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     td.Height = height;
     td.DepthOrArraySize = static_cast<UINT16>(slices);
     td.MipLevels = d16_mips;
-    td.Format = depth16 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.Format = depth16 ? DXGI_FORMAT_R16_UNORM
+                        : half_float ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -303,7 +306,8 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image_load d16 texels");
-    const UINT texel_bytes = depth16 ? sizeof(std::uint16_t) : 4 * sizeof(std::uint32_t);
+    const UINT texel_bytes = depth16 ? sizeof(std::uint16_t)
+                                    : half_float ? 4 * sizeof(std::uint16_t) : 4 * sizeof(std::uint32_t);
     for (UINT s = 0; s < slices; ++s) {
         for (UINT m = 0; m < d16_mips; ++m) {
             const UINT sub = m + s * d16_mips;
@@ -312,7 +316,17 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
             for (UINT y = 0; y < mh; ++y) {
                 for (UINT x = 0; x < mw; ++x) {
                     auto* const cell = sub_bytes + y * src_footprints[sub].Footprint.RowPitch + x * texel_bytes;
-                    if (m == 0) {
+                    if (half_float) {
+                        // Per-pixel finite binary16 values, with distinct signs and magnitudes across channels.
+                        const UINT pixel = y * mw + x;
+                        const std::uint16_t texel[4] = {
+                            static_cast<std::uint16_t>(0x3800 + pixel),
+                            static_cast<std::uint16_t>(0xc000 + pixel),
+                            static_cast<std::uint16_t>(0x4400 + pixel),
+                            static_cast<std::uint16_t>(0x3400 + pixel),
+                        };
+                        std::memcpy(cell, texel, sizeof(texel));
+                    } else if (m == 0) {
                         const UINT idx = s == 0 ? (y * width + x) : (width * height - 1u - (y * width + x));
                         if (depth16) std::memcpy(cell, &kDepthTexels[idx], texel_bytes);
                         else std::memcpy(cell, &kFloatTexels[idx][0], texel_bytes);
@@ -333,7 +347,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    rd.Format = pd.RTVFormats[0];
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const auto target = resource(device, rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -385,8 +399,14 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_size)};
     check(readback->Map(0, &read, &mapped), "Map image_load d16 readback");
     const auto* const rb_bytes = static_cast<const std::uint8_t*>(mapped) + target_footprint.Offset;
-    for (UINT y = 0; y < height; ++y)
-        std::memcpy(&words[y * width * 4], rb_bytes + y * target_footprint.Footprint.RowPitch,
-                    width * 4 * sizeof(std::uint32_t));
+    for (UINT y = 0; y < height; ++y) {
+        const auto* row = rb_bytes + y * target_footprint.Footprint.RowPitch;
+        if (red_only) {
+            for (UINT x = 0; x < width; ++x)
+                std::memcpy(&words[(y * width + x) * 4], row + x * sizeof(std::uint32_t), sizeof(std::uint32_t));
+        } else {
+            std::memcpy(&words[y * width * 4], row, width * 4 * sizeof(std::uint32_t));
+        }
+    }
     readback->Unmap(0, &none);
 }
