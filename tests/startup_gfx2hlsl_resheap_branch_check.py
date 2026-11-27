@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 from startup_gfx2hlsl_dynamic_heap_check import G, IMAGE_HEAD, IMAGE_LOAD, IMAGE_TAIL, root_blob, compile_shader
 from startup_gfx2hlsl_dynamic_heap_check import draw as draw_pixel
+from startup_gfx2hlsl_getpc_refusal_check import pipeline as vector_table_pipeline, vertex as vector_table_vertex
 from startup_gfx2hlsl_heap_record_check import root_blob as table_root_blob
 from startup_flat_param_check import PS_WORDS, VS_WORDS
 
@@ -219,6 +220,50 @@ def image_dimensions_control():
     return pipe, vs, ps
 
 
+EMBEDDED_WORDS = (0x3fa00000, 0x40200000, 0x40800000, 0x41000000, 0x41800000)
+
+
+def embedded_scalar_vertex(*, carry=0, flags=0x31016fac, bound=20, displacement=0, escape=b'', before_copy=b''):
+    flags_word = sop1(S_MOV_B32, 31, 255) + struct.pack('<I', flags)
+    prefix = (sop1(0x1f, 20, 0) + struct.pack('<I', 0xb0160000 | bound)
+              + sop1(S_MOV_B32, 23, 255) + struct.pack('<I', flags)
+              + sop2(0x1e, 12, 8, 130) + sop1(S_MOV_B32, 15, 12))
+    high = b'' if carry is None else sop2(0x04, 21, 21, ZERO + carry)
+    reads = (smem(0x09, 12, 28, 12, 1) + smem(0x08, 25, 20, 15, 8) + smem(0x08, 26, 20, 15, 12))
+    tail = (high + before_copy + struct.pack('<I', 0xb01e000c) + flags_word + sop1(0x04, 28, 20)
+            + reads + sopp(S_WAITCNT, LGKM0) + escape
+            + bytes.fromhex('0c020c7e0d020e7e1902107e1a02127e') + EXPORTS)
+    delta = len(prefix) - 4 + 8 + len(tail) + displacement
+    return HEAD + prefix + sop2_literal(0x00, 20, 20, delta) + tail
+
+
+def embedded_scalar_control():
+    data = struct.pack('<5I', *EMBEDDED_WORDS)
+    code = embedded_scalar_vertex()
+    pipe, vs, ps = translate(code + data + bytes.fromhex('000000f8'))  # invalid if decoded instead of treated as data
+    assert 'static const uint embedded_vs_scalar[5]' in vs
+    assert 'embedded_vs_sload(a, 1u, 12u)' in vs and 'embedded_vs_sload(a, 5u, 12u)' in vs
+    assert 'embedded_vs_sload(s15, 8u, 20u)' in vs and 'embedded_vs_sload(s15, 12u, 20u)' in vs
+    assert '(scalar_offset + imm) & ~3u' in vs and 'a > bound - 4u' in vs
+    assert 'embedded_vs_scalar[5]' in translate(embedded_scalar_vertex(carry=None) + data)[1]
+    for bad in (embedded_scalar_vertex(flags=0x21016fac), embedded_scalar_vertex(bound=28),
+                embedded_scalar_vertex(displacement=-4), embedded_scalar_vertex(carry=1),
+                embedded_scalar_vertex(escape=bytes.fromhex('1402107e')),  # v_mov_b32 v8, s20
+                embedded_scalar_vertex(before_copy=sopp(2, 0))):  # branch separates setup and access
+        assert G.embedded_scalar_buffer_proof(bad + data, G.decode(bad)) is None
+    with patch.object(G, 'embedded_scalar_buffer_proof', return_value=None):
+        reason = refusal(code + data)
+    assert reason and 'shader load address' in reason, reason
+
+    old = vector_table_pipeline(vector_table_vertex())
+    assert [hashlib.sha256(x.encode()).hexdigest() for x in (old.hlsl_vs(), old.hlsl_ps(), old.manifest())] == [
+        'c316062e876cfa7970566e2f472296f04290961ae518555fee43b8b760ec8a0a',
+        '6ae9d0b469c599e2cbbe58a2bac0c74cf9d9536ce9a105228dc8792c21fcdd52',
+        '9a6837358af0301f1dc4f3c4b36cdf8cfbf81be2f4f11c269c8027b4efd50839',
+    ]
+    return pipe, vs, ps
+
+
 # A divergent block (v_cmpx, s_cbranch_execz) first, so the program is not wave-uniform throughout; then a root constant
 # picks the arm. The first arm writes the index register from a register nothing defines, the else arm shifts the
 # index it had before the branch and loads the record. Encoded with llvm-mc (gfx1030, wave32):
@@ -267,6 +312,7 @@ def main(dxc=None):
     vertex_image_loop_control()
     descriptor_word_control()
     image_dimensions_control()
+    embedded_scalar_control()
     vs = vertex(ARM)
     decoded = [asm for _, _, _, asm in G.decode(vs)]
     tail = ['s_mov_b32 s11, 0', 'v_mov_b32_e32 v11, 0', 's_cmp_eq_u32 s9, 0', 's_cbranch_scc1 label_0x%x',
@@ -341,8 +387,9 @@ def draw(offscreen, vs, ps, offset, reference, count, negative=False, cond=2, he
     for index, word in (extra or {}).items():
         entry[index] = word
     as_hex = lambda words: ','.join('%08x' % word for word in words)
+    expected = reference if isinstance(reference, list) else [reference] * 4
     result = subprocess.run([offscreen, 'warp', '--startup-dynamic-heap', vs, ps, as_hex(entry),
-                             as_hex([reference] * 4)], capture_output=True, text=True)
+                             as_hex(expected)], capture_output=True, text=True)
     if result.returncode == 77:
         print(result.stdout, end='')
         sys.exit(77)
@@ -457,6 +504,27 @@ def warp_image_dimensions(offscreen, dxc):
         draw_pixel(offscreen, vs, wrong, 32 * slot, expected, count, negative=True, heap_count=5)
 
 
+def embedded_reference(index):
+    def read(offset, size):
+        word = (4 * index + offset) // 4
+        return EMBEDDED_WORDS[word] if 4 * (word + 1) <= size else 0
+
+    return [read(1, 12), read(5, 12), read(8, 20), read(12, 20)]
+
+
+def warp_embedded_scalar(offscreen, dxc):
+    pipe, source, ps_source = embedded_scalar_control()
+    count = len(pipe.uds)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        vs = compile_shader(dxc, directory, 'vs_6_6', source)
+        ps = compile_shader(dxc, directory, 'ps_6_6', ps_source)
+        for index in (0, 1, 2, 3):
+            draw(offscreen, vs, ps, index, embedded_reference(index), count)
+        wrong = compile_shader(dxc, directory, 'vs_6_6', mutate(source, '[a >> 2u]', '[(a >> 2u) + 1u]'))
+        draw(offscreen, wrong, ps, 0, embedded_reference(0), count, negative=True)
+
+
 def warp(offscreen, dxc):
     """The fixture heap holds three raw buffers whose first words are 1.25, 2.5 and 4.0. Both vertex stages read a
     record chosen by a root constant inside a branch; the target must hold the word the record names."""
@@ -487,5 +555,7 @@ if __name__ == '__main__':
         warp_descriptor_word(*sys.argv[2:4])
     elif sys.argv[1:2] == ['warp-image-dimensions']:
         warp_image_dimensions(*sys.argv[2:4])
+    elif sys.argv[1:2] == ['warp-embedded-scalar']:
+        warp_embedded_scalar(*sys.argv[2:4])
     else:
         main(*sys.argv[2:3] if sys.argv[1:2] == ['dxc'] else ())

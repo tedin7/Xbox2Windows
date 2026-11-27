@@ -39,3 +39,40 @@ output dwords retain the sentinel. Changing the record size or index-word
 address must change readback. A separate bounds mutant must read the poison
 descriptor immediately past the logical end. The WARP tests require Shader
 Model 6.6 and resource binding tier 3 and skip when either is unavailable.
+
+## Graphics image records and scalar tables
+
+Vertex stages can read heap image views using texel loads or explicit-level
+samples. The loop fixture loads two view indices from a root-table buffer and
+adds their red texels under narrowed EXEC. The loop proof runs after a heap
+load refusal and checks all back edges. Separate fixtures exercise numeric
+reads of fixed root-table descriptor words and low-half mixed-FMA constants.
+The WARP fixture binds texture SRVs directly. The runtime's dynamic-heap
+snapshot still creates raw buffer SRVs.
+
+Image dimensions use the complete shift-and-clamp calculation for the view's
+top mip. The two fixtures use 37 × 11 at mip 0 and 43 × 15 at mip 1. Raw
+mip-zero size fields and absolute mip indices remain unavailable because the
+desktop view supplies its relative mip range. [AMD RDNA 2 ISA, §8.2.6](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+The vertex scalar table fixture reads a program-image table through two raw
+descriptors with different bounds. It checks a misaligned byte offset, a
+two-dword read that overwrites its offset register and reads past the bounds.
+The shape without a high-word add uses the same 4 GiB address-window assumption
+as the vector table lowering. [AMD RDNA 2 ISA, §7.2.1 and §7.5](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+Run the source-built controls on Linux. The loop and vector table regressions
+compare HLSL and manifest hashes captured before the respective changes.
+
+```sh
+nice -n 15 python3 -B tests/startup_gfx2hlsl_resheap_branch_check.py
+nice -n 15 python3 -B tests/startup_gfx2hlsl_getpc_refusal_check.py
+nice -n 15 python3 -B tests/startup_gfx2hlsl_fma_mix_check.py
+```
+
+Run the six new WARP draw modes and the existing mixed-FMA WARP dispatch on
+Windows. The draws require a readback mismatch from each modified shader.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_(resheap_(vertex_image|vertex_loop|descriptor_word|image_dimensions|fma_mix|embedded_scalar)_warp|fma_mix_dispatch_warp)$'
+```

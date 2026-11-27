@@ -741,7 +741,7 @@ def decode(code, refusals=None, *, embedded_vertex=False, exports_only=False, em
                 saw_getpc |= name == 's_getpc_b64'
                 # A proven table is data, even if its words resemble instructions.
                 if name == 's_endpgm' and saw_getpc:
-                    if embedded_vertex and embedded_buffer_proof(code, out):
+                    if embedded_vertex and (embedded_buffer_proof(code, out) or embedded_scalar_buffer_proof(code, out)):
                         return out
                     if embedded_pixel and embedded_pixel_table(code, out):
                         return out
@@ -1361,6 +1361,11 @@ def reads_scc(name, asm):
     return 'src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))
 
 
+def embedded_raw_flags(flags):
+    # RDNA 2 ISA §8.1: raw bounds (OOB_SELECT=3), resource level 1, 32-bit format, no indexing or swizzling.
+    return flags >> 12 in (0x31014, 0x31015, 0x31016)
+
+
 def embedded_buffer_proof(code, ins):
     """Prove a vertex buffer descriptor whose only observable use is reading the shader image."""
     if not ins or ins[-1][2] != 's_endpgm' or classify_decoded(ins) != 'vs':
@@ -1458,14 +1463,160 @@ def embedded_buffer_proof(code, ins):
             continue
         setup[pc] = None
 
-    # RDNA 2 raw bounds (OOB_SELECT=3), resource level 1, a 32-bit format,
-    # and no indexing, swizzling, thread ID, or non-buffer type flags.
-    if (not loads or flags >> 12 not in (0x31014, 0x31015, 0x31016)
+    if (not loads or not embedded_raw_flags(flags)
             or offset % 4 or offset < end or size == 0 or offset + size > len(code)):
         return None
     data = code[offset:offset + size]
     words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-size % 4)))
     return setup, loads, size, words
+
+
+def embedded_scalar_buffer_proof(code, ins):
+    """Prove the scalar-only alternative without changing the legacy MUBUF proof."""
+    if not ins or ins[-1][2] != 's_endpgm' or classify_decoded(ins) != 'vs':
+        return None
+    reads = [i for i, (_, _, name, _) in enumerate(ins) if name == 's_getpc_b64']
+    if len(reads) != 1:
+        return None
+    start = reads[0]
+    getpc, length, _, asm = ins[start]
+    _, ops, mods = parse(asm)
+    low = pc_pair(ops[0]) if len(ops) == 1 and not mods and length == 4 else None
+    if low is None:
+        return None
+
+    offsets = {pc for pc, _, _, _ in ins}
+    branches = {}
+    end = 0
+    for pc, n, name, asm in ins:
+        if (pc != end or name.startswith(('s_setpc', 's_call', 's_rfe', 's_trap', 's_return', 's_endpgm_',
+                                         's_set_gpr_idx')) or 'movrel' in name):
+            return None
+        end = pc + n
+        if name.startswith('s_swappc') and (pc != 0 or parse(asm)[1:] != (['s[4:5]', 's[4:5]'], [])):
+            return None
+        if name == 's_branch' or name.startswith('s_cbranch'):
+            operands = parse(asm)[1]
+            label = re.fullmatch(r'label_0x([0-9a-f]+)', operands[0]) if len(operands) == 1 else None
+            if label is None or int(label[1], 16) not in offsets:
+                return None
+            branches[pc] = int(label[1], 16)
+
+    # One block establishes the advanced pair and each descriptor's literal size and flags before using them.
+    targets = set(branches.values())
+    setup, loads, literals = {getpc: None}, {}, {}
+    pairs = set()
+    offset = None
+    original = {low, low + 1}
+    carry_live = False
+    for pc, _, name, asm in ins[start + 1:]:
+        if pc in targets or pc in branches or name == 's_endpgm':
+            break
+        _, ops, mods = parse(asm)
+        written = scalar_destinations(name, asm)
+        imm = pc_word(ops[-1]) if ops else None
+        pair = None
+        if (offset is None and original == {low, low + 1} and name == 's_add_u32' and not mods
+                and ops[:2] == ['s%d' % low] * 2 and len(ops) == 3 and imm is not None and imm >= 0):
+            # As in the vector table form, an omitted high add assumes the code and table share a 4 GiB window.
+            offset = getpc + length + imm
+            pair, carry_live = low, True
+        elif (carry_live and low in pairs and name == 's_addc_u32' and not mods and len(ops) == 3
+              and ops[:2] == ['s%d' % (low + 1)] * 2 and imm == 0):
+            pair, carry_live = low, False
+        elif name == 's_mov_b64' and len(ops) == 2 and not mods and pc_pair(ops[1]) in pairs:
+            pair = pc_pair(ops[0])
+            carry_live = False
+        elif name.startswith('s_buffer_load_dword') and name in SCALAR_LOADS and len(ops) == 3:
+            dst, desc = map(reg_range, ops[:2])
+            if desc and desc[0] == 's' and desc[1] in pairs and desc[2] == desc[1] + 3 <= 105:
+                if (desc[1] % 4 or not dst or dst[0] != 's' or not dst[1] <= dst[2] <= 105
+                        or dst[1] % min(4, dst[2] - dst[1] + 1)):
+                    return None
+                size, flags = (literals.get(reg) for reg in (desc[1] + 2, desc[1] + 3))
+                if (not size or flags is None or not embedded_raw_flags(flags) or offset % 4
+                        or offset < end or offset + size > len(code)):
+                    return None
+                loads[pc] = size
+                carry_live = False
+        if pair is not None:
+            setup[pc] = None
+        elif carry_live and not name.startswith(('v_', 's_mov_', 's_movk_', 's_waitcnt', 's_nop', 's_load_',
+                                               's_buffer_load_', 'image_', 'buffer_', 'tbuffer_')):
+            carry_live = False
+        if {low, low + 1} & written and pair is None:
+            carry_live = False
+        original -= written
+        pairs = {p for p in pairs if not {p, p + 1} & written}
+        if pair is not None:
+            pairs.add(pair)
+        for reg in written:
+            literals.pop(reg, None)
+        if (name in ('s_mov_b32', 's_movk_i32') and not mods and len(ops) == 2 and imm is not None
+                and len(written) == 1 and ops[0].startswith('s')):
+            value = sopk_imm(ops[1], True) if name == 's_movk_i32' else imm
+            literals[next(iter(written))] = value & 0xffffffff
+
+    if not loads or not embedded_scalar_address_dead(ins, branches, setup, loads):
+        return None
+    data = code[offset:offset + max(loads.values())]
+    words = tuple(word for word, in struct.iter_unpack('<I', data + bytes(-len(data) % 4)))
+    return setup, loads, words
+
+
+def embedded_scalar_address_dead(ins, branches, setup, loads):
+    """Check that erased addresses and carry flags never reach an ordinary read, including around a back edge."""
+    tracked = set().union(*(scalar_registers(parse(asm)[1][0]) for pc, _, _, asm in ins if pc in setup))
+    entry_defs = dict.fromkeys(tracked, -1)
+    linear_defs, effects, elided_once = entry_defs.copy(), {}, set()
+    for pc, n, name, asm in ins:
+        _, ops, _ = parse(asm)
+        if pc in setup:
+            erased, reads, written = scalar_registers(ops[0]), set(), set()
+            if name in ('s_add_u32', 's_addc_u32'):
+                erased.add('scc')
+        else:
+            erased = set()
+            # Only unconditional SGPR assignments replace the ordinary reaching definition.
+            writes = scalar_destinations(name, asm) & tracked
+            written = writes if name in SCA or name.startswith(('s_load_', 's_buffer_load_', 's_cselect_')) else set()
+            read_ops = ops[2:] if pc in loads else ops[1:] if written else ops
+            reads = scalar_registers(' '.join(read_ops)) & tracked
+            if reads_scc(name, asm) or 'scc' in scalar_effects(name, asm)[0]:
+                reads.add('scc')
+            if re.fullmatch(r's_cmpk?_(eq|lg|gt|ge|lt|le)_[iu]32|s_bitcmp[01]_b32', name):
+                written = written | {'scc'}
+            # A potentially predicated write cannot clear taint or justify an ordinary definition at a join.
+            erased.update(writes - written)
+        successors = [] if name == 's_endpgm' else ([pc + n] if name != 's_branch' else [])
+        if pc in branches:
+            successors.append(branches[pc])
+        expected = {r: linear_defs.get(r) for r in reads & elided_once}
+        effects[pc] = (reads, erased, written, expected, successors)
+        if pc in setup:
+            elided_once.update(erased & tracked)
+        for reg in erased:
+            linear_defs.pop(reg, None)
+        linear_defs.update((reg, pc) for reg in written & tracked)
+
+    incoming, pending = {0: (set(), entry_defs)}, [0]
+    while pending:
+        pc = pending.pop()
+        tainted, definitions = incoming[pc]
+        reads, erased, written, expected, successors = effects[pc]
+        if reads & tainted or any(value is None or definitions.get(reg) != value for reg, value in expected.items()):
+            return False
+        tainted = (tainted - written) | erased
+        definitions = {r: d for r, d in definitions.items() if r not in erased}
+        definitions.update((reg, pc) for reg in written & tracked)
+        for target in successors:
+            previous = incoming.get(target)
+            merged = (tainted, definitions) if previous is None else (
+                previous[0] | tainted, {r: d for r, d in previous[1].items() if definitions.get(r) == d})
+            if merged != previous:
+                incoming[target] = merged
+                pending.append(target)
+    return (setup.keys() | loads.keys()) <= incoming.keys()
 
 
 def embedded_pixel_table(code, ins):
@@ -3507,6 +3658,7 @@ class Stage:
     _uniform_written = None
     raw_code = b''
     embedded_buffer = None
+    embedded_scalar_buffer = None
     address_carry_pairs = ()
     address_carry_reader = None
 
@@ -3524,6 +3676,8 @@ class Stage:
                         if refusals is None or decoded is None else decoded)
         if kind == 'vs' and any(name == 's_getpc_b64' for _, _, name, _ in self.ins):
             self.embedded_buffer = embedded_buffer_proof(self.raw_code, self.ins)
+            if not self.embedded_buffer:
+                self.embedded_scalar_buffer = embedded_scalar_buffer_proof(self.raw_code, self.ins)
         self.pixel_table = embedded_pixel_table(self.raw_code, self.ins) if kind == 'ps' else None
         if kind == 'ms':
             self.mesh_vcc_branches = {}
@@ -5648,6 +5802,8 @@ class Stage:
             self.calculated_pc = {}
         if self.embedded_buffer:
             self.calculated_pc.update(self.embedded_buffer[0])
+        if self.embedded_scalar_buffer:
+            self.calculated_pc.update(self.embedded_scalar_buffer[0])
         pixel_table = getattr(self, 'pixel_table', None)
         if pixel_table:
             self.calculated_pc[pixel_table[0]] = None
@@ -9867,7 +10023,9 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
-        key = self.descriptor(ops[1])
+        embedded = self.embedded_scalar_buffer
+        bound = embedded[1].get(self.pc) if embedded else None
+        key = self.descriptor(ops[1]) if bound is None else None
         token = smem_offset(ops[2])
         waterfall = getattr(self, 'pc', None) in getattr(self, 'active_waterfall_loads', ())
         if waterfall and key in self.pipe.rw_keys:
@@ -9912,8 +10070,12 @@ class Stage:
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
             address = '%s + %d' % (offset, extra + 4 * i)
-            expr = (self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic
-                    else '%s.Load(%s)' % (buf, address) if buf else '0u')
+            if bound is not None:
+                # RDNA 2 ISA §7.2.1 and Table 27: the SGPR byte offset is wave-wide and its low two address bits are ignored.
+                expr = 'embedded_vs_sload(%s, %du, %du)' % (offset, extra + 4 * i, bound)
+            else:
+                expr = (self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic
+                        else '%s.Load(%s)' % (buf, address) if buf else '0u')
             self.set_s(dst[1] + i, expr, uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
@@ -15811,6 +15973,19 @@ class Pipeline:
                 '    uint a = lane_offset + scalar_offset + imm;',
                 '    uint i = a >> 2u;',
                 '    ' + unaligned_dword_body('embedded_vs[i]', 'embedded_vs[i + 1u]'),
+            ]
+        scalar = self.vs.embedded_scalar_buffer if embedded_vertex else None
+        if scalar:
+            _, _, words = scalar
+            out += [
+                'static const uint embedded_vs_scalar[%d] = { %s };' %
+                (len(words), ', '.join('0x%08xu' % word for word in words)),
+                'uint embedded_vs_sload(uint scalar_offset, uint imm, uint bound) {',
+                '    if (scalar_offset > 0xffffffffu - imm) return 0u;',
+                '    uint a = (scalar_offset + imm) & ~3u;',
+                '    if (bound < 4u || a > bound - 4u) return 0u;',
+                '    return embedded_vs_scalar[a >> 2u];',
+                '}',
             ]
         return out
 
