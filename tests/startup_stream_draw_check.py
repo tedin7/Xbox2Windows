@@ -78,7 +78,7 @@ def run_census(args, env, output, ps, cache):
     ps.write_bytes(pixel(False))
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    env = dict(env, X2W_TEST_NOOP_CENSUS="1", X2W_D3D12_DEVICE_NOOP="1")
+    env = dict(env, X2W_NOOP_CENSUS="1", X2W_TEST_NOOP_CENSUS="1", X2W_D3D12_DEVICE_NOOP="1")
     env.pop("X2W_TEST_NOOP_CENSUS_MUTANT", None)
     expected = (bytes((255, 0, 0, 255)) * 4 + bytes((0, 0, 255, 255)) * 4) * 4
     for mutant in (False, True):

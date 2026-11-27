@@ -118,8 +118,16 @@ void format_arg(char* text, std::size_t size, unsigned arg)
 }
 }  // namespace noop_census
 
+bool noop_census_enabled()
+{
+    // Each call classifies six arguments (registry, VirtualQuery, ReadProcessMemory): opt in only.
+    static const bool enabled = x2w_local::env_on("X2W_NOOP_CENSUS");
+    return enabled;
+}
+
 void noop_census_record(Kind kind, int slot, const u64 (&args)[6])
 {
+    if (!noop_census_enabled()) return;
     using namespace noop_census;
     auto* self = reinterpret_cast<Wrapper*>(args[0]);
     if (kind == list_kind && (slot == 12 || slot == 13 || slot == 14 || slot == x2w_list_slots::execute_indirect_slot))
