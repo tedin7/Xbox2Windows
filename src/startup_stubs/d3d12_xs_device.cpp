@@ -1109,9 +1109,7 @@ void retire_leave_class(const void* object, RetireLeft why);
 void retire_add_view_ref(const void* object);
 void retire_release_view_ref(const void* object);
 void retire_drop_heap_views(Wrapper* heap);
-namespace replay_record {
-void held_srv_drop_heap(Wrapper* heap);  // d3d12_record.inl
-}
+void held_srv_drop_heap(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
@@ -1205,7 +1203,7 @@ ULONG __stdcall release(Wrapper* self)
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
         if (self->own().kind == descriptor_heap_kind) {
-            replay_record::held_srv_drop_heap(self);
+            held_srv_drop_heap(self);
             retire_drop_heap_views(self);
         }
         if (self->own().kind == resource_kind && self->own().title_memory) {
