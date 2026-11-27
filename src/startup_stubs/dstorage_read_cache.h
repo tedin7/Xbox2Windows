@@ -37,7 +37,7 @@ public:
 
     // Register the reads and queue their merged groups for the prefetch thread. Reads that would push the cache past its
     // byte limit, or that are already registered, are left to the worker's own reads.
-    void submit(const std::vector<PlannedRead>& reads, bool slow_disk = false)
+    void submit(const std::vector<PlannedRead>& reads)
     {
         std::vector<PlannedRead> fresh;
         {
@@ -52,10 +52,7 @@ public:
             }
         }
         if (fresh.empty()) return;
-        // Keep a fixed bound on the extra bytes fetched between requested ranges.
-        const auto gap = slow_disk ? std::uint64_t{512} << 10 : gap_;
-        const auto max_span = slow_disk ? std::uint64_t{8} << 20 : max_span_;
-        std::vector<ReadGroup> groups = plan_reads(std::move(fresh), gap, max_span);
+        std::vector<ReadGroup> groups = plan_reads(std::move(fresh), gap_, max_span_);
         {
             const std::lock_guard guard(mutex_);
             counters_.groups += static_cast<LONG>(groups.size());

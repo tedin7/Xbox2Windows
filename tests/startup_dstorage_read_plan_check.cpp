@@ -73,18 +73,6 @@ int main()
         auto groups = plan_reads({read(1, 0, 16, 0), read(1, ~0ull - 7, 4, 1)}, 65536, 1 << 20);
         expect(groups.size() == 2, "a read near 2^64 is not merged with a read at offset 0");
     }
-    // A later warm window must restore the ordinary merge limits.
-    {
-        x2w_startup::ReadLatencyWindow latency;
-        constexpr std::int64_t frequency = 1000;
-        expect(!latency.slow(frequency), "empty window uses ordinary merge limits");
-        latency.record(3);
-        expect(!latency.slow(frequency), "exactly 3 ms uses ordinary merge limits");
-        latency.record(5);
-        expect(latency.slow(frequency), "mean above 3 ms widens the merge limits");
-        for (int i = 0; i < 16; ++i) latency.record(1);
-        expect(!latency.slow(frequency), "old cold samples leave the rolling window");
-    }
     if (failures) {
         std::printf("FAILED: %d\n", failures);
         return 1;

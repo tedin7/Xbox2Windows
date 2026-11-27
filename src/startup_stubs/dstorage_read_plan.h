@@ -4,36 +4,11 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace x2w_startup {
-
-// Rolling service time of successful physical reads. Failed reads can be cheap
-// bounds checks, so they are excluded from the seek-cost estimate.
-class ReadLatencyWindow {
-public:
-    void record(std::int64_t ticks) noexcept
-    {
-        total_ += ticks - samples_[next_];
-        samples_[next_] = ticks;
-        next_ = (next_ + 1) % samples_.size();
-        count_ = (std::min)(count_ + 1, samples_.size());
-    }
-
-    bool slow(std::int64_t frequency) const noexcept
-    {
-        return frequency > 0 && count_ != 0 &&
-               static_cast<double>(total_) * 1000.0 > 3.0 * frequency * count_;
-    }
-
-private:
-    std::array<std::int64_t, 16> samples_{};
-    std::int64_t total_ = 0;
-    std::size_t next_ = 0, count_ = 0;
-};
 
 struct PlannedRead {
     std::uintptr_t file = 0;       // the file's identity: a number unique to the open (a handle value can be reused)
