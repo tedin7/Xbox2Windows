@@ -407,7 +407,7 @@ def cache_results(cache_dir):
     return sorted(rows, key=lambda row: (row[1], row[0]))
 
 
-KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute|mesh) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
+KEY_USE_RE = re.compile(r"^x2w-render key use (graphics|compute) ([0-9a-f]{16}) first ([0-9.]+) s last ([0-9.]+) s uses (\d+)\s*$")
 LATEST_USED_KEYS = 40
 
 
@@ -503,10 +503,6 @@ def select_requests(cache_dir, rows, weights, top=REQUESTS_TOP, cap=REQUESTS_CAP
     # base key, and the variant's request file travels with the base's files (Run R: be7c1a1a / ca7cec3b were never picked because
     # their draws were counted under variant keys).
     weights, variants = dict(weights), {}
-    if uses:
-        for key, kind, _, _ in rows:
-            if kind in ("mesh57", "mesh86") and key in uses:
-                weights[key] = uses[key][2]
     for name in names:
         match = re.match(r"^req_([0-9a-f]{16})\.rtv$", name)
         if not match:
@@ -597,6 +593,32 @@ SYMBOLS_NAME = "d3d12_xs.symbols.txt"
 MSVC_SYMBOL = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(\S+)?")
 MSVC_BASE = re.compile(r"Preferred load address is ([0-9a-fA-F]{16})")
 NM_SYMBOL = re.compile(r"^([0-9a-fA-F]{8,16})\s+[TtWw]\s+(\S+)\s*$")
+
+
+NULL_INPUTS_NAME = "null-inputs.txt"
+NULL_INPUT_RE = re.compile(
+    r"^x2w-render null input: key ([0-9a-f]{16}) input (\d+) \([^)]+\) cause (\w+) calls (\d+) ")
+NULL_TARGET_RE = re.compile(
+    r"^x2w-render target [0-9a-f]+ \(\d+x\d+ format \d+\): draws (\d+), with a null input (\d+) frames -?\d+\.\.-?\d+$")
+
+
+def null_inputs_section(stderr_text):
+    inputs = {}
+    windows = []
+    for line in stderr_text.splitlines():
+        if match := NULL_INPUT_RE.match(line):
+            key, index, cause, calls = match.groups()
+            inputs[key, index, cause] = (int(calls), line)
+        elif match := NULL_TARGET_RE.fullmatch(line):
+            draws, poisoned = map(int, match.groups())
+            if draws and poisoned <= draws:
+                windows.append(f"{line} ({poisoned / draws:.1%} poisoned)")
+        elif line.startswith("x2w-render null census overflow:"):
+            windows.append(line)
+    if not inputs and not windows:
+        return ""
+    rows = [line for _, line in sorted(inputs.values(), key=lambda row: (-row[0], row[1]))]
+    return "\n".join(["null inputs", *rows, "", "render target windows", *windows]) + "\n"
 
 
 def parse_symbols(text):
@@ -829,6 +851,8 @@ def pack(logdir, manifest_in, zip_path, limit_bytes=DEFAULT_LIMIT_MB * 1024 * 10
                 texts[name] = handle.read()
     if texts.get("stderr.txt") and HEARTBEAT_RE.search(texts["stderr.txt"]):
         add(PHASES_NAME, phase_table(texts["stderr.txt"], texts.get("timeline.txt", "")).encode("utf-8"))
+    if null_section := null_inputs_section(texts.get("stderr.txt", "")):
+        add(NULL_INPUTS_NAME, null_section.encode("utf-8"))
     files = log_files(logdir)
     small = [f for f in files if os.path.getsize(f[1]) <= SMALL_FILE_BYTES]
     for name, path in small + [f for f in files if f not in small]:

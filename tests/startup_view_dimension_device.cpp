@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +94,16 @@ RWByteAddressBuffer result : register(u0);
 [numthreads(1, 1, 1)] void main()
 {
     result.Store4(0, asuint(source.SampleLevel(point_sampler, float2(0.125, 0.125), 0)));
+}
+)";
+
+constexpr char memory_buffer_probe[] = R"(
+struct Record { uint4 first; uint4 rest[15]; };
+StructuredBuffer<Record> source : register(t0);
+RWByteAddressBuffer result : register(u0);
+[numthreads(1, 1, 1)] void main()
+{
+    result.Store4(0, asuint(float4(source[0].first.xy, source[0].rest[14].zw)));
 }
 )";
 
@@ -234,14 +245,86 @@ D3D12_SHADER_RESOURCE_VIEW_DESC texture2d_view()
     return srv;
 }
 
+int check_memory_buffer(Context& c, bool off, bool mutant)
+{
+    using Payload = std::array<std::uint32_t, 64>;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    // The requested bytes are readable, but the surrounding 64 KiB are not committed.
+    struct Reservation {
+        void* base = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+        ~Reservation() { if (base) VirtualFree(base, 0, MEM_RELEASE); }
+    } reservation;
+    if (!reservation.base || system.dwPageSize < sizeof(Payload) || system.dwPageSize >= 65536) return 4;
+    auto* data = VirtualAlloc(static_cast<unsigned char*>(reservation.base) + system.dwPageSize,
+                               system.dwPageSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!data) return 4;
+
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(Payload), 1, 1, 1,
+                             DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        UINT64 address;
+    } at{};
+    static_assert(offsetof(decltype(at), address) == 0x28);
+    at.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    at.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    at.view.Buffer.NumElements = 1;
+    at.view.Buffer.StructureByteStride = sizeof(Payload);
+    at.address = reinterpret_cast<UINT64>(data);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = c.heap_real->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < 3; ++i, cpu.ptr += c.increment)
+        c.device->CreateShaderResourceView(nullptr, &at.view, cpu);
+
+    Payload first{};
+    first[0] = 17;
+    first[1] = 63;
+    first[62] = 141;
+    first[63] = 201;
+    Payload second = first;
+    second[63] = 77;
+    const auto reference = [](const Payload& bytes) {
+        return std::array<float, 4>{float(bytes[0]), float(bytes[1]), float(bytes[62]), float(bytes[63])};
+    };
+    std::memcpy(data, first.data(), sizeof(first));
+    invoke<void>(c.guest, 70, &desc, &at, c.slot(0));
+    invoke<void>(c.guest, 70, &desc, &at, c.slot(1)); // unchanged generation
+    std::memcpy(data, second.data(), sizeof(second));
+    invoke<void>(c.guest, 70, &desc, &at, c.slot(2));
+
+    std::array<std::array<float, 4>, 3> readback{};
+    for (UINT i = 0; i < readback.size(); ++i) {
+        float result[4]{};
+        if (!c.read_slot(i, result) || !c.device_ok()) return 4;
+        std::memcpy(readback[i].data(), result, sizeof(result));
+        std::printf("slot70 slot %u readback %.0f %.0f %.0f %.0f\n", i, result[0], result[1], result[2], result[3]);
+    }
+    if (off) {
+        if (readback != decltype(readback){}) return 1;
+        std::puts("slot70 switch-off control: all three publications left the null SRVs intact");
+        return 0;
+    }
+    if (readback[0] != reference(first) || readback[1] != reference(first)) return 1;
+    if (readback[2] != reference(second)) {
+        if (mutant && readback[2] == reference(first))
+            std::puts("slot70 stale mutant: refreshed readback failed with the first generation");
+        return 1;
+    }
+    return mutant ? 2 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
+    const bool memory_off = argc == 3 && std::strcmp(argv[2], "memory-buffer-off") == 0;
+    const bool memory_mutant = argc == 3 && std::strcmp(argv[2], "memory-buffer-stale") == 0;
+    const bool memory_buffer = memory_off || memory_mutant || (argc == 3 && std::strcmp(argv[2], "memory-buffer") == 0);
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
-        (argc == 3 && std::strcmp(argv[2], "off")))
+        (argc == 3 && !memory_buffer && std::strcmp(argv[2], "off")))
         return 2;
-    const bool off = argc == 3;
+    const bool off = argc == 3 && !memory_buffer;
     char mode[8]{};
     const DWORD mode_n = GetEnvironmentVariableA("X2W_D3D12_VIEW_DEFAULTS", mode, sizeof(mode));
     const bool env_off = mode_n == 3 && std::strcmp(mode, "off") == 0;
@@ -301,12 +384,13 @@ int main(int argc, char** argv)
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     const D3D12_ROOT_SIGNATURE_DESC root_desc{2, root_parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const char* shader = memory_buffer ? memory_buffer_probe : probe_shader;
     ComPtr<ID3DBlob> root_blob, errors, code;
     if (!require(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, root_blob.GetAddressOf(),
                                             errors.GetAddressOf()), "root serialize") ||
         !require(device->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&c.root)),
                  "root signature") ||
-        !require(D3DCompile(probe_shader, std::strlen(probe_shader), nullptr, nullptr, nullptr, "main", "cs_5_1", 0, 0,
+        !require(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "main", "cs_5_1", 0, 0,
                             code.GetAddressOf(), errors.ReleaseAndGetAddressOf()), "probe shader"))
         return 4;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
@@ -326,6 +410,7 @@ int main(int argc, char** argv)
         return 4;
     }
     c.heap_cpu = invoke<UINT64>(c.heap.Get(), 9);
+    if (memory_buffer) return check_memory_buffer(c, memory_off, memory_mutant);
 
     const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                            {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};

@@ -1,12 +1,14 @@
 """Read back a gfx1013 compute image_gather4_lz and image_gather4_lz_o through the startup translator."""
 
 import argparse
+import math
 from pathlib import Path
 import struct
 import tempfile
 
 from compute_gather4_l_check import HEIGHT, ORDER, SENTINEL, WIDTH, first_mismatch, run_case, texel
 from startup_gfx2hlsl_compute_check import G, USER7, WORDS, assemble, refused, root_blob
+from startup_compute_gather_l_check import s_mov_word, v_mov_word
 
 
 SOURCE = """\
@@ -32,6 +34,44 @@ PREFIX = bytes.fromhex('06038abe80038bbe05040cf4000000fa050708f4200000fa'
                        'f002007ef002027e8002047e7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf001078e002040780000081bf')
 CHANNELS = ('Red', 'Green', 'Blue', 'Alpha')
+
+# name, X mode, Y mode, border color, channel, view mip, coordinates, unnormalized source, NSA
+ADDRESS_CASES = (
+    ('wrap', 0, 0, 0, 0, 0, (0.0, 1.0), None, False),
+    ('mirror', 1, 1, 0, 1, 0, (1.25, -0.25), None, False),
+    ('mirror_once', 3, 3, 0, 2, 0, (-0.25, -0.625), None, False),
+    ('white_border', 6, 2, 2, 2, 0, (0.0, 0.625), None, False),
+    ('opaque_black_border', 2, 6, 1, 3, 0, (0.625, 1.0), None, False),
+    ('transparent_border', 6, 2, 0, 3, 0, (1.0, 0.625), None, False),
+    ('unnormalized_sampler', 2, 2, 0, 3, 1, (5.25, 2.25), 'sampler', False),
+    ('unnormalized_instruction', 2, 2, 0, 2, 0, (6.25, 3.25), 'instruction', False),
+    ('nsa', 2, 2, 0, 1, 0, (0.25, 0.625), None, True),
+)
+
+
+def float_word(value):
+    return struct.unpack('<I', struct.pack('<f', value))[0]
+
+
+def address_program(w0, w3, channel, uv, nsa, llvm_mc=None, *, w2=0x04100000, unorm=False):
+    # Point minification, linear magnification. v1 remains zero in the NSA case.
+    y = 9 if nsa else 1
+    coords = [float_word(c) for c in uv]
+    prefix = (PREFIX[:24] + s_mov_word(24, w0) + s_mov_word(25, 0) +
+              s_mov_word(26, w2) + s_mov_word(27, w3) +
+              v_mov_word(0, hex(coords[0])) + v_mov_word(y, hex(coords[1])) + v_mov_word(2, '0') + WAIT)
+    first = 0xf11c0008 | (0x100 << channel) | (2 if nsa else 0) | (1 << 12 if unorm else 0)
+    instruction = struct.pack('<II', first, 0x00c40400)
+    if nsa:
+        instruction += bytes((y, 0, 0, 0))
+    if llvm_mc:
+        addr = '[v0, v9]' if nsa else 'v[0:1]'
+        source = (f'image_gather4_lz v[4:7], {addr}, s[16:23], s[24:27] '
+                  f'dmask:{1 << channel:#x} dim:SQ_RSRC_IMG_2D')
+        if unorm:
+            source += ' unorm'
+        assert instruction == assemble(llvm_mc, source + '\n'), source
+    return prefix + instruction + SUFFIX
 
 # image_gather4_lz_o: v0 holds the packed texel offset (signed X in bits 5:0, signed Y in bits 13:8), v1 and v2 the
 # coordinates; the output offset moves to v8 because v2 is now an address register.
@@ -91,7 +131,7 @@ def controls(llvm_mc):
     refused('one-hot dmask', lambda: pipeline(shader(3)))
     # Set MIN_LOD to 1/256, outside the constant sampler profile.
     bad_sampler = PREFIX.replace(bytes.fromhex('800399be'), bytes.fromhex('810399be'))
-    refused('requires normalized clamp', lambda: pipeline(shader(2, bad_sampler)))
+    refused('unsupported filter, LOD or descriptor flags', lambda: pipeline(shader(2, bad_sampler)))
     missing_sampler = PREFIX.replace(bytes.fromhex('80039bbe'), b'')
     refused('constant sampler', lambda: pipeline(shader(2, missing_sampler)))
     # A four-word load at the image slot omits the descriptor's high half.
@@ -105,6 +145,23 @@ def controls(llvm_mc):
     aliased = PREFIX.replace(bytes.fromhex('050708f4200000fa'), bytes.fromhex('050708f4000000fa'))
     refused('used for a load and a store', lambda: pipeline(shader(2, aliased)))
     check_image_provenance(llvm_mc)
+    for _, xmode, ymode, border, channel, _, uv, unnormalized, nsa in ADDRESS_CASES:
+        w0 = xmode | ymode << 3 | int(unnormalized == 'sampler') << 15
+        w3 = border << 30
+        pipe = pipeline(address_program(w0, w3, channel, uv, nsa, llvm_mc, unorm=unnormalized == 'instruction'))
+        coords = 'float2(F(v0), F(v9))' if nsa else 'float2(F(v0), F(v1))'
+        if unnormalized:
+            assert 'r0.GetDimensions(gw, gh);' in pipe.hlsl_cs()
+            coords += ' / float2(gw, gh)'
+        assert f'r0.Gather{CHANNELS[channel]}(q0, {coords})' in pipe.hlsl_cs()
+        assert f'smp 0 {w0:#x} 0x0 0x4100000 {w3:#x}\n' in pipe.manifest()
+    for mode in (4, 5, 7):
+        refused('unsupported X/Y address mode', lambda: pipeline(address_program(mode, 0, 0, (0.25, 0.625), False)))
+    refused('register border color requires a palette',
+            lambda: pipeline(address_program(6, 3 << 30, 0, (0.25, 0.625), False)))
+    pipe = linear_mip_pipeline(llvm_mc)
+    assert 'r0.GatherGreen(q0, float2(F(v0), F(v1)))' in pipe.hlsl_cs()
+    assert 'smp 0 0x12 0x0 0x8500000 0x0\n' in pipe.manifest()
     print('Four compute gather channels, manifest bindings and refusal controls passed')
 
 
@@ -225,6 +282,77 @@ def reference(level, channel):
     return taps + [SENTINEL] * (WORDS - len(taps))
 
 
+def address_texel(index, extent, mode):
+    if mode == 0:
+        return index % extent
+    if mode == 1:
+        index %= 2 * extent
+        return min(index, 2 * extent - index - 1)
+    if mode == 3 and index < 0:
+        index = -index - 1
+    if mode == 6 and not 0 <= index < extent:
+        return None
+    return min(max(index, 0), extent - 1)
+
+
+def linear_mip_pipeline(llvm_mc=None):
+    return pipeline(address_program(0x12, 0, 1, (0.5, 0.5), False, llvm_mc, w2=0x08500000))
+
+
+def address_reference(level, channel, uv, xmode, ymode, border, unnormalized):
+    width, height = WIDTH >> level, HEIGHT >> level
+    u, v = uv if unnormalized else (uv[0] * width, uv[1] * height)
+    x, y = math.floor(u - 0.5), math.floor(v - 0.5)
+    border_word = float_word(float(border == 2 or (border == 1 and channel == 3)))
+    taps = []
+    for dx, dy in ORDER:
+        i, j = address_texel(x + dx, width, xmode), address_texel(y + dy, height, ymode)
+        taps.append(border_word if i is None or j is None else texel(level, i, j, channel))
+    return taps + [SENTINEL] * (WORDS - len(taps))
+
+
+def dispatch_addresses(directory, compiler, renderer, adapter):
+    for name, xmode, ymode, border, channel, level, uv, unnormalized, nsa in ADDRESS_CASES:
+        w0 = xmode | ymode << 3 | int(unnormalized == 'sampler') << 15
+        w3 = border << 30
+        good = pipeline(address_program(w0, w3, channel, uv, nsa, unorm=unnormalized == 'instruction'))
+        want = address_reference(level, channel, uv, xmode, ymode, border, unnormalized)
+        result = run_case(directory, compiler, renderer, adapter, name, good.hlsl_cs(), want, level,
+                          manifest=good.manifest())
+        if result.returncode == 77:
+            return 77
+        assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout, name
+
+        if nsa:
+            # Keep v9 initialized but read v1 through the packed address encoding.
+            code = address_program(w0, w3, channel, uv, True)
+            end = len(code) - len(SUFFIX)
+            instruction = struct.pack('<II', 0xf11c0008 | (0x100 << channel), 0x00c40400)
+            wrong = pipeline(code[:end - 12] + instruction + SUFFIX)
+            actual = address_reference(level, channel, (uv[0], 0.0), 2, 2, 0, False)
+        else:
+            # Replace the address mode with clamp or drop unnormalized coordinates.
+            wrong = pipeline(address_program(0x12, w3, channel, uv, False))
+            actual = address_reference(level, channel, uv, 2, 2, border, False)
+        result = run_case(directory, compiler, renderer, adapter, name + '_mutant', wrong.hlsl_cs(), want, level,
+                          manifest=wrong.manifest())
+        mismatches = sum(a != b for a, b in zip(want, actual))
+        assert mismatches and result.returncode == 1 and first_mismatch(want, actual) in result.stderr, name
+        assert f'compared_words={WORDS} mismatches={mismatches}' in result.stdout, name
+    pipe = linear_mip_pipeline()
+    want = reference(0, 1)
+    result = run_case(directory, compiler, renderer, adapter, 'linear_mip', pipe.hlsl_cs(), want, 0,
+                      manifest=pipe.manifest())
+    if result.returncode == 77:
+        return 77
+    assert result.returncode == 0 and 'compared_words=320 mismatches=0' in result.stdout
+    result = run_case(directory, compiler, renderer, adapter, 'linear_mip_wrong_view', pipe.hlsl_cs(), want, 1,
+                      manifest=pipe.manifest())
+    assert result.returncode == 1 and first_mismatch(want, reference(1, 1)) in result.stderr
+    assert 'compared_words=320 mismatches=4' in result.stdout
+    return 0
+
+
 def dispatch(directory, compiler, renderer, adapter):
     for level, channel in ((0, 1), (1, 0), (1, 1), (1, 2), (1, 3)):
         source = pipeline(shader(1 << channel)).hlsl_cs()
@@ -263,7 +391,8 @@ if __name__ == '__main__':
         out = Path(__file__).resolve().parents[1] / 'out'
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out) as tmp:
-            code = dispatch(Path(tmp), *args.dispatch) or dispatch_o(Path(tmp), *args.dispatch)
+            code = (dispatch(Path(tmp), *args.dispatch) or dispatch_addresses(Path(tmp), *args.dispatch)
+                    or dispatch_o(Path(tmp), *args.dispatch))
             raise SystemExit(code)
     controls(args.llvm_mc)
     controls_o(args.llvm_mc)

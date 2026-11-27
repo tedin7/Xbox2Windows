@@ -1,6 +1,7 @@
 #include "desktop_gpu.h"
 #include "compute_root.h"
 #include "compute_tables.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -447,8 +448,35 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
     }
 }
 
+static ComPtr<ID3DBlob> compute_texture_sampler_root(const char* manifest)
+{
+    std::ifstream source(manifest);
+    if (!source) throw std::runtime_error("Could not open compute texture sampler manifest");
+    x2w_startup::TranslatedSamplers samplers;
+    for (std::string line; std::getline(source, line);)
+        if (!samplers.read_manifest_line(line.c_str()))
+            throw std::runtime_error("Invalid compute texture sampler manifest");
+    if (samplers.heap || samplers.statics.size() != 1)
+        throw std::runtime_error("Expected one static compute texture sampler");
+    const auto statics = x2w_startup::decode_statics(samplers);
+
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> embedded;
+    check(D3D12CreateVersionedRootSignatureDeserializer(compute_tables, sizeof(compute_tables),
+          IID_PPV_ARGS(&embedded)), "Read embedded compute table signature");
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* original = nullptr;
+    check(embedded->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &original),
+          "Read compute table layout");
+    auto root = *original;
+    root.Desc_1_1.NumStaticSamplers = static_cast<UINT>(statics.size());
+    root.Desc_1_1.pStaticSamplers = statics.data();
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeVersionedRootSignature(&root, &blob, nullptr), "Serialize compute texture sampler root");
+    return blob;
+}
+
 // The image load uses a descriptor-table signature. Its case file appends the source texels.
-void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference)
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference,
+                                const char* sampler_manifest)
 {
     const auto code = read_compute_shader(path);
     const D3D12_SHADER_BYTECODE shader{code.data(), code.size()};
@@ -476,7 +504,13 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         throw std::runtime_error("Invalid compute image load reference");
     const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
         : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
-    const auto program = create_compute_program(device, shader, {compute_tables, sizeof(compute_tables)});
+    auto root = D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)};
+    ComPtr<ID3DBlob> custom_root;
+    if (sampler_manifest) {
+        custom_root = compute_texture_sampler_root(sampler_manifest);
+        root = {custom_root->GetBufferPointer(), custom_root->GetBufferSize()};
+    }
+    const auto program = create_compute_program(device, shader, root);
     run_compute(device, true, program, false, &store, &texels, format,
                 nullptr, false, false, view_mip1 ? 1 : 0);
 }
@@ -574,18 +608,15 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     std::ifstream source(reference, std::ios::binary);
     source.read(reinterpret_cast<char*>(&groups), sizeof(groups));
     source.read(reinterpret_cast<char*>(&mip), sizeof(mip));
-    const UINT selector = groups & texture_format_mask;
+    const bool uav_load = (groups & texture_uav_load_flag) != 0;
+    const UINT selector = groups & (texture_format_mask & ~texture_uav_load_flag);
     groups &= ~texture_format_mask;
-    DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
+    DXGI_FORMAT format = uav_load ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
     D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
     switch (selector) {
     case 0: break;
     case texture_rgba32_float_flag: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
-    case texture_uav_load_flag:
-        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-        break;
     case texture_1d_flag:
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         dimension = D3D12_UAV_DIMENSION_TEXTURE1D;
@@ -624,9 +655,13 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         break;
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
-    const bool uav_load = selector == texture_uav_load_flag;
+    if (uav_load) {
+        if (format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+            throw std::runtime_error("Typed load fixture requires RGBA32 float");
+        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+    }
     const bool one_dimensional = dimension == D3D12_UAV_DIMENSION_TEXTURE1D;
-    const bool separate_srv = selector == texture_rgba32_float_flag || one_dimensional;
+    const bool separate_srv = !uav_load && (selector == texture_rgba32_float_flag || one_dimensional);
     const bool layered = dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY || dimension == D3D12_UAV_DIMENSION_TEXTURE3D;
     const bool half_image = selector == texture_rgba16_float_flag;
     const UINT words_per_texel = texture_words_per_texel(format);

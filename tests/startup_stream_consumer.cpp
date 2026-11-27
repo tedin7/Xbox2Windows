@@ -248,6 +248,8 @@ bool copy_vertex_sample_texture(void* device, void* list, bool cube, void*& text
 // 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
 // descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
 // dispatch-heap-outside sets the constant to 0x07ffffff, whose record is past any heap.
+// dispatch-heap-format-* dispatches one four-thread group and binds a typed view or native descriptor at record 2.
+// dispatch-heap-format-indexed takes record 2 from a literal byte offset in the uploaded index buffer.
 // dispatch-heap-word runs the program of startup_gfx2hlsl_heap_word_check.py: the constant is 1 and picks the word
 // of the upload buffer at table byte 96 that holds the index, 2. dispatch-heap-word-outside makes that word
 // 0x07ffffff, dispatch-heap-word-null leaves the descriptor of that buffer null (the word reads 0, record 0 is the input),
@@ -349,7 +351,34 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         for (const UINT at : {0u, 32u, 64u})  // dispatch-heap-word-null reads record 0, so record 0 holds the input
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64 && !(at == 0 && mode == "dispatch-heap-word-null")],
                         sizeof(descriptors[0]));
+    const bool formatted_indexed = mode == "dispatch-heap-format-indexed";
+    const bool formatted_heap = mode.rfind("dispatch-heap-format-", 0) == 0;
+    if (formatted_heap && mode != "dispatch-heap-format-plain") {
+        DXGI_FORMAT format;
+        UINT element;
+        UINT mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (formatted_indexed || mode == "dispatch-heap-format-half") {
+            format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            element = 8;
+        } else if (mode == "dispatch-heap-format-packed") {
+            format = DXGI_FORMAT_R10G10B10A2_UNORM;
+            element = 4;
+        } else if (mode == "dispatch-heap-format-uint") {
+            format = DXGI_FORMAT_R8G8B8A8_UINT;
+            element = 4;
+            mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
+        } else if (mode == "dispatch-heap-format-unsupported") {
+            format = DXGI_FORMAT_R16G16B16A16_UINT;
+            element = 8;
+        } else {
+            return 2;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{format, D3D12_SRV_DIMENSION_BUFFER, mapping};
+        view.Buffer = {0, 32u / element, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+        invoke(device, 18, word(placed[0]), word(&view), cpu + 64);
+    }
     const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
+    const bool dynamic_heap = mode.rfind("dispatch-heap-dynamic", 0) == 0;
     const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&](void* list) {
@@ -420,12 +449,31 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         bind(list);
     }
     if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (dynamic_heap) {
+        auto* const index = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
+        if (!index) return 81;
+        index[0] = 3;
+        index[1] = mode.find("-outside") != std::string::npos ? 4 : 2;
+        invoke(list, mode.find("-cbv") != std::string::npos ? 41 : 43, 2, word(index));
+        const UINT64 index_address = reinterpret_cast<UINT64>(index);
+        const UINT index_view[4]{static_cast<UINT>(index_address), static_cast<UINT>(index_address >> 32), 16, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu), index_view, sizeof(index_view));
+        for (UINT slot : {2u, 3u}) {
+            auto* const data = reinterpret_cast<UINT*>(invoke(list, 148, 16, 256));
+            if (!data) return 81;
+            *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
+            const UINT64 address = reinterpret_cast<UINT64>(data);
+            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
+        }
+    }
     if (mode == "dispatch-heap-word-null")
         std::memset(reinterpret_cast<void*>(cpu + 96), 0, 16);  // the index buffer's descriptor stays null: the word reads as 0
-    else if (heap_word) {
-        // The index buffer of table byte 96, in this recording's upload memory (list slot 148). Byte 288 + 336 * 1
-        // holds the index, 2; every other word names record 0 or 1, the output's descriptor.
-        constexpr UINT bytes = 0x400, at = 0x270;
+    else if (heap_word || formatted_indexed) {
+        // The index buffer at table byte 96 lives in the list's upload memory. Only the expected
+        // byte offset holds record 2. The other words name an output descriptor.
+        constexpr UINT bytes = 0x400;
+        const UINT at = formatted_indexed ? 52 : 0x270;
         auto* const index = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, bytes, 256)));
         if (!index) return 81;
         std::memset(index, 0, bytes);
@@ -437,7 +485,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+    if (dynamic_heap) invoke(list, 14, 1, 1, 1);
+    else if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
@@ -541,7 +590,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             invoke(lists[t], 9);
             invoke(queue, 10, 1, word(&lists[t]));
         }
-    } else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    } else if (formatted_heap) invoke(list, 14, 1, 1, 1);
+    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (mode == "dispatch-input-empty") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
@@ -877,6 +927,19 @@ int main(int argc, char** argv)
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
+        if (std::strncmp(argv[8], "dispatch-heap-dynamic", 21) == 0) {
+            ComPtr<ID3D12Device> desktop;
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop))) ||
+                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
+                FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+                model.HighestShaderModel < D3D_SHADER_MODEL_6_6 ||
+                options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3) {
+                std::puts("direct heap indexing requires Shader Model 6.6 and resource binding tier 3");
+                return 77;
+            }
+        }
         if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
         const bool nolock_retry = std::strcmp(argv[8], "dispatch-nolock-retry") == 0;
         if (nolock_retry || std::strcmp(argv[8], "dispatch-retry") == 0) {
@@ -901,7 +964,7 @@ int main(int argc, char** argv)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (argc == 5 && std::strncmp(argv[4], "present-", 8) == 0) return present_gray(device, argv[4]);
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
-    if (argc == 4) return 0;
+    if (argc == 4 || (argc == 6 && std::strcmp(argv[5], "create-only") == 0)) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
     bool two_targets = false;

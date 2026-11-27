@@ -56,7 +56,7 @@ def array_controls(llvm_mc):
     for addr in ('v[8:9]', 'v[8:11]'):
         refused('x, y and layer expected', lambda: pipe.cs.op_image_store(['v[14:15]', addr, 's[24:31]'], mods))
     refused('fixed table image descriptor', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[28:35]'], mods))
-    refused('typed UAV store writes all four channels', lambda: pipe.cs.op_image_store(['v14', 'v[8:10]', 's[24:31]'], ['dmask:0x3', *mods[1:]]))
+    refused('a 16-bit store writes all four channels', lambda: pipe.cs.op_image_store(['v14', 'v[8:10]', 's[24:31]'], ['dmask:0x3', *mods[1:]]))
     refused('modifier a16', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], mods + ['a16']))
     print('Compute packed D16 array translation and refusal checks passed' + ('; LLVM assembly matched' if llvm_mc else ''))
 
@@ -87,7 +87,7 @@ def controls(llvm_mc):
 
     for asm, code, reason in (
         (fixture.STORE.replace('v[14:15]', 'v14').replace('dmask:0xf', 'dmask:0x3'),
-         '080320f0080e0680', 'typed UAV store writes all four channels'),
+         '080320f0080e0680', 'a 16-bit store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8').replace(' d16', ' a16 d16'), '080f20f0080e06c0', 'modifier a16'),
         (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
          '100f20f0080e0680', 'only 2D images'),

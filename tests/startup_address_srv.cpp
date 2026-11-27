@@ -1,3 +1,4 @@
+#include <windows.h>
 #include <d3d12.h>
 #include <array>
 #include <cstddef>
@@ -105,6 +106,41 @@ int draw_1d_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     const D3D12_RECT full{0, 0, 8, 4};
     invoke(list, 22, 1, ptr(&full));
     invoke(list, 12, 3, 1);
+    return 0;
+}
+
+int draw_unregistered_1d_address_srv(void* guest, void* list)
+{
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 44;
+    const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 8u, 1,
+        1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    // A single R8 footprint consists of one row starting at offset zero.
+    static std::array<unsigned char, 8> memory;
+    ViewAt view{};
+    view.address = ptr(memory.data());
+    view.view.Format = desc.Format;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Texture1D.MipLevels = 1;
+    invoke(guest, 18, 0, ptr(&view.view), cpu);
+    const auto* slot = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), slot, previous.size());
+
+    const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
+    invoke(list, 21, 1, ptr(&viewport));
+    for (LONG phase = 0; phase < 2; ++phase) {
+        for (UINT x = 0; x < memory.size(); ++x)
+            memory[x] = static_cast<unsigned char>(11 + 19 * x + 73 * phase);
+        // Republish the same address after a title-side write, in the same frame.
+        invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+        const D3D12_RECT rows{0, phase * 2, 8, phase * 2 + 2};
+        invoke(list, 22, 1, ptr(&rows));
+        invoke(list, 12, 3, 1);
+    }
+    std::printf("unregistered 1D descriptor_changed=%d\n", std::memcmp(previous.data(), slot, previous.size()) != 0);
     return 0;
 }
 
@@ -570,16 +606,45 @@ int draw_copied_vertex_buffer_srv(void* guest, void* list)
 {
     constexpr UINT full_bytes = 512;
     constexpr UINT short_bytes = 256;
-    static std::array<std::uint8_t, 65536 + full_bytes> storage{};
-    auto* records = reinterpret_cast<std::uint32_t*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
-    records[224 / sizeof(*records)] = 57;
-    records[288 / sizeof(*records)] = 181;
-
     const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, full_bytes, 1, 1, 1,
         DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    std::uint32_t* records = nullptr;
     void* placed = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+
+    char mode[16]{};
+    GetEnvironmentVariableA("X2W_TEST_COPIED_VERTEX_SRV", mode, sizeof(mode));
+    if (std::strcmp(mode, "copy15") == 0) {
+        // Use fresh, deliberately unaligned placements so the draw snapshots
+        // the title destination. Give the untouched destination a different
+        // color so a skipped copy fails the pixel comparison.
+        static constexpr std::size_t page = 4096;
+        auto allocate = [] {
+            auto* base = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * page,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            return base ? reinterpret_cast<std::uint32_t*>(base + page) : nullptr;
+        };
+        auto* source = allocate();
+        records = allocate();
+        void* from = nullptr;
+        if (!source || !records ||
+            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(source), ptr(&buffer),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&from)))) ||
+            FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+        source[224 / sizeof(*source)] = 73;
+        source[288 / sizeof(*source)] = 149;
+        for (unsigned i = 0; i < 2000; ++i) {
+            const Word offset = (i % 8) * 64;
+            invoke(list, 15, ptr(placed), offset, ptr(from), offset, 64);
+        }
+    } else {
+        static std::array<std::uint8_t, 65536 + full_bytes> storage{};
+        records = reinterpret_cast<std::uint32_t*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
+        records[224 / sizeof(*records)] = 57;
+        records[288 / sizeof(*records)] = 181;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
+                                               0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    }
 
     const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     alignas(64) static std::array<std::uint8_t, 256> descriptors{};
@@ -1122,5 +1187,135 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     draw(6);
     draw(7);
 
+    return 0;
+}
+
+int draw_cube_address_srv(ID3D12Device* desktop, void* guest, void* list)
+{
+    const bool array = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_ARRAY", nullptr, 0) != 0;
+    const bool tiled = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_TILED", nullptr, 0) != 0;
+    const bool swap_faces = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_SWAP", nullptr, 0) != 0;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1,
+        static_cast<UINT16>(array ? 18 : 6), 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        tiled ? static_cast<D3D12_TEXTURE_LAYOUT>(0x101) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_RESOURCE_FLAG_NONE};
+
+    // A 1x1 face at (0,0) starts its own 256-byte standard block in layout 0x101.
+    UINT64 stride = 256;
+    if (!tiled) {
+        UINT64 face_bytes = 0;
+        desktop->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &face_bytes);
+        if (face_bytes < 4 || face_bytes == ~UINT64{0}) return 50;
+        // Slot 133's desktop-row backing rounds each slice's mip chain to 64 KiB.
+        stride = (face_bytes + 0xffff) & ~UINT64{0xffff};
+    }
+    static std::vector<unsigned char> backing;
+    backing.assign(static_cast<std::size_t>(stride * desc.DepthOrArraySize), 0);
+    for (UINT slice = 0; slice < desc.DepthOrArraySize; ++slice) {
+        const UINT face = slice % 6;
+        const UINT value_slice = swap_faces && face < 2 ? slice - face + (1 - face) : slice;
+        auto* pixel = backing.data() + slice * stride;
+        pixel[0] = static_cast<unsigned char>(16 + 11 * value_slice);
+        pixel[3] = 255;
+    }
+
+    void* placed = nullptr;
+    if (!tiled && FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&desc),
+                                           D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&placed)))))
+        return 51;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    ViewAt view{};
+    view.address = ptr(backing.data());
+    view.view.Format = desc.Format;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (array) {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        view.view.TextureCubeArray = {0, 1, 6, 2, 0};
+    } else {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        view.view.TextureCube = {0, 1, 0};
+    }
+    invoke(guest, 18, 0, ptr(&view.view), cpu);
+    const auto* descriptor = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), descriptor, previous.size());
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+    std::printf("slot 70 cube descriptor_changed=%d\n",
+                std::memcmp(previous.data(), descriptor, previous.size()) != 0);
+
+    if (array) {
+        std::memcpy(previous.data(), descriptor, previous.size());
+        view.view.TextureCubeArray.NumCubes = 3;
+        invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+        if (std::memcmp(previous.data(), descriptor, previous.size()) != 0) return 52;
+    }
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
+// An R8 0x105 slice has a 4 KiB mip tail followed by one 4 KiB tile for mip 0.
+// The request names the first two mips in the tail of the first or second slice.
+int draw_slot70_texture_alias(void* guest, void* list)
+{
+    constexpr std::size_t slice_bytes = 8192;
+    static std::array<unsigned char, 2 * slice_bytes> backing{};
+    constexpr auto layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    const D3D12_RESOURCE_DESC owner{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 2, 4, DXGI_FORMAT_R8_UNORM,
+        {1, 0}, layout, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    const D3D12_RESOURCE_DESC alias{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 2, DXGI_FORMAT_R8_UNORM,
+        {1, 0}, layout, D3D12_RESOURCE_FLAG_NONE};
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&owner), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&texture))))) return 40;
+
+    Word srv = 0;
+    if (!bind_view_table(guest, list, srv)) return 41;
+    wchar_t mode[4]{};
+    GetEnvironmentVariableW(L"X2W_TEST_SLOT70_TEXTURE_ALIAS", mode, 4);
+    const Word offset = mode[0] == L'2' ? slice_bytes : mode[0] == L'3' ? 1 : 0;
+    ViewAt view{};
+    view.address = ptr(backing.data()) + offset;
+    view.view.Format = alias.Format;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Texture2DArray = {0, UINT_MAX, 0, 1, 0, 0};
+    auto null_view = view.view;
+    null_view.Texture2DArray.MipLevels = 2;
+    invoke(guest, 18, 0, ptr(&null_view), srv);
+    std::array<unsigned char, 32> previous{};
+    const auto* descriptor = reinterpret_cast<const void*>(srv);
+    std::memcpy(previous.data(), descriptor, previous.size());
+    invoke(guest, 70, ptr(&alias), ptr(&view), srv);
+    std::printf("slot70 alias descriptor changed=%d\n", std::memcmp(previous.data(), descriptor, previous.size()) != 0);
+
+    struct ExtendedHeap {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    };
+    const ExtendedHeap heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)),
+                                           ptr(&heap))))) return 42;
+    const Word rtv_start = invoke(heap, 9);
+    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    // Write after publishing the alias. Distinct colours identify incorrect slice and mip remapping.
+    for (UINT slice = 0; slice < 2; ++slice) {
+        for (UINT mip = 0; mip < owner.MipLevels; ++mip) {
+            D3D12_RENDER_TARGET_VIEW_DESC target{};
+            target.Format = owner.Format;
+            target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            target.Texture2DArray = {mip, slice, 1, 0};
+            const Word handle = rtv_start + (slice * owner.MipLevels + mip) * stride;
+            invoke(guest, 20, ptr(texture), ptr(&target), handle);
+            const float color[]{(17 + 100 * slice + 31 * mip) / 255.0f, 0, 0, 1};
+            invoke(list, 52, handle, ptr(color));
+        }
+    }
+    const D3D12_RECT full{0, 0, 8, 4};
+    invoke(list, 22, 1, ptr(&full));
+    invoke(list, 12, 3, 1);
     return 0;
 }

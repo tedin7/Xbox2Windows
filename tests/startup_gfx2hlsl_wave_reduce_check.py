@@ -58,6 +58,7 @@ MASK = 0xffffffff
 SIZE = 32                  # the draw is SIZE x SIZE pixels
 CLEAR = 0xbf800000         # -1.0: the target's clear value, kept by uncovered pixels
 MULTIPLIER = 0x9b5d
+BRANCH_AND_BIT = 0x00800000
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 failures = []
 
@@ -108,7 +109,7 @@ def sopp(op, simm=0):
     return struct.pack('<I', 0xbf800000 | (op << 16) | (simm & 0xffff))
 
 
-S_MOV_B32, S_WQM_B32, S_OR_SAVEEXEC_B32, S_OR_SAVEEXEC_B64 = 0x03, 0x09, 0x3d, 0x25
+S_MOV_B32, S_WQM_B32, S_AND_SAVEEXEC_B32, S_OR_SAVEEXEC_B32, S_OR_SAVEEXEC_B64 = 0x03, 0x09, 0x3c, 0x3d, 0x25
 EXEC_LO, INLINE_M1 = 126, 0xc1
 V_PERMLANEX16_B32, V_READLANE_B32, V_CNDMASK_B32_E64, V_LSHLREV_B32_E64 = 0x378, 0x360, 0x101, 0x11a
 V_CNDMASK_B32, V_CMP_GT_U32 = 0x01, 0xc4
@@ -258,6 +259,43 @@ def branch_program(op, into):
     words_before = sum(len(w) for _t, w in upto) // 4
     label = [('s_cbranch_execz label_%04X' % (4 * (1 + words_before)), sopp(0x08, words_before))]
     return program(label, body, END)
+
+
+NARROW_EXEC = [('s_and_saveexec_b32 s6, 0', sop1(S_AND_SAVEEXEC_B32, 6, 128))]
+RESTORE_EXEC = [('s_mov_b32 exec_lo, s6', sop1(S_MOV_B32, EXEC_LO, 6))]
+
+
+def branch_reduction(op, before_dispatch=(), result=END, pair=False, scc_vote=False):
+    """Jump to the condition, then select a reduction or a zero result for the whole wave."""
+    def jump(opcode, name, pc, target):
+        return [('%s label_%04X' % (name, target), sopp(opcode, (target - pc - 4) // 4))]
+
+    def size(part):
+        return sum(len(data) for _, data in part)
+
+    # 0xfffff < packed position iff y >= 16.
+    compare = [('v_cmp_lt_u32_e32 vcc_lo, 0xfffff, v0',
+                struct.pack('<II', 0x7c000000 | (0xc1 << 17) | 255, 0xfffff))]
+    zero_regs = (4, 6, 8) if pair else (2, 4)
+    zero = [('v_mov_b32_e32 v%d, 0' % reg, vop1_mov(reg, 128)) for reg in zero_regs]
+    head = start(op)
+    if op == 'v_and_b32':
+        # Keep one bit set in every input so even a large wave's AND differs from the other arm's zero.
+        head = head + [('v_or_b32_e32 v1, 0x%x, v1' % BRANCH_AND_BIT,
+                        vop2(VOP2_OPS['v_or_b32'], 1, 255, 1) + struct.pack('<I', BRANCH_AND_BIT))]
+    body = CMP + interleaved() + PAIR_RESULTS if pair else chain(op) + RESULT
+    entry = size(head)
+    reduce = entry + 4
+    dispatch = reduce + size(body) + 4
+    vote = dispatch + size(before_dispatch) + size(compare)
+    join = vote + 4 + size(zero)
+    opcode, name = (5, 's_cbranch_scc1') if scc_vote else (7, 's_cbranch_vccnz')
+    return program(head, jump(2, 's_branch', entry, dispatch), body,
+                   jump(2, 's_branch', dispatch - 4, join), before_dispatch, compare,
+                   jump(opcode, name, vote, reduce), zero, result)
+
+
+BRANCH_PAIR = branch_reduction('v_min_u32', result=export('v4', 'v6', 'v8'), pair=True)
 
 
 def branch_into_later_readlane():
@@ -567,6 +605,35 @@ def controls():
     text, reason = translate(branch_program('v_max_u32', False)[1])
     check('a forward execz branch is a wave vote and the chain still lowers', text is not None and
           'WaveActiveAnyTrue((exec & 1u) != 0u)' in text and 'WaveActiveMax(' in text, str(reason))
+    for op in OPS:
+        text, reason = translate(branch_reduction(op)[1])
+        check('accepts wave-uniform if/else with a backward edge for ' + op,
+              text is not None and INTRINSIC[op] in text and 'WaveActiveAnyTrue((vcc & 1u) != 0u)' in text
+              and '!WaveActiveAnyTrue' not in text, str(reason))
+    text, reason = translate(BRANCH_PAIR[1])
+    check('accepts the interleaved min/max with shared scratch in the reduction arm', text is not None and
+          'WaveActiveMin(v1)' in text and 'WaveActiveMax(v1)' in text, str(reason))
+    collected = []
+    G.Pipeline(VS_WORDS, BRANCH_PAIR[1], root_blob(), ps_hw_inputs=PACKED, refusals=collected)
+    check('the branched reduction also succeeds in refusal collection mode', not collected, str(collected))
+    # Narrow EXEC, then restore the saved entry mask before the branch back.
+    text, reason = translate(branch_reduction('v_max_u32', NARROW_EXEC + RESTORE_EXEC)[1])
+    check('accepts a proven EXEC restore on the incoming path', text is not None and
+          'v2 = WaveActiveMax(v1);' in text, str(reason))
+    for name, before, result, fragment in (
+        ('changed EXEC at the reduction', NARROW_EXEC, END, 'EXEC is not proven'),
+        ('saved EXEC overwritten before the restore',
+         NARROW_EXEC + [('s_mov_b32 s6, 0', sop1(S_MOV_B32, 6, 128))] + RESTORE_EXEC,
+         END, 'EXEC is not proven'),
+        ('WQM can enable helpers', WQM, END, 'EXEC is not proven'),
+        ('scratch read across the join', [], END_READS_VP, 'read after the chain'),
+    ):
+        text, reason = translate(branch_reduction('v_max_u32', before, result)[1])
+        check('refuses ' + name, text is None and reason is not None and fragment in reason, str(reason))
+    # Saveexec leaves an SCC that cannot be used as a wave-uniform condition in the one-lane model.
+    text, reason = translate(branch_reduction('v_max_u32', NARROW_EXEC + RESTORE_EXEC, scc_vote=True)[1])
+    check('refuses a backward SCC branch without a uniform condition', text is None and reason is not None and
+          'neither wave-uniform nor an EXEC / VCC vote' in reason, str(reason))
     for label, (source, words), fragment, model in refusals():
         text, reason = translate(words)
         check('refuses %s, by name' % label, text is None and reason is not None and 'wave reduction' in reason
@@ -668,6 +735,15 @@ REORDERED = {'v_max_u32, half mirror first': ('v_max_u32', (STEPS[2], STEPS[0], 
 DRAWS += [(label, program(start(op), chain(op, steps=steps), RESULT, END)[1]) + single(op) for label, (op, steps) in REORDERED.items()]
 
 
+BRANCHED = {'branched ' + op: (op, []) for op in OPS}
+BRANCHED['branched max with EXEC restore'] = ('v_max_u32', NARROW_EXEC + RESTORE_EXEC)
+DRAWS += [(label, branch_reduction(op, before)[1], op, (('branch', op), ('input', None), ('branch', op)))
+          for label, (op, before) in BRANCHED.items()]
+BRANCH_PAIR_LABEL = 'branched min then max, interleaved'
+DRAWS.append((BRANCH_PAIR_LABEL, BRANCH_PAIR[1], 'v_min_u32',
+              (('branch', 'v_min_u32'), ('branch_lane', pair_sdwa), ('branch', 'v_max_u32'))))
+
+
 def verify(input_op, channels, words):
     """Group the readback by desktop wave and compare with the CPU reference. Returns (errors, facts)."""
     pixels = struct.unpack('<%dI' % (len(words) // 4), words)
@@ -678,22 +754,32 @@ def verify(input_op, channels, words):
             if p == (CLEAR,) * 4:
                 continue
             groups[p[3] >> 16].append((x, y, p))
-    counts = set()
+    counts, arms = set(), set()
+    branched = any(kind == 'branch' for kind, _ in channels)
+    input_bits = BRANCH_AND_BIT if branched and input_op == 'v_and_b32' else 0
     for key, members in groups.items():
         lanes = [p[3] & 0xff for _x, _y, p in members]
         counts.update((p[3] >> 8) & 0xff for _x, _y, p in members)
         if len(set(lanes)) != len(lanes) or (key & 31, key >> 5) not in {(x, y) for x, y, _p in members}:
             errors.append('wave %d: lanes %s do not name one wave' % (key, lanes))
+        taken = any(y >= 16 for _x, y, _p in members)
+        arms.add(taken)
         reduced = {}
         for kind, op in channels:
-            if kind == 'reduce':
+            if kind in ('reduce', 'branch'):
                 value = IDENTITY[op]
                 for x, y, _p in members:
-                    value = apply(op, value, word(input_op, x, y))
-                reduced[op] = value
+                    value = apply(op, value, word(input_op, x, y) | input_bits)
+                reduced[kind, op] = 0 if kind == 'branch' and not taken else value
         for x, y, p in members:
-            expected = [reduced[arg] if kind == 'reduce' else word(input_op, x, y) if kind == 'input' else arg(x, y)
-                        for kind, arg in channels]
+            expected = []
+            for kind, arg in channels:
+                if kind in ('reduce', 'branch'):
+                    expected.append(reduced[kind, arg])
+                elif kind == 'input':
+                    expected.append(word(input_op, x, y) | input_bits)
+                else:
+                    expected.append(0 if kind == 'branch_lane' and not taken else arg(x, y))
             if list(p[:3]) != expected:
                 errors.append('pixel (%d,%d): %s, reference %s over %d pixels of its wave'
                               % (x, y, ' / '.join('%08x' % w for w in p[:3]),
@@ -702,6 +788,8 @@ def verify(input_op, channels, words):
     quads = {(x // 2, y // 2) for x, y in covered}
     partial_quads = sum(1 for qx, qy in quads
                         if sum((2 * qx + i, 2 * qy + j) in covered for i in (0, 1) for j in (0, 1)) < 4)
+    if branched and arms != {False, True}:
+        errors.append('the draw did not exercise both branch arms')
     if len(counts) != 1:
         errors.append('lane counts %s' % sorted(counts))
     lane_count = min(counts) if counts else 0
@@ -731,7 +819,15 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if text is None:
                 check('%s translates for the draw' % label, False, str(reason))
                 continue
-            if label in OPS or label in REORDERED:
+            branched = label in BRANCHED or label == BRANCH_PAIR_LABEL
+            if label == BRANCH_PAIR_LABEL:
+                hows = [('min/max swapped', PAIR_MUTATIONS['min and max swapped'])]
+            elif label in BRANCHED:
+                op, _ = BRANCHED[label]
+                hows = [('lane-local instead of a wave value', lambda t: t.replace(INTRINSIC[op], 'v1')),
+                        ('reversed wave vote', lambda t: t.replace('WaveActiveAnyTrue((vcc & 1u) != 0u)',
+                                                                  '!WaveActiveAnyTrue((vcc & 1u) != 0u)'))]
+            elif label in OPS or label in REORDERED:
                 label_op = REORDERED[label][0] if label in REORDERED else label
                 hows = [(how, (lambda t, f=f: f(t, label_op))) for how, f in MUTATIONS.items()]
             else:
@@ -759,8 +855,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     check('%s %s: every covered pixel matches its desktop wave' % (adapter, label),
                           not errors and clean, '; '.join(errors[:3]) + ' ' + run.stdout)
                 else:
-                    check('%s %s %s mutation fails against the reference: %s (%d pixels)' % (
-                        adapter, label, how, errors[0] if errors else '', len(errors)), bool(errors))
+                    mismatches = [err for err in errors if err.startswith('pixel (')] if branched else errors
+                    check('%s %s %s mutation fails against the reference: %s (%d mismatches)' % (
+                        adapter, label, how, mismatches[0] if mismatches else '', len(mismatches)), bool(mismatches))
 
 
 def assemble_object(llvm_mc, source):
@@ -793,15 +890,17 @@ def check_binary(llvm_mc):
                  ('e32 combine variant', program(START_MUL, chain('v_max_u32', combine='e32'), RESULT, END)),
                  ('VOP3 combine variant', program(START_MUL, chain('v_max_u32', combine='e64'), RESULT, END)),
                  ('rewritten permlane VGPR', program(START_MUL, chain('v_max_u32'), RESULT, KILL_VP, END_READS_VP))]
+    programs += [(label, branch_reduction(op, before)) for label, (op, before) in BRANCHED.items()]
+    programs.append((BRANCH_PAIR_LABEL, BRANCH_PAIR))
     for label, (source, words) in programs:
         if 'label_' not in source:
             built = assemble(llvm_mc, source)
         else:  # a branch: llvm-mc needs the label defined, at the word the fixture names
-            target = int(re.search(r'label_([0-9A-F]{4})', source).group(1), 16)
+            targets = {int(label, 16) for label in re.findall(r'label_([0-9A-F]{4})', source)}
             out, offset = [], 0
             for text, size in zip(source.splitlines(), [n for _o, n, _name, _t in G.decode(words)]):
-                if offset == target:
-                    out.append('L%04X:' % target)
+                if offset in targets:
+                    out.append('L%04X:' % offset)
                 out.append(text.replace('label_', 'L'))
                 offset += size
             built = assemble_object(llvm_mc, '\n'.join(out) + '\n')

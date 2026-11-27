@@ -69,6 +69,13 @@ hop through resolved texture SRVs of translated draws to known present targets.
 Once discovered, up to 32 such textures are eligible for producer history and
 readback under the same format and operation limits.
 
+Use `X2W_RED_PRODUCER_ONSET=black` with `X2W_RED_PRODUCER_AUTO=<first>,<count>`
+to select black onset. A sample is flat black when every sampled RGB channel
+is at most 8 and each is within four levels of the corresponding center
+channel. The preceding completed sample must contain a channel above 8.
+This mode uses the same capture window, attachment rows and input tracking
+as color onset, with a fixed black threshold in place of the RGB target.
+
 The producer rows report one RGBA8 texel before and after a clear or supported
 graphics draw to a known present target. They include the submitting queue and
 operation order. Present samples use the same texel, and attachment rows identify
@@ -87,7 +94,11 @@ check red and magenta, ignore an early exact match and a later near match, and
 refuse an out-of-range RGB component. The default-cadence case omits the signature
 override. The onset case compares a near-red center in a nonuniform picture with
 a uniform near-red picture, then checks the producer readbacks with onset on and
-automatic capture with onset off. Run the WARP and hardware checks separately
+automatic capture with onset off. The black case starts with two black frames,
+then checks a white frame, fade levels and nonuniform frames before flat near-black
+at present 8. Its CPU reference expects capture on frames 10 and 11 after publication
+at present 9 and checks the GPU producer texels. The exact-black auto control arms
+on present 1 and must differ from that reference. Run the WARP and hardware checks separately
 when reporting adapter results.
 
 ```powershell
@@ -222,6 +233,23 @@ of only 64 bytes, and an unproven overlapping write all leave the target clear.
 
 Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
 `ctest --preset release -j1 --no-tests=error -R '^startup_indirect_copy_provenance_' -V`.
+
+### Title-memory tables in translated indirect draws
+
+With the same title-input switch, compute can also snapshot a readable range
+outside any placed buffer. Translated indirect draws additionally require
+`X2W_INDIRECT_TABLE_SNAPSHOT=1`, which defaults off, and
+`X2W_TRANSLATED_INDIRECT_DRAW=1`. The table range is capped at 16 MiB when the
+draw snapshot switch is on. Refusal logs identify the table lookup failure,
+and typed-view format failures report the DXGI format number.
+
+The WARP cases use a three-vertex draw with an unplaced title-memory table.
+They compare every target pixel to a CPU raster reference, check the named
+switch-off refusal, and require a one-record shift to disagree with the original
+reference while matching the shifted triangle. A typed-view control checks
+the numeric format in the refusal and the clear target.
+
+Run `ctest --preset dev --no-tests=error -R '^startup_indirect_table_snapshot(_off|_shifted|_format)?_warp$' -V`.
 
 ### Packed pixel position in a source-built shader
 
@@ -10139,14 +10167,6 @@ and the changed root or argument page at submission.
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_warp_dual-trace$' -V
 ```
 
-For a rejected indirect graphics pipeline, the runtime census records the
-command kind, key and refusal reason. A refused mesh dispatch with a known
-request key contributes to `x2w-render key use mesh`. The tester bundle ranks
-refused mesh requests by these counts and includes their request files within
-its existing limits. The `startup_indirect_mesh_request_warp` fixture checks
-per-key counts for both stage layouts. The `startup_tester_pack` check
-exercises request ranking and zip contents.
-
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound
@@ -15129,6 +15149,16 @@ cmake --build --preset dev --target offscreen_check d3d12_xs_shim
 ctest --preset dev --no-tests=error -R '^startup_image_sample_a16_(controls|warp|hardware)$' -V
 ```
 
+## Startup translator: packed D16 level-zero sampling
+
+Graphics `image_sample_lz d16` narrows the float result of `SampleLevel(..., 0)` to binary16 with round-to-nearest-even.
+The dmask selects channels in RGBA order, with the first channel in the low half of each destination VGPR.
+An odd mask leaves only the low half of the final register defined.
+
+On Windows run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sample_lz_d16_(controls|warp)$'`.
+The WARP fixture checks 64 integer readback words from a synthetic RGBA32_FLOAT texture against the CPU reference.
+The mip-one and truncation mutants must both differ from that reference and match their own CPU predictions.
+
 ## Startup translator: D16 image loads
 
 For `image_load` and `image_load_mip` with `d16` on 2D (including NSA, and `a16` on level-zero `image_load`), 3D and 2D-array resources, `tools/startup/gfx2hlsl.py` narrows each enabled `dmask` component of the `Load` result to IEEE binary16 and packs the halves pairwise into `ceil(popcount(dmask) / 2)` consecutive VGPRs (low half first, high half second). HLSL `f32tof16` truncates toward zero on WARP (lowering 31,740 of the 65,536 `DXGI_FORMAT_R16_UNORM` depth values by 1 ULP relative to RDNA hardware), while narrowing an intermediate binary32 `Load` value still double-rounds `R16_UNORM` at `0xffaf` (`0x3bfe` instead of `0x3bfd`) and `0xffef` (`0x3c00` instead of `0x3bff`). `gfx2hlsl.py` therefore emits both an integer binary32-to-binary16 round-to-nearest-even helper (`pack16_rne`, quieting NaNs while preserving sign) and an exact `UNORM16` helper (`pack16_unorm16`, recovering `u = uint(saturate(v) * 65535.0 + 0.5)` and rounding `u / 65535` directly to binary16), selected per SRV via `udsrc <ud> d16unorm16 <index>`, and writes `d16srv <index> exact` to `<key>.txt`. Before drawing, `src/startup_stubs/d3d12_draw.inl` (`src/startup_stubs/d16_image_format.h`) validates the bound view's effective `DXGI_FORMAT` against the 14 independently GPU-verified exact formats (five 32-bit float views, six 8-bit `UNORM` views, and three 16-bit `UNORM` views), setting `d16unorm16` to `1` for `R16*_UNORM` and `0` for the exact binary32/`UNORM8` formats while refusing integer (`UINT`/`SINT`), typeless, depth-stencil-only, `SNORM16`, `R24_UNORM`, `SRGB`, block-compressed, packed-target stand-in, console extension, null-resource and unbound views. When `popcount(dmask)` is odd (`1` or `3`), bits `31:16` of the final destination VGPR are hardware-undefined on RDNA 2; `gfx2hlsl.py` tracks those registers across expressions and basic blocks and refuses whole-word reads unless consumed through a low-16-bit operation (`v_cvt_f32_f16`, `v_cvt_f32_ubyte0`/`1`, `SDWA` `BYTE_0`/`BYTE_1`/`WORD_0`, `v_and_b32` with constant mask `<= 0xffff`, `v_cmp_class_f16`/`v_cmpx_class_f16`, or `v_fma_mix*` half operands). Pipelines without D16 image loads omit all helpers and `d16srv` lines; sampler MIMG forms with `d16`, 1D and cube dimensions, `image_load_mip` or 3D / 2D-array `a16`, `tfe`, `lwe`, `r128`, set reserved MIMG bits, an empty `dmask`, and mismatched register counts remain refused.
@@ -15242,7 +15272,12 @@ ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hard
 ### Compute mip-zero gather
 
 The startup compute translator accepts `image_gather4_lz` on a 2D texture with
-the same constant sampler and one-hot component selection as the pixel form.
+one-hot component selection and a constant sampler. It keeps the sampler words
+for wrap, mirror, clamp, mirror-once and predefined border colors. For
+unnormalized coordinates, it divides X and Y by the extent of view mip zero
+before gathering. Non-sequential address encodings supply X and Y in operand
+order. Half-border modes, mirror-once-border and register border colors still
+have explicit refusals.
 The eight image descriptor words must come from one intact descriptor at a
 fixed table offset. The compute manifest records the texture SRV, sampler and
 raw output UAV. The fixture binds these on the standalone D3D12 compute runner.
@@ -15255,6 +15290,19 @@ starting at resource mip 0 and each RGBA component with the view starting at
 mip 1. The controls drop the gather, select red in place of green, bind mip 0
 in place of mip 1, or swap the first and last taps. The reference predicts
 4, 4, 4 and 2 mismatching words respectively.
+
+Ten additional synthetic dispatches check address modes, three predefined
+border colors, linear mip filtering, both ways to request unnormalized
+coordinates, and X/Y in non-sequential registers. The runner decodes the
+translated static sampler from the manifest. Each dispatch also has a control
+with wrong addressing, coordinate interpretation or view mip. The CPU reference
+specifies the first wrong word and mismatch count for each control.
+
+On Linux x64, `python3 -B tests/startup_compute_gather_lz_check.py --llvm-mc llvm-mc-19`
+passed the translation and encoding checks. All ten new programs were refused
+at the base revision `e8015da7a`. HLSL and manifests matched byte for byte
+for 16 existing channel fixtures across the pixel and compute gather paths.
+The expanded dispatch suite awaits Windows WARP readback.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
@@ -15297,12 +15345,34 @@ It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
 uav N tex2da float table P O channels 4 in the version 2 manifest.
 The [startup runtime array UAV binding](experiments/startup-compute-array-uav.md)
 consumes this manifest for full-mask FP32 and packed D16 compute stores.
-Pixel arrays and the 1D, 3D and cube store forms remain refused.
+Full-mask FP32 compute stores also support 1D and 3D views.
 
 The standalone GPU fixture writes the same four words into mip zero of layer 1
 and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
 64 differences with the store omitted and 128 with the layer changed. Use the
 startup_compute_image_store CTests above to repeat the comparison.
+
+For FP32 stores with DMASK `0x1` through `0xe`, the startup compute translator
+reads the texel through the same UAV, replaces the selected channels in
+consecutive VDATA order, and writes it back under EXEC. This covers 1D, 2D,
+2D-array and 3D output views. The version 2 manifest adds `uavload N` for
+each affected output. Dispatch requires typed UAV load and store support for
+the bound format. [D3D12 typed UAV load support](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads)
+
+The read-modify-write assumes exclusive texel ownership by each active lane,
+including across groups and through aliasing UAV views, for the duration of
+the operation. The translator does not prove ownership. Lanes that write
+different channels of the same texel can lose updates. A partial D16 store
+remains unsupported.
+
+The WARP fixtures dispatch two groups against an RGBA32_FLOAT UAV. They compare
+every channel of every texel, including untouched mips and slices, against a
+CPU reference for each of the 14 masks on all four shapes. Each control
+replaces the typed load with zero and must fail at the first preserved channel.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_compute_image_store_partial_(1d|2d|array|3d)_warp$' -V
+```
 
 ### Explicit-LOD 2D gather
 
@@ -15335,23 +15405,28 @@ ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_har
 
 ### Startup compute raw buffer atomics
 
-The startup compute translator lowers 32-bit gfx1013 raw `offen` MUBUF buffer
+The startup compute translator lowers 32-bit gfx1013 MUBUF buffer
 atomics (`buffer_atomic_add`, `sub`, `smin`, `umin`, `smax`, `umax`, `and`,
 `or`, `xor`, `swap`, and `cmpswap`) through fixed-table unmodified `RWByteAddressBuffer`
-descriptors (`u0`). Addresses combine the `vaddr` byte offset, optional `soffset`
-register or aligned immediate, and aligned 12-bit `offset` rounded down by
-`& 0xfffffffcu`, guarded under `(exec & 1)` when `EXEC` is narrowed.
+descriptors (`u0`). The raw UAV view starts at the descriptor base. The byte
+address within it adds the scalar `soffset` and 12-bit `offset` to the
+`offen` VGPR byte offset, the `idxen` VGPR index times the descriptor's
+14-bit stride, or zero for `off`. The summed immediate terms
+must be dword-aligned. The emitted address rounds down to a dword, and
+`(exec & 1)` guards the atomic when `EXEC` is narrowed. Indexed addressing
+assumes a non-swizzled descriptor.
 
 `glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
 `cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
 `(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
 and `smin`/`smax` use signed `asint` overloads.
-Returning `buffer_atomic_add` also accepts `off` with a scalar byte offset
-register. The fixture increments separate counters at scalar offsets 0 and 32
-with immediate offsets 0 and 4, and records the returned old values.
-Each readback compares all 320 words, including the untouched guards.
-Dropping either offset, the old-value return, or the observer store changes
-the expected output. `idxen`, other scalar-only forms, `slc`/`dlc`,
+The synthetic address fixtures exercise all eleven operations with and without
+`glc` for `idxen` and `off`, using instruction immediates and inline or
+register `soffset`. The indexed fixture uses two lanes and a 12-byte stride.
+Each dispatch checks all 320 UAV words against a CPU reference, including the
+observed return values and untouched words. Mutations remove the immediate,
+scalar offset or return, or replace the descriptor stride with four bytes.
+The combined `idxen offen` form, `slc`/`dlc`,
 unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
 and `inc`/`dec`/float/64-bit forms stay refused.
 

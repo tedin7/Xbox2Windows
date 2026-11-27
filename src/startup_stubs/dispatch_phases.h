@@ -41,6 +41,30 @@ inline double ticks_per_us() noexcept
     return per_us;
 }
 
+// Active only on the thread recording a measured copy. Existing lock timers
+// can submit their elapsed ticks without taking a second timestamp.
+struct LockWaitScope {
+    inline static thread_local LockWaitScope* active = nullptr;
+    LockWaitScope* previous = active;
+    bool over_one_ms = false;
+
+    LockWaitScope() noexcept { active = this; }
+    ~LockWaitScope() { active = previous; }
+
+    static void note(std::uint64_t ticks) noexcept
+    {
+        if (active && ticks > 1000 * ticks_per_us()) active->over_one_ms = true;
+    }
+};
+
+inline void acquire_copy_lock(SRWLOCK* lock, bool exclusive = false) noexcept
+{
+    const auto start = LockWaitScope::active ? now_ticks() : 0;
+    if (exclusive) AcquireSRWLockExclusive(lock);
+    else AcquireSRWLockShared(lock);
+    if (LockWaitScope::active) LockWaitScope::note(now_ticks() - start);
+}
+
 struct Totals {
     volatile LONG64 calls[kind_count] = {};
     volatile LONG64 ticks[kind_count][phase_count] = {};

@@ -4,15 +4,18 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 #include "startup_stream_draw.h"
+#include "startup_stubs/local_log.h"
 #include "../src/startup_stubs/packed_target_format.h"
 #include "startup_stream_setup.h"
 
@@ -416,6 +419,80 @@ bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& b
 }
 }  // namespace
 
+extern "C" __declspec(dllimport) LONG64 x2w_d3d12_thread_draw_lock_calls();
+
+static int draw_during_resets(ID3D12Device* desktop, void* guest, StreamTarget& frame, const char* pixels)
+{
+    constexpr unsigned worker_count = 4, rounds = 256;
+    const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    const auto succeeded = [](Word hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); };
+    const auto make_allocator = [&](void*& allocator) {
+        return succeeded(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
+                                arg(&allocator)));
+    };
+    struct Worker { void* allocator{}; void* list{}; LONG64 calls{}; bool failed{}; };
+    std::array<Worker, worker_count> workers{};
+    void* next_allocator = nullptr;
+    void* gate = nullptr;
+    if (!make_allocator(next_allocator) ||
+        !succeeded(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate)))) return 80;
+    for (auto& worker : workers) {
+        if (!make_allocator(worker.allocator) ||
+            !succeeded(invoke(guest, 73, arg(list_desc), arg(worker.allocator), 0,
+                              arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&worker.list)))) return 81;
+    }
+    if (!succeeded(invoke(frame.queue, 17, arg(gate), 1))) return 82;
+
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::array<std::thread, worker_count> threads;
+    for (unsigned i = 0; i < worker_count; ++i) {
+        threads[i] = std::thread([&, i] {
+            auto& worker = workers[i];
+            ++ready;
+            while (!start.load()) SwitchToThread();
+            for (unsigned j = 0; j < rounds; ++j) {
+                const LONG64 before = x2w_d3d12_thread_draw_lock_calls();
+                const bool reset = succeeded(invoke(worker.list, 139, arg(worker.allocator)));
+                worker.calls += x2w_d3d12_thread_draw_lock_calls() - before;
+                if (!reset || !succeeded(invoke(worker.list, 9)) ||
+                    !succeeded(invoke(worker.allocator, 8))) {
+                    worker.failed = true;
+                    break;
+                }
+            }
+        });
+    }
+    while (ready.load() != worker_count) SwitchToThread();
+    start.store(true);
+    for (unsigned i = 0; i < 16; ++i) invoke(frame.list, 12, 3, 1);
+    const bool closed = succeeded(invoke(frame.list, 9));
+    if (closed) invoke(frame.queue, 10, 1, arg(&frame.list));
+    const bool signaled = closed && succeeded(invoke(frame.queue, 14, arg(frame.fence), 1));
+
+    // Reset the sampler-bearing recording before its submit can execute.
+    const LONG64 before = x2w_d3d12_thread_draw_lock_calls();
+    const bool reset = signaled && succeeded(invoke(frame.list, 139, arg(next_allocator)));
+    LONG64 calls = x2w_d3d12_thread_draw_lock_calls() - before;
+    const bool pending = invoke(frame.fence, 8) == 0;
+    const bool unblocked = succeeded(invoke(gate, 10, 1));
+    for (auto& thread : threads) thread.join();
+    for (const auto& worker : workers) {
+        if (worker.failed) return 83;
+        calls += worker.calls;
+        invoke(worker.list, 2);
+        invoke(worker.allocator, 2);
+    }
+    if (!reset || !pending || !unblocked || !succeeded(invoke(frame.list, 9))) return 84;
+    const auto deadline = GetTickCount64() + 10000;
+    while (invoke(frame.fence, 8) < 1 && GetTickCount64() < deadline) Sleep(1);
+    if (invoke(frame.fence, 8) != 1) return 85;
+    invoke(gate, 2);
+    invoke(next_allocator, 2);
+    std::printf("x2w-reset-bench resets=%u draw_lock_acquires=%lld\n", worker_count * rounds + 1, calls);
+    return read_stream_target(desktop, frame, pixels);
+}
+
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
@@ -444,9 +521,16 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (!bind_dropmips(desktop.Get(), guest, binding)) return 36;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
-    if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
+    if (two_targets) frame.count = 2;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        GetEnvironmentVariableW(L"X2W_TEST_GBUFFER_TARGETS", nullptr, 0)) {
+        frame.count = 2;
+        frame.second_format = DXGI_FORMAT_R32_UINT;
+    }
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           legacy && !bc7 && !bc_chain && !vertex_sample ? width / 2 : width, frame)) return rc;
+    if (GetEnvironmentVariableW(L"X2W_TEST_RESET_BENCH", nullptr, 0))
+        return draw_during_resets(desktop.Get(), guest, frame, pixels);
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -455,7 +539,38 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
     void* vertex_resource = nullptr;
-    if (index_probe[0]) {
+    const bool read_cache_clipped = !std::strcmp(index_probe, "read-cache-clipped");
+    const bool read_cache_probe = read_cache_clipped || !std::strcmp(index_probe, "read-cache");
+    static constexpr SIZE_T cache_page = 4096, cache_slots = 96;
+    unsigned char* cache_indices = nullptr;
+    const x2w_local::ReadCacheApi* cache = nullptr;
+    const auto draw_cache_indices = [&] {
+        const D3D12_RECT full{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        invoke(list, 22, 1, arg(&full));
+        for (SIZE_T i = 0; i < cache_slots; ++i) {
+            const D3D12_INDEX_BUFFER_VIEW view{arg(cache_indices + i * 2 * cache_page), 8, DXGI_FORMAT_R16_UINT};
+            invoke(list, 47, arg(&view));
+            invoke(list, 13, 3, 1, 1, 0, 0);
+        }
+    };
+    if (read_cache_probe) {
+        wchar_t path[32768];
+        const auto length = GetEnvironmentVariableW(L"X2W_TEST_READ_CACHE_XMEM", path, static_cast<DWORD>(std::size(path)));
+        if (!length || length >= std::size(path) || !LoadLibraryW(path)) return 75;
+        cache = x2w_local::read_cache();
+        if (!cache) return 76;
+        cache_indices = static_cast<unsigned char*>(VirtualAlloc(nullptr, cache_slots * 2 * cache_page,
+                                                                 MEM_RESERVE, PAGE_NOACCESS));
+        if (!cache_indices) return 71;
+        for (SIZE_T i = 0; i < cache_slots; ++i) {
+            auto* page = cache_indices + i * 2 * cache_page;
+            if (!VirtualAlloc(page, cache_page, MEM_COMMIT, PAGE_READWRITE)) return 71;
+            const std::uint16_t triangle[] = {9, 1, 2, 0};
+            const std::uint16_t clipped[] = {9, 4, 5, 3};
+            std::memcpy(page, read_cache_clipped ? clipped : triangle, sizeof(triangle));
+        }
+        draw_cache_indices();
+    } else if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
         const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;
@@ -529,6 +644,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
         if (const int result = draw_1d_srvs(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_UNREGISTERED_1D_SRV", nullptr, 0)) {
+        extern int draw_unregistered_1d_address_srv(void*, void*);
+        if (const int result = draw_unregistered_1d_address_srv(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_SLOT70_TEXTURE_ALIAS", nullptr, 0)) {
+        extern int draw_slot70_texture_alias(void*, void*);
+        if (const int result = draw_slot70_texture_alias(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV_1D", nullptr, 0)) {
         extern int draw_1d_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_1d_address_srvs(desktop.Get(), guest, list)) return result;
@@ -556,6 +677,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0)) {
         extern int draw_formatted_buffer(void*, void*);
         if (const int result = draw_formatted_buffer(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_CUBE_SRV", nullptr, 0)) {
+        extern int draw_cube_address_srv(ID3D12Device*, void*, void*);
+        if (const int result = draw_cube_address_srv(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_VOLUME_SRV", nullptr, 0)) {
         extern int draw_volume_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_volume_address_srvs(desktop.Get(), guest, list)) return result;
@@ -593,8 +717,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
-        extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
-        if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
+        extern int draw_frame_copies(ID3D12Device*, void*, StreamTarget&, void*, UINT, UINT, const char*, const char*);
+        char mode[16]{};
+        GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", mode, sizeof(mode));
+        const int result = draw_frame_copies(desktop.Get(), guest, frame, pso, width, height, pixels, mode);
+        if (result || !std::strncmp(mode, "once-mirror", 11)) return result;
     } else {
         if (vertex_sample) {
             extern bool copy_vertex_sample_texture(void*, void*, bool, void*&);
@@ -713,7 +840,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         frame.attachments[0] = std::move(big);
         frame.count = 1;
     }
-    if (std::wcscmp(viewport_mode, L"reset") == 0) {
+    if (read_cache_probe || std::wcscmp(viewport_mode, L"reset") == 0) {
         if (const int rc = submit(1)) return rc;
         const float clear[] = {0, 0, 1, 1};
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
@@ -723,10 +850,20 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 50, 1, arg(&rtv));
         invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         invoke(list, 25, arg(pso));
-        invoke(list, 12, 3, 1);
+        if (read_cache_probe) {
+            const auto before = cache->stats();
+            draw_cache_indices();
+            const auto after = cache->stats();
+            const auto queries = after.queries - before.queries;
+            std::printf("read cache: %llu queries / %zu indexed draws\n", queries, cache_slots);
+            if (queries >= cache_slots || after.hits - before.hits < cache_slots) return 78;
+        } else {
+            invoke(list, 12, 3, 1);
+        }
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (cache_indices && !VirtualFree(cache_indices, 0, MEM_RELEASE)) return 79;
     if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
     if (vertex_resource) invoke(vertex_resource, 2);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
