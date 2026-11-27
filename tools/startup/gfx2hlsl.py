@@ -8296,7 +8296,15 @@ class Stage:
         if len(ops) != 3:
             raise Unsupported('s_buffer_load with %d operands' % len(ops))
         dst = reg_range(ops[0])
-        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+        into_mask = count == 1 and ops[0] == 'vcc_lo'
+        if into_mask:
+            # A wave32 VCC fits in one word. Only model per-lane VALU selects from this
+            # write: scalar consumers would need the whole word, and branches a merge.
+            if (self.kind != 'ps' or self.has_branches or not wave32_exec_proof(self.ins)
+                    or any(name not in ('s_waitcnt', 'v_cndmask_b32_e32', 'exp', 's_endpgm')
+                           for at, _, name, _ in self.ins if at > self.pc)):
+                raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
+        elif not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
             raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
         key = self.descriptor(ops[1])
         token = smem_offset(ops[2])
@@ -8318,7 +8326,7 @@ class Stage:
             offset = self.smem_soffset(token)
             extra = imm or 0
             sreg = reg_range(token)
-            if sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
+            if not into_mask and sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
                 self.emit('a = %s;' % offset)
                 offset = 'a'
         # A word read from an unmodified table buffer at a literal offset or at a root constant word times a literal
@@ -8336,7 +8344,7 @@ class Stage:
                 where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
         # RDNA 2 scalar buffer addressing clears the low two bits of the final address.
         # The raw view starts at the aligned descriptor base. Align once before loading either word.
-        if waterfall and (extra % 4 or not self.operand_align4(token)):
+        if (waterfall or into_mask) and (extra % 4 or not self.operand_align4(token)):
             self.emit('a = (%s + %du) & ~3u;' % (offset, extra))
             offset, extra = 'a', 0
         # All words use the original offset, even when a destination overwrites its register.
@@ -8344,6 +8352,10 @@ class Stage:
         for i in range(count):
             address = '%s + %d' % (offset, extra + 4 * i)
             expr = self.dynamic_heap_load(key, '(%s) & ~3u' % address) if dynamic else '%s.Load(%s)' % (buf, address)
+            if into_mask:
+                self.needs_sm6 = True
+                self.emit('vcc = (%s >> (WaveGetLaneIndex() & 31u)) & 1u;' % expr)
+                return
             self.set_s(dst[1] + i, expr, uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
@@ -14970,6 +14982,7 @@ def raise_site(error):
 # only the next run: before the title starts tester_run retries every old refusal (--retry-lifted), these families
 # first, within PRE_RUN_RETRY_SECONDS. A lift adds the reason it removes here so it goes first.
 LIFTED_REASONS = (
+    ('pixel-buffer-mask-word', r'^s_buffer_load destination vcc_lo for 1 dwords$'),
     ('embedded-vertex-table', r'^s_getpc_b64: the shader load address is only elided '
                               r'for a program that also calculates a branch target'),
     ('lod-bias', r'with a sampler LOD bias'),
