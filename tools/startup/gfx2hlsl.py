@@ -4967,7 +4967,7 @@ class Stage:
 
     def materialize_mask_words(self, base, sources):
         """Collect one console wave's low word in guest lane order, independent of the host wave size."""
-        if (base not in ('s_mul_i32', 'v_sub_f32', 'v_mul_f32') or self.kind != 'cs'
+        if (base not in ('s_mul_i32', 'v_sub_f32', 'v_mul_f32') or getattr(self, 'kind', None) != 'cs'
                 or not self.quad_flow_straight() or not self.exec_known or self.wqm_exec):
             return {}
         x, y, z = self.pipe.group
@@ -5013,7 +5013,7 @@ class Stage:
         words = (self.materialize_mask_words(base, ops[1:])
                  if needs_word and len(ops) == 3 and hasattr(self, 'packable_masks') else {})
         packable = getattr(self, 'packable_masks', None)
-        copied_mask = (packable is not None and self.kind == 'cs' and base in ('s_mov_b32', 's_mov_b64')
+        copied_mask = (packable is not None and getattr(self, 'kind', None) == 'cs' and base in ('s_mov_b32', 's_mov_b64')
                        and len(ops) == 2 and self.packable_mask(ops[1]))
         if packable:
             writes = scalar_destinations(base, asm)
