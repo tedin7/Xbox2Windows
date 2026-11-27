@@ -134,13 +134,13 @@ bool in_window()
 // destination handle instead of being written, because a later write to the same handle supersedes it. The calls still
 // held when the window opens are written then, with their original sequence numbers, so the player (which plays by
 // sequence) restores the descriptors before the first window call.
-bool desc_snapshot_enabled;
+bool desc_snapshot_enabled, held_emit_pending;  // present() writes the held calls once it has let go of its buffer lock
 void emit_held_srvs();
 void update_window()
 {
     window_open = in_window();
     if (window_open) {
-        if (prefix_open && desc_snapshot_enabled) emit_held_srvs();
+        if (prefix_open && desc_snapshot_enabled) held_emit_pending = true;
         if (!window_base_set) {
             window_base_bytes = prefix_open ? bytes_written : 0;
             window_base_set = true;
@@ -998,6 +998,13 @@ void present()
         }
     }
     update_window();
+    if (held_emit_pending) {
+        // record_call takes this thread's buffer lock, which present() holds: let go of it (SRW locks are not recursive).
+        held_emit_pending = false;
+        ReleaseSRWLockExclusive(&b.lock);
+        emit_held_srvs();
+        AcquireSRWLockExclusive(&b.lock);
+    }
     if (window_open || present == first_present) {
         const u64 seq = static_cast<u64>(InterlockedIncrement64(&next_seq));
         struct { u64 seq; std::int32_t present, pad; double seconds; } mark{seq, present, 0, seconds_now()};
