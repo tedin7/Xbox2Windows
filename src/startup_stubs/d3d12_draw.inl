@@ -3527,7 +3527,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (!read_descriptor_entry_words(*tr, pass, descriptor_words)) {
         if (indirect) indirect->set_refusal("descriptor entry word unavailable", indirect_refusal_code::descriptor_word_not_ready);
         draw_lock_release_exclusive();
-        return not_drawn(pass, list, not_drawn_key, 1);
+        return not_drawn(1);
     }
     if (indirect) {
         if (!indirect_guest_root_matches(*bound, pass)) {
