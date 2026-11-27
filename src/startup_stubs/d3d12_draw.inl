@@ -2908,7 +2908,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
-    if (unfilled_heap_slot(words)) return refuse("an input buffer descriptor has zero records");
+    // A compute input with no records reads zeros, as a D3D12 null descriptor does; any other caller keeps the refusal.
+    if (unfilled_heap_slot(words)) return compute_input ? IndirectBufferView{nullptr, 0, 0, 0, false, 0, true}
+                                                        : refuse("an input buffer descriptor has zero records");
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         const bool known = read_view_token(words, record);
@@ -2996,7 +2998,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         std::memset(zero_bytes, 0, 16);
         return {zero_ring, zero_offset, 16, 0, true, 3};
     }
-    if (!bytes) return refuse("an input buffer descriptor has zero records");
+    if (!bytes) return compute_input ? IndirectBufferView{nullptr, 0, 0, 0, false, 0, true}
+                                     : refuse("an input buffer descriptor has zero records");
     const bool title_inputs = compute_input && compute_title_inputs_enabled();
     const u64 legacy_limit = limit;
     if (title_inputs) limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
