@@ -527,6 +527,27 @@ constexpr char compute_revision[] = "x2w-startup-shader-28cs";  // tools/startup
 constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
 }  // namespace shader_cache
 
+bool extended_buffer_formats()
+{
+    static const bool enabled = [] {
+        const DWORD saved = GetLastError();
+        char value[2]{};
+        const bool on = GetEnvironmentVariableA("X2W_EXTENDED_BUFFER_FORMATS", value, sizeof(value)) == 1 &&
+                        value[0] == '1';
+        SetLastError(saved);
+        return on;
+    }();
+    return enabled;
+}
+
+u64 shader_cache_seed(const char* revision, std::size_t bytes)
+{
+    const u64 seed = fnv_bytes(revision, bytes);
+    // Keep graphics bytecode with extended cases out of the default request namespace.
+    constexpr char feature[] = "extended-buffer-formats1";
+    return extended_buffer_formats() ? fnv_bytes(feature, sizeof(feature) - 1, seed) : seed;
+}
+
 // Once per process, before its first request: <X2W_SHADER_CACHE>\revision.txt names this runtime's revisions, so
 // that the launchers (tools/startup/shader_cache_revision.py) can warn before they start a translator of another
 // revision. A file that already says the same is left as it is.
@@ -723,7 +744,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
                                 const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
-    const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
+    const u64 seed = shader_cache_seed(shader_cache::revision, sizeof(shader_cache::revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
@@ -901,8 +922,8 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
-    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
-                                                                                 sizeof(shader_cache::mesh57_revision) - 1))));
+    const u64 seed = shader_cache_seed(shader_cache::mesh57_revision, sizeof(shader_cache::mesh57_revision) - 1);
+    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, seed)));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
@@ -3090,10 +3111,16 @@ struct FormattedBufferDescriptor {
     std::uint32_t words[8] = {};
 };
 
-// Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
-// buffer view the title created (words[0] its token) the word the driver builds from its format and component
-// mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
-const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+struct FormattedViewDetails {
+    bool present = false;
+    UINT format = 0;
+    UINT mapping = 0;
+};
+
+// Use the hardware word or synthesize it from a typed view token. An unsupported hardware code
+// is returned in format. Draws may also request the DXGI format and component mapping for diagnostics.
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format,
+                                   bool extended = false, FormattedViewDetails* details = nullptr)
 {
     if (words[0] == view_token_magic) {
         ViewRecord record{};
@@ -3104,9 +3131,10 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
         D3D12_SHADER_RESOURCE_VIEW_DESC view;
         std::memcpy(&view, record.desc, 40);
-        return x2w_startup::view_word3(view, words[3]);
+        if (details) *details = {true, static_cast<UINT>(view.Format), view.Shader4ComponentMapping};
+        return x2w_startup::view_word3(view, words[3], extended);
     }
-    if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
+    if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code, extended)) {
         format = code;
         return "unsupported FORMAT";
     }
@@ -3115,8 +3143,26 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
 
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
-    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+    // On by default so a tester log names the missing view format; X2W_FORMATTED_BUFFER_DIAGNOSTICS=0 turns it off.
+    static const bool view_diagnostics = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("X2W_FORMATTED_BUFFER_DIAGNOSTICS", value, sizeof(value)) != 1 || value[0] != '0';
+    }();
+    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0,
+                            FormattedViewDetails view = {}) {
         InterlockedIncrement(&formatted_draws_refused);
+        if (view.present) {
+            // The caller holds draw_lock exclusively. Log the first view refusal per pipeline and slot.
+            static std::unordered_map<u64, std::uint32_t> seen;
+            const std::uint32_t mask = 1u << slot;
+            auto& slots = seen[tr.key];
+            if (!(slots & mask)) {
+                slots |= mask;
+                log("x2w-draw %016llx srv %d: formatted buffer refused (%s DXGI format %u mapping 0x%x)",
+                    tr.key, slot, reason, view.format, view.mapping);
+            }
+            return false;
+        }
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
@@ -3136,7 +3182,10 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
         std::uint32_t format = 0;
-        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
+        FormattedViewDetails view;
+        if (const char* reason = formatted_buffer_word3(
+                descriptor.words, format, extended_buffer_formats(), view_diagnostics ? &view : nullptr))
+            return refuse(ud.a, reason, format, view);
         descriptor.entry = entry;
     }
     return true;

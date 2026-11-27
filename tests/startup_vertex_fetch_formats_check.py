@@ -349,10 +349,10 @@ def controls():
         alignments = {(v * stride + offset) % 4 for v in range(16)}
         assert len(alignments) > 1 if bits < 32 else alignments == {0}, name
 
-    # buffer_load_format_x/xy/xyz: every table format has a switch case, and the codes match the disassembler's.
+    # Every vertex-fetch format is also decoded by the legacy formatted-load switch.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
     from disasm_rdna2 import MTBUF_FORMATS
-    assert gfx2hlsl.DESC_FORMAT_CODES.keys() == gfx2hlsl.FETCH_FORMATS.keys()
+    assert gfx2hlsl.DESC_LEGACY_FORMATS == gfx2hlsl.FETCH_FORMATS.keys()
     def table_matches(table):
         for name, (code, *_rest) in FORMATS.items():
             if code == 1:  # the omitted tbuffer format: LLVM prints nothing, the disassembler has no name for it

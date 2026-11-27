@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 int failures;
@@ -92,6 +93,61 @@ int main(int argc, char** argv)
                                        x2w_startup::formatted_buffer_supported(77));
     refused("hardware DST_SEL 3", x2w_startup::descriptor_word3_refusal(77u << 12 | 3u | 5u << 3 | 6u << 6 | 7u << 9),
             "descriptor DST_SEL reserved value");
+
+    static constexpr struct {
+        DXGI_FORMAT format;
+        std::uint32_t code;
+    } added[] = {
+        {DXGI_FORMAT_R8_SNORM, 2},
+        {DXGI_FORMAT_R8_SINT, 6},
+        {DXGI_FORMAT_R16_UNORM, 7},
+        {DXGI_FORMAT_R16_SNORM, 8},
+        {DXGI_FORMAT_R16_UINT, 11},
+        {DXGI_FORMAT_R16_SINT, 12},
+        {DXGI_FORMAT_R16_FLOAT, 13},
+        {DXGI_FORMAT_R8G8_SNORM, 15},
+        {DXGI_FORMAT_R8G8_UINT, 18},
+        {DXGI_FORMAT_R8G8_SINT, 19},
+        {DXGI_FORMAT_R32_UINT, 20},
+        {DXGI_FORMAT_R32_SINT, 21},
+        {DXGI_FORMAT_R16G16_SINT, 28},
+        {DXGI_FORMAT_R11G11B10_FLOAT, 36},
+        {DXGI_FORMAT_R10G10B10A2_UINT, 54},
+        {DXGI_FORMAT_R8G8B8A8_SNORM, 57},
+        {DXGI_FORMAT_R8G8B8A8_SINT, 61},
+        {DXGI_FORMAT_R32G32_UINT, 62},
+        {DXGI_FORMAT_R32G32_SINT, 63},
+        {DXGI_FORMAT_R16G16B16A16_UNORM, 65},
+        {DXGI_FORMAT_R16G16B16A16_SNORM, 66},
+        {DXGI_FORMAT_R16G16B16A16_UINT, 69},
+        {DXGI_FORMAT_R16G16B16A16_SINT, 70},
+        {DXGI_FORMAT_R32G32B32A32_UINT, 75},
+        {DXGI_FORMAT_R32G32B32A32_SINT, 76},
+    };
+    for (const auto& entry : added) {
+        check("extended FORMAT disabled by default",
+              x2w_startup::buffer_format_code(entry.format) == 0 &&
+              !x2w_startup::formatted_buffer_supported(entry.code));
+        check("extended hardware FORMAT", x2w_startup::formatted_buffer_supported(entry.code, true));
+        check("extended view identity",
+              !x2w_startup::view_word3(typed(entry.format), word, true) &&
+              word == (entry.code << 12 | identity));
+        static constexpr UINT mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 4, 0, 5);
+        const std::uint32_t selects = ignore_mapping ? identity : (5 | 4 << 6 | 1 << 9);
+        if (x2w_startup::view_word3(typed(entry.format, mapping), word, true) ||
+            word != (entry.code << 12 | selects)) {
+            std::printf("FAIL extended view mapping for DXGI %u\n", static_cast<UINT>(entry.format));
+            ++failures;
+        }
+    }
+    for (const auto format : {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                              DXGI_FORMAT_R16_TYPELESS}) {
+        refused("unsupported extended view", x2w_startup::view_word3(typed(format), word, true),
+                x2w_startup::undecoded_view_format);
+        check("unsupported extended view leaves word 0", word == 0);
+    }
+    refused("extended view invalid mapping", x2w_startup::view_word3(typed(DXGI_FORMAT_R8_SINT, 0), word, true),
+            "invalid component mapping");
 
     if (failures) return 1;
     std::printf("startup_buffer_format_word3: all checks passed\n");

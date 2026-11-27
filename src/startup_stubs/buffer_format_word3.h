@@ -15,7 +15,7 @@ namespace x2w_startup {
 // FORMAT codes of tools/startup/gfx2hlsl.py DESC_FORMAT_CODES (gfx10 unified formats, as LLVM 15 encodes the
 // tbuffer format: operand) for the DXGI format whose typed read gives the same components; 0 for any other
 // format. tests/startup_buffer_format_word3_table_check.py keeps both tables equal.
-inline std::uint32_t buffer_format_code(DXGI_FORMAT format)
+inline std::uint32_t buffer_format_code(DXGI_FORMAT format, bool extended = false)
 {
     switch (format) {
     case DXGI_FORMAT_R8_UNORM: return 1;
@@ -33,6 +33,35 @@ inline std::uint32_t buffer_format_code(DXGI_FORMAT format)
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 71;
     case DXGI_FORMAT_R32G32B32_FLOAT: return 74;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return 77;
+    default: break;
+    }
+    if (!extended) return 0;
+    switch (format) {
+    case DXGI_FORMAT_R8_SNORM: return 2;
+    case DXGI_FORMAT_R8_SINT: return 6;
+    case DXGI_FORMAT_R16_UNORM: return 7;
+    case DXGI_FORMAT_R16_SNORM: return 8;
+    case DXGI_FORMAT_R16_UINT: return 11;
+    case DXGI_FORMAT_R16_SINT: return 12;
+    case DXGI_FORMAT_R16_FLOAT: return 13;
+    case DXGI_FORMAT_R8G8_SNORM: return 15;
+    case DXGI_FORMAT_R8G8_UINT: return 18;
+    case DXGI_FORMAT_R8G8_SINT: return 19;
+    case DXGI_FORMAT_R32_UINT: return 20;
+    case DXGI_FORMAT_R32_SINT: return 21;
+    case DXGI_FORMAT_R16G16_SINT: return 28;
+    case DXGI_FORMAT_R11G11B10_FLOAT: return 36;
+    case DXGI_FORMAT_R10G10B10A2_UINT: return 54;
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return 57;
+    case DXGI_FORMAT_R8G8B8A8_SINT: return 61;
+    case DXGI_FORMAT_R32G32_UINT: return 62;
+    case DXGI_FORMAT_R32G32_SINT: return 63;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return 65;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return 66;
+    case DXGI_FORMAT_R16G16B16A16_UINT: return 69;
+    case DXGI_FORMAT_R16G16B16A16_SINT: return 70;
+    case DXGI_FORMAT_R32G32B32A32_UINT: return 75;
+    case DXGI_FORMAT_R32G32B32A32_SINT: return 76;
     default: return 0;
     }
 }
@@ -41,13 +70,13 @@ inline constexpr char undecoded_view_format[] = "view format has no decoded buff
 
 // Word 3 for a typed buffer view: DST_SEL 4..7 for channels x..w, 0 and 1 for the forced constants. Returns
 // nullptr and sets `word`, or the reason no word can be given (the draw is then refused, not read as zeros).
-inline const char* view_word3(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::uint32_t& word)
+inline const char* view_word3(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::uint32_t& word, bool extended = false)
 {
     word = 0;
     if (view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || view.Buffer.Flags != D3D12_BUFFER_SRV_FLAG_NONE ||
         view.Buffer.StructureByteStride != 0)
         return "not a typed buffer view";
-    const std::uint32_t code = buffer_format_code(view.Format);
+    const std::uint32_t code = buffer_format_code(view.Format, extended);
     if (!code) return undecoded_view_format;
     const UINT mapping = view.Shader4ComponentMapping;
     if ((mapping >> 12) != 1) return "invalid component mapping";
