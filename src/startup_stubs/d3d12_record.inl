@@ -354,9 +354,23 @@ void generic_memory(ArgumentCapture& capture, std::uint32_t arg, u64 address, u6
     }
 }
 
+// Generic capture is bounded per device slot: past generic_slot_budget bytes a slot's calls are recorded without that
+// memory (logged once per slot), so one hot slot whose stack words look like pointers cannot fill the file.
+constexpr LONG64 generic_slot_budget = 32ll << 20;
+LONG64 volatile generic_spent[wide_slots];
+LONG volatile generic_bounded[wide_slots];
+
 void record_generic(ArgumentCapture& capture)
 {
     const Call& call = capture.call;
+    const int slot = call.slot < wide_slots ? call.slot : 0;
+    if (InterlockedCompareExchange64(&generic_spent[slot], 0, 0) >= generic_slot_budget) {
+        if (!InterlockedExchange(&generic_bounded[slot], 1))
+            log("x2w-replay record: device slot %d spent its %lld MiB of generic argument memory; its later calls are "
+                "recorded without it", slot, static_cast<long long>(generic_slot_budget >> 20));
+        return;
+    }
+    const std::size_t before = capture.remaining;
     for (std::uint32_t i = 0; i < call_args; ++i) {
         const u64 value = call.args[i];
         if (value < 0x10000 || value >= 0x7fffffffffffull || as_wrapper(reinterpret_cast<const void*>(value))) continue;
@@ -369,6 +383,7 @@ void record_generic(ArgumentCapture& capture)
         const bool followed = i < generic_followed_args;
         generic_memory(capture, i, value, followed && i + 1 < generic_followed_args ? call.args[i + 1] : 0, followed ? 2 : 0);
     }
+    InterlockedAdd64(&generic_spent[slot], static_cast<LONG64>(before - capture.remaining));
 }
 
 void record_arguments(ArgumentCapture& capture)
@@ -420,6 +435,8 @@ void record_arguments(ArgumentCapture& capture)
             break;
         case 36: capture.create(2); break;
         case 39: capture.arg(0, sizeof(D3D12_QUERY_HEAP_DESC)); capture.create(1); break;
+        case 1:   // AddRef and Release take no argument: the words are the caller's stack
+        case 2:
         case 15:  // descriptor increment size: no memory
         case 23:  // CopyDescriptors: the exact DARR arrays only
         case 24:  // CopyDescriptorsSimple: CPU handles, which the player translates

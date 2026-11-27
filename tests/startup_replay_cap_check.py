@@ -162,6 +162,18 @@ def main(scene, backend):
         assert trigger and int(trigger.group(1)) <= 16 and int(trigger.group(2)) >= 300, opened or text[-3000:]
         end_totals(slow)
 
+        # The prefix stays compact: the scene's 16000 device AddRef/Release calls take no argument, so their stack words
+        # are not captured as memory.
+        refcount, argument_seqs = set(), set()
+        for tag, header, _ in chunks(windowed.read_bytes()):
+            if tag == "CALL":
+                seq, _, kind, slot, _, *_ = CALL.unpack(header)
+                if kind == 0 and slot in (1, 2):
+                    refcount.add(seq)
+            elif tag == "ARGM":
+                argument_seqs.add(struct.unpack_from("<Q", header)[0])
+        assert len(refcount) >= 16000 and not refcount & argument_seqs, (len(refcount), len(refcount & argument_seqs))
+
         timings = {}
         for name, extra in (("plain", {}), ("closed", {"X2W_REPLAY_RECORD": "f100000,1"}),
                             ("recorded", {"X2W_REPLAY_RECORD": "all"})):
