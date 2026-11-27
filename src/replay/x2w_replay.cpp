@@ -844,6 +844,8 @@ void write_summary(const Options& o, const Player& p, const Recording& r, double
                      p.arena_bytes, p.shared_bytes, peak_private_bytes(), stopped ? "true" : "false", p.event_waits,
                      p.unpaced_waits, p.event_wait_seconds);
         const PageReplay& pages = page_replay();
+        std::fprintf(f, "\"view_tokens\": {\"rewritten\": %llu, \"unmapped\": %llu}, ",
+                     pages.view_tokens_rewritten, pages.view_tokens_unmapped);
         std::fprintf(f, "\"pages\": {\"maps\": %zu, \"applied\": %llu, \"written\": %llu, \"zero\": %llu, \"missing\": %llu, "
                         "\"bad_maps\": %llu, \"title_memory_args\": %llu}, \"ranges\": [",
                      r.maps.size(), pages.maps_applied, pages.pages_written, pages.zero_pages, pages.missing_pages, pages.bad_maps,
@@ -952,10 +954,13 @@ PrefixLive prefix_live_of(const Recording& r, u64 window_seq)
 
 int run(const Options& o)
 {
-    // Read the player switch before applying settings from the recording.
+    // Read the player switches before applying settings from the recording.
     wchar_t timing_switch[2]{};
     const bool time_slots = GetEnvironmentVariableW(L"X2W_REPLAY_TIMING", timing_switch, 2) == 1
                             && timing_switch[0] == L'1';
+    wchar_t view_token_switch[2]{};
+    const bool translate_view_tokens = !(GetEnvironmentVariableW(L"X2W_REPLAY_VIEW_TOKENS", view_token_switch, 2) == 1
+                                         && view_token_switch[0] == L'0');
     CreateDirectoryW(o.out.c_str(), nullptr);
     const std::wstring log_path = o.out + L"\\stderr.txt";
     const HANDLE log = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1021,6 +1026,16 @@ int run(const Options& o)
         say("x2w-replay: the stand-in made no device");
         return 4;
     }
+    using TakeViewId = std::uint64_t (*)();
+    TakeViewId take_view_id = nullptr;
+    auto& pages = page_replay();
+    if (translate_view_tokens && r.has_view_ids) {
+        // Device creation has loaded the delay-linked stand-in.
+        if (const HMODULE shim = GetModuleHandleW(L"d3d12_xs.dll"))
+            take_view_id = reinterpret_cast<TakeViewId>(GetProcAddress(shim, "x2w_d3d12_take_view_id"));
+        if (!take_view_id) say("x2w-replay: x2w_d3d12_take_view_id export unavailable, view token translation disabled");
+        pages.rewrite_view_tokens = take_view_id != nullptr;
+    }
     // The recorded device: the object most device-kind calls are made on. A struct-return call (slots 25, 26, 108) names
     // the title's return buffer as its object and the device second, so those calls do not vote; a recording that starts
     // with one must not bind a stack address as the device.
@@ -1075,6 +1090,14 @@ int run(const Options& o)
     };
     u64 index = 0;
     Step s;  // the call being played, loaded from the mapping
+    const auto play_step = [&] {
+        const bool learn_view_id = take_view_id && s.has_view_id;
+        if (learn_view_id) take_view_id();  // discard any view stored by a previous step
+        const bool played = play(p, r, s);
+        if (learn_view_id && played)
+            if (const u64 id = take_view_id())
+                pages.view_ids[s.recorded_view_id] = static_cast<std::uint32_t>(id);
+    };
     for (const StepRef& ref : r.steps) {
         r.load(ref, s);
         if (o.max_seconds > 0 && elapsed() >= o.max_seconds) {
@@ -1090,12 +1113,12 @@ int run(const Options& o)
         ++index;
         if (timing) {
             const auto before = ReplayClock::now();
-            play(p, r, s);
+            play_step();
             const auto after = ReplayClock::now();
             timing->add(s.call, after - before);
             timing->report(after, p);
         } else {
-            play(p, r, s);
+            play_step();
         }
     }
     current_step = nullptr;
@@ -1119,6 +1142,7 @@ int run(const Options& o)
         "%llu fence waits timed out, %llu mapped and %llu GPU address ranges translated, %.3f s",
         p.played, r.steps.size(), p.unknown_object, p.missing_blob, p.presents, p.fence_timeouts, p.mapped, p.gpu_addresses, wall);
     say_commit(p, "at the end");
+    say("x2w-replay: view tokens: rewritten %llu, unmapped %llu", pages.view_tokens_rewritten, pages.view_tokens_unmapped);
     say("x2w-replay: frame waits not paced: %llu of %llu (%.3f s inside them)%s", static_cast<unsigned long long>(p.unpaced_waits),
         static_cast<unsigned long long>(p.event_waits), p.event_wait_seconds, p.pace ? ", --pace on" : "");
     say("x2w-replay: memory: peak private %llu MiB; %zu calls kept as %zu-byte references into the mapped file",

@@ -22,11 +22,13 @@ struct PageRange { u64 address, bytes; };
 constexpr u64 draw_root_window = 0x10000;   // a root address has no size: the stand-in reads up to 64 KiB from it
 constexpr u64 draw_span_limit = 4ull << 20;  // larger vertex/index spans are left to the page scans
 constexpr std::size_t draw_pending_limit = 64;
+constexpr u64 draw_table_window = 64u << 10;
 std::unordered_map<u64, std::vector<PageRange>> draw_pending;  // list -> spans bound since its last draw or dispatch
 std::vector<PageRange> draw_ranges;  // the title ranges by address
 bool draw_ranges_missed;             // gathered again this Present for a span outside them
 LONG draw_ranges_present = -1, draw_time_present = -1;
 u64 draw_captures, draw_outside, draw_over_time, draw_pending_dropped;
+u64 draw_table_spans, draw_descriptor_buffers;
 u64 draw_ranges_gathered;
 double draw_time_used, draw_ranges_ms;
 bool draw_time_logged;
@@ -525,8 +527,10 @@ const PageRange* draw_find_range(u64 address)
 void draw_log_counters(LONG present, double used)
 {
     log("x2w-replay draw pages: captures %llu, outside title memory %llu, over the per-present time %llu, "
-        "pending dropped %llu, ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
-        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, draw_ranges_gathered, draw_ranges_ms,
+        "pending dropped %llu, table spans %llu, descriptor buffers %llu, "
+        "ranges gathered %llu (%.1f ms), used %.1f ms of %.0f ms at present %ld",
+        draw_captures, draw_outside, draw_over_time, draw_pending_dropped, draw_table_spans, draw_descriptor_buffers,
+        draw_ranges_gathered, draw_ranges_ms,
         used, draw_pages_ms, present);
 }
 
@@ -547,6 +551,19 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
         draw_ranges_missed = false;
     }
     const PageRange* range = draw_find_range(span.address);
+    constexpr u64 mask = x2w_replay::page_bytes - 1;
+    PageRange descriptor{};
+    if (!range) {
+        AcquireSRWLockShared(&descriptor_lock);
+        for (const auto& heap : descriptor_ranges) {
+            if (span.address < heap.title || span.address - heap.title >= heap.bytes) continue;
+            const u64 base = heap.title & ~mask;
+            descriptor = {base, ((heap.title + heap.bytes + mask) & ~mask) - base};
+            break;
+        }
+        ReleaseSRWLockShared(&descriptor_lock);
+        if (descriptor.bytes) range = &descriptor;
+    }
     if (!range && !draw_ranges_missed) {
         draw_ranges_missed = true;
         LARGE_INTEGER before{}, after{};
@@ -562,7 +579,6 @@ void draw_capture_span(const PageRange& span, LONG present, u64 stamp, LARGE_INT
     }
     if (!range) { ++draw_outside; return; }
     if (page_after_cut(*range)) return;
-    constexpr u64 mask = x2w_replay::page_bytes - 1;
     const u64 end = (std::min)(range->address + range->bytes,
         (span.address + (std::min<u64>)(span.bytes, draw_span_limit) + mask) & ~mask);
     bool captured = false;
@@ -596,13 +612,28 @@ void draw_consume_pending(u64 list, LONG present, u64 stamp, LARGE_INTEGER& star
     draw_pending.erase(it);
 }
 
-void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
+LONG draw_begin_capture()
 {
     const LONG present = InterlockedCompareExchange(&presents, 0, 0);
     if (draw_time_present != present) {
         draw_time_present = present;
         draw_time_used = 0;
     }
+    return present;
+}
+
+void draw_end_capture(LONG present, const LARGE_INTEGER& start)
+{
+    draw_time_used += page_ms_since(start);
+    if (draw_time_used >= draw_pages_ms && !draw_time_logged) {
+        draw_time_logged = true;
+        draw_log_counters(present, draw_time_used);
+    }
+}
+
+void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
+{
+    const LONG present = draw_begin_capture();
     LARGE_INTEGER start{};
     QueryPerformanceCounter(&start);
     if (slot <= 14 || slot == 61) {
@@ -623,11 +654,42 @@ void draw_pages_at_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, u64 stamp)
                     draw_add_pending(list, views[i].BufferLocation, views[i].SizeInBytes);
         }
     }
-    draw_time_used += page_ms_since(start);
-    if (draw_time_used >= draw_pages_ms && !draw_time_logged) {
-        draw_time_logged = true;
-        draw_log_counters(present, draw_time_used);
+    draw_end_capture(present, start);
+}
+
+void draw_note_span(u64 list, u64 address, u64 bytes, bool pending, bool table)
+{
+    if (!call_seq || !draw_pages || !window_open || !address || !bytes) return;
+    ThreadBuffer& b = my_buffer();
+    // Same lock order as pages_before_call. The stand-in has finished resolving the table or view.
+    AcquireSRWLockExclusive(&b.lock);
+    AcquireSRWLockExclusive(&pages_lock);
+    if (window_open && page_writer && !page_budget_reached && !stop_requested && active) {
+        const LONG present = draw_begin_capture();
+        LARGE_INTEGER start{};
+        QueryPerformanceCounter(&start);
+        page_target = &b;
+        draw_capture_span({address, bytes}, present, call_seq - 1, start);
+        page_target = nullptr;
+        if (table) ++draw_table_spans;
+        else ++draw_descriptor_buffers;
+        if (pending) draw_add_pending(list, address, bytes);
+        draw_end_capture(present, start);
     }
+    ReleaseSRWLockExclusive(&pages_lock);
+    ReleaseSRWLockExclusive(&b.lock);
+}
+
+void draw_pages_note(u64 list, u64 address, u64 bytes, bool pending)
+{
+    draw_note_span(list, address, bytes, pending, pending);
+}
+
+u64 draw_table_entry(const x2w_startup::ViewTable& table, u64 offset, u64 bytes)
+{
+    const u64 entry = table.record(offset, bytes);
+    if (entry && offset + bytes > draw_table_window) draw_note_span(0, entry, bytes, false, true);
+    return entry;
 }
 
 // With submit scans enabled, changes observed at Present must follow the latest scanned submission.
