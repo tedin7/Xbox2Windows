@@ -784,7 +784,7 @@ def render(pipe, G):
             for n in mask_operands(G, name, G.parse(asm)[1]):
                 hi_words.update((n, n + 1))
     scalars = sorted(set(scalars) | {'s%d' % n for n in hi_words | {106, 107}})
-    words = scalars + ['exec_lo', 'exec_hi', 'm0']
+    words = scalars + ['exec_lo', 'exec_hi', 'm0'] + sorted(s.uniform_load_temps)
     saved = words + ['scc']
     hlsl.extend('    uint %s[128];' % name for name in vgprs)
     hlsl.extend('    %s saved_%s[2];' % ('bool' if name == 'scc' else 'uint', name) for name in saved)
@@ -830,7 +830,6 @@ def render(pipe, G):
     ]
     if getattr(s, 'used_scratch', False):
         hlsl.append('            uint discard_word = 0u;')
-    hlsl.extend('            uint %s = 0u;' % name for name in sorted(s.uniform_load_temps))
     if 'uint' in s.used_atomic:
         hlsl.append('            uint ao = 0u;')
     if 'int' in s.used_atomic:

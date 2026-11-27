@@ -10677,7 +10677,7 @@ class Stage:
             return
         if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
-        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) == 'ps':
+        if p[1] == ('resheap',) and not base_off and count == 8 and getattr(self, 'kind', None) in ('ps', 'ms'):
             return self.dynamic_heap_image_record(dst, base, token, imm)
         if p[1] == ('resheap',) and not base_off and getattr(self, 'kind', None) in ('vs', 'ps', 'ms'):
             return self.dynamic_heap_record(dst, base, token, imm, count,
@@ -10689,7 +10689,7 @@ class Stage:
         # A vertex or mesh stage may load the record inside a branch arm: the index lives in a temporary that is declared at
         # the top of the function (uniform_load_temps), because the block that assigns it is not the block that reads
         # it. Pixel and compute stages keep refusing the load in a branch.
-        in_branch = self.has_branches
+        in_branch = self.has_branches or getattr(self, 'serial_mesh', False)
         if (count != 4 or dst[2] > 105 or (in_branch and getattr(self, 'kind', None) not in ('vs', 'ms'))
                 or len(self.sym[base[1]]) != 2 or not r or r[0] != 's' or not self.uniform_source(token)
                 or self.sym.get(base[2]) != ('const', 0)):
@@ -10704,7 +10704,7 @@ class Stage:
             self.sym[dst[1] + i] = ('desc', ('dynamic_heap', name), 0, i)
 
     def dynamic_heap_image_record(self, dst, base, token, imm):
-        """s_load_dwordx8 D, <resource heap pointer>, R in a pixel stage: the whole 32-byte heap record at byte R, the
+        """s_load_dwordx8 D, <resource heap pointer>, R in a pixel or mesh stage: the whole 32-byte heap record at byte R, the
         image descriptor of the view that heap slot (R >> 5) holds. The texture is picked at run time from the bound
         shader-model 6.6 heap (see image_texture); the descriptor words themselves are never read. The index lives in a
         function-scope temporary, so a later block (a branch arm, a join) reads the value this load wrote."""
@@ -10725,7 +10725,7 @@ class Stage:
             return self.pipe.resource(key, kind) if key is not None else None
         types = {'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>',
                  'tex3d': 'Texture3D<float4>'}
-        if self.kind != 'ps' or len(key[0]) != 3 or kind not in types or key[1] != 0 or key in self.pipe.modified:
+        if self.kind not in ('ps', 'ms') or len(key[0]) != 3 or kind not in types or key[1] != 0 or key in self.pipe.modified:
             raise Unsupported('dynamic resource heap views require a raw buffer load')
         self.pipe.uses_dynamic_heap = True
         name = 'heap_tex_%x' % self.pc

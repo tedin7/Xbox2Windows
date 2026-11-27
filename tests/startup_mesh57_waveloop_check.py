@@ -6,7 +6,7 @@ import tempfile
 from unittest.mock import patch
 
 from startup_mesh57_loop_check import DATA_DEP
-from startup_mesh57_skeleton_check import G, GROUP_MESH, HEAP_SETUP, MESH, PIXEL, heap_root, request, refusal_head
+from startup_mesh57_skeleton_check import G, GROUP_MESH, HEAP_MESH, HEAP_SETUP, MESH, PIXEL, heap_root, request, refusal_head
 
 
 # Separate allocation block for wave 0, followed by a partial-EXEC lane read.
@@ -90,6 +90,18 @@ def check_vcc_descriptor_alias():
         assert 's[104:107] needs four consecutive words' in status, status
 
 
+def check_mesh_heap_image_record():
+    # Replace the fixture's dynamic buffer read with an image record and a 2D load.
+    at = HEAP_MESH.index('f408070d')
+    image = ['f40c080d', '30000000',  # s_load_dwordx8 s[32:39], s[26:27], s24
+             'f0000108', '00081414']  # image_load v20, v[20:21], s[32:39]
+    program = HEAP_MESH[:at] + image + HEAP_MESH[at + 4:]
+    for mode in ('0', 'force'):
+        status, output = run(program, mode, root_blob=heap_root(), artifacts=True)
+        assert status == 'ok', status
+        assert b'dynamic_heap' in output['ms57.txt'].splitlines()
+
+
 def main():
     refused, _ = run(SERIAL_MESH, '0')
     assert refused.startswith('unsupported: slot 57 mesh'), refused
@@ -128,6 +140,7 @@ def main():
     check_exec_zero_symbols()
     check_scalar_uniformity()
     check_vcc_descriptor_alias()
+    check_mesh_heap_image_record()
     print('ok')
 
 
