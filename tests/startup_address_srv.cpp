@@ -303,6 +303,50 @@ int draw_1d_srvs(void* guest, void* list)
     return 0;
 }
 
+// Columns 0..5 sample a single cube. Column 6 reuses that resource with an array view.
+// Column 7 uses a cube view over a resource containing two cubes.
+int draw_cube_srvs(void* guest, void* list)
+{
+    constexpr std::size_t slice_stride = 64 * 1024;  // Placed title texture slice alignment.
+    alignas(4096) static std::array<std::array<unsigned char, 12 * slice_stride>, 2> data{};
+    void* textures[2]{};
+    for (unsigned i = 0; i < data.size(); ++i) {
+        const auto slices = static_cast<UINT16>(6 * (i + 1));
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, slices, 1,
+            DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+        for (unsigned face = 0; face < slices; ++face) {
+            const unsigned char color[] = {static_cast<unsigned char>(31 + 29 * (face % 6)), 73, 181, 255};
+            std::memcpy(data[i].data() + face * slice_stride, color, sizeof(color));
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(data[i].data()), ptr(&desc),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i]))))) return 41;
+    }
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC cube{};
+    cube.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    cube.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    cube.TextureCube.MipLevels = 1;
+    auto array = cube;
+    array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    array.Texture2DArray = {0, 1, 0, 6, 0, 0};
+
+    const auto draw = [&](LONG left, LONG right) {
+        const D3D12_RECT strip{left, 0, right, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    invoke(guest, 18, ptr(textures[0]), ptr(&cube), cpu);
+    draw(0, 6);
+    invoke(guest, 18, ptr(textures[0]), ptr(&array), cpu);
+    draw(6, 7);
+    invoke(guest, 18, ptr(textures[1]), ptr(&cube), cpu);
+    draw(7, 8);
+    return 0;
+}
+
 int draw_bc_address_srvs(void* guest, void* list)
 {
     wchar_t path[MAX_PATH]{};

@@ -540,6 +540,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_root_cbv(void*, void*);
         if (const int result = root_heap_control(desktop.Get())) return result;
         if (const int result = draw_root_cbv(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_CUBE_SRV", nullptr, 0)) {
+        extern int draw_cube_srvs(void*, void*);
+        if (const int result = draw_cube_srvs(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
         if (const int result = draw_1d_srvs(guest, list)) return result;

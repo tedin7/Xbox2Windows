@@ -27,6 +27,7 @@
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/present_readback_state.h"
 #include "startup_stubs/pixel_history.h"
+#include "startup_stubs/draw_cube_srv.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"

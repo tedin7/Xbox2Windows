@@ -224,6 +224,57 @@ def check_unregistered_1d(directory, consumer, backend):
         print(f"{backend}: placed 1D {case}; all 32 RGBA pixels exact for its CPU reference")
 
 
+CUBE_SHADER = """TextureCube<float4> cube : register(t0);
+SamplerState point_sampler : register(s0);
+static const float3 directions[6] = {
+    float3(1, 0.25, -0.125), float3(-1, 0.25, 0.125),
+    float3(0.25, 1, -0.125), float3(0.25, -1, 0.125),
+    float3(0.25, 0.125, 1), float3(-0.25, 0.125, -1)
+};
+float4 main(float4 p : SV_Position) : SV_Target {
+    return cube.SampleLevel(point_sampler, directions[(uint)p.x % 6u], 0);
+}
+"""
+
+
+def check_cube(directory, consumer, backend):
+    env, args, output = prepare_draw_cache(
+        directory, consumer, CUBE_SHADER, {"X2W_TEST_CUBE_SRV": "1", "X2W_TEST_FULL_TARGET": "1"},
+        "srv 0 texcube table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
+    )
+    result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 77:
+        return 77
+    if result.returncode:
+        raise RuntimeError(f"consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+
+    actual = output.read_bytes()
+    assert len(actual) == 8 * 4 * 4, f"expected 32 RGBA8 pixels, got {len(actual)} bytes"
+    # Mapping kind 5 to Texture2DArray breaks the first six columns.
+    # Removing wrong_cube_view makes the last column read face 1.
+    cases = (
+        *((f"cube face {face}", bytes((31 + 29 * face, 73, 181, 255))) for face in range(6)),
+        ("2D array view of six slices", bytes(4)),
+        ("cube view of twelve slices", bytes(4)),
+    )
+    for x, (case, expected) in enumerate(cases):
+        for y in range(4):
+            at = 4 * (y * 8 + x)
+            rgba = actual[at:at + 4]
+            assert rgba == expected, f"{case} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
+    # Slot 18 records the title view. These diagnostics must come from the
+    # real draw binder, including for the cube view whose dimension matches.
+    mismatches = re.findall(r"srv 0: view dimension (\d+) does not match the shader; binding null", result.stderr)
+    assert mismatches == ["5", "9"], f"expected array then cube mismatch, got {mismatches}\n{result.stderr[-5000:]}"
+    print(f"{backend}: six cube faces, array-view null and twelve-slice null match the CPU reference")
+    return 0
+
+
 if __name__ == "__main__":
+    consumer, backend, *mode = sys.argv[1:]
+    if mode and mode != ["cube"]:
+        raise SystemExit("expected consumer backend [cube]")
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
+        run = check_cube if mode == ["cube"] else check
+        sys.exit(run(Path(temporary), consumer, backend))
