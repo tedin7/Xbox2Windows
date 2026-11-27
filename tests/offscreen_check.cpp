@@ -82,9 +82,7 @@ ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp, ComPtr<I
     };
     ComPtr<IDXGIAdapter1> adapter;
     if (warp) {
-        const HRESULT hr = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
-        if (hr == DXGI_ERROR_NOT_FOUND) return {};
-        check(hr, "EnumWarpAdapter");
+        check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter");
         check(create_device(adapter.Get()), "Create device");
         return adapter;
     }
@@ -2524,7 +2522,7 @@ int main(int argc, char** argv)
         auto adapter = select_adapter(factory.Get(), cli.mode == "warp", device);
 #endif
         if (!adapter) {
-            std::printf("No D3D12-capable %s adapter visible\n", cli.mode == "warp" ? "WARP" : "hardware");
+            std::puts("No D3D12-capable hardware adapter visible");
             return 77;
         }
         DXGI_ADAPTER_DESC1 desc{};
