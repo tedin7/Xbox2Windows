@@ -29,6 +29,15 @@ double page_scan_ms = 250.0;
 // the smaller ranges come first: constants, vertex and index data, small textures before the big ones.
 u64 page_budget_bytes, page_range_limit = 8ull << 20, page_bytes_out, page_skipped_big;
 bool page_budget_reached;
+// The base image may use 3/4 of the budget: the rest keeps the window's changed pages (a per-frame descriptor ring,
+// constants), without which the window replays from stale memory. When the base image stops there, the range it stopped
+// in and the ones after it in scan order (by size, then address) stay out of the later scans too.
+bool page_base_cut;
+u64 page_cut_bytes, page_cut_address;  // the first range the base image did not finish
+bool page_after_cut(const PageRange& r)
+{
+    return page_base_cut && (r.bytes > page_cut_bytes || (r.bytes == page_cut_bytes && r.address >= page_cut_address));
+}
 std::vector<PageRange> page_ranges;   // pages_lock
 std::size_t page_cursor_range;        // pages_lock
 u64 page_cursor_offset;               // pages_lock
@@ -187,9 +196,25 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
     std::vector<unsigned char> buffer(page_slab_bytes);
     std::size_t visited = 0;
     bool stopped_early = false;
+    const u64 base_limit = page_budget_bytes - page_budget_bytes / 4;
     while (visited < page_ranges.size() && !stopped_early) {
         const PageRange range = page_ranges[page_cursor_range];
+        if (page_after_cut(range)) page_cursor_offset = range.bytes;  // not in the base image: left out
         while (page_cursor_offset < range.bytes) {
+            // The next slab could take the base image past its share (one slab is up to 1 MiB of pages).
+            const u64 slab = (std::min<u64>)(page_slab_bytes, range.bytes - page_cursor_offset);
+            if (everything && page_bytes_out + slab > base_limit) {
+                page_base_cut = true;
+                page_cut_bytes = range.bytes;
+                page_cut_address = range.address;
+                log("x2w-replay pages: the base image stopped at %llu MiB, 3/4 of the %llu MiB page budget: ranges of %llu "
+                    "bytes and more are left out, the rest of the budget keeps the window's changed pages",
+                    page_bytes_out >> 20, page_budget_bytes >> 20, range.bytes);
+                page_cursor_range = 0;
+                page_cursor_offset = 0;
+                stopped_early = true;
+                break;
+            }
             if (page_bytes_out >= page_budget_bytes) {
                 if (!page_budget_reached) {
                     page_budget_reached = true;

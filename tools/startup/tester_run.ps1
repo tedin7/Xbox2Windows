@@ -67,6 +67,8 @@ param(
     [string]$Record = "",                        # replay recorder (X2W_REPLAY_RECORD): "auto" = "slow": a 10 s window opened by the first slowdown (a present with a >= 500 ms gap after 120 s, fallback 180 s), 400 MiB cap, "140,60" = from 140 s for 60 s of the run, or "f4000,24" = 24 frames from frame 4000. Its own run: with -Input accept, never with -Matrix. PRIVATE game data: local, then Drive/browser upload, never GitHub
     [int]$RecordMaxMiB = 0,                     # hard cap of the recording (X2W_REPLAY_MAX_MIB); 0 = 400 for -Record auto, 2048 for an explicit window; the run refuses to start with less than twice this free on the disk
     [int]$RecordPrefixMaxMiB = 512,             # cap of the part of the recording before the window (X2W_REPLAY_PREFIX_MAX_MIB); the window cap above counts from where the window opens. Raise it (e.g. 1024) when a run starts its window late and the log says "prefix only"
+    [int]$RecordPagesMaxMiB = 0,                # title memory pages the recording may hold (X2W_REPLAY_PAGES_MAX_MIB, part of -RecordMaxMiB); 0 = half of -RecordMaxMiB. The log says "pages: budget of N MiB reached" when it was too small: the window then replays from stale memory
+    [int]$RecordPageRangeMiB = 0,               # resources larger than this are left out of the pages (X2W_REPLAY_PAGES_MAX_RANGE_MIB); 0 = 8. Raise it (e.g. 512) so big textures and buffers are recorded
     [switch]$NoUpload,                          # a -Record run uploads by default (-Upload is implied); this keeps the recording local
     [switch]$Upload,                            # (implied by -Record) after a -Record run: cut the recording into 100 MB chunks and copy it into the synced Drive folder x2w-registrazioni, or print the list to upload by hand in the browser
     [int]$LimitMB = 9,
@@ -358,6 +360,9 @@ if ($Record) {
     $recordDir = Join-Path $outRoot ("record_" + $stamp)
     New-Item -ItemType Directory -Force $recordDir | Out-Null
     $freeMiB = [math]::Floor((Get-PSDrive -Name ((Split-Path -Qualifier $recordDir).TrimEnd(":"))).Free / 1MB)
+    if ($RecordPagesMaxMiB -ge $RecordMaxMiB) { throw ("tester_run: -RecordPagesMaxMiB {0} must be below -RecordMaxMiB {1}: the pages are part of the window's cap" -f $RecordPagesMaxMiB, $RecordMaxMiB) }
+    if ($RecordPagesMaxMiB -gt 0) { $env:X2W_REPLAY_PAGES_MAX_MIB = [string]$RecordPagesMaxMiB }
+    if ($RecordPageRangeMiB -gt 0) { $env:X2W_REPLAY_PAGES_MAX_RANGE_MIB = [string]$RecordPageRangeMiB }
     if ($freeMiB -lt 2 * ($RecordMaxMiB + $RecordPrefixMaxMiB)) { throw ("tester_run: -Record needs twice the cap free ({0} MiB), the disk has {1} MiB: free space or lower -RecordMaxMiB or -RecordPrefixMaxMiB" -f (2 * ($RecordMaxMiB + $RecordPrefixMaxMiB)), $freeMiB) }
     $env:X2W_REPLAY_RECORD = $recordSpec; $env:X2W_REPLAY_DIR = $recordDir; $env:X2W_REPLAY_MAX_MIB = [string]$RecordMaxMiB; $env:X2W_REPLAY_SHADERS = "0"; $env:X2W_REPLAY_PREFIX_MAX_MIB = [string]$RecordPrefixMaxMiB
     Write-Host ("tester_run: recording {0} into {1} (cap {2} MiB, {3} MiB free): the run is slower while it records" -f $recordSpec, $recordDir, $RecordMaxMiB, $freeMiB)
