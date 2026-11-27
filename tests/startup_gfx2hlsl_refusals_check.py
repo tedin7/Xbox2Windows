@@ -507,6 +507,14 @@ def check_key_seed_mismatch():
               (cache / ('%016x.fail' % old_key)).read_text() == reason + '\n' and
               (cache / ('%016x.txt' % current_key)).is_file())
 
+        # The --watch loop calls translate_pending every few seconds: the count rereads every request, so a
+        # folder whose stamp did not change is not counted or reported again.
+        stderr = io.StringIO()
+        with patch.object(G, 'key_mismatch_count', side_effect=AssertionError('counted again')), \
+                contextlib.redirect_stderr(stderr):
+            G.translate_pending(cache, jobs=1)
+        check('a repeated pending pass over the same stamped cache stays quiet', 'key seed' not in stderr.getvalue())
+
 
 def check_normalization():
     for raw, normalized in (

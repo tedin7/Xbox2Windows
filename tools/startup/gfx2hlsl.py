@@ -19801,6 +19801,28 @@ def request_order(stamps, since=None):
     return sorted(stamps, key=lambda key: (since is None or stamps[key] < since, stamps[key], key))
 
 
+_KEY_SEED_CHECKED = set()  # cache folders this process already stamped and counted (--watch calls translate_pending often)
+
+
+def check_key_seed_once(out_dir):
+    """Stamp the cache and say loudly when >1% of its requests carry another key seed; once per folder and process,
+    because counting rereads every request."""
+    folder = os.path.normcase(os.path.abspath(out_dir))
+    if (folder, read_key_seed(out_dir)) in _KEY_SEED_CHECKED:
+        return  # same folder, same stamp as after the last check: nothing new to say
+    cache_seed = None
+    try:
+        cache_seed = stamp_key_seed(out_dir)
+    except OSError as error:
+        print(f'x2w-gfx cannot stamp key seed: {error}', file=sys.stderr)
+    _KEY_SEED_CHECKED.add((folder, read_key_seed(out_dir)))
+    mismatched, total = key_mismatch_count(out_dir)
+    if mismatched * 100 > total:
+        print(f'x2w-gfx key seed mismatch: {mismatched} of {total} requests ({mismatched / total:.1%}) in '
+              f"{os.path.basename(os.path.normpath(out_dir))} do not match this translator's key seed "
+              f"'{key_seed_line()}' (cache seed: '{cache_seed or 'unstamped'}')", file=sys.stderr)
+
+
 def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since=None, since_translator=None,
                       monitor=None, recycle=False, clock=None):
     """Translate every request that has no result yet, oldest published first (request_order). The runtime writes
@@ -19813,17 +19835,8 @@ def translate_pending(out_dir, skip_failed=False, jobs=None, rescan=False, since
     waiting for the next pass; a request already handled in this pass is queued again only when its marker is
     rewritten. Results are printed as they finish.
     """
-    cache_seed = None
-    try:
-        cache_seed = stamp_key_seed(out_dir)
-    except OSError as error:
-        print(f'x2w-gfx cannot stamp key seed: {error}', file=sys.stderr)
-    mismatched, total = key_mismatch_count(out_dir)
-    if mismatched * 100 > total:
-        print(f'x2w-gfx key seed mismatch: {mismatched} of {total} requests ({mismatched / total:.1%}) in '
-              f"{os.path.basename(os.path.normpath(out_dir))} do not match this translator's key seed "
-              f"'{key_seed_line()}' (cache seed: '{cache_seed or 'unstamped'}')", file=sys.stderr)
-    stamps = request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
+    check_key_seed_once(out_dir)
+    stamps =request_stamps(out_dir, dict.fromkeys(pending_keys(out_dir, skip_failed, since_translator)))
     queue = request_order(stamps, since)
     if not queue:
         return
