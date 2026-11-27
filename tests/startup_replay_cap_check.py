@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""X2W_REPLAY_MAX_MIB ends a replay recording at its size cap (docs/startup-runtime.md#d3d12-replay-record).
+"""X2W_REPLAY_PREFIX_MAX_MIB and X2W_REPLAY_MAX_MIB end a replay recording at its size caps
+(docs/startup-runtime.md#d3d12-replay-record).
 
-startup_replay_quad hits a 1 MiB file cap in the prefix of a future recording window.
-The scene must finish, with no recorder work after XEND. A second capture uses a
+startup_replay_quad hits a 1 MiB prefix cap before a future recording window opens.
+The scene must finish, with no recorder work after XEND. The same run under a 1 MiB WINDOW cap is not stopped:
+the prefix does not spend the window's cap. With X2W_REPLAY_SHADERS=0 the file holds no shader cache. A second capture uses a
 reserved address, a committed page in the same granule, and oversized blobs to
 check first-chance access exceptions and the per-call capture budget.
 The "slow" window check exercises the first present after a pause.
@@ -86,6 +88,7 @@ def main(scene, backend):
                    X2W_SHADER_CACHE=str(cache))
         env.setdefault("X2W_D3D12_DEBUG", "0")
         for name in ("X2W_REPLAY_RECORD", "X2W_REPLAY_RECORD_FILE", "X2W_REPLAY_DIR", "X2W_REPLAY_MAX_MIB",
+                     "X2W_REPLAY_PREFIX_MAX_MIB", "X2W_REPLAY_SHADERS",
                      "X2W_PRESENT_PICTURES", "X2W_TEST_REPLAY_RECORDER", "X2W_TEST_INPUT_LAYOUT", "X2W_REPLAY_PAGES"):
             env.pop(name, None)
         args = [scene, vs, ps, root, backend]
@@ -111,7 +114,7 @@ def main(scene, backend):
 
         capped = directory / "capped.x2wr"
         code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="f100000,1", X2W_REPLAY_RECORD_FILE=str(capped),
-                                                      X2W_REPLAY_MAX_MIB=str(CAP_MIB), X2W_TEST_REPLAY_RECORDER="cap"))
+                                                      X2W_REPLAY_PREFIX_MAX_MIB=str(CAP_MIB), X2W_TEST_REPLAY_RECORDER="cap"))
         assert code == 0, "the scene did not finish under a recording cap:\n" + text[-3000:]
         assert "replay quad: %d presents drawn" % PRESENTS in text, text[-2000:]
         assert "X2W_REPLAY_MAX_MIB reached" in text, text[-3000:]
@@ -125,6 +128,22 @@ def main(scene, backend):
         print("replay prefix cap: %d calls at XEND, zero recorder calls afterward" % calls)
         size = capped.stat().st_size
         assert size <= (CAP_MIB << 20) + SLACK, "capped file is %d bytes" % size
+        assert any(tag == "SHDR" for tag, _, _ in chunks(capped.read_bytes())), "the shader cache is recorded by default"
+
+        # The window's cap: the prefix does not count against it, so the same prefix runs past 1 MiB to the end.
+        window_capped = directory / "window_capped.x2wr"
+        code, text, _ = timed(args + [PRESENTS], dict(env, X2W_REPLAY_RECORD="f100000,1",
+                                                      X2W_REPLAY_RECORD_FILE=str(window_capped), X2W_REPLAY_MAX_MIB=str(CAP_MIB),
+                                                      X2W_REPLAY_SHADERS="0", X2W_TEST_REPLAY_RECORDER="cap"))
+        assert code == 0, text[-3000:]
+        assert "X2W_REPLAY_MAX_MIB reached" not in text and "BEFORE the window opened" not in text, text[-3000:]
+        assert "shader cache left out (X2W_REPLAY_SHADERS=0)" in text, text[-3000:]
+        window_calls = end_totals(window_capped)[0]
+        window_size = window_capped.stat().st_size
+        # The scene's 16000 reference-count calls alone pass 1 MiB: all of them are in the file.
+        assert window_calls >= 16000 and window_size > (CAP_MIB << 20), (window_calls, window_size)
+        assert not any(tag == "SHDR" for tag, _, _ in chunks(window_capped.read_bytes())), "X2W_REPLAY_SHADERS=0 wrote SHDR"
+        print("replay window cap: prefix of %d bytes kept, no shader cache" % window_size)
 
         # "slow": the window opens at the first present after a gap of 300 ms or more, lasts 0.15 s, and the file ends with
         # its XEND. The 400 ms pause before frame 15 makes present 16 such a present; a loaded machine can stall 300 ms

@@ -40,10 +40,19 @@ SRWLOCK file_lock = SRWLOCK_INIT, blob_lock = SRWLOCK_INIT, buffers_lock = SRWLO
 LONG64 volatile calls_written, blobs_stored;
 u64 bytes_written;
 LONG volatile stop_requested, cap_reached;
-u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the file is this large
+u64 max_bytes = 2048ull << 20;  // X2W_REPLAY_MAX_MIB: the recording stops (with its end chunk) once the window wrote this much
+// The prefix (creations before the window) has its own cap, X2W_REPLAY_PREFIX_MAX_MIB: a long prefix must not use up the
+// window's cap before the window opens. The window's bytes count from window_start_bytes.
+u64 prefix_max_bytes = 1024ull << 20;
+u64 volatile window_start_bytes;
+bool record_shaders = true;  // X2W_REPLAY_SHADERS=0 leaves the shader cache (SHDR) out of the file
 // The thunk checks active before doing any recorder work. Window and prefix
 // selection is published by present(); the prefix ends when the window opens.
 std::atomic<bool> window_open{false}, prefix_open{false};
+bool over_cap(u64 extra = 0)
+{
+    return prefix_open ? bytes_written + extra >= prefix_max_bytes : bytes_written + extra >= window_start_bytes + max_bytes;
+}
 std::atomic<unsigned> memory_epoch{0};
 constexpr LONG memory_cache_presents = 16;
 // "slow": the window opens at the first present after slow_after_s whose gap to the previous present is at least
@@ -116,7 +125,7 @@ bool in_window()
 void update_window()
 {
     window_open = in_window();
-    if (window_open) prefix_open = false;
+    if (window_open && prefix_open.exchange(false)) window_start_bytes = bytes_written;
 }
 
 // The calls recorded before the window: every device call (creations, views, descriptor copies), heap starts, Map and
@@ -519,7 +528,7 @@ void record_call(int kind, int slot, u64 seq, u64 object, const u64 (&args)[call
     if (b.bytes.size() >= flush_bytes) {
         AcquireSRWLockExclusive(&file_lock);
         drain(b);
-        if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+        if (over_cap() && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
         ReleaseSRWLockExclusive(&file_lock);
     }
     ReleaseSRWLockExclusive(&b.lock);
@@ -617,8 +626,9 @@ void flush_all(bool at_exit)
 
 // SHDR chunks: every file directly in X2W_SHADER_CACHE (requests and translations), header = its name (UTF-8), data =
 // its bytes, so a replay on another machine has the translations this run had. Files over 16 MiB, and the files after
-// 512 MiB in total, are left out (counted in the log). At process exit (DllMain, loader lock held) it stops after 5 s
-// so a large cache cannot hold the exit up. file_lock held.
+// 512 MiB in total, are left out (counted in the log). It runs on the thread that ends the recording (a present), so it
+// stops after 20 s (5 s at process exit, DllMain with the loader lock held): a large cache cannot stall the title.
+// Not counted against the caps. file_lock held.
 void write_shader_cache(bool at_exit)
 {
     wchar_t dir[MAX_PATH];
@@ -631,7 +641,7 @@ void write_shader_cache(bool at_exit)
     if (find == INVALID_HANDLE_VALUE) return;
     constexpr u64 file_max = 16ull << 20, total_max = 512ull << 20;
     u64 files = 0, total = 0, left_out = 0;
-    const ULONGLONG deadline = GetTickCount64() + (at_exit ? 5000 : 120000);
+    const ULONGLONG deadline = GetTickCount64() + (at_exit ? 5000 : 20000);
     std::vector<unsigned char> chunk;
     do {
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -683,7 +693,10 @@ void stop(bool at_exit)
     flush_all(at_exit);
     if (at_exit && !TryAcquireSRWLockExclusive(&file_lock)) return;
     if (!at_exit) AcquireSRWLockExclusive(&file_lock);
-    write_shader_cache(at_exit);
+    const u64 before_shaders = bytes_written;
+    if (record_shaders) write_shader_cache(at_exit);
+    else if (!at_exit) log("x2w-replay record: shader cache left out (X2W_REPLAY_SHADERS=0)");
+    const u64 shader_bytes = bytes_written - before_shaders;
     std::vector<unsigned char> tail;
     struct { u64 calls, blobs, bytes, presents; } end{calls_written, blobs_stored, bytes_written, static_cast<u64>(presents)};
     append_chunk(tail, "XEND", &end, sizeof(end), nullptr, 0);
@@ -693,8 +706,9 @@ void stop(bool at_exit)
     file = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&file_lock);
     if (!at_exit && in_prefix && cap_reached)
-        log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes, "
-            "%ld presents (X2W_REPLAY_MAX_MIB=%llu)", end.calls, end.bytes, presents, max_bytes >> 20);
+        log("x2w-replay record: the cap stopped the recording BEFORE the window opened: prefix only, %llu calls, %llu bytes "
+            "(%llu of them shader cache), %ld presents (X2W_REPLAY_PREFIX_MAX_MIB=%llu)", end.calls, end.bytes, shader_bytes,
+            presents, prefix_max_bytes >> 20);
     if (!at_exit)
         log("x2w-replay record: stopped after %llu calls, %llu blobs, %llu bytes, %ld presents%s", end.calls, end.blobs,
             end.bytes, presents, cap_reached ? " (X2W_REPLAY_MAX_MIB reached)" : "");
@@ -801,6 +815,11 @@ void install()
     const DWORD c = GetEnvironmentVariableA("X2W_REPLAY_MAX_MIB", cap, sizeof(cap));
     const unsigned long long cap_mib = c && c < sizeof(cap) ? std::strtoull(cap, nullptr, 10) : 0;
     if (cap_mib) max_bytes = cap_mib << 20;
+    char prefix_cap[24]{}, shaders[8]{};
+    const DWORD pc = GetEnvironmentVariableA("X2W_REPLAY_PREFIX_MAX_MIB", prefix_cap, sizeof(prefix_cap));
+    const unsigned long long prefix_mib = pc && pc < sizeof(prefix_cap) ? std::strtoull(prefix_cap, nullptr, 10) : 0;
+    if (prefix_mib) prefix_max_bytes = prefix_mib << 20;
+    record_shaders = !(GetEnvironmentVariableA("X2W_REPLAY_SHADERS", shaders, sizeof(shaders)) == 1 && shaders[0] == '0');
     file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         log("x2w-replay record: cannot create %s (error %lu)", path, GetLastError());

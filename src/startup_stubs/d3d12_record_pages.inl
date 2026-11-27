@@ -128,7 +128,7 @@ void page_flush_target()
     AcquireSRWLockExclusive(&file_lock);
     drain(*page_target);
     // The calls' cap check (record_call) only runs when a thread buffer fills; a scan that drains every present would skip it.
-    if (bytes_written >= max_bytes && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
+    if (over_cap() && !InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
     ReleaseSRWLockExclusive(&file_lock);
 }
 void page_sink(const char* tag, const void* header, std::size_t header_bytes, const void* data, std::size_t data_bytes)
@@ -198,7 +198,7 @@ void page_scan(bool everything, u64 stamp, bool placed = true)
                 stopped_early = true;
                 break;
             }
-            if (bytes_written + page_target->bytes.size() >= max_bytes) {  // the same cap as the calls: the recording ends with its XEND
+            if (over_cap(page_target->bytes.size())) {  // the same cap as the calls: the recording ends with its XEND
                 if (!InterlockedExchange(&cap_reached, 1)) InterlockedExchange(&stop_requested, 1);
                 stopped_early = true;
                 break;

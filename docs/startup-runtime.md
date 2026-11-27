@@ -1880,7 +1880,9 @@ ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failur
 
 `X2W_REPLAY_RECORD=all`, `<start s>,<seconds>` or `f<first present>,<presents>` records every call the title
 makes into the stand-in's objects to `X2W_REPLAY_RECORD_FILE` (default `<X2W_REPLAY_DIR>\replay.x2wr` when that folder is
-set, else `replay.x2wr`; it stops with its end chunk once the file reaches `X2W_REPLAY_MAX_MIB`, default 2048), so a replayer can feed the
+set, else `replay.x2wr`; it stops with its end chunk once the window has written `X2W_REPLAY_MAX_MIB`, default 2048, or
+the prefix before the window `X2W_REPLAY_PREFIX_MAX_MIB`, default 1024; the shader cache written at the end counts against
+neither, and `X2W_REPLAY_SHADERS=0` leaves it out, as `tester_run.ps1 -Record` does unless `-RecordShaders`), so a replayer can feed the
 same calls to the stand-in later: the runtime and the translator run for real on the replay, with any fix applied.
 Unset, no slot is wrapped and nothing changes.
 
