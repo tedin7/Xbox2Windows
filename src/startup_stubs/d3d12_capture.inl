@@ -16,8 +16,9 @@ struct PipelineInfo {
     bool has_stream_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
     bool has_stream_rasterizer = false;
+    bool stream_floating_bias = false;
     D3D12_RASTERIZER_DESC stream_rasterizer{};
-    DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT stream_title_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
@@ -238,7 +239,7 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
                    Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
                    const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
                    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN,
-                   const D3D12_RASTERIZER_DESC* rasterizer = nullptr)
+                   const D3D12_RASTERIZER_DESC* rasterizer = nullptr, bool floating_bias = false)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -253,8 +254,9 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     if (rasterizer) {
         info.stream_rasterizer = *rasterizer;
         info.has_stream_rasterizer = true;
+        info.stream_floating_bias = floating_bias;
     }
-    info.stream_dsv_format = dsv_format;
+    info.stream_title_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
     {

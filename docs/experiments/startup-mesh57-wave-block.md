@@ -95,3 +95,95 @@ On a local capture, 407 slot 57 requests stop at the refusal above on main `96a7
   covered`.
 - No new complete translation results from either change.
 - The other 316 have a branch inside the block, `src_scc`, or the `v_cmpx_lt_u32 v, v` compare form.
+
+## Voted mask if/else
+
+The new proof runs after the legacy wave-block proof declines. A forward SCC
+switch can define the same mask pair in multiple arms. `s_and_saveexec_b64`
+consumes the mask before writing its save destination, including when the
+operands alias. The inner EXEC-zero branch votes across 64 guest lanes so each
+lane of a wave sees the same scalar state after the arm. A wave that skips the
+scalar loads must already hold each live scalar. The complement uses the saved
+EXEC and the current EXEC. After the optional explicit OR restore, the enclosing
+EXEC reset ends the block. A VCC-zero or VCC-nonzero branch in the mask setup
+votes on the full guest wave's VCC bits.
+
+The synthetic tests cover the scalar descriptor load followed by a buffer load,
+constant and mask selects, EXEC copies, narrowing, and a VCC vote. Separate
+draws cover predicated typed buffer and image loads. A group has two guest
+waves. The first draw contains a mixed wave and an empty wave. A second draw
+makes the second wave full. The pixel reference exports each wave's scalar
+result from lanes outside the then arm as well as active lanes. Mutants include
+a lane-local branch, a wrong complement, a wrong select, and an unpredicated
+load. The offline purity control includes a whole-word numeric use of the pair.
+
+```text
+python3 -B tests/startup_mesh57_skeleton_check.py
+python3 -B tests/startup_mesh57_skeleton_check.py binary /usr/bin/llvm-mc-19
+ctest --preset dev --no-tests=error -R '^startup_mesh57_skeleton(_lanemask_warp)?$'
+```
+
+The Python and assembler checks run on a non-Windows host. The readback and
+mutant draws require the Windows runner and report capability skip 77 when
+the mesh shader tier is unavailable.
+
+On Linux with Python 3.14.8 and LLVM 19, the first two commands passed. The S1
+CPU model predicted 66 changed pixels for a lane-local EXEC branch and 259
+for the wrong complement in the mixed/empty draw. A before/after comparison
+against `d4a1fa9b7` covered 1,671 emitted HLSL and manifest outputs from the
+existing mesh57 and gfx2hlsl fixture scripts, including the graphics shaders
+from two draw-only scripts. All outputs matched byte for byte. The standalone
+watch, retry and draw-skip checks also passed. The Windows draws remain to be
+run.
+
+
+## Shared EXEC-zero joins
+
+The shared proof also accepts post-count mesh skips with a dead pure mask or
+a zero-initialized compare pair consumed by a lane select after the join. The
+existing mesh lane-mask readback mode covers both forms. Compute has four
+wave64 readback cases for VCC, an SGPR compare pair, all-ones initialization
+and a lane-preserving write. Changing the initialization in each case changes
+16 CPU reference words. The pixel derivative suite tests a compare pair that
+survives a quad-voted EXEC-zero join.
+
+```text
+ctest --preset dev --no-tests=error -R '^startup_(mesh57_skeleton(_lanemask_(warp|hardware))?|gfx2hlsl_compute_(controls|phi64_(warp|hardware))|image_sample_b_flow_(controls|warp|hardware))$'
+```
+
+On Linux with Python 3.14.8 and LLVM 19, the offline controls and assembler
+checks passed in all three suites. The before/after comparison against
+`871025f1c` matched all 484 emitted HLSL and manifest outputs from the seven
+existing fixture scripts exercised in the comparison. Windows readback
+remains pending.
+
+
+Round 2 checks numeric reuse before and after a mask lifetime, a mixed
+numeric/mask join, and high-word data reads. The same lane-mask draw mode
+now covers a standalone uniform SCC select, sequential regions and a region
+nested in the then arm. Reversing SCC in the standalone draw changes the
+CPU reference. The offline wave64 high-VCC numeric-read control still
+reports the same refusal.
+
+
+On Linux with Python 3.14.8 and LLVM 19, the mesh offline and assembly
+checks passed. Round 2 adds seven accepting fixtures and four refusal controls.
+A before/after comparison against `fd5f476b7` covered seven existing scripts
+and matched 496 emitted HLSL and manifest outputs byte for byte. Windows
+readback remains pending.
+
+
+## Defined positions under the published count
+
+Round 3 tracks the sources of mask operations even when no mask instruction
+writes those pairs. The loaded-pair and entry-only-pair controls changed
+from pure to impure. The compare-and-NOT control stayed pure.
+
+Both S1 arms now supply position VGPRs in a synthetic guarded draw. The
+offline tests accept the same bound, a zero-or-bound select, and an unsigned
+export compare. Five controls retain the legacy undefined-VGPR refusal.
+The widened-count mutant adds one allocated vertex and changes 80 CPU
+reference pixels. The mesh, compute and pixel controls, the mesh and
+compute LLVM 19 assembly checks, and docs links passed on Linux. A
+before/after check against `cf0e0c388` matched 517 legacy HLSL and manifest
+outputs across seven scripts. Windows readback remains pending.

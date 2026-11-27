@@ -109,6 +109,16 @@ FIXTURES = {
     'uni_loop': (PROLOGUE + 's_mov_b32 s30, 2\nBB1:\n' + SAMPLE + SUB + 's_add_i32 s30, s30, -1\ns_cmp_lg_u32 s30, 0\n'
                  's_cbranch_scc1 BB1\n' + EXPORT, (Fraction(-3, 8), Fraction(1, 8)), -1),
 }
+# A whole wave writes the compare pair in the block. The skipped quad has
+# zero bits before and after that write, and the join only reads a lane bit.
+source, uv, bias = FIXTURES['inside']
+PAIR_SOURCE = (source.replace('v_cmp_eq_u32_e32 vcc, 0, v8',
+                              's_mov_b64 s[30:31], 0\nv_cmp_eq_u32_e32 vcc, 0, v8')
+               .replace('s_cbranch_execz BB1\n', 's_cbranch_execz BB1\nv_cmp_eq_u32_e64 s[30:31], v8, 0\n')
+               .replace('s_or_b64 exec, exec, s[0:1]\n',
+                        's_or_b64 exec, exec, s[0:1]\nv_cndmask_b32_e64 v10, 0, v10, s[30:31]\n'))
+FIXTURES['inside_pair'] = PAIR_SOURCE, uv, bias
+
 # name: (source, text of the refusal)
 REFUSED = {
     # The plain s_mov_b64 exec, s[N] restore of a mask saved before s_wqm is a lane-exec break too (main accepts the form).
@@ -269,6 +279,11 @@ WORDS_HEX = {
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef2021c7e8010847d011d02028010847d6a2480be010088bff10404067e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
+WORDS_HEX['inside_pair'] = (
+    '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
+    'f0121210ff1204060000003ef302027eff02067e0000803e0902087e80049ebe8010847d6a2480be060088bf1e00c2d4'
+    '08010100f10404067fc08cbf280f94f0010ac4007e00fe880a0001d580147a00703f8cbf0f1800f80a0b0c0d000081bf'
+)
 BRANCH = re.compile(r'^(s_c?branch\w*) (BB\d+)$')
 
 
@@ -348,9 +363,24 @@ def controls():
     for name, (_source, text) in REFUSED.items():
         refused(name, text)
     # The quad votes: the EXEC branches of inside, kill and join_pixel, one vote each; v_cmpx alone needs none.
-    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('inside_y', 1)):
+    for name, votes in (('inside', 1), ('inside_pair', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('inside_y', 1)):
         text = pipeline(name).hlsl_ps()
         assert text.count('x2w_quad_any(exec)') == votes, (name, text)
+    saved_retry = G.Stage.retry_lane_mask_joins
+    G.Stage.retry_lane_mask_joins = lambda self, reason: False
+    try:
+        refused('inside_pair', 'image_sample_b needs implicit derivatives')
+    finally:
+        G.Stage.retry_lane_mask_joins = saved_retry
+    pair = words('inside_pair')
+    high_read = pair.replace(bytes.fromhex('0a0001d580147a00'), bytes.fromhex('1f02147e'), 1)
+    try:
+        G.Pipeline(VS_WORDS, high_read, root_blob(), ps_hw_inputs=PS_INPUTS).hlsl_ps()
+    except G.Unsupported as error:
+        assert 'image_sample_b needs implicit derivatives' in str(error), str(error)
+    else:
+        raise AssertionError('accepted a numeric read of the compare pair high word')
+
     # The gate is the vote's: with the EXEC rule of #2659 (the entry mask only) the divergent-EXEC fixtures are refused.
     saved = G.Stage.derivative_exec_ok
     G.Stage.derivative_exec_ok = lambda self: self.exec_known
@@ -383,6 +413,10 @@ def mutants(name, hlsl):
     the bias dropped."""
     out = []
     write = re.search(r'\n\s*if \(exec & 1\) v2 = U\(-?0\.5 \+ F\(v2\)\);', hlsl)
+    if name == 'inside_pair':
+        selector = '(s30 & 1) ? v10 : 0x00000000u'
+        assert hlsl.count(selector) == 1 and not reference(name).startswith('00000000,')
+        out.append(('compare mask cleared', hlsl.replace(selector, '0x00000000u')))
     if name.startswith('join'):
         out.append(('without the branch write', hlsl.replace(write.group(0), '')))
     if name in ('cmpx', 'inside', 'kill'):

@@ -1,4 +1,4 @@
-"""Cull through a slot-86 RASTERIZER / RASTERIZER1 subobject and check the 8x4 readback."""
+"""Check slot-86 culling and constant depth bias through the 8x4 readback."""
 import os
 from pathlib import Path
 import re
@@ -18,6 +18,8 @@ def check(directory, consumer, backend, mode):
     cases = ("back", "front", "dropped", "r1_back", "r1_front", "bias", "mixed_10_27", "mixed_27_10")
     if mode != "ignore":
         cases += ("ccw_back", "ccw_front", "r1_ccw_back", "r1_ccw_front")
+        cases += ("d16s8_64_below", "d16s8_64_equal", "d24_64_below", "d24_64_equal",
+                  "d16s8_half_below", "d16s8_half_equal")
     outs = {name: directory / name for name in cases}
     vs.write_bytes(vertex())
     ps.write_bytes(pixel(True))
@@ -50,7 +52,11 @@ def check(directory, consumer, backend, mode):
             print(f"ignore control did not reach a readback on {backend}: {run.returncode}")
             return 0
         raise RuntimeError(f"rasterizer draw failed on {backend}: {run.returncode}\n{run.stderr}")
-    assert not re.search(r"x2w-d3d12-debug.*sev=[012]\b", run.stderr), run.stderr
+    # Message 821 (ClearDepthStencilView without an optimized clear value) is a performance note about the
+    # fixture's own depth targets; every other warning or error still fails.
+    errors = [line for line in run.stderr.splitlines()
+              if re.search(r"x2w-d3d12-debug.*sev=[012]\b", line) and " id=821 " not in line]
+    assert not errors, "\n".join(errors)
 
     images = {name: outs[name].read_bytes() for name in outs}
     green = bytes((0, 255, 0, 255))
@@ -79,6 +85,11 @@ def check(directory, consumer, backend, mode):
     mixed_draws = [name for name in ("mixed_10_27", "mixed_27_10") if images[name] != blank]
     assert not mixed_draws, f"duplicate rasterizer state drew pixels: {mixed_draws}"
     print(f"{backend}: eight cull/winding images matched; fractional bias and both mixed rasterizer orders stayed clear")
+    for name, units in (("d16s8_64", 16384), ("d24_64", 64), ("d16s8_half", 128)):
+        assert images[name + "_below"] == drawn, f"{name}: LESS failed one D24 unit below {units}"
+        assert images[name + "_equal"] == blank, f"{name}: LESS passed at D24 depth {units}"
+    print(f"{backend}: depth bias matched 16384, 64, and 128 D24 units")
+    print("Mutant: without rescaling, format 118 stores a 256x smaller offset (64 D24 units); the below probe fails")
     return 0
 
 

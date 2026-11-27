@@ -1006,6 +1006,12 @@ OperationResult run_mesh_textured(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::textured));
 }
 
+OperationResult run_mesh_texture_load(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::mesh_texture_load));
+}
+
 OperationResult run_compute_mesh_texture(const OperationContext& ctx)
 {
     const MeshTextureProducers producers{ctx.argv[6], ctx.argc >= 8 ? ctx.argv[7] : nullptr, ctx.argc == 9};
@@ -1317,6 +1323,14 @@ OperationResult run_startup_sampler_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_startup_sampler_reduction(const OperationContext& ctx)
+{
+    const int result = check_startup_sampler_lod(ctx.device, false, {}, nullptr, 0.0f, true);
+    if (result == 77) return {OutcomeKind::skip, "skip: sampler min/max or required R32_FLOAT features unavailable"};
+    if (result) return {OutcomeKind::fail, "sampler reduction readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-bias <ps.cso> <sampler manifest line> <expected red>
 OperationResult run_startup_sampler_bias(const OperationContext& ctx)
 {
@@ -1352,6 +1366,7 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
+    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
     const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
     const bool one_dimensional_mips = std::strcmp(ctx.argv[2], "--startup-image-1d-mips") == 0;
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
@@ -1373,7 +1388,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
-                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
+                           cube ? 2 : (array_mips || one_dimensional_mips ? 3 : 1),
+                           one_dimensional, two_dimensional, 0, 0, cube);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1821,6 +1837,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-cube", 8, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-descriptor-limits", 8, 8, nullptr, kNoGate, run_startup_descriptor_limits},
@@ -1902,6 +1919,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
+    {"--mesh-texture-load", 6, 6, nullptr, kNoGate, run_mesh_texture_load},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
     {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
      kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
@@ -1940,6 +1958,7 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-reduction", 3, 3, nullptr, kNoGate, run_startup_sampler_reduction},
     {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
     {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
     {"--startup-sampler-bias", 6, 6, nullptr, kNoGate, run_startup_sampler_bias},

@@ -15,11 +15,18 @@
 #include <thread>
 #include <vector>
 
+#include "../src/startup_stubs/buffer_input_addressing.h"
 #include "startup_stream_draw.h"
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
 
 using Microsoft::WRL::ComPtr;
+
+static_assert(!x2w_startup::buffer_input_addressing_refusal(0, 0));
+static_assert(!x2w_startup::buffer_input_addressing_refusal(1u << 30, 3u << 21));
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 0) == x2w_startup::swizzled_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(0, 1u << 23) == x2w_startup::add_tid_input_buffer);
+static_assert(x2w_startup::buffer_input_addressing_refusal(1u << 31, 1u << 23) == x2w_startup::swizzled_input_buffer);
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
@@ -252,8 +259,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     constexpr UINT gpu_offset = 16;
     const bool ring_input = mode == "dispatch-input-title-ring" || mode == "dispatch-input-title-ring-full";
     const bool protected_input = mode == "dispatch-input-title-protected";
-    const UINT input_bytes = large_input ? 40u << 20 : 12u << 10;
-    const UINT record_offsets[] = {0, input_bytes / 2, input_bytes - 16};
+    const bool raw_range = mode == "dispatch-input-title-raw-range";
+    const bool range_control = mode == "dispatch-input-title-raw-range-control";
+    const bool range_fixture = raw_range || range_control;
+    const UINT input_bytes = range_fixture ? 16u * 64u : large_input ? 40u << 20 : 12u << 10;
+    const UINT record_offsets[] = {0, range_fixture ? 48u : input_bytes / 2, range_fixture ? 64u : input_bytes - 16};
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -331,8 +341,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 
         const UINT64 address = reinterpret_cast<UINT64>(source) + (gpu_input ? gpu_offset : 0);
         descriptors[0][0] = static_cast<UINT>(address);
-        descriptors[0][1] = static_cast<UINT>(address >> 32) | 4u << 16;
-        descriptors[0][2] = input_bytes / 4;
+        descriptors[0][1] = static_cast<UINT>(address >> 32) | (range_fixture ? 16u : 4u) << 16;
+        descriptors[0][2] = range_fixture ? 64u : input_bytes / 4;
+        if (range_fixture) descriptors[0][3] = raw_range ? 3u << 28 : 0;
+        if (mode == "dispatch-input-title-swizzled") descriptors[0][1] |= 1u << 31;
+        if (mode == "dispatch-input-title-add-tid") descriptors[0][3] |= 1u << 23;
+        if (mode == "dispatch-input-title-cache-hint") descriptors[0][1] |= 1u << 30;
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
@@ -400,9 +414,15 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             format = DXGI_FORMAT_R8G8B8A8_UINT;
             element = 4;
             mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
+        } else if (mode == "dispatch-heap-format-r32-uint" || mode == "dispatch-heap-format-snorm" ||
+                   mode == "dispatch-heap-format-ufloat") {
+            format = mode == "dispatch-heap-format-r32-uint" ? DXGI_FORMAT_R32_UINT :
+                     mode == "dispatch-heap-format-snorm" ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R11G11B10_FLOAT;
+            element = 4;
+            mapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 0, 3, 1);
         } else if (mode == "dispatch-heap-format-unsupported") {
-            format = DXGI_FORMAT_R16G16B16A16_UINT;
-            element = 8;
+            format = DXGI_FORMAT_R32G32B32_UINT;
+            element = 12;
         } else {
             return 2;
         }
@@ -549,7 +569,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             if (!data) return 81;
             *data = slot == 2 ? 0x428a6000u : 0x42aa6000u;
             const UINT64 address = reinterpret_cast<UINT64>(data);
-            const UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            UINT raw[4]{static_cast<UINT>(address), static_cast<UINT>(address >> 32), 16, 0};
+            if ((slot == 2 && mode.find("-selected-swizzled") != std::string::npos) ||
+                (slot == 3 && mode.find("-unrelated-swizzled") != std::string::npos))
+                raw[1] |= 1u << 31;
             std::memcpy(reinterpret_cast<void*>(cpu + slot * 32), raw, sizeof(raw));
         }
     }

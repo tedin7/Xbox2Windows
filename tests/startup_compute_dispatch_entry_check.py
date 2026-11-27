@@ -100,7 +100,7 @@ def main(consumer, dxc, adapter):
         root = Path(temporary)
         _, words_l, rsrc2_l, group_l, _ = C.CASES['L-uint']
         formatted = bytes(C.formatted_input())
-        undecoded = (C.L_WORD3['L-uint'] & ~(127 << 12)) | 2 << 12
+        undecoded = (C.L_WORD3["L-uint"] & ~(127 << 12)) | 3 << 12  # BUF_FMT_8_USCALED, in no format table
         assert C.L_STRIDE == 6 and not (undecoded >> 12) & 127 in (1, 5, 14, 22, 23, 24, 27, 29, 56, 60, 64, 71, 74, 77)
         # 20 records of 6 bytes cover the last lane's 4-byte read at byte 6 * 15 + 3.
         run_program(root, 'formatted', consumer, dxc, adapter, (words_l, rsrc2_l, group_l),

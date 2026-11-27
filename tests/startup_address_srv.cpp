@@ -130,20 +130,32 @@ int draw_unregistered_1d_address_srv(void* guest, void* list)
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 44;
     const bool mutant = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_WRONG_WIDTH", nullptr, 0) != 0;
-    const bool console_layout = GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", nullptr, 0) != 0;
+    wchar_t console_case[2]{};
+    GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_CONSOLE_LAYOUT", console_case, 2);
+    const bool console_layout = console_case[0] != L'\0';
+    const bool multiple_mips = console_case[0] == L'm';
+    const bool array = console_case[0] == L'a';
     const bool srgb = console_layout || GetEnvironmentVariableW(L"X2W_TEST_PLACED_1D_SRGB", nullptr, 0) != 0;
-    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, mutant ? 4u : 7u, 1, 1, 1,
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, multiple_mips ? 8u : mutant ? 4u : 7u,
+        1, array ? UINT16{2} : UINT16{1}, multiple_mips ? UINT16{2} : UINT16{1},
         srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8_UNORM, {1, 0},
-        console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(0x100) : D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        console_layout ? static_cast<D3D12_TEXTURE_LAYOUT>(console_case[0] == L'u' ? 0x105 : 0x100)
+                       : D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_NONE};
-    // The desktop footprint starts at offset zero. sRGB endpoints decode exactly.
-    static std::array<unsigned char, 8 * 4> memory;
+    // Leave backing for the desktop mip and array offsets so the refusal controls exercise the layout gate.
+    static std::array<unsigned char, 65536 + 8 * 4> memory{};
     ViewAt view{};
     view.address = ptr(memory.data());
     view.view.Format = desc.Format;
-    view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
     view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.view.Texture1D.MipLevels = 1;
+    if (array) {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        view.view.Texture1DArray.MipLevels = desc.MipLevels;
+        view.view.Texture1DArray.ArraySize = desc.DepthOrArraySize;
+    } else {
+        view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.view.Texture1D.MipLevels = desc.MipLevels;
+    }
     invoke(guest, 18, 0, ptr(&view.view), cpu);
     const auto* slot = reinterpret_cast<const void*>(cpu);
     std::array<unsigned char, 32> previous;
@@ -287,6 +299,113 @@ int draw_1d_srvs(void* guest, void* list)
         const D3D12_RECT strip{LONG(x), 0, LONG(x + 1), 4};
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
+    }
+    return 0;
+}
+
+// Columns 0..5 sample a single cube. Column 6 reuses that resource with an array view.
+// Column 7 uses a cube view over a resource containing two cubes.
+int draw_cube_srvs(void* guest, void* list)
+{
+    constexpr std::size_t slice_stride = 64 * 1024;  // Placed title texture slice alignment.
+    alignas(4096) static std::array<std::array<unsigned char, 12 * slice_stride>, 2> data{};
+    void* textures[2]{};
+    for (unsigned i = 0; i < data.size(); ++i) {
+        const auto slices = static_cast<UINT16>(6 * (i + 1));
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, slices, 1,
+            DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+        for (unsigned face = 0; face < slices; ++face) {
+            const unsigned char color[] = {static_cast<unsigned char>(31 + 29 * (face % 6)), 73, 181, 255};
+            std::memcpy(data[i].data() + face * slice_stride, color, sizeof(color));
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(data[i].data()), ptr(&desc),
+                D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i]))))) return 41;
+    }
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC cube{};
+    cube.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    cube.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    cube.TextureCube.MipLevels = 1;
+    auto array = cube;
+    array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    array.Texture2DArray = {0, 1, 0, 6, 0, 0};
+
+    const auto draw = [&](LONG left, LONG right) {
+        const D3D12_RECT strip{left, 0, right, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    invoke(guest, 18, ptr(textures[0]), ptr(&cube), cpu);
+    draw(0, 6);
+    invoke(guest, 18, ptr(textures[0]), ptr(&array), cpu);
+    draw(6, 7);
+    invoke(guest, 18, ptr(textures[1]), ptr(&cube), cpu);
+    draw(7, 8);
+    return 0;
+}
+
+int draw_desktop_array_srvs(void* guest, void* list)
+{
+    constexpr std::size_t slice_stride = 64 * 1024;
+    constexpr auto color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    alignas(4096) static std::array<unsigned char, 6 * slice_stride> cube_small{};
+    alignas(4096) static std::array<unsigned char, 12 * slice_stride> cube_large{};
+    const auto fill = [slice_stride](unsigned char* data, UINT slices, UINT side, UINT red) {
+        for (UINT slice = 0; slice < slices; ++slice)
+            for (UINT y = 0; y < side; ++y)
+                for (UINT x = 0; x < side; ++x) {
+                    const unsigned char color[] = {static_cast<unsigned char>(red + 13 * slice),
+                        static_cast<unsigned char>(slice < 6 ? 53 : 53 + 61 * y),
+                        static_cast<unsigned char>(slice < 6 ? 197 : 197 - 73 * x), 255};
+                    // Using an unrounded footprint stride reads zero padding for faces 1 through 5.
+                    std::memcpy(data + slice * slice_stride + y * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT + 4 * x,
+                                color, sizeof(color));
+                }
+    };
+    fill(cube_small.data(), 6, 1, 19);
+    fill(cube_large.data(), 12, 2, 31);
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_RESOURCE_DESC shape{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 2, 12, 1, color_format,
+        {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, static_cast<D3D12_RESOURCE_FLAGS>(0x300000)};
+    ViewAt binding{};
+    binding.view.Format = color_format;
+    binding.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    binding.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    binding.view.TextureCube.MipLevels = 1;
+    binding.address = ptr(cube_large.data());
+
+    const auto draw = [&](LONG top, LONG bottom) {
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        const D3D12_RECT region{0, top, 8, bottom};
+        invoke(list, 22, 1, ptr(&region));
+        invoke(list, 12, 3, 1);
+    };
+    if (GetEnvironmentVariableW(L"X2W_TEST_DESKTOP_ARRAY_SLICES", nullptr, 0)) {
+        binding.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        binding.view.Texture2DArray = {0, 1, 6, 6, 0, 0};
+        draw(0, 4);
+    } else {
+        draw(2, 4);
+        shape.Width = shape.Height = 1;
+        shape.DepthOrArraySize = 6;
+        binding.address = ptr(cube_small.data());
+        draw(0, 2);
+
+        const void* slot = reinterpret_cast<const void*>(cpu);
+        std::array<unsigned char, 32> previous;
+        std::memcpy(previous.data(), slot, previous.size());
+        shape.DepthOrArraySize = 5;
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        if (std::memcmp(previous.data(), slot, previous.size()) != 0) return 48;
+        shape.DepthOrArraySize = 6;
+        shape.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        invoke(guest, 70, ptr(&shape), ptr(&binding), cpu);
+        if (std::memcmp(previous.data(), slot, previous.size()) != 0) return 48;
     }
     return 0;
 }

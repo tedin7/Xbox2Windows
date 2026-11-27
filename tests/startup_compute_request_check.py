@@ -51,7 +51,8 @@ def runtime_key(code, data, root, desc, state_a, state_b):
     literal = re.search(rb'constexpr char compute_revision\[\] = "([^"]+)";', RUNTIME.read_bytes())
     graphics = re.search(rb'constexpr char revision\[\] = "([^"]+)";', RUNTIME.read_bytes())
     assert literal and graphics and literal[1] == graphics[1] + b"cs", "the compute revision must follow the graphics one"
-    key = fnv(literal[1])
+    # d3d12_draw.inl shader_cache_seed mixes the default-on extended-buffer-formats feature after the revision.
+    key = fnv(b"extended-buffer-formats1", fnv(literal[1]))
     for part in (code, data, root, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack("<Q", len(part)), key))
     return key

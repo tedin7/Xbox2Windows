@@ -10,7 +10,9 @@ the pairs passed to `run_checks`.
 Each script runs as `python -B <script>` from the current directory. Output is printed one
 script at a time, in the order given, so a failure log stays readable. The exit status is 1
 when any script exits non-zero. Scripts that exit 77 (skip) are listed under `SKIPPED:`,
-apart from the `FAILED:` line; a skip still makes the exit status 1.
+apart from the `FAILED:` line; a skip still makes the exit status 1. A script named in
+`tests/checks/needs_arguments.txt` and run with no arguments is not started: it is reported as
+a skip, because only CTest (or a listed command with arguments) can run it.
 
 `run_checks(checks, jobs=None)` runs the same runner directly over check pairs. Each pair is
 `(command, extra_env)`: `command` is the argument list placed after `python -B` and
@@ -27,6 +29,16 @@ import sys
 import time
 
 SKIP_EXIT_CODE = 77
+NEEDS_ARGUMENTS_FILE = Path(__file__).resolve().parent.parent / "tests" / "checks" / "needs_arguments.txt"
+
+
+def read_needs_arguments(path=NEEDS_ARGUMENTS_FILE):
+    """Return the script file names listed in `tests/checks/needs_arguments.txt` (empty if absent)."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(line.strip() for line in lines if line.strip() and not line.startswith("#"))
 
 
 def _validate_script_path(raw_path: str) -> str:
@@ -135,6 +147,10 @@ def run_one(check):
         raise ValueError("check command must not be empty")
     env = {**os.environ, **extra_env} if extra_env else None
     start = time.monotonic()
+    if len(command) == 1 and Path(command[0]).name in read_needs_arguments():
+        msg = (f"SKIP {command[0]} needs arguments (binary, compiler, renderer or backend); "
+               "CTest passes them.\n")
+        return command[0], SKIP_EXIT_CODE, msg, 0.0
     try:
         proc = subprocess.run([sys.executable, "-B", *command], env=env,
                               stdin=subprocess.DEVNULL,

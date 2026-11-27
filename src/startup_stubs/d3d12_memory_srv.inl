@@ -73,12 +73,15 @@ bool console_linear_texture_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
            x2w_startup::address_view_fits(r, v);
 }
 
-// The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
-// addresses with a view that stays inside it.
+// Slot 70 accepts its placed shapes and validated views of supported address layouts.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (supports_placed_memory_srv(r, v) || console_linear_texture_srv(r, v)) return true;
-    return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
+    const bool arrays = slot70_desktop_arrays_enabled();
+    if (arrays && x2w_startup::desktop_address_array(r))
+        return v.Format == r.Format && v.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING &&
+               x2w_startup::address_view_fits(r, v, true);
+    return console_layout_srv(r) && x2w_startup::address_view_fits(r, v, arrays);
 }
 
 bool placed_1d_texture_enabled()
@@ -146,7 +149,7 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
 
 // The layout tables describe the bytes independently of the desktop adapter's format support.
 bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& r,
-                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v, bool require_sampling = false)
 {
     const auto blocked = [&](const char* reason) {
         if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(reason, &r);
@@ -158,8 +161,10 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
         return blocked("format_plane_count");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT view{v.Format};
+    const UINT view_support = D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+                              (require_sampling ? 0u : D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &view, sizeof(view))) ||
-        !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
+        !(view.Support1 & view_support))
         return blocked("format_view_support");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
@@ -850,6 +855,11 @@ void log_address_kind(const char* outcome, const D3D12_RESOURCE_DESC& r, const D
 // Bytes the texels of a by-address texture span at their address.
 u64 address_texture_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 {
+    if (slot70_desktop_arrays_enabled() && x2w_startup::desktop_address_array(desc)) {
+        const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels);
+        if (plan.size == UINT64_MAX || !plan.size) return 0;
+        return ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * desc.DepthOrArraySize;
+    }
     if (const UINT element = x2w_startup::single_element_bytes(desc)) return element;
     if (x2w_startup::bc64::supports(desc)) return x2w_startup::bc64::Chain(desc).bytes();
     if (console_layout_srv(desc)) return x2w_startup::gfx10::Layout(desc).bytes();
@@ -944,7 +954,15 @@ Wrapper* publish_placed_1d_texture(Wrapper* device, u64 address, const D3D12_RES
     const auto note_blocker = [&](const char* reason) {
         if (memory_srv_diagnostics_enabled()) memory_srv_diagnostics.note(reason, &title);
     };
-    if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+    constexpr auto console_linear = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+    if (title.Layout == console_linear) {
+        // A single linear row starts at the base address, as in the desktop footprint.
+        if (title.MipLevels != 1 || title.DepthOrArraySize != 1) {
+            note_blocker("texture_1d_linear_mips_or_slices");
+            detail = "unsupported 1D linear layout (linear mip and slice alignment not mapped)";
+            return nullptr;
+        }
+    } else if (title.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
         note_blocker("texture_1d_layout_unmapped");
         detail = "unsupported 1D source layout (no console footprint mapping)";
         return nullptr;
@@ -1429,9 +1447,27 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         note_memory_srv_write(resource, input, destination);
         return;
     }
-    // A new console-layout view reads the address only when there is no matching live resource.
+    // With no matching live resource, these layouts can be read directly from the address.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
-    if (console_layout_srv(*resource)) {
+    const bool desktop_array = slot70_desktop_arrays_enabled() && x2w_startup::desktop_address_array(*resource);
+    if (desktop_array) {
+        if (!desktop_address_view_supported(self, *resource, input->view, true)) {
+            held = "unsupported_desktop_format";
+            texture = nullptr;
+        } else {
+            const auto bytes = address_texture_bytes(self, *resource);
+            if (!bytes) held = "texture_unavailable";
+            else if (bytes > max_published_texture_bytes) held = "texture_over_64mib";
+            else if (!texture && address_resource_overlap(input->address, bytes)) held = "overlapping_resource";
+            if (held) {
+                texture = nullptr;
+            } else if (!texture) {
+                texture = publish_tiled_texture(self, input->address, *resource);
+                outcome = "published desktop array";
+            }
+        }
+        note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
+    } else if (console_layout_srv(*resource)) {
         const char* alias_miss = texture ? "alias_existing_texture" : "alias_ineligible_shape";
         if ((!texture || !supports_placed_memory_srv(*resource, input->view)) &&
             !desktop_address_view_supported(self, *resource, input->view)) {
@@ -1466,10 +1502,11 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     } else {
         note_alias_miss(self, input->address, 1, *resource, "alias_ineligible_shape");
     }
-    // A publication was attempted for a BC / console-layout view; any other view only looks up a live resource.
+    // Report why an attempted publication or live-resource lookup failed.
     const char* unavailable = texture || held ? nullptr
         : texture_unavailable_reason(self, input->address, *resource,
-                                     tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) || console_layout_srv(*resource));
+                                     desktop_array || tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ||
+                                     console_layout_srv(*resource));
     if (!texture) outcome = held ? held : unavailable;
     log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {

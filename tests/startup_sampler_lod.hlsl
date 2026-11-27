@@ -1,4 +1,4 @@
-// Sampler heap LOD limits (#2221): one pixel per draw. The root signature is the startup stand-in's
+// Sampler heap LOD limits (#2221): one derivative quad per draw. The root signature is the startup stand-in's
 // (src/startup_stubs/translated_sampler_bindings.h): root constants at b0, one view table, the sampler
 // table at space 1 and the static samplers at space 0. Every mip of the texture holds one value.
 Texture2D<float> texels : register(t0);
@@ -7,7 +7,7 @@ SamplerComparisonState shadow : register(s0);
 
 cbuffer Probe : register(b0)
 {
-    uint mode;      // 0: SampleLevel through heap[entry]; 1: SampleCmpLevelZero through the static sampler
+    uint mode;      // 0: explicit LOD, 1: static comparison, 2: implicit LOD, 3: centre reduction
     uint entry;
     float lod;
     float reference;
@@ -27,9 +27,12 @@ Vertex vs_main(uint id : SV_VertexID)
     return output;
 }
 
-float4 ps_main() : SV_Target
+float4 ps_main(Vertex input) : SV_Target
 {
+    if (mode == 3) return texels.SampleLevel(heap[entry], float2(0.5, 0.5), 0).xxxx;
     const float2 uv = float2(0.5625, 0.5625);
     if (mode == 0) return texels.SampleLevel(heap[entry], uv, lod).xxxx;
+    // UV spans 0..1 over two pixels. On the 8x8 base mip, 1/4 of that UV gives one texel per pixel.
+    if (mode == 2) return texels.Sample(heap[entry], input.uv.xy * (0.25 * exp2(lod))).xxxx;
     return texels.SampleCmpLevelZero(shadow, uv, reference).xxxx;
 }

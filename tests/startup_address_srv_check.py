@@ -195,29 +195,43 @@ def check_unregistered_1d(directory, consumer, backend):
 
         return bytes(c for y in range(4) for x in range(8) for c in (red(x, y), 0, 0, 255))
 
+    def console(mode):
+        return {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_CONSOLE_LAYOUT": mode,
+                "X2W_SLOT70_DIAGNOSTICS": "1"}
+
+    linear_detail = "linear mip and slice alignment not mapped"
+    linear_reason = "texture_1d_linear_mips_or_slices"
+    # A mutant that accepts multiple linear mips fails the mips control.
+    # Removing linear acceptance fails the linear case's readback.
     cases = (
-        ("switch off", 0, {"X2W_PLACED_SRV_1D": "1"}, "texture_no_resource"),
+        ("switch off", 0, {"X2W_PLACED_SRV_1D": "1"}, None),
         ("enabled", 7, {"X2W_PLACED_1D_TEXTURE": "1"}, None),
         ("wrong width", 4, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_WRONG_WIDTH": "1"}, None),
         ("odd sRGB desktop rows", 7, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_SRGB": "1",
                                       "X2W_SLOT70_DIAGNOSTICS": "1"}, None),
-        ("unmapped layout", 0, {"X2W_PLACED_1D_TEXTURE": "1", "X2W_TEST_PLACED_1D_CONSOLE_LAYOUT": "1",
-                                "X2W_SLOT70_DIAGNOSTICS": "1"}, "unsupported_desktop_format"),
+        ("linear layout", 7, console("1"), None),
+        ("linear mips", 0, console("m"), (linear_detail, linear_reason, "8x1x1 mips=2 layout=0x100")),
+        ("linear slices", 0, console("a"), (linear_detail, linear_reason, "7x1x2 mips=1 layout=0x100")),
+        ("unmapped layout", 0, console("u"),
+         ("no console footprint mapping", "texture_1d_layout_unmapped", "7x1x1 mips=1 layout=0x105")),
     )
-    for case, width, switches, refusal in cases:
+    for case, width, switches, diagnostic in cases:
         output.unlink(missing_ok=True)
         result = subprocess.run([*args, backend, output], env={**env, **switches}, capture_output=True, text=True)
         print(result.stdout, end="")
         if result.returncode:
             raise RuntimeError(f"{case}: consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+        actual = output.read_bytes()
+        srgb = "X2W_TEST_PLACED_1D_CONSOLE_LAYOUT" in switches or "X2W_TEST_PLACED_1D_SRGB" in switches
+        expected = reference(width, srgb)
+        if actual != expected:
+            raise AssertionError(f"{case}: actual {actual.hex()} expected {expected.hex()}")
+        refusal = "unsupported_desktop_format" if diagnostic else "texture_no_resource"
         marker = f"unregistered 1D descriptor_changed={int(bool(width))}"
         refusals = [line for line in result.stderr.splitlines() if "Device::slot70" in line and "reason=" in line]
         if marker not in result.stdout.splitlines() or len(refusals) != (0 if width else 2) or any(
                 f"reason={refusal}" not in line for line in refusals):
             raise AssertionError(f"{case}: descriptor or refusal count mismatch\n{result.stderr[-5000:]}")
-        if case == "unmapped layout" and any("no console footprint mapping" not in line or "fmt=29" not in line
-                                              for line in refusals):
-            raise AssertionError(f"{case}: missing format and layout explanation\n{result.stderr[-5000:]}")
         if "X2W_PLACED_1D_TEXTURE" in switches:
             counts = ("1D published 1 bound 2 refused 0" if width else
                       "1D published 0 bound 0 refused 2 unsupported_desktop_format=2")
@@ -225,22 +239,130 @@ def check_unregistered_1d(directory, consumer, backend):
                 raise AssertionError(f"{case}: missing {counts}\n{result.stdout}")
         elif "memory SRV switches:" in result.stdout:
             raise AssertionError(f"{case}: unexpected switch census\n{result.stdout}")
-        if case == "unmapped layout":
-            shape = "reason=texture_1d_layout_unmapped dim=2 fmt=29 size=7x1x1 mips=1 layout=0x100 flags=0x0 calls=2"
+        if diagnostic:
+            detail, reason, layout_shape = diagnostic
+            if any(detail not in line or "fmt=29" not in line for line in refusals):
+                raise AssertionError(f"{case}: missing format and layout explanation\n{result.stderr[-5000:]}")
+            shape = f"reason={reason} dim=2 fmt=29 size={layout_shape} flags=0x0 calls=2"
             if shape not in result.stdout:
-                raise AssertionError(f"{case}: missing layout census\n{result.stdout}")
+                raise AssertionError(f"{case}: missing {shape}\n{result.stdout}")
         elif "memory SRV diagnostics" in result.stdout:
             raise AssertionError(f"{case}: unexpected diagnostics\n{result.stdout}")
-        actual = output.read_bytes()
-        srgb = case in {"odd sRGB desktop rows", "unmapped layout"}
-        expected = reference(width, srgb)
-        if actual != expected:
-            raise AssertionError(f"{case}: actual {actual.hex()} expected {expected.hex()}")
         if width != 7 and actual == reference(7, srgb):
             raise AssertionError(f"{case}: unexpectedly passed the width-7 oracle")
         print(f"{backend}: placed 1D {case}; all 32 RGBA pixels exact for its CPU reference")
 
 
+CUBE_SHADER = """TextureCube<float4> cube : register(t0);
+SamplerState point_sampler : register(s0);
+static const float3 directions[6] = {
+    float3(1, 0.25, -0.125), float3(-1, 0.25, 0.125),
+    float3(0.25, 1, -0.125), float3(0.25, -1, 0.125),
+    float3(0.25, 0.125, 1), float3(-0.25, 0.125, -1)
+};
+float4 main(float4 p : SV_Position) : SV_Target {
+    return cube.SampleLevel(point_sampler, directions[(uint)p.x % 6u], 0);
+}
+"""
+
+
+def check_cube(directory, consumer, backend):
+    env, args, output = prepare_draw_cache(
+        directory, consumer, CUBE_SHADER, {"X2W_TEST_CUBE_SRV": "1", "X2W_TEST_FULL_TARGET": "1"},
+        "srv 0 texcube table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0",
+    )
+    result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 77:
+        return 77
+    if result.returncode:
+        raise RuntimeError(f"consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+
+    actual = output.read_bytes()
+    assert len(actual) == 8 * 4 * 4, f"expected 32 RGBA8 pixels, got {len(actual)} bytes"
+    # Mapping kind 5 to Texture2DArray breaks the first six columns.
+    # Removing wrong_cube_view makes the last column read face 1.
+    cases = (
+        *((f"cube face {face}", bytes((31 + 29 * face, 73, 181, 255))) for face in range(6)),
+        ("2D array view of six slices", bytes(4)),
+        ("cube view of twelve slices", bytes(4)),
+    )
+    for x, (case, expected) in enumerate(cases):
+        for y in range(4):
+            at = 4 * (y * 8 + x)
+            rgba = actual[at:at + 4]
+            assert rgba == expected, f"{case} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
+    # Slot 18 records the title view. These diagnostics must come from the
+    # real draw binder, including for the cube view whose dimension matches.
+    mismatches = re.findall(r"srv 0: view dimension (\d+) does not match the shader; binding null", result.stderr)
+    assert mismatches == ["5", "9"], f"expected array then cube mismatch, got {mismatches}\n{result.stderr[-5000:]}"
+    print(f"{backend}: six cube faces, array-view null and twelve-slice null match the CPU reference")
+    return 0
+
+
+DESKTOP_ARRAY_SHADER = """Texture2DArray<float4> layers : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint2 pixel = (uint2)p.xy;
+    return layers.Load(int4(pixel.x & 1, pixel.y & 1, pixel.x % 6, 0));
+}
+"""
+
+
+def desktop_array_reference(x, y, array_view, enabled):
+    if not enabled:
+        return bytes(4)
+    if array_view:
+        return bytes((31 + 13 * (6 + x % 6), 53 + 61 * (y % 2), 197 - 73 * (x % 2), 255))
+    return bytes(((19 if y < 2 else 31) + 13 * (x % 6), 53, 197, 255))
+
+
+def check_desktop_arrays(directory, consumer, backend):
+    for array_view in (False, True):
+        case = "array" if array_view else "cube"
+        work = directory / case
+        work.mkdir()
+        modes = {"X2W_TEST_DESKTOP_ARRAY_SRVS": "1", "X2W_TEST_FULL_TARGET": "1"}
+        if array_view:
+            modes["X2W_TEST_DESKTOP_ARRAY_SLICES"] = "1"
+            shader, binding = DESKTOP_ARRAY_SHADER, "srv 0 tex2da table 0 0\nsrvuse 0 texel"
+        else:
+            shader, binding = CUBE_SHADER, "srv 0 texcube table 0 0\nsrvuse 0 sample\nsmp 0 0 0 0 0"
+        env, args, output = prepare_draw_cache(work, consumer, shader, modes, binding)
+        if not array_view:
+            env.pop("X2W_TEST_DESKTOP_ARRAY_SLICES", None)
+        for enabled in ((True,) if array_view else (False, True)):
+            env.pop("X2W_SLOT70_DESKTOP_ARRAYS", None)
+            if enabled:
+                env["X2W_SLOT70_DESKTOP_ARRAYS"] = "1"
+            output.unlink(missing_ok=True)
+            result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
+            print(result.stdout, end="")
+            if result.returncode == 77:
+                return 77
+            if result.returncode:
+                raise RuntimeError(f"{case}: consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+            reasons = re.findall(r"Device::slot70 [^\n]*reason=(\w+)", result.stderr)
+            count = 0 if array_view else 2 if enabled else 4
+            assert reasons == ["unsupported_description"] * count, (case, enabled, reasons, result.stderr[-5000:])
+            actual = output.read_bytes()
+            assert len(actual) == 8 * 4 * 4, f"expected 32 RGBA8 pixels, got {len(actual)} bytes"
+            for y in range(4):
+                for x in range(8):
+                    expected = desktop_array_reference(x, y, array_view, enabled)
+                    at = 4 * (y * 8 + x)
+                    rgba = actual[at:at + 4]
+                    assert rgba == expected, (
+                        f"{case} switch={enabled} pixel ({x}, {y}): got {rgba.hex()}, expected {expected.hex()}"
+                    )
+    print(f"{backend}: desktop array cube faces and slices 6–11 match the CPU reference; refusal controls passed")
+    print("Mutant: unrounded footprint stride makes cube faces 1 through 5 read zero padding.")
+    return 0
+
+
 if __name__ == "__main__":
+    consumer, backend, *mode = sys.argv[1:]
+    checks = {(): check, ("cube",): check_cube, ("desktop-arrays",): check_desktop_arrays}
+    if tuple(mode) not in checks:
+        raise SystemExit("expected consumer backend [cube|desktop-arrays]")
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *sys.argv[1:]))
+        sys.exit(checks[tuple(mode)](Path(temporary), consumer, backend))

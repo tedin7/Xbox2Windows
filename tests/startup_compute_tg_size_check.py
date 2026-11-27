@@ -10,11 +10,13 @@
                                         64 threads (two wave32 waves): every thread stores its wave-ID bits and the scc select
   waves-control <wave-id-zero|wave-width-16> <dxc> <offscreen_check> <warp|hardware>
 
-For groups of at most 32 threads (one wave), TG_SIZE[11:6] (wave ID, mask 0xfc0) is identically 0.
-TG_SIZE sits in the SGPR immediately following USER_SGPR and any enabled TGID_X/Y/Z SGPRs.
-Only `s_and_b32 R, TG, 0xfc0` (or `0xfc0, TG`) into a plain SGPR <= 105 is accepted, lowering to
-`R = 0u; scc = false;` with `R` tracked as `('const', 0)`; every other read of the untouched
-TG_SIZE SGPR is refused.
+  fields-dispatch <dxc> <offscreen_check> warp
+                                        compare both fields with the CPU for six guest group/wave configurations
+  fields-control <wave32-shift|wave64-shift|drop-wave-count> <dxc> <offscreen_check> warp
+
+The entry SGPR follows USER_SGPR and enabled group-ID registers. Only the wave-ID and
+wave-count masks are supported. Unknown wave size still permits the legacy small-group
+wave-ID fold because its result is independent of the guest wave size.
 """
 
 import struct
@@ -106,6 +108,7 @@ V_MBCNT_HI_U32_B32 = 0x366
 
 INLINE_0 = 128
 INLINE_2 = 130
+INLINE_3 = 131
 INLINE_4 = 132
 INLINE_6 = 134
 INLINE_17 = 128 + 17
@@ -204,6 +207,48 @@ WAVES_PROGRAM = b''.join([
 ])
 
 
+# Each guest thread writes two words through u0. The 320-word readback buffer
+# covers all 128 threads and leaves sentinel words to detect stray writes.
+FIELD_CASES = (
+    ((33, 1, 1), 32),
+    ((8, 3, 2), 32),
+    ((8, 4, 2), 32),
+    ((8, 6, 2), 32),
+    ((8, 4, 2), 64),
+    ((16, 4, 2), 64),
+)
+BUFFER_STORE_X2_V8_V4_S16 = bytes.fromhex('001074e004080480')
+
+
+def fields_program(group):
+    x, y, _ = group
+    return b''.join([
+        sop1(S_MOV_B32, 10, 6),
+        sop1(S_MOV_B32, 11, INLINE_0),
+        S_LOAD_X8_S12_S10,
+        sop2(S_AND_B32, 20, 8, LIT, 0xfc0),
+        sop2(S_AND_B32, 21, LIT, 8, 0x3f),
+        vop3(V_MAD_U32_U24, 3, 256 + 2, 128 + y, 256 + 1),
+        vop3(V_MAD_U32_U24, 3, 256 + 3, 128 + x, 256 + 0),
+        vop2(V_LSHLREV_B32, 4, INLINE_3, 3),
+        vop1(V_MOV_B32, 8, 20),
+        vop1(V_MOV_B32, 9, 21),
+        S_WAITCNT_LGKM0,
+        BUFFER_STORE_X2_V8_V4_S16,
+        S_ENDPGM,
+    ])
+
+
+def fields_expected_words(group, wave):
+    threads = group[0] * group[1] * group[2]
+    wave_count = len(range(0, threads, wave))
+    out = [SENTINEL] * WORDS
+    for wave_id, start in enumerate(range(0, threads, wave)):
+        for thread in range(start, min(start + wave, threads)):
+            out[2 * thread:2 * thread + 2] = [wave_id * 64, wave_count]
+    return out
+
+
 def waves_expected_words():
     out = [SENTINEL] * WORDS
     for lane in range(64):
@@ -285,12 +330,10 @@ def check_controls():
     hi_hlsl = translate(code=hi_prog).hlsl_cs()
     assert '    v8 = 0x00000000u;' in hi_hlsl, hi_hlsl
 
-    # 4. >32 threads per group with TG_SIZE_EN is refused unless the program is wave32 (stated or proved) and whole waves.
+    # 4. Groups above 32 threads require a known guest wave size.
     for bad_group in ((8, 4, 2), (33, 1, 1), (64, 1, 1)):
         refused('TG_SIZE_EN requires at most 32 threads per group',
                 lambda g=bad_group: translate(code=S_ENDPGM, group=g))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(33, 1, 1), wave_size=32))
-    refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=S_ENDPGM, group=(8, 4, 2), wave_size=64))
     wave_and = sop2(S_AND_B32, 20, 8, LIT, 0xfc0) + S_ENDPGM
     refused('TG_SIZE_EN requires at most 32 threads per group', lambda: translate(code=wave_and, group=(8, 4, 2)))  # no wave size known
     waves_hlsl = translate(code=WAVES_PROGRAM, group=WAVES_GROUP, wave_size=32).hlsl_cs()
@@ -305,9 +348,26 @@ def check_controls():
     assert not G.wave32_exec_proof([(0, 4, 's_mov_b32', 's_mov_b32 exec_lo, -1'), (4, 4, 's_mov_b64', 's_mov_b64 exec, -1')])
     assert not G.wave32_exec_proof([(0, 4, 's_endpgm', 's_endpgm')])
 
+    field_hlsl = {(group, wave): check_fields_translation(group, wave) for group, wave in FIELD_CASES}
+    for control, (case, old, new, _) in FIELD_MUTANTS.items():
+        mutate(field_hlsl[case], control, {control: (old, new)})
+    low_and = sop2(S_AND_B32, 21, 8, LIT, 0x3f) + S_ENDPGM
+    refused(G.TG_SIZE_WAVES_REFUSAL, lambda: translate(code=low_and))
+    for wave, group, copy_exec in (
+        (32, (33, 1, 1), sop1(S_MOV_B32, EXEC_LO, EXEC_LO)),
+        (64, (128, 1, 1), sop1(S_MOV_B64, 24, EXEC_LO)),
+    ):
+        code = copy_exec + fields_program(group)
+        assert translate(code=code, group=group).cs.tg_size_wave == wave
+
+    # The existing lane-operation refusal still applies to a partial guest wave64.
+    mbcnt = vop3(V_MBCNT_LO_U32_B32, 8, INLINE_NEG1, INLINE_0) + S_ENDPGM
+    refused('in a larger group requires a proven wave32 program',
+            lambda: translate(code=mbcnt, group=(48, 1, 1), wave_size=64))
+
     # 5. Disallowed reads of TG_SIZE are refused.
     bad_tg_reads = [
-        ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0x3f)),
+        ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0xfff)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, LIT, 0)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, 20, 8, 8)),
         ('TG_SIZE register s8 read outside s_and_b32 with 0xfc0', sop2(S_AND_B32, M0, 8, LIT, 0xfc0)),
@@ -395,7 +455,7 @@ def check_controls():
     ])
     refused('holding joined at a branch target', lambda: translate(code=join_leak).hlsl_cs())
 
-    print('tg_size_en: entry layout, s_and_b32 0xfc0 folding, v_mbcnt_lo base, overwrite and refusals pass')
+    print('tg_size_en: entry layout, both fields in six group/wave cases, mutation sites and refusals pass')
 
 
 CONTROLS = {
@@ -428,10 +488,46 @@ def mutate(hlsl, control, controls=None):
     return hlsl.replace(old, new)
 
 
+def check_fields_translation(group, wave):
+    pipe = translate(code=fields_program(group), group=group, wave_size=wave)
+    hlsl = pipe.hlsl_cs()
+    expected = fields_expected_words(group, wave)
+    assert pipe.cs.sym[21] == ('const', expected[1])
+    assert pipe.cs.uniform_source('s21') and pipe.cs.scc_uniform
+    assert 's21 = %du;\n    scc = true;' % expected[1] in hlsl
+    if expected[1] > 1:
+        assert '>> %du) << 6u);' % (5 if wave == 32 else 6) in hlsl
+    else:
+        assert 's20 = 0u;\n    scc = false;' in hlsl
+    return hlsl
+
+
+FIELD_MUTANTS = {
+    'wave32-shift': (FIELD_CASES[0], '>> 5u) << 6u);', '>> 6u) << 6u);',
+                     'word=64 expected=00000040 actual=00000000'),
+    'wave64-shift': (FIELD_CASES[-1], '>> 6u) << 6u);', '>> 5u) << 6u);',
+                     'word=64 expected=00000000 actual=00000040'),
+    'drop-wave-count': (FIELD_CASES[0], 'v9 = 0x00000002u;', 'v9 = 0u;',
+                        'word=1 expected=00000002 actual=00000000'),
+}
+
+
+def check_fields_dispatch(dxc, runner, adapter, control=None):
+    if control is not None:
+        (group, wave), old, new, mismatch = FIELD_MUTANTS[control]
+        hlsl = mutate(check_fields_translation(group, wave), control, {control: (old, new)})
+        return run_dispatch(dxc, runner, adapter, hlsl, (1, 1, 1), group,
+                            fields_expected_words(group, wave), control, mismatch)
+    for group, wave in FIELD_CASES:
+        print('guest wave%d' % wave)
+        status = run_dispatch(dxc, runner, adapter, check_fields_translation(group, wave),
+                              (1, 1, 1), group, fields_expected_words(group, wave))
+        if status:
+            return status
+    return 0
+
+
 def check_dispatch(dxc, runner, adapter, control=None, waves=False):
-    runner = str(Path(runner).resolve())
-    out = ROOT / 'out'
-    out.mkdir(exist_ok=True)
     controls, mismatch = (WAVES_CONTROLS, WAVES_MISMATCH) if waves else (CONTROLS, CONTROL_MISMATCH)
     groups, group, expected = (WAVES_DISPATCH_GROUPS, WAVES_GROUP, waves_expected_words()) if waves else (
         DISPATCH_GROUPS, GROUP, expected_words())
@@ -440,6 +536,14 @@ def check_dispatch(dxc, runner, adapter, control=None, waves=False):
         if control not in controls:
             raise SystemExit(f'unknown control {control!r}')
         hlsl = mutate(hlsl, control, controls)
+    return run_dispatch(dxc, runner, adapter, hlsl, groups, group, expected,
+                        control, mismatch.get(control))
+
+
+def run_dispatch(dxc, runner, adapter, hlsl, groups, group, expected, control=None, mismatch=None):
+    runner = str(Path(runner).resolve())
+    out = ROOT / 'out'
+    out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         d = Path(tmp)
         src, cso, case = d / 'tg_size.hlsl', d / 'tg_size.cso', d / 'tg_size.case'
@@ -466,7 +570,7 @@ def check_dispatch(dxc, runner, adapter, control=None, waves=False):
         if control:
             first = diagnostics[:1]
             if (run.returncode != 1 or not any('expected=' in line for line in diagnostics)
-                    or first != [mismatch[control]]):
+                    or first != [mismatch]):
                 raise AssertionError(
                     'control %s: unexpected result (exit %d) %s' % (control, run.returncode, run.stderr)
                 )
@@ -490,5 +594,9 @@ if __name__ == '__main__':
         sys.exit(check_dispatch(*sys.argv[2:], waves=True))
     elif len(sys.argv) == 6 and sys.argv[1] == 'waves-control':
         sys.exit(check_dispatch(*sys.argv[3:], control=sys.argv[2], waves=True))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'fields-dispatch':
+        sys.exit(check_fields_dispatch(*sys.argv[2:]))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'fields-control':
+        sys.exit(check_fields_dispatch(*sys.argv[3:], control=sys.argv[2]))
     else:
         sys.exit(__doc__)
