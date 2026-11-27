@@ -2598,6 +2598,11 @@ def lane_mask_accesses(ins):
     return accesses, writes, possible_writes, candidates
 
 
+def vcc_scalar_pair_copy(name, ops):
+    return (name == 's_mov_b64' and len(ops) == 2 and ops[0] == 'vcc'
+            and ops[1].startswith('s[') and lane_mask_pair(ops[1]) is not None)
+
+
 def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
     """Map pure mask operands by reaching values of both words, with optional use diagnostics."""
     if any(name.startswith(('s_setpc', 's_swappc', 's_movrel', 'v_movrel')) for _, _, name, _ in ins):
@@ -2612,7 +2617,7 @@ def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
     words = set().union(*(lane_mask_words(pair) for pair in pairs))
     incoming = reaching_mask_words(successors, writes, possible_writes, words)
     bad, uses, links = set(), {}, {}
-    numeric_uses = {}
+    numeric_uses, reaching_consumers = {}, {}
     for i, (ops, dests, sources, implicit) in enumerate(accesses):
         if incoming[i] is None:
             continue
@@ -2630,6 +2635,11 @@ def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
                 continue
             reached = set().union(*(incoming[i][word] for word in touched))
             defs = reached & candidates.keys()
+            if numeric_reads is not None and i in candidates and j in sources:
+                # Even when the source has no pure mask web, a mask reaching
+                # either word can flow through this definition.
+                for d in defs:
+                    reaching_consumers.setdefault(d, set()).add(i)
             if (j not in sources or not lane_mask_pair(token) or
                     not all(candidates.get(d) == token for d in reached) or
                     any(incoming[i][word] != reached for word in touched)):
@@ -2648,9 +2658,14 @@ def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
     if numeric_uses:
         # A pair copy or a 64-bit constant can also be ordinary scalar data.
         # Diagnose numeric reads only when the reaching web has a mask source.
+        vcc_copies = {
+            i for i, pair in candidates.items()
+            if pair == 'vcc' and incoming[i] is not None and vcc_scalar_pair_copy(ins[i][2], accesses[i][0])
+            and all(-1 not in incoming[i][word] for word in lane_mask_words(accesses[i][0][1]))
+        }
         mask_values = {
             i for i, pair in candidates.items()
-            if pair == 'vcc' or ins[i][2].startswith('v_cmp_')
+            if (pair == 'vcc' and i not in vcc_copies) or ins[i][2].startswith('v_cmp_')
             or LANE_MASK_CARRY.fullmatch(ins[i][2]) or LANE_MASK_SAVEEXEC.fullmatch(ins[i][2])
             or any(accesses[i][0][arg] == 'exec' for arg in accesses[i][2])
         }
@@ -2659,11 +2674,18 @@ def lane_mask_webs(ins, edges=None, *, readers=None, numeric_reads=None):
             for definitions in uses[i].values():
                 for d in definitions:
                     consumers.setdefault(d, set()).add(i)
-        pending = list(mask_values)
-        while pending:
-            fresh = consumers.get(pending.pop(), set()) - mask_values
-            mask_values.update(fresh)
-            pending.extend(fresh)
+        # Resolve whether the deferred VCC copies carry a mask, including
+        # mixed incoming values. Keep pure-web propagation for other pairs.
+        for graph, targets in ((reaching_consumers, vcc_copies), (consumers, candidates.keys())):
+            if not targets:
+                continue
+            reached = mask_values.copy()
+            pending = list(reached)
+            while pending:
+                fresh = graph.get(pending.pop(), set()) - reached
+                reached.update(fresh)
+                pending.extend(fresh)
+            mask_values.update(reached & targets)
         numeric_reads.update(i for i, defs in numeric_uses.items() if defs & mask_values)
     pending = list(bad)
     while pending:
@@ -3248,6 +3270,8 @@ def mesh_coherent_block(ins, source, target, edges, backward, live_at_join):
                 raise mesh_wave_block_error('an unsupported vector instruction (%s)' % name)
             if masks:
                 mask_ops.add(i)
+        elif vcc_scalar_pair_copy(name, args):
+            uniform.add(i)  # The emitter must prove these are tracked descriptor words.
         elif (mesh_wave_block_scalar(name, asm, explicit_scc=True) and
               all(reg == 'scc' or re.fullmatch(r's\d+', reg) for reg in reads | writes)):
             if name not in SCALAR_LOADS:
@@ -4315,6 +4339,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads, wave_votes, wave_s
                 pending.clear()
         elif index in mask_instructions:
             pass
+        elif coherent_sites and off in coherent_sites and vcc_scalar_pair_copy(name, ops):
+            pass  # Checked as a symbolic descriptor copy by the emitter.
         elif index in nested_saves and mask == 'wave_load':
             mask, scc_stale = ('nest', index), True
         elif index in nested_restores and mask == ('nest', nested_restores[index]):
@@ -7064,6 +7090,14 @@ class Stage:
                         reads, _, _ = scalar_effects(name, asm)
                         if off in mask_arm_sites and name == 's_cselect_b64':
                             reads = {'scc'}
+                        if off in coherent_sites and name == 's_mov_b64':
+                            descriptor_pair = len(reads) == 2 and all(
+                                re.fullmatch(r's\d+', reg) and self.sym.get(int(reg[1:]), (None,))[0] == 'desc'
+                                for reg in reads)
+                            if descriptor_pair:
+                                reads = set()  # The copy only updates symbolic descriptor state.
+                            elif vcc_scalar_pair_copy(name, parse(asm)[1]):
+                                raise mesh_wave_block_error('a scalar copy to VCC lacks descriptor words')
                         if off in coherent_sites and 'scc' in reads:
                             if not (self.scc_verified and self.scc_uniform):
                                 raise mesh_wave_block_error('SCC is not proven wave-uniform')
