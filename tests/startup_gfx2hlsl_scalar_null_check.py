@@ -285,7 +285,52 @@ def expected_root_null(s8, *, drop_and_scc=False, clobber_mov_scc=False, invert_
     return quad * 16 + [SENTINEL] * (320 - 64)
 
 
+def null_sample_pipeline(nonzero=False, store=False):
+    from startup_image_sample_a16_check import DIM_2D, IMG_SAMPLE_LZ, encode_mimg
+
+    # A hand-written zero image descriptor, two zero coordinates, then add 0.25 to red.
+    body = b''.join(sop1(4, reg, 128) for reg in range(64, 72, 2))
+    if nonzero:
+        body += sop1(3, 69, 137)
+    body += vop1(1, 20, 128) + vop1(1, 21, 128)
+    body += encode_mimg(IMG_SAMPLE_LZ, dim=DIM_2D, vaddr=20, vdata=12, srsrc=64, ssamp=84)
+    body += struct.pack('<I', 0xbf8c3f70)
+    body += vop2(3, 12, 255, 12) + struct.pack('<f', 0.25)
+    if store:
+        body += encode_mimg(8, dim=DIM_2D, vaddr=20, vdata=12, srsrc=64)
+    return G.Pipeline(vs_words([(0, 0, 0)] * 4), body + POST_WORDS, root_blob())
+
+
+def check_null_image():
+    pipe = null_sample_pipeline()
+    assert not pipe.resources
+    assert null_sample_pipeline(store=True).hlsl_ps() == pipe.hlsl_ps()
+    try:
+        null_sample_pipeline(nonzero=True)
+    except G.Unsupported as error:
+        assert "descriptor operand s[64:71] holds ('const', 0x9)" in str(error), error
+    else:
+        raise AssertionError('nonzero image descriptor translated')
+
+
+def draw_null_image(directory, dxc, renderer, adapter):
+    pipe = null_sample_pipeline()
+    source = pipe.hlsl_ps()
+    vs = compile_hlsl(dxc, 'dxc', pipe.hlsl_vs(), 'vs_null_image', 'vs_6_0', directory)
+    expected = words_text([G.fbits(0.25), 0, 0, 0])
+    mutant = source.replace('v12 = 0u;', 'v12 = U(1.0);', 1)
+    assert mutant != source
+    for label, shader in (('null_image', source), ('null_returns_one', mutant)):
+        ps = compile_hlsl(dxc, 'dxc', shader, label, 'ps_6_0', directory)
+        result = draw(renderer, adapter, vs, ps, expected)
+        if shader == source:
+            assert result.returncode == 0, (result.stdout, result.stderr)
+        else:
+            assert result.returncode == 1 and 'actual=3fa00000,00000000,00000000,00000000' in result.stderr, result.stderr
+
+
 def controls():
+    check_null_image()
     # 1. Canonical encodings round-trip through disasm_rdna2.decode_instruction.
     for text, raw in CANONICAL_CASES:
         n, _, asm, _ = D.decode_instruction(raw, 0)
@@ -550,6 +595,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     ps_draws = ps_muts = 0
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        draw_null_image(directory, dxc, renderer, adapter)
         ps_text = G.Pipeline(vs_words([(0, 0, 0)] * 4), PS_WORDS, root_blob()).hlsl_ps()
 
         # Part A: Graphics VS+PS draw across FXC ps_5_1 and DXC ps_6_0 + three pixel-stage mutations.
