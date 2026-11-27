@@ -22,6 +22,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
+extern "C" __declspec(dllimport) std::size_t x2w_d3d12_not_drawn_keys_report(char* out, std::size_t capacity);
 extern "C" __declspec(dllimport) UINT x2w_d3d12_fixture_fill_upload_ring(void*, UINT, BOOL);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_refusal_stats(
     LONG64* holds, LONG64* repeated_reads, LONG64* background_reads, LONG* untranslated);
@@ -110,7 +111,7 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
 
 // Binds the pipeline on a guest list and records `calls` ExecuteIndirect calls (list slot 61) with a Draw or a
 // Dispatch signature. No root or target is bound, so every call is refused and nothing is drawn.
-static bool bind_and_execute_indirect(void* device, void* pipeline, bool dispatch, int calls)
+static bool bind_and_execute_indirect(void* device, void* pipeline, bool dispatch, int calls, bool direct_draw = false)
 {
     auto* guest = static_cast<ID3D12Device*>(device);
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
@@ -133,7 +134,13 @@ static bool bind_and_execute_indirect(void* device, void* pipeline, bool dispatc
     using Close = HRESULT (WINAPI*)(void*);
     if (FAILED(reinterpret_cast<Reset>(slots(list)[139])(list, allocator.Get(), nullptr, nullptr))) return false;
     reinterpret_cast<Bind>(slots(list)[25])(list, pipeline);
-    for (int i = 0; i < calls; ++i) reinterpret_cast<Execute>(slots(list)[61])(list, signature.Get(), 1, nullptr, 0, nullptr, 0);
+    if (direct_draw) {
+        // A plain DrawInstanced with no render target bound: refused before any translation lookup.
+        using Draw = void (WINAPI*)(void*, UINT, UINT, UINT, UINT);
+        for (int i = 0; i < calls; ++i) reinterpret_cast<Draw>(slots(list)[12])(list, 3, 1, 0, 0);
+    } else {
+        for (int i = 0; i < calls; ++i) reinterpret_cast<Execute>(slots(list)[61])(list, signature.Get(), 1, nullptr, 0, nullptr, 0);
+    }
     const bool closed = SUCCEEDED(reinterpret_cast<Close>(slots(list)[9])(list));
     static_cast<IUnknown*>(list)->Release();
     return closed;
@@ -1098,15 +1105,24 @@ int main(int argc, char** argv)
     bool two_targets = false;
     if (argc == 7 && std::strncmp(argv[6], "indirect-", 9) == 0) {
         // A pipeline used only through slot 61. slot57-draw: three refused Draw calls; slot57-bound: bound, no call;
-        // slot57-dispatch: one refused Dispatch call; desktop-draw: a desktop pipeline and one refused Draw call.
+        // slot57-dispatch: one refused Dispatch call; desktop-draw: a desktop pipeline and one refused Draw call;
+        // slot57-unbound-draw: three direct Draws with no render target bound, then the not-drawn key report on stdout.
         const std::string mode(argv[6] + 9);
         if (mode == "desktop-draw") pso = desktop_pipeline(device);
-        else if (mode == "slot57-draw" || mode == "slot57-bound" || mode == "slot57-dispatch") {
+        else if (mode == "slot57-draw" || mode == "slot57-bound" || mode == "slot57-dispatch" || mode == "slot57-unbound-draw") {
             if (!create_slot57(device, argv[1], argv[2], argv[3], "", pso)) return 10;
         } else return 2;
         if (!pso) return 10;
-        const int calls = mode == "slot57-draw" ? 3 : mode == "slot57-bound" ? 0 : 1;
-        return bind_and_execute_indirect(device, pso, mode == "slot57-dispatch", calls) ? 0 : 11;
+        const bool direct = mode == "slot57-unbound-draw";
+        const int calls = mode == "slot57-draw" || direct ? 3 : mode == "slot57-bound" ? 0 : 1;
+        if (!bind_and_execute_indirect(device, pso, mode == "slot57-dispatch", calls, direct)) return 11;
+        if (direct) {
+            // The refused draws by pipeline key, as the periodic report prints them.
+            std::vector<char> report(x2w_d3d12_not_drawn_keys_report(nullptr, 0) + 1);
+            x2w_d3d12_not_drawn_keys_report(report.data(), report.size());
+            std::fputs(report.data(), stdout);
+        }
+        return 0;
     }
     if (argc == 8 && std::strncmp(argv[6], "slot57", 6) == 0) {
         // The same shaders and root through device slot 57, with the given words in state block A.

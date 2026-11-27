@@ -3385,6 +3385,11 @@ static const char* const not_drawn_names[] = {
     "d16_srv_not_ready",
     "formatted_buffer_not_ready",
     "descriptor_entry_word_not_ready",
+    // The old site 0 ("state_not_ready") split by which gate failed. Site 0 stays for a draw without a command list.
+    "no_pipeline_set",
+    "targets_not_bound",
+    "unsupported_topology",
+    "rect_draw_unsupported",
 };
 constexpr int not_drawn_sites = sizeof(not_drawn_names) / sizeof(not_drawn_names[0]);
 constexpr int buffer_copy_failed_site = 15;
@@ -3393,7 +3398,11 @@ constexpr int dynamic_resource_heap_unavailable_site = 17;
 constexpr int d16_srv_not_ready_site = 18;
 constexpr int formatted_buffer_not_ready_site = 19;
 constexpr int descriptor_entry_word_not_ready_site = 20;
-static_assert(not_drawn_sites == 21, "the not-drawn site numbers are fixed");
+constexpr int no_pipeline_set_site = 21;
+constexpr int targets_not_bound_site = 22;
+constexpr int unsupported_topology_site = 23;
+constexpr int rect_draw_unsupported_site = 24;
+static_assert(not_drawn_sites == 25, "the not-drawn site numbers are fixed");
 LONG not_drawn_counts[not_drawn_sites];
 // The same refusals by pipeline: key -> draws not drawn, and at which site. A counter map under its own lock, one
 // increment per refused draw, no per-draw log. Key 0: the pipeline had no translation entry yet.
@@ -3653,6 +3662,32 @@ bool indirect_guest_root_matches(const BoundPipeline& bound, const Pass& pass)
     return match;
 }
 
+// The key a draw refused before its translation lookup is attributed to. known_pipeline_key only sees pipelines that an
+// earlier accepted draw already looked up, so a slot-57 pipeline whose draws are all refused first (targets not bound,
+// an unsupported topology) stayed keyless ("key 0000000000000000"). Look it up the way its first accepted draw would.
+// A pipeline that still has no key is logged once per pipeline, with its creation path.
+u64 refused_pipeline_key(Wrapper* pipeline, int site)
+{
+    u64 key = known_pipeline_key(pipeline);
+    if (key || !pipeline || pipeline->own().real) {
+        static LONG logged;
+        if (!key && first_calls(logged, 16))
+            log("x2w-draw keyless refusal: %s, %s", not_drawn_names[site], pipeline ? "desktop pipeline" : "no pipeline set");
+        return key;
+    }
+    draw_lock_acquire_exclusive();
+    BoundPipeline* bound = translation_for(pipeline);
+    key = bound && bound->translation ? bound->translation->key : 0;
+    const PipelineInfo* info = pipeline_info(pipeline);
+    const int path = info ? info->path : 0;
+    draw_lock_release_exclusive();
+    static LONG logged_keyed, logged_keyless;
+    if (key ? first_calls(logged_keyed, 8) : first_calls(logged_keyless, 16))
+        log("x2w-draw refusal %s: pipeline %p creation slot %d key %016llx", not_drawn_names[site],
+            static_cast<void*>(pipeline), path, static_cast<unsigned long long>(key));
+    return key;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -3662,7 +3697,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool rect = pass.topology == 0x11;
     const bool indexed_rect = rect && indexed && indirect;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
-        (rect && indexed && !indexed_rect)) return not_drawn(pass, list, known_pipeline_key(pass.pipeline), 0);
+        (rect && indexed && !indexed_rect)) {
+        const int site = !list ? 0 : !pass.pipeline ? no_pipeline_set_site : !pass.targets_bound ? targets_not_bound_site
+                         : !(rect || pass.topology == 4 || pass.topology == 5) ? unsupported_topology_site : rect_draw_unsupported_site;
+        return not_drawn(pass, list, refused_pipeline_key(pass.pipeline, site), site);
+    }
     draw_lock_acquire_exclusive();
     DrawPhases phases;
     BoundPipeline* bound = translation_for(pass.pipeline);
